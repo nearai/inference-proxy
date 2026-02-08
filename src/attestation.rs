@@ -57,7 +57,9 @@ async fn collect_gpu_evidence(
         info!("GPU evidence no-GPU mode enabled; using canned evidence");
     }
 
-    // Build a small Python script that collects GPU evidence
+    // Build a small Python script that collects GPU evidence.
+    // ppcie_mode=False is required on PPCIE systems (the default True triggers a
+    // "standalone mode not supported" error). Safe on non-PPCIE systems too.
     let script = if no_gpu_mode {
         format!(
             r#"
@@ -72,7 +74,7 @@ print(json.dumps(evidence))
             r#"
 import json
 from verifier import cc_admin
-evidence = cc_admin.collect_gpu_evidence_remote("{nonce_hex}")
+evidence = cc_admin.collect_gpu_evidence_remote("{nonce_hex}", ppcie_mode=False)
 print(json.dumps(evidence))
 "#,
         )
@@ -95,8 +97,15 @@ print(json.dumps(evidence))
         anyhow::bail!("GPU evidence collection failed: {stderr}");
     }
 
+    // The Python verifier library prints info messages to stdout (e.g. "Number of GPUs
+    // available : 8"). Extract only the last line, which contains the JSON evidence array.
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let evidence: serde_json::Value = serde_json::from_str(stdout.trim())
+    let json_line = stdout
+        .lines()
+        .rev()
+        .find(|line| line.starts_with('['))
+        .ok_or_else(|| anyhow::anyhow!("No JSON array found in GPU evidence output"))?;
+    let evidence: serde_json::Value = serde_json::from_str(json_line)
         .map_err(|e| anyhow::anyhow!("Failed to parse GPU evidence JSON: {e}"))?;
 
     Ok(evidence)

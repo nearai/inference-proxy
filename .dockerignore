@@ -1,0 +1,8 @@
+target/
+.git/
+.claude/
+.github/
+*.md
+.gitignore
+tests/
+oci.tar

@@ -1,6 +1,7 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
+use tracing::error;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -46,11 +47,14 @@ impl IntoResponse for AppError {
                 format!("Request body too large. Maximum: {max_size} bytes"),
                 "payload_too_large",
             ),
-            AppError::Internal(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal server error".to_string(),
-                "server_error",
-            ),
+            AppError::Internal(ref e) => {
+                error!(error = %e, "Internal server error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal server error".to_string(),
+                    "server_error",
+                )
+            }
         };
 
         let body = serde_json::json!({

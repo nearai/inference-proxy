@@ -1,4 +1,5 @@
 pub mod attestation;
+pub mod catch_all;
 pub mod chat;
 pub mod completions;
 pub mod health;
@@ -40,4 +41,5 @@ pub fn build_router() -> Router<AppState> {
             "/v1/attestation/report",
             get(attestation::attestation_report),
         )
+        .fallback(catch_all::catch_all)
 }

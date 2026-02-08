@@ -63,7 +63,9 @@ pub async fn proxy_json_request(
                 opts.id_prefix,
                 &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]
             );
-            response_data["id"] = serde_json::Value::String(id.clone());
+            if let Some(obj) = response_data.as_object_mut() {
+                obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
+            }
             debug!(id = %id, "Generated response ID");
             id
         }
@@ -234,7 +236,9 @@ pub async fn proxy_multipart_request(
                 opts.id_prefix,
                 &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]
             );
-            response_data["id"] = serde_json::Value::String(id.clone());
+            if let Some(obj) = response_data.as_object_mut() {
+                obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
+            }
             id
         }
     };
@@ -306,9 +310,138 @@ pub async fn proxy_simple(
         .unwrap())
 }
 
+/// Sign already-fetched JSON response bytes, cache the signature, and return a JSON response.
+/// Used by catch-all when content-type is already known to be JSON.
+pub async fn sign_and_cache_json_response(
+    response_bytes: &[u8],
+    request_sha256: &str,
+    opts: &ProxyOpts,
+    status: StatusCode,
+) -> Result<Response, AppError> {
+    let mut response_data: serde_json::Value =
+        serde_json::from_slice(response_bytes).map_err(|e| AppError::Internal(e.into()))?;
+
+    let chat_id = match response_data.get("id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => {
+            let id = format!(
+                "{}-{}",
+                opts.id_prefix,
+                &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]
+            );
+            if let Some(obj) = response_data.as_object_mut() {
+                obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
+            }
+            debug!(id = %id, "Generated response ID");
+            id
+        }
+    };
+
+    let response_body =
+        serde_json::to_string(&response_data).map_err(|e| AppError::Internal(e.into()))?;
+    let response_sha256 = hex::encode(Sha256::digest(response_body.as_bytes()));
+
+    let text = format!("{request_sha256}:{response_sha256}");
+    let signed = opts.signing.sign_chat(&text).map_err(|e| {
+        error!(error = %e, "Signing failed");
+        AppError::Internal(e)
+    })?;
+    let signed_json = serde_json::to_string(&signed).map_err(|e| AppError::Internal(e.into()))?;
+    opts.cache.set_chat(&chat_id, &signed_json);
+
+    Ok(Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Body::from(response_body))
+        .unwrap())
+}
+
+/// Proxy an already-received streaming SSE response. Hashes all chunks, signs at end, caches.
+/// Used by catch-all when content-type is already known to be SSE.
+pub async fn proxy_streaming_response(
+    response: reqwest::Response,
+    request_sha256: &str,
+    opts: &ProxyOpts,
+    status: StatusCode,
+) -> Result<Response, AppError> {
+    let signing = opts.signing.clone();
+    let cache = opts.cache.clone();
+    let request_sha256 = request_sha256.to_string();
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+
+    let byte_stream = response.bytes_stream();
+    tokio::spawn(async move {
+        use futures_util::StreamExt;
+
+        let mut byte_stream = std::pin::pin!(byte_stream);
+        let mut hasher = Sha256::new();
+        let mut parser = SseParser::new();
+        let mut upstream_error = false;
+        let mut downstream_closed = false;
+
+        while let Some(chunk_result) = byte_stream.next().await {
+            match chunk_result {
+                Ok(chunk) => {
+                    hasher.update(&chunk);
+                    parser.process_chunk(&chunk);
+
+                    let chunk_bytes: Bytes = chunk;
+                    if tx.send(Ok(chunk_bytes)).await.is_err() {
+                        downstream_closed = true;
+                        break;
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Error reading upstream stream");
+                    upstream_error = true;
+                    let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
+                    break;
+                }
+            }
+        }
+
+        if !upstream_error && !downstream_closed && parser.seen_done {
+            let response_sha256 = hex::encode(hasher.finalize());
+            if let Some(id) = parser.chat_id {
+                let text = format!("{request_sha256}:{response_sha256}");
+                match signing.sign_chat(&text) {
+                    Ok(signed) => {
+                        if let Ok(signed_json) = serde_json::to_string(&signed) {
+                            cache.set_chat(&id, &signed_json);
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Signing failed for streaming response");
+                    }
+                }
+            } else {
+                error!("Chat id could not be extracted from the completed streaming response");
+            }
+        } else {
+            info!(
+                upstream_error,
+                downstream_closed,
+                seen_done = parser.seen_done,
+                "Skipping streaming signature cache: stream did not complete cleanly"
+            );
+        }
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let body = Body::from_stream(stream);
+
+    Ok(Response::builder()
+        .status(status)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(body)
+        .unwrap())
+}
+
 /// Line-buffered SSE parser that handles data split across chunk boundaries.
 /// Extracts `chat_id` from the first JSON chunk and detects the `[DONE]` marker.
-struct SseParser {
+pub(crate) struct SseParser {
     line_buffer: String,
     pub chat_id: Option<String>,
     pub seen_done: bool,

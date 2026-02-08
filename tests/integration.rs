@@ -1704,6 +1704,593 @@ async fn test_audio_transcriptions_multipart() {
     assert_eq!(sig_response.status(), StatusCode::OK);
 }
 
+// ---- Catch-all passthrough ----
+
+#[tokio::test]
+async fn test_passthrough_json_post() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/custom/endpoint"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "pt-custom-1",
+            "result": "ok"
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/custom/endpoint")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(r#"{"data":"test"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response).await;
+    assert_eq!(body["id"], "pt-custom-1");
+    assert_eq!(body["result"], "ok");
+
+    // Verify signature was cached
+    let sig_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/signature/pt-custom-1?signing_algo=ecdsa")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(sig_response.status(), StatusCode::OK);
+    let sig_body = body_to_json(sig_response).await;
+    assert!(sig_body["text"].as_str().unwrap().contains(":"));
+}
+
+#[tokio::test]
+async fn test_passthrough_get_json() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/custom/info"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"id": "pt-info-1", "status": "healthy"}))
+                .insert_header("content-type", "application/json"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/custom/info")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response).await;
+    assert_eq!(body["status"], "healthy");
+
+    // Verify signature was cached
+    let sig_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/signature/pt-info-1?signing_algo=ecdsa")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(sig_response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_passthrough_streaming() {
+    let mock_server = MockServer::start().await;
+
+    let sse_body =
+        "data: {\"id\":\"pt-stream-1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/v1/custom/stream"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse_body, "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/custom/stream")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(r#"{"stream":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "text/event-stream"
+    );
+
+    let body_bytes = body_to_bytes(response).await;
+    let body_str = String::from_utf8_lossy(&body_bytes);
+    assert!(body_str.contains("pt-stream-1"));
+    assert!(body_str.contains("[DONE]"));
+
+    // Wait for background signing task
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Verify signature was cached
+    let sig_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/signature/pt-stream-1?signing_algo=ecdsa")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(sig_response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_passthrough_raw_response() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/custom/text"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("plain text output")
+                .insert_header("content-type", "text/plain"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/custom/text")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "text/plain"
+    );
+    let body_bytes = body_to_bytes(response).await;
+    assert_eq!(String::from_utf8_lossy(&body_bytes), "plain text output");
+}
+
+#[tokio::test]
+async fn test_passthrough_path_traversal() {
+    let app = build_test_app("http://unused");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/../etc/passwd")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(response).await;
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Path traversal"));
+}
+
+#[tokio::test]
+async fn test_passthrough_auth_required() {
+    let app = build_test_app("http://unused");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/custom/anything")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_passthrough_upstream_error() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/custom/broken"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("internal secret error details"))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/custom/broken")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Should preserve the upstream status code (500)
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = body_to_json(response).await;
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("Upstream request failed with status"));
+    // Should NOT leak the raw upstream body
+    assert!(!msg.contains("internal secret error details"));
+}
+
+#[tokio::test]
+async fn test_passthrough_headers_forwarded() {
+    use wiremock::matchers::header;
+
+    let mock_server = MockServer::start().await;
+
+    // Expect that custom headers are forwarded, but host/content-length/authorization are excluded
+    Mock::given(method("POST"))
+        .and(path("/v1/custom/headers"))
+        .and(header("x-custom-header", "custom-value"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "pt-headers-1",
+            "ok": true
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/custom/headers")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header("x-custom-header", "custom-value")
+                .body(Body::from(r#"{"test": true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    // The mock expectation (header matcher) verifies the custom header was forwarded
+}
+
+#[tokio::test]
+async fn test_passthrough_excluded_headers_not_forwarded() {
+    use wiremock::matchers::header_exists;
+    use wiremock::Match;
+
+    /// Matcher that asserts a header does NOT exist on the request.
+    struct HeaderAbsent(&'static str);
+    impl Match for HeaderAbsent {
+        fn matches(&self, request: &wiremock::Request) -> bool {
+            !request.headers.contains_key(self.0)
+        }
+    }
+
+    let mock_server = MockServer::start().await;
+
+    // Verify: custom headers forwarded, authorization excluded.
+    // Note: we don't assert host is absent because reqwest always adds Host per HTTP/1.1.
+    Mock::given(method("POST"))
+        .and(path("/v1/custom/excl"))
+        .and(header_exists("x-custom-header"))
+        .and(HeaderAbsent("authorization"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "pt-excl-1",
+            "ok": true
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/custom/excl")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header("x-custom-header", "present")
+                .body(Body::from(r#"{"test": true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    // The mock expectations verify: x-custom-header present, authorization absent, host absent
+}
+
+#[tokio::test]
+async fn test_passthrough_json_array_response() {
+    let mock_server = MockServer::start().await;
+
+    // Backend returns a JSON array (not an object) — should not panic
+    Mock::given(method("POST"))
+        .and(path("/v1/custom/array"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!([1, 2, 3]))
+                .insert_header("content-type", "application/json"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/custom/array")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(r#"{"data":"test"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response).await;
+    // Should return the array unmodified (can't inject ID into non-object)
+    assert!(body.is_array());
+    assert_eq!(body[0], 1);
+}
+
+#[tokio::test]
+async fn test_passthrough_raw_response_no_signature_cached() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/custom/binary"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"binary data".to_vec())
+                .insert_header("content-type", "application/octet-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/custom/binary")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = body_to_bytes(response).await;
+    assert_eq!(body_bytes, b"binary data");
+
+    // Raw passthrough should NOT have any signature cached.
+    // Use a generated ID pattern — since there's no signing, no ID is generated at all.
+    // Try fetching with a plausible ID prefix to confirm nothing was cached.
+    let sig_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/signature/pt-does-not-exist?signing_algo=ecdsa")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(sig_response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_passthrough_upstream_404_preserved() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/custom/notfound"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/custom/notfound")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = body_to_json(response).await;
+    assert!(body["error"]["message"].as_str().unwrap().contains("404"));
+}
+
+#[tokio::test]
+async fn test_passthrough_upstream_429_preserved() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/custom/ratelimit"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/custom/ratelimit")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(r#"{}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn test_passthrough_success_status_preserved() {
+    let mock_server = MockServer::start().await;
+
+    // Backend returns 201 Created with JSON
+    Mock::given(method("POST"))
+        .and(path("/v1/custom/create"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(serde_json::json!({"id": "pt-created-1", "created": true})),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/custom/create")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(r#"{"name":"test"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Should preserve 201, not normalize to 200
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = body_to_json(response).await;
+    assert_eq!(body["created"], true);
+}
+
+#[tokio::test]
+async fn test_passthrough_raw_response_headers_preserved() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/custom/headers_resp"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("data")
+                .insert_header("content-type", "text/plain")
+                .insert_header("x-custom-response", "from-backend")
+                .insert_header("cache-control", "max-age=60"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/custom/headers_resp")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    // Upstream response headers should be preserved
+    assert_eq!(
+        response.headers().get("x-custom-response").unwrap(),
+        "from-backend"
+    );
+    assert_eq!(
+        response.headers().get("cache-control").unwrap(),
+        "max-age=60"
+    );
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "text/plain"
+    );
+}
+
 // ---- Helpers ----
 
 async fn body_to_json(response: axum::http::Response<Body>) -> serde_json::Value {

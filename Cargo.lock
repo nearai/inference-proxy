@@ -4244,6 +4244,7 @@ dependencies = [
  "http-body-util",
  "k256",
  "moka",
+ "percent-encoding",
  "rand 0.8.5",
  "reqwest",
  "serde",

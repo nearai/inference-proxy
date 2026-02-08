@@ -1,0 +1,428 @@
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
+use sha2::{Digest, Sha256};
+use tracing::{debug, error, info};
+
+use crate::cache::ChatCache;
+use crate::error::AppError;
+use crate::signing::SigningPair;
+
+/// Options for proxy requests that need signing.
+pub struct ProxyOpts {
+    pub signing: Arc<SigningPair>,
+    pub cache: Arc<ChatCache>,
+    /// Prefix for auto-generated IDs (e.g., "chatcmpl", "img", "emb").
+    pub id_prefix: String,
+}
+
+/// Proxy a JSON request to the backend, sign the response, cache signature.
+pub async fn proxy_json_request(
+    client: &reqwest::Client,
+    url: &str,
+    request_body: &[u8],
+    opts: &ProxyOpts,
+) -> Result<Response, AppError> {
+    let request_sha256 = hex::encode(Sha256::digest(request_body));
+
+    let response = client
+        .post(url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json")
+        .body(request_body.to_vec())
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(e.into()))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
+        return Err(AppError::Upstream {
+            status: StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            body,
+        });
+    }
+
+    let response_bytes = response
+        .bytes()
+        .await
+        .map_err(|e| AppError::Internal(e.into()))?;
+
+    // Parse response to extract/generate ID
+    let mut response_data: serde_json::Value =
+        serde_json::from_slice(&response_bytes).map_err(|e| AppError::Internal(e.into()))?;
+
+    let chat_id = match response_data.get("id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => {
+            let id = format!(
+                "{}-{}",
+                opts.id_prefix,
+                &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]
+            );
+            response_data["id"] = serde_json::Value::String(id.clone());
+            debug!(id = %id, "Generated response ID");
+            id
+        }
+    };
+
+    // Serialize with compact separators (matching Python's separators=(",",":"))
+    let response_body =
+        serde_json::to_string(&response_data).map_err(|e| AppError::Internal(e.into()))?;
+    let response_sha256 = hex::encode(Sha256::digest(response_body.as_bytes()));
+
+    // Sign and cache
+    let text = format!("{request_sha256}:{response_sha256}");
+    let signed = opts.signing.sign_chat(&text).map_err(|e| {
+        error!(error = %e, "Signing failed");
+        AppError::Internal(e)
+    })?;
+    let signed_json = serde_json::to_string(&signed).map_err(|e| AppError::Internal(e.into()))?;
+    opts.cache.set_chat(&chat_id, &signed_json);
+
+    Ok((
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        response_body,
+    )
+        .into_response())
+}
+
+/// Proxy a streaming SSE request. Hashes all chunks, signs at end, caches signature.
+pub async fn proxy_streaming_request(
+    client: &reqwest::Client,
+    url: &str,
+    request_body: &[u8],
+    opts: &ProxyOpts,
+) -> Result<Response, AppError> {
+    let request_sha256 = hex::encode(Sha256::digest(request_body));
+
+    let response = client
+        .post(url)
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .body(request_body.to_vec())
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(e.into()))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
+        return Err(AppError::Upstream {
+            status: StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            body,
+        });
+    }
+
+    let signing = opts.signing.clone();
+    let cache = opts.cache.clone();
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+
+    // Spawn a task to consume upstream and forward chunks
+    let byte_stream = response.bytes_stream();
+    tokio::spawn(async move {
+        use futures_util::StreamExt;
+
+        let mut byte_stream = std::pin::pin!(byte_stream);
+        let mut hasher = Sha256::new();
+        let mut parser = SseParser::new();
+        let mut upstream_error = false;
+        let mut downstream_closed = false;
+
+        while let Some(chunk_result) = byte_stream.next().await {
+            match chunk_result {
+                Ok(chunk) => {
+                    hasher.update(&chunk);
+                    parser.process_chunk(&chunk);
+
+                    let chunk_bytes: Bytes = chunk;
+                    if tx.send(Ok(chunk_bytes)).await.is_err() {
+                        downstream_closed = true;
+                        break;
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Error reading upstream stream");
+                    upstream_error = true;
+                    let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
+                    break;
+                }
+            }
+        }
+
+        // Only sign and cache for a fully completed stream
+        if !upstream_error && !downstream_closed && parser.seen_done {
+            let response_sha256 = hex::encode(hasher.finalize());
+            if let Some(id) = parser.chat_id {
+                let text = format!("{request_sha256}:{response_sha256}");
+                match signing.sign_chat(&text) {
+                    Ok(signed) => {
+                        if let Ok(signed_json) = serde_json::to_string(&signed) {
+                            cache.set_chat(&id, &signed_json);
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Signing failed for streaming response");
+                    }
+                }
+            } else {
+                error!("Chat id could not be extracted from the completed streaming response");
+            }
+        } else {
+            info!(
+                upstream_error,
+                downstream_closed,
+                seen_done = parser.seen_done,
+                "Skipping streaming signature cache: stream did not complete cleanly"
+            );
+        }
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let body = Body::from_stream(stream);
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(body)
+        .unwrap())
+}
+
+/// Proxy a multipart request. Caller provides pre-computed request hash covering all field bytes.
+pub async fn proxy_multipart_request(
+    client: &reqwest::Client,
+    url: &str,
+    form: reqwest::multipart::Form,
+    request_sha256: &str,
+    opts: &ProxyOpts,
+) -> Result<Response, AppError> {
+    let response = client
+        .post(url)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(e.into()))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
+        return Err(AppError::Upstream {
+            status: StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            body,
+        });
+    }
+
+    let response_bytes = response
+        .bytes()
+        .await
+        .map_err(|e| AppError::Internal(e.into()))?;
+
+    let mut response_data: serde_json::Value =
+        serde_json::from_slice(&response_bytes).map_err(|e| AppError::Internal(e.into()))?;
+
+    let response_id = match response_data.get("id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => {
+            let id = format!(
+                "{}-{}",
+                opts.id_prefix,
+                &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]
+            );
+            response_data["id"] = serde_json::Value::String(id.clone());
+            id
+        }
+    };
+
+    let response_body =
+        serde_json::to_string(&response_data).map_err(|e| AppError::Internal(e.into()))?;
+    let response_sha256 = hex::encode(Sha256::digest(response_body.as_bytes()));
+
+    let text = format!("{request_sha256}:{response_sha256}");
+    let signed = opts.signing.sign_chat(&text).map_err(|e| {
+        error!(error = %e, "Signing failed");
+        AppError::Internal(e)
+    })?;
+    let signed_json = serde_json::to_string(&signed).map_err(|e| AppError::Internal(e.into()))?;
+    opts.cache.set_chat(&response_id, &signed_json);
+
+    Ok((
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        response_body,
+    )
+        .into_response())
+}
+
+/// Simple proxy without signing (for tokenize, metrics, models).
+pub async fn proxy_simple(
+    client: &reqwest::Client,
+    url: &str,
+    method: reqwest::Method,
+    body: Option<&[u8]>,
+    content_type: &str,
+    timeout: Option<std::time::Duration>,
+) -> Result<Response, AppError> {
+    let mut builder = client.request(method, url);
+
+    if let Some(body) = body {
+        builder = builder
+            .header("content-type", "application/json")
+            .body(body.to_vec());
+    }
+
+    if let Some(timeout) = timeout {
+        builder = builder.timeout(timeout);
+    }
+
+    let response = builder
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(e.into()))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
+        return Err(AppError::Upstream {
+            status: StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            body,
+        });
+    }
+
+    let response_bytes = response
+        .bytes()
+        .await
+        .map_err(|e| AppError::Internal(e.into()))?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", content_type)
+        .body(Body::from(response_bytes))
+        .unwrap())
+}
+
+/// Line-buffered SSE parser that handles data split across chunk boundaries.
+/// Extracts `chat_id` from the first JSON chunk and detects the `[DONE]` marker.
+struct SseParser {
+    line_buffer: String,
+    pub chat_id: Option<String>,
+    pub seen_done: bool,
+}
+
+impl SseParser {
+    fn new() -> Self {
+        Self {
+            line_buffer: String::new(),
+            chat_id: None,
+            seen_done: false,
+        }
+    }
+
+    fn process_chunk(&mut self, chunk: &[u8]) {
+        let chunk_str = String::from_utf8_lossy(chunk);
+        self.line_buffer.push_str(&chunk_str);
+
+        // Process all complete lines in the buffer
+        while let Some(newline_pos) = self.line_buffer.find('\n') {
+            let line = self.line_buffer[..newline_pos]
+                .trim_end_matches('\r')
+                .to_string();
+            self.line_buffer = self.line_buffer[newline_pos + 1..].to_string();
+
+            let data = line
+                .strip_prefix("data: ")
+                .or_else(|| line.strip_prefix("data:"))
+                .unwrap_or(&line)
+                .trim();
+
+            if data.is_empty() {
+                continue;
+            }
+            if data == "[DONE]" {
+                self.seen_done = true;
+                continue;
+            }
+            if self.chat_id.is_none() {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
+                    if let Some(id) = parsed.get("id").and_then(|v| v.as_str()) {
+                        self.chat_id = Some(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sse_parser_normal_sse() {
+        let mut parser = SseParser::new();
+        parser.process_chunk(b"data: {\"id\":\"chat-1\",\"content\":\"hi\"}\n\ndata: [DONE]\n\n");
+        assert_eq!(parser.chat_id.as_deref(), Some("chat-1"));
+        assert!(parser.seen_done);
+    }
+
+    #[test]
+    fn test_sse_parser_done_split_across_chunks() {
+        let mut parser = SseParser::new();
+        parser.process_chunk(b"data: {\"id\":\"chat-2\"}\n\ndata: [DO");
+        assert_eq!(parser.chat_id.as_deref(), Some("chat-2"));
+        assert!(!parser.seen_done);
+
+        parser.process_chunk(b"NE]\n\n");
+        assert!(parser.seen_done);
+    }
+
+    #[test]
+    fn test_sse_parser_id_split_across_chunks() {
+        let mut parser = SseParser::new();
+        parser.process_chunk(b"data: {\"id\":\"cha");
+        assert!(parser.chat_id.is_none());
+
+        parser.process_chunk(b"t-3\",\"choices\":[]}\n\n");
+        assert_eq!(parser.chat_id.as_deref(), Some("chat-3"));
+    }
+
+    #[test]
+    fn test_sse_parser_no_space_after_data_colon() {
+        let mut parser = SseParser::new();
+        parser.process_chunk(b"data:{\"id\":\"chat-4\"}\n\ndata:[DONE]\n\n");
+        assert_eq!(parser.chat_id.as_deref(), Some("chat-4"));
+        assert!(parser.seen_done);
+    }
+
+    #[test]
+    fn test_sse_parser_crlf_line_endings() {
+        let mut parser = SseParser::new();
+        parser.process_chunk(b"data: {\"id\":\"chat-5\"}\r\n\r\ndata: [DONE]\r\n\r\n");
+        assert_eq!(parser.chat_id.as_deref(), Some("chat-5"));
+        assert!(parser.seen_done);
+    }
+
+    #[test]
+    fn test_sse_parser_no_done_marker() {
+        let mut parser = SseParser::new();
+        parser.process_chunk(b"data: {\"id\":\"chat-6\"}\n\n");
+        assert_eq!(parser.chat_id.as_deref(), Some("chat-6"));
+        assert!(!parser.seen_done);
+    }
+
+    #[test]
+    fn test_sse_parser_multiple_json_chunks() {
+        let mut parser = SseParser::new();
+        parser.process_chunk(b"data: {\"id\":\"chat-7\",\"delta\":\"a\"}\n\n");
+        parser.process_chunk(b"data: {\"id\":\"chat-7\",\"delta\":\"b\"}\n\n");
+        parser.process_chunk(b"data: [DONE]\n\n");
+        // Should use the first id
+        assert_eq!(parser.chat_id.as_deref(), Some("chat-7"));
+        assert!(parser.seen_done);
+    }
+}

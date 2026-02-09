@@ -318,8 +318,16 @@ pub async fn sign_and_cache_json_response(
     opts: &ProxyOpts,
     status: StatusCode,
 ) -> Result<Response, AppError> {
-    let mut response_data: serde_json::Value =
-        serde_json::from_slice(response_bytes).map_err(|e| AppError::Internal(e.into()))?;
+    // Parse JSON; if the backend sent content-type: application/json but the body
+    // is empty or not valid JSON, wrap it in an empty object so we can still
+    // generate an ID, sign, and cache.
+    let mut response_data: serde_json::Value = match serde_json::from_slice(response_bytes) {
+        Ok(data) => data,
+        Err(e) => {
+            debug!(error = %e, "Response body not valid JSON, wrapping in empty object");
+            serde_json::json!({})
+        }
+    };
 
     let chat_id = match response_data.get("id").and_then(|v| v.as_str()) {
         Some(id) => id.to_string(),
@@ -494,6 +502,135 @@ impl SseParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::ChatCache;
+    use crate::signing::{EcdsaContext, Ed25519Context, SigningPair};
+
+    /// Build a ProxyOpts with fixed signing keys for deterministic tests.
+    fn test_proxy_opts() -> ProxyOpts {
+        let ecdsa_key: [u8; 32] = [
+            0xac, 0x09, 0x74, 0xbe, 0xc3, 0x9a, 0x17, 0xe3, 0x6b, 0xa4, 0xa6, 0xb4, 0xd2, 0x38,
+            0xff, 0x94, 0x4b, 0xac, 0xb3, 0x5e, 0x5d, 0xc4, 0xaf, 0x0f, 0x33, 0x47, 0xe5, 0x87,
+            0x31, 0x79, 0x67, 0x0f,
+        ];
+        let ed25519_key: [u8; 32] = [
+            0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec,
+            0x2c, 0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03,
+            0x1c, 0xae, 0x7f, 0x60,
+        ];
+        let ecdsa = EcdsaContext::from_key_bytes(&ecdsa_key).unwrap();
+        let ed25519 = Ed25519Context::from_key_bytes(&ed25519_key).unwrap();
+        let signing = Arc::new(SigningPair { ecdsa, ed25519 });
+        let cache = Arc::new(ChatCache::new("test-model", 1200));
+        ProxyOpts {
+            signing,
+            cache,
+            id_prefix: "test".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sign_and_cache_json_empty_body() {
+        let opts = test_proxy_opts();
+        let request_sha256 = hex::encode(Sha256::digest(b"test-request"));
+
+        let result =
+            sign_and_cache_json_response(b"", &request_sha256, &opts, StatusCode::OK).await;
+
+        let resp = result.expect("empty body should not return error");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Should have a generated ID starting with the prefix
+        let id = parsed["id"].as_str().unwrap();
+        assert!(id.starts_with("test-"), "id should start with prefix: {id}");
+    }
+
+    #[tokio::test]
+    async fn test_sign_and_cache_json_invalid_json_body() {
+        let opts = test_proxy_opts();
+        let request_sha256 = hex::encode(Sha256::digest(b"test-request"));
+
+        let result = sign_and_cache_json_response(
+            b"this is not json",
+            &request_sha256,
+            &opts,
+            StatusCode::OK,
+        )
+        .await;
+
+        let resp = result.expect("invalid JSON should not return error");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = parsed["id"].as_str().unwrap();
+        assert!(id.starts_with("test-"), "id should start with prefix: {id}");
+    }
+
+    #[tokio::test]
+    async fn test_sign_and_cache_json_valid_body_with_id() {
+        let opts = test_proxy_opts();
+        let request_sha256 = hex::encode(Sha256::digest(b"test-request"));
+        let body = br#"{"id":"existing-id","text":"hello"}"#;
+
+        let result =
+            sign_and_cache_json_response(body, &request_sha256, &opts, StatusCode::OK).await;
+
+        let resp = result.expect("valid JSON should succeed");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp_body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(parsed["id"], "existing-id");
+
+        // Signature should be cached under "existing-id"
+        assert!(opts.cache.get_chat("existing-id").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_sign_and_cache_json_valid_body_without_id() {
+        let opts = test_proxy_opts();
+        let request_sha256 = hex::encode(Sha256::digest(b"test-request"));
+        let body = br#"{"text":"hello"}"#;
+
+        let result =
+            sign_and_cache_json_response(body, &request_sha256, &opts, StatusCode::OK).await;
+
+        let resp = result.expect("valid JSON without id should succeed");
+        let resp_body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        let id = parsed["id"].as_str().unwrap();
+        assert!(id.starts_with("test-"), "should generate id with prefix");
+
+        // Signature should be cached under the generated id
+        assert!(opts.cache.get_chat(id).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_sign_and_cache_json_preserves_status_code() {
+        let opts = test_proxy_opts();
+        let request_sha256 = hex::encode(Sha256::digest(b"test"));
+        let body = br#"{"id":"s1"}"#;
+
+        let resp = sign_and_cache_json_response(
+            body,
+            &request_sha256,
+            &opts,
+            StatusCode::CREATED,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
 
     #[test]
     fn test_sse_parser_normal_sse() {

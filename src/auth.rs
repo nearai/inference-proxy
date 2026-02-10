@@ -1,5 +1,6 @@
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
+use subtle::ConstantTimeEq;
 
 use crate::error::AppError;
 use crate::AppState;
@@ -7,6 +8,13 @@ use crate::AppState;
 /// Extractor that validates Bearer token authentication.
 /// Use as a handler parameter to require auth on a route.
 pub struct RequireAuth;
+
+/// Constant-time token comparison to prevent timing attacks.
+/// Returns true if `a` and `b` are equal, using a fixed-time algorithm
+/// that does not short-circuit on the first mismatched byte.
+pub(crate) fn token_eq(a: &str, b: &str) -> bool {
+    a.as_bytes().ct_eq(b.as_bytes()).into()
+}
 
 impl FromRequestParts<AppState> for RequireAuth {
     type Rejection = AppError;
@@ -23,7 +31,7 @@ impl FromRequestParts<AppState> for RequireAuth {
         match auth_header {
             Some(header) if header.starts_with("Bearer ") => {
                 let token = &header[7..];
-                if token == state.config.token {
+                if token_eq(token, &state.config.token) {
                     Ok(RequireAuth)
                 } else {
                     Err(AppError::Unauthorized)
@@ -31,5 +39,110 @@ impl FromRequestParts<AppState> for RequireAuth {
             }
             _ => Err(AppError::Unauthorized),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    /// Vulnerable comparison that short-circuits on first mismatch (the old behavior).
+    fn token_eq_vulnerable(a: &str, b: &str) -> bool {
+        a == b
+    }
+
+    /// Measure the median duration (in nanoseconds) of `iterations` calls to `compare_fn(a, b)`.
+    fn median_nanos(
+        a: &str,
+        b: &str,
+        compare_fn: fn(&str, &str) -> bool,
+        iterations: usize,
+    ) -> u64 {
+        let mut durations = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            let a = black_box(a);
+            let b = black_box(b);
+            let start = Instant::now();
+            let _ = black_box(compare_fn(a, b));
+            durations.push(start.elapsed().as_nanos() as u64);
+        }
+        durations.sort_unstable();
+        durations[durations.len() / 2]
+    }
+
+    #[test]
+    fn test_token_eq_correctness() {
+        assert!(token_eq("secret-token-123", "secret-token-123"));
+        assert!(!token_eq("secret-token-123", "wrong-token-456"));
+        assert!(!token_eq("secret-token-123", "secret-token-124"));
+        assert!(!token_eq("short", "short-but-longer"));
+        assert!(!token_eq("", "notempty"));
+        assert!(token_eq("", ""));
+    }
+
+    /// Demonstrates the timing attack vulnerability with standard `==` comparison.
+    ///
+    /// With `==`, comparing a token that differs at byte 0 is faster than comparing
+    /// a token that differs only at the last byte, because `==` short-circuits.
+    /// We measure this as a timing ratio: late_mismatch / early_mismatch.
+    /// A ratio significantly > 1.0 indicates an observable timing discrepancy.
+    #[test]
+    fn test_vulnerable_comparison_shows_timing_discrepancy() {
+        // Use a long token to amplify the timing difference
+        let secret = "a]9$kL2#mP7!xR4&wQ8*nJ5^tY1+hF3@vB6%cD0".repeat(8); // 320 chars
+        let early_mismatch = format!("X{}", &secret[1..]); // differs at byte 0
+        let late_mismatch = format!("{}X", &secret[..secret.len() - 1]); // differs at last byte
+
+        let iterations = 50_000;
+
+        // Warm up
+        median_nanos(&secret, &early_mismatch, token_eq_vulnerable, 1_000);
+        median_nanos(&secret, &late_mismatch, token_eq_vulnerable, 1_000);
+
+        let t_early = median_nanos(&secret, &early_mismatch, token_eq_vulnerable, iterations);
+        let t_late = median_nanos(&secret, &late_mismatch, token_eq_vulnerable, iterations);
+
+        let ratio = t_late as f64 / t_early.max(1) as f64;
+        eprintln!("Vulnerable ==:  early={t_early}ns  late={t_late}ns  ratio={ratio:.2}");
+
+        // Standard == should show the late mismatch taking noticeably longer.
+        // On most systems the ratio is 2-10x+. We use a conservative threshold.
+        assert!(
+            ratio > 1.2,
+            "Expected vulnerable == to show timing discrepancy (ratio {ratio:.2} <= 1.2). \
+             This may fail on unusual hardware; the important thing is the next test passes."
+        );
+    }
+
+    /// Verifies that `token_eq` (constant-time) does NOT exhibit the same timing discrepancy.
+    ///
+    /// The ratio of late_mismatch / early_mismatch should be close to 1.0.
+    #[test]
+    fn test_constant_time_comparison_no_timing_discrepancy() {
+        let secret = "a]9$kL2#mP7!xR4&wQ8*nJ5^tY1+hF3@vB6%cD0".repeat(8);
+        let early_mismatch = format!("X{}", &secret[1..]);
+        let late_mismatch = format!("{}X", &secret[..secret.len() - 1]);
+
+        let iterations = 50_000;
+
+        // Warm up
+        median_nanos(&secret, &early_mismatch, token_eq, 1_000);
+        median_nanos(&secret, &late_mismatch, token_eq, 1_000);
+
+        let t_early = median_nanos(&secret, &early_mismatch, token_eq, iterations);
+        let t_late = median_nanos(&secret, &late_mismatch, token_eq, iterations);
+
+        let ratio = t_late as f64 / t_early.max(1) as f64;
+        eprintln!("Constant-time:  early={t_early}ns  late={t_late}ns  ratio={ratio:.2}");
+
+        // Constant-time comparison should have a ratio very close to 1.0.
+        // We allow a generous margin for system noise but reject the large
+        // discrepancies that == exhibits.
+        assert!(
+            ratio < 1.2,
+            "Constant-time comparison should not leak timing (ratio {ratio:.2} >= 1.2)"
+        );
     }
 }

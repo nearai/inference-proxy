@@ -4251,6 +4251,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sha3",
+ "subtle",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",

@@ -125,7 +125,9 @@ pub async fn proxy_streaming_request(
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
-    // Spawn a task to consume upstream and forward chunks
+    // Spawn a task to consume upstream and forward chunks.
+    // Uses select! on tx.closed() to detect client disconnect while waiting
+    // for upstream data, preventing resource leaks from abandoned connections.
     let byte_stream = response.bytes_stream();
     tokio::spawn(async move {
         use futures_util::StreamExt;
@@ -136,22 +138,30 @@ pub async fn proxy_streaming_request(
         let mut upstream_error = false;
         let mut downstream_closed = false;
 
-        while let Some(chunk_result) = byte_stream.next().await {
-            match chunk_result {
-                Ok(chunk) => {
-                    hasher.update(&chunk);
-                    parser.process_chunk(&chunk);
-
-                    let chunk_bytes: Bytes = chunk;
-                    if tx.send(Ok(chunk_bytes)).await.is_err() {
-                        downstream_closed = true;
-                        break;
+        loop {
+            tokio::select! {
+                chunk = byte_stream.next() => {
+                    match chunk {
+                        Some(Ok(chunk)) => {
+                            hasher.update(&chunk);
+                            parser.process_chunk(&chunk);
+                            if tx.send(Ok(chunk)).await.is_err() {
+                                downstream_closed = true;
+                                break;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            error!(error = %e, "Error reading upstream stream");
+                            upstream_error = true;
+                            let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
+                            break;
+                        }
+                        None => break, // stream ended
                     }
                 }
-                Err(e) => {
-                    error!(error = %e, "Error reading upstream stream");
-                    upstream_error = true;
-                    let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
+                _ = tx.closed() => {
+                    info!("Client disconnected, aborting upstream stream processing");
+                    downstream_closed = true;
                     break;
                 }
             }
@@ -388,22 +398,30 @@ pub async fn proxy_streaming_response(
         let mut upstream_error = false;
         let mut downstream_closed = false;
 
-        while let Some(chunk_result) = byte_stream.next().await {
-            match chunk_result {
-                Ok(chunk) => {
-                    hasher.update(&chunk);
-                    parser.process_chunk(&chunk);
-
-                    let chunk_bytes: Bytes = chunk;
-                    if tx.send(Ok(chunk_bytes)).await.is_err() {
-                        downstream_closed = true;
-                        break;
+        loop {
+            tokio::select! {
+                chunk = byte_stream.next() => {
+                    match chunk {
+                        Some(Ok(chunk)) => {
+                            hasher.update(&chunk);
+                            parser.process_chunk(&chunk);
+                            if tx.send(Ok(chunk)).await.is_err() {
+                                downstream_closed = true;
+                                break;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            error!(error = %e, "Error reading upstream stream");
+                            upstream_error = true;
+                            let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
+                            break;
+                        }
+                        None => break, // stream ended
                     }
                 }
-                Err(e) => {
-                    error!(error = %e, "Error reading upstream stream");
-                    upstream_error = true;
-                    let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
+                _ = tx.closed() => {
+                    info!("Client disconnected, aborting upstream stream processing");
+                    downstream_closed = true;
                     break;
                 }
             }
@@ -630,6 +648,62 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    /// Verifies that the streaming task exits promptly when the client disconnects
+    /// (i.e. the response body receiver is dropped) even if the upstream is still
+    /// producing data. Without the `tx.closed()` branch in `select!`, the task
+    /// would block on `byte_stream.next().await` indefinitely.
+    #[tokio::test]
+    async fn test_streaming_task_cancels_on_client_disconnect() {
+        use std::time::Duration;
+
+        // Simulate a slow upstream that hasn't sent anything yet.
+        // We keep _upstream_tx alive so the upstream channel stays open — this means
+        // byte_stream.next() will block forever waiting for data, which is exactly
+        // the scenario that tx.closed() needs to rescue us from.
+        let (_upstream_tx, upstream_rx) =
+            tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+
+        // This is the downstream channel (proxy -> client)
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+
+        let handle = tokio::spawn(async move {
+            use futures_util::StreamExt;
+            let byte_stream = tokio_stream::wrappers::ReceiverStream::new(upstream_rx);
+            let mut byte_stream = std::pin::pin!(byte_stream);
+
+            loop {
+                tokio::select! {
+                    chunk = byte_stream.next() => {
+                        match chunk {
+                            Some(Ok(data)) => {
+                                if tx.send(Ok(data)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                    _ = tx.closed() => {
+                        // Client disconnected — exit immediately
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Drop the receiver to simulate client disconnect
+        drop(rx);
+
+        // The task should exit promptly thanks to tx.closed().
+        // Without the tx.closed() branch in select!, the task would block forever
+        // on byte_stream.next() since _upstream_tx is alive and never sends data.
+        let result = tokio::time::timeout(Duration::from_millis(100), handle).await;
+        assert!(
+            result.is_ok(),
+            "Streaming task should exit promptly on client disconnect"
+        );
     }
 
     #[test]

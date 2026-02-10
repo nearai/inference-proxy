@@ -1365,7 +1365,8 @@ dependencies = [
 [[package]]
 name = "dstack-sdk"
 version = "0.1.2"
-source = "git+https://github.com/Dstack-TEE/dstack.git#84cb327fc93309a757793e166bc3680577cb9dd9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f21263be8034d895a3bef0deb4e786a8a401acdcfc49c742b385c1f17508ad4"
 dependencies = [
  "alloy",
  "anyhow",
@@ -1384,7 +1385,8 @@ dependencies = [
 [[package]]
 name = "dstack-sdk-types"
 version = "0.1.2"
-source = "git+https://github.com/Dstack-TEE/dstack.git#84cb327fc93309a757793e166bc3680577cb9dd9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92088a95c64c01d235c6592a7dd892ab6c7198b371b3a8c15d4cf62566d82138"
 dependencies = [
  "anyhow",
  "bon",

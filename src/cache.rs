@@ -28,6 +28,7 @@ impl ChatCache {
     pub fn set_chat(&self, chat_id: &str, value: &str) {
         let key = self.make_key(chat_id);
         self.inner.insert(key, value.to_string());
+        // moka::sync::Cache::entry_count() is O(1) (atomic counter), safe to call per insert
         metrics::gauge!("cache_size").set(self.inner.entry_count() as f64);
     }
 

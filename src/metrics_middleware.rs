@@ -13,7 +13,12 @@ use crate::AppState;
 pub fn setup_metrics_recorder() -> PrometheusHandle {
     PrometheusBuilder::new()
         .install_recorder()
-        .expect("failed to install Prometheus recorder")
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to install Prometheus recorder. \
+             This may occur if a recorder is already installed: {err}"
+            )
+        })
 }
 
 /// Axum middleware that tracks HTTP request metrics.

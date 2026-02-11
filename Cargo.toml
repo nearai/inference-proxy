@@ -15,7 +15,7 @@ futures-util = "0.3"
 http-body-util = "0.1"
 
 # dstack SDK
-dstack-sdk = { git = "https://github.com/Dstack-TEE/dstack.git" }
+dstack-sdk = "0.1.2"
 
 # Crypto
 k256 = { version = "0.13", features = ["ecdsa"] }

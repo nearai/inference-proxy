@@ -22,6 +22,7 @@ k256 = { version = "0.13", features = ["ecdsa"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 sha2 = "0.10"
 sha3 = "0.10"
+subtle = "2.5"
 
 # Cache
 moka = { version = "0.12", features = ["sync"] }

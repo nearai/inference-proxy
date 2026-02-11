@@ -37,6 +37,8 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         dev_mode: true,
         gpu_no_hw_mode: true,
         git_rev: "test-rev".to_string(),
+        rate_limit_per_second: 100,
+        rate_limit_burst_size: 200,
         timeout_secs: 30,
         timeout_tokenize_secs: 5,
     };

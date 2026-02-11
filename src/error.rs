@@ -20,6 +20,9 @@ pub enum AppError {
     #[error("payload too large (max {max_size} bytes)")]
     PayloadTooLarge { max_size: usize },
 
+    #[error("rate limit exceeded")]
+    RateLimited,
+
     #[error("{0}")]
     Internal(#[from] anyhow::Error),
 }
@@ -46,6 +49,11 @@ impl IntoResponse for AppError {
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!("Request body too large. Maximum: {max_size} bytes"),
                 "payload_too_large",
+            ),
+            AppError::RateLimited => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Rate limit exceeded. Please try again later.".to_string(),
+                "rate_limited",
             ),
             AppError::Internal(ref e) => {
                 error!(error = %e, "Internal server error");
@@ -136,6 +144,20 @@ mod tests {
             "Request body too large. Maximum: 10485760 bytes"
         );
         assert_eq!(json["error"]["type"], "payload_too_large");
+    }
+
+    #[tokio::test]
+    async fn test_rate_limited_error() {
+        let err = AppError::RateLimited;
+        let response = err.into_response();
+        let (status, json) = response_to_json(response).await;
+
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            json["error"]["message"],
+            "Rate limit exceeded. Please try again later."
+        );
+        assert_eq!(json["error"]["type"], "rate_limited");
     }
 
     #[tokio::test]

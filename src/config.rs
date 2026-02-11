@@ -54,6 +54,10 @@ pub struct Config {
     // Version
     pub git_rev: String,
 
+    // Rate limiting
+    pub rate_limit_per_second: u64,
+    pub rate_limit_burst_size: u32,
+
     // Timeouts
     pub timeout_secs: u64,
     pub timeout_tokenize_secs: u64,
@@ -108,6 +112,8 @@ impl Config {
             dev_mode: env_bool("DEV"),
             gpu_no_hw_mode: env_bool("GPU_NO_HW_MODE"),
             git_rev,
+            rate_limit_per_second: env_int("RATE_LIMIT_PER_SECOND", 100) as u64,
+            rate_limit_burst_size: env_int("RATE_LIMIT_BURST_SIZE", 200) as u32,
             timeout_secs: 600,
             timeout_tokenize_secs: 10,
         })

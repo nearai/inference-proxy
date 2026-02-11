@@ -23,6 +23,10 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 sha2 = "0.10"
 sha3 = "0.10"
 
+# Rate limiting
+governor = "0.8"
+nonzero_ext = "0.3"
+
 # Cache
 moka = { version = "0.12", features = ["sync"] }
 

@@ -621,14 +621,9 @@ mod tests {
         let request_sha256 = hex::encode(Sha256::digest(b"test"));
         let body = br#"{"id":"s1"}"#;
 
-        let resp = sign_and_cache_json_response(
-            body,
-            &request_sha256,
-            &opts,
-            StatusCode::CREATED,
-        )
-        .await
-        .unwrap();
+        let resp = sign_and_cache_json_response(body, &request_sha256, &opts, StatusCode::CREATED)
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
     }
 

@@ -72,11 +72,17 @@ fn build_test_app_with_rate_limit(
     let chat_cache = cache::ChatCache::new("test-model", 1200);
     let http_client = reqwest::Client::new();
 
+    // Create a standalone PrometheusHandle for tests (not installed globally)
+    let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .build_recorder()
+        .handle();
+
     let state = AppState {
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),
         http_client,
+        metrics_handle,
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(rate_per_second, rate_burst);
@@ -2355,6 +2361,51 @@ async fn test_rate_limit_does_not_block_with_high_burst() {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
+}
+
+// ---- Prometheus metrics endpoint ----
+
+#[tokio::test]
+async fn test_prometheus_metrics_endpoint() {
+    let app = build_test_app("http://unused");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    // Response should be valid UTF-8 text (Prometheus exposition format)
+    let body_bytes = body_to_bytes(response).await;
+    let body_str = String::from_utf8(body_bytes).expect("metrics body should be valid UTF-8");
+    // Empty or containing metric lines — either is valid since no global recorder is installed
+    assert!(
+        body_str.is_empty() || body_str.is_ascii(),
+        "metrics body should be ASCII text"
+    );
+}
+
+#[tokio::test]
+async fn test_prometheus_metrics_no_auth_required() {
+    let app = build_test_app("http://unused");
+
+    // No auth header — should still succeed
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 // ---- Helpers ----

@@ -31,6 +31,7 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, message, error_type) = match &self {
             AppError::Upstream { status, body } => {
+                metrics::counter!("http_errors_total", "error_type" => "upstream").increment(1);
                 // Forward upstream errors directly
                 return Response::builder()
                     .status(*status)
@@ -64,6 +65,8 @@ impl IntoResponse for AppError {
                 )
             }
         };
+
+        metrics::counter!("http_errors_total", "error_type" => error_type).increment(1);
 
         let body = serde_json::json!({
             "error": {

@@ -149,10 +149,13 @@ pub async fn catch_all(
         builder = builder.body(body_bytes);
     }
 
+    let upstream_start = std::time::Instant::now();
     let response = builder
         .send()
         .await
         .map_err(|e| AppError::Internal(e.into()))?;
+    metrics::histogram!("upstream_request_duration_seconds", "endpoint" => "catch_all")
+        .record(upstream_start.elapsed().as_secs_f64());
 
     let upstream_status = response.status();
     if !upstream_status.is_success() {

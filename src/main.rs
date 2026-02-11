@@ -74,16 +74,21 @@ async fn main() -> anyhow::Result<()> {
         state.config.rate_limit_per_second,
         state.config.rate_limit_burst_size,
     );
+    let rate_limit_state = rate_limit::RateLimitState {
+        limiter: rate_limiter,
+        trust_proxy_headers: state.config.rate_limit_trust_proxy_headers,
+    };
     info!(
         per_second = state.config.rate_limit_per_second,
         burst = state.config.rate_limit_burst_size,
+        trust_proxy_headers = state.config.rate_limit_trust_proxy_headers,
         "Rate limiter configured"
     );
 
     // Build router
     let app = routes::build_router()
         .layer(middleware::from_fn(rate_limit::rate_limit_middleware))
-        .layer(axum::Extension(rate_limiter))
+        .layer(axum::Extension(rate_limit_state))
         .layer(middleware::from_fn(request_id_middleware))
         .with_state(state);
 

@@ -57,6 +57,10 @@ pub struct Config {
     // Rate limiting
     pub rate_limit_per_second: u64,
     pub rate_limit_burst_size: u32,
+    /// Trust X-Forwarded-For / X-Real-IP headers for rate-limit IP extraction.
+    /// Set to false when the proxy is directly internet-facing (no trusted
+    /// reverse proxy) to prevent IP spoofing that bypasses rate limits.
+    pub rate_limit_trust_proxy_headers: bool,
 
     // Timeouts
     pub timeout_secs: u64,
@@ -114,6 +118,7 @@ impl Config {
             git_rev,
             rate_limit_per_second: env_int("RATE_LIMIT_PER_SECOND", 100) as u64,
             rate_limit_burst_size: env_int("RATE_LIMIT_BURST_SIZE", 200) as u32,
+            rate_limit_trust_proxy_headers: !env_bool("RATE_LIMIT_NO_TRUST_PROXY"),
             timeout_secs: 600,
             timeout_tokenize_secs: 10,
         })

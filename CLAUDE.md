@@ -50,6 +50,10 @@ This is a Rust rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-pro
 - Run `cargo fmt` before committing
 - Error types in `error.rs` produce OpenAI-compatible JSON: `{"error": {"message": ..., "type": ..., "param": null, "code": null}}`
 - Internal errors hide details from clients (returns generic "Internal server error")
-- Upstream errors are passed through verbatim (status code + body)
+- Named route upstream errors are passed through verbatim (status code + body)
+- Catch-all upstream errors are parsed and re-wrapped via `AppError::UpstreamParsed` (never leaks raw body)
+- `parse_upstream_error()` in `proxy.rs` handles both vLLM flat (`{"message":"..."}`) and nested (`{"error":{"message":"..."}}`) formats
+- All upstream errors logged with `warn!` including `error_message` and `error_type` (never body content)
+- `request_id_middleware` wraps requests in a tracing span — all log lines automatically include `request_id`, `method`, `path`
 - Unit tests live in `#[cfg(test)] mod tests` within each source file
 - Integration tests in `tests/integration.rs` use `tower::ServiceExt::oneshot` with wiremock

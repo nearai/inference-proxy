@@ -3,6 +3,7 @@ use std::sync::Arc;
 use axum::http::{HeaderValue, Request};
 use axum::middleware::Next;
 use axum::response::Response;
+use tracing::Instrument;
 
 pub mod attestation;
 pub mod auth;
@@ -38,7 +39,17 @@ pub async fn request_id_middleware(mut request: Request<axum::body::Body>, next:
     // Store in request extensions for handlers
     request.extensions_mut().insert(request_id.clone());
 
-    let mut response = next.run(request).await;
+    let method = request.method().to_string();
+    let path = request.uri().path().to_string();
+
+    let span = tracing::info_span!(
+        "request",
+        request_id = %request_id,
+        method = %method,
+        path = %path,
+    );
+
+    let mut response = next.run(request).instrument(span).await;
     if let Ok(val) = HeaderValue::from_str(&request_id) {
         response.headers_mut().insert("x-request-id", val);
     }

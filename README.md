@@ -32,6 +32,59 @@ Rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-proxy) (Python).
 | GET | `/v1/signature/{chat_id}` | Yes | Retrieve cached signature |
 | GET | `/v1/attestation/report` | Yes | TEE attestation report |
 
+## Error Handling
+
+All error responses use the OpenAI-compatible JSON format:
+
+```json
+{"error": {"message": "...", "type": "...", "param": null, "code": null}}
+```
+
+### Proxy-generated errors
+
+| Status | Type | When |
+|--------|------|------|
+| 400 | `bad_request` | Invalid JSON, bad parameters |
+| 401 | `unauthorized` | Invalid or missing Bearer token |
+| 404 | `not_found` | Signature chat ID not found |
+| 413 | `payload_too_large` | Request body exceeds size limit |
+| 429 | `rate_limited` | Per-IP rate limit exceeded |
+| 500 | `server_error` | Internal proxy error (details hidden from client) |
+
+### Upstream errors (vLLM/sglang)
+
+Named routes (`/v1/chat/completions`, `/v1/completions`, etc.) pass through the backend error body verbatim, preserving the original status code. The catch-all route (arbitrary paths) parses the backend error and re-wraps it in the OpenAI format above.
+
+Common upstream errors:
+
+| Status | Type | Example message |
+|--------|------|-----------------|
+| 400 | `BadRequestError` | `"This model's maximum context length is 2048 tokens. However, you requested 4374 tokens"` |
+| 400 | `BadRequestError` | `"temperature must be non-negative, got -0.5"` |
+| 400 | `BadRequestError` | `"Stream options can only be defined when 'stream=True'"` |
+| 400 | `BadRequestError` | `"please provide at least one prompt"` |
+| 400 | `BadRequestError` | `"auto tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set"` |
+| 404 | `Not Found` | `"The model 'gpt-5' does not exist"` |
+| 422 | `Bad Request` | Pydantic validation details (field type mismatches) |
+| 500 | `InternalServerError` | `"Internal server error"` (GPU OOM, engine crash) |
+| 501 | `NotImplementedError` | `"Tool usage is only supported for Chat Completions API"` |
+
+### Logging and privacy
+
+All upstream errors are logged with structured fields for diagnostics:
+
+```
+WARN request{request_id=abc-123 method=POST path=/v1/chat/completions}:
+  Backend returned non-success status
+  upstream_status=400 upstream_url=http://vllm:8000/v1/chat/completions
+  error_message="This model's maximum context length is 2048 tokens..."
+  error_type=BadRequestError
+```
+
+**What is logged**: HTTP status codes, backend URLs, error messages (token counts, parameter names), error types, request IDs.
+
+**What is never logged**: Request bodies, response bodies, prompt content, user messages, completion text.
+
 ## Configuration
 
 All configuration is via environment variables:

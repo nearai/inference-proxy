@@ -2006,6 +2006,249 @@ async fn test_passthrough_upstream_error() {
 }
 
 #[tokio::test]
+async fn test_passthrough_upstream_json_error_rewrapped() {
+    let mock_server = MockServer::start().await;
+
+    // vLLM-style flat error response
+    let vllm_error = serde_json::json!({
+        "object": "error",
+        "message": "This model's maximum context length is 2048 tokens. However, you requested 4374 tokens (3350 in the messages, 1024 in the completion). Please reduce the length of the messages or completion.",
+        "type": "BadRequestError",
+        "param": null,
+        "code": 400
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/custom/chat"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(&vllm_error))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/custom/chat")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(r#"{"prompt":"test"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Should preserve the upstream status code
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(response).await;
+    // Should re-wrap with the actual error message from vLLM
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("maximum context length is 2048 tokens"));
+    assert_eq!(body["error"]["type"], "BadRequestError");
+    // Should be in OpenAI-compatible format (nested under "error")
+    assert!(body["error"]["param"].is_null());
+    assert!(body["error"]["code"].is_null());
+}
+
+#[tokio::test]
+async fn test_passthrough_upstream_model_not_found() {
+    let mock_server = MockServer::start().await;
+
+    let vllm_error = serde_json::json!({
+        "object": "error",
+        "message": "The model `gpt-5` does not exist.",
+        "type": "Not Found",
+        "param": null,
+        "code": 404
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/v1/custom/models/gpt-5"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(&vllm_error))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/custom/models/gpt-5")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = body_to_json(response).await;
+    assert!(body["error"]["message"].as_str().unwrap().contains("gpt-5"));
+    assert_eq!(body["error"]["type"], "Not Found");
+}
+
+#[tokio::test]
+async fn test_passthrough_upstream_invalid_param() {
+    let mock_server = MockServer::start().await;
+
+    let vllm_error = serde_json::json!({
+        "object": "error",
+        "message": "temperature must be non-negative, got -0.5.",
+        "type": "BadRequestError",
+        "param": null,
+        "code": 400
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/custom/complete"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(&vllm_error))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/custom/complete")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(r#"{"temperature":-0.5}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(response).await;
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("temperature must be non-negative"));
+}
+
+#[tokio::test]
+async fn test_passthrough_upstream_internal_server_error() {
+    let mock_server = MockServer::start().await;
+
+    // vLLM sometimes returns 500 with just "Internal Server Error"
+    let vllm_error = serde_json::json!({
+        "object": "error",
+        "message": "Internal server error",
+        "type": "InternalServerError",
+        "param": null,
+        "code": 500
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/custom/inference"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(&vllm_error))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/custom/inference")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(r#"{}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = body_to_json(response).await;
+    assert_eq!(body["error"]["type"], "InternalServerError");
+}
+
+#[tokio::test]
+async fn test_passthrough_upstream_nested_error_format() {
+    let mock_server = MockServer::start().await;
+
+    // sglang-style nested error format
+    let sglang_error = serde_json::json!({
+        "error": {
+            "message": "Tools cannot be empty if tool choice is set to required.",
+            "type": "BadRequestError",
+            "param": null,
+            "code": 400
+        }
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/custom/tools"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(&sglang_error))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/custom/tools")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(r#"{"tool_choice":"required"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(response).await;
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Tools cannot be empty"));
+    assert_eq!(body["error"]["type"], "BadRequestError");
+}
+
+#[tokio::test]
+async fn test_passthrough_upstream_empty_body_error() {
+    let mock_server = MockServer::start().await;
+
+    // vLLM intermittently returns 500 with empty body (Content-Length: 0)
+    Mock::given(method("POST"))
+        .and(path("/v1/custom/empty"))
+        .respond_with(ResponseTemplate::new(500).set_body_string(""))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/custom/empty")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(r#"{}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = body_to_json(response).await;
+    // Falls back to generic message when body is unparseable
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Upstream request failed with status"));
+}
+
+#[tokio::test]
 async fn test_passthrough_headers_forwarded() {
     use wiremock::matchers::header;
 

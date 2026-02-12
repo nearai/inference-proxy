@@ -5,11 +5,51 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::cache::ChatCache;
 use crate::error::AppError;
 use crate::signing::SigningPair;
+
+/// Parsed upstream error info for logging and re-wrapping.
+pub(crate) struct UpstreamErrorInfo {
+    pub message: String,
+    pub error_type: String,
+}
+
+/// Parse an upstream error body to extract message and type.
+/// Handles both vLLM flat format (`{"object":"error","message":"...","type":"..."}`)
+/// and nested format (`{"error":{"message":"...","type":"..."}}`).
+/// Returns None if the body is not parseable JSON with the expected fields.
+pub(crate) fn parse_upstream_error(body: &[u8]) -> Option<UpstreamErrorInfo> {
+    let json: serde_json::Value = serde_json::from_slice(body).ok()?;
+
+    // Try nested format first: {"error": {"message": "...", "type": "..."}}
+    if let Some(error_obj) = json.get("error") {
+        let message = error_obj.get("message")?.as_str()?.to_string();
+        let error_type = error_obj
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        return Some(UpstreamErrorInfo {
+            message,
+            error_type,
+        });
+    }
+
+    // Try vLLM flat format: {"message": "...", "type": "...", "object": "error"}
+    let message = json.get("message")?.as_str()?.to_string();
+    let error_type = json
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    Some(UpstreamErrorInfo {
+        message,
+        error_type,
+    })
+}
 
 /// Options for proxy requests that need signing.
 pub struct ProxyOpts {
@@ -43,6 +83,14 @@ pub async fn proxy_json_request(
     let status = response.status();
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
+        let error_info = parse_upstream_error(&body);
+        warn!(
+            upstream_status = %status,
+            upstream_url = %url,
+            error_message = error_info.as_ref().map(|e| e.message.as_str()).unwrap_or("unparseable"),
+            error_type = error_info.as_ref().map(|e| e.error_type.as_str()).unwrap_or("unknown"),
+            "Backend returned non-success status"
+        );
         return Err(AppError::Upstream {
             status: StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
             body,
@@ -120,6 +168,14 @@ pub async fn proxy_streaming_request(
     let status = response.status();
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
+        let error_info = parse_upstream_error(&body);
+        warn!(
+            upstream_status = %status,
+            upstream_url = %url,
+            error_message = error_info.as_ref().map(|e| e.message.as_str()).unwrap_or("unparseable"),
+            error_type = error_info.as_ref().map(|e| e.error_type.as_str()).unwrap_or("unknown"),
+            "Backend returned non-success status"
+        );
         return Err(AppError::Upstream {
             status: StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
             body,
@@ -235,6 +291,14 @@ pub async fn proxy_multipart_request(
     let status = response.status();
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
+        let error_info = parse_upstream_error(&body);
+        warn!(
+            upstream_status = %status,
+            upstream_url = %url,
+            error_message = error_info.as_ref().map(|e| e.message.as_str()).unwrap_or("unparseable"),
+            error_type = error_info.as_ref().map(|e| e.error_type.as_str()).unwrap_or("unknown"),
+            "Backend returned non-success status"
+        );
         return Err(AppError::Upstream {
             status: StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
             body,
@@ -316,6 +380,14 @@ pub async fn proxy_simple(
     let status = response.status();
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
+        let error_info = parse_upstream_error(&body);
+        warn!(
+            upstream_status = %status,
+            upstream_url = %url,
+            error_message = error_info.as_ref().map(|e| e.message.as_str()).unwrap_or("unparseable"),
+            error_type = error_info.as_ref().map(|e| e.error_type.as_str()).unwrap_or("unknown"),
+            "Backend returned non-success status"
+        );
         return Err(AppError::Upstream {
             status: StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
             body,
@@ -796,5 +868,53 @@ mod tests {
         // Should use the first id
         assert_eq!(parser.chat_id.as_deref(), Some("chat-7"));
         assert!(parser.seen_done);
+    }
+
+    #[test]
+    fn test_parse_upstream_error_vllm_flat_format() {
+        let body = br#"{"object":"error","message":"This model's maximum context length is 2048 tokens","type":"BadRequestError","param":null,"code":400}"#;
+        let info = parse_upstream_error(body).unwrap();
+        assert_eq!(
+            info.message,
+            "This model's maximum context length is 2048 tokens"
+        );
+        assert_eq!(info.error_type, "BadRequestError");
+    }
+
+    #[test]
+    fn test_parse_upstream_error_nested_format() {
+        let body = br#"{"error":{"message":"model not found","type":"not_found"}}"#;
+        let info = parse_upstream_error(body).unwrap();
+        assert_eq!(info.message, "model not found");
+        assert_eq!(info.error_type, "not_found");
+    }
+
+    #[test]
+    fn test_parse_upstream_error_nested_missing_type() {
+        let body = br#"{"error":{"message":"something went wrong"}}"#;
+        let info = parse_upstream_error(body).unwrap();
+        assert_eq!(info.message, "something went wrong");
+        assert_eq!(info.error_type, "unknown");
+    }
+
+    #[test]
+    fn test_parse_upstream_error_non_json() {
+        assert!(parse_upstream_error(b"internal secret error details").is_none());
+    }
+
+    #[test]
+    fn test_parse_upstream_error_missing_message() {
+        let body = br#"{"type":"BadRequestError","code":400}"#;
+        assert!(parse_upstream_error(body).is_none());
+    }
+
+    #[test]
+    fn test_parse_upstream_error_empty_body() {
+        assert!(parse_upstream_error(b"").is_none());
+    }
+
+    #[test]
+    fn test_parse_upstream_error_empty_json() {
+        assert!(parse_upstream_error(b"{}").is_none());
     }
 }

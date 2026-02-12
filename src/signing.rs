@@ -380,6 +380,156 @@ mod tests {
         assert!(parsed.get("signing_address_ed25519").is_some());
     }
 
+    // ---- Client-perspective verification tests ----
+
+    /// Helper: recover Ethereum address from an EIP-191 signature.
+    fn recover_ecdsa_address(message: &str, sig_hex: &str) -> String {
+        let sig_bytes = hex::decode(&sig_hex[2..]).unwrap();
+        let v = sig_bytes[64];
+        let prefix = format!("\x19Ethereum Signed Message:\n{}", message.len());
+        let mut prefixed = Vec::new();
+        prefixed.extend_from_slice(prefix.as_bytes());
+        prefixed.extend_from_slice(message.as_bytes());
+        let hash = Keccak256::digest(&prefixed);
+        let signature = k256::ecdsa::Signature::from_slice(&sig_bytes[..64]).unwrap();
+        let recovery_id = RecoveryId::from_byte(v - 27).unwrap();
+        let recovered_key =
+            VerifyingKey::recover_from_prehash(&hash[..], &signature, recovery_id).unwrap();
+        let pk_encoded = recovered_key.to_encoded_point(false);
+        let pk_hash = Keccak256::digest(&pk_encoded.as_bytes()[1..]);
+        format!("0x{}", hex::encode(&pk_hash[12..32]))
+    }
+
+    /// Helper: verify an Ed25519 signature.
+    fn verify_ed25519(message: &str, sig_hex: &str, pk_hex: &str) -> bool {
+        let sig_bytes = hex::decode(sig_hex).unwrap();
+        let signature = ed25519_dalek::Signature::from_bytes(sig_bytes[..64].try_into().unwrap());
+        let pk_bytes = hex::decode(pk_hex).unwrap();
+        let verifying_key =
+            ed25519_dalek::VerifyingKey::from_bytes(pk_bytes[..32].try_into().unwrap()).unwrap();
+        verifying_key.verify(message.as_bytes(), &signature).is_ok()
+    }
+
+    #[test]
+    fn test_ecdsa_signature_recovers_correct_address() {
+        let ctx = EcdsaContext::from_key_bytes(&TEST_ECDSA_KEY).unwrap();
+        let message = "request_hash:response_hash";
+        let sig_hex = ctx.sign(message).unwrap();
+
+        let recovered = recover_ecdsa_address(message, &sig_hex);
+        assert_eq!(recovered, ctx.signing_address);
+    }
+
+    #[test]
+    fn test_ecdsa_wrong_message_recovers_wrong_address() {
+        let ctx = EcdsaContext::from_key_bytes(&TEST_ECDSA_KEY).unwrap();
+        let sig_hex = ctx.sign("original message").unwrap();
+
+        let recovered = recover_ecdsa_address("tampered message", &sig_hex);
+        assert_ne!(recovered, ctx.signing_address);
+    }
+
+    #[test]
+    fn test_ecdsa_wrong_key_recovers_wrong_address() {
+        let ctx = EcdsaContext::from_key_bytes(&TEST_ECDSA_KEY).unwrap();
+        let mut other_key = TEST_ECDSA_KEY;
+        other_key[0] ^= 0xff;
+        let other_ctx = EcdsaContext::from_key_bytes(&other_key).unwrap();
+
+        let sig_hex = other_ctx.sign("hello").unwrap();
+        let recovered = recover_ecdsa_address("hello", &sig_hex);
+        assert_ne!(recovered, ctx.signing_address);
+    }
+
+    #[test]
+    fn test_ecdsa_corrupted_signature_does_not_recover_original_address() {
+        let ctx = EcdsaContext::from_key_bytes(&TEST_ECDSA_KEY).unwrap();
+        let message = "test message";
+        let sig_hex = ctx.sign(message).unwrap();
+
+        // Corrupt one byte in the r component of the signature
+        let mut sig_bytes = hex::decode(&sig_hex[2..]).unwrap();
+        sig_bytes[0] ^= 0xff;
+        let corrupted_sig = format!("0x{}", hex::encode(&sig_bytes));
+
+        // Recovery may succeed but should yield a different address,
+        // or may panic/fail entirely — either outcome means rejection
+        let result = std::panic::catch_unwind(|| recover_ecdsa_address(message, &corrupted_sig));
+        match result {
+            Ok(recovered) => assert_ne!(recovered, ctx.signing_address),
+            Err(_) => {} // Panicked during recovery = also a rejection
+        }
+    }
+
+    #[test]
+    fn test_ed25519_wrong_message_fails_verification() {
+        let ctx = Ed25519Context::from_key_bytes(&TEST_ED25519_KEY).unwrap();
+        let sig_hex = ctx.sign("original message").unwrap();
+
+        assert!(!verify_ed25519(
+            "tampered message",
+            &sig_hex,
+            &ctx.signing_public_key
+        ));
+    }
+
+    #[test]
+    fn test_ed25519_wrong_key_fails_verification() {
+        let ctx = Ed25519Context::from_key_bytes(&TEST_ED25519_KEY).unwrap();
+        let sig_hex = ctx.sign("hello").unwrap();
+
+        let mut other_key = TEST_ED25519_KEY;
+        other_key[0] ^= 0xff;
+        let other_ctx = Ed25519Context::from_key_bytes(&other_key).unwrap();
+
+        assert!(!verify_ed25519(
+            "hello",
+            &sig_hex,
+            &other_ctx.signing_public_key
+        ));
+    }
+
+    #[test]
+    fn test_sign_chat_both_signatures_verifiable() {
+        let ecdsa = EcdsaContext::from_key_bytes(&TEST_ECDSA_KEY).unwrap();
+        let ed25519 = Ed25519Context::from_key_bytes(&TEST_ED25519_KEY).unwrap();
+        let pair = SigningPair { ecdsa, ed25519 };
+
+        let text = "abc123hash:def456hash";
+        let signed = pair.sign_chat(text).unwrap();
+
+        // Verify ECDSA
+        let recovered_addr = recover_ecdsa_address(&signed.text, &signed.signature_ecdsa);
+        assert_eq!(recovered_addr, signed.signing_address_ecdsa);
+
+        // Verify Ed25519
+        assert!(verify_ed25519(
+            &signed.text,
+            &signed.signature_ed25519,
+            &signed.signing_address_ed25519
+        ));
+    }
+
+    #[test]
+    fn test_sign_chat_tampered_text_fails_both_verifications() {
+        let ecdsa = EcdsaContext::from_key_bytes(&TEST_ECDSA_KEY).unwrap();
+        let ed25519 = Ed25519Context::from_key_bytes(&TEST_ED25519_KEY).unwrap();
+        let pair = SigningPair { ecdsa, ed25519 };
+
+        let signed = pair.sign_chat("original:hash").unwrap();
+
+        // Tampered text should fail both
+        let tampered = "tampered:hash";
+        let recovered_addr = recover_ecdsa_address(tampered, &signed.signature_ecdsa);
+        assert_ne!(recovered_addr, signed.signing_address_ecdsa);
+
+        assert!(!verify_ed25519(
+            tampered,
+            &signed.signature_ed25519,
+            &signed.signing_address_ed25519
+        ));
+    }
+
     #[tokio::test]
     async fn test_signing_pair_dev_mode_init() {
         let pair = SigningPair::init("test-model", true).await.unwrap();

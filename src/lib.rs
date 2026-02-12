@@ -9,6 +9,7 @@ pub mod auth;
 pub mod cache;
 pub mod config;
 pub mod error;
+pub mod metrics_middleware;
 pub mod proxy;
 pub mod rate_limit;
 pub mod routes;
@@ -22,6 +23,7 @@ pub struct AppState {
     pub signing: Arc<signing::SigningPair>,
     pub cache: Arc<cache::ChatCache>,
     pub http_client: reqwest::Client,
+    pub metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
 }
 
 /// Request ID middleware: generates or passes through X-Request-ID header.

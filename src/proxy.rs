@@ -28,6 +28,7 @@ pub async fn proxy_json_request(
 ) -> Result<Response, AppError> {
     let request_sha256 = hex::encode(Sha256::digest(request_body));
 
+    let upstream_start = std::time::Instant::now();
     let response = client
         .post(url)
         .header("content-type", "application/json")
@@ -36,6 +37,8 @@ pub async fn proxy_json_request(
         .send()
         .await
         .map_err(|e| AppError::Internal(e.into()))?;
+    metrics::histogram!("upstream_request_duration_seconds", "endpoint" => "json")
+        .record(upstream_start.elapsed().as_secs_f64());
 
     let status = response.status();
     if !status.is_success() {
@@ -102,6 +105,7 @@ pub async fn proxy_streaming_request(
 ) -> Result<Response, AppError> {
     let request_sha256 = hex::encode(Sha256::digest(request_body));
 
+    let upstream_start = std::time::Instant::now();
     let response = client
         .post(url)
         .header("content-type", "application/json")
@@ -110,6 +114,8 @@ pub async fn proxy_streaming_request(
         .send()
         .await
         .map_err(|e| AppError::Internal(e.into()))?;
+    metrics::histogram!("upstream_request_duration_seconds", "endpoint" => "streaming")
+        .record(upstream_start.elapsed().as_secs_f64());
 
     let status = response.status();
     if !status.is_success() {
@@ -131,6 +137,8 @@ pub async fn proxy_streaming_request(
     let byte_stream = response.bytes_stream();
     tokio::spawn(async move {
         use futures_util::StreamExt;
+
+        let _guard = StreamingGuard::new();
 
         let mut byte_stream = std::pin::pin!(byte_stream);
         let mut hasher = Sha256::new();
@@ -214,12 +222,15 @@ pub async fn proxy_multipart_request(
     request_sha256: &str,
     opts: &ProxyOpts,
 ) -> Result<Response, AppError> {
+    let upstream_start = std::time::Instant::now();
     let response = client
         .post(url)
         .multipart(form)
         .send()
         .await
         .map_err(|e| AppError::Internal(e.into()))?;
+    metrics::histogram!("upstream_request_duration_seconds", "endpoint" => "multipart")
+        .record(upstream_start.elapsed().as_secs_f64());
 
     let status = response.status();
     if !status.is_success() {
@@ -294,10 +305,13 @@ pub async fn proxy_simple(
         builder = builder.timeout(timeout);
     }
 
+    let upstream_start = std::time::Instant::now();
     let response = builder
         .send()
         .await
         .map_err(|e| AppError::Internal(e.into()))?;
+    metrics::histogram!("upstream_request_duration_seconds", "endpoint" => "simple")
+        .record(upstream_start.elapsed().as_secs_f64());
 
     let status = response.status();
     if !status.is_success() {
@@ -392,6 +406,8 @@ pub async fn proxy_streaming_response(
     tokio::spawn(async move {
         use futures_util::StreamExt;
 
+        let _guard = StreamingGuard::new();
+
         let mut byte_stream = std::pin::pin!(byte_stream);
         let mut hasher = Sha256::new();
         let mut parser = SseParser::new();
@@ -463,6 +479,23 @@ pub async fn proxy_streaming_response(
         .header("cache-control", "no-cache")
         .body(body)
         .unwrap())
+}
+
+/// Drop guard that tracks the streaming_connections gauge.
+/// Increments on creation, decrements on drop — guarantees they stay paired.
+struct StreamingGuard;
+
+impl StreamingGuard {
+    fn new() -> Self {
+        metrics::gauge!("streaming_connections").increment(1);
+        Self
+    }
+}
+
+impl Drop for StreamingGuard {
+    fn drop(&mut self) {
+        metrics::gauge!("streaming_connections").decrement(1);
+    }
 }
 
 /// Line-buffered SSE parser that handles data split across chunk boundaries.

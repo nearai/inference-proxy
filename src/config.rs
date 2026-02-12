@@ -65,6 +65,12 @@ pub struct Config {
     // Timeouts
     pub timeout_secs: u64,
     pub timeout_tokenize_secs: u64,
+
+    // Startup health checks
+    pub startup_checks_enabled: bool,
+    pub startup_check_retries: usize,
+    pub startup_check_retry_delay_secs: u64,
+    pub startup_check_timeout_secs: u64,
 }
 
 impl Config {
@@ -121,6 +127,10 @@ impl Config {
             rate_limit_trust_proxy_headers: !env_bool("RATE_LIMIT_NO_TRUST_PROXY"),
             timeout_secs: 600,
             timeout_tokenize_secs: 10,
+            startup_checks_enabled: env_bool("STARTUP_CHECKS"),
+            startup_check_retries: env_int("STARTUP_CHECK_RETRIES", 3),
+            startup_check_retry_delay_secs: env_int("STARTUP_CHECK_RETRY_DELAY_SECS", 5) as u64,
+            startup_check_timeout_secs: env_int("STARTUP_CHECK_TIMEOUT_SECS", 30) as u64,
         })
     }
 }

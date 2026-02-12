@@ -48,11 +48,6 @@ mod tests {
     use std::hint::black_box;
     use std::time::Instant;
 
-    /// Vulnerable comparison that short-circuits on first mismatch (the old behavior).
-    fn token_eq_vulnerable(a: &str, b: &str) -> bool {
-        a == b
-    }
-
     /// Measure the median duration (in nanoseconds) of `iterations` calls to `compare_fn(a, b)`.
     fn median_nanos(
         a: &str,
@@ -82,43 +77,9 @@ mod tests {
         assert!(token_eq("", ""));
     }
 
-    /// Demonstrates the timing attack vulnerability with standard `==` comparison.
-    ///
-    /// With `==`, comparing a token that differs at byte 0 is faster than comparing
-    /// a token that differs only at the last byte, because `==` short-circuits.
-    /// We measure this as a timing ratio: late_mismatch / early_mismatch.
-    /// A ratio significantly > 1.0 indicates an observable timing discrepancy.
-    #[test]
-    fn test_vulnerable_comparison_shows_timing_discrepancy() {
-        // Use a long token to amplify the timing difference
-        let secret = "a]9$kL2#mP7!xR4&wQ8*nJ5^tY1+hF3@vB6%cD0".repeat(8); // 320 chars
-        let early_mismatch = format!("X{}", &secret[1..]); // differs at byte 0
-        let late_mismatch = format!("{}X", &secret[..secret.len() - 1]); // differs at last byte
-
-        let iterations = 50_000;
-
-        // Warm up
-        median_nanos(&secret, &early_mismatch, token_eq_vulnerable, 1_000);
-        median_nanos(&secret, &late_mismatch, token_eq_vulnerable, 1_000);
-
-        let t_early = median_nanos(&secret, &early_mismatch, token_eq_vulnerable, iterations);
-        let t_late = median_nanos(&secret, &late_mismatch, token_eq_vulnerable, iterations);
-
-        let ratio = t_late as f64 / t_early.max(1) as f64;
-        eprintln!("Vulnerable ==:  early={t_early}ns  late={t_late}ns  ratio={ratio:.2}");
-
-        // Standard == should show the late mismatch taking noticeably longer.
-        // On most systems the ratio is 2-10x+. We use a conservative threshold.
-        assert!(
-            ratio > 1.2,
-            "Expected vulnerable == to show timing discrepancy (ratio {ratio:.2} <= 1.2). \
-             This may fail on unusual hardware; the important thing is the next test passes."
-        );
-    }
-
-    /// Verifies that `token_eq` (constant-time) does NOT exhibit the same timing discrepancy.
-    ///
-    /// The ratio of late_mismatch / early_mismatch should be close to 1.0.
+    /// Verifies that `token_eq` (constant-time) takes the same time regardless of
+    /// where the mismatch occurs. The ratio of late_mismatch / early_mismatch
+    /// should be close to 1.0, indicating no timing leak.
     #[test]
     fn test_constant_time_comparison_no_timing_discrepancy() {
         let secret = "a]9$kL2#mP7!xR4&wQ8*nJ5^tY1+hF3@vB6%cD0".repeat(8);

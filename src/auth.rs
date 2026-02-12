@@ -77,9 +77,9 @@ mod tests {
         assert!(token_eq("", ""));
     }
 
-    /// Verifies that `token_eq` (constant-time) does NOT exhibit the same timing discrepancy.
-    ///
-    /// The ratio of late_mismatch / early_mismatch should be close to 1.0.
+    /// Verifies that `token_eq` (constant-time) takes the same time regardless of
+    /// where the mismatch occurs. The ratio of late_mismatch / early_mismatch
+    /// should be close to 1.0, indicating no timing leak.
     #[test]
     fn test_constant_time_comparison_no_timing_discrepancy() {
         let secret = "a]9$kL2#mP7!xR4&wQ8*nJ5^tY1+hF3@vB6%cD0".repeat(8);

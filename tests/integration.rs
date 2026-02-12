@@ -12,6 +12,15 @@ use vllm_proxy_rs::*;
 
 /// Build a test app with the given mock backend URL.
 fn build_test_app(mock_url: &str) -> axum::Router {
+    build_test_app_with_rate_limit(mock_url, 100, 200)
+}
+
+/// Build a test app with custom rate limit settings.
+fn build_test_app_with_rate_limit(
+    mock_url: &str,
+    rate_per_second: u64,
+    rate_burst: u32,
+) -> axum::Router {
     let base = mock_url.trim_end_matches('/');
 
     let config = config::Config {
@@ -37,6 +46,9 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         dev_mode: true,
         gpu_no_hw_mode: true,
         git_rev: "test-rev".to_string(),
+        rate_limit_per_second: rate_per_second,
+        rate_limit_burst_size: rate_burst,
+        rate_limit_trust_proxy_headers: true,
         timeout_secs: 30,
         timeout_tokenize_secs: 5,
     };
@@ -67,7 +79,15 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         http_client,
     };
 
+    let rate_limiter = rate_limit::build_rate_limiter(rate_per_second, rate_burst);
+    let rate_limit_state = rate_limit::RateLimitState {
+        limiter: rate_limiter,
+        trust_proxy_headers: true,
+    };
+
     routes::build_router()
+        .layer(middleware::from_fn(rate_limit::rate_limit_middleware))
+        .layer(axum::Extension(rate_limit_state))
         .layer(middleware::from_fn(request_id_middleware))
         .with_state(state)
 }
@@ -2289,6 +2309,52 @@ async fn test_passthrough_raw_response_headers_preserved() {
         response.headers().get("content-type").unwrap(),
         "text/plain"
     );
+}
+
+// ---- Rate limiting ----
+
+#[tokio::test]
+async fn test_rate_limit_returns_429_after_burst() {
+    let app = build_test_app_with_rate_limit("http://unused", 1, 2);
+
+    // First two requests should succeed (burst = 2)
+    for i in 0..2 {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "Request {i} should succeed within burst"
+        );
+    }
+
+    // Third request should be rate limited
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = body_to_json(resp).await;
+    assert_eq!(body["error"]["type"], "rate_limited");
+}
+
+#[tokio::test]
+async fn test_rate_limit_does_not_block_with_high_burst() {
+    // Default test app has burst=200, should not block normal test traffic
+    let app = build_test_app("http://unused");
+
+    for _ in 0..10 {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
 }
 
 // ---- Helpers ----

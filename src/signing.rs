@@ -164,8 +164,17 @@ impl SigningPair {
 
     /// Sign content with both algorithms and return a SignedChat.
     pub fn sign_chat(&self, text: &str) -> Result<crate::types::SignedChat> {
+        let start_ecdsa = std::time::Instant::now();
         let sig_ecdsa = self.ecdsa.sign(text)?;
+        metrics::counter!("signatures_generated_total", "algorithm" => "ecdsa").increment(1);
+        metrics::histogram!("signature_generation_duration_seconds", "algorithm" => "ecdsa")
+            .record(start_ecdsa.elapsed().as_secs_f64());
+
+        let start_ed25519 = std::time::Instant::now();
         let sig_ed25519 = self.ed25519.sign(text)?;
+        metrics::counter!("signatures_generated_total", "algorithm" => "ed25519").increment(1);
+        metrics::histogram!("signature_generation_duration_seconds", "algorithm" => "ed25519")
+            .record(start_ed25519.elapsed().as_secs_f64());
 
         Ok(crate::types::SignedChat {
             text: text.to_string(),

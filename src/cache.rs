@@ -28,11 +28,19 @@ impl ChatCache {
     pub fn set_chat(&self, chat_id: &str, value: &str) {
         let key = self.make_key(chat_id);
         self.inner.insert(key, value.to_string());
+        // moka::sync::Cache::entry_count() is O(1) (atomic counter), safe to call per insert
+        metrics::gauge!("cache_size").set(self.inner.entry_count() as f64);
     }
 
     pub fn get_chat(&self, chat_id: &str) -> Option<String> {
         let key = self.make_key(chat_id);
-        self.inner.get(&key)
+        let result = self.inner.get(&key);
+        if result.is_some() {
+            metrics::counter!("cache_hits_total").increment(1);
+        } else {
+            metrics::counter!("cache_misses_total").increment(1);
+        }
+        result
     }
 }
 

@@ -4,7 +4,9 @@ use axum::middleware;
 use tokio::net::TcpListener;
 use tracing::info;
 
-use vllm_proxy_rs::{cache, config, rate_limit, request_id_middleware, routes, signing, AppState};
+use vllm_proxy_rs::{
+    cache, config, metrics_middleware, rate_limit, request_id_middleware, routes, signing, AppState,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -61,12 +63,16 @@ async fn main() -> anyhow::Result<()> {
         .timeout(std::time::Duration::from_secs(config.timeout_secs))
         .build()?;
 
+    // Initialize metrics
+    let metrics_handle = metrics_middleware::setup_metrics_recorder();
+
     // Build app state
     let state = AppState {
         config: Arc::new(config),
         signing: Arc::new(signing),
         cache: Arc::new(chat_cache),
         http_client,
+        metrics_handle,
     };
 
     // Build rate limiter
@@ -90,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
         .layer(middleware::from_fn(rate_limit::rate_limit_middleware))
         .layer(axum::Extension(rate_limit_state))
         .layer(middleware::from_fn(request_id_middleware))
+        .layer(middleware::from_fn(metrics_middleware::metrics_middleware))
         .with_state(state);
 
     // Bind and serve

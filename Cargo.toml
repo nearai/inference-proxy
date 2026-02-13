@@ -21,6 +21,7 @@ dstack-sdk = "0.1.2"
 k256 = { version = "0.13", features = ["ecdsa"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 sha2 = "0.10"
+x509-parser = "0.16"
 sha3 = "0.10"
 subtle = "2.5"
 

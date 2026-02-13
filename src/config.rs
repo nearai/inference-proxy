@@ -47,6 +47,9 @@ pub struct Config {
     // Cache
     pub chat_cache_expiration_secs: u64,
 
+    // TLS certificate binding
+    pub tls_cert_path: Option<String>,
+
     // Modes
     pub dev_mode: bool,
     pub gpu_no_hw_mode: bool,
@@ -122,6 +125,10 @@ impl Config {
             embeddings_url: format!("{base}/v1/embeddings"),
             rerank_url,
             score_url,
+            tls_cert_path: env::var("TLS_CERT_PATH")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .filter(|s| std::path::Path::new(s).exists()),
             max_keepalive: env_int("VLLM_PROXY_MAX_KEEPALIVE", 100),
             max_request_size: env_int("VLLM_PROXY_MAX_REQUEST_SIZE", 10 * 1024 * 1024),
             max_image_request_size: env_int("VLLM_PROXY_MAX_IMAGE_REQUEST_SIZE", 50 * 1024 * 1024),

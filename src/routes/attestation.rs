@@ -59,6 +59,7 @@ pub async fn attestation_report(
         &signing_address_bytes,
         query.nonce.as_deref(),
         state.config.gpu_no_hw_mode,
+        state.tls_cert_fingerprint.as_deref(),
     )
     .await
     .map_err(|e| match e {

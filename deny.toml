@@ -33,4 +33,4 @@ wildcards = "allow"
 
 [sources]
 unknown-registry = "deny"
-unknown-git = "warn"
+unknown-git = "deny"

@@ -1,5 +1,10 @@
 [advisories]
 version = 2
+ignore = [
+    # paste is unmaintained but is a transitive dep from alloy-primitives;
+    # no action we can take until alloy migrates away from it
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 version = 2
@@ -9,11 +14,18 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
+    "Zlib",
     "Unicode-3.0",
     "Unicode-DFS-2016",
     "OpenSSL",
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
+
+# Exclude our own crate from license checks (no license field in Cargo.toml)
+exceptions = [
+    { allow = ["MIT"], name = "vllm-proxy-rs" },
+]
 
 [[licenses.clarify]]
 name = "ring"

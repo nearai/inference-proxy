@@ -25,7 +25,7 @@ pub enum StartupCheckError {
     #[error("Chat completions check failed: {reason}")]
     ChatCompletionFailed { reason: String },
 
-    #[error("All {retries} retries exhausted for '{check_name}': {last_error}")]
+    #[error("Failed after {retries} attempts for '{check_name}': {last_error}")]
     RetriesExhausted {
         check_name: String,
         retries: usize,
@@ -45,7 +45,17 @@ impl StartupCheckError {
     }
 }
 
-/// Run all startup health checks against the backend.
+/// Run OpenAI chat compatibility checks against the backend.
+///
+/// Validates that hosted models (qwen, glm, etc.) send OpenAI-compliant responses:
+/// - /v1/models API format
+/// - /v1/chat/completions with tool_calls (streaming & non-streaming)
+///
+/// Only enable for models serving OpenAI-compatible chat API. Do not enable for:
+/// - Image generation models (FLUX, etc.)
+/// - Embedding models
+/// - Reranker models
+/// - Cohere or other non-OpenAI-compliant APIs
 pub async fn run_startup_checks(
     client: &reqwest::Client,
     config: &Config,
@@ -56,7 +66,7 @@ pub async fn run_startup_checks(
         retries = config.startup_check_retries,
         retry_delay_secs = config.startup_check_retry_delay_secs,
         timeout_secs = config.startup_check_timeout_secs,
-        "Running startup health checks"
+        "Running OpenAI chat compatibility checks"
     );
 
     let timeout = Duration::from_secs(config.startup_check_timeout_secs);
@@ -146,7 +156,7 @@ where
                         check = check_name,
                         attempt,
                         error = %e,
-                        "Startup check failed, no retries remaining"
+                        "Startup check failed, no attempts remaining"
                     );
                 }
             }
@@ -210,14 +220,33 @@ async fn check_models(
         });
     }
 
-    let body: serde_json::Value =
-        response
-            .json()
-            .await
-            .map_err(|e| StartupCheckError::ConnectionFailed {
+    // Read the body as text first so we can include it in errors if JSON parsing fails.
+    let body_text = response
+        .text()
+        .await
+        .map_err(|e| StartupCheckError::ConnectionFailed {
+            url: models_url.to_string(),
+            source: e,
+        })?;
+
+    // Attempt to parse JSON; treat malformed/non-JSON responses as a protocol error, not connectivity.
+    let body: serde_json::Value = match serde_json::from_str(&body_text) {
+        Ok(json) => json,
+        Err(parse_error) => {
+            error!(
+                url = %models_url,
+                status = status.as_u16(),
+                response_body = %body_text,
+                error = %parse_error,
+                "Backend /v1/models returned invalid JSON"
+            );
+            return Err(StartupCheckError::UnexpectedStatus {
                 url: models_url.to_string(),
-                source: e,
-            })?;
+                status: status.as_u16(),
+                body: body_text,
+            });
+        }
+    };
 
     // vLLM /v1/models returns: {"data": [{"id": "model-name", ...}, ...]}
     let model_ids: Vec<String> = body
@@ -468,8 +497,12 @@ async fn validate_streaming_response(response: reqwest::Response) -> Result<(), 
 
         // Process complete lines
         while let Some(newline_pos) = buffer.find('\n') {
-            let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
-            buffer = buffer[newline_pos + 1..].to_string();
+            // Take the current line as an owned String, then drain it (and its newline)
+            let line = {
+                let line_slice = &buffer[..newline_pos];
+                line_slice.trim_end_matches('\r').to_string()
+            };
+            buffer.drain(..=newline_pos);
 
             let data = line
                 .strip_prefix("data: ")
@@ -485,37 +518,56 @@ async fn validate_streaming_response(response: reqwest::Response) -> Result<(), 
                 continue;
             }
 
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
-                got_any_data = true;
-                chunk_count += 1;
-                debug!(chunk = chunk_count, data = %data, "Received SSE chunk");
+            match serde_json::from_str::<serde_json::Value>(data) {
+                Ok(parsed) => {
+                    got_any_data = true;
+                    chunk_count += 1;
+                    debug!(chunk = chunk_count, data = %data, "Received SSE chunk");
 
-                // Accumulate tool call argument deltas
-                if let Some(choices) = parsed.get("choices").and_then(|c| c.as_array()) {
-                    for choice in choices {
-                        if let Some(tool_calls) = choice
-                            .get("delta")
-                            .and_then(|d| d.get("tool_calls"))
-                            .and_then(|tc| tc.as_array())
-                        {
-                            for tool_call in tool_calls {
-                                let index =
-                                    tool_call.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
-                                let key = format!(
-                                    "{}-{}",
-                                    choice.get("index").and_then(|i| i.as_u64()).unwrap_or(0),
-                                    index
-                                );
-                                if let Some(args) = tool_call
-                                    .get("function")
-                                    .and_then(|f| f.get("arguments"))
-                                    .and_then(|a| a.as_str())
-                                {
-                                    accumulated_tool_args.entry(key).or_default().push_str(args);
+                    // Accumulate tool call argument deltas
+                    if let Some(choices) = parsed.get("choices").and_then(|c| c.as_array()) {
+                        for choice in choices {
+                            if let Some(tool_calls) = choice
+                                .get("delta")
+                                .and_then(|d| d.get("tool_calls"))
+                                .and_then(|tc| tc.as_array())
+                            {
+                                for tool_call in tool_calls {
+                                    let index = tool_call
+                                        .get("index")
+                                        .and_then(|i| i.as_u64())
+                                        .unwrap_or(0);
+                                    let key = format!(
+                                        "{}-{}",
+                                        choice.get("index").and_then(|i| i.as_u64()).unwrap_or(0),
+                                        index
+                                    );
+                                    if let Some(args) = tool_call
+                                        .get("function")
+                                        .and_then(|f| f.get("arguments"))
+                                        .and_then(|a| a.as_str())
+                                    {
+                                        accumulated_tool_args
+                                            .entry(key)
+                                            .or_default()
+                                            .push_str(args);
+                                    }
                                 }
                             }
                         }
                     }
+                }
+                Err(e) => {
+                    error!(
+                        error = %e,
+                        data = %data,
+                        "Failed to parse SSE data line as JSON during startup check"
+                    );
+                    return Err(StartupCheckError::ChatCompletionFailed {
+                        reason: format!(
+                            "Failed to parse streaming SSE data as JSON: {e}; data: {data}"
+                        ),
+                    });
                 }
             }
         }

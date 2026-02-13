@@ -51,7 +51,7 @@ fn build_test_app_with_rate_limit(
         rate_limit_trust_proxy_headers: true,
         timeout_secs: 30,
         timeout_tokenize_secs: 5,
-        startup_checks_enabled: false,
+        openai_chat_compatibility_check_enabled: false,
         startup_check_retries: 1,
         startup_check_retry_delay_secs: 0,
         startup_check_timeout_secs: 5,

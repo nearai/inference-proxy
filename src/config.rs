@@ -66,8 +66,16 @@ pub struct Config {
     pub timeout_secs: u64,
     pub timeout_tokenize_secs: u64,
 
-    // Startup health checks
-    pub startup_checks_enabled: bool,
+    // OpenAI Chat Compatibility Checks
+    // Validates that hosted models (qwen, glm, etc.) send OpenAI-compliant responses:
+    // - /v1/models API format
+    // - /v1/chat/completions with tool_calls (streaming & non-streaming)
+    // Only enable for models serving OpenAI-compatible chat API. Disable for:
+    // - Image generation models (FLUX, etc.)
+    // - Embedding models
+    // - Reranker models
+    // - Cohere or other non-OpenAI-compliant APIs
+    pub openai_chat_compatibility_check_enabled: bool,
     pub startup_check_retries: usize,
     pub startup_check_retry_delay_secs: u64,
     pub startup_check_timeout_secs: u64,
@@ -127,7 +135,7 @@ impl Config {
             rate_limit_trust_proxy_headers: !env_bool("RATE_LIMIT_NO_TRUST_PROXY"),
             timeout_secs: 600,
             timeout_tokenize_secs: 10,
-            startup_checks_enabled: env_bool("STARTUP_CHECKS"),
+            openai_chat_compatibility_check_enabled: env_bool("OPENAI_CHAT_COMPATIBILITY_CHECK"),
             startup_check_retries: env_int("STARTUP_CHECK_RETRIES", 3),
             startup_check_retry_delay_secs: env_int("STARTUP_CHECK_RETRY_DELAY_SECS", 5) as u64,
             startup_check_timeout_secs: env_int("STARTUP_CHECK_TIMEOUT_SECS", 30) as u64,

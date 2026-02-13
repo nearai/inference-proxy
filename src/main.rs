@@ -76,16 +76,16 @@ async fn main() -> anyhow::Result<()> {
         metrics_handle,
     };
 
-    // Run startup health checks if enabled
-    if state.config.startup_checks_enabled {
-        info!("Startup health checks enabled, verifying backend...");
+    // Run OpenAI chat compatibility checks if enabled
+    if state.config.openai_chat_compatibility_check_enabled {
+        info!("OpenAI chat compatibility check enabled, verifying backend...");
         if let Err(e) = startup_checks::run_startup_checks(&state.http_client, &state.config).await
         {
-            tracing::error!(error = %e, "Startup health check failed — exiting");
-            std::process::exit(1);
+            tracing::error!(error = %e, "OpenAI chat compatibility check failed — exiting");
+            return Err(e.into());
         }
     } else {
-        info!("Startup health checks disabled (set STARTUP_CHECKS=true to enable)");
+        info!("OpenAI chat compatibility check disabled (set OPENAI_CHAT_COMPATIBILITY_CHECK=true to enable)");
     }
 
     // Build rate limiter

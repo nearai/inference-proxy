@@ -3,7 +3,7 @@ use axum::extract::{OriginalUri, State};
 use axum::http::{HeaderMap, Method};
 use axum::response::Response;
 use sha2::{Digest, Sha256};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::auth::RequireAuth;
 use crate::error::AppError;
@@ -163,14 +163,7 @@ pub async fn catch_all(
             .bytes()
             .await
             .unwrap_or_else(|_| bytes::Bytes::from("{}"));
-        let error_info = crate::proxy::parse_upstream_error(&error_body);
-        warn!(
-            upstream_status = %upstream_status,
-            upstream_url = %backend_url,
-            error_message = error_info.as_ref().map(|e| e.message.as_str()).unwrap_or("unparseable"),
-            error_type = error_info.as_ref().map(|e| e.error_type.as_str()).unwrap_or("unknown"),
-            "Backend returned non-success status (catch-all)"
-        );
+        let error_info = crate::proxy::log_upstream_error(upstream_status, &backend_url, &error_body);
         let axum_status = axum::http::StatusCode::from_u16(upstream_status.as_u16())
             .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
         return Err(AppError::UpstreamParsed {

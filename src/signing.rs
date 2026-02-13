@@ -464,10 +464,11 @@ mod tests {
         // Recovery may succeed but should yield a different address,
         // or may panic/fail entirely — either outcome means rejection
         let result = std::panic::catch_unwind(|| recover_ecdsa_address(message, &corrupted_sig));
-        match result {
-            Ok(recovered) => assert_ne!(recovered, ctx.signing_address),
-            Err(_) => {} // Panicked during recovery = also a rejection
+        if let Ok(recovered) = result {
+            // Recovery may succeed but should yield a different address
+            assert_ne!(recovered, ctx.signing_address);
         }
+        // Err(_) = panicked during recovery = also a rejection
     }
 
     #[test]

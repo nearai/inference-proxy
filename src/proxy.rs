@@ -25,7 +25,7 @@ pub(crate) fn parse_upstream_error(body: &[u8]) -> Option<UpstreamErrorInfo> {
     let json: serde_json::Value = serde_json::from_slice(body).ok()?;
 
     // Try nested format first: {"error": {"message": "...", "type": "..."}}
-    if let Some(error_obj) = json.get("error") {
+    if let Some(error_obj) = json.get("error").filter(|v| v.is_object()) {
         let message = error_obj.get("message")?.as_str()?.to_string();
         let error_type = error_obj
             .get("type")
@@ -49,6 +49,23 @@ pub(crate) fn parse_upstream_error(body: &[u8]) -> Option<UpstreamErrorInfo> {
         message,
         error_type,
     })
+}
+
+/// Parse an upstream error body, log it, and return the parsed info.
+pub(crate) fn log_upstream_error(
+    status: reqwest::StatusCode,
+    url: &str,
+    body: &[u8],
+) -> Option<UpstreamErrorInfo> {
+    let info = parse_upstream_error(body);
+    warn!(
+        upstream_status = %status,
+        upstream_url = %url,
+        error_message = info.as_ref().map(|e| e.message.as_str()).unwrap_or("unparseable"),
+        error_type = info.as_ref().map(|e| e.error_type.as_str()).unwrap_or("unknown"),
+        "Backend returned non-success status"
+    );
+    info
 }
 
 /// Options for proxy requests that need signing.
@@ -83,14 +100,7 @@ pub async fn proxy_json_request(
     let status = response.status();
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
-        let error_info = parse_upstream_error(&body);
-        warn!(
-            upstream_status = %status,
-            upstream_url = %url,
-            error_message = error_info.as_ref().map(|e| e.message.as_str()).unwrap_or("unparseable"),
-            error_type = error_info.as_ref().map(|e| e.error_type.as_str()).unwrap_or("unknown"),
-            "Backend returned non-success status"
-        );
+        log_upstream_error(status, url, &body);
         return Err(AppError::Upstream {
             status: StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
             body,
@@ -168,14 +178,7 @@ pub async fn proxy_streaming_request(
     let status = response.status();
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
-        let error_info = parse_upstream_error(&body);
-        warn!(
-            upstream_status = %status,
-            upstream_url = %url,
-            error_message = error_info.as_ref().map(|e| e.message.as_str()).unwrap_or("unparseable"),
-            error_type = error_info.as_ref().map(|e| e.error_type.as_str()).unwrap_or("unknown"),
-            "Backend returned non-success status"
-        );
+        log_upstream_error(status, url, &body);
         return Err(AppError::Upstream {
             status: StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
             body,
@@ -291,14 +294,7 @@ pub async fn proxy_multipart_request(
     let status = response.status();
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
-        let error_info = parse_upstream_error(&body);
-        warn!(
-            upstream_status = %status,
-            upstream_url = %url,
-            error_message = error_info.as_ref().map(|e| e.message.as_str()).unwrap_or("unparseable"),
-            error_type = error_info.as_ref().map(|e| e.error_type.as_str()).unwrap_or("unknown"),
-            "Backend returned non-success status"
-        );
+        log_upstream_error(status, url, &body);
         return Err(AppError::Upstream {
             status: StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
             body,
@@ -380,14 +376,7 @@ pub async fn proxy_simple(
     let status = response.status();
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
-        let error_info = parse_upstream_error(&body);
-        warn!(
-            upstream_status = %status,
-            upstream_url = %url,
-            error_message = error_info.as_ref().map(|e| e.message.as_str()).unwrap_or("unparseable"),
-            error_type = error_info.as_ref().map(|e| e.error_type.as_str()).unwrap_or("unknown"),
-            "Backend returned non-success status"
-        );
+        log_upstream_error(status, url, &body);
         return Err(AppError::Upstream {
             status: StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
             body,

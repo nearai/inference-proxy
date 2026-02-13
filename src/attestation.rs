@@ -153,6 +153,94 @@ pub fn compute_spki_hash(cert_path: &str) -> anyhow::Result<String> {
     Ok(hex::encode(hash))
 }
 
+#[cfg(test)]
+mod tests_spki {
+    use super::compute_spki_hash;
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    use std::fs::File;
+    use std::io::Write;
+
+    // A small, valid self-signed test certificate in PEM format.
+    // This is only used for unit testing of SPKI hashing.
+    const TEST_CERT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIC7jCCAdagAwIBAgIUOcqT1McI2FJ7uWZLxE+nobVhtMEwDQYJKoZIhvcNAQEL
+BQAwGjEYMBYGA1UEAwwPdGVzdC1sb2NhbGhvc3QwHhcNMjQwMTAxMDAwMDAwWhcN
+MzQwMTAxMDAwMDAwWjAaMRgwFgYDVQQDDA90ZXN0LWxvY2FsaG9zdDCBnzANBgkq
+hkiG9w0BAQEFAAOBjQAwgYkCgYEAuGmA+vGzv+Jwz2Xb4VYq4Qq7G8WQwQqkR9oH
+Lp6+vXnq5rV4XzjJ5bK2Oe7JcV+X9m7q5sO3x9x3gOQnFvXm6k8k2s9VhWlUu8Mc
+9oaZJpYxZC1JjNn39ZtXy5TuJv0X7JqY8i1g7m1c4n2pG7w0i1j8J7n9LP9VtCsp
+G5LH9mYtqv0CAwEAAaNTMFEwHQYDVR0OBBYEFDfV9hZ1A5c+JXG3p50fykZpTlTD
+MB8GA1UdIwQYMBaAFDfV9hZ1A5c+JXG3p50fykZpTlTDMA8GA1UdEwEB/wQFMAMB
+Af8wDQYJKoZIhvcNAQELBQADgYEAu7w5LzE0B7zVqJ+8dXcQjyzWv8kZfG+2YxjQ
+7z0+9R3mO6F9J5K3WQjqyX2Yv6pS9Ih4Vtq3F3M2bVtJ3GNTx5s3bW7GvUu7pXh5
+gKlC3zP2PuzhU7tKx7TAcG1BZxqT3T5tGR+3u3NP2pjd4rHcQ4Vb2z2c9zZ9e6Q=
+-----END CERTIFICATE-----
+"#;
+
+    fn write_temp_file(prefix: &str, contents: &str) -> String {
+        let mut path = std::env::temp_dir();
+        // Use the process ID and a monotonic counter to reduce collision risk.
+        static COUNTER: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let filename = format!("{}_{}_{}.pem", prefix, std::process::id(), id);
+        path.push(filename);
+
+        let mut file = File::create(&path).expect("failed to create temp file");
+        file.write_all(contents.as_bytes())
+            .expect("failed to write temp file");
+
+        path.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn test_compute_spki_hash_valid_cert() {
+        let path = write_temp_file("valid_cert", TEST_CERT_PEM);
+
+        // Independently compute expected SPKI hash from the in-memory PEM.
+        let pem_bytes = TEST_CERT_PEM.as_bytes();
+        let (_, pem) =
+            x509_parser::pem::parse_x509_pem(pem_bytes).expect("failed to parse test PEM");
+        let (_, cert) = x509_parser::parse_x509_certificate(&pem.contents)
+            .expect("failed to parse test X.509");
+        let spki_der = cert.tbs_certificate.subject_pki.raw;
+        let expected_hash = {
+            let hash = Sha256::digest(spki_der);
+            hex::encode(hash)
+        };
+
+        let actual_hash =
+            compute_spki_hash(&path).expect("compute_spki_hash should succeed for valid cert");
+
+        // Clean up the temp file; ignore errors.
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(actual_hash, expected_hash);
+    }
+
+    #[test]
+    fn test_compute_spki_hash_invalid_pem() {
+        let path = write_temp_file("invalid_pem", "this is not a valid PEM certificate");
+
+        let result = compute_spki_hash(&path);
+
+        // Clean up the temp file; ignore errors.
+        let _ = fs::remove_file(&path);
+
+        assert!(result.is_err(), "expected error for invalid PEM input");
+    }
+
+    #[test]
+    fn test_compute_spki_hash_missing_file() {
+        // Use a path that is very unlikely to exist.
+        let path = "/nonexistent/path/to/cert_for_spki_hash_test.pem";
+
+        let result = compute_spki_hash(path);
+
+        assert!(result.is_err(), "expected error for missing certificate file");
+    }
+}
 /// Generate a complete attestation report.
 pub async fn generate_attestation(
     signing_address: &str,

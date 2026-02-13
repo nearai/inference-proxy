@@ -99,7 +99,7 @@ impl Config {
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
 
-        Ok(Config {
+        let config = Config {
             model_name,
             token,
             vllm_base_url: vllm_base_url.clone(),
@@ -131,7 +131,17 @@ impl Config {
             startup_check_retries: env_int("STARTUP_CHECK_RETRIES", 3),
             startup_check_retry_delay_secs: env_int("STARTUP_CHECK_RETRY_DELAY_SECS", 5) as u64,
             startup_check_timeout_secs: env_int("STARTUP_CHECK_TIMEOUT_SECS", 30) as u64,
-        })
+        };
+
+        // Validate startup check configuration
+        if config.startup_check_retries == 0 {
+            anyhow::bail!("STARTUP_CHECK_RETRIES must be at least 1");
+        }
+        if config.startup_check_timeout_secs == 0 {
+            anyhow::bail!("STARTUP_CHECK_TIMEOUT_SECS must be greater than 0");
+        }
+
+        Ok(config)
     }
 }
 

@@ -431,10 +431,11 @@ async fn validate_non_streaming_response(
                     .get("content")
                     .and_then(|c| c.as_str())
                     .unwrap_or("<no content>");
+                let preview: String = content.chars().take(100).collect();
                 info!(
                     choice_index = i,
                     finish_reason,
-                    content_preview = %&content[..content.len().min(100)],
+                    content_preview = %preview,
                     "Model returned text response"
                 );
             }

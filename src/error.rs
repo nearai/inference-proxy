@@ -51,7 +51,7 @@ impl IntoResponse for AppError {
                 message,
                 error_type,
             } => {
-                metrics::counter!("http_errors_total", "error_type" => "upstream_parsed").increment(1);
+                metrics::counter!("http_errors_total", "error_type" => "upstream").increment(1);
                 let body = serde_json::json!({
                     "error": {
                         "message": message,

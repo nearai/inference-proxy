@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use tracing::{error, info};
 
 use crate::types::AttestationReport;
@@ -13,11 +14,29 @@ pub enum AttestationError {
     Internal(#[from] anyhow::Error),
 }
 
-/// Build TDX report data: [signing_address (padded to 32 bytes) || nonce (32 bytes)].
-fn build_report_data(signing_address_bytes: &[u8], nonce: &[u8; 32]) -> Vec<u8> {
+/// Build TDX report data (64 bytes).
+///
+/// Without cert fingerprint: `[signing_address (padded to 32) || nonce (32)]`
+/// With cert fingerprint:    `[SHA256(signing_address || cert_fingerprint) || nonce (32)]`
+fn build_report_data(
+    signing_address_bytes: &[u8],
+    nonce: &[u8; 32],
+    cert_fingerprint: Option<&[u8]>,
+) -> Vec<u8> {
     let mut data = vec![0u8; 64];
-    let len = signing_address_bytes.len().min(32);
-    data[..len].copy_from_slice(&signing_address_bytes[..len]);
+    match cert_fingerprint {
+        Some(fp) => {
+            let mut hasher = Sha256::new();
+            hasher.update(signing_address_bytes);
+            hasher.update(fp);
+            let hash = hasher.finalize();
+            data[..32].copy_from_slice(&hash);
+        }
+        None => {
+            let len = signing_address_bytes.len().min(32);
+            data[..len].copy_from_slice(&signing_address_bytes[..len]);
+        }
+    }
     data[32..64].copy_from_slice(nonce);
     data
 }
@@ -121,6 +140,115 @@ fn build_nvidia_payload(nonce_hex: &str, evidences: &serde_json::Value) -> Strin
     .to_string()
 }
 
+/// Compute SHA-256 hash of a PEM certificate's Subject Public Key Info (SPKI).
+pub fn compute_spki_hash(cert_path: &str) -> anyhow::Result<String> {
+    let pem_data = std::fs::read(cert_path)
+        .map_err(|e| anyhow::anyhow!("failed to read cert {cert_path}: {e}"))?;
+    let (_, pem) = x509_parser::pem::parse_x509_pem(&pem_data)
+        .map_err(|e| anyhow::anyhow!("failed to parse PEM: {e}"))?;
+    let (_, cert) = x509_parser::parse_x509_certificate(&pem.contents)
+        .map_err(|e| anyhow::anyhow!("failed to parse X.509: {e}"))?;
+    let spki_der = cert.tbs_certificate.subject_pki.raw;
+    let hash = Sha256::digest(spki_der);
+    Ok(hex::encode(hash))
+}
+
+#[cfg(test)]
+mod tests_spki {
+    use super::compute_spki_hash;
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    use std::fs::File;
+    use std::io::Write;
+
+    // A small, valid self-signed test certificate in PEM format.
+    // This is only used for unit testing of SPKI hashing.
+    const TEST_CERT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIDEzCCAfugAwIBAgIUc8i7HuXjfzh0UgxHI50TZ5VvEMswDQYJKoZIhvcNAQEL
+BQAwGTEXMBUGA1UEAwwOdGVzdC1sb2NhbGhvc3QwHhcNMjYwMjEzMTMwODAzWhcN
+MzYwMjExMTMwODAzWjAZMRcwFQYDVQQDDA50ZXN0LWxvY2FsaG9zdDCCASIwDQYJ
+KoZIhvcNAQEBBQADggEPADCCAQoCggEBAJ3j+xeMEJ9c4nfYNXLOFwkdBU1lxI/u
+qWHCnHoNwbmVFBZDvksf9jv8KQwfqaOj8VwBVHat1rbpkgCkcwVHnmZBB6DjDhhs
+2wp8MDnjHR58J3tqvgZmrf6Dp4TkziwAlGWHM//wI9km8KWr0cX2p/z3YfHOWj3F
+yaRbJ6b/QFJ3fyuk8UY9d9WlKG91wPX8Oeg3d2rSiAXx3daO/MbkRroT2XpKaYux
+qTDsxAWRqxkCcQsdHxXG+rbA3HPTpirNWDxLRmxm0Q8PCEFG9EF+Mu1XVmOgkUTp
+7p98vdwtP3c6HnfoMkpobfEUmTbtcXkJHMTPr2IrqxMC/8I+8+F5lrMCAwEAAaNT
+MFEwHQYDVR0OBBYEFJsscWLVB2QcCxb9PxMMG9vxZZ/8MB8GA1UdIwQYMBaAFJss
+cWLVB2QcCxb9PxMMG9vxZZ/8MA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQEL
+BQADggEBAIPwnN16vmNi26XppI4E6TzOY4EXyqhPhtGNeos7Hxsw6DXKA28iaaOW
+xnH5LeNFP1//9hojTCo/w6CS4BWJNlGoFPfAHIAHFAIVkqOcmO+YLGYotcR67ftd
+loGVCS8p4a88M7X2JeziizPlssmbzQkcAGQ3latUu5O6wxUATFFWmdPELhm8xRdW
+qB2wGiBhxD46CKcMKZrtW+P8SjhhxXEJ2x+UYdSxXSTTnrBAZi23yo4TNFVXw5jA
+Tw4GxEVK193pwe3l749yk1dkJkxAfRCavr3BVP5Br53GWHVFBDOR2tPw83frzTBJ
+nU+jXBG7tgClr/DntUBJx+xfNWpxLKE=
+-----END CERTIFICATE-----
+"#;
+
+    fn write_temp_file(prefix: &str, contents: &str) -> String {
+        let mut path = std::env::temp_dir();
+        // Use the process ID and a monotonic counter to reduce collision risk.
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let filename = format!("{}_{}_{}.pem", prefix, std::process::id(), id);
+        path.push(filename);
+
+        let mut file = File::create(&path).expect("failed to create temp file");
+        file.write_all(contents.as_bytes())
+            .expect("failed to write temp file");
+
+        path.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn test_compute_spki_hash_valid_cert() {
+        let path = write_temp_file("valid_cert", TEST_CERT_PEM);
+
+        // Independently compute expected SPKI hash from the in-memory PEM.
+        let pem_bytes = TEST_CERT_PEM.as_bytes();
+        let (_, pem) =
+            x509_parser::pem::parse_x509_pem(pem_bytes).expect("failed to parse test PEM");
+        let (_, cert) =
+            x509_parser::parse_x509_certificate(&pem.contents).expect("failed to parse test X.509");
+        let spki_der = cert.tbs_certificate.subject_pki.raw;
+        let expected_hash = {
+            let hash = Sha256::digest(spki_der);
+            hex::encode(hash)
+        };
+
+        let actual_hash =
+            compute_spki_hash(&path).expect("compute_spki_hash should succeed for valid cert");
+
+        // Clean up the temp file; ignore errors.
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(actual_hash, expected_hash);
+    }
+
+    #[test]
+    fn test_compute_spki_hash_invalid_pem() {
+        let path = write_temp_file("invalid_pem", "this is not a valid PEM certificate");
+
+        let result = compute_spki_hash(&path);
+
+        // Clean up the temp file; ignore errors.
+        let _ = fs::remove_file(&path);
+
+        assert!(result.is_err(), "expected error for invalid PEM input");
+    }
+
+    #[test]
+    fn test_compute_spki_hash_missing_file() {
+        // Use a path that is very unlikely to exist.
+        let path = "/nonexistent/path/to/cert_for_spki_hash_test.pem";
+
+        let result = compute_spki_hash(path);
+
+        assert!(
+            result.is_err(),
+            "expected error for missing certificate file"
+        );
+    }
+}
 /// Generate a complete attestation report.
 pub async fn generate_attestation(
     signing_address: &str,
@@ -129,12 +257,19 @@ pub async fn generate_attestation(
     signing_address_bytes: &[u8],
     nonce: Option<&str>,
     gpu_no_hw_mode: bool,
+    tls_cert_fingerprint: Option<&str>,
 ) -> Result<AttestationReport, AttestationError> {
     let nonce_bytes = parse_nonce(nonce)?;
     let nonce_hex = hex::encode(nonce_bytes);
 
-    // Build TDX report data
-    let report_data = build_report_data(signing_address_bytes, &nonce_bytes);
+    // Build TDX report data (binds cert fingerprint when present)
+    let fp_bytes = tls_cert_fingerprint
+        .map(hex::decode)
+        .transpose()
+        .map_err(|e| {
+            AttestationError::Internal(anyhow::anyhow!("bad cert fingerprint hex: {e}"))
+        })?;
+    let report_data = build_report_data(signing_address_bytes, &nonce_bytes, fp_bytes.as_deref());
 
     // Get TDX quote from dstack
     let client = dstack_sdk::dstack_client::DstackClient::new(None);
@@ -159,6 +294,7 @@ pub async fn generate_attestation(
         nvidia_payload,
         event_log,
         info: info_value,
+        tls_cert_fingerprint: tls_cert_fingerprint.map(|s| s.to_string()),
     })
 }
 
@@ -168,11 +304,11 @@ mod tests {
 
     #[test]
     fn test_build_report_data_structure() {
-        // 20-byte Ethereum address
+        // 20-byte Ethereum address, no cert fingerprint
         let address = vec![0xABu8; 20];
         let nonce = [0xCDu8; 32];
 
-        let data = build_report_data(&address, &nonce);
+        let data = build_report_data(&address, &nonce, None);
 
         assert_eq!(data.len(), 64);
         // First 20 bytes = address
@@ -189,7 +325,7 @@ mod tests {
         let address = vec![0xFFu8; 32];
         let nonce = [0x11u8; 32];
 
-        let data = build_report_data(&address, &nonce);
+        let data = build_report_data(&address, &nonce, None);
 
         assert_eq!(data.len(), 64);
         assert_eq!(&data[..32], &[0xFF; 32]);
@@ -202,11 +338,44 @@ mod tests {
         let address = vec![0xAA; 40];
         let nonce = [0x00; 32];
 
-        let data = build_report_data(&address, &nonce);
+        let data = build_report_data(&address, &nonce, None);
 
         assert_eq!(data.len(), 64);
         // Only first 32 bytes of address used
         assert_eq!(&data[..32], &[0xAA; 32]);
+    }
+
+    #[test]
+    fn test_build_report_data_with_cert_fingerprint() {
+        let address = vec![0xABu8; 20];
+        let nonce = [0xCDu8; 32];
+        let cert_fp = vec![0xEEu8; 32];
+
+        let data = build_report_data(&address, &nonce, Some(&cert_fp));
+
+        assert_eq!(data.len(), 64);
+        // First 32 bytes = SHA256(address || cert_fingerprint)
+        let mut hasher = Sha256::new();
+        hasher.update(&address);
+        hasher.update(&cert_fp);
+        let expected_hash = hasher.finalize();
+        assert_eq!(&data[..32], &expected_hash[..]);
+        // Last 32 bytes = nonce
+        assert_eq!(&data[32..64], &[0xCD; 32]);
+    }
+
+    #[test]
+    fn test_build_report_data_cert_fingerprint_changes_output() {
+        let address = vec![0xABu8; 20];
+        let nonce = [0xCDu8; 32];
+
+        let data_without = build_report_data(&address, &nonce, None);
+        let data_with = build_report_data(&address, &nonce, Some(&[0xEE; 32]));
+
+        // First 32 bytes must differ
+        assert_ne!(&data_without[..32], &data_with[..32]);
+        // Nonce (last 32) stays the same
+        assert_eq!(&data_without[32..], &data_with[32..]);
     }
 
     #[test]

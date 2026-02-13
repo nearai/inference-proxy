@@ -26,6 +26,9 @@ pub struct AppState {
     pub cache: Arc<cache::ChatCache>,
     pub http_client: reqwest::Client,
     pub metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+    /// SHA-256 hash of the TLS certificate's SPKI (Subject Public Key Info).
+    /// Computed at startup when `TLS_CERT_PATH` is set.
+    pub tls_cert_fingerprint: Option<String>,
 }
 
 /// Request ID middleware: generates or passes through X-Request-ID header.

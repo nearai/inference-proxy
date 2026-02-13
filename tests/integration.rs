@@ -49,6 +49,7 @@ fn build_test_app_with_rate_limit(
         rate_limit_per_second: rate_per_second,
         rate_limit_burst_size: rate_burst,
         rate_limit_trust_proxy_headers: true,
+        tls_cert_path: None,
         timeout_secs: 30,
         timeout_tokenize_secs: 5,
         openai_chat_compatibility_check_enabled: false,
@@ -87,6 +88,7 @@ fn build_test_app_with_rate_limit(
         cache: Arc::new(chat_cache),
         http_client,
         metrics_handle,
+        tls_cert_fingerprint: None,
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(rate_per_second, rate_burst);

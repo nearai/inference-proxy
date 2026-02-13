@@ -1,14 +1,18 @@
 # Stage 1: Build the Rust binary
 FROM rust:1.93.0-bookworm AS builder
 
-RUN apt-get update && apt-get install -y git pkg-config && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends git pkg-config \
+    && rm -rf /var/lib/apt/lists/* /var/log/* /var/cache/ldconfig/aux-cache
 
 WORKDIR /build
+
+ARG SOURCE_DATE_EPOCH=0
+ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 
 # Cache dependencies: copy manifests first, then do a dummy build
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs \
-    && cargo build --release 2>/dev/null || true \
+    && cargo build --release --locked 2>/dev/null || true \
     && rm -rf src \
     && rm -f target/release/deps/*vllm_proxy_rs* \
     && rm -f target/release/vllm-proxy-rs* \
@@ -16,7 +20,7 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs \
 
 # Copy real source and build — touch to ensure cargo detects changes
 COPY src/ src/
-RUN find src -name '*.rs' -exec touch {} + && cargo build --release
+RUN find src -name '*.rs' -exec touch {} + && cargo build --release --locked
 
 # Stage 2: Runtime image
 # GPU attestation requires pynvml (needs CUDA), so use vllm base image

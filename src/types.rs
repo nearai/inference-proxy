@@ -21,6 +21,10 @@ pub struct AttestationReport {
     pub nvidia_payload: String,
     pub event_log: serde_json::Value,
     pub info: serde_json::Value,
+    /// SHA-256 hash of the TLS certificate's SPKI, if configured.
+    /// When present, report_data[..32] = SHA256(signing_address_bytes || cert_fingerprint_bytes).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_cert_fingerprint: Option<String>,
 }
 
 /// Response for GET /v1/attestation/report (wraps with all_attestations).

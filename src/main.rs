@@ -5,8 +5,8 @@ use tokio::net::TcpListener;
 use tracing::info;
 
 use vllm_proxy_rs::{
-    cache, config, metrics_middleware, rate_limit, request_id_middleware, routes, signing,
-    startup_checks, AppState,
+    attestation, cache, config, metrics_middleware, rate_limit, request_id_middleware, routes,
+    signing, startup_checks, AppState,
 };
 
 #[tokio::main]
@@ -55,6 +55,16 @@ async fn main() -> anyhow::Result<()> {
         "Signing keys ready"
     );
 
+    // Compute TLS certificate fingerprint if configured
+    let tls_cert_fingerprint = match &config.tls_cert_path {
+        Some(path) => {
+            let hash = attestation::compute_spki_hash(path)?;
+            info!(tls_cert_path = %path, fingerprint = %hash, "TLS certificate SPKI hash computed");
+            Some(hash)
+        }
+        None => None,
+    };
+
     // Initialize cache
     let chat_cache = cache::ChatCache::new(&config.model_name, config.chat_cache_expiration_secs);
 
@@ -74,6 +84,7 @@ async fn main() -> anyhow::Result<()> {
         cache: Arc::new(chat_cache),
         http_client,
         metrics_handle,
+        tls_cert_fingerprint,
     };
 
     // Run OpenAI chat compatibility checks if enabled

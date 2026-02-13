@@ -164,25 +164,30 @@ mod tests_spki {
     // A small, valid self-signed test certificate in PEM format.
     // This is only used for unit testing of SPKI hashing.
     const TEST_CERT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
-MIIC7jCCAdagAwIBAgIUOcqT1McI2FJ7uWZLxE+nobVhtMEwDQYJKoZIhvcNAQEL
-BQAwGjEYMBYGA1UEAwwPdGVzdC1sb2NhbGhvc3QwHhcNMjQwMTAxMDAwMDAwWhcN
-MzQwMTAxMDAwMDAwWjAaMRgwFgYDVQQDDA90ZXN0LWxvY2FsaG9zdDCBnzANBgkq
-hkiG9w0BAQEFAAOBjQAwgYkCgYEAuGmA+vGzv+Jwz2Xb4VYq4Qq7G8WQwQqkR9oH
-Lp6+vXnq5rV4XzjJ5bK2Oe7JcV+X9m7q5sO3x9x3gOQnFvXm6k8k2s9VhWlUu8Mc
-9oaZJpYxZC1JjNn39ZtXy5TuJv0X7JqY8i1g7m1c4n2pG7w0i1j8J7n9LP9VtCsp
-G5LH9mYtqv0CAwEAAaNTMFEwHQYDVR0OBBYEFDfV9hZ1A5c+JXG3p50fykZpTlTD
-MB8GA1UdIwQYMBaAFDfV9hZ1A5c+JXG3p50fykZpTlTDMA8GA1UdEwEB/wQFMAMB
-Af8wDQYJKoZIhvcNAQELBQADgYEAu7w5LzE0B7zVqJ+8dXcQjyzWv8kZfG+2YxjQ
-7z0+9R3mO6F9J5K3WQjqyX2Yv6pS9Ih4Vtq3F3M2bVtJ3GNTx5s3bW7GvUu7pXh5
-gKlC3zP2PuzhU7tKx7TAcG1BZxqT3T5tGR+3u3NP2pjd4rHcQ4Vb2z2c9zZ9e6Q=
+MIIDEzCCAfugAwIBAgIUc8i7HuXjfzh0UgxHI50TZ5VvEMswDQYJKoZIhvcNAQEL
+BQAwGTEXMBUGA1UEAwwOdGVzdC1sb2NhbGhvc3QwHhcNMjYwMjEzMTMwODAzWhcN
+MzYwMjExMTMwODAzWjAZMRcwFQYDVQQDDA50ZXN0LWxvY2FsaG9zdDCCASIwDQYJ
+KoZIhvcNAQEBBQADggEPADCCAQoCggEBAJ3j+xeMEJ9c4nfYNXLOFwkdBU1lxI/u
+qWHCnHoNwbmVFBZDvksf9jv8KQwfqaOj8VwBVHat1rbpkgCkcwVHnmZBB6DjDhhs
+2wp8MDnjHR58J3tqvgZmrf6Dp4TkziwAlGWHM//wI9km8KWr0cX2p/z3YfHOWj3F
+yaRbJ6b/QFJ3fyuk8UY9d9WlKG91wPX8Oeg3d2rSiAXx3daO/MbkRroT2XpKaYux
+qTDsxAWRqxkCcQsdHxXG+rbA3HPTpirNWDxLRmxm0Q8PCEFG9EF+Mu1XVmOgkUTp
+7p98vdwtP3c6HnfoMkpobfEUmTbtcXkJHMTPr2IrqxMC/8I+8+F5lrMCAwEAAaNT
+MFEwHQYDVR0OBBYEFJsscWLVB2QcCxb9PxMMG9vxZZ/8MB8GA1UdIwQYMBaAFJss
+cWLVB2QcCxb9PxMMG9vxZZ/8MA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQEL
+BQADggEBAIPwnN16vmNi26XppI4E6TzOY4EXyqhPhtGNeos7Hxsw6DXKA28iaaOW
+xnH5LeNFP1//9hojTCo/w6CS4BWJNlGoFPfAHIAHFAIVkqOcmO+YLGYotcR67ftd
+loGVCS8p4a88M7X2JeziizPlssmbzQkcAGQ3latUu5O6wxUATFFWmdPELhm8xRdW
+qB2wGiBhxD46CKcMKZrtW+P8SjhhxXEJ2x+UYdSxXSTTnrBAZi23yo4TNFVXw5jA
+Tw4GxEVK193pwe3l749yk1dkJkxAfRCavr3BVP5Br53GWHVFBDOR2tPw83frzTBJ
+nU+jXBG7tgClr/DntUBJx+xfNWpxLKE=
 -----END CERTIFICATE-----
 "#;
 
     fn write_temp_file(prefix: &str, contents: &str) -> String {
         let mut path = std::env::temp_dir();
         // Use the process ID and a monotonic counter to reduce collision risk.
-        static COUNTER: std::sync::atomic::AtomicUsize =
-            std::sync::atomic::AtomicUsize::new(0);
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let filename = format!("{}_{}_{}.pem", prefix, std::process::id(), id);
         path.push(filename);
@@ -202,8 +207,8 @@ gKlC3zP2PuzhU7tKx7TAcG1BZxqT3T5tGR+3u3NP2pjd4rHcQ4Vb2z2c9zZ9e6Q=
         let pem_bytes = TEST_CERT_PEM.as_bytes();
         let (_, pem) =
             x509_parser::pem::parse_x509_pem(pem_bytes).expect("failed to parse test PEM");
-        let (_, cert) = x509_parser::parse_x509_certificate(&pem.contents)
-            .expect("failed to parse test X.509");
+        let (_, cert) =
+            x509_parser::parse_x509_certificate(&pem.contents).expect("failed to parse test X.509");
         let spki_der = cert.tbs_certificate.subject_pki.raw;
         let expected_hash = {
             let hash = Sha256::digest(spki_der);
@@ -238,7 +243,10 @@ gKlC3zP2PuzhU7tKx7TAcG1BZxqT3T5tGR+3u3NP2pjd4rHcQ4Vb2z2c9zZ9e6Q=
 
         let result = compute_spki_hash(path);
 
-        assert!(result.is_err(), "expected error for missing certificate file");
+        assert!(
+            result.is_err(),
+            "expected error for missing certificate file"
+        );
     }
 }
 /// Generate a complete attestation report.

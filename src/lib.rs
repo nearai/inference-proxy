@@ -15,6 +15,7 @@ pub mod proxy;
 pub mod rate_limit;
 pub mod routes;
 pub mod signing;
+pub mod startup_checks;
 pub mod types;
 
 /// Shared application state available to all handlers.

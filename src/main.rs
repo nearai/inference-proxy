@@ -5,7 +5,8 @@ use tokio::net::TcpListener;
 use tracing::info;
 
 use vllm_proxy_rs::{
-    cache, config, metrics_middleware, rate_limit, request_id_middleware, routes, signing, AppState,
+    cache, config, metrics_middleware, rate_limit, request_id_middleware, routes, signing,
+    startup_checks, AppState,
 };
 
 #[tokio::main]
@@ -74,6 +75,18 @@ async fn main() -> anyhow::Result<()> {
         http_client,
         metrics_handle,
     };
+
+    // Run OpenAI chat compatibility checks if enabled
+    if state.config.openai_chat_compatibility_check_enabled {
+        info!("OpenAI chat compatibility check enabled, verifying backend...");
+        if let Err(e) = startup_checks::run_startup_checks(&state.http_client, &state.config).await
+        {
+            tracing::error!(error = %e, "OpenAI chat compatibility check failed — exiting");
+            return Err(e.into());
+        }
+    } else {
+        info!("OpenAI chat compatibility check disabled (set OPENAI_CHAT_COMPATIBILITY_CHECK=true to enable)");
+    }
 
     // Build rate limiter
     let rate_limiter = rate_limit::build_rate_limiter(

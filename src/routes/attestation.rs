@@ -13,6 +13,9 @@ pub struct AttestationQuery {
     pub signing_algo: Option<String>,
     pub nonce: Option<String>,
     pub signing_address: Option<String>,
+    /// Include TLS certificate fingerprint in the report data.
+    /// Defaults to false; when true, report_data[..32] = SHA256(signing_address || cert_fingerprint).
+    pub include_tls_fingerprint: Option<bool>,
 }
 
 /// GET /v1/attestation/report
@@ -59,7 +62,11 @@ pub async fn attestation_report(
         &signing_address_bytes,
         query.nonce.as_deref(),
         state.config.gpu_no_hw_mode,
-        state.tls_cert_fingerprint.as_deref(),
+        if query.include_tls_fingerprint.unwrap_or(false) {
+            state.tls_cert_fingerprint.as_deref()
+        } else {
+            None
+        },
     )
     .await
     .map_err(|e| match e {

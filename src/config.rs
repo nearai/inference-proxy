@@ -1,4 +1,5 @@
 use std::env;
+use tracing::warn;
 
 fn env_or(name: &str, default: &str) -> String {
     env::var(name).unwrap_or_else(|_| default.to_string())
@@ -110,6 +111,19 @@ impl Config {
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
 
+        // Handle TLS certificate path with logging
+        let tls_cert_path = env::var("TLS_CERT_PATH")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .and_then(|path| {
+                if std::path::Path::new(&path).exists() {
+                    Some(path)
+                } else {
+                    warn!(tls_cert_path = %path, "TLS_CERT_PATH is set but file does not exist");
+                    None
+                }
+            });
+
         let config = Config {
             model_name,
             token,
@@ -125,10 +139,7 @@ impl Config {
             embeddings_url: format!("{base}/v1/embeddings"),
             rerank_url,
             score_url,
-            tls_cert_path: env::var("TLS_CERT_PATH")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .filter(|s| std::path::Path::new(s).exists()),
+            tls_cert_path,
             max_keepalive: env_int("VLLM_PROXY_MAX_KEEPALIVE", 100),
             max_request_size: env_int("VLLM_PROXY_MAX_REQUEST_SIZE", 10 * 1024 * 1024),
             max_image_request_size: env_int("VLLM_PROXY_MAX_IMAGE_REQUEST_SIZE", 50 * 1024 * 1024),

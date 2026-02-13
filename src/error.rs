@@ -8,6 +8,13 @@ pub enum AppError {
     #[error("upstream error")]
     Upstream { status: StatusCode, body: Bytes },
 
+    #[error("upstream request failed with status {status}")]
+    UpstreamParsed {
+        status: StatusCode,
+        message: String,
+        error_type: String,
+    },
+
     #[error("{0}")]
     BadRequest(String),
 
@@ -38,6 +45,22 @@ impl IntoResponse for AppError {
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(body.clone()))
                     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            }
+            AppError::UpstreamParsed {
+                status,
+                message,
+                error_type,
+            } => {
+                metrics::counter!("http_errors_total", "error_type" => "upstream").increment(1);
+                let body = serde_json::json!({
+                    "error": {
+                        "message": message,
+                        "type": error_type,
+                        "param": null,
+                        "code": null,
+                    }
+                });
+                return (*status, axum::Json(body)).into_response();
             }
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone(), "bad_request"),
             AppError::Unauthorized => (
@@ -173,6 +196,45 @@ mod tests {
         // Should NOT leak the internal error message
         assert_eq!(json["error"]["message"], "Internal server error");
         assert_eq!(json["error"]["type"], "server_error");
+    }
+
+    #[tokio::test]
+    async fn test_upstream_parsed_error() {
+        let err = AppError::UpstreamParsed {
+            status: StatusCode::BAD_REQUEST,
+            message: "This model's maximum context length is 2048 tokens".to_string(),
+            error_type: "BadRequestError".to_string(),
+        };
+        let response = err.into_response();
+        let (status, json) = response_to_json(response).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["type"], "BadRequestError");
+        assert_eq!(
+            json["error"]["message"],
+            "This model's maximum context length is 2048 tokens"
+        );
+        assert!(json["error"]["param"].is_null());
+        assert!(json["error"]["code"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_upstream_parsed_preserves_status_codes() {
+        for (code, expected_status) in [
+            (400, StatusCode::BAD_REQUEST),
+            (404, StatusCode::NOT_FOUND),
+            (422, StatusCode::UNPROCESSABLE_ENTITY),
+            (500, StatusCode::INTERNAL_SERVER_ERROR),
+            (501, StatusCode::NOT_IMPLEMENTED),
+        ] {
+            let err = AppError::UpstreamParsed {
+                status: StatusCode::from_u16(code).unwrap(),
+                message: "test".to_string(),
+                error_type: "TestError".to_string(),
+            };
+            let response = err.into_response();
+            assert_eq!(response.status(), expected_status, "status code {code}");
+        }
     }
 
     #[tokio::test]

@@ -159,21 +159,27 @@ pub async fn catch_all(
 
     let upstream_status = response.status();
     if !upstream_status.is_success() {
+        let error_body = response
+            .bytes()
+            .await
+            .unwrap_or_else(|_| bytes::Bytes::from("{}"));
+        let error_info =
+            crate::proxy::log_upstream_error(upstream_status, &backend_url, &error_body);
         let axum_status = axum::http::StatusCode::from_u16(upstream_status.as_u16())
             .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
-        let error_body = serde_json::json!({
-            "error": {
-                "message": format!("Upstream request failed with status {upstream_status}"),
-                "type": "upstream_error",
-                "param": null,
-                "code": null,
-            }
+        return Err(AppError::UpstreamParsed {
+            status: axum_status,
+            message: error_info
+                .as_ref()
+                .map(|e| e.message.clone())
+                .unwrap_or_else(|| {
+                    format!("Upstream request failed with status {upstream_status}")
+                }),
+            error_type: error_info
+                .as_ref()
+                .map(|e| e.error_type.clone())
+                .unwrap_or_else(|| "upstream_error".to_string()),
         });
-        return Ok(Response::builder()
-            .status(axum_status)
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_string(&error_body).unwrap()))
-            .unwrap());
     }
 
     let axum_status = axum::http::StatusCode::from_u16(upstream_status.as_u16())

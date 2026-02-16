@@ -59,8 +59,8 @@ fn parse_nonce(nonce: Option<&str>) -> Result<[u8; 32], AttestationError> {
         }
         None => {
             let mut arr = [0u8; 32];
-            use rand::RngCore;
-            rand::rngs::OsRng.fill_bytes(&mut arr);
+            use rand::rand_core::TryRngCore;
+            rand::rngs::OsRng.try_fill_bytes(&mut arr).unwrap();
             Ok(arr)
         }
     }

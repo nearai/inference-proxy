@@ -1,6 +1,7 @@
 use anyhow::Result;
 use ed25519_dalek::{Signer, SigningKey as Ed25519SigningKey};
 use k256::ecdsa::{signature::hazmat::PrehashSigner, RecoveryId, SigningKey as K256SigningKey};
+use rand::rand_core::TryRngCore;
 use rand::rngs::OsRng;
 use sha3::{Digest as Sha3Digest, Keccak256};
 use tracing::info;
@@ -115,8 +116,8 @@ impl SigningPair {
             info!("DEV mode: generating random signing keys");
             let mut ecdsa_bytes = [0u8; 32];
             let mut ed25519_bytes = [0u8; 32];
-            OsRng.fill_bytes(&mut ecdsa_bytes);
-            OsRng.fill_bytes(&mut ed25519_bytes);
+            OsRng.try_fill_bytes(&mut ecdsa_bytes).unwrap();
+            OsRng.try_fill_bytes(&mut ed25519_bytes).unwrap();
 
             let ecdsa = EcdsaContext::from_key_bytes(&ecdsa_bytes)?;
             let ed25519 = Ed25519Context::from_key_bytes(&ed25519_bytes)?;
@@ -185,9 +186,6 @@ impl SigningPair {
         })
     }
 }
-
-// Need to use RngCore trait for fill_bytes
-use rand::RngCore;
 
 #[cfg(test)]
 mod tests {

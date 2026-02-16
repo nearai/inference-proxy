@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Log in to Docker registry
         uses: docker/login-action@3227f5311cb93ffd14d13e65d8cc400d30f4dd8a

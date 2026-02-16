@@ -25,6 +25,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
       - name: Log in to Docker registry
         uses: docker/login-action@3227f5311cb93ffd14d13e65d8cc400d30f4dd8a
         with:

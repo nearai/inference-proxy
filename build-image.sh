@@ -42,10 +42,17 @@ fi
 
 git rev-parse HEAD > .GIT_REV
 TEMP_TAG="vllm-proxy-rs-temp:$(date +%s)"
+
+# When pushing, only produce the OCI archive (saves disk space in CI).
+# For local builds, also load into Docker daemon for convenience.
+BUILD_OUTPUTS=(--output "type=oci,dest=./oci.tar,rewrite-timestamp=true")
+if [ "$PUSH" = false ]; then
+    BUILD_OUTPUTS+=(--output "type=docker,name=$TEMP_TAG,rewrite-timestamp=true")
+fi
+
 docker buildx build --builder buildkit_20 --no-cache --platform linux/amd64 \
     --build-arg SOURCE_DATE_EPOCH="0" \
-    --output type=oci,dest=./oci.tar,rewrite-timestamp=true \
-    --output type=docker,name="$TEMP_TAG",rewrite-timestamp=true .
+    "${BUILD_OUTPUTS[@]}" .
 
 if [ "$?" -ne 0 ]; then
     echo "Build failed"

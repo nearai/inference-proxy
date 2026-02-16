@@ -68,7 +68,11 @@ echo ""
 
 if [ "$PUSH" = true ]; then
     echo "Pushing image to $REPO..."
-    skopeo copy --insecure-policy oci-archive:./oci.tar docker://"$REPO"
+    SKOPEO_AUTH=()
+    if [ -f "$HOME/.docker/config.json" ]; then
+        SKOPEO_AUTH=(--authfile "$HOME/.docker/config.json")
+    fi
+    skopeo copy --insecure-policy "${SKOPEO_AUTH[@]}" oci-archive:./oci.tar docker://"$REPO"
     echo "Image pushed successfully to $REPO"
 else
     echo "To push the image to a registry, run:"

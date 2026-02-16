@@ -116,8 +116,12 @@ impl SigningPair {
             info!("DEV mode: generating random signing keys");
             let mut ecdsa_bytes = [0u8; 32];
             let mut ed25519_bytes = [0u8; 32];
-            OsRng.try_fill_bytes(&mut ecdsa_bytes).unwrap();
-            OsRng.try_fill_bytes(&mut ed25519_bytes).unwrap();
+            OsRng
+                .try_fill_bytes(&mut ecdsa_bytes)
+                .expect("Failed to generate ECDSA key bytes");
+            OsRng
+                .try_fill_bytes(&mut ed25519_bytes)
+                .expect("Failed to generate Ed25519 key bytes");
 
             let ecdsa = EcdsaContext::from_key_bytes(&ecdsa_bytes)?;
             let ed25519 = Ed25519Context::from_key_bytes(&ed25519_bytes)?;

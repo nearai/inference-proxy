@@ -5,7 +5,8 @@ use moka::sync::Cache;
 /// In-memory cache with TTL for chat signatures.
 pub struct ChatCache {
     inner: Cache<String, String>,
-    model_name: String,
+    /// Pre-computed key prefix: "{model_name}:chat:"
+    key_prefix: String,
 }
 
 impl ChatCache {
@@ -17,12 +18,15 @@ impl ChatCache {
 
         ChatCache {
             inner,
-            model_name: model_name.to_string(),
+            key_prefix: format!("{model_name}:chat:"),
         }
     }
 
     fn make_key(&self, chat_id: &str) -> String {
-        format!("{}:chat:{}", self.model_name, chat_id)
+        let mut key = String::with_capacity(self.key_prefix.len() + chat_id.len());
+        key.push_str(&self.key_prefix);
+        key.push_str(chat_id);
+        key
     }
 
     pub fn set_chat(&self, chat_id: &str, value: &str) {

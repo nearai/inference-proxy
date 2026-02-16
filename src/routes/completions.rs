@@ -34,7 +34,7 @@ pub async fn completions(
         proxy::proxy_streaming_request(
             &state.http_client,
             &state.config.completions_url,
-            &request_body,
+            request_body,
             &opts,
         )
         .await
@@ -42,7 +42,7 @@ pub async fn completions(
         proxy::proxy_json_request(
             &state.http_client,
             &state.config.completions_url,
-            &request_body,
+            request_body,
             &opts,
         )
         .await

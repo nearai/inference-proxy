@@ -206,7 +206,7 @@ async fn json_passthrough(
     };
 
     let url = url_fn(&state.config);
-    proxy::proxy_json_request(&state.http_client, url, &request_body, &opts).await
+    proxy::proxy_json_request(&state.http_client, url, request_body, &opts).await
 }
 
 /// Read a multipart field incrementally, checking cumulative size and hashing all bytes.

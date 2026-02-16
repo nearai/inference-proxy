@@ -567,6 +567,12 @@ pub struct SseParser {
     pub seen_done: bool,
 }
 
+impl Default for SseParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SseParser {
     pub fn new() -> Self {
         Self {

@@ -27,7 +27,7 @@ sha3 = "0.10"
 subtle = "2.5"
 
 # Rate limiting
-governor = "0.8"
+governor = "0.10"
 nonzero_ext = "0.3"
 
 # Cache

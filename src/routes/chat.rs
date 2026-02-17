@@ -4,13 +4,13 @@ use axum::response::Response;
 
 use crate::auth::RequireAuth;
 use crate::error::AppError;
-use crate::proxy::{self, ProxyOpts};
+use crate::proxy::{self, make_usage_reporter, ProxyOpts, UsageType};
 use crate::AppState;
 
 /// POST /v1/chat/completions
 pub async fn chat_completions(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    auth: RequireAuth,
     body: Body,
 ) -> Result<Response, AppError> {
     let request_body = read_body_with_limit(body, state.config.max_audio_request_size).await?;
@@ -26,6 +26,19 @@ pub async fn chat_completions(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // For cloud API key requests with streaming, force include_usage
+    // so the backend always sends token counts for billing.
+    if auth.cloud_api_key.is_some() && is_stream {
+        let stream_opts = request_json
+            .get("stream_options")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let mut stream_opts = stream_opts;
+        stream_opts.insert("include_usage".into(), true.into());
+        request_json["stream_options"] = serde_json::Value::Object(stream_opts);
+    }
+
     let modified_body =
         serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?;
 
@@ -33,6 +46,8 @@ pub async fn chat_completions(
         signing: state.signing.clone(),
         cache: state.cache.clone(),
         id_prefix: "chatcmpl".to_string(),
+        usage_reporter: make_usage_reporter(auth.cloud_api_key.as_ref(), &state),
+        usage_type: UsageType::ChatCompletion,
     };
 
     if is_stream {

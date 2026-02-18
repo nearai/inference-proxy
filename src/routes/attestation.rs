@@ -3,7 +3,6 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::Deserialize;
 
-use crate::auth::RequireAuth;
 use crate::error::AppError;
 use crate::types::AttestationResponse;
 use crate::AppState;
@@ -21,7 +20,6 @@ pub struct AttestationQuery {
 /// GET /v1/attestation/report
 pub async fn attestation_report(
     State(state): State<AppState>,
-    _auth: RequireAuth,
     Query(query): Query<AttestationQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let signing_algo = query.signing_algo.as_deref().unwrap_or("ecdsa");

@@ -1201,7 +1201,7 @@ async fn test_streaming_signature_cached_and_verifiable() {
 // ---- Attestation endpoint ----
 
 #[tokio::test]
-async fn test_attestation_requires_auth() {
+async fn test_attestation_is_public() {
     let app = build_test_app("http://unused");
 
     let response = app
@@ -1214,7 +1214,9 @@ async fn test_attestation_requires_auth() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // Attestation is a public endpoint — should not return 401.
+    // Without dstack it will return 500, which is expected in tests.
+    assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

@@ -25,6 +25,11 @@ pub fn build_router() -> Router<AppState> {
         // Unauthenticated backend metrics/models
         .route("/v1/metrics", get(metrics::metrics))
         .route("/v1/models", get(metrics::models))
+        // Unauthenticated attestation report
+        .route(
+            "/v1/attestation/report",
+            get(attestation::attestation_report),
+        )
         // Authenticated endpoints
         .route("/v1/chat/completions", post(chat::chat_completions))
         .route("/v1/completions", post(completions::completions))
@@ -42,9 +47,5 @@ pub fn build_router() -> Router<AppState> {
             post(passthrough::audio_transcriptions),
         )
         .route("/v1/signature/{chat_id}", get(signature::signature))
-        .route(
-            "/v1/attestation/report",
-            get(attestation::attestation_report),
-        )
         .fallback(catch_all::catch_all)
 }

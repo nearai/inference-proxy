@@ -81,7 +81,14 @@ impl EcdsaContext {
         sig_bytes[..64].copy_from_slice(&signature.to_bytes());
         sig_bytes[64] = recovery_id.to_byte() + 27;
 
-        Ok(format!("0x{}", hex::encode(sig_bytes)))
+        // Encode to stack buffer to avoid intermediate String allocation
+        let mut hex_buf = [0u8; 130];
+        hex::encode_to_slice(sig_bytes, &mut hex_buf).expect("buffer is exactly 2*65");
+        let mut result = String::with_capacity(132);
+        result.push_str("0x");
+        // Safety: hex::encode_to_slice produces ASCII hex chars
+        result.push_str(std::str::from_utf8(&hex_buf).expect("hex is valid ASCII"));
+        Ok(result)
     }
 }
 

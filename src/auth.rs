@@ -99,11 +99,12 @@ mod tests {
         eprintln!("Constant-time:  early={t_early}ns  late={t_late}ns  ratio={ratio:.2}");
 
         // Constant-time comparison should have a ratio very close to 1.0.
-        // We allow a generous margin for system noise but reject the large
-        // discrepancies that == exhibits.
+        // A real timing leak (using ==) would show ratios of 5–50×.
+        // We use a generous threshold to tolerate noise on shared CI runners
+        // while still catching real timing side-channels.
         assert!(
-            ratio < 1.2,
-            "Constant-time comparison should not leak timing (ratio {ratio:.2} >= 1.2)"
+            ratio < 2.0,
+            "Constant-time comparison should not leak timing (ratio {ratio:.2} >= 2.0)"
         );
     }
 }

@@ -12,7 +12,7 @@ use crate::error::AppError;
 use crate::signing::SigningPair;
 
 /// Parsed upstream error info for logging and re-wrapping.
-pub(crate) struct UpstreamErrorInfo {
+pub struct UpstreamErrorInfo {
     pub message: String,
     pub error_type: String,
 }
@@ -21,7 +21,7 @@ pub(crate) struct UpstreamErrorInfo {
 /// Handles both vLLM flat format (`{"object":"error","message":"...","type":"..."}`)
 /// and nested format (`{"error":{"message":"...","type":"..."}}`).
 /// Returns None if the body is not parseable JSON with the expected fields.
-pub(crate) fn parse_upstream_error(body: &[u8]) -> Option<UpstreamErrorInfo> {
+pub fn parse_upstream_error(body: &[u8]) -> Option<UpstreamErrorInfo> {
     let json: serde_json::Value = serde_json::from_slice(body).ok()?;
 
     // Try nested format first: {"error": {"message": "...", "type": "..."}}
@@ -80,17 +80,17 @@ pub struct ProxyOpts {
 pub async fn proxy_json_request(
     client: &reqwest::Client,
     url: &str,
-    request_body: &[u8],
+    request_body: Vec<u8>,
     opts: &ProxyOpts,
 ) -> Result<Response, AppError> {
-    let request_sha256 = hex::encode(Sha256::digest(request_body));
+    let request_sha256 = hex::encode(Sha256::digest(&request_body));
 
     let upstream_start = std::time::Instant::now();
     let response = client
         .post(url)
         .header("content-type", "application/json")
         .header("accept", "application/json")
-        .body(request_body.to_vec())
+        .body(request_body)
         .send()
         .await
         .map_err(|e| AppError::Internal(e.into()))?;
@@ -158,17 +158,17 @@ pub async fn proxy_json_request(
 pub async fn proxy_streaming_request(
     client: &reqwest::Client,
     url: &str,
-    request_body: &[u8],
+    request_body: Vec<u8>,
     opts: &ProxyOpts,
 ) -> Result<Response, AppError> {
-    let request_sha256 = hex::encode(Sha256::digest(request_body));
+    let request_sha256 = hex::encode(Sha256::digest(&request_body));
 
     let upstream_start = std::time::Instant::now();
     let response = client
         .post(url)
         .header("content-type", "application/json")
         .header("accept", "text/event-stream")
-        .body(request_body.to_vec())
+        .body(request_body)
         .send()
         .await
         .map_err(|e| AppError::Internal(e.into()))?;
@@ -561,14 +561,20 @@ impl Drop for StreamingGuard {
 
 /// Line-buffered SSE parser that handles data split across chunk boundaries.
 /// Extracts `chat_id` from the first JSON chunk and detects the `[DONE]` marker.
-pub(crate) struct SseParser {
+pub struct SseParser {
     line_buffer: String,
     pub chat_id: Option<String>,
     pub seen_done: bool,
 }
 
+impl Default for SseParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SseParser {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             line_buffer: String::new(),
             chat_id: None,
@@ -576,37 +582,59 @@ impl SseParser {
         }
     }
 
-    fn process_chunk(&mut self, chunk: &[u8]) {
-        let chunk_str = String::from_utf8_lossy(chunk);
-        self.line_buffer.push_str(&chunk_str);
+    pub fn process_chunk(&mut self, chunk: &[u8]) {
+        match std::str::from_utf8(chunk) {
+            Ok(s) => self.line_buffer.push_str(s),
+            Err(_) => self.line_buffer.push_str(&String::from_utf8_lossy(chunk)),
+        }
 
-        // Process all complete lines in the buffer
-        while let Some(newline_pos) = self.line_buffer.find('\n') {
-            let line = self.line_buffer[..newline_pos]
-                .trim_end_matches('\r')
-                .to_string();
-            self.line_buffer = self.line_buffer[newline_pos + 1..].to_string();
+        // Process all complete lines in the buffer.
+        // We extract state changes from borrowed data first, then mutate,
+        // to avoid allocating a String copy of each line.
+        loop {
+            let Some(newline_pos) = self.line_buffer.find('\n') else {
+                break;
+            };
 
-            let data = line
-                .strip_prefix("data: ")
-                .or_else(|| line.strip_prefix("data:"))
-                .unwrap_or(&line)
-                .trim();
+            let line_end =
+                if newline_pos > 0 && self.line_buffer.as_bytes()[newline_pos - 1] == b'\r' {
+                    newline_pos - 1
+                } else {
+                    newline_pos
+                };
 
-            if data.is_empty() {
-                continue;
-            }
-            if data == "[DONE]" {
-                self.seen_done = true;
-                continue;
-            }
-            if self.chat_id.is_none() {
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
-                    if let Some(id) = parsed.get("id").and_then(|v| v.as_str()) {
-                        self.chat_id = Some(id.to_string());
-                    }
+            // Borrow the line from the buffer, extract what we need, then release the borrow
+            let (is_done, extracted_id) = {
+                let line = &self.line_buffer[..line_end];
+                let data = line
+                    .strip_prefix("data: ")
+                    .or_else(|| line.strip_prefix("data:"))
+                    .unwrap_or(line)
+                    .trim();
+
+                if data.is_empty() {
+                    (false, None)
+                } else if data == "[DONE]" {
+                    (true, None)
+                } else if self.chat_id.is_none() {
+                    let id = serde_json::from_str::<serde_json::Value>(data)
+                        .ok()
+                        .and_then(|v| v.get("id").and_then(|id| id.as_str().map(String::from)));
+                    (false, id)
+                } else {
+                    (false, None)
                 }
+            };
+
+            if is_done {
+                self.seen_done = true;
             }
+            if let Some(id) = extracted_id {
+                self.chat_id = Some(id);
+            }
+
+            // Remove the processed line in-place (no allocation, just memmove)
+            self.line_buffer.drain(..newline_pos + 1);
         }
     }
 }

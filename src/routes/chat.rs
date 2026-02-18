@@ -39,7 +39,7 @@ pub async fn chat_completions(
         proxy::proxy_streaming_request(
             &state.http_client,
             &state.config.chat_completions_url,
-            &modified_body,
+            modified_body,
             &opts,
         )
         .await
@@ -47,7 +47,7 @@ pub async fn chat_completions(
         proxy::proxy_json_request(
             &state.http_client,
             &state.config.chat_completions_url,
-            &modified_body,
+            modified_body,
             &opts,
         )
         .await

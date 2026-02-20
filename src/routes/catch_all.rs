@@ -7,7 +7,7 @@ use tracing::debug;
 
 use crate::auth::RequireAuth;
 use crate::error::AppError;
-use crate::proxy::{self, ProxyOpts};
+use crate::proxy::{self, make_usage_reporter, ProxyOpts, UsageType};
 use crate::routes::chat::read_body_with_limit;
 use crate::AppState;
 
@@ -95,7 +95,7 @@ fn validate_path(path: &str) -> Result<(), AppError> {
 /// JSON or SSE streaming.
 pub async fn catch_all(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    auth: RequireAuth,
     method: Method,
     uri: OriginalUri,
     headers: HeaderMap,
@@ -193,11 +193,15 @@ pub async fn catch_all(
         .unwrap_or("")
         .to_string();
 
+    let reporter = make_usage_reporter(auth.cloud_api_key.as_ref(), &state);
+
     if content_type.contains("text/event-stream") {
         let opts = ProxyOpts {
             signing: state.signing.clone(),
             cache: state.cache.clone(),
             id_prefix: "pt".to_string(),
+            usage_reporter: reporter,
+            usage_type: UsageType::ChatCompletion,
         };
         proxy::proxy_streaming_response(response, &request_sha256, &opts, axum_status).await
     } else if content_type.contains("application/json") {
@@ -217,6 +221,8 @@ pub async fn catch_all(
             signing: state.signing.clone(),
             cache: state.cache.clone(),
             id_prefix: "pt".to_string(),
+            usage_reporter: reporter,
+            usage_type: UsageType::ChatCompletion,
         };
         proxy::sign_and_cache_json_response(&response_bytes, &request_sha256, &opts, axum_status)
             .await

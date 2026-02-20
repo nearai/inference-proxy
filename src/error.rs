@@ -21,6 +21,9 @@ pub enum AppError {
     #[error("unauthorized")]
     Unauthorized,
 
+    #[error("insufficient credits")]
+    InsufficientCredits,
+
     #[error("{0}")]
     NotFound(String),
 
@@ -67,6 +70,11 @@ impl IntoResponse for AppError {
                 StatusCode::UNAUTHORIZED,
                 "Invalid or missing Authorization header".to_string(),
                 "unauthorized",
+            ),
+            AppError::InsufficientCredits => (
+                StatusCode::PAYMENT_REQUIRED,
+                "Insufficient credits".to_string(),
+                "insufficient_credits",
             ),
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone(), "not_found"),
             AppError::PayloadTooLarge { max_size } => (

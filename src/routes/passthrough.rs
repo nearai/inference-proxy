@@ -6,7 +6,7 @@ use sha2::Digest;
 
 use crate::auth::RequireAuth;
 use crate::error::AppError;
-use crate::proxy::{self, ProxyOpts};
+use crate::proxy::{self, make_usage_reporter, ProxyOpts, UsageReporter, UsageType};
 use crate::routes::chat::read_body_with_limit;
 use crate::AppState;
 
@@ -34,15 +34,18 @@ pub async fn tokenize(
 /// POST /v1/embeddings — JSON proxy with signing.
 pub async fn embeddings(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    auth: RequireAuth,
     body: Body,
 ) -> Result<Response, AppError> {
+    let reporter = make_usage_reporter(auth.cloud_api_key.as_ref(), &state);
     json_passthrough(
         state,
         body,
         |c| &c.embeddings_url,
         "emb",
         |c| c.max_request_size,
+        reporter,
+        UsageType::ChatCompletion,
     )
     .await
 }
@@ -50,15 +53,18 @@ pub async fn embeddings(
 /// POST /v1/rerank — JSON proxy with signing.
 pub async fn rerank(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    auth: RequireAuth,
     body: Body,
 ) -> Result<Response, AppError> {
+    let reporter = make_usage_reporter(auth.cloud_api_key.as_ref(), &state);
     json_passthrough(
         state,
         body,
         |c| &c.rerank_url,
         "rerank",
         |c| c.max_request_size,
+        reporter,
+        UsageType::ChatCompletion,
     )
     .await
 }
@@ -66,15 +72,18 @@ pub async fn rerank(
 /// POST /v1/score — JSON proxy with signing.
 pub async fn score(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    auth: RequireAuth,
     body: Body,
 ) -> Result<Response, AppError> {
+    let reporter = make_usage_reporter(auth.cloud_api_key.as_ref(), &state);
     json_passthrough(
         state,
         body,
         |c| &c.score_url,
         "score",
         |c| c.max_request_size,
+        reporter,
+        UsageType::ChatCompletion,
     )
     .await
 }
@@ -82,15 +91,18 @@ pub async fn score(
 /// POST /v1/images/generations — JSON proxy with signing, 50MB limit.
 pub async fn images_generations(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    auth: RequireAuth,
     body: Body,
 ) -> Result<Response, AppError> {
+    let reporter = make_usage_reporter(auth.cloud_api_key.as_ref(), &state);
     json_passthrough(
         state,
         body,
         |c| &c.images_url,
         "img",
         |c| c.max_image_request_size,
+        reporter,
+        UsageType::ImageGeneration,
     )
     .await
 }
@@ -98,7 +110,7 @@ pub async fn images_generations(
 /// POST /v1/images/edits — multipart proxy with signing.
 pub async fn images_edits(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    auth: RequireAuth,
     mut multipart: Multipart,
 ) -> Result<Response, AppError> {
     let max_size = state.config.max_image_request_size;
@@ -127,6 +139,8 @@ pub async fn images_edits(
         signing: state.signing.clone(),
         cache: state.cache.clone(),
         id_prefix: "img".to_string(),
+        usage_reporter: make_usage_reporter(auth.cloud_api_key.as_ref(), &state),
+        usage_type: UsageType::ImageGeneration,
     };
 
     proxy::proxy_multipart_request(
@@ -142,7 +156,7 @@ pub async fn images_edits(
 /// POST /v1/audio/transcriptions — multipart proxy with signing.
 pub async fn audio_transcriptions(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    auth: RequireAuth,
     mut multipart: Multipart,
 ) -> Result<Response, AppError> {
     let max_size = state.config.max_audio_request_size;
@@ -171,6 +185,8 @@ pub async fn audio_transcriptions(
         signing: state.signing.clone(),
         cache: state.cache.clone(),
         id_prefix: "trans".to_string(),
+        usage_reporter: make_usage_reporter(auth.cloud_api_key.as_ref(), &state),
+        usage_type: UsageType::ChatCompletion,
     };
 
     proxy::proxy_multipart_request(
@@ -190,6 +206,8 @@ async fn json_passthrough(
     url_fn: fn(&crate::config::Config) -> &str,
     id_prefix: &str,
     size_fn: fn(&crate::config::Config) -> usize,
+    usage_reporter: Option<UsageReporter>,
+    usage_type: UsageType,
 ) -> Result<Response, AppError> {
     let max_size = size_fn(&state.config);
     let request_body = read_body_with_limit(body, max_size).await?;
@@ -201,8 +219,9 @@ async fn json_passthrough(
     let opts = ProxyOpts {
         signing: state.signing.clone(),
         cache: state.cache.clone(),
-
         id_prefix: id_prefix.to_string(),
+        usage_reporter,
+        usage_type,
     };
 
     let url = url_fn(&state.config);

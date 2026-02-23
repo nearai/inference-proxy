@@ -4,7 +4,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::middleware;
 use tower::ServiceExt;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // Import from the crate
@@ -49,6 +49,7 @@ fn build_test_app_with_rate_limit(
         rate_limit_per_second: rate_per_second,
         rate_limit_burst_size: rate_burst,
         rate_limit_trust_proxy_headers: true,
+        cloud_api_url: None,
         tls_cert_path: None,
         timeout_secs: 30,
         timeout_tokenize_secs: 5,
@@ -2676,4 +2677,724 @@ async fn body_to_bytes(response: axum::http::Response<Body>) -> Vec<u8> {
         .unwrap()
         .to_bytes()
         .to_vec()
+}
+
+// ---- Cloud API key validation ----
+
+/// Build a test app with cloud_api_url configured.
+fn build_test_app_with_cloud_api(mock_url: &str, cloud_api_url: &str) -> axum::Router {
+    let base = mock_url.trim_end_matches('/');
+
+    let config = config::Config {
+        model_name: "test-model".to_string(),
+        token: "test-token".to_string(),
+        vllm_base_url: mock_url.to_string(),
+        chat_completions_url: format!("{base}/v1/chat/completions"),
+        completions_url: format!("{base}/v1/completions"),
+        tokenize_url: format!("{base}/tokenize"),
+        metrics_url: format!("{base}/metrics"),
+        models_url: format!("{base}/v1/models"),
+        images_url: format!("{base}/v1/images/generations"),
+        images_edits_url: format!("{base}/v1/images/edits"),
+        transcriptions_url: format!("{base}/v1/audio/transcriptions"),
+        embeddings_url: format!("{base}/v1/embeddings"),
+        rerank_url: format!("{base}/v1/rerank"),
+        score_url: format!("{base}/v1/score"),
+        max_keepalive: 5,
+        max_request_size: 1024 * 1024,
+        max_image_request_size: 5 * 1024 * 1024,
+        max_audio_request_size: 10 * 1024 * 1024,
+        chat_cache_expiration_secs: 1200,
+        cloud_api_url: Some(cloud_api_url.to_string()),
+        dev_mode: true,
+        gpu_no_hw_mode: true,
+        git_rev: "test-rev".to_string(),
+        rate_limit_per_second: 100,
+        rate_limit_burst_size: 200,
+        rate_limit_trust_proxy_headers: true,
+        tls_cert_path: None,
+        timeout_secs: 30,
+        timeout_tokenize_secs: 5,
+        openai_chat_compatibility_check_enabled: false,
+        startup_check_retries: 1,
+        startup_check_retry_delay_secs: 0,
+        startup_check_timeout_secs: 5,
+    };
+
+    let ecdsa_key: [u8; 32] = [
+        0xac, 0x09, 0x74, 0xbe, 0xc3, 0x9a, 0x17, 0xe3, 0x6b, 0xa4, 0xa6, 0xb4, 0xd2, 0x38, 0xff,
+        0x94, 0x4b, 0xac, 0xb3, 0x5e, 0x5d, 0xc4, 0xaf, 0x0f, 0x33, 0x47, 0xe5, 0x87, 0x31, 0x79,
+        0x67, 0x0f,
+    ];
+    let ed25519_key: [u8; 32] = [
+        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
+        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
+        0x7f, 0x60,
+    ];
+
+    let ecdsa = signing::EcdsaContext::from_key_bytes(&ecdsa_key).unwrap();
+    let ed25519 = signing::Ed25519Context::from_key_bytes(&ed25519_key).unwrap();
+    let signing_pair = signing::SigningPair { ecdsa, ed25519 };
+    let chat_cache = cache::ChatCache::new("test-model", 1200);
+    let http_client = reqwest::Client::new();
+
+    let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .build_recorder()
+        .handle();
+
+    let state = AppState {
+        config: Arc::new(config),
+        signing: Arc::new(signing_pair),
+        cache: Arc::new(chat_cache),
+        http_client,
+        metrics_handle,
+        tls_cert_fingerprint: None,
+    };
+
+    let rate_limiter = rate_limit::build_rate_limiter(100, 200);
+    let rate_limit_state = rate_limit::RateLimitState {
+        limiter: rate_limiter,
+        trust_proxy_headers: true,
+    };
+
+    routes::build_router()
+        .layer(middleware::from_fn(rate_limit::rate_limit_middleware))
+        .layer(axum::Extension(rate_limit_state))
+        .layer(middleware::from_fn(request_id_middleware))
+        .with_state(state)
+}
+
+#[tokio::test]
+async fn test_cloud_api_key_valid() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+
+    // Mock the cloud API check endpoint to return 200
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .and(header(
+            "authorization",
+            "Bearer sk-test-valid-key-12345678901",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})))
+        .mount(&cloud_api)
+        .await;
+
+    // Mock the backend chat completions
+    let backend_response = serde_json::json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "model": "test-model",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&backend_response))
+        .mount(&backend)
+        .await;
+
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_cloud_api_key_unauthorized() {
+    let cloud_api = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": {"message": "Invalid or expired API key", "type": "invalid_api_key", "param": null, "code": null}
+        })))
+        .mount(&cloud_api)
+        .await;
+
+    let app = build_test_app_with_cloud_api("http://unused", &cloud_api.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-invalid-key-00000000000000")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_cloud_api_key_insufficient_credits() {
+    let cloud_api = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(402))
+        .mount(&cloud_api)
+        .await;
+
+    let app = build_test_app_with_cloud_api("http://unused", &cloud_api.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-nocredits-key-0000000000000")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    let body = body_to_json(response).await;
+    assert_eq!(body["error"]["type"], "insufficient_credits");
+}
+
+#[tokio::test]
+async fn test_cloud_api_key_rate_limited() {
+    let cloud_api = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(429))
+        .mount(&cloud_api)
+        .await;
+
+    let app = build_test_app_with_cloud_api("http://unused", &cloud_api.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-ratelimited-key-000000000000")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn test_proxy_token_still_works_with_cloud_api_configured() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+
+    let backend_response = serde_json::json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "model": "test-model",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&backend_response))
+        .mount(&backend)
+        .await;
+
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+
+    // Use the proxy token (test-token), not an sk- key
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test-token")
+                .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_sk_token_rejected_without_cloud_api_url() {
+    // No cloud_api_url configured (using default build_test_app)
+    let app = build_test_app("http://unused");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-some-key-without-cloud-api")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ---- Usage reporting for cloud API keys ----
+
+/// Helper: wait for async usage report to be received (max 2s).
+async fn wait_for_usage_request(cloud_api: &MockServer, min_count: usize) {
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let reqs = cloud_api.received_requests().await.unwrap_or_default();
+        let usage_reqs: Vec<_> = reqs
+            .iter()
+            .filter(|r| r.url.path() == "/v1/usage")
+            .collect();
+        if usage_reqs.len() >= min_count {
+            return;
+        }
+    }
+}
+
+/// Helper: extract usage requests from a mock server.
+async fn get_usage_requests(cloud_api: &MockServer) -> Vec<serde_json::Value> {
+    cloud_api
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == "/v1/usage")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn test_usage_reported_for_cloud_api_key_non_streaming() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_api)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/usage"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_api)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-usage1",
+            "object": "chat.completion",
+            "model": "test-model",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        })))
+        .mount(&backend)
+        .await;
+
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Wait for the async usage report
+    wait_for_usage_request(&cloud_api, 1).await;
+    let usage_reqs = get_usage_requests(&cloud_api).await;
+    assert_eq!(usage_reqs.len(), 1, "Expected exactly one usage report");
+    assert_eq!(usage_reqs[0]["type"], "chat_completion");
+    assert_eq!(usage_reqs[0]["model"], "test-model");
+    assert_eq!(usage_reqs[0]["input_tokens"], 10);
+    assert_eq!(usage_reqs[0]["output_tokens"], 5);
+    assert!(usage_reqs[0]["id"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn test_usage_reported_for_streaming_chat_with_cloud_api_key() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_api)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/usage"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_api)
+        .await;
+
+    // SSE streaming response with usage in final chunk
+    let sse_body = "\
+data: {\"id\":\"chatcmpl-stream-u1\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"index\":0}]}\n\n\
+data: {\"id\":\"chatcmpl-stream-u1\",\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":3,\"total_tokens\":11}}\n\n\
+data: [DONE]\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_body),
+        )
+        .mount(&backend)
+        .await;
+
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": true
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Consume the streaming body so the background task finishes
+    use http_body_util::BodyExt;
+    let _ = response.into_body().collect().await;
+
+    wait_for_usage_request(&cloud_api, 1).await;
+    let usage_reqs = get_usage_requests(&cloud_api).await;
+    assert_eq!(usage_reqs.len(), 1, "Expected exactly one usage report");
+    assert_eq!(usage_reqs[0]["type"], "chat_completion");
+    assert_eq!(usage_reqs[0]["input_tokens"], 8);
+    assert_eq!(usage_reqs[0]["output_tokens"], 3);
+}
+
+#[tokio::test]
+async fn test_no_usage_reported_for_proxy_token() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-proxy1",
+            "object": "chat.completion",
+            "model": "test-model",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        })))
+        .mount(&backend)
+        .await;
+
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test-token")
+                .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Give time for any potential usage report (there shouldn't be one)
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let usage_reqs = get_usage_requests(&cloud_api).await;
+    assert_eq!(
+        usage_reqs.len(),
+        0,
+        "Proxy-token request should NOT report usage"
+    );
+}
+
+#[tokio::test]
+async fn test_usage_report_failure_does_not_affect_response() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_api)
+        .await;
+
+    // Usage endpoint returns 500 — should not affect the client response
+    Mock::given(method("POST"))
+        .and(path("/v1/usage"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&cloud_api)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-fail1",
+            "object": "chat.completion",
+            "model": "test-model",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "works"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
+        })))
+        .mount(&backend)
+        .await;
+
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Client should still get a successful response despite usage POST failure
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response).await;
+    assert_eq!(body["choices"][0]["message"]["content"], "works");
+}
+
+#[tokio::test]
+async fn test_usage_reported_for_image_generation() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_api)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/usage"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_api)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/images/generations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [
+                {"url": "https://example.com/img1.png"},
+                {"url": "https://example.com/img2.png"}
+            ]
+        })))
+        .mount(&backend)
+        .await;
+
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "prompt": "a sunset",
+        "n": 2
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/images/generations")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    wait_for_usage_request(&cloud_api, 1).await;
+    let usage_reqs = get_usage_requests(&cloud_api).await;
+    assert_eq!(usage_reqs.len(), 1, "Expected exactly one usage report");
+    assert_eq!(usage_reqs[0]["type"], "image_generation");
+    assert_eq!(usage_reqs[0]["model"], "test-model");
+    assert_eq!(usage_reqs[0]["image_count"], 2);
+}
+
+#[tokio::test]
+async fn test_usage_reported_for_embeddings() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_api)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/usage"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_api)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "emb-test1",
+            "data": [{"embedding": [0.1, 0.2], "index": 0}],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 0, "total_tokens": 4}
+        })))
+        .mount(&backend)
+        .await;
+
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "input": "hello world"
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    wait_for_usage_request(&cloud_api, 1).await;
+    let usage_reqs = get_usage_requests(&cloud_api).await;
+    assert_eq!(usage_reqs.len(), 1, "Expected exactly one usage report");
+    assert_eq!(usage_reqs[0]["type"], "chat_completion");
+    assert_eq!(usage_reqs[0]["input_tokens"], 4);
+    assert_eq!(usage_reqs[0]["output_tokens"], 0);
+}
+
+#[tokio::test]
+async fn test_streaming_includes_usage_injected_for_cloud_key() {
+    use wiremock::matchers::body_string_contains;
+
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_api)
+        .await;
+
+    // Verify the backend receives include_usage: true
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("\"include_usage\":true"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string("data: {\"id\":\"chatcmpl-iu\",\"choices\":[{\"delta\":{\"content\":\"ok\"},\"index\":0}]}\n\ndata: [DONE]\n\n"),
+        )
+        .expect(1)
+        .mount(&backend)
+        .await;
+
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": true
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    // Mock expect(1) will verify the backend received include_usage:true
 }

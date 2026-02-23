@@ -10,6 +10,7 @@ use tracing::{debug, error, info, warn};
 use crate::cache::ChatCache;
 use crate::error::AppError;
 use crate::signing::SigningPair;
+use crate::AppState;
 
 /// Parsed upstream error info for logging and re-wrapping.
 pub struct UpstreamErrorInfo {
@@ -68,12 +69,124 @@ pub(crate) fn log_upstream_error(
     info
 }
 
+/// Reports usage to the cloud API for billing.
+#[derive(Clone)]
+pub struct UsageReporter {
+    pub http_client: reqwest::Client,
+    pub cloud_api_url: String,
+    pub api_key: String,
+    pub model_name: String,
+}
+
+/// What kind of usage to extract from the response.
+#[derive(Clone, Default)]
+pub enum UsageType {
+    /// Extract prompt_tokens / completion_tokens from the `usage` object.
+    #[default]
+    ChatCompletion,
+    /// Count items in the `data` array (for image generation).
+    ImageGeneration,
+}
+
+/// Build a `UsageReporter` if the request was authenticated with a cloud API key.
+pub fn make_usage_reporter(
+    cloud_api_key: Option<&String>,
+    state: &AppState,
+) -> Option<UsageReporter> {
+    let key = cloud_api_key?;
+    let url = state.config.cloud_api_url.as_ref()?;
+    Some(UsageReporter {
+        http_client: state.http_client.clone(),
+        cloud_api_url: url.clone(),
+        api_key: key.clone(),
+        model_name: state.config.model_name.clone(),
+    })
+}
+
+/// Extract usage from a parsed JSON response and fire-and-forget a report to the cloud API.
+fn try_report_usage(response_data: &serde_json::Value, id: &str, opts: &ProxyOpts) {
+    let reporter = match &opts.usage_reporter {
+        Some(r) => r,
+        None => return,
+    };
+    let body = match &opts.usage_type {
+        UsageType::ChatCompletion => {
+            let usage = match response_data.get("usage") {
+                Some(u) => u,
+                None => return,
+            };
+            let input = usage
+                .get("prompt_tokens")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let output = usage
+                .get("completion_tokens")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            if input == 0 && output == 0 {
+                return;
+            }
+            serde_json::json!({
+                "type": "chat_completion",
+                "model": reporter.model_name,
+                "input_tokens": input,
+                "output_tokens": output,
+                "id": id,
+            })
+        }
+        UsageType::ImageGeneration => {
+            let count = response_data
+                .get("data")
+                .and_then(|d| d.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            if count == 0 {
+                return;
+            }
+            serde_json::json!({
+                "type": "image_generation",
+                "model": reporter.model_name,
+                "image_count": count,
+                "id": id,
+            })
+        }
+    };
+    spawn_usage_report(reporter, body);
+}
+
+/// Fire-and-forget POST to the cloud API usage endpoint.
+fn spawn_usage_report(reporter: &UsageReporter, body: serde_json::Value) {
+    let client = reporter.http_client.clone();
+    let url = format!("{}/v1/usage", reporter.cloud_api_url);
+    let auth = format!("Bearer {}", reporter.api_key);
+    tokio::spawn(async move {
+        match client
+            .post(&url)
+            .header("authorization", &auth)
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+        {
+            Ok(resp) if !resp.status().is_success() => {
+                warn!(status = %resp.status(), "Usage reporting returned non-success");
+            }
+            Err(e) => warn!(error = %e, "Usage reporting failed"),
+            _ => {}
+        }
+    });
+}
+
 /// Options for proxy requests that need signing.
 pub struct ProxyOpts {
     pub signing: Arc<SigningPair>,
     pub cache: Arc<ChatCache>,
     /// Prefix for auto-generated IDs (e.g., "chatcmpl", "img", "emb").
     pub id_prefix: String,
+    /// If set, report usage to the cloud API after a successful response.
+    pub usage_reporter: Option<UsageReporter>,
+    /// What kind of usage to extract from the response.
+    pub usage_type: UsageType,
 }
 
 /// Proxy a JSON request to the backend, sign the response, cache signature.
@@ -146,6 +259,9 @@ pub async fn proxy_json_request(
     let signed_json = serde_json::to_string(&signed).map_err(|e| AppError::Internal(e.into()))?;
     opts.cache.set_chat(&chat_id, &signed_json);
 
+    // Report usage for cloud API key requests
+    try_report_usage(&response_data, &chat_id, opts);
+
     Ok((
         StatusCode::OK,
         [("content-type", "application/json")],
@@ -187,6 +303,7 @@ pub async fn proxy_streaming_request(
 
     let signing = opts.signing.clone();
     let cache = opts.cache.clone();
+    let usage_reporter = opts.usage_reporter.clone();
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
@@ -237,17 +354,29 @@ pub async fn proxy_streaming_request(
         // Only sign and cache for a fully completed stream
         if !upstream_error && !downstream_closed && parser.seen_done {
             let response_sha256 = hex::encode(hasher.finalize());
-            if let Some(id) = parser.chat_id {
+            if let Some(ref id) = parser.chat_id {
                 let text = format!("{request_sha256}:{response_sha256}");
                 match signing.sign_chat(&text) {
                     Ok(signed) => {
                         if let Ok(signed_json) = serde_json::to_string(&signed) {
-                            cache.set_chat(&id, &signed_json);
+                            cache.set_chat(id, &signed_json);
                         }
                     }
                     Err(e) => {
                         error!(error = %e, "Signing failed for streaming response");
                     }
+                }
+
+                // Report usage for cloud API key requests
+                if let (Some(reporter), Some((input, output))) = (&usage_reporter, parser.usage) {
+                    let body = serde_json::json!({
+                        "type": "chat_completion",
+                        "model": reporter.model_name,
+                        "input_tokens": input,
+                        "output_tokens": output,
+                        "id": id,
+                    });
+                    spawn_usage_report(reporter, body);
                 }
             } else {
                 error!("Chat id could not be extracted from the completed streaming response");
@@ -335,6 +464,9 @@ pub async fn proxy_multipart_request(
     })?;
     let signed_json = serde_json::to_string(&signed).map_err(|e| AppError::Internal(e.into()))?;
     opts.cache.set_chat(&response_id, &signed_json);
+
+    // Report usage for cloud API key requests
+    try_report_usage(&response_data, &response_id, opts);
 
     Ok((
         StatusCode::OK,
@@ -442,6 +574,9 @@ pub async fn sign_and_cache_json_response(
     let signed_json = serde_json::to_string(&signed).map_err(|e| AppError::Internal(e.into()))?;
     opts.cache.set_chat(&chat_id, &signed_json);
 
+    // Report usage for cloud API key requests
+    try_report_usage(&response_data, &chat_id, opts);
+
     Ok(Response::builder()
         .status(status)
         .header("content-type", "application/json")
@@ -459,6 +594,7 @@ pub async fn proxy_streaming_response(
 ) -> Result<Response, AppError> {
     let signing = opts.signing.clone();
     let cache = opts.cache.clone();
+    let usage_reporter = opts.usage_reporter.clone();
     let request_sha256 = request_sha256.to_string();
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
@@ -506,17 +642,29 @@ pub async fn proxy_streaming_response(
 
         if !upstream_error && !downstream_closed && parser.seen_done {
             let response_sha256 = hex::encode(hasher.finalize());
-            if let Some(id) = parser.chat_id {
+            if let Some(ref id) = parser.chat_id {
                 let text = format!("{request_sha256}:{response_sha256}");
                 match signing.sign_chat(&text) {
                     Ok(signed) => {
                         if let Ok(signed_json) = serde_json::to_string(&signed) {
-                            cache.set_chat(&id, &signed_json);
+                            cache.set_chat(id, &signed_json);
                         }
                     }
                     Err(e) => {
                         error!(error = %e, "Signing failed for streaming response");
                     }
+                }
+
+                // Report usage for cloud API key requests
+                if let (Some(reporter), Some((input, output))) = (&usage_reporter, parser.usage) {
+                    let body = serde_json::json!({
+                        "type": "chat_completion",
+                        "model": reporter.model_name,
+                        "input_tokens": input,
+                        "output_tokens": output,
+                        "id": id,
+                    });
+                    spawn_usage_report(reporter, body);
                 }
             } else {
                 error!("Chat id could not be extracted from the completed streaming response");
@@ -565,6 +713,8 @@ pub struct SseParser {
     line_buffer: String,
     pub chat_id: Option<String>,
     pub seen_done: bool,
+    /// Token usage extracted from the final SSE chunk (prompt_tokens, completion_tokens).
+    pub usage: Option<(i64, i64)>,
 }
 
 impl Default for SseParser {
@@ -579,6 +729,7 @@ impl SseParser {
             line_buffer: String::new(),
             chat_id: None,
             seen_done: false,
+            usage: None,
         }
     }
 
@@ -604,7 +755,7 @@ impl SseParser {
                 };
 
             // Borrow the line from the buffer, extract what we need, then release the borrow
-            let (is_done, extracted_id) = {
+            let (is_done, extracted_id, extracted_usage) = {
                 let line = &self.line_buffer[..line_end];
                 let data = line
                     .strip_prefix("data: ")
@@ -613,16 +764,39 @@ impl SseParser {
                     .trim();
 
                 if data.is_empty() {
-                    (false, None)
+                    (false, None, None)
                 } else if data == "[DONE]" {
-                    (true, None)
-                } else if self.chat_id.is_none() {
-                    let id = serde_json::from_str::<serde_json::Value>(data)
-                        .ok()
-                        .and_then(|v| v.get("id").and_then(|id| id.as_str().map(String::from)));
-                    (false, id)
+                    (true, None, None)
+                } else if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
+                    let id = if self.chat_id.is_none() {
+                        parsed
+                            .get("id")
+                            .and_then(|id| id.as_str().map(String::from))
+                    } else {
+                        None
+                    };
+                    // Capture usage from any chunk that has it (typically the final one)
+                    let usage = parsed
+                        .get("usage")
+                        .filter(|u| u.is_object())
+                        .and_then(|usage| {
+                            let input = usage
+                                .get("prompt_tokens")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0);
+                            let output = usage
+                                .get("completion_tokens")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0);
+                            if input > 0 || output > 0 {
+                                Some((input, output))
+                            } else {
+                                None
+                            }
+                        });
+                    (false, id, usage)
                 } else {
-                    (false, None)
+                    (false, None, None)
                 }
             };
 
@@ -631,6 +805,9 @@ impl SseParser {
             }
             if let Some(id) = extracted_id {
                 self.chat_id = Some(id);
+            }
+            if let Some(usage) = extracted_usage {
+                self.usage = Some(usage);
             }
 
             // Remove the processed line in-place (no allocation, just memmove)
@@ -665,6 +842,8 @@ mod tests {
             signing,
             cache,
             id_prefix: "test".to_string(),
+            usage_reporter: None,
+            usage_type: UsageType::default(),
         }
     }
 

@@ -70,6 +70,9 @@ pub struct Config {
     pub timeout_secs: u64,
     pub timeout_tokenize_secs: u64,
 
+    // Cloud API for sk- key validation
+    pub cloud_api_url: Option<String>,
+
     // OpenAI Chat Compatibility Checks
     // Validates that hosted models (qwen, glm, etc.) send OpenAI-compliant responses:
     // - /v1/models API format
@@ -124,6 +127,11 @@ impl Config {
                 }
             });
 
+        let cloud_api_url = env::var("CLOUD_API_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.trim_end_matches('/').to_string());
+
         let config = Config {
             model_name,
             token,
@@ -139,6 +147,7 @@ impl Config {
             embeddings_url: format!("{base}/v1/embeddings"),
             rerank_url,
             score_url,
+            cloud_api_url,
             tls_cert_path,
             max_keepalive: env_int("VLLM_PROXY_MAX_KEEPALIVE", 100),
             max_request_size: env_int("VLLM_PROXY_MAX_REQUEST_SIZE", 10 * 1024 * 1024),

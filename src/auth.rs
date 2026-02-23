@@ -1,19 +1,55 @@
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use subtle::ConstantTimeEq;
+use tracing::warn;
 
 use crate::error::AppError;
 use crate::AppState;
 
 /// Extractor that validates Bearer token authentication.
 /// Use as a handler parameter to require auth on a route.
-pub struct RequireAuth;
+///
+/// If authentication was via a cloud API key (`sk-` prefix),
+/// `cloud_api_key` contains the key for downstream usage reporting.
+pub struct RequireAuth {
+    pub cloud_api_key: Option<String>,
+}
 
 /// Constant-time token comparison to prevent timing attacks.
 /// Returns true if `a` and `b` are equal, using a fixed-time algorithm
 /// that does not short-circuit on the first mismatched byte.
 pub(crate) fn token_eq(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
+}
+
+/// Validate an `sk-` prefixed API key against the cloud API.
+async fn check_cloud_api_key(
+    http_client: &reqwest::Client,
+    cloud_api_url: &str,
+    token: &str,
+) -> Result<(), AppError> {
+    let url = format!("{cloud_api_url}/v1/check_api_key");
+
+    let response = http_client
+        .post(&url)
+        .header("authorization", format!("Bearer {token}"))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| {
+            warn!(error = %e, "Cloud API key check request failed");
+            AppError::Unauthorized
+        })?;
+
+    match response.status().as_u16() {
+        200 => Ok(()),
+        402 => Err(AppError::InsufficientCredits),
+        429 => Err(AppError::RateLimited),
+        status => {
+            warn!(status, "Cloud API key check rejected");
+            Err(AppError::Unauthorized)
+        }
+    }
 }
 
 impl FromRequestParts<AppState> for RequireAuth {
@@ -32,10 +68,22 @@ impl FromRequestParts<AppState> for RequireAuth {
             Some(header) if header.starts_with("Bearer ") => {
                 let token = &header[7..];
                 if token_eq(token, &state.config.token) {
-                    Ok(RequireAuth)
-                } else {
-                    Err(AppError::Unauthorized)
+                    return Ok(RequireAuth {
+                        cloud_api_key: None,
+                    });
                 }
+
+                // Fallback: validate sk- tokens against cloud API
+                if token.starts_with("sk-") {
+                    if let Some(cloud_api_url) = &state.config.cloud_api_url {
+                        check_cloud_api_key(&state.http_client, cloud_api_url, token).await?;
+                        return Ok(RequireAuth {
+                            cloud_api_key: Some(token.to_string()),
+                        });
+                    }
+                }
+
+                Err(AppError::Unauthorized)
             }
             _ => Err(AppError::Unauthorized),
         }

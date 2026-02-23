@@ -12,14 +12,16 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 # Cache dependencies: copy manifests first, then do a dummy build
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs \
+    && mkdir -p benches && echo "fn main() {}" > benches/hot_path.rs \
     && cargo build --release --locked 2>/dev/null || true \
-    && rm -rf src \
+    && rm -rf src benches \
     && rm -f target/release/deps/*vllm_proxy_rs* \
     && rm -f target/release/vllm-proxy-rs* \
     && rm -rf target/release/.fingerprint/vllm-proxy-rs-*
 
 # Copy real source and build — touch to ensure cargo detects changes
 COPY src/ src/
+COPY benches/ benches/
 RUN find src -name '*.rs' -exec touch {} + && cargo build --release --locked
 
 # Stage 2: Runtime image

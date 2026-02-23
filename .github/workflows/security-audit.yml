@@ -9,6 +9,9 @@ on:
     # Run weekly on Mondays at 9am UTC
     - cron: "0 9 * * 1"
 
+permissions:
+  issues: write
+
 jobs:
   audit:
     name: cargo audit

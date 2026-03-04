@@ -200,6 +200,7 @@ pub async fn catch_all(
             signing: state.signing.clone(),
             cache: state.cache.clone(),
             id_prefix: "pt".to_string(),
+            model_name: state.config.model_name.clone(),
             usage_reporter: reporter,
             usage_type: UsageType::ChatCompletion,
         };
@@ -221,6 +222,7 @@ pub async fn catch_all(
             signing: state.signing.clone(),
             cache: state.cache.clone(),
             id_prefix: "pt".to_string(),
+            model_name: state.config.model_name.clone(),
             usage_reporter: reporter,
             usage_type: UsageType::ChatCompletion,
         };

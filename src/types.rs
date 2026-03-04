@@ -13,6 +13,7 @@ pub struct SignedChat {
 /// Attestation report returned by GET /v1/attestation/report.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttestationReport {
+    pub model_name: String,
     pub signing_address: String,
     pub signing_algo: String,
     pub signing_public_key: String,

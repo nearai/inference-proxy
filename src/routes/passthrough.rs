@@ -139,6 +139,7 @@ pub async fn images_edits(
         signing: state.signing.clone(),
         cache: state.cache.clone(),
         id_prefix: "img".to_string(),
+        model_name: state.config.model_name.clone(),
         usage_reporter: make_usage_reporter(auth.cloud_api_key.as_ref(), &state),
         usage_type: UsageType::ImageGeneration,
     };
@@ -185,6 +186,7 @@ pub async fn audio_transcriptions(
         signing: state.signing.clone(),
         cache: state.cache.clone(),
         id_prefix: "trans".to_string(),
+        model_name: state.config.model_name.clone(),
         usage_reporter: make_usage_reporter(auth.cloud_api_key.as_ref(), &state),
         usage_type: UsageType::ChatCompletion,
     };
@@ -220,6 +222,7 @@ async fn json_passthrough(
         signing: state.signing.clone(),
         cache: state.cache.clone(),
         id_prefix: id_prefix.to_string(),
+        model_name: state.config.model_name.clone(),
         usage_reporter,
         usage_type,
     };

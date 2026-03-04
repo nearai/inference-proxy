@@ -253,6 +253,7 @@ nU+jXBG7tgClr/DntUBJx+xfNWpxLKE=
 }
 /// Generate a complete attestation report.
 pub async fn generate_attestation(
+    model_name: &str,
     signing_address: &str,
     signing_algo: &str,
     signing_public_key: &str,
@@ -288,6 +289,7 @@ pub async fn generate_attestation(
     let info_value = serde_json::to_value(&info).map_err(anyhow::Error::from)?;
 
     Ok(AttestationReport {
+        model_name: model_name.to_string(),
         signing_address: signing_address.to_string(),
         signing_algo: signing_algo.to_string(),
         signing_public_key: signing_public_key.to_string(),

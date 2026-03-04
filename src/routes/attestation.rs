@@ -54,6 +54,7 @@ pub async fn attestation_report(
     }
 
     let report = crate::attestation::generate_attestation(
+        &state.config.model_name,
         &signing_address,
         signing_algo,
         &signing_public_key,

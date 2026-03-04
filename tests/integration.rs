@@ -744,8 +744,8 @@ async fn test_signature_binds_actual_request_body() {
         body["text"]
             .as_str()
             .unwrap()
-            .starts_with(&format!("{expected_hash}:")),
-        "Signed text must start with SHA-256 of actual request body"
+            .starts_with(&format!("test-model:{expected_hash}:")),
+        "Signed text must start with model_name:SHA-256 of actual request body"
     );
 }
 
@@ -804,7 +804,7 @@ async fn test_x_request_hash_header_is_ignored() {
         body["text"]
             .as_str()
             .unwrap()
-            .starts_with(&format!("{expected_hash}:")),
+            .starts_with(&format!("test-model:{expected_hash}:")),
         "Signed text must use actual body hash, not X-Request-Hash header"
     );
 }
@@ -996,7 +996,10 @@ async fn test_ecdsa_signature_cryptographic_verification() {
     // Verify text = sha256(request):sha256(response)
     let expected_req_hash = hex::encode(Sha256::digest(&request_bytes));
     let expected_resp_hash = hex::encode(Sha256::digest(&response_body_bytes));
-    assert_eq!(text, format!("{expected_req_hash}:{expected_resp_hash}"));
+    assert_eq!(
+        text,
+        format!("test-model:{expected_req_hash}:{expected_resp_hash}")
+    );
 
     // Verify ECDSA EIP-191 signature via key recovery
     let sig_bytes = hex::decode(&signature_hex[2..]).unwrap();
@@ -1092,7 +1095,10 @@ async fn test_ed25519_signature_cryptographic_verification() {
     // Verify text = sha256(request):sha256(response)
     let expected_req_hash = hex::encode(Sha256::digest(&request_bytes));
     let expected_resp_hash = hex::encode(Sha256::digest(&response_body_bytes));
-    assert_eq!(text, format!("{expected_req_hash}:{expected_resp_hash}"));
+    assert_eq!(
+        text,
+        format!("test-model:{expected_req_hash}:{expected_resp_hash}")
+    );
 
     // Verify Ed25519 signature
     let sig_bytes = hex::decode(signature_hex).unwrap();
@@ -1181,17 +1187,19 @@ async fn test_streaming_signature_cached_and_verifiable() {
     let parts: Vec<&str> = text.split(':').collect();
     assert_eq!(
         parts.len(),
-        2,
-        "Signed text should be request_hash:response_hash"
+        3,
+        "Signed text should be model_name:request_hash:response_hash"
     );
+
+    assert_eq!(parts[0], "test-model");
 
     // Request hash should match SHA256 of request body
     let expected_req_hash = hex::encode(Sha256::digest(&request_bytes));
-    assert_eq!(parts[0], expected_req_hash);
+    assert_eq!(parts[1], expected_req_hash);
 
     // Response hash should match SHA256 of the streamed bytes
     let expected_resp_hash = hex::encode(Sha256::digest(&stream_body_bytes));
-    assert_eq!(parts[1], expected_resp_hash);
+    assert_eq!(parts[2], expected_resp_hash);
 
     // Signature should be valid format
     let sig_hex = sig_body["signature"].as_str().unwrap();

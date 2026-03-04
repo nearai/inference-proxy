@@ -183,6 +183,8 @@ pub struct ProxyOpts {
     pub cache: Arc<ChatCache>,
     /// Prefix for auto-generated IDs (e.g., "chatcmpl", "img", "emb").
     pub id_prefix: String,
+    /// Model name included in the signed text.
+    pub model_name: String,
     /// If set, report usage to the cloud API after a successful response.
     pub usage_reporter: Option<UsageReporter>,
     /// What kind of usage to extract from the response.
@@ -251,7 +253,7 @@ pub async fn proxy_json_request(
     let response_sha256 = hex::encode(Sha256::digest(response_body.as_bytes()));
 
     // Sign and cache
-    let text = format!("{request_sha256}:{response_sha256}");
+    let text = format!("{}:{request_sha256}:{response_sha256}", opts.model_name);
     let signed = opts.signing.sign_chat(&text).map_err(|e| {
         error!(error = %e, "Signing failed");
         AppError::Internal(e)
@@ -304,6 +306,7 @@ pub async fn proxy_streaming_request(
     let signing = opts.signing.clone();
     let cache = opts.cache.clone();
     let usage_reporter = opts.usage_reporter.clone();
+    let model_name = opts.model_name.clone();
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
@@ -355,7 +358,7 @@ pub async fn proxy_streaming_request(
         if !upstream_error && !downstream_closed && parser.seen_done {
             let response_sha256 = hex::encode(hasher.finalize());
             if let Some(ref id) = parser.chat_id {
-                let text = format!("{request_sha256}:{response_sha256}");
+                let text = format!("{model_name}:{request_sha256}:{response_sha256}");
                 match signing.sign_chat(&text) {
                     Ok(signed) => {
                         if let Ok(signed_json) = serde_json::to_string(&signed) {
@@ -457,7 +460,7 @@ pub async fn proxy_multipart_request(
         serde_json::to_string(&response_data).map_err(|e| AppError::Internal(e.into()))?;
     let response_sha256 = hex::encode(Sha256::digest(response_body.as_bytes()));
 
-    let text = format!("{request_sha256}:{response_sha256}");
+    let text = format!("{}:{request_sha256}:{response_sha256}", opts.model_name);
     let signed = opts.signing.sign_chat(&text).map_err(|e| {
         error!(error = %e, "Signing failed");
         AppError::Internal(e)
@@ -566,7 +569,7 @@ pub async fn sign_and_cache_json_response(
         serde_json::to_string(&response_data).map_err(|e| AppError::Internal(e.into()))?;
     let response_sha256 = hex::encode(Sha256::digest(response_body.as_bytes()));
 
-    let text = format!("{request_sha256}:{response_sha256}");
+    let text = format!("{}:{request_sha256}:{response_sha256}", opts.model_name);
     let signed = opts.signing.sign_chat(&text).map_err(|e| {
         error!(error = %e, "Signing failed");
         AppError::Internal(e)
@@ -595,6 +598,7 @@ pub async fn proxy_streaming_response(
     let signing = opts.signing.clone();
     let cache = opts.cache.clone();
     let usage_reporter = opts.usage_reporter.clone();
+    let model_name = opts.model_name.clone();
     let request_sha256 = request_sha256.to_string();
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
@@ -643,7 +647,7 @@ pub async fn proxy_streaming_response(
         if !upstream_error && !downstream_closed && parser.seen_done {
             let response_sha256 = hex::encode(hasher.finalize());
             if let Some(ref id) = parser.chat_id {
-                let text = format!("{request_sha256}:{response_sha256}");
+                let text = format!("{model_name}:{request_sha256}:{response_sha256}");
                 match signing.sign_chat(&text) {
                     Ok(signed) => {
                         if let Ok(signed_json) = serde_json::to_string(&signed) {
@@ -842,6 +846,7 @@ mod tests {
             signing,
             cache,
             id_prefix: "test".to_string(),
+            model_name: "test-model".to_string(),
             usage_reporter: None,
             usage_type: UsageType::default(),
         }

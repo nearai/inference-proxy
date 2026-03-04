@@ -53,22 +53,20 @@ pub async fn attestation_report(
         }
     }
 
-    let report = crate::attestation::generate_attestation(
-        crate::attestation::AttestationParams {
-            model_name: &state.config.model_name,
-            signing_address: &signing_address,
-            signing_algo,
-            signing_public_key: &signing_public_key,
-            signing_address_bytes: &signing_address_bytes,
-            nonce: query.nonce.as_deref(),
-            gpu_no_hw_mode: state.config.gpu_no_hw_mode,
-            tls_cert_fingerprint: if query.include_tls_fingerprint.unwrap_or(false) {
-                state.tls_cert_fingerprint.as_deref()
-            } else {
-                None
-            },
+    let report = crate::attestation::generate_attestation(crate::attestation::AttestationParams {
+        model_name: &state.config.model_name,
+        signing_address: &signing_address,
+        signing_algo,
+        signing_public_key: &signing_public_key,
+        signing_address_bytes: &signing_address_bytes,
+        nonce: query.nonce.as_deref(),
+        gpu_no_hw_mode: state.config.gpu_no_hw_mode,
+        tls_cert_fingerprint: if query.include_tls_fingerprint.unwrap_or(false) {
+            state.tls_cert_fingerprint.as_deref()
+        } else {
+            None
         },
-    )
+    })
     .await
     .map_err(|e| match e {
         crate::attestation::AttestationError::InvalidNonce(msg) => AppError::BadRequest(msg),

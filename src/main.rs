@@ -73,8 +73,11 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
-    // Initialize cache
+    // Initialize caches
     let chat_cache = cache::ChatCache::new(&config.model_name, config.chat_cache_expiration_secs);
+    let attestation_cache = Arc::new(attestation::AttestationCache::new(
+        config.attestation_cache_ttl_secs,
+    ));
 
     // Initialize HTTP client with connection pooling
     let http_client = reqwest::Client::builder()
@@ -86,14 +89,27 @@ async fn main() -> anyhow::Result<()> {
     let metrics_handle = metrics_middleware::setup_metrics_recorder();
 
     // Build app state
+    let model_name = config.model_name.clone();
     let state = AppState {
         config: Arc::new(config),
         signing: Arc::new(signing),
         cache: Arc::new(chat_cache),
+        attestation_cache: attestation_cache.clone(),
         http_client,
         metrics_handle,
-        tls_cert_fingerprint,
+        tls_cert_fingerprint: tls_cert_fingerprint.clone(),
     };
+
+    // Spawn background attestation cache refresh task.
+    // Refresh interval is half the TTL to ensure the cache never goes stale.
+    attestation::spawn_cache_refresh_task(
+        attestation_cache,
+        model_name,
+        state.signing.clone(),
+        state.config.gpu_no_hw_mode,
+        tls_cert_fingerprint,
+        state.config.attestation_cache_ttl_secs / 2,
+    );
 
     // Run OpenAI chat compatibility checks if enabled
     if state.config.openai_chat_compatibility_check_enabled {

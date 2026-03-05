@@ -47,6 +47,8 @@ pub struct Config {
 
     // Cache
     pub chat_cache_expiration_secs: u64,
+    /// TTL for cached nonce-less attestation reports (seconds).
+    pub attestation_cache_ttl_secs: u64,
 
     // TLS certificate binding
     pub tls_cert_path: Option<String>,
@@ -154,6 +156,7 @@ impl Config {
             max_image_request_size: env_int("VLLM_PROXY_MAX_IMAGE_REQUEST_SIZE", 50 * 1024 * 1024),
             max_audio_request_size: env_int("VLLM_PROXY_MAX_AUDIO_REQUEST_SIZE", 100 * 1024 * 1024),
             chat_cache_expiration_secs: env_int("CHAT_CACHE_EXPIRATION", 1200) as u64,
+            attestation_cache_ttl_secs: env_int("ATTESTATION_CACHE_TTL", 300) as u64,
             dev_mode: env_bool("DEV"),
             gpu_no_hw_mode: env_bool("GPU_NO_HW_MODE"),
             git_rev,

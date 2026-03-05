@@ -176,7 +176,13 @@ pub fn spawn_cache_refresh_task(
                 }
             }
 
-            tokio::time::sleep(std::time::Duration::from_secs(refresh_interval_secs)).await;
+            let sleep_secs = if refresh_interval_secs == 0 {
+                warn!("refresh_interval_secs was 0; clamping to 1s to avoid busy loop");
+                1
+            } else {
+                refresh_interval_secs
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
         }
     });
 }
@@ -734,15 +740,35 @@ mod tests {
             .await;
 
         assert!(cache.get("ecdsa", false).await.is_some());
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         assert!(cache.get("ecdsa", false).await.is_none());
     }
 
     #[tokio::test]
     async fn test_gpu_semaphore_serializes() {
-        let cache = AttestationCache::new(300);
-        let permit = cache.acquire_gpu_permit().await;
-        drop(permit);
-        let _permit2 = cache.acquire_gpu_permit().await;
+        let cache = Arc::new(AttestationCache::new(300));
+
+        // Hold the first permit.
+        let permit1 = cache.acquire_gpu_permit().await;
+
+        // Spawn a task that tries to acquire the semaphore while we hold it.
+        let cache2 = cache.clone();
+        let mut handle = tokio::spawn(async move {
+            cache2.acquire_gpu_permit().await;
+        });
+
+        // The second acquire should block (not complete within 50ms).
+        let result = tokio::time::timeout(std::time::Duration::from_millis(50), &mut handle).await;
+        assert!(
+            result.is_err(),
+            "second acquire should block while first permit is held"
+        );
+
+        // Release the first permit — the second task should now complete.
+        drop(permit1);
+        tokio::time::timeout(std::time::Duration::from_millis(50), handle)
+            .await
+            .expect("second acquire should complete after first permit is dropped")
+            .expect("task should not panic");
     }
 }

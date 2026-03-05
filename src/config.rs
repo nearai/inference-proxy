@@ -171,6 +171,14 @@ impl Config {
             startup_check_timeout_secs: env_int("STARTUP_CHECK_TIMEOUT_SECS", 30) as u64,
         };
 
+        // Validate attestation cache TTL (TTL/2 is used as refresh interval, so TTL < 2 would cause a busy loop)
+        if config.attestation_cache_ttl_secs < 2 {
+            anyhow::bail!(
+                "ATTESTATION_CACHE_TTL must be at least 2 (got {})",
+                config.attestation_cache_ttl_secs
+            );
+        }
+
         // Validate startup check configuration
         if config.startup_check_retries == 0 {
             anyhow::bail!("STARTUP_CHECK_RETRIES must be at least 1");

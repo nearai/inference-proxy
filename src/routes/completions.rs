@@ -44,6 +44,7 @@ pub async fn completions(
         signing: state.signing.clone(),
         cache: state.cache.clone(),
         id_prefix: "cmpl".to_string(),
+        model_name: state.config.model_name.clone(),
         usage_reporter: make_usage_reporter(auth.cloud_api_key.as_ref(), &state),
         usage_type: UsageType::ChatCompletion,
     };

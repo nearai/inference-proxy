@@ -251,27 +251,38 @@ nU+jXBG7tgClr/DntUBJx+xfNWpxLKE=
         );
     }
 }
+/// Parameters for generating an attestation report.
+pub struct AttestationParams<'a> {
+    pub model_name: &'a str,
+    pub signing_address: &'a str,
+    pub signing_algo: &'a str,
+    pub signing_public_key: &'a str,
+    pub signing_address_bytes: &'a [u8],
+    pub nonce: Option<&'a str>,
+    pub gpu_no_hw_mode: bool,
+    pub tls_cert_fingerprint: Option<&'a str>,
+}
+
 /// Generate a complete attestation report.
 pub async fn generate_attestation(
-    signing_address: &str,
-    signing_algo: &str,
-    signing_public_key: &str,
-    signing_address_bytes: &[u8],
-    nonce: Option<&str>,
-    gpu_no_hw_mode: bool,
-    tls_cert_fingerprint: Option<&str>,
+    params: AttestationParams<'_>,
 ) -> Result<AttestationReport, AttestationError> {
-    let nonce_bytes = parse_nonce(nonce)?;
+    let nonce_bytes = parse_nonce(params.nonce)?;
     let nonce_hex = hex::encode(nonce_bytes);
 
     // Build TDX report data (binds cert fingerprint when present)
-    let fp_bytes = tls_cert_fingerprint
+    let fp_bytes = params
+        .tls_cert_fingerprint
         .map(hex::decode)
         .transpose()
         .map_err(|e| {
             AttestationError::Internal(anyhow::anyhow!("bad cert fingerprint hex: {e}"))
         })?;
-    let report_data = build_report_data(signing_address_bytes, &nonce_bytes, fp_bytes.as_deref());
+    let report_data = build_report_data(
+        params.signing_address_bytes,
+        &nonce_bytes,
+        fp_bytes.as_deref(),
+    );
 
     // Get TDX quote from dstack
     let client = dstack_sdk::dstack_client::DstackClient::new(None);
@@ -280,7 +291,7 @@ pub async fn generate_attestation(
         serde_json::from_str(&quote_result.event_log).map_err(anyhow::Error::from)?;
 
     // Collect GPU evidence
-    let gpu_evidence = collect_gpu_evidence(&nonce_hex, gpu_no_hw_mode).await?;
+    let gpu_evidence = collect_gpu_evidence(&nonce_hex, params.gpu_no_hw_mode).await?;
     let nvidia_payload = build_nvidia_payload(&nonce_hex, &gpu_evidence);
 
     // Get system info
@@ -288,15 +299,16 @@ pub async fn generate_attestation(
     let info_value = serde_json::to_value(&info).map_err(anyhow::Error::from)?;
 
     Ok(AttestationReport {
-        signing_address: signing_address.to_string(),
-        signing_algo: signing_algo.to_string(),
-        signing_public_key: signing_public_key.to_string(),
+        model_name: params.model_name.to_string(),
+        signing_address: params.signing_address.to_string(),
+        signing_algo: params.signing_algo.to_string(),
+        signing_public_key: params.signing_public_key.to_string(),
         request_nonce: nonce_hex,
         intel_quote: quote_result.quote,
         nvidia_payload,
         event_log,
         info: info_value,
-        tls_cert_fingerprint: tls_cert_fingerprint.map(|s| s.to_string()),
+        tls_cert_fingerprint: params.tls_cert_fingerprint.map(|s| s.to_string()),
     })
 }
 

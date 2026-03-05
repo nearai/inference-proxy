@@ -754,7 +754,7 @@ mod tests {
         // Spawn a task that tries to acquire the semaphore while we hold it.
         let cache2 = cache.clone();
         let mut handle = tokio::spawn(async move {
-            cache2.acquire_gpu_permit().await;
+            let _permit = cache2.acquire_gpu_permit().await;
         });
 
         // The second acquire should block (not complete within 50ms).

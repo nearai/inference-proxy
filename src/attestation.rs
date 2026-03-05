@@ -1,7 +1,191 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
+
 use sha2::{Digest, Sha256};
-use tracing::{error, info};
+use tokio::sync::{RwLock, Semaphore};
+use tracing::{error, info, warn};
 
 use crate::types::AttestationReport;
+
+/// Cache key for nonce-less attestation reports.
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+struct AttestationCacheKey {
+    signing_algo: String,
+    include_tls_fingerprint: bool,
+}
+
+struct CachedReport {
+    report: AttestationReport,
+    created_at: Instant,
+}
+
+/// Caches nonce-less attestation reports and serializes GPU evidence collection.
+///
+/// GPU evidence collection spawns a Python subprocess that calls `nvmlInit()`.
+/// Under heavy GPU load, `nvmlInit` can intermittently time out (5s timeout in
+/// the NVIDIA verifier library). This cache:
+/// 1. Serves pre-generated reports for requests without a nonce (the common case).
+/// 2. Serializes subprocess calls so only one `nvmlInit` runs at a time.
+/// 3. Retries once on GPU evidence failure.
+pub struct AttestationCache {
+    /// Cached reports keyed by (signing_algo, include_tls_fingerprint).
+    reports: RwLock<HashMap<AttestationCacheKey, CachedReport>>,
+    /// Serializes GPU evidence subprocess calls (only 1 at a time).
+    gpu_semaphore: Semaphore,
+    /// Cache TTL in seconds.
+    ttl_secs: u64,
+}
+
+impl AttestationCache {
+    pub fn new(ttl_secs: u64) -> Self {
+        Self {
+            reports: RwLock::new(HashMap::new()),
+            gpu_semaphore: Semaphore::new(1),
+            ttl_secs,
+        }
+    }
+
+    /// Get a cached report if it exists and is fresh.
+    pub async fn get(
+        &self,
+        signing_algo: &str,
+        include_tls_fingerprint: bool,
+    ) -> Option<AttestationReport> {
+        let key = AttestationCacheKey {
+            signing_algo: signing_algo.to_string(),
+            include_tls_fingerprint,
+        };
+        let reports = self.reports.read().await;
+        if let Some(cached) = reports.get(&key) {
+            if cached.created_at.elapsed().as_secs() < self.ttl_secs {
+                metrics::counter!("attestation_cache_hits_total").increment(1);
+                return Some(cached.report.clone());
+            }
+        }
+        metrics::counter!("attestation_cache_misses_total").increment(1);
+        None
+    }
+
+    /// Store a report in the cache.
+    pub async fn set(
+        &self,
+        signing_algo: &str,
+        include_tls_fingerprint: bool,
+        report: AttestationReport,
+    ) {
+        let key = AttestationCacheKey {
+            signing_algo: signing_algo.to_string(),
+            include_tls_fingerprint,
+        };
+        let mut reports = self.reports.write().await;
+        reports.insert(
+            key,
+            CachedReport {
+                report,
+                created_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Acquire the GPU evidence semaphore (serializes subprocess calls).
+    pub async fn acquire_gpu_permit(&self) -> tokio::sync::SemaphorePermit<'_> {
+        self.gpu_semaphore
+            .acquire()
+            .await
+            .expect("semaphore closed")
+    }
+}
+
+/// Spawn a background task that periodically refreshes cached attestation reports.
+pub fn spawn_cache_refresh_task(
+    cache: Arc<AttestationCache>,
+    model_name: String,
+    signing: Arc<crate::signing::SigningPair>,
+    gpu_no_hw_mode: bool,
+    tls_cert_fingerprint: Option<String>,
+    refresh_interval_secs: u64,
+) {
+    tokio::spawn(async move {
+        // Initial delay to let the server start up.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        loop {
+            for algo in &["ecdsa", "ed25519"] {
+                let (signing_address, signing_address_bytes, signing_public_key) = match *algo {
+                    "ecdsa" => (
+                        signing.ecdsa.signing_address.clone(),
+                        signing.ecdsa.signing_address_bytes.clone(),
+                        signing.ecdsa.signing_public_key.clone(),
+                    ),
+                    "ed25519" => (
+                        signing.ed25519.signing_address.clone(),
+                        signing.ed25519.signing_address_bytes.clone(),
+                        signing.ed25519.signing_public_key.clone(),
+                    ),
+                    _ => unreachable!(),
+                };
+
+                // Refresh without TLS fingerprint (most common).
+                let _permit = cache.acquire_gpu_permit().await;
+                match generate_attestation_inner(AttestationParams {
+                    model_name: &model_name,
+                    signing_address: &signing_address,
+                    signing_algo: algo,
+                    signing_public_key: &signing_public_key,
+                    signing_address_bytes: &signing_address_bytes,
+                    nonce: None,
+                    gpu_no_hw_mode,
+                    tls_cert_fingerprint: None,
+                })
+                .await
+                {
+                    Ok(report) => {
+                        cache.set(algo, false, report).await;
+                        info!(algo, "Background attestation cache refresh succeeded");
+                    }
+                    Err(e) => {
+                        warn!(algo, error = %e, "Background attestation cache refresh failed");
+                    }
+                }
+                drop(_permit);
+
+                // Also refresh with TLS fingerprint if configured.
+                if let Some(ref fp) = tls_cert_fingerprint {
+                    let _permit = cache.acquire_gpu_permit().await;
+                    match generate_attestation_inner(AttestationParams {
+                        model_name: &model_name,
+                        signing_address: &signing_address,
+                        signing_algo: algo,
+                        signing_public_key: &signing_public_key,
+                        signing_address_bytes: &signing_address_bytes,
+                        nonce: None,
+                        gpu_no_hw_mode,
+                        tls_cert_fingerprint: Some(fp.as_str()),
+                    })
+                    .await
+                    {
+                        Ok(report) => {
+                            cache.set(algo, true, report).await;
+                        }
+                        Err(e) => {
+                            warn!(algo, error = %e, "Background attestation cache refresh (with TLS) failed");
+                        }
+                    }
+                    drop(_permit);
+                }
+            }
+
+            let sleep_secs = if refresh_interval_secs == 0 {
+                warn!("refresh_interval_secs was 0; clamping to 1s to avoid busy loop");
+                1
+            } else {
+                refresh_interval_secs
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+        }
+    });
+}
 
 /// Errors from attestation generation.
 #[derive(Debug, thiserror::Error)]
@@ -68,9 +252,8 @@ fn parse_nonce(nonce: Option<&str>) -> Result<[u8; 32], AttestationError> {
     }
 }
 
-/// Collect GPU evidence via Python subprocess.
-/// In no_gpu_mode, produces canned evidence.
-async fn collect_gpu_evidence(
+/// Collect GPU evidence via Python subprocess (single attempt).
+async fn collect_gpu_evidence_once(
     nonce_hex: &str,
     no_gpu_mode: bool,
 ) -> anyhow::Result<serde_json::Value> {
@@ -130,6 +313,28 @@ print(json.dumps(evidence))
         .map_err(|e| anyhow::anyhow!("Failed to parse GPU evidence JSON: {e}"))?;
 
     Ok(evidence)
+}
+
+/// Collect GPU evidence with one retry on failure.
+///
+/// nvmlInit can intermittently time out under heavy GPU load. A single retry
+/// after a short delay often succeeds once the driver lock is released.
+async fn collect_gpu_evidence(
+    nonce_hex: &str,
+    no_gpu_mode: bool,
+) -> anyhow::Result<serde_json::Value> {
+    match collect_gpu_evidence_once(nonce_hex, no_gpu_mode).await {
+        Ok(evidence) => Ok(evidence),
+        Err(first_err) => {
+            warn!(
+                error = %first_err,
+                "GPU evidence collection failed, retrying after 2s"
+            );
+            metrics::counter!("gpu_evidence_retries_total").increment(1);
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            collect_gpu_evidence_once(nonce_hex, no_gpu_mode).await
+        }
+    }
 }
 
 /// Build NVIDIA payload JSON.
@@ -263,8 +468,8 @@ pub struct AttestationParams<'a> {
     pub tls_cert_fingerprint: Option<&'a str>,
 }
 
-/// Generate a complete attestation report.
-pub async fn generate_attestation(
+/// Generate a complete attestation report (core logic, no caching).
+async fn generate_attestation_inner(
     params: AttestationParams<'_>,
 ) -> Result<AttestationReport, AttestationError> {
     let nonce_bytes = parse_nonce(params.nonce)?;
@@ -310,6 +515,50 @@ pub async fn generate_attestation(
         info: info_value,
         tls_cert_fingerprint: params.tls_cert_fingerprint.map(|s| s.to_string()),
     })
+}
+
+/// Generate an attestation report, using the cache for nonce-less requests.
+///
+/// When a caller provides a nonce, the GPU evidence and TDX quote are
+/// cryptographically bound to that nonce, so we must generate fresh.
+/// When no nonce is provided, we serve a cached report (which contains its
+/// own randomly-generated nonce) — the caller accepts whatever nonce we return.
+pub async fn generate_attestation(
+    params: AttestationParams<'_>,
+    cache: Option<&AttestationCache>,
+) -> Result<AttestationReport, AttestationError> {
+    let is_nonceless = params.nonce.is_none();
+    let include_tls = params.tls_cert_fingerprint.is_some();
+    let signing_algo = params.signing_algo.to_string();
+
+    // For nonce-less requests, try the cache first.
+    if is_nonceless {
+        if let Some(cache) = cache {
+            if let Some(report) = cache.get(&signing_algo, include_tls).await {
+                return Ok(report);
+            }
+        }
+    }
+
+    // Generate fresh report. Acquire semaphore to serialize GPU evidence calls.
+    let report = if let Some(cache) = cache {
+        let _permit = cache.acquire_gpu_permit().await;
+        // Double-check cache after acquiring permit (another request may have filled it).
+        if is_nonceless {
+            if let Some(report) = cache.get(&signing_algo, include_tls).await {
+                return Ok(report);
+            }
+        }
+        let report = generate_attestation_inner(params).await?;
+        if is_nonceless {
+            cache.set(&signing_algo, include_tls, report.clone()).await;
+        }
+        report
+    } else {
+        generate_attestation_inner(params).await?
+    };
+
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -435,5 +684,91 @@ mod tests {
         assert_eq!(payload["nonce"], "abc123");
         assert_eq!(payload["arch"], "HOPPER");
         assert_eq!(payload["evidence_list"][0]["gpu"], "H100");
+    }
+
+    fn make_test_report(algo: &str, nonce: &str) -> AttestationReport {
+        AttestationReport {
+            model_name: "test-model".to_string(),
+            signing_address: "0xtest".to_string(),
+            signing_algo: algo.to_string(),
+            signing_public_key: "pk".to_string(),
+            request_nonce: nonce.to_string(),
+            intel_quote: "quote".to_string(),
+            nvidia_payload: "payload".to_string(),
+            event_log: serde_json::json!({}),
+            info: serde_json::json!({}),
+            tls_cert_fingerprint: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_attestation_cache_hit() {
+        let cache = AttestationCache::new(300);
+        let report = make_test_report("ecdsa", "aabb");
+        cache.set("ecdsa", false, report.clone()).await;
+
+        let result = cache.get("ecdsa", false).await;
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().request_nonce, "aabb");
+    }
+
+    #[tokio::test]
+    async fn test_attestation_cache_miss_different_algo() {
+        let cache = AttestationCache::new(300);
+        cache
+            .set("ecdsa", false, make_test_report("ecdsa", "aa"))
+            .await;
+
+        assert!(cache.get("ed25519", false).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_attestation_cache_miss_different_tls() {
+        let cache = AttestationCache::new(300);
+        cache
+            .set("ecdsa", false, make_test_report("ecdsa", "aa"))
+            .await;
+
+        assert!(cache.get("ecdsa", true).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_attestation_cache_ttl_expiry() {
+        let cache = AttestationCache::new(1);
+        cache
+            .set("ecdsa", false, make_test_report("ecdsa", "aa"))
+            .await;
+
+        assert!(cache.get("ecdsa", false).await.is_some());
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        assert!(cache.get("ecdsa", false).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_gpu_semaphore_serializes() {
+        let cache = Arc::new(AttestationCache::new(300));
+
+        // Hold the first permit.
+        let permit1 = cache.acquire_gpu_permit().await;
+
+        // Spawn a task that tries to acquire the semaphore while we hold it.
+        let cache2 = cache.clone();
+        let mut handle = tokio::spawn(async move {
+            let _permit = cache2.acquire_gpu_permit().await;
+        });
+
+        // The second acquire should block (not complete within 50ms).
+        let result = tokio::time::timeout(std::time::Duration::from_millis(50), &mut handle).await;
+        assert!(
+            result.is_err(),
+            "second acquire should block while first permit is held"
+        );
+
+        // Release the first permit — the second task should now complete.
+        drop(permit1);
+        tokio::time::timeout(std::time::Duration::from_millis(50), handle)
+            .await
+            .expect("second acquire should complete after first permit is dropped")
+            .expect("task should not panic");
     }
 }

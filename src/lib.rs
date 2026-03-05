@@ -24,6 +24,7 @@ pub struct AppState {
     pub config: Arc<config::Config>,
     pub signing: Arc<signing::SigningPair>,
     pub cache: Arc<cache::ChatCache>,
+    pub attestation_cache: Arc<attestation::AttestationCache>,
     pub http_client: reqwest::Client,
     pub metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
     /// SHA-256 hash of the TLS certificate's SPKI (Subject Public Key Info).

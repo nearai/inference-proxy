@@ -203,8 +203,11 @@ pub async fn catch_all(
             model_name: state.config.model_name.clone(),
             usage_reporter: reporter,
             usage_type: UsageType::ChatCompletion,
+            request_hash: None,
+            response_transform: None,
+            chunk_transform: None,
         };
-        proxy::proxy_streaming_response(response, &request_sha256, &opts, axum_status).await
+        proxy::proxy_streaming_response(response, &request_sha256, opts, axum_status).await
     } else if content_type.contains("application/json") {
         // Buffer JSON response with size guard
         let response_bytes = response
@@ -225,8 +228,11 @@ pub async fn catch_all(
             model_name: state.config.model_name.clone(),
             usage_reporter: reporter,
             usage_type: UsageType::ChatCompletion,
+            request_hash: None,
+            response_transform: None,
+            chunk_transform: None,
         };
-        proxy::sign_and_cache_json_response(&response_bytes, &request_sha256, &opts, axum_status)
+        proxy::sign_and_cache_json_response(&response_bytes, &request_sha256, opts, axum_status)
             .await
     } else {
         // Raw passthrough — stream without signing, preserve upstream headers

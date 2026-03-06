@@ -3410,3 +3410,1057 @@ async fn test_streaming_includes_usage_injected_for_cloud_key() {
     assert_eq!(response.status(), StatusCode::OK);
     // Mock expect(1) will verify the backend received include_usage:true
 }
+
+// ---- End-to-end encryption tests ----
+
+/// Helper: get the test server's Ed25519 public key hex (matches the fixed test key).
+fn test_ed25519_pub_key_hex() -> String {
+    let ed25519_key: [u8; 32] = [
+        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
+        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
+        0x7f, 0x60,
+    ];
+    let ctx = signing::Ed25519Context::from_key_bytes(&ed25519_key).unwrap();
+    ctx.signing_public_key
+}
+
+/// Helper: build a signing pair matching the server's keys (used for encryption/decryption).
+fn test_signing_pair() -> signing::SigningPair {
+    let ecdsa_key: [u8; 32] = [
+        0xac, 0x09, 0x74, 0xbe, 0xc3, 0x9a, 0x17, 0xe3, 0x6b, 0xa4, 0xa6, 0xb4, 0xd2, 0x38, 0xff,
+        0x94, 0x4b, 0xac, 0xb3, 0x5e, 0x5d, 0xc4, 0xaf, 0x0f, 0x33, 0x47, 0xe5, 0x87, 0x31, 0x79,
+        0x67, 0x0f,
+    ];
+    let ed25519_key: [u8; 32] = [
+        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
+        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
+        0x7f, 0x60,
+    ];
+    let ecdsa = signing::EcdsaContext::from_key_bytes(&ecdsa_key).unwrap();
+    let ed25519 = signing::Ed25519Context::from_key_bytes(&ed25519_key).unwrap();
+    signing::SigningPair { ecdsa, ed25519 }
+}
+
+/// Helper: build a *separate* client signing pair with different keys than the server.
+/// This validates directionality — client encrypts with server's pub key, server
+/// encrypts responses with client's pub key.
+fn test_client_signing_pair() -> signing::SigningPair {
+    let ecdsa_key: [u8; 32] = [
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
+        0x1f, 0x20,
+    ];
+    let ed25519_key: [u8; 32] = [
+        0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
+        0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e,
+        0x3f, 0x40,
+    ];
+    let ecdsa = signing::EcdsaContext::from_key_bytes(&ecdsa_key).unwrap();
+    let ed25519 = signing::Ed25519Context::from_key_bytes(&ed25519_key).unwrap();
+    signing::SigningPair { ecdsa, ed25519 }
+}
+
+#[tokio::test]
+async fn test_encrypted_chat_non_streaming_ed25519() {
+    use vllm_proxy_rs::encryption;
+
+    let mock_server = MockServer::start().await;
+    let client_pair = test_client_signing_pair();
+    let server_pair = test_signing_pair();
+
+    let backend_response = serde_json::json!({
+        "id": "chatcmpl-enc1",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "Hello encrypted!"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&backend_response))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    // Client encrypts with server's pub key
+    let server_pub_hex = test_ed25519_pub_key_hex();
+    let server_pub_bytes = hex::decode(&server_pub_hex).unwrap();
+    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
+    let client_pub_bytes = hex::decode(&client_pub_hex).unwrap();
+
+    let enc_for_request = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: server_pub_bytes,
+    };
+
+    let dec_for_response = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: client_pub_bytes,
+    };
+
+    // Encrypt the message content (client encrypts with server's pub key)
+    let encrypted_content =
+        encryption::encrypt_string("Hi", &enc_for_request, &client_pair).unwrap();
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": encrypted_content}],
+        "stream": false
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header("x-signing-algo", "ed25519")
+                .header("x-client-pub-key", &client_pub_hex)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response).await;
+    assert_eq!(body["id"], "chatcmpl-enc1");
+
+    // Response content should be encrypted (hex-encoded ciphertext, not plaintext)
+    let encrypted_response = body["choices"][0]["message"]["content"].as_str().unwrap();
+    assert_ne!(encrypted_response, "Hello encrypted!");
+    assert!(!encrypted_response.is_empty());
+
+    // Client decrypts with its own key pair (server encrypted with client's pub key)
+    let decrypted =
+        encryption::decrypt_string(encrypted_response, &dec_for_response, &client_pair).unwrap();
+    assert_eq!(decrypted, "Hello encrypted!");
+
+    // Verify the server pair can NOT decrypt the response (directionality check)
+    let wrong_ctx = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: hex::decode(&server_pub_hex).unwrap(),
+    };
+    assert!(
+        encryption::decrypt_string(encrypted_response, &wrong_ctx, &server_pair).is_err(),
+        "Server should not be able to decrypt response meant for client"
+    );
+}
+
+#[tokio::test]
+async fn test_encrypted_chat_streaming_ed25519() {
+    use vllm_proxy_rs::encryption;
+
+    let mock_server = MockServer::start().await;
+    let client_pair = test_client_signing_pair();
+
+    let sse_body = "data: {\"id\":\"chatcmpl-encstream1\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\ndata: [DONE]\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(sse_body)
+                .insert_header("content-type", "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let server_pub_hex = test_ed25519_pub_key_hex();
+    let server_pub_bytes = hex::decode(&server_pub_hex).unwrap();
+    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
+    let client_pub_bytes = hex::decode(&client_pub_hex).unwrap();
+
+    let enc_for_request = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: server_pub_bytes,
+    };
+    let dec_for_response = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: client_pub_bytes,
+    };
+
+    let encrypted_msg = encryption::encrypt_string("Hi", &enc_for_request, &client_pair).unwrap();
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": encrypted_msg}],
+        "stream": true
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header("x-signing-algo", "ed25519")
+                .header("x-client-pub-key", &client_pub_hex)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "text/event-stream"
+    );
+
+    let body_bytes = body_to_bytes(response).await;
+    let body_str = String::from_utf8_lossy(&body_bytes);
+
+    assert!(body_str.contains("chatcmpl-encstream1"));
+
+    for line in body_str.lines() {
+        if let Some(data) = line.strip_prefix("data: ") {
+            if data != "[DONE]" {
+                let parsed: serde_json::Value = serde_json::from_str(data).unwrap();
+                if let Some(content) = parsed["choices"][0]["delta"]["content"].as_str() {
+                    assert_ne!(content, "Hi", "Content should be encrypted in SSE chunk");
+                    let decrypted =
+                        encryption::decrypt_string(content, &dec_for_response, &client_pair)
+                            .unwrap();
+                    assert_eq!(decrypted, "Hi");
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_non_encrypted_request_still_works() {
+    // Verify backward compatibility: requests without encryption headers work normally
+    let mock_server = MockServer::start().await;
+
+    let backend_response = serde_json::json!({
+        "id": "chatcmpl-plain",
+        "choices": [{"message": {"role": "assistant", "content": "plain response"}}]
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&backend_response))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": false
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response).await;
+    // Content should be plaintext (not encrypted)
+    assert_eq!(body["choices"][0]["message"]["content"], "plain response");
+}
+
+#[tokio::test]
+async fn test_encryption_missing_one_header_returns_400() {
+    let app = build_test_app("http://unused");
+
+    // Only X-Signing-Algo without X-Client-Pub-Key
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header("x-signing-algo", "ed25519")
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_encryption_invalid_algo_returns_400() {
+    let app = build_test_app("http://unused");
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header("x-signing-algo", "rsa")
+                .header("x-client-pub-key", "aa".repeat(32))
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_encryption_wrong_key_length_returns_400() {
+    let app = build_test_app("http://unused");
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header("x-signing-algo", "ed25519")
+                .header("x-client-pub-key", "aabb") // too short
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_encrypted_completions_ed25519() {
+    use vllm_proxy_rs::encryption;
+
+    let mock_server = MockServer::start().await;
+    let client_pair = test_client_signing_pair();
+
+    let backend_response = serde_json::json!({
+        "id": "cmpl-enc1",
+        "choices": [{"text": "completed text", "index": 0}]
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&backend_response))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let server_pub_hex = test_ed25519_pub_key_hex();
+    let server_pub_bytes = hex::decode(&server_pub_hex).unwrap();
+    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
+    let client_pub_bytes = hex::decode(&client_pub_hex).unwrap();
+
+    let enc_for_request = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: server_pub_bytes,
+    };
+    let dec_for_response = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: client_pub_bytes,
+    };
+
+    let encrypted_prompt =
+        encryption::encrypt_string("Once upon a", &enc_for_request, &client_pair).unwrap();
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "prompt": encrypted_prompt,
+        "stream": false
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header("x-signing-algo", "ed25519")
+                .header("x-client-pub-key", &client_pub_hex)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response).await;
+
+    let encrypted_text = body["choices"][0]["text"].as_str().unwrap();
+    assert_ne!(encrypted_text, "completed text");
+    let decrypted =
+        encryption::decrypt_string(encrypted_text, &dec_for_response, &client_pair).unwrap();
+    assert_eq!(decrypted, "completed text");
+}
+
+#[tokio::test]
+async fn test_encrypted_signature_covers_plaintext() {
+    use sha2::{Digest, Sha256};
+    use vllm_proxy_rs::encryption;
+
+    let mock_server = MockServer::start().await;
+    let server_pair = test_signing_pair();
+    let client_pair = test_client_signing_pair();
+
+    let backend_response = serde_json::json!({
+        "id": "chatcmpl-sig1",
+        "choices": [{"message": {"role": "assistant", "content": "Signed!"}}]
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&backend_response))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    // Client encrypts with server's Ed25519 pub key, sends client's pub key in header
+    let server_pub_hex = test_ed25519_pub_key_hex();
+    let server_pub_bytes = hex::decode(&server_pub_hex).unwrap();
+    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
+    let client_pub_bytes = hex::decode(&client_pub_hex).unwrap();
+
+    // Context for encrypting request (uses server's pub key)
+    let enc_for_request = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: server_pub_bytes,
+    };
+
+    // Context for decrypting response (uses client's pub key, matching what the server sees)
+    let dec_for_response = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: client_pub_bytes,
+    };
+
+    let encrypted_msg = encryption::encrypt_string("Hi", &enc_for_request, &client_pair).unwrap();
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": encrypted_msg}],
+        "stream": false
+    });
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header("x-signing-algo", "ed25519")
+                .header("x-client-pub-key", &client_pub_hex)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Collect raw response bytes so we can hash exactly what the client receives
+    let response_bytes = body_to_bytes(response).await;
+    let body: serde_json::Value = serde_json::from_slice(&response_bytes).unwrap();
+
+    // Verify the encrypted response content can be decrypted by the client
+    let encrypted_content = body["choices"][0]["message"]["content"].as_str().unwrap();
+    let decrypted =
+        encryption::decrypt_string(encrypted_content, &dec_for_response, &client_pair).unwrap();
+    assert_eq!(decrypted, "Signed!");
+
+    // Now fetch the cached signature and verify it covers the ENCRYPTED response hash
+    let sig_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/signature/chatcmpl-sig1?signing_algo=ed25519")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(sig_response.status(), StatusCode::OK);
+    let sig_body = body_to_json(sig_response).await;
+    let signed_text = sig_body["text"].as_str().unwrap();
+
+    // The signed text format is "model:request_sha256:response_sha256"
+    // request_sha256 should cover the ORIGINAL (encrypted) request body
+    // response_sha256 should cover the encrypted response (what client receives)
+    let original_request_bytes = serde_json::to_vec(&request_body).unwrap();
+    let request_sha256 = hex::encode(Sha256::digest(&original_request_bytes));
+    let response_sha256 = hex::encode(Sha256::digest(&response_bytes));
+
+    let parts: Vec<&str> = signed_text.split(':').collect();
+    assert_eq!(parts.len(), 3);
+    assert_eq!(parts[0], "test-model");
+    assert_eq!(
+        parts[1], request_sha256,
+        "Signature should cover original (encrypted) request body hash"
+    );
+    assert_eq!(
+        parts[2], response_sha256,
+        "Signature should cover encrypted response hash (what client receives)"
+    );
+
+    // Verify the Ed25519 signature is valid
+    assert!(!sig_body["signature"].as_str().unwrap().is_empty());
+    assert_eq!(
+        sig_body["signing_address"],
+        server_pair.ed25519.signing_address
+    );
+}
+
+// ---- Streaming: signature covers encrypted chunks ----
+
+#[tokio::test]
+async fn test_encrypted_streaming_signature_covers_transformed_bytes() {
+    use sha2::{Digest, Sha256};
+    use vllm_proxy_rs::encryption;
+
+    let mock_server = MockServer::start().await;
+    let client_pair = test_client_signing_pair();
+
+    let sse_body = "data: {\"id\":\"chatcmpl-encsig1\",\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: [DONE]\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(sse_body)
+                .insert_header("content-type", "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let server_pub_hex = test_ed25519_pub_key_hex();
+    let server_pub_bytes = hex::decode(&server_pub_hex).unwrap();
+    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
+
+    let enc_for_request = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: server_pub_bytes,
+    };
+
+    let encrypted_msg =
+        encryption::encrypt_string("Hello", &enc_for_request, &client_pair).unwrap();
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": encrypted_msg}],
+        "stream": true
+    });
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header("x-signing-algo", "ed25519")
+                .header("x-client-pub-key", &client_pub_hex)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Collect the raw SSE bytes the client receives
+    let response_bytes = body_to_bytes(response).await;
+
+    // Hash the bytes the client actually received
+    let response_sha256 = hex::encode(Sha256::digest(&response_bytes));
+
+    // Hash the original (encrypted) request body
+    let original_request_bytes = serde_json::to_vec(&request_body).unwrap();
+    let request_sha256 = hex::encode(Sha256::digest(&original_request_bytes));
+
+    // Wait briefly for the background signing task to complete
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Fetch the cached signature
+    let sig_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/signature/chatcmpl-encsig1?signing_algo=ed25519")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(sig_response.status(), StatusCode::OK);
+    let sig_body = body_to_json(sig_response).await;
+    let signed_text = sig_body["text"].as_str().unwrap();
+
+    let parts: Vec<&str> = signed_text.split(':').collect();
+    assert_eq!(parts.len(), 3);
+    assert_eq!(parts[0], "test-model");
+    assert_eq!(
+        parts[1], request_sha256,
+        "Streaming signature should cover original (encrypted) request body hash"
+    );
+    assert_eq!(
+        parts[2], response_sha256,
+        "Streaming signature should cover encrypted response bytes (what client receives)"
+    );
+}
+
+// ---- ECDSA encryption test ----
+
+#[tokio::test]
+async fn test_encrypted_chat_non_streaming_ecdsa() {
+    use vllm_proxy_rs::encryption;
+
+    let mock_server = MockServer::start().await;
+    let server_pair = test_signing_pair();
+    let client_pair = test_client_signing_pair();
+
+    let backend_response = serde_json::json!({
+        "id": "chatcmpl-ecdsa1",
+        "choices": [{"message": {"role": "assistant", "content": "ECDSA response"}}]
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&backend_response))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    // ECDSA: client encrypts with server's ECDSA pub key
+    let server_ecdsa_pub = hex::decode(&server_pair.ecdsa.signing_public_key).unwrap();
+    let client_ecdsa_pub_hex = client_pair.ecdsa.signing_public_key.clone();
+    let client_ecdsa_pub = hex::decode(&client_ecdsa_pub_hex).unwrap();
+
+    let enc_for_request = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ecdsa,
+        client_pub_key: server_ecdsa_pub,
+    };
+    let dec_for_response = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ecdsa,
+        client_pub_key: client_ecdsa_pub,
+    };
+
+    let encrypted_content =
+        encryption::encrypt_string("ECDSA test", &enc_for_request, &client_pair).unwrap();
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": encrypted_content}],
+        "stream": false
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header("x-signing-algo", "ecdsa")
+                .header("x-client-pub-key", &client_ecdsa_pub_hex)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response).await;
+
+    let encrypted_response = body["choices"][0]["message"]["content"].as_str().unwrap();
+    assert_ne!(encrypted_response, "ECDSA response");
+
+    let decrypted =
+        encryption::decrypt_string(encrypted_response, &dec_for_response, &client_pair).unwrap();
+    assert_eq!(decrypted, "ECDSA response");
+}
+
+// ---- Encrypted embeddings test ----
+
+#[tokio::test]
+async fn test_encrypted_embeddings_ed25519() {
+    use vllm_proxy_rs::encryption;
+
+    let mock_server = MockServer::start().await;
+    let client_pair = test_client_signing_pair();
+
+    let backend_response = serde_json::json!({
+        "id": "emb-enc1",
+        "data": [{"embedding": [0.1, 0.2, 0.3], "index": 0}],
+        "usage": {"prompt_tokens": 5, "total_tokens": 5}
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&backend_response))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let server_pub_hex = test_ed25519_pub_key_hex();
+    let server_pub_bytes = hex::decode(&server_pub_hex).unwrap();
+    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
+
+    let enc_for_request = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: server_pub_bytes,
+    };
+
+    // Each string element is individually encrypted (matching Python proxy)
+    let enc_hello = encryption::encrypt_string("hello", &enc_for_request, &client_pair).unwrap();
+    let enc_world = encryption::encrypt_string("world", &enc_for_request, &client_pair).unwrap();
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "input": [enc_hello, enc_world]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header("x-signing-algo", "ed25519")
+                .header("x-client-pub-key", &client_pub_hex)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response).await;
+
+    // Embeddings response is encrypted — embedding is now a hex-encoded string
+    let encrypted_embedding = body["data"][0]["embedding"]
+        .as_str()
+        .expect("embedding should be an encrypted string");
+    // Decrypt and verify original value
+    let dec_ctx = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: hex::decode(&client_pub_hex).unwrap(),
+    };
+    let decrypted =
+        encryption::decrypt_string(encrypted_embedding, &dec_ctx, &client_pair).unwrap();
+    assert_eq!(decrypted, "[0.1,0.2,0.3]");
+}
+
+// ---- Encrypted images test ----
+
+#[tokio::test]
+async fn test_encrypted_images_generations_ed25519() {
+    use vllm_proxy_rs::encryption;
+
+    let mock_server = MockServer::start().await;
+    let client_pair = test_client_signing_pair();
+
+    let backend_response = serde_json::json!({
+        "id": "img-enc1",
+        "data": [{"b64_json": "iVBORw0KGgo="}]
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/images/generations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&backend_response))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let server_pub_hex = test_ed25519_pub_key_hex();
+    let server_pub_bytes = hex::decode(&server_pub_hex).unwrap();
+    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
+    let client_pub_bytes = hex::decode(&client_pub_hex).unwrap();
+
+    let enc_for_request = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: server_pub_bytes,
+    };
+    let dec_for_response = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: client_pub_bytes,
+    };
+
+    let encrypted_prompt =
+        encryption::encrypt_string("a cat", &enc_for_request, &client_pair).unwrap();
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "prompt": encrypted_prompt
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/images/generations")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header("x-signing-algo", "ed25519")
+                .header("x-client-pub-key", &client_pub_hex)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response).await;
+
+    // b64_json should be encrypted
+    let encrypted_b64 = body["data"][0]["b64_json"].as_str().unwrap();
+    assert_ne!(encrypted_b64, "iVBORw0KGgo=");
+
+    let decrypted =
+        encryption::decrypt_string(encrypted_b64, &dec_for_response, &client_pair).unwrap();
+    assert_eq!(decrypted, "iVBORw0KGgo=");
+}
+
+// ---- Encrypted streaming completions test ----
+
+#[tokio::test]
+async fn test_encrypted_streaming_completions_ed25519() {
+    use vllm_proxy_rs::encryption;
+
+    let mock_server = MockServer::start().await;
+    let client_pair = test_client_signing_pair();
+
+    let sse_body = "data: {\"id\":\"cmpl-encstream1\",\"choices\":[{\"text\":\"hello\",\"index\":0}]}\n\ndata: [DONE]\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/v1/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(sse_body)
+                .insert_header("content-type", "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let server_pub_hex = test_ed25519_pub_key_hex();
+    let server_pub_bytes = hex::decode(&server_pub_hex).unwrap();
+    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
+    let client_pub_bytes = hex::decode(&client_pub_hex).unwrap();
+
+    let enc_for_request = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: server_pub_bytes,
+    };
+    let dec_for_response = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: client_pub_bytes,
+    };
+
+    let encrypted_prompt =
+        encryption::encrypt_string("Once upon", &enc_for_request, &client_pair).unwrap();
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "prompt": encrypted_prompt,
+        "stream": true
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header("x-signing-algo", "ed25519")
+                .header("x-client-pub-key", &client_pub_hex)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_bytes = body_to_bytes(response).await;
+    let body_str = String::from_utf8_lossy(&body_bytes);
+
+    // Parse the SSE data line and verify choices[*].text is encrypted
+    for line in body_str.lines() {
+        if let Some(data) = line.strip_prefix("data: ") {
+            if data != "[DONE]" {
+                let parsed: serde_json::Value = serde_json::from_str(data).unwrap();
+                if let Some(text) = parsed["choices"][0]["text"].as_str() {
+                    assert_ne!(text, "hello", "choices[*].text should be encrypted");
+                    let decrypted =
+                        encryption::decrypt_string(text, &dec_for_response, &client_pair).unwrap();
+                    assert_eq!(decrypted, "hello");
+                }
+            }
+        }
+    }
+}
+
+// ---- Multipart: signature covers encrypted response ----
+
+#[tokio::test]
+async fn test_encrypted_audio_transcription_signature_covers_transformed() {
+    use sha2::{Digest, Sha256};
+    use vllm_proxy_rs::encryption;
+
+    let mock_server = MockServer::start().await;
+    let client_pair = test_client_signing_pair();
+
+    let backend_response = serde_json::json!({
+        "id": "trans-enc1",
+        "text": "Hello world"
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&backend_response))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let server_pub_hex = test_ed25519_pub_key_hex();
+    let server_pub_bytes = hex::decode(&server_pub_hex).unwrap();
+    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
+    let client_pub_bytes = hex::decode(&client_pub_hex).unwrap();
+
+    let enc_for_request = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: server_pub_bytes,
+    };
+    let dec_for_response = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: client_pub_bytes,
+    };
+
+    // Encrypt the prompt field
+    let encrypted_prompt =
+        encryption::encrypt_string("transcribe this", &enc_for_request, &client_pair).unwrap();
+
+    let boundary = "----TestBoundary99999";
+    let body = format!(
+        "--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"model\"\r\n\r\n\
+         whisper-1\r\n\
+         --{boundary}\r\n\
+         Content-Disposition: form-data; name=\"prompt\"\r\n\r\n\
+         {encrypted_prompt}\r\n\
+         --{boundary}\r\n\
+         Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n\
+         Content-Type: audio/wav\r\n\r\n\
+         fakeaudiodata\r\n\
+         --{boundary}--\r\n"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .header(auth_header().0, auth_header().1)
+                .header("x-signing-algo", "ed25519")
+                .header("x-client-pub-key", &client_pub_hex)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Collect raw response bytes to hash what the client receives
+    let response_bytes = body_to_bytes(response).await;
+    let body_json: serde_json::Value = serde_json::from_slice(&response_bytes).unwrap();
+
+    // Verify the text field is encrypted and can be decrypted
+    let encrypted_text = body_json["text"].as_str().unwrap();
+    assert_ne!(encrypted_text, "Hello world");
+    let decrypted =
+        encryption::decrypt_string(encrypted_text, &dec_for_response, &client_pair).unwrap();
+    assert_eq!(decrypted, "Hello world");
+
+    // Fetch the cached signature
+    let sig_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/signature/trans-enc1?signing_algo=ed25519")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(sig_response.status(), StatusCode::OK);
+    let sig_body = body_to_json(sig_response).await;
+    let signed_text = sig_body["text"].as_str().unwrap();
+
+    // Verify response hash in the signature covers the encrypted response
+    let response_sha256 = hex::encode(Sha256::digest(&response_bytes));
+
+    let parts: Vec<&str> = signed_text.split(':').collect();
+    assert_eq!(parts.len(), 3);
+    assert_eq!(parts[0], "test-model");
+    assert_eq!(
+        parts[2], response_sha256,
+        "Multipart signature should cover encrypted response bytes (what client receives)"
+    );
+}

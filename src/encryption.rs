@@ -264,9 +264,15 @@ pub fn encrypt_string(
     let _ = signing;
     let ciphertext = match ctx.algo {
         EncryptionAlgo::Ed25519 => {
+            let client_ed25519: [u8; 32] =
+                ctx.client_pub_key.as_slice().try_into().map_err(|_| {
+                    AppError::BadRequest(format!(
+                        "invalid Ed25519 public key length: expected 32 bytes, got {}",
+                        ctx.client_pub_key.len()
+                    ))
+                })?;
             let client_x25519 =
-                nacl::ed25519_public_to_x25519(ctx.client_pub_key.as_slice().try_into().unwrap())
-                    .map_err(AppError::BadRequest)?;
+                nacl::ed25519_public_to_x25519(&client_ed25519).map_err(AppError::BadRequest)?;
             nacl::encrypt(plaintext.as_bytes(), &client_x25519)
                 .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?
         }

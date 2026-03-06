@@ -260,10 +260,19 @@ pub async fn proxy_json_request(
         }
     };
 
+    // Report usage for cloud API key requests (before encryption, needs plaintext fields)
+    try_report_usage(&response_data, &chat_id, &opts);
+
+    // Apply response transform (e.g., encryption) before hashing/signing.
+    // The signature covers the response bytes the client actually receives.
+    if let Some(transform) = opts.response_transform.take() {
+        transform(&mut response_data)?;
+    }
+
     // Serialize with compact separators (matching Python's separators=(",",":"))
-    let response_body =
+    let final_body =
         serde_json::to_string(&response_data).map_err(|e| AppError::Internal(e.into()))?;
-    let response_sha256 = hex::encode(Sha256::digest(response_body.as_bytes()));
+    let response_sha256 = hex::encode(Sha256::digest(final_body.as_bytes()));
 
     // Sign and cache
     let text = format!("{}:{request_sha256}:{response_sha256}", opts.model_name);
@@ -273,17 +282,6 @@ pub async fn proxy_json_request(
     })?;
     let signed_json = serde_json::to_string(&signed).map_err(|e| AppError::Internal(e.into()))?;
     opts.cache.set_chat(&chat_id, &signed_json);
-
-    // Report usage for cloud API key requests
-    try_report_usage(&response_data, &chat_id, &opts);
-
-    // Apply response transform (e.g., encryption) after signing
-    let final_body = if let Some(transform) = opts.response_transform.take() {
-        transform(&mut response_data)?;
-        serde_json::to_string(&response_data).map_err(|e| AppError::Internal(e.into()))?
-    } else {
-        response_body
-    };
 
     Ok((
         StatusCode::OK,
@@ -356,10 +354,10 @@ pub async fn proxy_streaming_request(
                 chunk = byte_stream.next() => {
                     match chunk {
                         Some(Ok(chunk)) => {
-                            // Always hash the original (plaintext) bytes for signing
-                            hasher.update(&chunk);
                             parser.process_chunk(&chunk);
 
+                            // Transform (encrypt) the chunk if needed, then hash
+                            // what the client actually receives for signatures.
                             let to_send = if let Some(ref mut xform) = transformer {
                                 match xform.process_chunk(&chunk) {
                                     Ok(transformed) => transformed,
@@ -375,6 +373,7 @@ pub async fn proxy_streaming_request(
                             } else {
                                 chunk
                             };
+                            hasher.update(&to_send);
 
                             if tx.send(Ok(to_send)).await.is_err() {
                                 downstream_closed = true;
@@ -403,6 +402,7 @@ pub async fn proxy_streaming_request(
             if let Some(ref mut xform) = transformer {
                 match xform.flush() {
                     Ok(flushed) if !flushed.is_empty() => {
+                        hasher.update(&flushed);
                         if tx.send(Ok(flushed)).await.is_err() {
                             downstream_closed = true;
                         }
@@ -488,12 +488,10 @@ impl SseTransformer {
     /// Feed raw bytes into the buffer and return all complete transformed lines.
     /// Incomplete lines are buffered for the next call.
     fn process_chunk(&mut self, chunk: &[u8]) -> Result<Bytes, AppError> {
-        match std::str::from_utf8(chunk) {
-            Ok(s) => self.line_buffer.push_str(s),
-            Err(_) => {
-                self.line_buffer.push_str(&String::from_utf8_lossy(chunk));
-            }
-        }
+        let s = std::str::from_utf8(chunk).map_err(|e| {
+            AppError::Internal(anyhow::anyhow!("Received invalid UTF-8 in SSE stream: {e}"))
+        })?;
+        self.line_buffer.push_str(s);
 
         let mut output = String::new();
 
@@ -808,9 +806,10 @@ pub async fn proxy_streaming_response(
                 chunk = byte_stream.next() => {
                     match chunk {
                         Some(Ok(chunk)) => {
-                            hasher.update(&chunk);
                             parser.process_chunk(&chunk);
 
+                            // Transform (encrypt) the chunk if needed, then hash
+                            // what the client actually receives for signatures.
                             let to_send = if let Some(ref mut xform) = transformer {
                                 match xform.process_chunk(&chunk) {
                                     Ok(transformed) => transformed,
@@ -826,6 +825,8 @@ pub async fn proxy_streaming_response(
                             } else {
                                 chunk
                             };
+
+                            hasher.update(&to_send);
 
                             if tx.send(Ok(to_send)).await.is_err() {
                                 downstream_closed = true;
@@ -854,6 +855,7 @@ pub async fn proxy_streaming_response(
             if let Some(ref mut xform) = transformer {
                 match xform.flush() {
                     Ok(flushed) if !flushed.is_empty() => {
+                        hasher.update(&flushed);
                         if tx.send(Ok(flushed)).await.is_err() {
                             downstream_closed = true;
                         }

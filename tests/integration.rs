@@ -3894,7 +3894,10 @@ async fn test_encrypted_signature_covers_plaintext() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
-    let body = body_to_json(response).await;
+
+    // Collect raw response bytes so we can hash exactly what the client receives
+    let response_bytes = body_to_bytes(response).await;
+    let body: serde_json::Value = serde_json::from_slice(&response_bytes).unwrap();
 
     // Verify the encrypted response content can be decrypted by the client
     let encrypted_content = body["choices"][0]["message"]["content"].as_str().unwrap();
@@ -3902,7 +3905,7 @@ async fn test_encrypted_signature_covers_plaintext() {
         encryption::decrypt_string(encrypted_content, &dec_for_response, &client_pair).unwrap();
     assert_eq!(decrypted, "Signed!");
 
-    // Now fetch the cached signature and verify it covers the PLAINTEXT response hash
+    // Now fetch the cached signature and verify it covers the ENCRYPTED response hash
     let sig_response = app
         .clone()
         .oneshot(
@@ -3921,11 +3924,10 @@ async fn test_encrypted_signature_covers_plaintext() {
 
     // The signed text format is "model:request_sha256:response_sha256"
     // request_sha256 should cover the ORIGINAL (encrypted) request body
-    // response_sha256 should cover the plaintext (pre-encryption) response
+    // response_sha256 should cover the encrypted response (what client receives)
     let original_request_bytes = serde_json::to_vec(&request_body).unwrap();
     let request_sha256 = hex::encode(Sha256::digest(&original_request_bytes));
-    let plaintext_response = serde_json::to_string(&backend_response).unwrap();
-    let response_sha256 = hex::encode(Sha256::digest(plaintext_response.as_bytes()));
+    let response_sha256 = hex::encode(Sha256::digest(&response_bytes));
 
     let parts: Vec<&str> = signed_text.split(':').collect();
     assert_eq!(parts.len(), 3);
@@ -3936,7 +3938,7 @@ async fn test_encrypted_signature_covers_plaintext() {
     );
     assert_eq!(
         parts[2], response_sha256,
-        "Signature should cover plaintext response hash"
+        "Signature should cover encrypted response hash (what client receives)"
     );
 
     // Verify the Ed25519 signature is valid

@@ -61,7 +61,7 @@ impl EcdsaContext {
     }
 
     /// Access the underlying signing key (needed for ECIES encryption).
-    pub fn secret_key(&self) -> &K256SigningKey {
+    pub(crate) fn secret_key(&self) -> &K256SigningKey {
         &self.signing_key
     }
 
@@ -115,7 +115,7 @@ impl Ed25519Context {
     }
 
     /// Access the raw 32-byte secret key bytes (needed for NaCl box encryption).
-    pub fn secret_bytes(&self) -> &[u8; 32] {
+    pub(crate) fn secret_bytes(&self) -> &[u8; 32] {
         self.signing_key.as_bytes()
     }
 

@@ -18,7 +18,7 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
-    let request_body = read_body_with_limit(body, state.config.max_audio_request_size).await?;
+    let request_body = read_body_with_limit(body, state.config.max_request_size).await?;
 
     let mut request_json: serde_json::Value = serde_json::from_slice(&request_body)
         .map_err(|e| AppError::BadRequest(format!("Invalid JSON: {e}")))?;

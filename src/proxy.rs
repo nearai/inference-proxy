@@ -189,6 +189,18 @@ pub struct ProxyOpts {
     pub usage_reporter: Option<UsageReporter>,
     /// What kind of usage to extract from the response.
     pub usage_type: UsageType,
+    /// Pre-computed SHA-256 hex hash of the original request body.
+    /// When set, this hash is used in the signature instead of hashing the
+    /// (possibly decrypted/modified) body that is forwarded to the backend.
+    /// This matches the Python proxy behavior where signatures cover the
+    /// original client-sent body, not the decrypted version.
+    pub request_hash: Option<String>,
+    /// Applied to response JSON after signing, before sending to client.
+    pub response_transform:
+        Option<Box<dyn FnOnce(&mut serde_json::Value) -> Result<(), AppError> + Send>>,
+    /// Applied to each SSE chunk JSON before forwarding to client.
+    pub chunk_transform:
+        Option<Arc<dyn Fn(&mut serde_json::Value) -> Result<(), AppError> + Send + Sync>>,
 }
 
 /// Proxy a JSON request to the backend, sign the response, cache signature.
@@ -196,9 +208,12 @@ pub async fn proxy_json_request(
     client: &reqwest::Client,
     url: &str,
     request_body: Vec<u8>,
-    opts: &ProxyOpts,
+    mut opts: ProxyOpts,
 ) -> Result<Response, AppError> {
-    let request_sha256 = hex::encode(Sha256::digest(&request_body));
+    let request_sha256 = opts
+        .request_hash
+        .take()
+        .unwrap_or_else(|| hex::encode(Sha256::digest(&request_body)));
 
     let upstream_start = std::time::Instant::now();
     let response = client
@@ -262,12 +277,20 @@ pub async fn proxy_json_request(
     opts.cache.set_chat(&chat_id, &signed_json);
 
     // Report usage for cloud API key requests
-    try_report_usage(&response_data, &chat_id, opts);
+    try_report_usage(&response_data, &chat_id, &opts);
+
+    // Apply response transform (e.g., encryption) after signing
+    let final_body = if let Some(transform) = opts.response_transform.take() {
+        transform(&mut response_data)?;
+        serde_json::to_string(&response_data).map_err(|e| AppError::Internal(e.into()))?
+    } else {
+        response_body
+    };
 
     Ok((
         StatusCode::OK,
         [("content-type", "application/json")],
-        response_body,
+        final_body,
     )
         .into_response())
 }
@@ -277,9 +300,12 @@ pub async fn proxy_streaming_request(
     client: &reqwest::Client,
     url: &str,
     request_body: Vec<u8>,
-    opts: &ProxyOpts,
+    mut opts: ProxyOpts,
 ) -> Result<Response, AppError> {
-    let request_sha256 = hex::encode(Sha256::digest(&request_body));
+    let request_sha256 = opts
+        .request_hash
+        .take()
+        .unwrap_or_else(|| hex::encode(Sha256::digest(&request_body)));
 
     let upstream_start = std::time::Instant::now();
     let response = client
@@ -307,6 +333,7 @@ pub async fn proxy_streaming_request(
     let cache = opts.cache.clone();
     let usage_reporter = opts.usage_reporter.clone();
     let model_name = opts.model_name.clone();
+    let chunk_transform = opts.chunk_transform;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
@@ -324,15 +351,34 @@ pub async fn proxy_streaming_request(
         let mut parser = SseParser::new();
         let mut upstream_error = false;
         let mut downstream_closed = false;
+        let mut transformer = chunk_transform.map(SseTransformer::new);
 
         loop {
             tokio::select! {
                 chunk = byte_stream.next() => {
                     match chunk {
                         Some(Ok(chunk)) => {
+                            // Always hash the original (plaintext) bytes for signing
                             hasher.update(&chunk);
                             parser.process_chunk(&chunk);
-                            if tx.send(Ok(chunk)).await.is_err() {
+
+                            let to_send = if let Some(ref mut xform) = transformer {
+                                match xform.process_chunk(&chunk) {
+                                    Ok(transformed) => transformed,
+                                    Err(e) => {
+                                        error!(error = %e, "Stream encryption failed");
+                                        let _ = tx.send(Err(std::io::Error::other(
+                                            "Stream encryption failed",
+                                        ))).await;
+                                        upstream_error = true;
+                                        break;
+                                    }
+                                }
+                            } else {
+                                chunk
+                            };
+
+                            if tx.send(Ok(to_send)).await.is_err() {
                                 downstream_closed = true;
                                 break;
                             }
@@ -350,6 +396,27 @@ pub async fn proxy_streaming_request(
                     info!("Client disconnected, aborting upstream stream processing");
                     downstream_closed = true;
                     break;
+                }
+            }
+        }
+
+        // Flush any remaining buffered content in the transformer
+        if !upstream_error && !downstream_closed {
+            if let Some(ref mut xform) = transformer {
+                match xform.flush() {
+                    Ok(flushed) if !flushed.is_empty() => {
+                        if tx.send(Ok(flushed)).await.is_err() {
+                            downstream_closed = true;
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Stream encryption flush failed");
+                        let _ = tx
+                            .send(Err(std::io::Error::other("Stream encryption failed")))
+                            .await;
+                        upstream_error = true;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -405,13 +472,120 @@ pub async fn proxy_streaming_request(
         .unwrap())
 }
 
+/// Line-buffered SSE transformer that handles data split across chunk boundaries.
+/// Fail-closed: if a data line contains JSON that cannot be transformed, the stream errors.
+struct SseTransformer {
+    line_buffer: String,
+    transform: Arc<dyn Fn(&mut serde_json::Value) -> Result<(), AppError> + Send + Sync>,
+}
+
+impl SseTransformer {
+    fn new(
+        transform: Arc<dyn Fn(&mut serde_json::Value) -> Result<(), AppError> + Send + Sync>,
+    ) -> Self {
+        Self {
+            line_buffer: String::new(),
+            transform,
+        }
+    }
+
+    /// Feed raw bytes into the buffer and return all complete transformed lines.
+    /// Incomplete lines are buffered for the next call.
+    fn process_chunk(&mut self, chunk: &[u8]) -> Result<Bytes, AppError> {
+        match std::str::from_utf8(chunk) {
+            Ok(s) => self.line_buffer.push_str(s),
+            Err(_) => {
+                self.line_buffer.push_str(&String::from_utf8_lossy(chunk));
+            }
+        }
+
+        let mut output = String::new();
+
+        loop {
+            let Some(newline_pos) = self.line_buffer.find('\n') else {
+                break;
+            };
+
+            // Extract the complete line including the newline
+            let full_line = self.line_buffer[..=newline_pos].to_string();
+            self.line_buffer.drain(..=newline_pos);
+
+            let trimmed = full_line.trim_end_matches(|c| c == '\n' || c == '\r');
+            let data = trimmed
+                .strip_prefix("data: ")
+                .or_else(|| trimmed.strip_prefix("data:"));
+
+            if let Some(data) = data {
+                let data = data.trim();
+                if !data.is_empty() && data != "[DONE]" {
+                    // This is a JSON data line — must transform or fail
+                    let mut parsed: serde_json::Value =
+                        serde_json::from_str(data).map_err(|e| {
+                            AppError::Internal(anyhow::anyhow!(
+                                "Failed to parse SSE data for encryption: {e}"
+                            ))
+                        })?;
+                    (self.transform)(&mut parsed)?;
+                    let re_serialized =
+                        serde_json::to_string(&parsed).map_err(|e| AppError::Internal(e.into()))?;
+                    output.push_str("data: ");
+                    output.push_str(&re_serialized);
+                    // Preserve the original line ending
+                    let ending = &full_line[trimmed.len()..];
+                    output.push_str(ending);
+                    continue;
+                }
+            }
+            // Pass through non-data lines, empty lines, and [DONE]
+            output.push_str(&full_line);
+        }
+
+        Ok(Bytes::from(output))
+    }
+
+    /// Flush any remaining buffered content at stream end.
+    /// A well-formed SSE stream always ends lines with `\n`, but if the backend
+    /// sends a final line without one, this ensures it is still transformed and
+    /// forwarded so the signature hash (which covers all raw bytes) matches
+    /// what the client receives.
+    fn flush(&mut self) -> Result<Bytes, AppError> {
+        if self.line_buffer.is_empty() {
+            return Ok(Bytes::new());
+        }
+        let remaining = std::mem::take(&mut self.line_buffer);
+        let trimmed = remaining.trim_end_matches(|c| c == '\n' || c == '\r');
+        let data = trimmed
+            .strip_prefix("data: ")
+            .or_else(|| trimmed.strip_prefix("data:"));
+
+        if let Some(data) = data {
+            let data = data.trim();
+            if !data.is_empty() && data != "[DONE]" {
+                let mut parsed: serde_json::Value = serde_json::from_str(data).map_err(|e| {
+                    AppError::Internal(anyhow::anyhow!(
+                        "Failed to parse SSE data for encryption: {e}"
+                    ))
+                })?;
+                (self.transform)(&mut parsed)?;
+                let re_serialized =
+                    serde_json::to_string(&parsed).map_err(|e| AppError::Internal(e.into()))?;
+                let mut output = String::from("data: ");
+                output.push_str(&re_serialized);
+                output.push_str(&remaining[trimmed.len()..]);
+                return Ok(Bytes::from(output));
+            }
+        }
+        Ok(Bytes::from(remaining))
+    }
+}
+
 /// Proxy a multipart request. Caller provides pre-computed request hash covering all field bytes.
 pub async fn proxy_multipart_request(
     client: &reqwest::Client,
     url: &str,
     form: reqwest::multipart::Form,
     request_sha256: &str,
-    opts: &ProxyOpts,
+    mut opts: ProxyOpts,
 ) -> Result<Response, AppError> {
     let upstream_start = std::time::Instant::now();
     let response = client
@@ -469,12 +643,20 @@ pub async fn proxy_multipart_request(
     opts.cache.set_chat(&response_id, &signed_json);
 
     // Report usage for cloud API key requests
-    try_report_usage(&response_data, &response_id, opts);
+    try_report_usage(&response_data, &response_id, &opts);
+
+    // Apply response transform (e.g., encryption) after signing
+    let final_body = if let Some(transform) = opts.response_transform.take() {
+        transform(&mut response_data)?;
+        serde_json::to_string(&response_data).map_err(|e| AppError::Internal(e.into()))?
+    } else {
+        response_body
+    };
 
     Ok((
         StatusCode::OK,
         [("content-type", "application/json")],
-        response_body,
+        final_body,
     )
         .into_response())
 }
@@ -535,7 +717,7 @@ pub async fn proxy_simple(
 pub async fn sign_and_cache_json_response(
     response_bytes: &[u8],
     request_sha256: &str,
-    opts: &ProxyOpts,
+    mut opts: ProxyOpts,
     status: StatusCode,
 ) -> Result<Response, AppError> {
     // Parse JSON; if the backend sent content-type: application/json but the body
@@ -578,12 +760,20 @@ pub async fn sign_and_cache_json_response(
     opts.cache.set_chat(&chat_id, &signed_json);
 
     // Report usage for cloud API key requests
-    try_report_usage(&response_data, &chat_id, opts);
+    try_report_usage(&response_data, &chat_id, &opts);
+
+    // Apply response transform (e.g., encryption) after signing
+    let final_body = if let Some(transform) = opts.response_transform.take() {
+        transform(&mut response_data)?;
+        serde_json::to_string(&response_data).map_err(|e| AppError::Internal(e.into()))?
+    } else {
+        response_body
+    };
 
     Ok(Response::builder()
         .status(status)
         .header("content-type", "application/json")
-        .body(Body::from(response_body))
+        .body(Body::from(final_body))
         .unwrap())
 }
 
@@ -592,13 +782,14 @@ pub async fn sign_and_cache_json_response(
 pub async fn proxy_streaming_response(
     response: reqwest::Response,
     request_sha256: &str,
-    opts: &ProxyOpts,
+    opts: ProxyOpts,
     status: StatusCode,
 ) -> Result<Response, AppError> {
     let signing = opts.signing.clone();
     let cache = opts.cache.clone();
     let usage_reporter = opts.usage_reporter.clone();
     let model_name = opts.model_name.clone();
+    let chunk_transform = opts.chunk_transform;
     let request_sha256 = request_sha256.to_string();
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
@@ -614,6 +805,7 @@ pub async fn proxy_streaming_response(
         let mut parser = SseParser::new();
         let mut upstream_error = false;
         let mut downstream_closed = false;
+        let mut transformer = chunk_transform.map(SseTransformer::new);
 
         loop {
             tokio::select! {
@@ -622,7 +814,24 @@ pub async fn proxy_streaming_response(
                         Some(Ok(chunk)) => {
                             hasher.update(&chunk);
                             parser.process_chunk(&chunk);
-                            if tx.send(Ok(chunk)).await.is_err() {
+
+                            let to_send = if let Some(ref mut xform) = transformer {
+                                match xform.process_chunk(&chunk) {
+                                    Ok(transformed) => transformed,
+                                    Err(e) => {
+                                        error!(error = %e, "Stream encryption failed");
+                                        let _ = tx.send(Err(std::io::Error::other(
+                                            "Stream encryption failed",
+                                        ))).await;
+                                        upstream_error = true;
+                                        break;
+                                    }
+                                }
+                            } else {
+                                chunk
+                            };
+
+                            if tx.send(Ok(to_send)).await.is_err() {
                                 downstream_closed = true;
                                 break;
                             }
@@ -640,6 +849,27 @@ pub async fn proxy_streaming_response(
                     info!("Client disconnected, aborting upstream stream processing");
                     downstream_closed = true;
                     break;
+                }
+            }
+        }
+
+        // Flush any remaining buffered content in the transformer
+        if !upstream_error && !downstream_closed {
+            if let Some(ref mut xform) = transformer {
+                match xform.flush() {
+                    Ok(flushed) if !flushed.is_empty() => {
+                        if tx.send(Ok(flushed)).await.is_err() {
+                            downstream_closed = true;
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Stream encryption flush failed");
+                        let _ = tx
+                            .send(Err(std::io::Error::other("Stream encryption failed")))
+                            .await;
+                        upstream_error = true;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -849,6 +1079,9 @@ mod tests {
             model_name: "test-model".to_string(),
             usage_reporter: None,
             usage_type: UsageType::default(),
+            request_hash: None,
+            response_transform: None,
+            chunk_transform: None,
         }
     }
 
@@ -857,8 +1090,7 @@ mod tests {
         let opts = test_proxy_opts();
         let request_sha256 = hex::encode(Sha256::digest(b"test-request"));
 
-        let result =
-            sign_and_cache_json_response(b"", &request_sha256, &opts, StatusCode::OK).await;
+        let result = sign_and_cache_json_response(b"", &request_sha256, opts, StatusCode::OK).await;
 
         let resp = result.expect("empty body should not return error");
         assert_eq!(resp.status(), StatusCode::OK);
@@ -880,7 +1112,7 @@ mod tests {
         let result = sign_and_cache_json_response(
             b"this is not json",
             &request_sha256,
-            &opts,
+            opts,
             StatusCode::OK,
         )
         .await;
@@ -899,11 +1131,12 @@ mod tests {
     #[tokio::test]
     async fn test_sign_and_cache_json_valid_body_with_id() {
         let opts = test_proxy_opts();
+        let cache = opts.cache.clone();
         let request_sha256 = hex::encode(Sha256::digest(b"test-request"));
         let body = br#"{"id":"existing-id","text":"hello"}"#;
 
         let result =
-            sign_and_cache_json_response(body, &request_sha256, &opts, StatusCode::OK).await;
+            sign_and_cache_json_response(body, &request_sha256, opts, StatusCode::OK).await;
 
         let resp = result.expect("valid JSON should succeed");
         assert_eq!(resp.status(), StatusCode::OK);
@@ -915,17 +1148,18 @@ mod tests {
         assert_eq!(parsed["id"], "existing-id");
 
         // Signature should be cached under "existing-id"
-        assert!(opts.cache.get_chat("existing-id").is_some());
+        assert!(cache.get_chat("existing-id").is_some());
     }
 
     #[tokio::test]
     async fn test_sign_and_cache_json_valid_body_without_id() {
         let opts = test_proxy_opts();
+        let cache = opts.cache.clone();
         let request_sha256 = hex::encode(Sha256::digest(b"test-request"));
         let body = br#"{"text":"hello"}"#;
 
         let result =
-            sign_and_cache_json_response(body, &request_sha256, &opts, StatusCode::OK).await;
+            sign_and_cache_json_response(body, &request_sha256, opts, StatusCode::OK).await;
 
         let resp = result.expect("valid JSON without id should succeed");
         let resp_body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
@@ -936,7 +1170,7 @@ mod tests {
         assert!(id.starts_with("test-"), "should generate id with prefix");
 
         // Signature should be cached under the generated id
-        assert!(opts.cache.get_chat(id).is_some());
+        assert!(cache.get_chat(id).is_some());
     }
 
     #[tokio::test]
@@ -945,7 +1179,7 @@ mod tests {
         let request_sha256 = hex::encode(Sha256::digest(b"test"));
         let body = br#"{"id":"s1"}"#;
 
-        let resp = sign_and_cache_json_response(body, &request_sha256, &opts, StatusCode::CREATED)
+        let resp = sign_and_cache_json_response(body, &request_sha256, opts, StatusCode::CREATED)
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
@@ -1117,5 +1351,153 @@ mod tests {
     #[test]
     fn test_parse_upstream_error_empty_json() {
         assert!(parse_upstream_error(b"{}").is_none());
+    }
+
+    // ── Fix 1: SseTransformer line buffering and fail-closed tests ──
+
+    #[test]
+    fn test_sse_transformer_data_split_across_chunks() {
+        // Simulate a "data: {...}\n" line split across two TCP chunks
+        let transform: Arc<dyn Fn(&mut serde_json::Value) -> Result<(), AppError> + Send + Sync> =
+            Arc::new(|v| {
+                if let Some(s) = v
+                    .get_mut("text")
+                    .and_then(|t| t.as_str().map(|s| s.to_string()))
+                {
+                    v["text"] = serde_json::Value::String(format!("ENC:{s}"));
+                }
+                Ok(())
+            });
+
+        let mut transformer = SseTransformer::new(transform);
+
+        // First chunk: incomplete line
+        let out1 = transformer.process_chunk(b"data: {\"text\":\"hel").unwrap();
+        assert_eq!(out1.as_ref(), b""); // No complete line yet
+
+        // Second chunk: completes the line
+        let out2 = transformer.process_chunk(b"lo\"}\n").unwrap();
+        let out_str = std::str::from_utf8(&out2).unwrap();
+        assert!(out_str.contains("\"ENC:hello\""), "Got: {out_str}");
+    }
+
+    #[test]
+    fn test_sse_transformer_multiple_lines_in_one_chunk() {
+        let transform: Arc<dyn Fn(&mut serde_json::Value) -> Result<(), AppError> + Send + Sync> =
+            Arc::new(|v| {
+                if let Some(s) = v
+                    .get_mut("x")
+                    .and_then(|t| t.as_str().map(|s| s.to_string()))
+                {
+                    v["x"] = serde_json::Value::String(format!("T:{s}"));
+                }
+                Ok(())
+            });
+
+        let mut transformer = SseTransformer::new(transform);
+        let chunk = b"data: {\"x\":\"a\"}\ndata: {\"x\":\"b\"}\n\n";
+        let out = transformer.process_chunk(chunk).unwrap();
+        let out_str = std::str::from_utf8(&out).unwrap();
+        assert!(out_str.contains("\"T:a\""), "Got: {out_str}");
+        assert!(out_str.contains("\"T:b\""), "Got: {out_str}");
+    }
+
+    #[test]
+    fn test_sse_transformer_fail_closed_on_bad_json() {
+        let transform: Arc<dyn Fn(&mut serde_json::Value) -> Result<(), AppError> + Send + Sync> =
+            Arc::new(|_| Ok(()));
+
+        let mut transformer = SseTransformer::new(transform);
+        // Invalid JSON in data line
+        let result = transformer.process_chunk(b"data: {not json}\n");
+        assert!(result.is_err(), "Should fail-closed on bad JSON");
+    }
+
+    #[test]
+    fn test_sse_transformer_fail_closed_on_transform_error() {
+        let transform: Arc<dyn Fn(&mut serde_json::Value) -> Result<(), AppError> + Send + Sync> =
+            Arc::new(|_| Err(AppError::Internal(anyhow::anyhow!("transform failed"))));
+
+        let mut transformer = SseTransformer::new(transform);
+        let result = transformer.process_chunk(b"data: {\"x\":1}\n");
+        assert!(result.is_err(), "Should fail-closed on transform error");
+    }
+
+    #[test]
+    fn test_sse_transformer_passes_through_done_and_empty_lines() {
+        let transform: Arc<dyn Fn(&mut serde_json::Value) -> Result<(), AppError> + Send + Sync> =
+            Arc::new(|_| Ok(()));
+
+        let mut transformer = SseTransformer::new(transform);
+        let chunk = b"data: [DONE]\n\n";
+        let out = transformer.process_chunk(chunk).unwrap();
+        let out_str = std::str::from_utf8(&out).unwrap();
+        assert!(out_str.contains("[DONE]"));
+    }
+
+    #[test]
+    fn test_sse_transformer_flush_incomplete_line() {
+        // Simulate a data line that arrives without a trailing newline (stream ends mid-line).
+        let transform: Arc<dyn Fn(&mut serde_json::Value) -> Result<(), AppError> + Send + Sync> =
+            Arc::new(|val| {
+                // Uppercase the "text" field to prove the transform ran
+                if let Some(t) = val
+                    .get_mut("text")
+                    .and_then(|v| v.as_str().map(|s| s.to_uppercase()))
+                {
+                    val["text"] = serde_json::Value::String(t);
+                }
+                Ok(())
+            });
+
+        let mut transformer = SseTransformer::new(transform);
+
+        // Send a partial chunk with no trailing newline
+        let chunk = b"data: {\"text\":\"hello\"}";
+        let out = transformer.process_chunk(chunk).unwrap();
+        // Should be buffered, nothing emitted yet
+        assert!(
+            out.is_empty(),
+            "Expected buffered, got: {:?}",
+            std::str::from_utf8(&out)
+        );
+
+        // Flush should emit the transformed line
+        let flushed = transformer.flush().unwrap();
+        let flushed_str = std::str::from_utf8(&flushed).unwrap();
+        assert!(
+            flushed_str.contains("HELLO"),
+            "Expected transformed text, got: {flushed_str}"
+        );
+
+        // Second flush should be empty
+        let flushed2 = transformer.flush().unwrap();
+        assert!(flushed2.is_empty());
+    }
+
+    #[test]
+    fn test_sse_transformer_flush_empty_buffer() {
+        let transform: Arc<dyn Fn(&mut serde_json::Value) -> Result<(), AppError> + Send + Sync> =
+            Arc::new(|_| Ok(()));
+
+        let mut transformer = SseTransformer::new(transform);
+        let flushed = transformer.flush().unwrap();
+        assert!(flushed.is_empty());
+    }
+
+    #[test]
+    fn test_sse_transformer_flush_done_marker() {
+        // A [DONE] marker buffered without trailing newline should pass through unchanged.
+        let transform: Arc<dyn Fn(&mut serde_json::Value) -> Result<(), AppError> + Send + Sync> =
+            Arc::new(|_| Ok(()));
+
+        let mut transformer = SseTransformer::new(transform);
+        let chunk = b"data: [DONE]";
+        let out = transformer.process_chunk(chunk).unwrap();
+        assert!(out.is_empty());
+
+        let flushed = transformer.flush().unwrap();
+        let flushed_str = std::str::from_utf8(&flushed).unwrap();
+        assert!(flushed_str.contains("[DONE]"));
     }
 }

@@ -1,0 +1,1431 @@
+use std::sync::Arc;
+
+use crate::error::AppError;
+use crate::signing::SigningPair;
+
+// ── Algorithm enum ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncryptionAlgo {
+    Ed25519,
+    Ecdsa,
+}
+
+// ── Encryption context (parsed from request headers) ────────────────
+
+#[derive(Debug, Clone)]
+pub struct EncryptionContext {
+    pub algo: EncryptionAlgo,
+    /// Raw client public key bytes.
+    pub client_pub_key: Vec<u8>,
+}
+
+/// Extract encryption context from request headers.
+/// Both `X-Signing-Algo` and `X-Client-Pub-Key` must be present together, or neither.
+pub fn extract_encryption_context(
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<EncryptionContext>, AppError> {
+    let algo_hdr = headers
+        .get("x-signing-algo")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let key_hdr = headers
+        .get("x-client-pub-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    match (algo_hdr, key_hdr) {
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => Err(AppError::BadRequest(
+            "Both X-Signing-Algo and X-Client-Pub-Key headers must be present together".to_string(),
+        )),
+        (Some(algo_str), Some(key_hex)) => {
+            let algo = match algo_str.to_lowercase().as_str() {
+                "ed25519" => EncryptionAlgo::Ed25519,
+                "ecdsa" => EncryptionAlgo::Ecdsa,
+                _ => {
+                    return Err(AppError::BadRequest(format!(
+                        "Invalid X-Signing-Algo: {algo_str}. Must be 'ecdsa' or 'ed25519'"
+                    )));
+                }
+            };
+
+            let key_bytes = hex::decode(&key_hex).map_err(|_| {
+                AppError::BadRequest("X-Client-Pub-Key must be valid hex".to_string())
+            })?;
+
+            // Validate key length
+            match algo {
+                EncryptionAlgo::Ed25519 => {
+                    if key_bytes.len() != 32 {
+                        return Err(AppError::BadRequest(format!(
+                            "Ed25519 client public key must be 32 bytes, got {}",
+                            key_bytes.len()
+                        )));
+                    }
+                }
+                EncryptionAlgo::Ecdsa => {
+                    // Accept 64 bytes (raw) or 65 bytes (with 0x04 prefix)
+                    if key_bytes.len() != 64 && key_bytes.len() != 65 {
+                        return Err(AppError::BadRequest(format!(
+                            "ECDSA client public key must be 64 or 65 bytes, got {}",
+                            key_bytes.len()
+                        )));
+                    }
+                }
+            }
+
+            Ok(Some(EncryptionContext {
+                algo,
+                client_pub_key: key_bytes,
+            }))
+        }
+    }
+}
+
+// ── Ed25519 / NaCl Box encryption ───────────────────────────────────
+
+mod nacl {
+    use crypto_box::{
+        aead::{Aead, AeadCore, OsRng},
+        PublicKey, SalsaBox, SecretKey,
+    };
+
+    /// Encrypt bytes using NaCl box (X25519 + XSalsa20-Poly1305).
+    /// Wire format: [ephemeral_pubkey(32)][nonce(24)][ciphertext+tag]
+    pub fn encrypt(plaintext: &[u8], recipient_pub: &[u8; 32]) -> Result<Vec<u8>, String> {
+        let recipient = PublicKey::from(*recipient_pub);
+        let ephemeral_secret = SecretKey::generate(&mut OsRng);
+        let ephemeral_public = ephemeral_secret.public_key();
+
+        let salsa_box = SalsaBox::new(&recipient, &ephemeral_secret);
+        let nonce = SalsaBox::generate_nonce(&mut OsRng);
+        let ciphertext = salsa_box
+            .encrypt(&nonce, plaintext)
+            .map_err(|e| format!("NaCl encrypt failed: {e}"))?;
+
+        let mut out = Vec::with_capacity(32 + 24 + ciphertext.len());
+        out.extend_from_slice(ephemeral_public.as_bytes());
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
+    }
+
+    /// Decrypt bytes using NaCl box.
+    /// Expects wire format: [ephemeral_pubkey(32)][nonce(24)][ciphertext+tag]
+    pub fn decrypt(data: &[u8], secret_key_bytes: &[u8; 32]) -> Result<Vec<u8>, String> {
+        if data.len() < 32 + 24 + 16 {
+            return Err("NaCl ciphertext too short".to_string());
+        }
+
+        let ephemeral_pub = PublicKey::from(<[u8; 32]>::try_from(&data[..32]).unwrap());
+        #[allow(deprecated)]
+        let nonce = crypto_box::Nonce::from_slice(&data[32..56]);
+        let ciphertext = &data[56..];
+
+        let secret = SecretKey::from(*secret_key_bytes);
+        let salsa_box = SalsaBox::new(&ephemeral_pub, &secret);
+        salsa_box
+            .decrypt(nonce, ciphertext)
+            .map_err(|e| format!("NaCl decrypt failed: {e}"))
+    }
+
+    /// Convert an Ed25519 secret key (32 bytes) to an X25519 secret key.
+    /// Ed25519 signing keys are clamped SHA-512 hashes; for NaCl box we need
+    /// the X25519 private scalar, which is the first 32 bytes of SHA-512(seed)
+    /// with clamping applied.
+    pub fn ed25519_secret_to_x25519(ed25519_secret: &[u8; 32]) -> [u8; 32] {
+        use sha2::Digest;
+        let hash = sha2::Sha512::digest(ed25519_secret);
+        let mut scalar = [0u8; 32];
+        scalar.copy_from_slice(&hash[..32]);
+        // Clamp
+        scalar[0] &= 248;
+        scalar[31] &= 127;
+        scalar[31] |= 64;
+        scalar
+    }
+
+    /// Convert an Ed25519 public key (32 bytes) to an X25519 public key.
+    /// Uses the birational map from Edwards to Montgomery form.
+    pub fn ed25519_public_to_x25519(ed25519_pub: &[u8; 32]) -> Result<[u8; 32], String> {
+        use ed25519_dalek::VerifyingKey;
+        let vk = VerifyingKey::from_bytes(ed25519_pub)
+            .map_err(|e| format!("Invalid Ed25519 public key: {e}"))?;
+        Ok(vk.to_montgomery().to_bytes())
+    }
+}
+
+// ── ECDSA / ECIES encryption ────────────────────────────────────────
+
+mod ecies {
+    use aes_gcm::{
+        aead::{Aead, AeadCore, KeyInit, OsRng},
+        Aes256Gcm,
+    };
+    use hkdf::Hkdf;
+    use k256::{ecdh::EphemeralSecret, elliptic_curve::sec1::ToEncodedPoint, PublicKey};
+    use sha2::Sha256;
+
+    /// Encrypt bytes using ECIES (secp256k1 ECDH + HKDF-SHA256 + AES-256-GCM).
+    /// Wire format: [ephemeral_pubkey_uncompressed(65)][nonce(12)][ciphertext+tag]
+    pub fn encrypt(plaintext: &[u8], recipient_pub: &PublicKey) -> Result<Vec<u8>, String> {
+        let ephemeral_secret = EphemeralSecret::random(&mut OsRng);
+        let ephemeral_public = ephemeral_secret.public_key().to_encoded_point(false);
+
+        let shared_secret = ephemeral_secret.diffie_hellman(recipient_pub);
+
+        let hkdf = Hkdf::<Sha256>::new(None, shared_secret.raw_secret_bytes());
+        let mut aes_key = [0u8; 32];
+        hkdf.expand(&[], &mut aes_key)
+            .map_err(|e| format!("HKDF expand failed: {e}"))?;
+
+        let cipher =
+            Aes256Gcm::new_from_slice(&aes_key).map_err(|e| format!("AES key init failed: {e}"))?;
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let ciphertext = cipher
+            .encrypt(&nonce, plaintext)
+            .map_err(|e| format!("AES-GCM encrypt failed: {e}"))?;
+
+        let pub_bytes = ephemeral_public.as_bytes();
+        let mut out = Vec::with_capacity(pub_bytes.len() + 12 + ciphertext.len());
+        out.extend_from_slice(pub_bytes);
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
+    }
+
+    /// Decrypt bytes using ECIES.
+    /// Expects wire format: [ephemeral_pubkey_uncompressed(65)][nonce(12)][ciphertext+tag]
+    pub fn decrypt(data: &[u8], secret_key: &k256::ecdsa::SigningKey) -> Result<Vec<u8>, String> {
+        if data.len() < 65 + 12 + 16 {
+            return Err("ECIES ciphertext too short".to_string());
+        }
+
+        let ephemeral_pub = PublicKey::from_sec1_bytes(&data[..65])
+            .map_err(|e| format!("Invalid ephemeral public key: {e}"))?;
+        #[allow(deprecated)]
+        let nonce = aes_gcm::Nonce::from_slice(&data[65..77]);
+        let ciphertext = &data[77..];
+
+        // Perform ECDH using the server's secret key
+        let shared_secret =
+            k256::ecdh::diffie_hellman(secret_key.as_nonzero_scalar(), ephemeral_pub.as_affine());
+
+        let hkdf = Hkdf::<Sha256>::new(None, shared_secret.raw_secret_bytes());
+        let mut aes_key = [0u8; 32];
+        hkdf.expand(&[], &mut aes_key)
+            .map_err(|e| format!("HKDF expand failed: {e}"))?;
+
+        let cipher =
+            Aes256Gcm::new_from_slice(&aes_key).map_err(|e| format!("AES key init failed: {e}"))?;
+        cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|e| format!("AES-GCM decrypt failed: {e}"))
+    }
+
+    /// Parse a client public key (64 bytes raw or 65 bytes with 0x04 prefix) into a k256 PublicKey.
+    pub fn parse_client_pubkey(bytes: &[u8]) -> Result<PublicKey, String> {
+        match bytes.len() {
+            65 => PublicKey::from_sec1_bytes(bytes)
+                .map_err(|e| format!("Invalid ECDSA public key: {e}")),
+            64 => {
+                let mut prefixed = vec![0x04];
+                prefixed.extend_from_slice(bytes);
+                PublicKey::from_sec1_bytes(&prefixed)
+                    .map_err(|e| format!("Invalid ECDSA public key: {e}"))
+            }
+            n => Err(format!("ECDSA public key must be 64 or 65 bytes, got {n}")),
+        }
+    }
+}
+
+// ── High-level encrypt/decrypt string wrappers ──────────────────────
+
+/// Encrypt a plaintext string, returning a hex-encoded ciphertext string.
+///
+/// Only uses `ctx.client_pub_key` and `ctx.algo`. The `signing` parameter is
+/// accepted for API symmetry with `decrypt_string` but is not used for
+/// encryption — the recipient's public key (from the client) is sufficient.
+pub fn encrypt_string(
+    plaintext: &str,
+    ctx: &EncryptionContext,
+    signing: &SigningPair,
+) -> Result<String, AppError> {
+    if plaintext.is_empty() {
+        return Ok(String::new());
+    }
+    let _ = signing;
+    let ciphertext = match ctx.algo {
+        EncryptionAlgo::Ed25519 => {
+            let client_x25519 =
+                nacl::ed25519_public_to_x25519(ctx.client_pub_key.as_slice().try_into().unwrap())
+                    .map_err(|e| AppError::BadRequest(e))?;
+            nacl::encrypt(plaintext.as_bytes(), &client_x25519)
+                .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?
+        }
+        EncryptionAlgo::Ecdsa => {
+            let client_pk = ecies::parse_client_pubkey(&ctx.client_pub_key)
+                .map_err(|e| AppError::BadRequest(e))?;
+            ecies::encrypt(plaintext.as_bytes(), &client_pk)
+                .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?
+        }
+    };
+    Ok(hex::encode(ciphertext))
+}
+
+/// Decrypt a hex-encoded ciphertext string, returning plaintext.
+pub fn decrypt_string(
+    hex_ciphertext: &str,
+    ctx: &EncryptionContext,
+    signing: &SigningPair,
+) -> Result<String, AppError> {
+    if hex_ciphertext.is_empty() {
+        return Ok(String::new());
+    }
+    let data = hex::decode(hex_ciphertext)
+        .map_err(|_| AppError::BadRequest("Encrypted field is not valid hex".to_string()))?;
+
+    // Use a generic error message for all decryption failures to avoid
+    // leaking oracle information (e.g. distinguishing "too short" from
+    // "authentication tag mismatch").
+    let plaintext_bytes = match ctx.algo {
+        EncryptionAlgo::Ed25519 => {
+            let x25519_secret = nacl::ed25519_secret_to_x25519(signing.ed25519.secret_bytes());
+            nacl::decrypt(&data, &x25519_secret)
+                .map_err(|_| AppError::BadRequest("Decryption failed".to_string()))?
+        }
+        EncryptionAlgo::Ecdsa => ecies::decrypt(&data, signing.ecdsa.secret_key())
+            .map_err(|_| AppError::BadRequest("Decryption failed".to_string()))?,
+    };
+
+    String::from_utf8(plaintext_bytes)
+        .map_err(|_| AppError::BadRequest("Decrypted content is not valid UTF-8".to_string()))
+}
+
+// ── Field-level JSON transformers ───────────────────────────────────
+
+/// Endpoint type for determining which fields to encrypt/decrypt.
+#[derive(Debug, Clone, Copy)]
+pub enum Endpoint {
+    ChatCompletions,
+    Completions,
+    ImagesGenerations,
+    Embeddings,
+    AudioTranscriptions,
+}
+
+/// Decrypt request fields in-place based on the endpoint type.
+pub fn decrypt_request_fields(
+    value: &mut serde_json::Value,
+    endpoint: Endpoint,
+    ctx: &EncryptionContext,
+    signing: &SigningPair,
+) -> Result<(), AppError> {
+    match endpoint {
+        Endpoint::ChatCompletions => {
+            if let Some(messages) = value.get_mut("messages").and_then(|m| m.as_array_mut()) {
+                for msg in messages.iter_mut() {
+                    decrypt_chat_message_fields(msg, ctx, signing)?;
+                }
+            }
+        }
+        Endpoint::Completions => {
+            // prompt can be a string or an array of strings
+            decrypt_field_or_array(value, "prompt", ctx, signing)?;
+        }
+        Endpoint::ImagesGenerations => {
+            decrypt_field(value, "prompt", ctx, signing)?;
+        }
+        Endpoint::Embeddings => {
+            // The client JSON-serializes the `input` value before encrypting,
+            // so after decryption we parse it back to the original JSON type
+            // (string, array of strings, or array of token arrays).
+            decrypt_field_json(value, "input", ctx, signing)?;
+        }
+        Endpoint::AudioTranscriptions => {
+            decrypt_field(value, "prompt", ctx, signing)?;
+        }
+    }
+    Ok(())
+}
+
+/// Encrypt response fields in-place based on the endpoint type.
+pub fn encrypt_response_fields(
+    value: &mut serde_json::Value,
+    endpoint: Endpoint,
+    ctx: &EncryptionContext,
+    signing: &SigningPair,
+) -> Result<(), AppError> {
+    match endpoint {
+        Endpoint::ChatCompletions => {
+            encrypt_chat_response_choices(value, ctx, signing, false)?;
+        }
+        Endpoint::Completions => {
+            if let Some(choices) = value.get_mut("choices").and_then(|c| c.as_array_mut()) {
+                for choice in choices.iter_mut() {
+                    encrypt_field(choice, "text", ctx, signing)?;
+                }
+            }
+        }
+        Endpoint::ImagesGenerations => {
+            if let Some(data) = value.get_mut("data").and_then(|d| d.as_array_mut()) {
+                for item in data.iter_mut() {
+                    encrypt_field(item, "b64_json", ctx, signing)?;
+                }
+            }
+        }
+        Endpoint::Embeddings => {
+            // Numeric output — not encrypted
+        }
+        Endpoint::AudioTranscriptions => {
+            encrypt_field(value, "text", ctx, signing)?;
+        }
+    }
+    Ok(())
+}
+
+/// Encrypt fields in a streaming SSE chunk, dispatching by endpoint type.
+pub fn encrypt_streaming_chunk(
+    value: &mut serde_json::Value,
+    endpoint: Endpoint,
+    ctx: &EncryptionContext,
+    signing: &SigningPair,
+) -> Result<(), AppError> {
+    match endpoint {
+        Endpoint::ChatCompletions => encrypt_chat_response_choices(value, ctx, signing, true),
+        Endpoint::Completions => {
+            // Completions streams emit choices[*].text (not delta)
+            if let Some(choices) = value.get_mut("choices").and_then(|c| c.as_array_mut()) {
+                for choice in choices.iter_mut() {
+                    encrypt_field(choice, "text", ctx, signing)?;
+                }
+            }
+            Ok(())
+        }
+        // These endpoints don't use streaming — no fields to encrypt
+        Endpoint::ImagesGenerations => Ok(()),
+        Endpoint::Embeddings => Ok(()),
+        Endpoint::AudioTranscriptions => Ok(()),
+    }
+}
+
+// ── Internal helpers ────────────────────────────────────────────────
+
+fn decrypt_chat_message_fields(
+    msg: &mut serde_json::Value,
+    ctx: &EncryptionContext,
+    signing: &SigningPair,
+) -> Result<(), AppError> {
+    // content can be a string or array of content parts
+    if let Some(content) = msg.get_mut("content") {
+        match content {
+            serde_json::Value::String(s) => {
+                if !s.is_empty() {
+                    let decrypted = decrypt_string(s, ctx, signing)?;
+                    *s = decrypted;
+                }
+            }
+            serde_json::Value::Array(parts) => {
+                for part in parts.iter_mut() {
+                    decrypt_field(part, "text", ctx, signing)?;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    decrypt_field(msg, "reasoning_content", ctx, signing)?;
+
+    // audio.data
+    if let Some(audio) = msg.get_mut("audio") {
+        decrypt_field(audio, "data", ctx, signing)?;
+    }
+
+    Ok(())
+}
+
+fn encrypt_chat_response_choices(
+    value: &mut serde_json::Value,
+    ctx: &EncryptionContext,
+    signing: &SigningPair,
+    is_streaming: bool,
+) -> Result<(), AppError> {
+    if let Some(choices) = value.get_mut("choices").and_then(|c| c.as_array_mut()) {
+        for choice in choices.iter_mut() {
+            let msg_key = if is_streaming { "delta" } else { "message" };
+            if let Some(msg) = choice.get_mut(msg_key) {
+                encrypt_content_field(msg, ctx, signing)?;
+                encrypt_field(msg, "reasoning_content", ctx, signing)?;
+                if let Some(audio) = msg.get_mut("audio") {
+                    encrypt_field(audio, "data", ctx, signing)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn encrypt_content_field(
+    msg: &mut serde_json::Value,
+    ctx: &EncryptionContext,
+    signing: &SigningPair,
+) -> Result<(), AppError> {
+    if let Some(content) = msg.get_mut("content") {
+        match content {
+            serde_json::Value::String(s) => {
+                if !s.is_empty() {
+                    let encrypted = encrypt_string(s, ctx, signing)?;
+                    *s = encrypted;
+                }
+            }
+            serde_json::Value::Array(parts) => {
+                for part in parts.iter_mut() {
+                    encrypt_field(part, "text", ctx, signing)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Decrypt a single string field on an object, in-place.
+fn decrypt_field(
+    obj: &mut serde_json::Value,
+    field: &str,
+    ctx: &EncryptionContext,
+    signing: &SigningPair,
+) -> Result<(), AppError> {
+    if let Some(val) = obj.get_mut(field) {
+        if let Some(s) = val.as_str() {
+            if !s.is_empty() {
+                let s_owned = s.to_string();
+                let decrypted = decrypt_string(&s_owned, ctx, signing)?;
+                *val = serde_json::Value::String(decrypted);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Decrypt a field that may be a string or an array of encrypted strings.
+/// Handles the completions `prompt` field which can be either form.
+fn decrypt_field_or_array(
+    obj: &mut serde_json::Value,
+    field: &str,
+    ctx: &EncryptionContext,
+    signing: &SigningPair,
+) -> Result<(), AppError> {
+    if let Some(val) = obj.get_mut(field) {
+        match val {
+            serde_json::Value::String(s) => {
+                if !s.is_empty() {
+                    let decrypted = decrypt_string(s, ctx, signing)?;
+                    *s = decrypted;
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for item in arr.iter_mut() {
+                    if let Some(s) = item.as_str() {
+                        if !s.is_empty() {
+                            let s_owned = s.to_string();
+                            let decrypted = decrypt_string(&s_owned, ctx, signing)?;
+                            *item = serde_json::Value::String(decrypted);
+                        }
+                    }
+                    // Non-string array elements (e.g. token ID arrays) are not encrypted
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Decrypt a string field and parse the result as JSON, restoring the original type.
+/// Used for embeddings `input` which is JSON-serialized before encryption.
+/// Validates that the result is a string or array (the only valid `input` types).
+fn decrypt_field_json(
+    obj: &mut serde_json::Value,
+    field: &str,
+    ctx: &EncryptionContext,
+    signing: &SigningPair,
+) -> Result<(), AppError> {
+    if let Some(val) = obj.get_mut(field) {
+        if let Some(s) = val.as_str() {
+            if !s.is_empty() {
+                let s_owned = s.to_string();
+                let decrypted = decrypt_string(&s_owned, ctx, signing)?;
+                let parsed: serde_json::Value = serde_json::from_str(&decrypted).map_err(|e| {
+                    AppError::BadRequest(format!("Decrypted input is not valid JSON: {e}"))
+                })?;
+                // Only allow string or array — reject objects, booleans, numbers, null
+                if !parsed.is_string() && !parsed.is_array() {
+                    return Err(AppError::BadRequest(
+                        "Decrypted input must be a string or array".to_string(),
+                    ));
+                }
+                *val = parsed;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Encrypt a single string field on an object, in-place.
+fn encrypt_field(
+    obj: &mut serde_json::Value,
+    field: &str,
+    ctx: &EncryptionContext,
+    signing: &SigningPair,
+) -> Result<(), AppError> {
+    if let Some(val) = obj.get_mut(field) {
+        if let Some(s) = val.as_str() {
+            if !s.is_empty() {
+                let s_owned = s.to_string();
+                let encrypted = encrypt_string(&s_owned, ctx, signing)?;
+                *val = serde_json::Value::String(encrypted);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Build a response transform closure for `ProxyOpts`.
+pub fn make_response_transform(
+    endpoint: Endpoint,
+    ctx: EncryptionContext,
+    signing: Arc<SigningPair>,
+) -> Box<dyn FnOnce(&mut serde_json::Value) -> Result<(), AppError> + Send> {
+    Box::new(move |value: &mut serde_json::Value| {
+        encrypt_response_fields(value, endpoint, &ctx, &signing)
+    })
+}
+
+/// Build a streaming chunk transform closure for `ProxyOpts`.
+pub fn make_chunk_transform(
+    endpoint: Endpoint,
+    ctx: EncryptionContext,
+    signing: Arc<SigningPair>,
+) -> Arc<dyn Fn(&mut serde_json::Value) -> Result<(), AppError> + Send + Sync> {
+    Arc::new(move |value: &mut serde_json::Value| {
+        encrypt_streaming_chunk(value, endpoint, &ctx, &signing)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::signing::{EcdsaContext, Ed25519Context, SigningPair};
+
+    const TEST_ECDSA_KEY: [u8; 32] = [
+        0xac, 0x09, 0x74, 0xbe, 0xc3, 0x9a, 0x17, 0xe3, 0x6b, 0xa4, 0xa6, 0xb4, 0xd2, 0x38, 0xff,
+        0x94, 0x4b, 0xac, 0xb3, 0x5e, 0x5d, 0xc4, 0xaf, 0x0f, 0x33, 0x47, 0xe5, 0x87, 0x31, 0x79,
+        0x67, 0x0f,
+    ];
+
+    const TEST_ED25519_KEY: [u8; 32] = [
+        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
+        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
+        0x7f, 0x60,
+    ];
+
+    fn test_signing_pair() -> SigningPair {
+        let ecdsa = EcdsaContext::from_key_bytes(&TEST_ECDSA_KEY).unwrap();
+        let ed25519 = Ed25519Context::from_key_bytes(&TEST_ED25519_KEY).unwrap();
+        SigningPair { ecdsa, ed25519 }
+    }
+
+    // ── NaCl round-trip tests ───────────────────────────────────────
+
+    #[test]
+    fn test_nacl_round_trip() {
+        let server_pair = test_signing_pair();
+        let server_x25519_secret =
+            nacl::ed25519_secret_to_x25519(server_pair.ed25519.secret_bytes());
+
+        // Derive the server's X25519 public key from the secret
+        let server_x25519_pub = {
+            let sk = crypto_box::SecretKey::from(server_x25519_secret);
+            *sk.public_key().as_bytes()
+        };
+
+        let plaintext = b"Hello, encrypted world!";
+        let encrypted = nacl::encrypt(plaintext, &server_x25519_pub).unwrap();
+        let decrypted = nacl::decrypt(&encrypted, &server_x25519_secret).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_nacl_empty_plaintext() {
+        let server_pair = test_signing_pair();
+        let server_x25519_secret =
+            nacl::ed25519_secret_to_x25519(server_pair.ed25519.secret_bytes());
+        let server_x25519_pub = {
+            let sk = crypto_box::SecretKey::from(server_x25519_secret);
+            *sk.public_key().as_bytes()
+        };
+
+        let encrypted = nacl::encrypt(b"", &server_x25519_pub).unwrap();
+        let decrypted = nacl::decrypt(&encrypted, &server_x25519_secret).unwrap();
+        assert_eq!(decrypted, b"");
+    }
+
+    #[test]
+    fn test_nacl_large_payload() {
+        let server_pair = test_signing_pair();
+        let server_x25519_secret =
+            nacl::ed25519_secret_to_x25519(server_pair.ed25519.secret_bytes());
+        let server_x25519_pub = {
+            let sk = crypto_box::SecretKey::from(server_x25519_secret);
+            *sk.public_key().as_bytes()
+        };
+
+        let plaintext = vec![0x42u8; 100_000];
+        let encrypted = nacl::encrypt(&plaintext, &server_x25519_pub).unwrap();
+        let decrypted = nacl::decrypt(&encrypted, &server_x25519_secret).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_nacl_tampered_ciphertext() {
+        let server_pair = test_signing_pair();
+        let server_x25519_secret =
+            nacl::ed25519_secret_to_x25519(server_pair.ed25519.secret_bytes());
+        let server_x25519_pub = {
+            let sk = crypto_box::SecretKey::from(server_x25519_secret);
+            *sk.public_key().as_bytes()
+        };
+
+        let mut encrypted = nacl::encrypt(b"secret", &server_x25519_pub).unwrap();
+        // Tamper with ciphertext byte
+        let last = encrypted.len() - 1;
+        encrypted[last] ^= 0xff;
+        assert!(nacl::decrypt(&encrypted, &server_x25519_secret).is_err());
+    }
+
+    #[test]
+    fn test_nacl_too_short() {
+        let server_pair = test_signing_pair();
+        let server_x25519_secret =
+            nacl::ed25519_secret_to_x25519(server_pair.ed25519.secret_bytes());
+        assert!(nacl::decrypt(&[0u8; 10], &server_x25519_secret).is_err());
+    }
+
+    // ── ECIES round-trip tests ──────────────────────────────────────
+
+    #[test]
+    fn test_ecies_round_trip() {
+        let server_pair = test_signing_pair();
+        let server_pk = server_pair.ecdsa.secret_key().verifying_key();
+        let k256_pub = k256::PublicKey::from(server_pk);
+
+        let plaintext = b"Hello, ECIES!";
+        let encrypted = ecies::encrypt(plaintext, &k256_pub).unwrap();
+        let decrypted = ecies::decrypt(&encrypted, server_pair.ecdsa.secret_key()).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_ecies_empty_plaintext() {
+        let server_pair = test_signing_pair();
+        let server_pk = server_pair.ecdsa.secret_key().verifying_key();
+        let k256_pub = k256::PublicKey::from(server_pk);
+
+        let encrypted = ecies::encrypt(b"", &k256_pub).unwrap();
+        let decrypted = ecies::decrypt(&encrypted, server_pair.ecdsa.secret_key()).unwrap();
+        assert_eq!(decrypted, b"");
+    }
+
+    #[test]
+    fn test_ecies_large_payload() {
+        let server_pair = test_signing_pair();
+        let server_pk = server_pair.ecdsa.secret_key().verifying_key();
+        let k256_pub = k256::PublicKey::from(server_pk);
+
+        let plaintext = vec![0x42u8; 100_000];
+        let encrypted = ecies::encrypt(&plaintext, &k256_pub).unwrap();
+        let decrypted = ecies::decrypt(&encrypted, server_pair.ecdsa.secret_key()).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_ecies_tampered_ciphertext() {
+        let server_pair = test_signing_pair();
+        let server_pk = server_pair.ecdsa.secret_key().verifying_key();
+        let k256_pub = k256::PublicKey::from(server_pk);
+
+        let mut encrypted = ecies::encrypt(b"secret", &k256_pub).unwrap();
+        let last = encrypted.len() - 1;
+        encrypted[last] ^= 0xff;
+        assert!(ecies::decrypt(&encrypted, server_pair.ecdsa.secret_key()).is_err());
+    }
+
+    #[test]
+    fn test_ecies_too_short() {
+        let server_pair = test_signing_pair();
+        assert!(ecies::decrypt(&[0u8; 10], server_pair.ecdsa.secret_key()).is_err());
+    }
+
+    #[test]
+    fn test_ecies_parse_client_pubkey_65_bytes() {
+        let server_pair = test_signing_pair();
+        let vk = server_pair.ecdsa.secret_key().verifying_key();
+        let encoded = vk.to_encoded_point(false);
+        let bytes = encoded.as_bytes();
+        assert_eq!(bytes.len(), 65);
+        assert!(ecies::parse_client_pubkey(bytes).is_ok());
+    }
+
+    #[test]
+    fn test_ecies_parse_client_pubkey_64_bytes() {
+        let server_pair = test_signing_pair();
+        let vk = server_pair.ecdsa.secret_key().verifying_key();
+        let encoded = vk.to_encoded_point(false);
+        let bytes = &encoded.as_bytes()[1..]; // strip 0x04 prefix
+        assert_eq!(bytes.len(), 64);
+        assert!(ecies::parse_client_pubkey(bytes).is_ok());
+    }
+
+    // ── High-level encrypt/decrypt string tests ─────────────────────
+
+    #[test]
+    fn test_encrypt_decrypt_string_ed25519() {
+        let server_pair = test_signing_pair();
+
+        // Generate a "client" keypair (reuse server key for test simplicity)
+        let client_ed25519_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_ed25519_pub,
+        };
+
+        let plaintext = "Hello from client!";
+        let encrypted = encrypt_string(plaintext, &ctx, &server_pair).unwrap();
+        assert!(!encrypted.is_empty());
+        assert_ne!(encrypted, plaintext);
+
+        // Decrypt with server key (which is same as client key in this test)
+        let decrypted = decrypt_string(&encrypted, &ctx, &server_pair).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_string_ecdsa() {
+        let server_pair = test_signing_pair();
+
+        // Use server's ECDSA public key as "client" public key
+        let vk = server_pair.ecdsa.secret_key().verifying_key();
+        let encoded = vk.to_encoded_point(false);
+        let client_pub = encoded.as_bytes()[1..].to_vec(); // 64 bytes raw
+
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ecdsa,
+            client_pub_key: client_pub,
+        };
+
+        let plaintext = "Hello from client!";
+        let encrypted = encrypt_string(plaintext, &ctx, &server_pair).unwrap();
+        assert!(!encrypted.is_empty());
+
+        let decrypted = decrypt_string(&encrypted, &ctx, &server_pair).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_empty_string() {
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+        };
+
+        let encrypted = encrypt_string("", &ctx, &server_pair).unwrap();
+        assert_eq!(encrypted, "");
+
+        let decrypted = decrypt_string("", &ctx, &server_pair).unwrap();
+        assert_eq!(decrypted, "");
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_unicode() {
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+        };
+
+        let plaintext = "こんにちは世界 🌍 Привет мир";
+        let encrypted = encrypt_string(plaintext, &ctx, &server_pair).unwrap();
+        let decrypted = decrypt_string(&encrypted, &ctx, &server_pair).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    // ── Field-level transformer tests ───────────────────────────────
+
+    #[test]
+    fn test_decrypt_chat_message_string_content() {
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+        };
+
+        // Encrypt "Hello" to simulate client-encrypted message
+        let encrypted_hello = encrypt_string("Hello", &ctx, &server_pair).unwrap();
+
+        let mut request = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": encrypted_hello}
+            ]
+        });
+
+        decrypt_request_fields(&mut request, Endpoint::ChatCompletions, &ctx, &server_pair)
+            .unwrap();
+
+        assert_eq!(request["messages"][0]["content"], "Hello");
+    }
+
+    #[test]
+    fn test_decrypt_chat_message_array_content() {
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+        };
+
+        let encrypted_text = encrypt_string("Hello world", &ctx, &server_pair).unwrap();
+
+        let mut request = serde_json::json!({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": encrypted_text},
+                        {"type": "image_url", "image_url": {"url": "data:..."}}
+                    ]
+                }
+            ]
+        });
+
+        decrypt_request_fields(&mut request, Endpoint::ChatCompletions, &ctx, &server_pair)
+            .unwrap();
+
+        assert_eq!(request["messages"][0]["content"][0]["text"], "Hello world");
+        // image_url part should be unchanged
+        assert_eq!(request["messages"][0]["content"][1]["type"], "image_url");
+    }
+
+    #[test]
+    fn test_encrypt_chat_response() {
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+        };
+
+        let mut response = serde_json::json!({
+            "id": "chatcmpl-123",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hello!"
+                    }
+                }
+            ]
+        });
+
+        encrypt_response_fields(&mut response, Endpoint::ChatCompletions, &ctx, &server_pair)
+            .unwrap();
+
+        let encrypted_content = response["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap();
+        assert_ne!(encrypted_content, "Hello!");
+        assert!(!encrypted_content.is_empty());
+
+        // Verify we can decrypt it
+        let decrypted = decrypt_string(encrypted_content, &ctx, &server_pair).unwrap();
+        assert_eq!(decrypted, "Hello!");
+    }
+
+    #[test]
+    fn test_encrypt_streaming_chunk() {
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+        };
+
+        let mut chunk = serde_json::json!({
+            "id": "chatcmpl-123",
+            "choices": [
+                {
+                    "delta": {
+                        "content": "Hi"
+                    }
+                }
+            ]
+        });
+
+        super::encrypt_streaming_chunk(&mut chunk, Endpoint::ChatCompletions, &ctx, &server_pair)
+            .unwrap();
+
+        let encrypted = chunk["choices"][0]["delta"]["content"].as_str().unwrap();
+        assert_ne!(encrypted, "Hi");
+
+        let decrypted = decrypt_string(encrypted, &ctx, &server_pair).unwrap();
+        assert_eq!(decrypted, "Hi");
+    }
+
+    #[test]
+    fn test_encrypt_completions_response() {
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+        };
+
+        let mut response = serde_json::json!({
+            "choices": [
+                {"text": "completed text"}
+            ]
+        });
+
+        encrypt_response_fields(&mut response, Endpoint::Completions, &ctx, &server_pair).unwrap();
+
+        let encrypted = response["choices"][0]["text"].as_str().unwrap();
+        let decrypted = decrypt_string(encrypted, &ctx, &server_pair).unwrap();
+        assert_eq!(decrypted, "completed text");
+    }
+
+    #[test]
+    fn test_encrypt_images_response() {
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+        };
+
+        let mut response = serde_json::json!({
+            "data": [
+                {"b64_json": "base64imagedata"}
+            ]
+        });
+
+        encrypt_response_fields(
+            &mut response,
+            Endpoint::ImagesGenerations,
+            &ctx,
+            &server_pair,
+        )
+        .unwrap();
+
+        let encrypted = response["data"][0]["b64_json"].as_str().unwrap();
+        let decrypted = decrypt_string(encrypted, &ctx, &server_pair).unwrap();
+        assert_eq!(decrypted, "base64imagedata");
+    }
+
+    #[test]
+    fn test_encrypt_audio_transcription_response() {
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+        };
+
+        let mut response = serde_json::json!({
+            "text": "transcribed text"
+        });
+
+        encrypt_response_fields(
+            &mut response,
+            Endpoint::AudioTranscriptions,
+            &ctx,
+            &server_pair,
+        )
+        .unwrap();
+
+        let encrypted = response["text"].as_str().unwrap();
+        let decrypted = decrypt_string(encrypted, &ctx, &server_pair).unwrap();
+        assert_eq!(decrypted, "transcribed text");
+    }
+
+    #[test]
+    fn test_embeddings_response_not_encrypted() {
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+        };
+
+        let mut response = serde_json::json!({
+            "data": [
+                {"embedding": [0.1, 0.2, 0.3]}
+            ]
+        });
+
+        let original = response.clone();
+        encrypt_response_fields(&mut response, Endpoint::Embeddings, &ctx, &server_pair).unwrap();
+        assert_eq!(response, original);
+    }
+
+    #[test]
+    fn test_null_content_not_encrypted() {
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+        };
+
+        let mut response = serde_json::json!({
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": null
+                    }
+                }
+            ]
+        });
+
+        encrypt_response_fields(&mut response, Endpoint::ChatCompletions, &ctx, &server_pair)
+            .unwrap();
+        assert!(response["choices"][0]["message"]["content"].is_null());
+    }
+
+    // ── Header extraction tests ─────────────────────────────────────
+
+    #[test]
+    fn test_extract_encryption_context_none() {
+        let headers = axum::http::HeaderMap::new();
+        assert!(extract_encryption_context(&headers).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_extract_encryption_context_missing_one_header() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-signing-algo", "ed25519".parse().unwrap());
+        assert!(extract_encryption_context(&headers).is_err());
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-client-pub-key", "abcd".parse().unwrap());
+        assert!(extract_encryption_context(&headers).is_err());
+    }
+
+    #[test]
+    fn test_extract_encryption_context_invalid_algo() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-signing-algo", "rsa".parse().unwrap());
+        headers.insert("x-client-pub-key", "aa".repeat(32).parse().unwrap());
+        assert!(extract_encryption_context(&headers).is_err());
+    }
+
+    #[test]
+    fn test_extract_encryption_context_invalid_hex() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-signing-algo", "ed25519".parse().unwrap());
+        headers.insert("x-client-pub-key", "not-hex".parse().unwrap());
+        assert!(extract_encryption_context(&headers).is_err());
+    }
+
+    #[test]
+    fn test_extract_encryption_context_wrong_key_length() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-signing-algo", "ed25519".parse().unwrap());
+        headers.insert("x-client-pub-key", "aabb".parse().unwrap()); // 2 bytes, need 32
+        assert!(extract_encryption_context(&headers).is_err());
+    }
+
+    #[test]
+    fn test_extract_encryption_context_valid_ed25519() {
+        let server_pair = test_signing_pair();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-signing-algo", "ed25519".parse().unwrap());
+        headers.insert(
+            "x-client-pub-key",
+            server_pair.ed25519.signing_public_key.parse().unwrap(),
+        );
+        let ctx = extract_encryption_context(&headers).unwrap().unwrap();
+        assert_eq!(ctx.algo, EncryptionAlgo::Ed25519);
+        assert_eq!(ctx.client_pub_key.len(), 32);
+    }
+
+    // ── Fix 2: Completions streaming encryption ───────────────────
+
+    #[test]
+    fn test_encrypt_streaming_chunk_completions() {
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+        };
+
+        let mut chunk = serde_json::json!({
+            "id": "cmpl-123",
+            "choices": [
+                {
+                    "text": "hello world"
+                }
+            ]
+        });
+
+        super::encrypt_streaming_chunk(&mut chunk, Endpoint::Completions, &ctx, &server_pair)
+            .unwrap();
+
+        let encrypted = chunk["choices"][0]["text"].as_str().unwrap();
+        assert_ne!(encrypted, "hello world");
+
+        let decrypted = decrypt_string(encrypted, &ctx, &server_pair).unwrap();
+        assert_eq!(decrypted, "hello world");
+    }
+
+    // ── Fix 4: Embeddings input JSON deserialization ────────────────
+
+    #[test]
+    fn test_decrypt_embeddings_input_string() {
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+        };
+
+        // Client encrypts JSON-serialized string: "\"hello world\""
+        let input_json = serde_json::json!("hello world");
+        let serialized = serde_json::to_string(&input_json).unwrap();
+        let encrypted = encrypt_string(&serialized, &ctx, &server_pair).unwrap();
+
+        let mut request = serde_json::json!({
+            "input": encrypted,
+            "model": "text-embedding"
+        });
+
+        decrypt_request_fields(&mut request, Endpoint::Embeddings, &ctx, &server_pair).unwrap();
+
+        // After decryption, input should be a string value, not a JSON string containing quotes
+        assert_eq!(request["input"], serde_json::json!("hello world"));
+    }
+
+    #[test]
+    fn test_decrypt_embeddings_input_array() {
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+        };
+
+        // Client encrypts JSON-serialized array: "[\"hello\",\"world\"]"
+        let input_json = serde_json::json!(["hello", "world"]);
+        let serialized = serde_json::to_string(&input_json).unwrap();
+        let encrypted = encrypt_string(&serialized, &ctx, &server_pair).unwrap();
+
+        let mut request = serde_json::json!({
+            "input": encrypted,
+            "model": "text-embedding"
+        });
+
+        decrypt_request_fields(&mut request, Endpoint::Embeddings, &ctx, &server_pair).unwrap();
+
+        // After decryption, input should be an array, not a string
+        assert_eq!(request["input"], serde_json::json!(["hello", "world"]));
+    }
+
+    #[test]
+    fn test_decrypt_embeddings_input_token_array() {
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+        };
+
+        // Client encrypts JSON-serialized array of token arrays: "[[1,2,3],[4,5,6]]"
+        let input_json = serde_json::json!([[1, 2, 3], [4, 5, 6]]);
+        let serialized = serde_json::to_string(&input_json).unwrap();
+        let encrypted = encrypt_string(&serialized, &ctx, &server_pair).unwrap();
+
+        let mut request = serde_json::json!({
+            "input": encrypted,
+            "model": "text-embedding"
+        });
+
+        decrypt_request_fields(&mut request, Endpoint::Embeddings, &ctx, &server_pair).unwrap();
+
+        assert_eq!(request["input"], serde_json::json!([[1, 2, 3], [4, 5, 6]]));
+    }
+
+    // ── Decryption error message is generic (#3) ─────────────────────
+
+    #[test]
+    fn test_decrypt_error_is_generic() {
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+        };
+
+        // Tampered ciphertext — should fail with generic message
+        let bad_hex = hex::encode(vec![0u8; 100]);
+        let err = decrypt_string(&bad_hex, &ctx, &server_pair).unwrap_err();
+        let err_msg = format!("{err}");
+        // Must not contain crypto implementation details like "tag mismatch" or "too short"
+        assert!(
+            err_msg.contains("Decryption failed"),
+            "Error should be generic, got: {err_msg}"
+        );
+        assert!(
+            !err_msg.contains("NaCl") && !err_msg.contains("AES") && !err_msg.contains("tag"),
+            "Error should not leak crypto details, got: {err_msg}"
+        );
+    }
+
+    // ── Embeddings input type validation (#8) ──────────────────────
+
+    #[test]
+    fn test_decrypt_embeddings_rejects_object_input() {
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+        };
+
+        // Client encrypts a JSON object — should be rejected
+        let input_json = serde_json::json!({"evil": "payload"});
+        let serialized = serde_json::to_string(&input_json).unwrap();
+        let encrypted = encrypt_string(&serialized, &ctx, &server_pair).unwrap();
+
+        let mut request = serde_json::json!({
+            "input": encrypted,
+            "model": "text-embedding"
+        });
+
+        let result = decrypt_request_fields(&mut request, Endpoint::Embeddings, &ctx, &server_pair);
+        assert!(
+            result.is_err(),
+            "Should reject object type for embeddings input"
+        );
+    }
+
+    #[test]
+    fn test_decrypt_embeddings_rejects_number_input() {
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+        };
+
+        let encrypted = encrypt_string("42", &ctx, &server_pair).unwrap();
+
+        let mut request = serde_json::json!({
+            "input": encrypted,
+            "model": "text-embedding"
+        });
+
+        let result = decrypt_request_fields(&mut request, Endpoint::Embeddings, &ctx, &server_pair);
+        assert!(
+            result.is_err(),
+            "Should reject number type for embeddings input"
+        );
+    }
+
+    // ── Completions prompt array decryption (#9) ───────────────────
+
+    #[test]
+    fn test_decrypt_completions_prompt_string() {
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+        };
+
+        let encrypted = encrypt_string("hello", &ctx, &server_pair).unwrap();
+
+        let mut request = serde_json::json!({
+            "prompt": encrypted,
+            "model": "test"
+        });
+
+        decrypt_request_fields(&mut request, Endpoint::Completions, &ctx, &server_pair).unwrap();
+        assert_eq!(request["prompt"], "hello");
+    }
+
+    #[test]
+    fn test_decrypt_completions_prompt_array() {
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+        };
+
+        let enc1 = encrypt_string("hello", &ctx, &server_pair).unwrap();
+        let enc2 = encrypt_string("world", &ctx, &server_pair).unwrap();
+
+        let mut request = serde_json::json!({
+            "prompt": [enc1, enc2],
+            "model": "test"
+        });
+
+        decrypt_request_fields(&mut request, Endpoint::Completions, &ctx, &server_pair).unwrap();
+        assert_eq!(request["prompt"][0], "hello");
+        assert_eq!(request["prompt"][1], "world");
+    }
+
+    #[test]
+    fn test_decrypt_completions_prompt_array_with_tokens() {
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+        };
+
+        // Array with mixed types: encrypted strings and token ID arrays (not encrypted)
+        let enc1 = encrypt_string("hello", &ctx, &server_pair).unwrap();
+
+        let mut request = serde_json::json!({
+            "prompt": [enc1, [1, 2, 3]],
+            "model": "test"
+        });
+
+        decrypt_request_fields(&mut request, Endpoint::Completions, &ctx, &server_pair).unwrap();
+        assert_eq!(request["prompt"][0], "hello");
+        // Token arrays are left unchanged
+        assert_eq!(request["prompt"][1], serde_json::json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn test_extract_encryption_context_valid_ecdsa() {
+        let server_pair = test_signing_pair();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-signing-algo", "ecdsa".parse().unwrap());
+        headers.insert(
+            "x-client-pub-key",
+            server_pair.ecdsa.signing_public_key.parse().unwrap(), // 128 hex = 64 bytes
+        );
+        let ctx = extract_encryption_context(&headers).unwrap().unwrap();
+        assert_eq!(ctx.algo, EncryptionAlgo::Ecdsa);
+        assert_eq!(ctx.client_pub_key.len(), 64);
+    }
+}

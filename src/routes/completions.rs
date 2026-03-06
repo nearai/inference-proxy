@@ -1,8 +1,12 @@
 use axum::body::Body;
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::response::Response;
 
+use sha2::Digest;
+
 use crate::auth::RequireAuth;
+use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
 use crate::proxy::{self, make_usage_reporter, ProxyOpts, UsageType};
 use crate::routes::chat::read_body_with_limit;
@@ -12,12 +16,33 @@ use crate::AppState;
 pub async fn completions(
     State(state): State<AppState>,
     auth: RequireAuth,
+    headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
     let request_body = read_body_with_limit(body, state.config.max_request_size).await?;
 
     let mut request_json: serde_json::Value = serde_json::from_slice(&request_body)
         .map_err(|e| AppError::BadRequest(format!("Invalid JSON: {e}")))?;
+
+    // Extract encryption context from headers
+    let enc_ctx = encryption::extract_encryption_context(&headers)?;
+
+    // Hash original client-sent body before decryption for signatures
+    let original_request_hash = if enc_ctx.is_some() {
+        Some(hex::encode(sha2::Sha256::digest(&request_body)))
+    } else {
+        None
+    };
+
+    // Decrypt request fields if encryption is active
+    if let Some(ref ctx) = enc_ctx {
+        encryption::decrypt_request_fields(
+            &mut request_json,
+            Endpoint::Completions,
+            ctx,
+            &state.signing,
+        )?;
+    }
 
     let is_stream = request_json
         .get("stream")
@@ -40,6 +65,25 @@ pub async fn completions(
     let modified_body =
         serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?;
 
+    // Build encryption transforms if active
+    let (response_transform, chunk_transform) = if let Some(ctx) = enc_ctx {
+        let signing = state.signing.clone();
+        (
+            Some(encryption::make_response_transform(
+                Endpoint::Completions,
+                ctx.clone(),
+                signing.clone(),
+            )),
+            Some(encryption::make_chunk_transform(
+                Endpoint::Completions,
+                ctx,
+                signing,
+            )),
+        )
+    } else {
+        (None, None)
+    };
+
     let opts = ProxyOpts {
         signing: state.signing.clone(),
         cache: state.cache.clone(),
@@ -47,6 +91,9 @@ pub async fn completions(
         model_name: state.config.model_name.clone(),
         usage_reporter: make_usage_reporter(auth.cloud_api_key.as_ref(), &state),
         usage_type: UsageType::ChatCompletion,
+        request_hash: original_request_hash,
+        response_transform,
+        chunk_transform,
     };
 
     if is_stream {
@@ -54,7 +101,7 @@ pub async fn completions(
             &state.http_client,
             &state.config.completions_url,
             modified_body,
-            &opts,
+            opts,
         )
         .await
     } else {
@@ -62,7 +109,7 @@ pub async fn completions(
             &state.http_client,
             &state.config.completions_url,
             modified_body,
-            &opts,
+            opts,
         )
         .await
     }

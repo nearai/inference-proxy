@@ -60,6 +60,11 @@ impl EcdsaContext {
         })
     }
 
+    /// Access the underlying signing key (needed for ECIES encryption).
+    pub fn secret_key(&self) -> &K256SigningKey {
+        &self.signing_key
+    }
+
     /// Sign a message using EIP-191 personal_sign format.
     /// Returns "0x{r}{s}{v}" (65 bytes hex-encoded).
     pub fn sign(&self, message: &str) -> Result<String> {
@@ -107,6 +112,11 @@ impl Ed25519Context {
             signing_address_bytes: pk_bytes.to_vec(),
             signing_public_key,
         })
+    }
+
+    /// Access the raw 32-byte secret key bytes (needed for NaCl box encryption).
+    pub fn secret_bytes(&self) -> &[u8; 32] {
+        self.signing_key.as_bytes()
     }
 
     /// Sign a message. Returns hex-encoded 64-byte signature.

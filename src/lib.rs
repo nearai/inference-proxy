@@ -9,6 +9,7 @@ pub mod attestation;
 pub mod auth;
 pub mod cache;
 pub mod config;
+pub mod encryption;
 pub mod error;
 pub mod metrics_middleware;
 pub mod proxy;

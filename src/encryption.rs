@@ -125,7 +125,7 @@ mod nacl {
         }
 
         let ephemeral_pub = PublicKey::from(<[u8; 32]>::try_from(&data[..32]).unwrap());
-        #[allow(deprecated)]
+        #[allow(deprecated)] // generic-array 0.x from_slice deprecation; fixed when deps upgrade
         let nonce = crypto_box::Nonce::from_slice(&data[32..56]);
         let ciphertext = &data[56..];
 
@@ -210,7 +210,7 @@ mod ecies {
 
         let ephemeral_pub = PublicKey::from_sec1_bytes(&data[..65])
             .map_err(|e| format!("Invalid ephemeral public key: {e}"))?;
-        #[allow(deprecated)]
+        #[allow(deprecated)] // generic-array 0.x from_slice deprecation; fixed when deps upgrade
         let nonce = aes_gcm::Nonce::from_slice(&data[65..77]);
         let ciphertext = &data[77..];
 

@@ -624,10 +624,21 @@ pub async fn proxy_multipart_request(
         }
     };
 
-    let response_body =
-        serde_json::to_string(&response_data).map_err(|e| AppError::Internal(e.into()))?;
-    let response_sha256 = hex::encode(Sha256::digest(response_body.as_bytes()));
+    // Report usage for cloud API key requests (before encryption, needs plaintext fields)
+    try_report_usage(&response_data, &response_id, &opts);
 
+    // Apply response transform (e.g., encryption) before hashing/signing.
+    // The signature covers the response bytes the client actually receives.
+    if let Some(transform) = opts.response_transform.take() {
+        transform(&mut response_data)?;
+    }
+
+    // Serialize with compact separators (matching Python's separators=(",",":"))
+    let final_body =
+        serde_json::to_string(&response_data).map_err(|e| AppError::Internal(e.into()))?;
+    let response_sha256 = hex::encode(Sha256::digest(final_body.as_bytes()));
+
+    // Sign and cache
     let text = format!("{}:{request_sha256}:{response_sha256}", opts.model_name);
     let signed = opts.signing.sign_chat(&text).map_err(|e| {
         error!(error = %e, "Signing failed");
@@ -635,17 +646,6 @@ pub async fn proxy_multipart_request(
     })?;
     let signed_json = serde_json::to_string(&signed).map_err(|e| AppError::Internal(e.into()))?;
     opts.cache.set_chat(&response_id, &signed_json);
-
-    // Report usage for cloud API key requests
-    try_report_usage(&response_data, &response_id, &opts);
-
-    // Apply response transform (e.g., encryption) after signing
-    let final_body = if let Some(transform) = opts.response_transform.take() {
-        transform(&mut response_data)?;
-        serde_json::to_string(&response_data).map_err(|e| AppError::Internal(e.into()))?
-    } else {
-        response_body
-    };
 
     Ok((
         StatusCode::OK,
@@ -741,10 +741,21 @@ pub async fn sign_and_cache_json_response(
         }
     };
 
-    let response_body =
-        serde_json::to_string(&response_data).map_err(|e| AppError::Internal(e.into()))?;
-    let response_sha256 = hex::encode(Sha256::digest(response_body.as_bytes()));
+    // Report usage for cloud API key requests (before encryption, needs plaintext fields)
+    try_report_usage(&response_data, &chat_id, &opts);
 
+    // Apply response transform (e.g., encryption) before hashing/signing.
+    // The signature covers the response bytes the client actually receives.
+    if let Some(transform) = opts.response_transform.take() {
+        transform(&mut response_data)?;
+    }
+
+    // Serialize with compact separators (matching Python's separators=(",",":"))
+    let final_body =
+        serde_json::to_string(&response_data).map_err(|e| AppError::Internal(e.into()))?;
+    let response_sha256 = hex::encode(Sha256::digest(final_body.as_bytes()));
+
+    // Sign and cache
     let text = format!("{}:{request_sha256}:{response_sha256}", opts.model_name);
     let signed = opts.signing.sign_chat(&text).map_err(|e| {
         error!(error = %e, "Signing failed");
@@ -752,17 +763,6 @@ pub async fn sign_and_cache_json_response(
     })?;
     let signed_json = serde_json::to_string(&signed).map_err(|e| AppError::Internal(e.into()))?;
     opts.cache.set_chat(&chat_id, &signed_json);
-
-    // Report usage for cloud API key requests
-    try_report_usage(&response_data, &chat_id, &opts);
-
-    // Apply response transform (e.g., encryption) after signing
-    let final_body = if let Some(transform) = opts.response_transform.take() {
-        transform(&mut response_data)?;
-        serde_json::to_string(&response_data).map_err(|e| AppError::Internal(e.into()))?
-    } else {
-        response_body
-    };
 
     Ok(Response::builder()
         .status(status)

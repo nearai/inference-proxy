@@ -196,11 +196,9 @@ pub struct ProxyOpts {
     /// original client-sent body, not the decrypted version.
     pub request_hash: Option<String>,
     /// Applied to response JSON after signing, before sending to client.
-    pub response_transform:
-        Option<Box<dyn FnOnce(&mut serde_json::Value) -> Result<(), AppError> + Send>>,
+    pub response_transform: Option<crate::encryption::ResponseTransform>,
     /// Applied to each SSE chunk JSON before forwarding to client.
-    pub chunk_transform:
-        Option<Arc<dyn Fn(&mut serde_json::Value) -> Result<(), AppError> + Send + Sync>>,
+    pub chunk_transform: Option<crate::encryption::ChunkTransform>,
 }
 
 /// Proxy a JSON request to the backend, sign the response, cache signature.
@@ -476,13 +474,11 @@ pub async fn proxy_streaming_request(
 /// Fail-closed: if a data line contains JSON that cannot be transformed, the stream errors.
 struct SseTransformer {
     line_buffer: String,
-    transform: Arc<dyn Fn(&mut serde_json::Value) -> Result<(), AppError> + Send + Sync>,
+    transform: crate::encryption::ChunkTransform,
 }
 
 impl SseTransformer {
-    fn new(
-        transform: Arc<dyn Fn(&mut serde_json::Value) -> Result<(), AppError> + Send + Sync>,
-    ) -> Self {
+    fn new(transform: crate::encryption::ChunkTransform) -> Self {
         Self {
             line_buffer: String::new(),
             transform,
@@ -510,7 +506,7 @@ impl SseTransformer {
             let full_line = self.line_buffer[..=newline_pos].to_string();
             self.line_buffer.drain(..=newline_pos);
 
-            let trimmed = full_line.trim_end_matches(|c| c == '\n' || c == '\r');
+            let trimmed = full_line.trim_end_matches(['\n', '\r']);
             let data = trimmed
                 .strip_prefix("data: ")
                 .or_else(|| trimmed.strip_prefix("data:"));
@@ -553,7 +549,7 @@ impl SseTransformer {
             return Ok(Bytes::new());
         }
         let remaining = std::mem::take(&mut self.line_buffer);
-        let trimmed = remaining.trim_end_matches(|c| c == '\n' || c == '\r');
+        let trimmed = remaining.trim_end_matches(['\n', '\r']);
         let data = trimmed
             .strip_prefix("data: ")
             .or_else(|| trimmed.strip_prefix("data:"));
@@ -1054,6 +1050,7 @@ impl SseParser {
 mod tests {
     use super::*;
     use crate::cache::ChatCache;
+    use crate::encryption::ChunkTransform;
     use crate::signing::{EcdsaContext, Ed25519Context, SigningPair};
 
     /// Build a ProxyOpts with fixed signing keys for deterministic tests.
@@ -1358,7 +1355,7 @@ mod tests {
     #[test]
     fn test_sse_transformer_data_split_across_chunks() {
         // Simulate a "data: {...}\n" line split across two TCP chunks
-        let transform: Arc<dyn Fn(&mut serde_json::Value) -> Result<(), AppError> + Send + Sync> =
+        let transform: ChunkTransform =
             Arc::new(|v| {
                 if let Some(s) = v
                     .get_mut("text")
@@ -1383,7 +1380,7 @@ mod tests {
 
     #[test]
     fn test_sse_transformer_multiple_lines_in_one_chunk() {
-        let transform: Arc<dyn Fn(&mut serde_json::Value) -> Result<(), AppError> + Send + Sync> =
+        let transform: ChunkTransform =
             Arc::new(|v| {
                 if let Some(s) = v
                     .get_mut("x")
@@ -1404,7 +1401,7 @@ mod tests {
 
     #[test]
     fn test_sse_transformer_fail_closed_on_bad_json() {
-        let transform: Arc<dyn Fn(&mut serde_json::Value) -> Result<(), AppError> + Send + Sync> =
+        let transform: ChunkTransform =
             Arc::new(|_| Ok(()));
 
         let mut transformer = SseTransformer::new(transform);
@@ -1415,7 +1412,7 @@ mod tests {
 
     #[test]
     fn test_sse_transformer_fail_closed_on_transform_error() {
-        let transform: Arc<dyn Fn(&mut serde_json::Value) -> Result<(), AppError> + Send + Sync> =
+        let transform: ChunkTransform =
             Arc::new(|_| Err(AppError::Internal(anyhow::anyhow!("transform failed"))));
 
         let mut transformer = SseTransformer::new(transform);
@@ -1425,7 +1422,7 @@ mod tests {
 
     #[test]
     fn test_sse_transformer_passes_through_done_and_empty_lines() {
-        let transform: Arc<dyn Fn(&mut serde_json::Value) -> Result<(), AppError> + Send + Sync> =
+        let transform: ChunkTransform =
             Arc::new(|_| Ok(()));
 
         let mut transformer = SseTransformer::new(transform);
@@ -1438,7 +1435,7 @@ mod tests {
     #[test]
     fn test_sse_transformer_flush_incomplete_line() {
         // Simulate a data line that arrives without a trailing newline (stream ends mid-line).
-        let transform: Arc<dyn Fn(&mut serde_json::Value) -> Result<(), AppError> + Send + Sync> =
+        let transform: ChunkTransform =
             Arc::new(|val| {
                 // Uppercase the "text" field to prove the transform ran
                 if let Some(t) = val
@@ -1477,7 +1474,7 @@ mod tests {
 
     #[test]
     fn test_sse_transformer_flush_empty_buffer() {
-        let transform: Arc<dyn Fn(&mut serde_json::Value) -> Result<(), AppError> + Send + Sync> =
+        let transform: ChunkTransform =
             Arc::new(|_| Ok(()));
 
         let mut transformer = SseTransformer::new(transform);
@@ -1488,7 +1485,7 @@ mod tests {
     #[test]
     fn test_sse_transformer_flush_done_marker() {
         // A [DONE] marker buffered without trailing newline should pass through unchanged.
-        let transform: Arc<dyn Fn(&mut serde_json::Value) -> Result<(), AppError> + Send + Sync> =
+        let transform: ChunkTransform =
             Arc::new(|_| Ok(()));
 
         let mut transformer = SseTransformer::new(transform);

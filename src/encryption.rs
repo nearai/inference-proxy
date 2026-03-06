@@ -3,6 +3,14 @@ use std::sync::Arc;
 use crate::error::AppError;
 use crate::signing::SigningPair;
 
+/// One-shot transform applied to a full JSON response body.
+pub type ResponseTransform =
+    Box<dyn FnOnce(&mut serde_json::Value) -> Result<(), AppError> + Send>;
+
+/// Reusable transform applied to each SSE chunk.
+pub type ChunkTransform =
+    Arc<dyn Fn(&mut serde_json::Value) -> Result<(), AppError> + Send + Sync>;
+
 // ── Algorithm enum ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,13 +268,13 @@ pub fn encrypt_string(
         EncryptionAlgo::Ed25519 => {
             let client_x25519 =
                 nacl::ed25519_public_to_x25519(ctx.client_pub_key.as_slice().try_into().unwrap())
-                    .map_err(|e| AppError::BadRequest(e))?;
+                    .map_err(AppError::BadRequest)?;
             nacl::encrypt(plaintext.as_bytes(), &client_x25519)
                 .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?
         }
         EncryptionAlgo::Ecdsa => {
             let client_pk = ecies::parse_client_pubkey(&ctx.client_pub_key)
-                .map_err(|e| AppError::BadRequest(e))?;
+                .map_err(AppError::BadRequest)?;
             ecies::encrypt(plaintext.as_bytes(), &client_pk)
                 .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?
         }
@@ -597,7 +605,7 @@ pub fn make_response_transform(
     endpoint: Endpoint,
     ctx: EncryptionContext,
     signing: Arc<SigningPair>,
-) -> Box<dyn FnOnce(&mut serde_json::Value) -> Result<(), AppError> + Send> {
+) -> ResponseTransform {
     Box::new(move |value: &mut serde_json::Value| {
         encrypt_response_fields(value, endpoint, &ctx, &signing)
     })
@@ -608,7 +616,7 @@ pub fn make_chunk_transform(
     endpoint: Endpoint,
     ctx: EncryptionContext,
     signing: Arc<SigningPair>,
-) -> Arc<dyn Fn(&mut serde_json::Value) -> Result<(), AppError> + Send + Sync> {
+) -> ChunkTransform {
     Arc::new(move |value: &mut serde_json::Value| {
         encrypt_streaming_chunk(value, endpoint, &ctx, &signing)
     })

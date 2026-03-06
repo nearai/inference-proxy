@@ -194,11 +194,10 @@ pub async fn audio_transcriptions(
         let file_name = field.file_name().map(|s| s.to_string());
         let content_type = field.content_type().map(|s| s.to_string());
 
-        if name == "prompt" && enc_ctx.is_some() {
+        if let (true, Some(ctx)) = (name == "prompt", enc_ctx.as_ref()) {
             // Read field, hash the raw (encrypted) bytes, then decrypt for forwarding
             let raw_data = read_field_data(&mut field, &mut total_size, max_size).await?;
             hasher.update(&raw_data);
-            let ctx = enc_ctx.as_ref().unwrap();
             let text = String::from_utf8(raw_data)
                 .map_err(|_| AppError::BadRequest("prompt field is not UTF-8".to_string()))?;
             let data = if !text.is_empty() {
@@ -282,6 +281,7 @@ async fn json_passthrough(
 }
 
 /// Generic JSON passthrough with signing and optional encryption support.
+#[allow(clippy::too_many_arguments)]
 async fn json_passthrough_encrypted(
     state: AppState,
     body: Body,

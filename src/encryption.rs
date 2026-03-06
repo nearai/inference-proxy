@@ -4,12 +4,10 @@ use crate::error::AppError;
 use crate::signing::SigningPair;
 
 /// One-shot transform applied to a full JSON response body.
-pub type ResponseTransform =
-    Box<dyn FnOnce(&mut serde_json::Value) -> Result<(), AppError> + Send>;
+pub type ResponseTransform = Box<dyn FnOnce(&mut serde_json::Value) -> Result<(), AppError> + Send>;
 
 /// Reusable transform applied to each SSE chunk.
-pub type ChunkTransform =
-    Arc<dyn Fn(&mut serde_json::Value) -> Result<(), AppError> + Send + Sync>;
+pub type ChunkTransform = Arc<dyn Fn(&mut serde_json::Value) -> Result<(), AppError> + Send + Sync>;
 
 // ── Algorithm enum ──────────────────────────────────────────────────
 
@@ -273,8 +271,8 @@ pub fn encrypt_string(
                 .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?
         }
         EncryptionAlgo::Ecdsa => {
-            let client_pk = ecies::parse_client_pubkey(&ctx.client_pub_key)
-                .map_err(AppError::BadRequest)?;
+            let client_pk =
+                ecies::parse_client_pubkey(&ctx.client_pub_key).map_err(AppError::BadRequest)?;
             ecies::encrypt(plaintext.as_bytes(), &client_pk)
                 .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?
         }

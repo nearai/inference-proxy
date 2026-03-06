@@ -1355,16 +1355,15 @@ mod tests {
     #[test]
     fn test_sse_transformer_data_split_across_chunks() {
         // Simulate a "data: {...}\n" line split across two TCP chunks
-        let transform: ChunkTransform =
-            Arc::new(|v| {
-                if let Some(s) = v
-                    .get_mut("text")
-                    .and_then(|t| t.as_str().map(|s| s.to_string()))
-                {
-                    v["text"] = serde_json::Value::String(format!("ENC:{s}"));
-                }
-                Ok(())
-            });
+        let transform: ChunkTransform = Arc::new(|v| {
+            if let Some(s) = v
+                .get_mut("text")
+                .and_then(|t| t.as_str().map(|s| s.to_string()))
+            {
+                v["text"] = serde_json::Value::String(format!("ENC:{s}"));
+            }
+            Ok(())
+        });
 
         let mut transformer = SseTransformer::new(transform);
 
@@ -1380,16 +1379,15 @@ mod tests {
 
     #[test]
     fn test_sse_transformer_multiple_lines_in_one_chunk() {
-        let transform: ChunkTransform =
-            Arc::new(|v| {
-                if let Some(s) = v
-                    .get_mut("x")
-                    .and_then(|t| t.as_str().map(|s| s.to_string()))
-                {
-                    v["x"] = serde_json::Value::String(format!("T:{s}"));
-                }
-                Ok(())
-            });
+        let transform: ChunkTransform = Arc::new(|v| {
+            if let Some(s) = v
+                .get_mut("x")
+                .and_then(|t| t.as_str().map(|s| s.to_string()))
+            {
+                v["x"] = serde_json::Value::String(format!("T:{s}"));
+            }
+            Ok(())
+        });
 
         let mut transformer = SseTransformer::new(transform);
         let chunk = b"data: {\"x\":\"a\"}\ndata: {\"x\":\"b\"}\n\n";
@@ -1401,8 +1399,7 @@ mod tests {
 
     #[test]
     fn test_sse_transformer_fail_closed_on_bad_json() {
-        let transform: ChunkTransform =
-            Arc::new(|_| Ok(()));
+        let transform: ChunkTransform = Arc::new(|_| Ok(()));
 
         let mut transformer = SseTransformer::new(transform);
         // Invalid JSON in data line
@@ -1422,8 +1419,7 @@ mod tests {
 
     #[test]
     fn test_sse_transformer_passes_through_done_and_empty_lines() {
-        let transform: ChunkTransform =
-            Arc::new(|_| Ok(()));
+        let transform: ChunkTransform = Arc::new(|_| Ok(()));
 
         let mut transformer = SseTransformer::new(transform);
         let chunk = b"data: [DONE]\n\n";
@@ -1435,17 +1431,16 @@ mod tests {
     #[test]
     fn test_sse_transformer_flush_incomplete_line() {
         // Simulate a data line that arrives without a trailing newline (stream ends mid-line).
-        let transform: ChunkTransform =
-            Arc::new(|val| {
-                // Uppercase the "text" field to prove the transform ran
-                if let Some(t) = val
-                    .get_mut("text")
-                    .and_then(|v| v.as_str().map(|s| s.to_uppercase()))
-                {
-                    val["text"] = serde_json::Value::String(t);
-                }
-                Ok(())
-            });
+        let transform: ChunkTransform = Arc::new(|val| {
+            // Uppercase the "text" field to prove the transform ran
+            if let Some(t) = val
+                .get_mut("text")
+                .and_then(|v| v.as_str().map(|s| s.to_uppercase()))
+            {
+                val["text"] = serde_json::Value::String(t);
+            }
+            Ok(())
+        });
 
         let mut transformer = SseTransformer::new(transform);
 
@@ -1474,8 +1469,7 @@ mod tests {
 
     #[test]
     fn test_sse_transformer_flush_empty_buffer() {
-        let transform: ChunkTransform =
-            Arc::new(|_| Ok(()));
+        let transform: ChunkTransform = Arc::new(|_| Ok(()));
 
         let mut transformer = SseTransformer::new(transform);
         let flushed = transformer.flush().unwrap();
@@ -1485,8 +1479,7 @@ mod tests {
     #[test]
     fn test_sse_transformer_flush_done_marker() {
         // A [DONE] marker buffered without trailing newline should pass through unchanged.
-        let transform: ChunkTransform =
-            Arc::new(|_| Ok(()));
+        let transform: ChunkTransform = Arc::new(|_| Ok(()));
 
         let mut transformer = SseTransformer::new(transform);
         let chunk = b"data: [DONE]";

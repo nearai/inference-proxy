@@ -61,10 +61,13 @@ pub async fn embeddings(
 pub async fn rerank(
     State(state): State<AppState>,
     auth: RequireAuth,
+    headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
     let reporter = make_usage_reporter(auth.cloud_api_key.as_ref(), &state);
-    json_passthrough(
+    let enc_ctx = encryption::extract_encryption_context(&headers)?;
+
+    json_passthrough_encrypted(
         state,
         body,
         |c| &c.rerank_url,
@@ -72,6 +75,8 @@ pub async fn rerank(
         |c| c.max_request_size,
         reporter,
         UsageType::ChatCompletion,
+        enc_ctx,
+        Endpoint::Rerank,
     )
     .await
 }
@@ -80,10 +85,13 @@ pub async fn rerank(
 pub async fn score(
     State(state): State<AppState>,
     auth: RequireAuth,
+    headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
     let reporter = make_usage_reporter(auth.cloud_api_key.as_ref(), &state);
-    json_passthrough(
+    let enc_ctx = encryption::extract_encryption_context(&headers)?;
+
+    json_passthrough_encrypted(
         state,
         body,
         |c| &c.score_url,
@@ -91,6 +99,8 @@ pub async fn score(
         |c| c.max_request_size,
         reporter,
         UsageType::ChatCompletion,
+        enc_ctx,
+        Endpoint::Score,
     )
     .await
 }
@@ -123,8 +133,10 @@ pub async fn images_generations(
 pub async fn images_edits(
     State(state): State<AppState>,
     auth: RequireAuth,
+    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Response, AppError> {
+    let enc_ctx = encryption::extract_encryption_context(&headers)?;
     let max_size = state.config.max_image_request_size;
     let mut form = reqwest::multipart::Form::new();
     let mut total_size: usize = 0;
@@ -139,13 +151,36 @@ pub async fn images_edits(
         let file_name = field.file_name().map(|s| s.to_string());
         let content_type = field.content_type().map(|s| s.to_string());
 
-        let data = read_field_chunks(&mut field, &mut total_size, max_size, &mut hasher).await?;
-
-        let part = build_multipart_part(data, file_name, content_type)?;
-        form = form.part(name, part);
+        if let (true, Some(ctx)) = (name == "prompt", enc_ctx.as_ref()) {
+            // Read field, hash the raw (encrypted) bytes, then decrypt for forwarding
+            let raw_data = read_field_data(&mut field, &mut total_size, max_size).await?;
+            hasher.update(&raw_data);
+            let text = String::from_utf8(raw_data)
+                .map_err(|_| AppError::BadRequest("prompt field is not UTF-8".to_string()))?;
+            let data = if !text.is_empty() {
+                encryption::decrypt_string(&text, ctx, &state.signing)?.into_bytes()
+            } else {
+                text.into_bytes()
+            };
+            let part = build_multipart_part(data, file_name, content_type)?;
+            form = form.part(name, part);
+        } else {
+            let data =
+                read_field_chunks(&mut field, &mut total_size, max_size, &mut hasher).await?;
+            let part = build_multipart_part(data, file_name, content_type)?;
+            form = form.part(name, part);
+        }
     }
 
     let request_sha256 = hex::encode(hasher.finalize());
+
+    let response_transform = enc_ctx.as_ref().map(|ctx| {
+        encryption::make_response_transform(
+            Endpoint::ImagesEdits,
+            ctx.clone(),
+            state.signing.clone(),
+        )
+    });
 
     let opts = ProxyOpts {
         signing: state.signing.clone(),
@@ -155,7 +190,7 @@ pub async fn images_edits(
         usage_reporter: make_usage_reporter(auth.cloud_api_key.as_ref(), &state),
         usage_type: UsageType::ImageGeneration,
         request_hash: None,
-        response_transform: None,
+        response_transform,
         chunk_transform: None,
     };
 
@@ -245,39 +280,6 @@ pub async fn audio_transcriptions(
         opts,
     )
     .await
-}
-
-/// Generic JSON passthrough with signing (no encryption support).
-async fn json_passthrough(
-    state: AppState,
-    body: Body,
-    url_fn: fn(&crate::config::Config) -> &str,
-    id_prefix: &str,
-    size_fn: fn(&crate::config::Config) -> usize,
-    usage_reporter: Option<UsageReporter>,
-    usage_type: UsageType,
-) -> Result<Response, AppError> {
-    let max_size = size_fn(&state.config);
-    let request_body = read_body_with_limit(body, max_size).await?;
-
-    // Validate JSON
-    let _: serde_json::Value = serde_json::from_slice(&request_body)
-        .map_err(|e| AppError::BadRequest(format!("Invalid JSON: {e}")))?;
-
-    let opts = ProxyOpts {
-        signing: state.signing.clone(),
-        cache: state.cache.clone(),
-        id_prefix: id_prefix.to_string(),
-        model_name: state.config.model_name.clone(),
-        usage_reporter,
-        usage_type,
-        request_hash: None,
-        response_transform: None,
-        chunk_transform: None,
-    };
-
-    let url = url_fn(&state.config);
-    proxy::proxy_json_request(&state.http_client, url, request_body, opts).await
 }
 
 /// Generic JSON passthrough with signing and optional encryption support.

@@ -183,7 +183,7 @@ mod ecies {
 
         let hkdf = Hkdf::<Sha256>::new(None, shared_secret.raw_secret_bytes());
         let mut aes_key = [0u8; 32];
-        hkdf.expand(&[], &mut aes_key)
+        hkdf.expand(b"ecdsa_encryption", &mut aes_key)
             .map_err(|e| format!("HKDF expand failed: {e}"))?;
 
         let cipher =
@@ -220,7 +220,7 @@ mod ecies {
 
         let hkdf = Hkdf::<Sha256>::new(None, shared_secret.raw_secret_bytes());
         let mut aes_key = [0u8; 32];
-        hkdf.expand(&[], &mut aes_key)
+        hkdf.expand(b"ecdsa_encryption", &mut aes_key)
             .map_err(|e| format!("HKDF expand failed: {e}"))?;
 
         let cipher =
@@ -317,8 +317,11 @@ pub enum Endpoint {
     ChatCompletions,
     Completions,
     ImagesGenerations,
+    ImagesEdits,
     Embeddings,
     AudioTranscriptions,
+    Rerank,
+    Score,
 }
 
 /// Decrypt request fields in-place based on the endpoint type.
@@ -340,17 +343,24 @@ pub fn decrypt_request_fields(
             // prompt can be a string or an array of strings
             decrypt_field_or_array(value, "prompt", ctx, signing)?;
         }
-        Endpoint::ImagesGenerations => {
+        Endpoint::ImagesGenerations | Endpoint::ImagesEdits => {
             decrypt_field(value, "prompt", ctx, signing)?;
         }
         Endpoint::Embeddings => {
-            // The client JSON-serializes the `input` value before encrypting,
-            // so after decryption we parse it back to the original JSON type
-            // (string, array of strings, or array of token arrays).
-            decrypt_field_json(value, "input", ctx, signing)?;
+            // input can be a string or array of strings; non-string elements
+            // (token ID arrays) pass through unchanged — matches Python proxy.
+            decrypt_field_or_array(value, "input", ctx, signing)?;
         }
         Endpoint::AudioTranscriptions => {
             decrypt_field(value, "prompt", ctx, signing)?;
+        }
+        Endpoint::Rerank => {
+            decrypt_field(value, "query", ctx, signing)?;
+            decrypt_rerank_documents(value, ctx, signing)?;
+        }
+        Endpoint::Score => {
+            decrypt_field(value, "text_1", ctx, signing)?;
+            decrypt_field(value, "text_2", ctx, signing)?;
         }
     }
     Ok(())
@@ -374,18 +384,49 @@ pub fn encrypt_response_fields(
                 }
             }
         }
-        Endpoint::ImagesGenerations => {
+        Endpoint::ImagesGenerations | Endpoint::ImagesEdits => {
             if let Some(data) = value.get_mut("data").and_then(|d| d.as_array_mut()) {
                 for item in data.iter_mut() {
                     encrypt_field(item, "b64_json", ctx, signing)?;
+                    encrypt_field(item, "revised_prompt", ctx, signing)?;
                 }
             }
         }
         Endpoint::Embeddings => {
-            // Numeric output — not encrypted
+            // Encrypt each embedding: serialize float array to JSON, then encrypt
+            if let Some(data) = value.get_mut("data").and_then(|d| d.as_array_mut()) {
+                for item in data.iter_mut() {
+                    if let Some(embedding) = item.get_mut("embedding") {
+                        if embedding.is_array() {
+                            let json_str = serde_json::to_string(embedding)
+                                .map_err(|e| AppError::Internal(e.into()))?;
+                            let encrypted = encrypt_string(&json_str, ctx, signing)?;
+                            *embedding = serde_json::Value::String(encrypted);
+                        }
+                    }
+                }
+            }
         }
         Endpoint::AudioTranscriptions => {
             encrypt_field(value, "text", ctx, signing)?;
+        }
+        Endpoint::Rerank => {
+            if let Some(results) = value.get_mut("results").and_then(|r| r.as_array_mut()) {
+                for result in results.iter_mut() {
+                    if let Some(doc) = result.get_mut("document") {
+                        encrypt_field(doc, "text", ctx, signing)?;
+                    }
+                }
+            }
+        }
+        Endpoint::Score => {
+            // Serialize score value to JSON string, then encrypt
+            if let Some(score) = value.get_mut("score") {
+                let json_str =
+                    serde_json::to_string(score).map_err(|e| AppError::Internal(e.into()))?;
+                let encrypted = encrypt_string(&json_str, ctx, signing)?;
+                *score = serde_json::Value::String(encrypted);
+            }
         }
     }
     Ok(())
@@ -410,9 +451,12 @@ pub fn encrypt_streaming_chunk(
             Ok(())
         }
         // These endpoints don't use streaming — no fields to encrypt
-        Endpoint::ImagesGenerations => Ok(()),
-        Endpoint::Embeddings => Ok(()),
-        Endpoint::AudioTranscriptions => Ok(()),
+        Endpoint::ImagesGenerations
+        | Endpoint::ImagesEdits
+        | Endpoint::Embeddings
+        | Endpoint::AudioTranscriptions
+        | Endpoint::Rerank
+        | Endpoint::Score => Ok(()),
     }
 }
 
@@ -423,25 +467,30 @@ fn decrypt_chat_message_fields(
     ctx: &EncryptionContext,
     signing: &SigningPair,
 ) -> Result<(), AppError> {
-    // content can be a string or array of content parts
+    // content can be a string (encrypted) or array of content parts.
+    // When encrypted, the client sends a single encrypted string; after decryption
+    // we try json.loads to restore multimodal content arrays (matching Python proxy).
     if let Some(content) = msg.get_mut("content") {
-        match content {
-            serde_json::Value::String(s) => {
-                if !s.is_empty() {
-                    let decrypted = decrypt_string(s, ctx, signing)?;
-                    *s = decrypted;
+        if let Some(s) = content.as_str() {
+            if !s.is_empty() {
+                let decrypted = decrypt_string(s, ctx, signing)?;
+                // Try to parse as JSON array (multimodal content parts)
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&decrypted) {
+                    if parsed.is_array() {
+                        *content = parsed;
+                    } else {
+                        *content = serde_json::Value::String(decrypted);
+                    }
+                } else {
+                    *content = serde_json::Value::String(decrypted);
                 }
             }
-            serde_json::Value::Array(parts) => {
-                for part in parts.iter_mut() {
-                    decrypt_field(part, "text", ctx, signing)?;
-                }
-            }
-            _ => {}
         }
+        // If content is already an array, it was not encrypted — pass through
     }
 
     decrypt_field(msg, "reasoning_content", ctx, signing)?;
+    decrypt_field(msg, "reasoning", ctx, signing)?;
 
     // audio.data
     if let Some(audio) = msg.get_mut("audio") {
@@ -463,6 +512,7 @@ fn encrypt_chat_response_choices(
             if let Some(msg) = choice.get_mut(msg_key) {
                 encrypt_content_field(msg, ctx, signing)?;
                 encrypt_field(msg, "reasoning_content", ctx, signing)?;
+                encrypt_field(msg, "reasoning", ctx, signing)?;
                 if let Some(audio) = msg.get_mut("audio") {
                     encrypt_field(audio, "data", ctx, signing)?;
                 }
@@ -549,30 +599,26 @@ fn decrypt_field_or_array(
     Ok(())
 }
 
-/// Decrypt a string field and parse the result as JSON, restoring the original type.
-/// Used for embeddings `input` which is JSON-serialized before encryption.
-/// Validates that the result is a string or array (the only valid `input` types).
-fn decrypt_field_json(
-    obj: &mut serde_json::Value,
-    field: &str,
+/// Decrypt rerank `documents[]` in-place.
+/// Each element can be a string (decrypt directly) or an object with a `text` field.
+fn decrypt_rerank_documents(
+    value: &mut serde_json::Value,
     ctx: &EncryptionContext,
     signing: &SigningPair,
 ) -> Result<(), AppError> {
-    if let Some(val) = obj.get_mut(field) {
-        if let Some(s) = val.as_str() {
-            if !s.is_empty() {
-                let s_owned = s.to_string();
-                let decrypted = decrypt_string(&s_owned, ctx, signing)?;
-                let parsed: serde_json::Value = serde_json::from_str(&decrypted).map_err(|e| {
-                    AppError::BadRequest(format!("Decrypted input is not valid JSON: {e}"))
-                })?;
-                // Only allow string or array — reject objects, booleans, numbers, null
-                if !parsed.is_string() && !parsed.is_array() {
-                    return Err(AppError::BadRequest(
-                        "Decrypted input must be a string or array".to_string(),
-                    ));
+    if let Some(docs) = value.get_mut("documents").and_then(|d| d.as_array_mut()) {
+        for doc in docs.iter_mut() {
+            match doc {
+                serde_json::Value::String(s) => {
+                    if !s.is_empty() {
+                        let decrypted = decrypt_string(s, ctx, signing)?;
+                        *s = decrypted;
+                    }
                 }
-                *val = parsed;
+                serde_json::Value::Object(_) => {
+                    decrypt_field(doc, "text", ctx, signing)?;
+                }
+                _ => {}
             }
         }
     }
@@ -899,6 +945,8 @@ mod tests {
 
     #[test]
     fn test_decrypt_chat_message_array_content() {
+        // When content is an encrypted string that decrypts to a JSON array,
+        // it should be restored to the array form (matching Python proxy's json.loads behavior).
         let server_pair = test_signing_pair();
         let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
         let ctx = EncryptionContext {
@@ -906,16 +954,23 @@ mod tests {
             client_pub_key: client_pub,
         };
 
-        let encrypted_text = encrypt_string("Hello world", &ctx, &server_pair).unwrap();
+        // Client encrypts a JSON-serialized content array
+        let content_array = serde_json::json!([
+            {"type": "text", "text": "Hello world"},
+            {"type": "image_url", "image_url": {"url": "data:..."}}
+        ]);
+        let encrypted_content = encrypt_string(
+            &serde_json::to_string(&content_array).unwrap(),
+            &ctx,
+            &server_pair,
+        )
+        .unwrap();
 
         let mut request = serde_json::json!({
             "messages": [
                 {
                     "role": "user",
-                    "content": [
-                        {"type": "text", "text": encrypted_text},
-                        {"type": "image_url", "image_url": {"url": "data:..."}}
-                    ]
+                    "content": encrypted_content
                 }
             ]
         });
@@ -923,8 +978,8 @@ mod tests {
         decrypt_request_fields(&mut request, Endpoint::ChatCompletions, &ctx, &server_pair)
             .unwrap();
 
+        // Content should be restored to the original array
         assert_eq!(request["messages"][0]["content"][0]["text"], "Hello world");
-        // image_url part should be unchanged
         assert_eq!(request["messages"][0]["content"][1]["type"], "image_url");
     }
 
@@ -1070,7 +1125,7 @@ mod tests {
     }
 
     #[test]
-    fn test_embeddings_response_not_encrypted() {
+    fn test_embeddings_response_encrypted() {
         let server_pair = test_signing_pair();
         let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
         let ctx = EncryptionContext {
@@ -1084,9 +1139,11 @@ mod tests {
             ]
         });
 
-        let original = response.clone();
         encrypt_response_fields(&mut response, Endpoint::Embeddings, &ctx, &server_pair).unwrap();
-        assert_eq!(response, original);
+        // Embedding should now be an encrypted hex string, not an array
+        let encrypted = response["data"][0]["embedding"].as_str().unwrap();
+        let decrypted = decrypt_string(encrypted, &ctx, &server_pair).unwrap();
+        assert_eq!(decrypted, "[0.1,0.2,0.3]");
     }
 
     #[test]
@@ -1201,7 +1258,7 @@ mod tests {
         assert_eq!(decrypted, "hello world");
     }
 
-    // ── Fix 4: Embeddings input JSON deserialization ────────────────
+    // ── Embeddings input decryption ──────────────────────────────────
 
     #[test]
     fn test_decrypt_embeddings_input_string() {
@@ -1212,10 +1269,8 @@ mod tests {
             client_pub_key: client_pub,
         };
 
-        // Client encrypts JSON-serialized string: "\"hello world\""
-        let input_json = serde_json::json!("hello world");
-        let serialized = serde_json::to_string(&input_json).unwrap();
-        let encrypted = encrypt_string(&serialized, &ctx, &server_pair).unwrap();
+        // Client encrypts the input string directly (matching Python proxy's decrypt_prompt)
+        let encrypted = encrypt_string("hello world", &ctx, &server_pair).unwrap();
 
         let mut request = serde_json::json!({
             "input": encrypted,
@@ -1224,7 +1279,6 @@ mod tests {
 
         decrypt_request_fields(&mut request, Endpoint::Embeddings, &ctx, &server_pair).unwrap();
 
-        // After decryption, input should be a string value, not a JSON string containing quotes
         assert_eq!(request["input"], serde_json::json!("hello world"));
     }
 
@@ -1237,24 +1291,23 @@ mod tests {
             client_pub_key: client_pub,
         };
 
-        // Client encrypts JSON-serialized array: "[\"hello\",\"world\"]"
-        let input_json = serde_json::json!(["hello", "world"]);
-        let serialized = serde_json::to_string(&input_json).unwrap();
-        let encrypted = encrypt_string(&serialized, &ctx, &server_pair).unwrap();
+        // Client encrypts each string element individually (matching Python proxy)
+        let enc_hello = encrypt_string("hello", &ctx, &server_pair).unwrap();
+        let enc_world = encrypt_string("world", &ctx, &server_pair).unwrap();
 
         let mut request = serde_json::json!({
-            "input": encrypted,
+            "input": [enc_hello, enc_world],
             "model": "text-embedding"
         });
 
         decrypt_request_fields(&mut request, Endpoint::Embeddings, &ctx, &server_pair).unwrap();
 
-        // After decryption, input should be an array, not a string
         assert_eq!(request["input"], serde_json::json!(["hello", "world"]));
     }
 
     #[test]
     fn test_decrypt_embeddings_input_token_array() {
+        // Token ID arrays are not encrypted — they pass through unchanged
         let server_pair = test_signing_pair();
         let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
         let ctx = EncryptionContext {
@@ -1262,18 +1315,14 @@ mod tests {
             client_pub_key: client_pub,
         };
 
-        // Client encrypts JSON-serialized array of token arrays: "[[1,2,3],[4,5,6]]"
-        let input_json = serde_json::json!([[1, 2, 3], [4, 5, 6]]);
-        let serialized = serde_json::to_string(&input_json).unwrap();
-        let encrypted = encrypt_string(&serialized, &ctx, &server_pair).unwrap();
-
         let mut request = serde_json::json!({
-            "input": encrypted,
+            "input": [[1, 2, 3], [4, 5, 6]],
             "model": "text-embedding"
         });
 
         decrypt_request_fields(&mut request, Endpoint::Embeddings, &ctx, &server_pair).unwrap();
 
+        // Token arrays pass through unchanged
         assert_eq!(request["input"], serde_json::json!([[1, 2, 3], [4, 5, 6]]));
     }
 
@@ -1303,56 +1352,8 @@ mod tests {
         );
     }
 
-    // ── Embeddings input type validation (#8) ──────────────────────
-
-    #[test]
-    fn test_decrypt_embeddings_rejects_object_input() {
-        let server_pair = test_signing_pair();
-        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
-        let ctx = EncryptionContext {
-            algo: EncryptionAlgo::Ed25519,
-            client_pub_key: client_pub,
-        };
-
-        // Client encrypts a JSON object — should be rejected
-        let input_json = serde_json::json!({"evil": "payload"});
-        let serialized = serde_json::to_string(&input_json).unwrap();
-        let encrypted = encrypt_string(&serialized, &ctx, &server_pair).unwrap();
-
-        let mut request = serde_json::json!({
-            "input": encrypted,
-            "model": "text-embedding"
-        });
-
-        let result = decrypt_request_fields(&mut request, Endpoint::Embeddings, &ctx, &server_pair);
-        assert!(
-            result.is_err(),
-            "Should reject object type for embeddings input"
-        );
-    }
-
-    #[test]
-    fn test_decrypt_embeddings_rejects_number_input() {
-        let server_pair = test_signing_pair();
-        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
-        let ctx = EncryptionContext {
-            algo: EncryptionAlgo::Ed25519,
-            client_pub_key: client_pub,
-        };
-
-        let encrypted = encrypt_string("42", &ctx, &server_pair).unwrap();
-
-        let mut request = serde_json::json!({
-            "input": encrypted,
-            "model": "text-embedding"
-        });
-
-        let result = decrypt_request_fields(&mut request, Endpoint::Embeddings, &ctx, &server_pair);
-        assert!(
-            result.is_err(),
-            "Should reject number type for embeddings input"
-        );
-    }
+    // Embeddings input type validation removed — now using decrypt_field_or_array
+    // which matches Python proxy behavior (decrypt strings, skip non-strings).
 
     // ── Completions prompt array decryption (#9) ───────────────────
 

@@ -4051,15 +4051,13 @@ async fn test_encrypted_embeddings_ed25519() {
         client_pub_key: server_pub_bytes,
     };
 
-    // Embeddings input is JSON-serialized before encryption
-    let input_json = serde_json::json!(["hello", "world"]);
-    let serialized_input = serde_json::to_string(&input_json).unwrap();
-    let encrypted_input =
-        encryption::encrypt_string(&serialized_input, &enc_for_request, &client_pair).unwrap();
+    // Each string element is individually encrypted (matching Python proxy)
+    let enc_hello = encryption::encrypt_string("hello", &enc_for_request, &client_pair).unwrap();
+    let enc_world = encryption::encrypt_string("world", &enc_for_request, &client_pair).unwrap();
 
     let request_body = serde_json::json!({
         "model": "test-model",
-        "input": encrypted_input
+        "input": [enc_hello, enc_world]
     });
 
     let response = app
@@ -4080,8 +4078,18 @@ async fn test_encrypted_embeddings_ed25519() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_to_json(response).await;
 
-    // Embeddings response is numeric — not encrypted
-    assert!(body["data"][0]["embedding"].is_array());
+    // Embeddings response is encrypted — embedding is now a hex-encoded string
+    let encrypted_embedding = body["data"][0]["embedding"]
+        .as_str()
+        .expect("embedding should be an encrypted string");
+    // Decrypt and verify original value
+    let dec_ctx = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: hex::decode(&client_pub_hex).unwrap(),
+    };
+    let decrypted =
+        encryption::decrypt_string(encrypted_embedding, &dec_ctx, &client_pair).unwrap();
+    assert_eq!(decrypted, "[0.1,0.2,0.3]");
 }
 
 // ---- Encrypted images test ----

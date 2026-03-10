@@ -27,12 +27,10 @@ pub async fn completions(
     // Extract encryption context from headers
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
 
-    // Hash original client-sent body before decryption for signatures
-    let original_request_hash = if enc_ctx.is_some() {
-        Some(hex::encode(sha2::Sha256::digest(&request_body)))
-    } else {
-        None
-    };
+    // Always hash the original client-sent body for signatures.
+    // The body gets re-serialized after parsing (which reorders keys), so we must
+    // hash the original bytes to let clients verify the exact request they sent.
+    let original_request_hash = Some(hex::encode(sha2::Sha256::digest(&request_body)));
 
     // Decrypt request fields if encryption is active
     if let Some(ref ctx) = enc_ctx {

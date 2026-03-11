@@ -4464,3 +4464,107 @@ async fn test_encrypted_audio_transcription_signature_covers_transformed() {
         "Multipart signature should cover encrypted response bytes (what client receives)"
     );
 }
+
+/// End-to-end test: a legacy client sends a Salsa20-encrypted request.
+/// The server's ChaCha20-first decrypt should fall back to Salsa20 and succeed.
+/// The response (encrypted by the server with ChaCha20) should be decryptable by the client.
+#[tokio::test]
+async fn test_encrypted_chat_salsa20_fallback_e2e() {
+    use crypto_box::{
+        aead::{Aead, AeadCore, OsRng},
+        PublicKey, SalsaBox, SecretKey,
+    };
+    use vllm_proxy_rs::encryption;
+
+    let mock_server = MockServer::start().await;
+    let client_pair = test_client_signing_pair();
+
+    let backend_response = serde_json::json!({
+        "id": "chatcmpl-salsa-fallback",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "Salsa fallback works!"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 4}
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&backend_response))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    // Derive server's X25519 public key from its Ed25519 public key
+    let server_pub_hex = test_ed25519_pub_key_hex();
+    let server_ed25519_pub: [u8; 32] = hex::decode(&server_pub_hex).unwrap().try_into().unwrap();
+    let server_x25519_pub = {
+        use ed25519_dalek::VerifyingKey;
+        let vk = VerifyingKey::from_bytes(&server_ed25519_pub).unwrap();
+        vk.to_montgomery().to_bytes()
+    };
+
+    // Encrypt "Hi from legacy client" using SalsaBox (simulating an old client)
+    let recipient = PublicKey::from(server_x25519_pub);
+    let ephemeral_secret = SecretKey::generate(&mut OsRng);
+    let ephemeral_public = ephemeral_secret.public_key();
+    let salsa_box = SalsaBox::new(&recipient, &ephemeral_secret);
+    let nonce = SalsaBox::generate_nonce(&mut OsRng);
+    let ciphertext = salsa_box
+        .encrypt(&nonce, b"Hi from legacy client".as_ref())
+        .unwrap();
+
+    // Wire format: [ephemeral_pubkey(32)][nonce(24)][ciphertext+tag]
+    let mut wire = Vec::with_capacity(32 + 24 + ciphertext.len());
+    wire.extend_from_slice(ephemeral_public.as_bytes());
+    wire.extend_from_slice(&nonce);
+    wire.extend_from_slice(&ciphertext);
+    let encrypted_content = hex::encode(&wire);
+
+    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": encrypted_content}],
+        "stream": false
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header("x-signing-algo", "ed25519")
+                .header("x-client-pub-key", &client_pub_hex)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "Salsa20-encrypted request should succeed via fallback"
+    );
+
+    let body = body_to_json(response).await;
+    assert_eq!(body["id"], "chatcmpl-salsa-fallback");
+
+    // Response is encrypted with ChaCha20 — client can decrypt with its own keys
+    let encrypted_response = body["choices"][0]["message"]["content"].as_str().unwrap();
+    assert_ne!(encrypted_response, "Salsa fallback works!");
+
+    let client_pub_bytes = hex::decode(&client_pub_hex).unwrap();
+    let dec_for_response = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: client_pub_bytes,
+    };
+    let decrypted =
+        encryption::decrypt_string(encrypted_response, &dec_for_response, &client_pair).unwrap();
+    assert_eq!(decrypted, "Salsa fallback works!");
+}

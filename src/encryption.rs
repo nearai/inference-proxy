@@ -94,19 +94,19 @@ pub fn extract_encryption_context(
 mod nacl {
     use crypto_box::{
         aead::{Aead, AeadCore, OsRng},
-        PublicKey, SalsaBox, SecretKey,
+        ChaChaBox, PublicKey, SalsaBox, SecretKey,
     };
 
-    /// Encrypt bytes using NaCl box (X25519 + XSalsa20-Poly1305).
+    /// Encrypt bytes using NaCl box (X25519 + XChaCha20-Poly1305).
     /// Wire format: [ephemeral_pubkey(32)][nonce(24)][ciphertext+tag]
     pub fn encrypt(plaintext: &[u8], recipient_pub: &[u8; 32]) -> Result<Vec<u8>, String> {
         let recipient = PublicKey::from(*recipient_pub);
         let ephemeral_secret = SecretKey::generate(&mut OsRng);
         let ephemeral_public = ephemeral_secret.public_key();
 
-        let salsa_box = SalsaBox::new(&recipient, &ephemeral_secret);
-        let nonce = SalsaBox::generate_nonce(&mut OsRng);
-        let ciphertext = salsa_box
+        let chacha_box = ChaChaBox::new(&recipient, &ephemeral_secret);
+        let nonce = ChaChaBox::generate_nonce(&mut OsRng);
+        let ciphertext = chacha_box
             .encrypt(&nonce, plaintext)
             .map_err(|e| format!("NaCl encrypt failed: {e}"))?;
 
@@ -118,6 +118,8 @@ mod nacl {
     }
 
     /// Decrypt bytes using NaCl box.
+    /// Tries XChaCha20-Poly1305 first, falls back to XSalsa20-Poly1305 for
+    /// backward compatibility with older clients.
     /// Expects wire format: [ephemeral_pubkey(32)][nonce(24)][ciphertext+tag]
     pub fn decrypt(data: &[u8], secret_key_bytes: &[u8; 32]) -> Result<Vec<u8>, String> {
         if data.len() < 32 + 24 + 16 {
@@ -130,6 +132,14 @@ mod nacl {
         let ciphertext = &data[56..];
 
         let secret = SecretKey::from(*secret_key_bytes);
+
+        // Try ChaCha20 first (documented algorithm)
+        let chacha_box = ChaChaBox::new(&ephemeral_pub, &secret);
+        if let Ok(plaintext) = chacha_box.decrypt(nonce, ciphertext) {
+            return Ok(plaintext);
+        }
+
+        // Fall back to Salsa20 for backward compatibility
         let salsa_box = SalsaBox::new(&ephemeral_pub, &secret);
         salsa_box
             .decrypt(nonce, ciphertext)
@@ -808,6 +818,25 @@ mod tests {
 
         let decrypted = nacl::decrypt(&wire, &server_x25519_secret).unwrap();
         assert_eq!(decrypted, b"cross-compat test");
+    }
+
+    /// Verify that the primary ChaCha20 path works with known Ed25519 keys.
+    #[test]
+    fn test_nacl_chacha_round_trip_known_keys() {
+        let server_pair = test_signing_pair();
+        let server_x25519_secret =
+            nacl::ed25519_secret_to_x25519(server_pair.ed25519.secret_bytes());
+
+        let ed25519_pub_bytes: [u8; 32] = hex::decode(&server_pair.ed25519.signing_public_key)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let server_x25519_pub = nacl::ed25519_public_to_x25519(&ed25519_pub_bytes).unwrap();
+
+        let plaintext = b"chacha20 round-trip test";
+        let encrypted = nacl::encrypt(plaintext, &server_x25519_pub).unwrap();
+        let decrypted = nacl::decrypt(&encrypted, &server_x25519_secret).unwrap();
+        assert_eq!(decrypted, plaintext);
     }
 
     // ── ECIES round-trip tests ──────────────────────────────────────

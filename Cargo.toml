@@ -25,7 +25,7 @@ sha2 = "0.10"
 x509-parser = "0.18"
 sha3 = "0.10"
 subtle = "2.5"
-crypto_box = "0.9"
+crypto_box = { version = "0.9", features = ["chacha20"] }
 aes-gcm = "0.10"
 hkdf = "0.12"
 

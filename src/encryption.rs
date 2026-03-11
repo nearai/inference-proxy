@@ -24,6 +24,8 @@ pub struct EncryptionContext {
     pub algo: EncryptionAlgo,
     /// Raw client public key bytes.
     pub client_pub_key: Vec<u8>,
+    /// Encryption protocol version (1 = legacy NaCl box, 2 = HKDF + XChaCha20-Poly1305).
+    pub version: u8,
 }
 
 /// Extract encryption context from request headers.
@@ -81,9 +83,22 @@ pub fn extract_encryption_context(
                 }
             }
 
+            let version = headers
+                .get("x-encryption-version")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u8>().ok())
+                .unwrap_or(1);
+
+            if version != 1 && version != 2 {
+                return Err(AppError::BadRequest(format!(
+                    "Invalid X-Encryption-Version: {version}. Must be 1 or 2"
+                )));
+            }
+
             Ok(Some(EncryptionContext {
                 algo,
                 client_pub_key: key_bytes,
+                version,
             }))
         }
     }
@@ -169,6 +184,73 @@ mod nacl {
         let vk = VerifyingKey::from_bytes(ed25519_pub)
             .map_err(|e| format!("Invalid Ed25519 public key: {e}"))?;
         Ok(vk.to_montgomery().to_bytes())
+    }
+}
+
+// ── Ed25519 / v2 encryption (X25519 + HKDF-SHA256 + XChaCha20-Poly1305) ──
+
+mod nacl_v2 {
+    use chacha20poly1305::{
+        aead::{Aead, AeadCore, KeyInit, OsRng},
+        XChaCha20Poly1305,
+    };
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+    use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
+
+    /// Encrypt bytes using X25519 ECDH + HKDF-SHA256 + XChaCha20-Poly1305.
+    /// Wire format: [ephemeral_pubkey(32)][nonce(24)][ciphertext+tag]
+    pub fn encrypt(plaintext: &[u8], recipient_pub: &[u8; 32]) -> Result<Vec<u8>, String> {
+        let recipient = PublicKey::from(*recipient_pub);
+        let ephemeral_secret = EphemeralSecret::random_from_rng(OsRng);
+        let ephemeral_public = PublicKey::from(&ephemeral_secret);
+
+        let shared_secret = ephemeral_secret.diffie_hellman(&recipient);
+
+        let hkdf = Hkdf::<Sha256>::new(None, shared_secret.as_bytes());
+        let mut symmetric_key = [0u8; 32];
+        hkdf.expand(b"ed25519_encryption", &mut symmetric_key)
+            .map_err(|e| format!("HKDF expand failed: {e}"))?;
+
+        let cipher = XChaCha20Poly1305::new_from_slice(&symmetric_key)
+            .map_err(|e| format!("XChaCha20Poly1305 key init failed: {e}"))?;
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let ciphertext = cipher
+            .encrypt(&nonce, plaintext)
+            .map_err(|e| format!("XChaCha20Poly1305 encrypt failed: {e}"))?;
+
+        let mut out = Vec::with_capacity(32 + 24 + ciphertext.len());
+        out.extend_from_slice(ephemeral_public.as_bytes());
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
+    }
+
+    /// Decrypt bytes using X25519 ECDH + HKDF-SHA256 + XChaCha20-Poly1305.
+    /// Expects wire format: [ephemeral_pubkey(32)][nonce(24)][ciphertext+tag]
+    pub fn decrypt(data: &[u8], secret_key_bytes: &[u8; 32]) -> Result<Vec<u8>, String> {
+        if data.len() < 32 + 24 + 16 {
+            return Err("Ciphertext too short".to_string());
+        }
+
+        let ephemeral_pub = PublicKey::from(<[u8; 32]>::try_from(&data[..32]).unwrap());
+        #[allow(deprecated)] // generic-array 0.x from_slice deprecation; fixed when deps upgrade
+        let nonce = chacha20poly1305::XNonce::from_slice(&data[32..56]);
+        let ciphertext = &data[56..];
+
+        let secret = StaticSecret::from(*secret_key_bytes);
+        let shared_secret = secret.diffie_hellman(&ephemeral_pub);
+
+        let hkdf = Hkdf::<Sha256>::new(None, shared_secret.as_bytes());
+        let mut symmetric_key = [0u8; 32];
+        hkdf.expand(b"ed25519_encryption", &mut symmetric_key)
+            .map_err(|e| format!("HKDF expand failed: {e}"))?;
+
+        let cipher = XChaCha20Poly1305::new_from_slice(&symmetric_key)
+            .map_err(|e| format!("XChaCha20Poly1305 key init failed: {e}"))?;
+        cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|e| format!("Decrypt failed: {e}"))
     }
 }
 
@@ -283,7 +365,12 @@ pub fn encrypt_string(
                 })?;
             let client_x25519 =
                 nacl::ed25519_public_to_x25519(&client_ed25519).map_err(AppError::BadRequest)?;
-            nacl::encrypt(plaintext.as_bytes(), &client_x25519)
+            let encrypt_fn = if ctx.version >= 2 {
+                nacl_v2::encrypt
+            } else {
+                nacl::encrypt
+            };
+            encrypt_fn(plaintext.as_bytes(), &client_x25519)
                 .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?
         }
         EncryptionAlgo::Ecdsa => {
@@ -314,7 +401,12 @@ pub fn decrypt_string(
     let plaintext_bytes = match ctx.algo {
         EncryptionAlgo::Ed25519 => {
             let x25519_secret = nacl::ed25519_secret_to_x25519(signing.ed25519.secret_bytes());
-            nacl::decrypt(&data, &x25519_secret)
+            let decrypt_fn = if ctx.version >= 2 {
+                nacl_v2::decrypt
+            } else {
+                nacl::decrypt
+            };
+            decrypt_fn(&data, &x25519_secret)
                 .map_err(|_| AppError::BadRequest("Decryption failed".to_string()))?
         }
         EncryptionAlgo::Ecdsa => ecies::decrypt(&data, signing.ecdsa.secret_key())
@@ -839,6 +931,83 @@ mod tests {
         assert_eq!(decrypted, plaintext);
     }
 
+    // ── NaCl v2 (HKDF + XChaCha20-Poly1305) tests ────────────────────
+
+    #[test]
+    fn test_nacl_v2_round_trip() {
+        let server_pair = test_signing_pair();
+        let server_x25519_secret =
+            nacl::ed25519_secret_to_x25519(server_pair.ed25519.secret_bytes());
+        let server_x25519_pub = {
+            let sk = x25519_dalek::StaticSecret::from(server_x25519_secret);
+            *x25519_dalek::PublicKey::from(&sk).as_bytes()
+        };
+
+        let plaintext = b"Hello from v2!";
+        let encrypted = nacl_v2::encrypt(plaintext, &server_x25519_pub).unwrap();
+        let decrypted = nacl_v2::decrypt(&encrypted, &server_x25519_secret).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_nacl_v2_empty_plaintext() {
+        let server_pair = test_signing_pair();
+        let server_x25519_secret =
+            nacl::ed25519_secret_to_x25519(server_pair.ed25519.secret_bytes());
+        let server_x25519_pub = {
+            let sk = x25519_dalek::StaticSecret::from(server_x25519_secret);
+            *x25519_dalek::PublicKey::from(&sk).as_bytes()
+        };
+
+        let encrypted = nacl_v2::encrypt(b"", &server_x25519_pub).unwrap();
+        let decrypted = nacl_v2::decrypt(&encrypted, &server_x25519_secret).unwrap();
+        assert!(decrypted.is_empty());
+    }
+
+    #[test]
+    fn test_nacl_v2_tampered_ciphertext() {
+        let server_pair = test_signing_pair();
+        let server_x25519_secret =
+            nacl::ed25519_secret_to_x25519(server_pair.ed25519.secret_bytes());
+        let server_x25519_pub = {
+            let sk = x25519_dalek::StaticSecret::from(server_x25519_secret);
+            *x25519_dalek::PublicKey::from(&sk).as_bytes()
+        };
+
+        let mut encrypted = nacl_v2::encrypt(b"secret", &server_x25519_pub).unwrap();
+        let last = encrypted.len() - 1;
+        encrypted[last] ^= 0xff;
+        assert!(nacl_v2::decrypt(&encrypted, &server_x25519_secret).is_err());
+    }
+
+    #[test]
+    fn test_nacl_v2_too_short() {
+        let server_pair = test_signing_pair();
+        let server_x25519_secret =
+            nacl::ed25519_secret_to_x25519(server_pair.ed25519.secret_bytes());
+        assert!(nacl_v2::decrypt(&[0u8; 10], &server_x25519_secret).is_err());
+    }
+
+    /// Verify that v1 (NaCl box) and v2 (HKDF) ciphertexts are NOT cross-compatible.
+    #[test]
+    fn test_nacl_v1_v2_not_cross_compatible() {
+        let server_pair = test_signing_pair();
+        let server_x25519_secret =
+            nacl::ed25519_secret_to_x25519(server_pair.ed25519.secret_bytes());
+        let server_x25519_pub = {
+            let sk = x25519_dalek::StaticSecret::from(server_x25519_secret);
+            *x25519_dalek::PublicKey::from(&sk).as_bytes()
+        };
+
+        // v1 ciphertext cannot be decrypted by v2
+        let v1_encrypted = nacl::encrypt(b"v1 message", &server_x25519_pub).unwrap();
+        assert!(nacl_v2::decrypt(&v1_encrypted, &server_x25519_secret).is_err());
+
+        // v2 ciphertext cannot be decrypted by v1
+        let v2_encrypted = nacl_v2::encrypt(b"v2 message", &server_x25519_pub).unwrap();
+        assert!(nacl::decrypt(&v2_encrypted, &server_x25519_secret).is_err());
+    }
+
     // ── ECIES round-trip tests ──────────────────────────────────────
 
     #[test]
@@ -926,6 +1095,7 @@ mod tests {
         let ctx = EncryptionContext {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_ed25519_pub,
+            version: 1,
         };
 
         let plaintext = "Hello from client!";
@@ -950,6 +1120,7 @@ mod tests {
         let ctx = EncryptionContext {
             algo: EncryptionAlgo::Ecdsa,
             client_pub_key: client_pub,
+            version: 1,
         };
 
         let plaintext = "Hello from client!";
@@ -967,6 +1138,7 @@ mod tests {
         let ctx = EncryptionContext {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
+            version: 1,
         };
 
         let encrypted = encrypt_string("", &ctx, &server_pair).unwrap();
@@ -983,6 +1155,7 @@ mod tests {
         let ctx = EncryptionContext {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
+            version: 1,
         };
 
         let plaintext = "こんにちは世界 🌍 Привет мир";
@@ -1000,6 +1173,7 @@ mod tests {
         let ctx = EncryptionContext {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
+            version: 1,
         };
 
         // Encrypt "Hello" to simulate client-encrypted message
@@ -1026,6 +1200,7 @@ mod tests {
         let ctx = EncryptionContext {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
+            version: 1,
         };
 
         // Client encrypts a JSON-serialized content array
@@ -1064,6 +1239,7 @@ mod tests {
         let ctx = EncryptionContext {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
+            version: 1,
         };
 
         let mut response = serde_json::json!({
@@ -1099,6 +1275,7 @@ mod tests {
         let ctx = EncryptionContext {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
+            version: 1,
         };
 
         let mut chunk = serde_json::json!({
@@ -1129,6 +1306,7 @@ mod tests {
         let ctx = EncryptionContext {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
+            version: 1,
         };
 
         let mut response = serde_json::json!({
@@ -1151,6 +1329,7 @@ mod tests {
         let ctx = EncryptionContext {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
+            version: 1,
         };
 
         let mut response = serde_json::json!({
@@ -1179,6 +1358,7 @@ mod tests {
         let ctx = EncryptionContext {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
+            version: 1,
         };
 
         let mut response = serde_json::json!({
@@ -1205,6 +1385,7 @@ mod tests {
         let ctx = EncryptionContext {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
+            version: 1,
         };
 
         let mut response = serde_json::json!({
@@ -1227,6 +1408,7 @@ mod tests {
         let ctx = EncryptionContext {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
+            version: 1,
         };
 
         let mut response = serde_json::json!({
@@ -1311,6 +1493,7 @@ mod tests {
         let ctx = EncryptionContext {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
+            version: 1,
         };
 
         let mut chunk = serde_json::json!({
@@ -1341,6 +1524,7 @@ mod tests {
         let ctx = EncryptionContext {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
+            version: 1,
         };
 
         // Client encrypts the input string directly (matching Python proxy's decrypt_prompt)
@@ -1363,6 +1547,7 @@ mod tests {
         let ctx = EncryptionContext {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
+            version: 1,
         };
 
         // Client encrypts each string element individually (matching Python proxy)
@@ -1387,6 +1572,7 @@ mod tests {
         let ctx = EncryptionContext {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
+            version: 1,
         };
 
         let mut request = serde_json::json!({
@@ -1409,6 +1595,7 @@ mod tests {
         let ctx = EncryptionContext {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
+            version: 1,
         };
 
         // Tampered ciphertext — should fail with generic message
@@ -1438,6 +1625,7 @@ mod tests {
         let ctx = EncryptionContext {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
+            version: 1,
         };
 
         let encrypted = encrypt_string("hello", &ctx, &server_pair).unwrap();
@@ -1458,6 +1646,7 @@ mod tests {
         let ctx = EncryptionContext {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
+            version: 1,
         };
 
         let enc1 = encrypt_string("hello", &ctx, &server_pair).unwrap();
@@ -1480,6 +1669,7 @@ mod tests {
         let ctx = EncryptionContext {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
+            version: 1,
         };
 
         // Array with mixed types: encrypted strings and token ID arrays (not encrypted)

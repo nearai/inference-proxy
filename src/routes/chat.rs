@@ -29,10 +29,10 @@ pub async fn chat_completions(
     // Extract encryption context from headers
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
 
-    // Always hash the original client-sent body for signatures.
-    // The body gets re-serialized after parsing (which reorders keys), so we must
-    // hash the original bytes to let clients verify the exact request they sent.
-    let original_request_hash = Some(hex::encode(sha2::Sha256::digest(&request_body)));
+    // Request hash for signing: SHA256(wire body) by default. If X-Request-Hash is a
+    // valid 64-hex string different from the wire body hash, use the header (cloud-api
+    // and others may re-serialize JSON; header carries the client's original hash).
+    let original_request_hash = Some(resolve_request_hash_for_signing(&headers, &request_body));
 
     // Decrypt request fields if encryption is active
     if let Some(ref ctx) = enc_ctx {
@@ -113,6 +113,29 @@ pub async fn chat_completions(
         )
         .await
     }
+}
+
+/// Resolve SHA-256 hex digest to use as request_sha256 in signed text.
+///
+/// Default: hash of the wire body. If `X-Request-Hash` is present, is 64 hex chars,
+/// and differs from the wire body hash, returns the header value so gateways that
+/// re-serialize the body (plaintext or ciphertext envelope) can still bind signatures
+/// to the client's original byte sequence. When header equals body hash or is invalid,
+/// the wire body hash is used so direct clients sending a garbage header are unaffected.
+pub fn resolve_request_hash_for_signing(headers: &HeaderMap, body_bytes: &[u8]) -> String {
+    let body_hash = hex::encode(sha2::Sha256::digest(body_bytes));
+    for name in ["x-request-hash", "X-Request-Hash"] {
+        if let Some(hv) = headers.get(name) {
+            if let Ok(s) = hv.to_str() {
+                let s = s.trim().to_lowercase();
+                if s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()) && s != body_hash {
+                    return s;
+                }
+            }
+            break;
+        }
+    }
+    body_hash
 }
 
 /// Strip empty tool_calls arrays from messages (vLLM bug workaround).

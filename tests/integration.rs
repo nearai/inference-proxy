@@ -752,7 +752,7 @@ async fn test_signature_binds_actual_request_body() {
 }
 
 #[tokio::test]
-async fn test_x_request_hash_header_is_ignored() {
+async fn test_x_request_hash_invalid_or_same_as_body_uses_body_hash() {
     use sha2::{Digest, Sha256};
 
     let mock_server = MockServer::start().await;
@@ -760,7 +760,7 @@ async fn test_x_request_hash_header_is_ignored() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-ignore-hash",
+            "id": "chatcmpl-body-hash-only",
             "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
         })))
         .mount(&mock_server)
@@ -770,9 +770,9 @@ async fn test_x_request_hash_header_is_ignored() {
 
     let request_body = serde_json::json!({"messages": []});
     let request_bytes = serde_json::to_vec(&request_body).unwrap();
-    let expected_hash = hex::encode(Sha256::digest(&request_bytes));
+    let body_hash = hex::encode(Sha256::digest(&request_bytes));
 
-    // Even with X-Request-Hash header, the actual body hash should be used
+    // Invalid header (not 64 hex) -> signed text uses wire body hash
     let response = app
         .clone()
         .oneshot(
@@ -781,8 +781,11 @@ async fn test_x_request_hash_header_is_ignored() {
                 .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
                 .header(auth_header().0, auth_header().1)
-                .header("x-request-hash", "a".repeat(64))
-                .body(Body::from(request_bytes))
+                .header(
+                    "x-request-hash",
+                    "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+                )
+                .body(Body::from(request_bytes.clone()))
                 .unwrap(),
         )
         .await
@@ -793,7 +796,7 @@ async fn test_x_request_hash_header_is_ignored() {
     let sig_response = app
         .oneshot(
             Request::builder()
-                .uri("/v1/signature/chatcmpl-ignore-hash?signing_algo=ecdsa")
+                .uri("/v1/signature/chatcmpl-body-hash-only?signing_algo=ecdsa")
                 .header(auth_header().0, auth_header().1)
                 .body(Body::empty())
                 .unwrap(),
@@ -806,8 +809,79 @@ async fn test_x_request_hash_header_is_ignored() {
         body["text"]
             .as_str()
             .unwrap()
-            .starts_with(&format!("test-model:{expected_hash}:")),
-        "Signed text must use actual body hash, not X-Request-Hash header"
+            .starts_with(&format!("test-model:{body_hash}:")),
+        "Invalid X-Request-Hash must fall back to wire body hash"
+    );
+}
+
+#[tokio::test]
+async fn test_x_request_hash_honored_when_differs_from_wire_body() {
+    use sha2::{Digest, Sha256};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-header-hash",
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    // Wire body at proxy (e.g. gateway re-serialized JSON)
+    let wire_body = serde_json::json!({"messages": [], "stream": false});
+    let wire_bytes = serde_json::to_vec(&wire_body).unwrap();
+    let _wire_hash = hex::encode(Sha256::digest(&wire_bytes));
+
+    // Header carries original client body hash (64 hex) — cloud-api pattern
+    let original_client_body = serde_json::json!({"messages": []});
+    let original_bytes = serde_json::to_vec(&original_client_body).unwrap();
+    let header_hash = hex::encode(Sha256::digest(&original_bytes));
+
+    assert_ne!(
+        hex::encode(Sha256::digest(&wire_bytes)),
+        header_hash,
+        "test setup: wire body hash must differ from header hash"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header("x-request-hash", &header_hash)
+                .body(Body::from(wire_bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let sig_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/signature/chatcmpl-header-hash?signing_algo=ecdsa")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let body = body_to_json(sig_response).await;
+    assert!(
+        body["text"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("test-model:{header_hash}:")),
+        "When X-Request-Hash differs from wire body hash, signed text must use header hash"
     );
 }
 

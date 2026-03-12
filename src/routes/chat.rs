@@ -124,15 +124,19 @@ pub async fn chat_completions(
 /// the wire body hash is used so direct clients sending a garbage header are unaffected.
 pub fn resolve_request_hash_for_signing(headers: &HeaderMap, body_bytes: &[u8]) -> String {
     let body_hash = hex::encode(sha2::Sha256::digest(body_bytes));
-    for name in ["x-request-hash", "X-Request-Hash"] {
-        if let Some(hv) = headers.get(name) {
-            if let Ok(s) = hv.to_str() {
-                let s = s.trim().to_lowercase();
-                if s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()) && s != body_hash {
-                    return s;
+    // HeaderMap::get is case-insensitive; no need to try multiple spellings.
+    if let Some(hv) = headers.get("x-request-hash") {
+        if let Ok(s) = hv.to_str() {
+            let s = s.trim();
+            // hex::decode validates digits and rejects odd length; 32 bytes == SHA-256.
+            if let Ok(bytes) = hex::decode(s) {
+                if bytes.len() == 32 {
+                    let header_hash = hex::encode(&bytes);
+                    if header_hash != body_hash {
+                        return header_hash;
+                    }
                 }
             }
-            break;
         }
     }
     body_hash

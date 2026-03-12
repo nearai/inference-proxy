@@ -25,7 +25,11 @@ pub async fn completions(
     // Extract encryption context from headers
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
 
-    let original_request_hash = Some(resolve_request_hash_for_signing(&headers, &request_body));
+    let original_request_hash = Some(resolve_request_hash_for_signing(
+        &headers,
+        &request_body,
+        auth.cloud_api_key.is_none(),
+    ));
 
     // Decrypt request fields if encryption is active
     if let Some(ref ctx) = enc_ctx {

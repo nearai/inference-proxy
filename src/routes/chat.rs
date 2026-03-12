@@ -29,10 +29,15 @@ pub async fn chat_completions(
     // Extract encryption context from headers
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
 
-    // Request hash for signing: SHA256(wire body) by default. If X-Request-Hash is a
-    // valid 64-hex string different from the wire body hash, use the header (cloud-api
-    // and others may re-serialize JSON; header carries the client's original hash).
-    let original_request_hash = Some(resolve_request_hash_for_signing(&headers, &request_body));
+    // Request hash for signing: SHA256(wire body) by default. X-Request-Hash is only
+    // honored when authenticated with config.token (trusted gateway); sk- clients
+    // always bind signatures to the wire body so they cannot forge a hash for a
+    // different payload.
+    let original_request_hash = Some(resolve_request_hash_for_signing(
+        &headers,
+        &request_body,
+        auth.cloud_api_key.is_none(),
+    ));
 
     // Decrypt request fields if encryption is active
     if let Some(ref ctx) = enc_ctx {
@@ -117,13 +122,21 @@ pub async fn chat_completions(
 
 /// Resolve SHA-256 hex digest to use as request_sha256 in signed text.
 ///
-/// Default: hash of the wire body. If `X-Request-Hash` is present, is 64 hex chars,
-/// and differs from the wire body hash, returns the header value so gateways that
-/// re-serialize the body (plaintext or ciphertext envelope) can still bind signatures
-/// to the client's original byte sequence. When header equals body hash or is invalid,
-/// the wire body hash is used so direct clients sending a garbage header are unaffected.
-pub fn resolve_request_hash_for_signing(headers: &HeaderMap, body_bytes: &[u8]) -> String {
+/// Default: hash of the wire body. When `allow_x_request_hash_override` is true
+/// (caller authenticated with `config.token`, not `sk-`), if `X-Request-Hash` is
+/// present, decodes to 32 bytes, and differs from the wire body hash, returns the
+/// header value so trusted gateways that re-serialize JSON can bind signatures to
+/// the original client body hash. When false, the header is ignored so end-user
+/// API keys cannot bind signatures to an arbitrary hash.
+pub fn resolve_request_hash_for_signing(
+    headers: &HeaderMap,
+    body_bytes: &[u8],
+    allow_x_request_hash_override: bool,
+) -> String {
     let body_hash = hex::encode(sha2::Sha256::digest(body_bytes));
+    if !allow_x_request_hash_override {
+        return body_hash;
+    }
     // HeaderMap::get is case-insensitive; no need to try multiple spellings.
     if let Some(hv) = headers.get("x-request-hash") {
         if let Ok(s) = hv.to_str() {

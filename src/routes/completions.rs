@@ -3,7 +3,6 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::Response;
 
-
 use crate::auth::RequireAuth;
 use crate::encryption::{self, Endpoint};
 use crate::error::AppError;

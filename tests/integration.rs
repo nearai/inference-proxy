@@ -3569,11 +3569,13 @@ async fn test_encrypted_chat_non_streaming_ed25519() {
     let enc_for_request = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
+        version: 1,
     };
 
     let dec_for_response = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: client_pub_bytes,
+        version: 1,
     };
 
     // Encrypt the message content (client encrypts with server's pub key)
@@ -3619,6 +3621,7 @@ async fn test_encrypted_chat_non_streaming_ed25519() {
     let wrong_ctx = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: hex::decode(&server_pub_hex).unwrap(),
+        version: 1,
     };
     assert!(
         encryption::decrypt_string(encrypted_response, &wrong_ctx, &server_pair).is_err(),
@@ -3655,10 +3658,12 @@ async fn test_encrypted_chat_streaming_ed25519() {
     let enc_for_request = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
+        version: 1,
     };
     let dec_for_response = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: client_pub_bytes,
+        version: 1,
     };
 
     let encrypted_msg = encryption::encrypt_string("Hi", &enc_for_request, &client_pair).unwrap();
@@ -3863,10 +3868,12 @@ async fn test_encrypted_completions_ed25519() {
     let enc_for_request = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
+        version: 1,
     };
     let dec_for_response = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: client_pub_bytes,
+        version: 1,
     };
 
     let encrypted_prompt =
@@ -3935,12 +3942,14 @@ async fn test_encrypted_signature_covers_plaintext() {
     let enc_for_request = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
+        version: 1,
     };
 
     // Context for decrypting response (uses client's pub key, matching what the server sees)
     let dec_for_response = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: client_pub_bytes,
+        version: 1,
     };
 
     let encrypted_msg = encryption::encrypt_string("Hi", &enc_for_request, &client_pair).unwrap();
@@ -4054,6 +4063,7 @@ async fn test_encrypted_streaming_signature_covers_transformed_bytes() {
     let enc_for_request = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
+        version: 1,
     };
 
     let encrypted_msg =
@@ -4156,10 +4166,12 @@ async fn test_encrypted_chat_non_streaming_ecdsa() {
     let enc_for_request = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ecdsa,
         client_pub_key: server_ecdsa_pub,
+        version: 1,
     };
     let dec_for_response = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ecdsa,
         client_pub_key: client_ecdsa_pub,
+        version: 1,
     };
 
     let encrypted_content =
@@ -4227,6 +4239,7 @@ async fn test_encrypted_embeddings_ed25519() {
     let enc_for_request = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
+        version: 1,
     };
 
     // Each string element is individually encrypted (matching Python proxy)
@@ -4264,6 +4277,7 @@ async fn test_encrypted_embeddings_ed25519() {
     let dec_ctx = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: hex::decode(&client_pub_hex).unwrap(),
+        version: 1,
     };
     let decrypted =
         encryption::decrypt_string(encrypted_embedding, &dec_ctx, &client_pair).unwrap();
@@ -4300,10 +4314,12 @@ async fn test_encrypted_images_generations_ed25519() {
     let enc_for_request = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
+        version: 1,
     };
     let dec_for_response = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: client_pub_bytes,
+        version: 1,
     };
 
     let encrypted_prompt =
@@ -4372,10 +4388,12 @@ async fn test_encrypted_streaming_completions_ed25519() {
     let enc_for_request = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
+        version: 1,
     };
     let dec_for_response = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: client_pub_bytes,
+        version: 1,
     };
 
     let encrypted_prompt =
@@ -4454,10 +4472,12 @@ async fn test_encrypted_audio_transcription_signature_covers_transformed() {
     let enc_for_request = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
+        version: 1,
     };
     let dec_for_response = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: client_pub_bytes,
+        version: 1,
     };
 
     // Encrypt the prompt field
@@ -4536,5 +4556,203 @@ async fn test_encrypted_audio_transcription_signature_covers_transformed() {
     assert_eq!(
         parts[2], response_sha256,
         "Multipart signature should cover encrypted response bytes (what client receives)"
+    );
+}
+
+/// End-to-end test: a legacy client sends a Salsa20-encrypted request.
+/// The server's ChaCha20-first decrypt should fall back to Salsa20 and succeed.
+/// The response (encrypted by the server with ChaCha20) should be decryptable by the client.
+#[tokio::test]
+async fn test_encrypted_chat_salsa20_fallback_e2e() {
+    use crypto_box::{
+        aead::{Aead, AeadCore, OsRng},
+        PublicKey, SalsaBox, SecretKey,
+    };
+    use vllm_proxy_rs::encryption;
+
+    let mock_server = MockServer::start().await;
+    let client_pair = test_client_signing_pair();
+
+    let backend_response = serde_json::json!({
+        "id": "chatcmpl-salsa-fallback",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "Salsa fallback works!"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 4}
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&backend_response))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    // Derive server's X25519 public key from its Ed25519 public key
+    let server_pub_hex = test_ed25519_pub_key_hex();
+    let server_ed25519_pub: [u8; 32] = hex::decode(&server_pub_hex).unwrap().try_into().unwrap();
+    let server_x25519_pub = {
+        use ed25519_dalek::VerifyingKey;
+        let vk = VerifyingKey::from_bytes(&server_ed25519_pub).unwrap();
+        vk.to_montgomery().to_bytes()
+    };
+
+    // Encrypt "Hi from legacy client" using SalsaBox (simulating an old client)
+    let recipient = PublicKey::from(server_x25519_pub);
+    let ephemeral_secret = SecretKey::generate(&mut OsRng);
+    let ephemeral_public = ephemeral_secret.public_key();
+    let salsa_box = SalsaBox::new(&recipient, &ephemeral_secret);
+    let nonce = SalsaBox::generate_nonce(&mut OsRng);
+    let ciphertext = salsa_box
+        .encrypt(&nonce, b"Hi from legacy client".as_ref())
+        .unwrap();
+
+    // Wire format: [ephemeral_pubkey(32)][nonce(24)][ciphertext+tag]
+    let mut wire = Vec::with_capacity(32 + 24 + ciphertext.len());
+    wire.extend_from_slice(ephemeral_public.as_bytes());
+    wire.extend_from_slice(&nonce);
+    wire.extend_from_slice(&ciphertext);
+    let encrypted_content = hex::encode(&wire);
+
+    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": encrypted_content}],
+        "stream": false
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header("x-signing-algo", "ed25519")
+                .header("x-client-pub-key", &client_pub_hex)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "Salsa20-encrypted request should succeed via fallback"
+    );
+
+    let body = body_to_json(response).await;
+    assert_eq!(body["id"], "chatcmpl-salsa-fallback");
+
+    // Response is encrypted with ChaCha20 — client can decrypt with its own keys
+    let encrypted_response = body["choices"][0]["message"]["content"].as_str().unwrap();
+    assert_ne!(encrypted_response, "Salsa fallback works!");
+
+    let client_pub_bytes = hex::decode(&client_pub_hex).unwrap();
+    let dec_for_response = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: client_pub_bytes,
+        version: 1,
+    };
+    let decrypted =
+        encryption::decrypt_string(encrypted_response, &dec_for_response, &client_pair).unwrap();
+    assert_eq!(decrypted, "Salsa fallback works!");
+}
+
+/// End-to-end test: v2 encryption (X25519 + HKDF + XChaCha20-Poly1305).
+/// Client sends X-Encryption-Version: 2 header, server uses the v2 encrypt/decrypt path.
+#[tokio::test]
+async fn test_encrypted_chat_non_streaming_ed25519_v2() {
+    use vllm_proxy_rs::encryption;
+
+    let mock_server = MockServer::start().await;
+    let client_pair = test_client_signing_pair();
+
+    let backend_response = serde_json::json!({
+        "id": "chatcmpl-v2",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "Hello from v2!"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 4}
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&backend_response))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let server_pub_hex = test_ed25519_pub_key_hex();
+    let server_pub_bytes = hex::decode(&server_pub_hex).unwrap();
+    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
+    let client_pub_bytes = hex::decode(&client_pub_hex).unwrap();
+
+    // Encrypt with v2 (HKDF + XChaCha20-Poly1305)
+    let enc_for_request = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: server_pub_bytes,
+        version: 2,
+    };
+
+    let encrypted_content =
+        encryption::encrypt_string("Hi v2", &enc_for_request, &client_pair).unwrap();
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": encrypted_content}],
+        "stream": false
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header("x-signing-algo", "ed25519")
+                .header("x-client-pub-key", &client_pub_hex)
+                .header("x-encryption-version", "2")
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response).await;
+    assert_eq!(body["id"], "chatcmpl-v2");
+
+    // Response is encrypted with v2 — client can decrypt
+    let encrypted_response = body["choices"][0]["message"]["content"].as_str().unwrap();
+    assert_ne!(encrypted_response, "Hello from v2!");
+
+    let dec_for_response = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: client_pub_bytes.clone(),
+        version: 2,
+    };
+    let decrypted =
+        encryption::decrypt_string(encrypted_response, &dec_for_response, &client_pair).unwrap();
+    assert_eq!(decrypted, "Hello from v2!");
+
+    // v1 decrypt should NOT work on v2 ciphertext
+    let v1_ctx = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: client_pub_bytes,
+        version: 1,
+    };
+    assert!(
+        encryption::decrypt_string(encrypted_response, &v1_ctx, &client_pair).is_err(),
+        "v1 decrypt must not work on v2 ciphertext"
     );
 }

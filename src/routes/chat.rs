@@ -29,10 +29,15 @@ pub async fn chat_completions(
     // Extract encryption context from headers
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
 
-    // Always hash the original client-sent body for signatures.
-    // The body gets re-serialized after parsing (which reorders keys), so we must
-    // hash the original bytes to let clients verify the exact request they sent.
-    let original_request_hash = Some(hex::encode(sha2::Sha256::digest(&request_body)));
+    // Request hash for signing: SHA256(wire body) by default. X-Request-Hash is only
+    // honored when authenticated with config.token (trusted gateway); sk- clients
+    // always bind signatures to the wire body so they cannot forge a hash for a
+    // different payload.
+    let original_request_hash = Some(resolve_request_hash_for_signing(
+        &headers,
+        &request_body,
+        auth.cloud_api_key.is_none(),
+    ));
 
     // Decrypt request fields if encryption is active
     if let Some(ref ctx) = enc_ctx {
@@ -113,6 +118,41 @@ pub async fn chat_completions(
         )
         .await
     }
+}
+
+/// Resolve SHA-256 hex digest to use as request_sha256 in signed text.
+///
+/// Default: hash of the wire body. When `allow_x_request_hash_override` is true
+/// (caller authenticated with `config.token`, not `sk-`), if `X-Request-Hash` is
+/// present, decodes to 32 bytes, and differs from the wire body hash, returns the
+/// header value so trusted gateways that re-serialize JSON can bind signatures to
+/// the original client body hash. When false, the header is ignored so end-user
+/// API keys cannot bind signatures to an arbitrary hash.
+pub fn resolve_request_hash_for_signing(
+    headers: &HeaderMap,
+    body_bytes: &[u8],
+    allow_x_request_hash_override: bool,
+) -> String {
+    let body_hash = hex::encode(sha2::Sha256::digest(body_bytes));
+    if !allow_x_request_hash_override {
+        return body_hash;
+    }
+    // HeaderMap::get is case-insensitive; no need to try multiple spellings.
+    if let Some(hv) = headers.get("x-request-hash") {
+        if let Ok(s) = hv.to_str() {
+            let s = s.trim();
+            // hex::decode validates digits and rejects odd length; 32 bytes == SHA-256.
+            if let Ok(bytes) = hex::decode(s) {
+                if bytes.len() == 32 {
+                    let header_hash = hex::encode(&bytes);
+                    if header_hash != body_hash {
+                        return header_hash;
+                    }
+                }
+            }
+        }
+    }
+    body_hash
 }
 
 /// Strip empty tool_calls arrays from messages (vLLM bug workaround).

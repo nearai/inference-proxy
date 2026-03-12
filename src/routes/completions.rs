@@ -3,13 +3,11 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::Response;
 
-use sha2::Digest;
-
 use crate::auth::RequireAuth;
 use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
 use crate::proxy::{self, make_usage_reporter, ProxyOpts, UsageType};
-use crate::routes::chat::read_body_with_limit;
+use crate::routes::chat::{read_body_with_limit, resolve_request_hash_for_signing};
 use crate::AppState;
 
 /// POST /v1/completions
@@ -27,10 +25,11 @@ pub async fn completions(
     // Extract encryption context from headers
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
 
-    // Always hash the original client-sent body for signatures.
-    // The body gets re-serialized after parsing (which reorders keys), so we must
-    // hash the original bytes to let clients verify the exact request they sent.
-    let original_request_hash = Some(hex::encode(sha2::Sha256::digest(&request_body)));
+    let original_request_hash = Some(resolve_request_hash_for_signing(
+        &headers,
+        &request_body,
+        auth.cloud_api_key.is_none(),
+    ));
 
     // Decrypt request fields if encryption is active
     if let Some(ref ctx) = enc_ctx {

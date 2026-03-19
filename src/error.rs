@@ -3,6 +3,8 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use tracing::error;
 
+use crate::proxy::parse_upstream_error;
+
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("upstream error")]
@@ -41,13 +43,27 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, message, error_type) = match &self {
             AppError::Upstream { status, body } => {
-                // Forward upstream errors directly
+                // Parse and sanitize upstream errors to prevent leaking user data
+                // (validation errors from SGLang/vLLM include conversation content
+                // in 'input' fields)
                 metrics::counter!("http_errors_total", "error_type" => "upstream").increment(1);
-                return Response::builder()
-                    .status(*status)
-                    .header("content-type", "application/json")
-                    .body(axum::body::Body::from(body.clone()))
-                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                let (message, error_type) = match parse_upstream_error(body) {
+                    Some(info) => (info.message, info.error_type),
+                    None => {
+                        // Unparseable body — return generic message, never forward raw
+                        let msg = format!("Upstream request failed with status {status}");
+                        (msg, "upstream_error".to_string())
+                    }
+                };
+                let sanitized_body = serde_json::json!({
+                    "error": {
+                        "message": message,
+                        "type": error_type,
+                        "param": null,
+                        "code": null,
+                    }
+                });
+                return (*status, axum::Json(sanitized_body)).into_response();
             }
             AppError::UpstreamParsed {
                 status,
@@ -277,5 +293,56 @@ mod tests {
         assert!(error_obj.get("type").is_some());
         assert!(error_obj.get("param").is_some());
         assert!(error_obj.get("code").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_upstream_error_redacts_validation_input() {
+        let upstream_body = serde_json::json!({
+            "object": "error",
+            "message": "1 validation errors:\n  {'type': 'value_error', 'msg': 'bad', 'input': 'secret user conversation'}"
+        });
+        let body_bytes = serde_json::to_vec(&upstream_body).unwrap();
+
+        let err = AppError::Upstream {
+            status: StatusCode::BAD_REQUEST,
+            body: Bytes::from(body_bytes),
+        };
+        let response = err.into_response();
+        let (status, json) = response_to_json(response).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("secret user conversation"));
+        assert!(json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("value_error: bad"));
+        // Now produces OpenAI-compatible format
+        assert!(json["error"]["type"].is_string());
+        assert!(json["error"]["param"].is_null());
+        assert!(json["error"]["code"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_upstream_error_unparseable_body() {
+        let err = AppError::Upstream {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: Bytes::from("not json at all"),
+        };
+        let response = err.into_response();
+        let (status, json) = response_to_json(response).await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        // Should return generic message, not the raw body
+        assert!(json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Upstream request failed"));
+        assert!(!json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not json at all"));
     }
 }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use sha2::{Digest, Sha256};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{OnceCell, RwLock, Semaphore};
 use tracing::{error, info, warn};
 
 use crate::types::AttestationReport;
@@ -35,6 +35,8 @@ pub struct AttestationCache {
     gpu_semaphore: Semaphore,
     /// Cache TTL in seconds.
     ttl_secs: u64,
+    /// Cached dstack info (static for the lifetime of the process).
+    dstack_info: OnceCell<serde_json::Value>,
 }
 
 impl AttestationCache {
@@ -43,7 +45,20 @@ impl AttestationCache {
             reports: RwLock::new(HashMap::new()),
             gpu_semaphore: Semaphore::new(1),
             ttl_secs,
+            dstack_info: OnceCell::new(),
         }
+    }
+
+    /// Get cached dstack info, fetching it once on first call.
+    async fn get_dstack_info(&self) -> anyhow::Result<serde_json::Value> {
+        self.dstack_info
+            .get_or_try_init(|| async {
+                let client = dstack_sdk::dstack_client::DstackClient::new(None);
+                let info = client.info().await?;
+                serde_json::to_value(&info).map_err(anyhow::Error::from)
+            })
+            .await
+            .cloned()
     }
 
     /// Get a cached report if it exists and is fresh.
@@ -128,16 +143,19 @@ pub fn spawn_cache_refresh_task(
 
                 // Refresh without TLS fingerprint (most common).
                 let _permit = cache.acquire_gpu_permit().await;
-                match generate_attestation_inner(AttestationParams {
-                    model_name: &model_name,
-                    signing_address: &signing_address,
-                    signing_algo: algo,
-                    signing_public_key: &signing_public_key,
-                    signing_address_bytes: &signing_address_bytes,
-                    nonce: None,
-                    gpu_no_hw_mode,
-                    tls_cert_fingerprint: None,
-                })
+                match generate_attestation_inner(
+                    AttestationParams {
+                        model_name: &model_name,
+                        signing_address: &signing_address,
+                        signing_algo: algo,
+                        signing_public_key: &signing_public_key,
+                        signing_address_bytes: &signing_address_bytes,
+                        nonce: None,
+                        gpu_no_hw_mode,
+                        tls_cert_fingerprint: None,
+                    },
+                    Some(&cache),
+                )
                 .await
                 {
                     Ok(report) => {
@@ -153,16 +171,19 @@ pub fn spawn_cache_refresh_task(
                 // Also refresh with TLS fingerprint if configured.
                 if let Some(ref fp) = tls_cert_fingerprint {
                     let _permit = cache.acquire_gpu_permit().await;
-                    match generate_attestation_inner(AttestationParams {
-                        model_name: &model_name,
-                        signing_address: &signing_address,
-                        signing_algo: algo,
-                        signing_public_key: &signing_public_key,
-                        signing_address_bytes: &signing_address_bytes,
-                        nonce: None,
-                        gpu_no_hw_mode,
-                        tls_cert_fingerprint: Some(fp.as_str()),
-                    })
+                    match generate_attestation_inner(
+                        AttestationParams {
+                            model_name: &model_name,
+                            signing_address: &signing_address,
+                            signing_algo: algo,
+                            signing_public_key: &signing_public_key,
+                            signing_address_bytes: &signing_address_bytes,
+                            nonce: None,
+                            gpu_no_hw_mode,
+                            tls_cert_fingerprint: Some(fp.as_str()),
+                        },
+                        Some(&cache),
+                    )
                     .await
                     {
                         Ok(report) => {
@@ -469,8 +490,15 @@ pub struct AttestationParams<'a> {
 }
 
 /// Generate a complete attestation report (core logic, no caching).
+///
+/// Parallelizes the two slow operations:
+/// - TDX quote generation (dstack Unix socket RPC)
+/// - GPU evidence collection (Python subprocess with NVML)
+///
+/// dstack info is cached for the process lifetime (it never changes).
 async fn generate_attestation_inner(
     params: AttestationParams<'_>,
+    cache: Option<&AttestationCache>,
 ) -> Result<AttestationReport, AttestationError> {
     let nonce_bytes = parse_nonce(params.nonce)?;
     let nonce_hex = hex::encode(nonce_bytes);
@@ -489,19 +517,38 @@ async fn generate_attestation_inner(
         fp_bytes.as_deref(),
     );
 
-    // Get TDX quote from dstack
-    let client = dstack_sdk::dstack_client::DstackClient::new(None);
-    let quote_result = client.get_quote(report_data).await?;
-    let event_log: serde_json::Value =
-        serde_json::from_str(&quote_result.event_log).map_err(anyhow::Error::from)?;
+    // Run TDX quote and GPU evidence collection in parallel.
+    // These are independent: TDX quote talks to dstack via Unix socket,
+    // GPU evidence spawns a Python subprocess calling NVML.
+    let gpu_no_hw_mode = params.gpu_no_hw_mode;
+    let nonce_hex_clone = nonce_hex.clone();
+    let (quote_result, gpu_evidence) = tokio::try_join!(
+        async {
+            let client = dstack_sdk::dstack_client::DstackClient::new(None);
+            client
+                .get_quote(report_data)
+                .await
+                .map_err(AttestationError::Internal)
+        },
+        async {
+            collect_gpu_evidence(&nonce_hex_clone, gpu_no_hw_mode)
+                .await
+                .map_err(AttestationError::Internal)
+        },
+    )?;
 
-    // Collect GPU evidence
-    let gpu_evidence = collect_gpu_evidence(&nonce_hex, params.gpu_no_hw_mode).await?;
+    let event_log: serde_json::Value = serde_json::from_str(&quote_result.event_log)
+        .map_err(|e| AttestationError::Internal(anyhow::Error::from(e)))?;
     let nvidia_payload = build_nvidia_payload(&nonce_hex, &gpu_evidence);
 
-    // Get system info
-    let info = client.info().await?;
-    let info_value = serde_json::to_value(&info).map_err(anyhow::Error::from)?;
+    // dstack info is static — use cached value if available.
+    let info_value = if let Some(cache) = cache {
+        cache.get_dstack_info().await.map_err(AttestationError::Internal)?
+    } else {
+        let client = dstack_sdk::dstack_client::DstackClient::new(None);
+        let info = client.info().await.map_err(AttestationError::Internal)?;
+        serde_json::to_value(&info).map_err(|e| AttestationError::Internal(anyhow::Error::from(e)))?
+    };
 
     Ok(AttestationReport {
         model_name: params.model_name.to_string(),
@@ -549,13 +596,13 @@ pub async fn generate_attestation(
                 return Ok(report);
             }
         }
-        let report = generate_attestation_inner(params).await?;
+        let report = generate_attestation_inner(params, Some(cache)).await?;
         if is_nonceless {
             cache.set(&signing_algo, include_tls, report.clone()).await;
         }
         report
     } else {
-        generate_attestation_inner(params).await?
+        generate_attestation_inner(params, None).await?
     };
 
     Ok(report)

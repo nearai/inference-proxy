@@ -97,10 +97,7 @@ impl GpuEvidenceWorker {
             .map_err(|e| anyhow::anyhow!("Worker ready signal is not valid JSON: {e}"))?;
 
         if ready.get("ready") != Some(&serde_json::Value::Bool(true)) {
-            anyhow::bail!(
-                "Worker sent unexpected ready signal: {}",
-                ready_line.trim()
-            );
+            anyhow::bail!("Worker sent unexpected ready signal: {}", ready_line.trim());
         }
 
         let import_ok = ready
@@ -142,9 +139,10 @@ impl GpuEvidenceWorker {
             .write_all(request_line.as_bytes())
             .await
             .map_err(|e| anyhow::anyhow!("Failed to write to GPU evidence worker: {e}"))?;
-        self.stdin.flush().await.map_err(|e| {
-            anyhow::anyhow!("Failed to flush GPU evidence worker stdin: {e}")
-        })?;
+        self.stdin
+            .flush()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to flush GPU evidence worker stdin: {e}"))?;
 
         // Read response (with timeout)
         let mut response_line = String::new();
@@ -750,11 +748,15 @@ async fn generate_attestation_inner(
 
     // dstack info is static — use cached value if available.
     let info_value = if let Some(cache) = cache {
-        cache.get_dstack_info().await.map_err(AttestationError::Internal)?
+        cache
+            .get_dstack_info()
+            .await
+            .map_err(AttestationError::Internal)?
     } else {
         let client = dstack_sdk::dstack_client::DstackClient::new(None);
         let info = client.info().await.map_err(AttestationError::Internal)?;
-        serde_json::to_value(&info).map_err(|e| AttestationError::Internal(anyhow::Error::from(e)))?
+        serde_json::to_value(&info)
+            .map_err(|e| AttestationError::Internal(anyhow::Error::from(e)))?
     };
 
     Ok(AttestationReport {

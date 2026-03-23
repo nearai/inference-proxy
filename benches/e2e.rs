@@ -20,15 +20,13 @@ use vllm_proxy_rs::*;
 // ── Test keys (same as integration tests) ──
 
 const ECDSA_KEY: [u8; 32] = [
-    0xac, 0x09, 0x74, 0xbe, 0xc3, 0x9a, 0x17, 0xe3, 0x6b, 0xa4, 0xa6, 0xb4, 0xd2, 0x38, 0xff,
-    0x94, 0x4b, 0xac, 0xb3, 0x5e, 0x5d, 0xc4, 0xaf, 0x0f, 0x33, 0x47, 0xe5, 0x87, 0x31, 0x79,
-    0x67, 0x0f,
+    0xac, 0x09, 0x74, 0xbe, 0xc3, 0x9a, 0x17, 0xe3, 0x6b, 0xa4, 0xa6, 0xb4, 0xd2, 0x38, 0xff, 0x94,
+    0x4b, 0xac, 0xb3, 0x5e, 0x5d, 0xc4, 0xaf, 0x0f, 0x33, 0x47, 0xe5, 0x87, 0x31, 0x79, 0x67, 0x0f,
 ];
 
 const ED25519_KEY: [u8; 32] = [
-    0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
-    0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
-    0x7f, 0x60,
+    0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c, 0xc4,
+    0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae, 0x7f, 0x60,
 ];
 
 fn build_test_app(mock_url: &str) -> axum::Router {
@@ -161,7 +159,10 @@ fn make_streaming_response(id: &str, num_chunks: usize) -> String {
                 "finish_reason": null
             }]
         });
-        body.push_str(&format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap()));
+        body.push_str(&format!(
+            "data: {}\n\n",
+            serde_json::to_string(&chunk).unwrap()
+        ));
     }
     // Final chunk with usage
     let final_chunk = serde_json::json!({
@@ -213,21 +214,18 @@ fn bench_attestation_cache_operations(c: &mut Criterion) {
     rt.block_on(cache.set("ecdsa", false, report.clone()));
 
     group.bench_function("cache_hit", |b| {
-        b.to_async(&rt).iter(|| async {
-            black_box(cache.get("ecdsa", false).await)
-        })
+        b.to_async(&rt)
+            .iter(|| async { black_box(cache.get("ecdsa", false).await) })
     });
 
     group.bench_function("cache_miss", |b| {
-        b.to_async(&rt).iter(|| async {
-            black_box(cache.get("ed25519", true).await)
-        })
+        b.to_async(&rt)
+            .iter(|| async { black_box(cache.get("ed25519", true).await) })
     });
 
     group.bench_function("cache_set", |b| {
-        b.to_async(&rt).iter(|| async {
-            cache.set("ecdsa", false, report.clone()).await
-        })
+        b.to_async(&rt)
+            .iter(|| async { cache.set("ecdsa", false, report.clone()).await })
     });
 
     group.bench_function("semaphore_acquire_uncontended", |b| {
@@ -410,9 +408,7 @@ fn bench_request_body_processing(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("sha256_hash", msg_count),
             body_bytes,
-            |b, data| {
-                b.iter(|| hex::encode(Sha256::digest(black_box(data))))
-            },
+            |b, data| b.iter(|| hex::encode(Sha256::digest(black_box(data)))),
         );
 
         group.bench_with_input(
@@ -601,8 +597,7 @@ fn bench_json_body_round_trip(c: &mut Criterion) {
 
     group.bench_function("parse_modify_reserialize", |b| {
         b.iter(|| {
-            let mut v: serde_json::Value =
-                serde_json::from_str(black_box(&body_str)).unwrap();
+            let mut v: serde_json::Value = serde_json::from_str(black_box(&body_str)).unwrap();
 
             // strip_empty_tool_calls equivalent
             if let Some(messages) = v.get_mut("messages").and_then(|m| m.as_array_mut()) {

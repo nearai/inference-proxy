@@ -262,14 +262,20 @@ impl AttestationCache {
                 warn!(error = %first_err, "GPU evidence worker failed, restarting and retrying");
                 metrics::counter!("gpu_evidence_retries_total").increment(1);
 
-                // Kill old worker, spawn fresh one
+                // Kill old worker, spawn fresh one and retry
                 *worker_guard = None;
                 match GpuEvidenceWorker::spawn().await {
-                    Ok(mut new_worker) => {
-                        let result = new_worker.collect(nonce_hex, no_gpu_mode).await;
-                        *worker_guard = Some(new_worker);
-                        result
-                    }
+                    Ok(mut new_worker) => match new_worker.collect(nonce_hex, no_gpu_mode).await {
+                        Ok(evidence) => {
+                            *worker_guard = Some(new_worker);
+                            Ok(evidence)
+                        }
+                        Err(retry_err) => {
+                            warn!(error = %retry_err, "Worker retry also failed, falling back to subprocess");
+                            *worker_guard = None;
+                            collect_gpu_evidence_subprocess(nonce_hex, no_gpu_mode).await
+                        }
+                    },
                     Err(spawn_err) => {
                         warn!(error = %spawn_err, "Worker restart failed, falling back to subprocess");
                         collect_gpu_evidence_subprocess(nonce_hex, no_gpu_mode).await

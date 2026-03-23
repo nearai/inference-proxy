@@ -10,11 +10,27 @@ Protocol:
 
 Keeps the Python interpreter, verifier module, and NVML driver initialized
 across requests, avoiding ~0.5-2s startup overhead per call.
+
+IMPORTANT: The NVIDIA verifier library (cc_admin) prints info messages
+directly to stdout (e.g. "Number of GPUs available : 8"). We redirect
+stdout to /dev/null during evidence collection and use a saved reference
+to the real stdout for our JSON protocol.
 """
 
+import io
 import json
+import os
 import sys
 import traceback
+
+# Save the real stdout fd before anything can pollute it.
+# We dup the fd so even if sys.stdout is replaced, we can still write.
+_real_stdout_fd = os.dup(sys.stdout.fileno())
+_real_stdout = os.fdopen(_real_stdout_fd, "w", buffering=1)  # line-buffered
+
+# Redirect sys.stdout to stderr so any library prints go to stderr
+# (which the Rust parent reads separately / ignores).
+sys.stdout = sys.stderr
 
 # Import verifier once at startup — this is the expensive part
 # (loads shared libraries, may trigger nvmlInit on import).
@@ -25,6 +41,12 @@ try:
 except Exception as e:
     IMPORT_OK = False
     IMPORT_ERROR = str(e)
+
+
+def _write_response(obj):
+    """Write a JSON response to the real stdout (not the redirected one)."""
+    _real_stdout.write(json.dumps(obj) + "\n")
+    _real_stdout.flush()
 
 
 def collect(nonce_hex: str, no_gpu_mode: bool):
@@ -46,13 +68,13 @@ def collect(nonce_hex: str, no_gpu_mode: bool):
 
 
 def main():
-    # Signal readiness to the Rust parent.
+    # Signal readiness to the Rust parent on the real stdout.
     ready_msg = {"ready": True, "import_ok": IMPORT_OK}
     if not IMPORT_OK:
         ready_msg["import_error"] = IMPORT_ERROR
-    sys.stdout.write(json.dumps(ready_msg) + "\n")
-    sys.stdout.flush()
+    _write_response(ready_msg)
 
+    # Read requests from stdin (which is NOT redirected).
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -69,8 +91,7 @@ def main():
         except Exception as e:
             result = {"ok": False, "error": f"{type(e).__name__}: {e}\n{traceback.format_exc()}"}
 
-        sys.stdout.write(json.dumps(result) + "\n")
-        sys.stdout.flush()
+        _write_response(result)
 
 
 if __name__ == "__main__":

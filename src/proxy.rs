@@ -22,6 +22,9 @@ pub struct UpstreamErrorInfo {
 /// Handles both vLLM flat format (`{"object":"error","message":"...","type":"..."}`)
 /// and nested format (`{"error":{"message":"...","type":"..."}}`).
 /// Returns None if the body is not parseable JSON with the expected fields.
+///
+/// The extracted message is sanitized to strip user data from validation error
+/// details (the `'input'` and `'ctx'` fields in Python-formatted validation dicts).
 pub fn parse_upstream_error(body: &[u8]) -> Option<UpstreamErrorInfo> {
     let json: serde_json::Value = serde_json::from_slice(body).ok()?;
 
@@ -34,7 +37,7 @@ pub fn parse_upstream_error(body: &[u8]) -> Option<UpstreamErrorInfo> {
             .unwrap_or("unknown")
             .to_string();
         return Some(UpstreamErrorInfo {
-            message,
+            message: sanitize_validation_errors(&message),
             error_type,
         });
     }
@@ -47,9 +50,69 @@ pub fn parse_upstream_error(body: &[u8]) -> Option<UpstreamErrorInfo> {
         .unwrap_or("unknown")
         .to_string();
     Some(UpstreamErrorInfo {
-        message,
+        message: sanitize_validation_errors(&message),
         error_type,
     })
+}
+
+/// Regex to extract 'type' values from Python-formatted validation error dicts.
+/// Handles both single-quoted and double-quoted strings.
+static VALIDATION_TYPE_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r#"'type':\s*(?:'([^']+)'|"([^"]+)")"#).unwrap());
+
+/// Regex to extract 'msg' values from Python-formatted validation error dicts.
+/// Handles both single-quoted and double-quoted strings.
+static VALIDATION_MSG_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r#"'msg':\s*(?:'([^']*)'|"([^"]*)")"#).unwrap());
+
+/// Sanitize validation error messages to prevent leaking user conversation content.
+///
+/// Backend validation errors (from SGLang/vLLM) include `'input'` and `'ctx'` fields
+/// containing the original request data, which may include user messages, AI responses,
+/// and other sensitive conversation content. This function strips those fields while
+/// preserving useful error type and message information.
+pub fn sanitize_validation_errors(message: &str) -> String {
+    // Only sanitize if the message contains sensitive fields
+    if !message.contains("'input':") && !message.contains("'ctx':") {
+        return message.to_string();
+    }
+
+    message
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+
+            // Skip stack traces and HTTP method lines (leak internal paths)
+            if trimmed.starts_with("File \"")
+                || trimmed.starts_with("POST ")
+                || trimmed.starts_with("GET ")
+            {
+                return None;
+            }
+
+            // Any line containing 'input' or 'ctx' fields needs sanitization
+            if trimmed.contains("'input':") || trimmed.contains("'ctx':") {
+                let error_type = VALIDATION_TYPE_RE
+                    .captures(trimmed)
+                    .and_then(|c| c.get(1).or_else(|| c.get(2)))
+                    .map(|m| m.as_str());
+                let error_msg = VALIDATION_MSG_RE
+                    .captures(trimmed)
+                    .and_then(|c| c.get(1).or_else(|| c.get(2)))
+                    .map(|m| m.as_str());
+
+                let sanitized = match (error_type, error_msg) {
+                    (Some(t), Some(m)) => format!("  {}: {}", t, m),
+                    (Some(t), None) => format!("  {}", t),
+                    _ => "  (validation error)".to_string(),
+                };
+                Some(sanitized)
+            } else {
+                Some(line.to_string())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Parse an upstream error body, log it, and return the parsed info.
@@ -1491,5 +1554,90 @@ mod tests {
         let flushed = transformer.flush().unwrap();
         let flushed_str = std::str::from_utf8(&flushed).unwrap();
         assert!(flushed_str.contains("[DONE]"));
+    }
+
+    // --- sanitize_validation_errors tests ---
+
+    #[test]
+    fn test_sanitize_strips_input_from_validation_errors() {
+        let message = concat!(
+            "2 validation errors:\n",
+            "  {'type': 'value_error', 'loc': ('body', 'messages', 1), 'msg': \"Value error, invalid role\", 'input': 'user', 'ctx': {'error': ValueError(\"bad\")}}\n",
+            "  {'type': 'string_type', 'loc': ('body', 'messages', 1, 'content'), 'msg': 'Input should be a valid string', 'input': [{'text': 'secret user conversation content', 'type': 'custom'}]}"
+        );
+        let result = sanitize_validation_errors(message);
+        assert!(!result.contains("secret user conversation"));
+        assert!(!result.contains("'input':"));
+        assert!(result.contains("2 validation errors:"));
+        assert!(result.contains("value_error: Value error, invalid role"));
+        assert!(result.contains("string_type: Input should be a valid string"));
+    }
+
+    #[test]
+    fn test_sanitize_strips_ctx_only_lines() {
+        let message = concat!(
+            "1 validation errors:\n",
+            "  {'type': 'value_error', 'msg': 'bad', 'ctx': {'error': ValueError('secret data')}}"
+        );
+        let result = sanitize_validation_errors(message);
+        assert!(!result.contains("secret data"));
+        assert!(result.contains("value_error: bad"));
+    }
+
+    #[test]
+    fn test_sanitize_strips_stack_traces() {
+        let message = concat!(
+            "1 validation errors:\n",
+            "  {'type': 'value_error', 'msg': 'bad', 'input': 'x'}\n",
+            "  File \"/sgl-workspace/sglang/python/sglang/srt/entrypoints/http_server.py\", line 1324\n",
+            "    POST /v1/chat/completions some data"
+        );
+        let result = sanitize_validation_errors(message);
+        assert!(!result.contains("sgl-workspace"));
+        assert!(!result.contains("POST /v1/chat"));
+    }
+
+    #[test]
+    fn test_sanitize_preserves_non_validation_errors() {
+        let message = "Context length exceeded: 32768 tokens requested, 16384 max";
+        assert_eq!(sanitize_validation_errors(message), message);
+    }
+
+    #[test]
+    fn test_sanitize_handles_non_dict_lines_with_input() {
+        let message = concat!(
+            "1 validation errors:\n",
+            "  - {'type': 'value_error', 'msg': 'bad', 'input': 'secret user message'}"
+        );
+        let result = sanitize_validation_errors(message);
+        assert!(!result.contains("secret user message"));
+        assert!(result.contains("value_error: bad"));
+    }
+
+    #[test]
+    fn test_parse_upstream_error_sanitizes_sglang_validation() {
+        let body = serde_json::json!({
+            "object": "error",
+            "message": "1 validation errors:\n  {'type': 'value_error', 'msg': 'bad request', 'input': 'sensitive user data', 'ctx': {'error': ValueError('details')}}"
+        });
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+        let info = parse_upstream_error(&body_bytes).unwrap();
+        assert!(!info.message.contains("sensitive user data"));
+        assert!(info.message.contains("value_error: bad request"));
+    }
+
+    #[test]
+    fn test_parse_upstream_error_sanitizes_nested_format() {
+        let body = serde_json::json!({
+            "error": {
+                "message": "1 validation errors:\n  {'type': 'string_type', 'msg': 'bad input', 'input': [{'text': 'secret conversation'}]}",
+                "type": "invalid_request_error"
+            }
+        });
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+        let info = parse_upstream_error(&body_bytes).unwrap();
+        assert!(!info.message.contains("secret conversation"));
+        assert!(info.message.contains("string_type: bad input"));
+        assert_eq!(info.error_type, "invalid_request_error");
     }
 }

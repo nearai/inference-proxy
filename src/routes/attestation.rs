@@ -1,8 +1,10 @@
 use axum::extract::{Query, State};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::Deserialize;
 
+use crate::attestation::AttestationResult;
 use crate::error::AppError;
 use crate::types::AttestationResponse;
 use crate::AppState;
@@ -53,7 +55,7 @@ pub async fn attestation_report(
         }
     }
 
-    let report = crate::attestation::generate_attestation(
+    let result = crate::attestation::generate_attestation(
         crate::attestation::AttestationParams {
             model_name: &state.config.model_name,
             signing_address: &signing_address,
@@ -76,10 +78,21 @@ pub async fn attestation_report(
         crate::attestation::AttestationError::Internal(e) => AppError::Internal(e),
     })?;
 
-    let response = AttestationResponse {
-        report: report.clone(),
-        all_attestations: vec![report],
-    };
-
-    Ok(Json(serde_json::to_value(response).unwrap()))
+    match result {
+        // Cache hit: return pre-serialized bytes directly (no clone, no serialization).
+        AttestationResult::CachedBytes(bytes) => Ok((
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            bytes,
+        )
+            .into_response()),
+        // Fresh report: serialize once.
+        AttestationResult::Fresh(report) => {
+            let response = AttestationResponse {
+                report: report.as_ref().clone(),
+                all_attestations: vec![*report],
+            };
+            Ok(Json(serde_json::to_value(response).unwrap()).into_response())
+        }
+    }
 }

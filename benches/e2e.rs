@@ -228,13 +228,6 @@ fn bench_attestation_cache_operations(c: &mut Criterion) {
             .iter(|| async { cache.set("ecdsa", false, report.clone()).await })
     });
 
-    group.bench_function("semaphore_acquire_uncontended", |b| {
-        b.to_async(&rt).iter(|| async {
-            let permit = cache.acquire_gpu_permit().await;
-            drop(black_box(permit));
-        })
-    });
-
     group.finish();
 }
 

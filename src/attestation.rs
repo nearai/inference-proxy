@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{Mutex, OnceCell, RwLock, Semaphore};
+use tokio::sync::{Mutex, OnceCell, RwLock};
 use tracing::{error, info, warn};
 
 use crate::types::AttestationReport;
@@ -17,6 +17,10 @@ struct AttestationCacheKey {
 }
 
 struct CachedReport {
+    /// Pre-serialized JSON bytes of the full AttestationResponse.
+    /// Avoids re-serializing 297KB on every cache hit.
+    response_bytes: bytes::Bytes,
+    /// The report struct, needed for background refresh to build new responses.
     report: AttestationReport,
     created_at: Instant,
 }
@@ -191,15 +195,13 @@ impl GpuEvidenceWorker {
 pub struct AttestationCache {
     /// Cached reports keyed by (signing_algo, include_tls_fingerprint).
     reports: RwLock<HashMap<AttestationCacheKey, CachedReport>>,
-    /// Serializes GPU evidence calls (only 1 at a time).
-    gpu_semaphore: Semaphore,
     /// Cache TTL in seconds.
     ttl_secs: u64,
     /// Cached dstack info (static for the lifetime of the process).
     dstack_info: OnceCell<serde_json::Value>,
-    /// Persistent GPU evidence worker process. Protected by Mutex because
-    /// send/receive must be atomic (one request at a time). The outer Option
-    /// is None until first use; the worker is lazily spawned.
+    /// Persistent GPU evidence worker process. Protected by Mutex which also
+    /// serializes GPU evidence calls (only one NVML call at a time).
+    /// The outer Option is None until first use; the worker is lazily spawned.
     gpu_worker: Mutex<Option<GpuEvidenceWorker>>,
 }
 
@@ -207,7 +209,6 @@ impl AttestationCache {
     pub fn new(ttl_secs: u64) -> Self {
         Self {
             reports: RwLock::new(HashMap::new()),
-            gpu_semaphore: Semaphore::new(1),
             ttl_secs,
             dstack_info: OnceCell::new(),
             gpu_worker: Mutex::new(None),
@@ -285,7 +286,29 @@ impl AttestationCache {
         }
     }
 
-    /// Get a cached report if it exists and is fresh.
+    /// Get pre-serialized JSON bytes for a cached report, if fresh.
+    pub async fn get_bytes(
+        &self,
+        signing_algo: &str,
+        include_tls_fingerprint: bool,
+    ) -> Option<bytes::Bytes> {
+        let key = AttestationCacheKey {
+            signing_algo: signing_algo.to_string(),
+            include_tls_fingerprint,
+        };
+        let reports = self.reports.read().await;
+        if let Some(cached) = reports.get(&key) {
+            if cached.created_at.elapsed().as_secs() < self.ttl_secs {
+                metrics::counter!("attestation_cache_hits_total").increment(1);
+                return Some(cached.response_bytes.clone());
+            }
+        }
+        metrics::counter!("attestation_cache_misses_total").increment(1);
+        None
+    }
+
+    /// Get a cached report struct if it exists and is fresh.
+    /// Used by background refresh to check if a refresh is needed.
     pub async fn get(
         &self,
         signing_algo: &str,
@@ -298,21 +321,30 @@ impl AttestationCache {
         let reports = self.reports.read().await;
         if let Some(cached) = reports.get(&key) {
             if cached.created_at.elapsed().as_secs() < self.ttl_secs {
-                metrics::counter!("attestation_cache_hits_total").increment(1);
                 return Some(cached.report.clone());
             }
         }
-        metrics::counter!("attestation_cache_misses_total").increment(1);
         None
     }
 
-    /// Store a report in the cache.
+    /// Store a report in the cache, pre-serializing to JSON bytes.
     pub async fn set(
         &self,
         signing_algo: &str,
         include_tls_fingerprint: bool,
         report: AttestationReport,
     ) {
+        let response = crate::types::AttestationResponse {
+            report: report.clone(),
+            all_attestations: vec![report.clone()],
+        };
+        let response_bytes = match serde_json::to_vec(&response) {
+            Ok(bytes) => bytes::Bytes::from(bytes),
+            Err(e) => {
+                error!(error = %e, "Failed to serialize attestation response for cache");
+                return;
+            }
+        };
         let key = AttestationCacheKey {
             signing_algo: signing_algo.to_string(),
             include_tls_fingerprint,
@@ -321,18 +353,11 @@ impl AttestationCache {
         reports.insert(
             key,
             CachedReport {
+                response_bytes,
                 report,
                 created_at: Instant::now(),
             },
         );
-    }
-
-    /// Acquire the GPU evidence semaphore (serializes GPU evidence calls).
-    pub async fn acquire_gpu_permit(&self) -> tokio::sync::SemaphorePermit<'_> {
-        self.gpu_semaphore
-            .acquire()
-            .await
-            .expect("semaphore closed")
     }
 }
 
@@ -366,7 +391,7 @@ pub fn spawn_cache_refresh_task(
                 };
 
                 // Refresh without TLS fingerprint (most common).
-                let _permit = cache.acquire_gpu_permit().await;
+                // GPU evidence serialization is handled by the worker Mutex.
                 match generate_attestation_inner(
                     AttestationParams {
                         model_name: &model_name,
@@ -390,11 +415,9 @@ pub fn spawn_cache_refresh_task(
                         warn!(algo, error = %e, "Background attestation cache refresh failed");
                     }
                 }
-                drop(_permit);
 
                 // Also refresh with TLS fingerprint if configured.
                 if let Some(ref fp) = tls_cert_fingerprint {
-                    let _permit = cache.acquire_gpu_permit().await;
                     match generate_attestation_inner(
                         AttestationParams {
                             model_name: &model_name,
@@ -417,7 +440,6 @@ pub fn spawn_cache_refresh_task(
                             warn!(algo, error = %e, "Background attestation cache refresh (with TLS) failed");
                         }
                     }
-                    drop(_permit);
                 }
             }
 
@@ -779,48 +801,50 @@ async fn generate_attestation_inner(
     })
 }
 
+/// Result of attestation generation — either pre-serialized cached bytes or a fresh report.
+pub enum AttestationResult {
+    /// Cache hit: pre-serialized JSON bytes ready to send.
+    CachedBytes(bytes::Bytes),
+    /// Fresh report that needs serialization.
+    Fresh(Box<AttestationReport>),
+}
+
 /// Generate an attestation report, using the cache for nonce-less requests.
 ///
 /// When a caller provides a nonce, the GPU evidence and TDX quote are
 /// cryptographically bound to that nonce, so we must generate fresh.
 /// When no nonce is provided, we serve a cached report (which contains its
 /// own randomly-generated nonce) — the caller accepts whatever nonce we return.
+///
+/// GPU evidence collection is serialized by the worker Mutex (NVML constraint),
+/// but TDX quotes and dstack info calls run concurrently with other requests.
 pub async fn generate_attestation(
     params: AttestationParams<'_>,
     cache: Option<&AttestationCache>,
-) -> Result<AttestationReport, AttestationError> {
+) -> Result<AttestationResult, AttestationError> {
     let is_nonceless = params.nonce.is_none();
     let include_tls = params.tls_cert_fingerprint.is_some();
     let signing_algo = params.signing_algo.to_string();
 
-    // For nonce-less requests, try the cache first.
+    // For nonce-less requests, try the cache first (returns pre-serialized bytes).
     if is_nonceless {
         if let Some(cache) = cache {
-            if let Some(report) = cache.get(&signing_algo, include_tls).await {
-                return Ok(report);
+            if let Some(bytes) = cache.get_bytes(&signing_algo, include_tls).await {
+                return Ok(AttestationResult::CachedBytes(bytes));
             }
         }
     }
 
-    // Generate fresh report. Acquire semaphore to serialize GPU evidence calls.
-    let report = if let Some(cache) = cache {
-        let _permit = cache.acquire_gpu_permit().await;
-        // Double-check cache after acquiring permit (another request may have filled it).
-        if is_nonceless {
-            if let Some(report) = cache.get(&signing_algo, include_tls).await {
-                return Ok(report);
-            }
-        }
-        let report = generate_attestation_inner(params, Some(cache)).await?;
-        if is_nonceless {
+    // Generate fresh report. GPU evidence is serialized by the worker Mutex,
+    // but TDX quote runs concurrently.
+    let report = generate_attestation_inner(params, cache).await?;
+    if is_nonceless {
+        if let Some(cache) = cache {
             cache.set(&signing_algo, include_tls, report.clone()).await;
         }
-        report
-    } else {
-        generate_attestation_inner(params, None).await?
-    };
+    }
 
-    Ok(report)
+    Ok(AttestationResult::Fresh(Box::new(report)))
 }
 
 #[cfg(test)]
@@ -1007,30 +1031,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gpu_semaphore_serializes() {
-        let cache = Arc::new(AttestationCache::new(300));
+    async fn test_cache_get_bytes_returns_preserialized() {
+        let cache = AttestationCache::new(300);
+        let report = make_test_report("ecdsa", "aabb");
+        cache.set("ecdsa", false, report).await;
 
-        // Hold the first permit.
-        let permit1 = cache.acquire_gpu_permit().await;
-
-        // Spawn a task that tries to acquire the semaphore while we hold it.
-        let cache2 = cache.clone();
-        let mut handle = tokio::spawn(async move {
-            let _permit = cache2.acquire_gpu_permit().await;
-        });
-
-        // The second acquire should block (not complete within 50ms).
-        let result = tokio::time::timeout(std::time::Duration::from_millis(50), &mut handle).await;
-        assert!(
-            result.is_err(),
-            "second acquire should block while first permit is held"
-        );
-
-        // Release the first permit — the second task should now complete.
-        drop(permit1);
-        tokio::time::timeout(std::time::Duration::from_millis(50), handle)
-            .await
-            .expect("second acquire should complete after first permit is dropped")
-            .expect("task should not panic");
+        let bytes = cache.get_bytes("ecdsa", false).await;
+        assert!(bytes.is_some());
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&bytes.unwrap()).expect("cached bytes should be valid JSON");
+        assert_eq!(parsed["request_nonce"], "aabb");
+        assert!(parsed["all_attestations"].is_array());
     }
 }

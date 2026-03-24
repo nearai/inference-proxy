@@ -12,7 +12,7 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 # Cache dependencies: copy manifests first, then do a dummy build
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs \
-    && mkdir -p benches && echo "fn main() {}" > benches/hot_path.rs \
+    && mkdir -p benches && echo "fn main() {}" > benches/hot_path.rs && echo "fn main() {}" > benches/e2e.rs \
     && cargo build --release --locked 2>/dev/null || true \
     && rm -rf src benches \
     && rm -f target/release/deps/*vllm_proxy_rs* \
@@ -37,8 +37,9 @@ RUN pip install --no-cache-dir nv-attestation-sdk nv-ppcie-verifier
 
 WORKDIR /app
 
-# Copy compiled binary from builder
+# Copy compiled binary and GPU evidence worker from builder
 COPY --from=builder /build/target/release/vllm-proxy-rs /app/vllm-proxy-rs
+COPY gpu_evidence_worker.py /app/gpu_evidence_worker.py
 
 # Bake in git revision for version tracking
 COPY --chmod=664 .GIT_REV /etc/

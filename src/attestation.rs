@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use sha2::{Digest, Sha256};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::{Mutex, OnceCell, RwLock};
 use tracing::{error, info, warn};
 
 use crate::types::AttestationReport;
@@ -16,37 +17,298 @@ struct AttestationCacheKey {
 }
 
 struct CachedReport {
+    /// Pre-serialized JSON bytes of the full AttestationResponse.
+    /// Avoids re-serializing 297KB on every cache hit.
+    response_bytes: bytes::Bytes,
+    /// The report struct, needed for background refresh to build new responses.
     report: AttestationReport,
     created_at: Instant,
 }
 
+/// Persistent Python worker process for GPU evidence collection.
+///
+/// Keeps the Python interpreter, verifier module imports, and NVML driver
+/// initialized across requests, avoiding ~0.5-2s startup overhead per call.
+/// Communication is via JSON lines over stdin/stdout pipes.
+///
+/// The worker is automatically restarted if it dies. All access is serialized
+/// by the gpu_semaphore in AttestationCache (only one evidence collection at a time).
+struct GpuEvidenceWorker {
+    stdin: tokio::process::ChildStdin,
+    stdout: BufReader<tokio::process::ChildStdout>,
+    child: tokio::process::Child,
+}
+
+/// Path to the worker script, resolved relative to the binary.
+fn worker_script_path() -> String {
+    // In Docker: /app/gpu_evidence_worker.py (next to /app/vllm-proxy-rs)
+    // In dev: ./gpu_evidence_worker.py
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    if let Some(dir) = exe_dir {
+        let candidate = dir.join("gpu_evidence_worker.py");
+        if candidate.exists() {
+            return candidate.to_string_lossy().to_string();
+        }
+    }
+    // Fallback: current directory or CARGO_MANIFEST_DIR for dev
+    if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
+        let candidate = std::path::Path::new(&manifest).join("gpu_evidence_worker.py");
+        if candidate.exists() {
+            return candidate.to_string_lossy().to_string();
+        }
+    }
+    "gpu_evidence_worker.py".to_string()
+}
+
+impl GpuEvidenceWorker {
+    /// Spawn a new persistent Python worker process.
+    async fn spawn() -> anyhow::Result<Self> {
+        let script_path = worker_script_path();
+        info!(script = %script_path, "Spawning GPU evidence worker");
+
+        let mut child = tokio::process::Command::new("python3")
+            .arg(&script_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("Failed to spawn GPU evidence worker: {e}"))?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Failed to capture worker stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Failed to capture worker stdout"))?;
+        let mut stdout = BufReader::new(stdout);
+
+        // Wait for the ready signal (first line of output).
+        let mut ready_line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            stdout.read_line(&mut ready_line),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("GPU evidence worker did not send ready signal within 30s"))?
+        .map_err(|e| anyhow::anyhow!("Failed to read worker ready signal: {e}"))?;
+
+        let ready: serde_json::Value = serde_json::from_str(ready_line.trim())
+            .map_err(|e| anyhow::anyhow!("Worker ready signal is not valid JSON: {e}"))?;
+
+        if ready.get("ready") != Some(&serde_json::Value::Bool(true)) {
+            anyhow::bail!("Worker sent unexpected ready signal: {}", ready_line.trim());
+        }
+
+        let import_ok = ready
+            .get("import_ok")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !import_ok {
+            let err = ready
+                .get("import_error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            warn!(error = %err, "GPU evidence worker started but verifier import failed");
+        } else {
+            info!("GPU evidence worker ready");
+        }
+
+        Ok(Self {
+            stdin,
+            stdout,
+            child,
+        })
+    }
+
+    /// Send a nonce to the worker and read back GPU evidence.
+    async fn collect(
+        &mut self,
+        nonce_hex: &str,
+        no_gpu_mode: bool,
+    ) -> anyhow::Result<serde_json::Value> {
+        let request = serde_json::json!({
+            "nonce": nonce_hex,
+            "no_gpu_mode": no_gpu_mode,
+        });
+        let mut request_line = serde_json::to_string(&request)?;
+        request_line.push('\n');
+
+        // Write request
+        self.stdin
+            .write_all(request_line.as_bytes())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to write to GPU evidence worker: {e}"))?;
+        self.stdin
+            .flush()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to flush GPU evidence worker stdin: {e}"))?;
+
+        // Read response (with timeout)
+        let mut response_line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            self.stdout.read_line(&mut response_line),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("GPU evidence worker timed out after 60s"))?
+        .map_err(|e| anyhow::anyhow!("Failed to read from GPU evidence worker: {e}"))?;
+
+        if response_line.is_empty() {
+            anyhow::bail!("GPU evidence worker closed stdout (process may have died)");
+        }
+
+        let response: serde_json::Value = serde_json::from_str(response_line.trim())
+            .map_err(|e| anyhow::anyhow!("Worker response is not valid JSON: {e}"))?;
+
+        if response.get("ok") == Some(&serde_json::Value::Bool(true)) {
+            response
+                .get("evidence")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Worker response missing 'evidence' field"))
+        } else {
+            let err = response
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            anyhow::bail!("GPU evidence worker error: {err}")
+        }
+    }
+
+    /// Check if the worker process is still alive.
+    fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+}
+
 /// Caches nonce-less attestation reports and serializes GPU evidence collection.
 ///
-/// GPU evidence collection spawns a Python subprocess that calls `nvmlInit()`.
-/// Under heavy GPU load, `nvmlInit` can intermittently time out (5s timeout in
-/// the NVIDIA verifier library). This cache:
+/// GPU evidence collection uses a persistent Python worker process that keeps
+/// the verifier module and NVML driver initialized. This cache:
 /// 1. Serves pre-generated reports for requests without a nonce (the common case).
-/// 2. Serializes subprocess calls so only one `nvmlInit` runs at a time.
-/// 3. Retries once on GPU evidence failure.
+/// 2. Serializes evidence calls so only one `nvmlInit`-using request runs at a time.
+/// 3. Retries once on GPU evidence failure (restarting the worker if needed).
 pub struct AttestationCache {
     /// Cached reports keyed by (signing_algo, include_tls_fingerprint).
     reports: RwLock<HashMap<AttestationCacheKey, CachedReport>>,
-    /// Serializes GPU evidence subprocess calls (only 1 at a time).
-    gpu_semaphore: Semaphore,
     /// Cache TTL in seconds.
     ttl_secs: u64,
+    /// Cached dstack info (static for the lifetime of the process).
+    dstack_info: OnceCell<serde_json::Value>,
+    /// Persistent GPU evidence worker process. Protected by Mutex which also
+    /// serializes GPU evidence calls (only one NVML call at a time).
+    /// The outer Option is None until first use; the worker is lazily spawned.
+    gpu_worker: Mutex<Option<GpuEvidenceWorker>>,
 }
 
 impl AttestationCache {
     pub fn new(ttl_secs: u64) -> Self {
         Self {
             reports: RwLock::new(HashMap::new()),
-            gpu_semaphore: Semaphore::new(1),
             ttl_secs,
+            dstack_info: OnceCell::new(),
+            gpu_worker: Mutex::new(None),
         }
     }
 
-    /// Get a cached report if it exists and is fresh.
+    /// Get cached dstack info, fetching it once on first call.
+    async fn get_dstack_info(&self) -> anyhow::Result<serde_json::Value> {
+        self.dstack_info
+            .get_or_try_init(|| async {
+                let client = dstack_sdk::dstack_client::DstackClient::new(None);
+                let info = client.info().await?;
+                serde_json::to_value(&info).map_err(anyhow::Error::from)
+            })
+            .await
+            .cloned()
+    }
+
+    /// Collect GPU evidence using the persistent worker, with auto-restart.
+    ///
+    /// Caller must hold the gpu_semaphore permit.
+    async fn collect_gpu_evidence(
+        &self,
+        nonce_hex: &str,
+        no_gpu_mode: bool,
+    ) -> anyhow::Result<serde_json::Value> {
+        let mut worker_guard = self.gpu_worker.lock().await;
+
+        // Ensure we have a live worker
+        let needs_spawn = match worker_guard.as_mut() {
+            Some(w) => !w.is_alive(),
+            None => true,
+        };
+        if needs_spawn {
+            match GpuEvidenceWorker::spawn().await {
+                Ok(w) => {
+                    *worker_guard = Some(w);
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to spawn GPU evidence worker, falling back to subprocess");
+                    *worker_guard = None;
+                    // Fall back to one-shot subprocess
+                    return collect_gpu_evidence_subprocess(nonce_hex, no_gpu_mode).await;
+                }
+            }
+        }
+
+        let worker = worker_guard.as_mut().unwrap();
+        match worker.collect(nonce_hex, no_gpu_mode).await {
+            Ok(evidence) => Ok(evidence),
+            Err(first_err) => {
+                warn!(error = %first_err, "GPU evidence worker failed, restarting and retrying");
+                metrics::counter!("gpu_evidence_retries_total").increment(1);
+
+                // Kill old worker, spawn fresh one and retry
+                *worker_guard = None;
+                match GpuEvidenceWorker::spawn().await {
+                    Ok(mut new_worker) => match new_worker.collect(nonce_hex, no_gpu_mode).await {
+                        Ok(evidence) => {
+                            *worker_guard = Some(new_worker);
+                            Ok(evidence)
+                        }
+                        Err(retry_err) => {
+                            warn!(error = %retry_err, "Worker retry also failed, falling back to subprocess");
+                            *worker_guard = None;
+                            collect_gpu_evidence_subprocess(nonce_hex, no_gpu_mode).await
+                        }
+                    },
+                    Err(spawn_err) => {
+                        warn!(error = %spawn_err, "Worker restart failed, falling back to subprocess");
+                        collect_gpu_evidence_subprocess(nonce_hex, no_gpu_mode).await
+                    }
+                }
+            }
+        }
+    }
+
+    /// Get pre-serialized JSON bytes for a cached report, if fresh.
+    pub async fn get_bytes(
+        &self,
+        signing_algo: &str,
+        include_tls_fingerprint: bool,
+    ) -> Option<bytes::Bytes> {
+        let key = AttestationCacheKey {
+            signing_algo: signing_algo.to_string(),
+            include_tls_fingerprint,
+        };
+        let reports = self.reports.read().await;
+        if let Some(cached) = reports.get(&key) {
+            if cached.created_at.elapsed().as_secs() < self.ttl_secs {
+                metrics::counter!("attestation_cache_hits_total").increment(1);
+                return Some(cached.response_bytes.clone());
+            }
+        }
+        metrics::counter!("attestation_cache_misses_total").increment(1);
+        None
+    }
+
+    /// Get a cached report struct if it exists and is fresh.
+    /// Used by background refresh to check if a refresh is needed.
     pub async fn get(
         &self,
         signing_algo: &str,
@@ -59,21 +321,30 @@ impl AttestationCache {
         let reports = self.reports.read().await;
         if let Some(cached) = reports.get(&key) {
             if cached.created_at.elapsed().as_secs() < self.ttl_secs {
-                metrics::counter!("attestation_cache_hits_total").increment(1);
                 return Some(cached.report.clone());
             }
         }
-        metrics::counter!("attestation_cache_misses_total").increment(1);
         None
     }
 
-    /// Store a report in the cache.
+    /// Store a report in the cache, pre-serializing to JSON bytes.
     pub async fn set(
         &self,
         signing_algo: &str,
         include_tls_fingerprint: bool,
         report: AttestationReport,
     ) {
+        let response = crate::types::AttestationResponse {
+            report: report.clone(),
+            all_attestations: vec![report.clone()],
+        };
+        let response_bytes = match serde_json::to_vec(&response) {
+            Ok(bytes) => bytes::Bytes::from(bytes),
+            Err(e) => {
+                error!(error = %e, "Failed to serialize attestation response for cache");
+                return;
+            }
+        };
         let key = AttestationCacheKey {
             signing_algo: signing_algo.to_string(),
             include_tls_fingerprint,
@@ -82,18 +353,11 @@ impl AttestationCache {
         reports.insert(
             key,
             CachedReport {
+                response_bytes,
                 report,
                 created_at: Instant::now(),
             },
         );
-    }
-
-    /// Acquire the GPU evidence semaphore (serializes subprocess calls).
-    pub async fn acquire_gpu_permit(&self) -> tokio::sync::SemaphorePermit<'_> {
-        self.gpu_semaphore
-            .acquire()
-            .await
-            .expect("semaphore closed")
     }
 }
 
@@ -127,17 +391,20 @@ pub fn spawn_cache_refresh_task(
                 };
 
                 // Refresh without TLS fingerprint (most common).
-                let _permit = cache.acquire_gpu_permit().await;
-                match generate_attestation_inner(AttestationParams {
-                    model_name: &model_name,
-                    signing_address: &signing_address,
-                    signing_algo: algo,
-                    signing_public_key: &signing_public_key,
-                    signing_address_bytes: &signing_address_bytes,
-                    nonce: None,
-                    gpu_no_hw_mode,
-                    tls_cert_fingerprint: None,
-                })
+                // GPU evidence serialization is handled by the worker Mutex.
+                match generate_attestation_inner(
+                    AttestationParams {
+                        model_name: &model_name,
+                        signing_address: &signing_address,
+                        signing_algo: algo,
+                        signing_public_key: &signing_public_key,
+                        signing_address_bytes: &signing_address_bytes,
+                        nonce: None,
+                        gpu_no_hw_mode,
+                        tls_cert_fingerprint: None,
+                    },
+                    Some(&cache),
+                )
                 .await
                 {
                     Ok(report) => {
@@ -148,21 +415,22 @@ pub fn spawn_cache_refresh_task(
                         warn!(algo, error = %e, "Background attestation cache refresh failed");
                     }
                 }
-                drop(_permit);
 
                 // Also refresh with TLS fingerprint if configured.
                 if let Some(ref fp) = tls_cert_fingerprint {
-                    let _permit = cache.acquire_gpu_permit().await;
-                    match generate_attestation_inner(AttestationParams {
-                        model_name: &model_name,
-                        signing_address: &signing_address,
-                        signing_algo: algo,
-                        signing_public_key: &signing_public_key,
-                        signing_address_bytes: &signing_address_bytes,
-                        nonce: None,
-                        gpu_no_hw_mode,
-                        tls_cert_fingerprint: Some(fp.as_str()),
-                    })
+                    match generate_attestation_inner(
+                        AttestationParams {
+                            model_name: &model_name,
+                            signing_address: &signing_address,
+                            signing_algo: algo,
+                            signing_public_key: &signing_public_key,
+                            signing_address_bytes: &signing_address_bytes,
+                            nonce: None,
+                            gpu_no_hw_mode,
+                            tls_cert_fingerprint: Some(fp.as_str()),
+                        },
+                        Some(&cache),
+                    )
                     .await
                     {
                         Ok(report) => {
@@ -172,7 +440,6 @@ pub fn spawn_cache_refresh_task(
                             warn!(algo, error = %e, "Background attestation cache refresh (with TLS) failed");
                         }
                     }
-                    drop(_permit);
                 }
             }
 
@@ -252,8 +519,11 @@ fn parse_nonce(nonce: Option<&str>) -> Result<[u8; 32], AttestationError> {
     }
 }
 
-/// Collect GPU evidence via Python subprocess (single attempt).
-async fn collect_gpu_evidence_once(
+/// Fallback: collect GPU evidence via one-shot Python subprocess.
+///
+/// Used when the persistent worker cannot be spawned (e.g., script not found,
+/// Python not installed). Slower due to Python startup + module import overhead.
+async fn collect_gpu_evidence_subprocess(
     nonce_hex: &str,
     no_gpu_mode: bool,
 ) -> anyhow::Result<serde_json::Value> {
@@ -261,7 +531,6 @@ async fn collect_gpu_evidence_once(
         info!("GPU evidence no-GPU mode enabled; using canned evidence");
     }
 
-    // Build a small Python script that collects GPU evidence.
     // ppcie_mode=False is required on PPCIE systems (the default True triggers a
     // "standalone mode not supported" error). Safe on non-PPCIE systems too.
     let script = if no_gpu_mode {
@@ -313,28 +582,6 @@ print(json.dumps(evidence))
         .map_err(|e| anyhow::anyhow!("Failed to parse GPU evidence JSON: {e}"))?;
 
     Ok(evidence)
-}
-
-/// Collect GPU evidence with one retry on failure.
-///
-/// nvmlInit can intermittently time out under heavy GPU load. A single retry
-/// after a short delay often succeeds once the driver lock is released.
-async fn collect_gpu_evidence(
-    nonce_hex: &str,
-    no_gpu_mode: bool,
-) -> anyhow::Result<serde_json::Value> {
-    match collect_gpu_evidence_once(nonce_hex, no_gpu_mode).await {
-        Ok(evidence) => Ok(evidence),
-        Err(first_err) => {
-            warn!(
-                error = %first_err,
-                "GPU evidence collection failed, retrying after 2s"
-            );
-            metrics::counter!("gpu_evidence_retries_total").increment(1);
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            collect_gpu_evidence_once(nonce_hex, no_gpu_mode).await
-        }
-    }
 }
 
 /// Build NVIDIA payload JSON.
@@ -469,8 +716,15 @@ pub struct AttestationParams<'a> {
 }
 
 /// Generate a complete attestation report (core logic, no caching).
+///
+/// Parallelizes the two slow operations:
+/// - TDX quote generation (dstack Unix socket RPC)
+/// - GPU evidence collection (Python subprocess with NVML)
+///
+/// dstack info is cached for the process lifetime (it never changes).
 async fn generate_attestation_inner(
     params: AttestationParams<'_>,
+    cache: Option<&AttestationCache>,
 ) -> Result<AttestationReport, AttestationError> {
     let nonce_bytes = parse_nonce(params.nonce)?;
     let nonce_hex = hex::encode(nonce_bytes);
@@ -489,19 +743,49 @@ async fn generate_attestation_inner(
         fp_bytes.as_deref(),
     );
 
-    // Get TDX quote from dstack
-    let client = dstack_sdk::dstack_client::DstackClient::new(None);
-    let quote_result = client.get_quote(report_data).await?;
-    let event_log: serde_json::Value =
-        serde_json::from_str(&quote_result.event_log).map_err(anyhow::Error::from)?;
+    // Run TDX quote and GPU evidence collection in parallel.
+    // These are independent: TDX quote talks to dstack via Unix socket,
+    // GPU evidence uses the persistent Python worker (or subprocess fallback).
+    let gpu_no_hw_mode = params.gpu_no_hw_mode;
+    let nonce_hex_clone = nonce_hex.clone();
+    let (quote_result, gpu_evidence) = tokio::try_join!(
+        async {
+            let client = dstack_sdk::dstack_client::DstackClient::new(None);
+            client
+                .get_quote(report_data)
+                .await
+                .map_err(AttestationError::Internal)
+        },
+        async {
+            if let Some(cache) = cache {
+                cache
+                    .collect_gpu_evidence(&nonce_hex_clone, gpu_no_hw_mode)
+                    .await
+                    .map_err(AttestationError::Internal)
+            } else {
+                collect_gpu_evidence_subprocess(&nonce_hex_clone, gpu_no_hw_mode)
+                    .await
+                    .map_err(AttestationError::Internal)
+            }
+        },
+    )?;
 
-    // Collect GPU evidence
-    let gpu_evidence = collect_gpu_evidence(&nonce_hex, params.gpu_no_hw_mode).await?;
+    let event_log: serde_json::Value = serde_json::from_str(&quote_result.event_log)
+        .map_err(|e| AttestationError::Internal(anyhow::Error::from(e)))?;
     let nvidia_payload = build_nvidia_payload(&nonce_hex, &gpu_evidence);
 
-    // Get system info
-    let info = client.info().await?;
-    let info_value = serde_json::to_value(&info).map_err(anyhow::Error::from)?;
+    // dstack info is static — use cached value if available.
+    let info_value = if let Some(cache) = cache {
+        cache
+            .get_dstack_info()
+            .await
+            .map_err(AttestationError::Internal)?
+    } else {
+        let client = dstack_sdk::dstack_client::DstackClient::new(None);
+        let info = client.info().await.map_err(AttestationError::Internal)?;
+        serde_json::to_value(&info)
+            .map_err(|e| AttestationError::Internal(anyhow::Error::from(e)))?
+    };
 
     Ok(AttestationReport {
         model_name: params.model_name.to_string(),
@@ -517,48 +801,50 @@ async fn generate_attestation_inner(
     })
 }
 
+/// Result of attestation generation — either pre-serialized cached bytes or a fresh report.
+pub enum AttestationResult {
+    /// Cache hit: pre-serialized JSON bytes ready to send.
+    CachedBytes(bytes::Bytes),
+    /// Fresh report that needs serialization.
+    Fresh(Box<AttestationReport>),
+}
+
 /// Generate an attestation report, using the cache for nonce-less requests.
 ///
 /// When a caller provides a nonce, the GPU evidence and TDX quote are
 /// cryptographically bound to that nonce, so we must generate fresh.
 /// When no nonce is provided, we serve a cached report (which contains its
 /// own randomly-generated nonce) — the caller accepts whatever nonce we return.
+///
+/// GPU evidence collection is serialized by the worker Mutex (NVML constraint),
+/// but TDX quotes and dstack info calls run concurrently with other requests.
 pub async fn generate_attestation(
     params: AttestationParams<'_>,
     cache: Option<&AttestationCache>,
-) -> Result<AttestationReport, AttestationError> {
+) -> Result<AttestationResult, AttestationError> {
     let is_nonceless = params.nonce.is_none();
     let include_tls = params.tls_cert_fingerprint.is_some();
     let signing_algo = params.signing_algo.to_string();
 
-    // For nonce-less requests, try the cache first.
+    // For nonce-less requests, try the cache first (returns pre-serialized bytes).
     if is_nonceless {
         if let Some(cache) = cache {
-            if let Some(report) = cache.get(&signing_algo, include_tls).await {
-                return Ok(report);
+            if let Some(bytes) = cache.get_bytes(&signing_algo, include_tls).await {
+                return Ok(AttestationResult::CachedBytes(bytes));
             }
         }
     }
 
-    // Generate fresh report. Acquire semaphore to serialize GPU evidence calls.
-    let report = if let Some(cache) = cache {
-        let _permit = cache.acquire_gpu_permit().await;
-        // Double-check cache after acquiring permit (another request may have filled it).
-        if is_nonceless {
-            if let Some(report) = cache.get(&signing_algo, include_tls).await {
-                return Ok(report);
-            }
-        }
-        let report = generate_attestation_inner(params).await?;
-        if is_nonceless {
+    // Generate fresh report. GPU evidence is serialized by the worker Mutex,
+    // but TDX quote runs concurrently.
+    let report = generate_attestation_inner(params, cache).await?;
+    if is_nonceless {
+        if let Some(cache) = cache {
             cache.set(&signing_algo, include_tls, report.clone()).await;
         }
-        report
-    } else {
-        generate_attestation_inner(params).await?
-    };
+    }
 
-    Ok(report)
+    Ok(AttestationResult::Fresh(Box::new(report)))
 }
 
 #[cfg(test)]
@@ -745,30 +1031,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gpu_semaphore_serializes() {
-        let cache = Arc::new(AttestationCache::new(300));
+    async fn test_cache_get_bytes_returns_preserialized() {
+        let cache = AttestationCache::new(300);
+        let report = make_test_report("ecdsa", "aabb");
+        cache.set("ecdsa", false, report).await;
 
-        // Hold the first permit.
-        let permit1 = cache.acquire_gpu_permit().await;
-
-        // Spawn a task that tries to acquire the semaphore while we hold it.
-        let cache2 = cache.clone();
-        let mut handle = tokio::spawn(async move {
-            let _permit = cache2.acquire_gpu_permit().await;
-        });
-
-        // The second acquire should block (not complete within 50ms).
-        let result = tokio::time::timeout(std::time::Duration::from_millis(50), &mut handle).await;
-        assert!(
-            result.is_err(),
-            "second acquire should block while first permit is held"
-        );
-
-        // Release the first permit — the second task should now complete.
-        drop(permit1);
-        tokio::time::timeout(std::time::Duration::from_millis(50), handle)
-            .await
-            .expect("second acquire should complete after first permit is dropped")
-            .expect("task should not panic");
+        let bytes = cache.get_bytes("ecdsa", false).await;
+        assert!(bytes.is_some());
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&bytes.unwrap()).expect("cached bytes should be valid JSON");
+        assert_eq!(parsed["request_nonce"], "aabb");
+        assert!(parsed["all_attestations"].is_array());
     }
 }

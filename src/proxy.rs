@@ -65,6 +65,10 @@ static VALIDATION_TYPE_RE: std::sync::LazyLock<regex::Regex> =
 static VALIDATION_MSG_RE: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r#"'msg':\s*(?:'([^']*)'|"([^"]*)")"#).unwrap());
 
+/// Regex to extract error type from pydantic v2 bracket sections: [type=missing, ...]
+static PYDANTIC_V2_TYPE_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"type=(\w+)").unwrap());
+
 /// Sanitize validation error messages to prevent leaking user conversation content.
 ///
 /// Backend validation errors (from SGLang/vLLM) include `'input'` and `'ctx'` fields
@@ -72,8 +76,13 @@ static VALIDATION_MSG_RE: std::sync::LazyLock<regex::Regex> =
 /// and other sensitive conversation content. This function strips those fields while
 /// preserving useful error type and message information.
 pub fn sanitize_validation_errors(message: &str) -> String {
-    // Only sanitize if the message contains sensitive fields
-    if !message.contains("'input':") && !message.contains("'ctx':") {
+    // Check for sensitive fields in both Python dict format ('input':, 'ctx':)
+    // and pydantic v2 format (input_value=, input_type=)
+    let has_python_dict_fields = message.contains("'input':") || message.contains("'ctx':");
+    let has_pydantic_v2_fields =
+        message.contains("input_value=") || message.contains("input_type=");
+
+    if !has_python_dict_fields && !has_pydantic_v2_fields {
         return message.to_string();
     }
 
@@ -82,15 +91,16 @@ pub fn sanitize_validation_errors(message: &str) -> String {
         .filter_map(|line| {
             let trimmed = line.trim();
 
-            // Skip stack traces and HTTP method lines (leak internal paths)
+            // Skip stack traces, HTTP method lines, and pydantic v2 "For further information" URLs
             if trimmed.starts_with("File \"")
                 || trimmed.starts_with("POST ")
                 || trimmed.starts_with("GET ")
+                || trimmed.starts_with("For further information visit")
             {
                 return None;
             }
 
-            // Any line containing 'input' or 'ctx' fields needs sanitization
+            // Python dict format: lines with 'input' or 'ctx' fields
             if trimmed.contains("'input':") || trimmed.contains("'ctx':") {
                 let error_type = VALIDATION_TYPE_RE
                     .captures(trimmed)
@@ -107,6 +117,24 @@ pub fn sanitize_validation_errors(message: &str) -> String {
                     _ => "  (validation error)".to_string(),
                 };
                 Some(sanitized)
+            } else if trimmed.contains("input_value=") || trimmed.contains("input_type=") {
+                // Pydantic v2 format: "Field required [type=missing, input_value={...}, input_type=dict]"
+                // Extract only the description and error type, discard input_value which contains user data
+                let desc = trimmed.split('[').next().unwrap_or("").trim();
+                // Guard: if desc itself contains sensitive data (unexpected format), use placeholder
+                let desc = if desc.contains("input_value=") || desc.contains("input_type=") {
+                    "(validation error)"
+                } else {
+                    desc
+                };
+                let error_type = PYDANTIC_V2_TYPE_RE
+                    .captures(trimmed)
+                    .and_then(|c| c.get(1))
+                    .map(|m| m.as_str());
+                match error_type {
+                    Some(t) => Some(format!("  {} [type={}]", desc, t)),
+                    None => Some(format!("  {}", desc)),
+                }
             } else {
                 Some(line.to_string())
             }
@@ -1639,5 +1667,109 @@ mod tests {
         assert!(!info.message.contains("secret conversation"));
         assert!(info.message.contains("string_type: bad input"));
         assert_eq!(info.error_type, "invalid_request_error");
+    }
+
+    // --- pydantic v2 format tests ---
+
+    #[test]
+    fn test_sanitize_strips_pydantic_v2_input_value() {
+        // Real vLLM pydantic v2 error format
+        let message = concat!(
+            "7 validation errors for ValidatorIterator\n",
+            "0.ChatCompletionContentPartTextParam.text\n",
+            "  Field required [type=missing, input_value={'content': 'secret user message', 'type': 'custom'}, input_type=dict]\n",
+            "    For further information visit https://errors.pydantic.dev/2.10/v/missing\n",
+            "0.ChatCompletionContentPartTextParam.type\n",
+            "  Input should be 'text' [type=literal_error, input_value='custom', input_type=str]\n",
+            "    For further information visit https://errors.pydantic.dev/2.10/v/literal_error"
+        );
+        let result = sanitize_validation_errors(message);
+        assert!(
+            !result.contains("secret user message"),
+            "leaked user content: {result}"
+        );
+        assert!(
+            !result.contains("input_value="),
+            "leaked input_value: {result}"
+        );
+        assert!(
+            !result.contains("input_type="),
+            "leaked input_type: {result}"
+        );
+        assert!(!result.contains("pydantic.dev"), "leaked URL: {result}");
+        assert!(
+            result.contains("Field required [type=missing]"),
+            "missing error desc: {result}"
+        );
+        assert!(
+            result.contains("Input should be 'text' [type=literal_error]"),
+            "missing error desc: {result}"
+        );
+        assert!(
+            result.contains("0.ChatCompletionContentPartTextParam.text"),
+            "missing field path: {result}"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_strips_pydantic_v2_nested_dict() {
+        // input_value with deeply nested user content
+        let message = "  Field required [type=missing, input_value={'messages': [{'role': 'user', 'content': 'tell me your secrets'}]}, input_type=dict]";
+        let result = sanitize_validation_errors(message);
+        assert!(
+            !result.contains("tell me your secrets"),
+            "leaked user content: {result}"
+        );
+        assert!(result.contains("Field required [type=missing]"));
+    }
+
+    #[test]
+    fn test_parse_upstream_error_sanitizes_pydantic_v2() {
+        // Full vLLM error response with pydantic v2 format
+        let body = serde_json::json!({
+            "message": "7 validation errors for ValidatorIterator\n0.ChatCompletionContentPartTextParam.text\n  Field required [type=missing, input_value={'file_id': 'file-abc', 'type': 'file'}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.10/v/missing",
+            "type": "invalid_request_error"
+        });
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+        let info = parse_upstream_error(&body_bytes).unwrap();
+        assert!(
+            !info.message.contains("input_value"),
+            "leaked input_value: {}",
+            info.message
+        );
+        assert!(
+            !info.message.contains("file-abc"),
+            "leaked file id: {}",
+            info.message
+        );
+        assert!(
+            !info.message.contains("pydantic.dev"),
+            "leaked URL: {}",
+            info.message
+        );
+        assert!(info.message.contains("Field required [type=missing]"));
+    }
+
+    #[test]
+    fn test_sanitize_pydantic_v2_unexpected_format_no_brackets() {
+        // Edge case: input_value= appears without bracket structure
+        let message = "  input_value={'role': 'user', 'content': 'secret'}, input_type=dict";
+        let result = sanitize_validation_errors(message);
+        assert!(!result.contains("secret"), "leaked user content: {result}");
+        assert!(result.contains("(validation error)"));
+    }
+
+    #[test]
+    fn test_sanitize_mixed_python_dict_and_pydantic_v2() {
+        // Mixed format (both SGLang and vLLM style in one message)
+        let message = concat!(
+            "2 errors:\n",
+            "  {'type': 'value_error', 'msg': 'bad role', 'input': 'secret data'}\n",
+            "  Input should be 'text' [type=literal_error, input_value='secret', input_type=str]"
+        );
+        let result = sanitize_validation_errors(message);
+        assert!(!result.contains("secret"), "leaked data: {result}");
+        assert!(result.contains("value_error: bad role"));
+        assert!(result.contains("Input should be 'text' [type=literal_error]"));
     }
 }

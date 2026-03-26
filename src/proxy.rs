@@ -120,7 +120,7 @@ pub fn sanitize_validation_errors(message: &str) -> String {
             } else if trimmed.contains("input_value=") || trimmed.contains("input_type=") {
                 // Pydantic v2 format: "Field required [type=missing, input_value={...}, input_type=dict]"
                 // Extract only the description and error type, discard input_value which contains user data
-                let desc = trimmed.splitn(2, '[').next().unwrap_or("").trim();
+                let desc = trimmed.split('[').next().unwrap_or("").trim();
                 // Guard: if desc itself contains sensitive data (unexpected format), use placeholder
                 let desc = if desc.contains("input_value=") || desc.contains("input_type=") {
                     "(validation error)"

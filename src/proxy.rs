@@ -79,7 +79,8 @@ pub fn sanitize_validation_errors(message: &str) -> String {
     // Check for sensitive fields in both Python dict format ('input':, 'ctx':)
     // and pydantic v2 format (input_value=, input_type=)
     let has_python_dict_fields = message.contains("'input':") || message.contains("'ctx':");
-    let has_pydantic_v2_fields = message.contains("input_value=") || message.contains("input_type=");
+    let has_pydantic_v2_fields =
+        message.contains("input_value=") || message.contains("input_type=");
 
     if !has_python_dict_fields && !has_pydantic_v2_fields {
         return message.to_string();
@@ -119,7 +120,13 @@ pub fn sanitize_validation_errors(message: &str) -> String {
             } else if trimmed.contains("input_value=") || trimmed.contains("input_type=") {
                 // Pydantic v2 format: "Field required [type=missing, input_value={...}, input_type=dict]"
                 // Extract only the description and error type, discard input_value which contains user data
-                let desc = trimmed.split('[').next().unwrap_or("").trim();
+                let desc = trimmed.splitn(2, '[').next().unwrap_or("").trim();
+                // Guard: if desc itself contains sensitive data (unexpected format), use placeholder
+                let desc = if desc.contains("input_value=") || desc.contains("input_type=") {
+                    "(validation error)"
+                } else {
+                    desc
+                };
                 let error_type = PYDANTIC_V2_TYPE_RE
                     .captures(trimmed)
                     .and_then(|c| c.get(1))
@@ -1677,13 +1684,31 @@ mod tests {
             "    For further information visit https://errors.pydantic.dev/2.10/v/literal_error"
         );
         let result = sanitize_validation_errors(message);
-        assert!(!result.contains("secret user message"), "leaked user content: {result}");
-        assert!(!result.contains("input_value="), "leaked input_value: {result}");
-        assert!(!result.contains("input_type="), "leaked input_type: {result}");
+        assert!(
+            !result.contains("secret user message"),
+            "leaked user content: {result}"
+        );
+        assert!(
+            !result.contains("input_value="),
+            "leaked input_value: {result}"
+        );
+        assert!(
+            !result.contains("input_type="),
+            "leaked input_type: {result}"
+        );
         assert!(!result.contains("pydantic.dev"), "leaked URL: {result}");
-        assert!(result.contains("Field required [type=missing]"), "missing error desc: {result}");
-        assert!(result.contains("Input should be 'text' [type=literal_error]"), "missing error desc: {result}");
-        assert!(result.contains("0.ChatCompletionContentPartTextParam.text"), "missing field path: {result}");
+        assert!(
+            result.contains("Field required [type=missing]"),
+            "missing error desc: {result}"
+        );
+        assert!(
+            result.contains("Input should be 'text' [type=literal_error]"),
+            "missing error desc: {result}"
+        );
+        assert!(
+            result.contains("0.ChatCompletionContentPartTextParam.text"),
+            "missing field path: {result}"
+        );
     }
 
     #[test]
@@ -1691,7 +1716,10 @@ mod tests {
         // input_value with deeply nested user content
         let message = "  Field required [type=missing, input_value={'messages': [{'role': 'user', 'content': 'tell me your secrets'}]}, input_type=dict]";
         let result = sanitize_validation_errors(message);
-        assert!(!result.contains("tell me your secrets"), "leaked user content: {result}");
+        assert!(
+            !result.contains("tell me your secrets"),
+            "leaked user content: {result}"
+        );
         assert!(result.contains("Field required [type=missing]"));
     }
 
@@ -1704,10 +1732,31 @@ mod tests {
         });
         let body_bytes = serde_json::to_vec(&body).unwrap();
         let info = parse_upstream_error(&body_bytes).unwrap();
-        assert!(!info.message.contains("input_value"), "leaked input_value: {}", info.message);
-        assert!(!info.message.contains("file-abc"), "leaked file id: {}", info.message);
-        assert!(!info.message.contains("pydantic.dev"), "leaked URL: {}", info.message);
+        assert!(
+            !info.message.contains("input_value"),
+            "leaked input_value: {}",
+            info.message
+        );
+        assert!(
+            !info.message.contains("file-abc"),
+            "leaked file id: {}",
+            info.message
+        );
+        assert!(
+            !info.message.contains("pydantic.dev"),
+            "leaked URL: {}",
+            info.message
+        );
         assert!(info.message.contains("Field required [type=missing]"));
+    }
+
+    #[test]
+    fn test_sanitize_pydantic_v2_unexpected_format_no_brackets() {
+        // Edge case: input_value= appears without bracket structure
+        let message = "  input_value={'role': 'user', 'content': 'secret'}, input_type=dict";
+        let result = sanitize_validation_errors(message);
+        assert!(!result.contains("secret"), "leaked user content: {result}");
+        assert!(result.contains("(validation error)"));
     }
 
     #[test]

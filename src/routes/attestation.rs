@@ -55,6 +55,7 @@ pub async fn attestation_report(
         }
     }
 
+    let include_tls = query.include_tls_fingerprint.unwrap_or(false);
     let result = crate::attestation::generate_attestation(
         crate::attestation::AttestationParams {
             model_name: &state.config.model_name,
@@ -64,7 +65,7 @@ pub async fn attestation_report(
             signing_address_bytes: &signing_address_bytes,
             nonce: query.nonce.as_deref(),
             gpu_no_hw_mode: state.config.gpu_no_hw_mode,
-            tls_cert_fingerprint: if query.include_tls_fingerprint.unwrap_or(false) {
+            tls_cert_fingerprint: if include_tls {
                 state.tls_cert_fingerprint.as_deref()
             } else {
                 None
@@ -80,19 +81,46 @@ pub async fn attestation_report(
 
     match result {
         // Cache hit: return pre-serialized bytes directly (no clone, no serialization).
+        // Compose-manager attestation is included in cached bytes by the background refresh task.
         AttestationResult::CachedBytes(bytes) => Ok((
             StatusCode::OK,
             [("content-type", "application/json")],
             bytes,
         )
             .into_response()),
-        // Fresh report: serialize once.
+        // Fresh report: fetch compose-manager attestation, cache, and return.
         AttestationResult::Fresh(report) => {
+            let cm_attestation = if let Some(ref url) = state.config.compose_manager_url {
+                crate::attestation::fetch_compose_manager_attestation(
+                    &state.http_client,
+                    url,
+                    query.nonce.as_deref(),
+                )
+                .await
+            } else {
+                None
+            };
+
+            // Cache nonce-less reports so subsequent requests get the full response
+            // including compose-manager attestation.
+            if query.nonce.is_none() {
+                state
+                    .attestation_cache
+                    .set(
+                        signing_algo,
+                        include_tls,
+                        report.as_ref().clone(),
+                        cm_attestation.clone(),
+                    )
+                    .await;
+            }
+
             let response = AttestationResponse {
                 report: report.as_ref().clone(),
                 all_attestations: vec![*report],
+                compose_manager_attestation: cm_attestation,
             };
-            Ok(Json(serde_json::to_value(response).unwrap()).into_response())
+            Ok(Json(response).into_response())
         }
     }
 }

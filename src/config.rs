@@ -75,6 +75,9 @@ pub struct Config {
     // Cloud API for sk- key validation
     pub cloud_api_url: Option<String>,
 
+    // Compose-manager attestation (deployment actions attestation)
+    pub compose_manager_url: Option<String>,
+
     // OpenAI Chat Compatibility Checks
     // Validates that hosted models (qwen, glm, etc.) send OpenAI-compliant responses:
     // - /v1/models API format
@@ -134,6 +137,11 @@ impl Config {
             .filter(|s| !s.is_empty())
             .map(|s| s.trim_end_matches('/').to_string());
 
+        let compose_manager_url = env::var("COMPOSE_MANAGER_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.trim_end_matches('/').to_string());
+
         let config = Config {
             model_name,
             token,
@@ -150,6 +158,7 @@ impl Config {
             rerank_url,
             score_url,
             cloud_api_url,
+            compose_manager_url,
             tls_cert_path,
             max_keepalive: env_int("VLLM_PROXY_MAX_KEEPALIVE", 100),
             max_request_size: env_int("VLLM_PROXY_MAX_REQUEST_SIZE", 10 * 1024 * 1024),

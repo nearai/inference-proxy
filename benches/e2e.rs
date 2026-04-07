@@ -60,6 +60,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         rate_limit_burst_size: 20000,
         rate_limit_trust_proxy_headers: false,
         cloud_api_url: None,
+        compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,
         timeout_tokenize_secs: 5,
@@ -211,7 +212,7 @@ fn bench_attestation_cache_operations(c: &mut Criterion) {
         info: serde_json::json!({"version": "1.0"}),
         tls_cert_fingerprint: None,
     };
-    rt.block_on(cache.set("ecdsa", false, report.clone()));
+    rt.block_on(cache.set("ecdsa", false, report.clone(), None));
 
     group.bench_function("cache_hit", |b| {
         b.to_async(&rt)
@@ -225,7 +226,7 @@ fn bench_attestation_cache_operations(c: &mut Criterion) {
 
     group.bench_function("cache_set", |b| {
         b.to_async(&rt)
-            .iter(|| async { cache.set("ecdsa", false, report.clone()).await })
+            .iter(|| async { cache.set("ecdsa", false, report.clone(), None).await })
     });
 
     group.finish();
@@ -259,6 +260,7 @@ fn bench_attestation_report_serialization(c: &mut Criterion) {
     let response = types::AttestationResponse {
         report: report.clone(),
         all_attestations: vec![report],
+        compose_manager_attestation: None,
     };
 
     c.bench_function("attestation_response_serialize", |b| {

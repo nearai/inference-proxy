@@ -34,6 +34,10 @@ pub struct AttestationResponse {
     #[serde(flatten)]
     pub report: AttestationReport,
     pub all_attestations: Vec<AttestationReport>,
+    /// Compose-manager deployment attestation, if available.
+    /// Contains the compose-manager's TDX-attested action log (deployment events).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compose_manager_attestation: Option<serde_json::Value>,
 }
 
 /// Response for GET /v1/signature/{chat_id}.

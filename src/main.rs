@@ -102,6 +102,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn background attestation cache refresh task.
     // Refresh interval is half the TTL to ensure the cache never goes stale.
+    let compose_manager =
+        state
+            .config
+            .compose_manager_url
+            .as_ref()
+            .map(|url| attestation::ComposeManagerConfig {
+                http_client: state.http_client.clone(),
+                url: url.clone(),
+            });
     attestation::spawn_cache_refresh_task(
         attestation_cache,
         model_name,
@@ -109,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
         state.config.gpu_no_hw_mode,
         tls_cert_fingerprint,
         state.config.attestation_cache_ttl_secs / 2,
+        compose_manager,
     );
 
     // Run OpenAI chat compatibility checks if enabled

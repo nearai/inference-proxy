@@ -333,10 +333,12 @@ impl AttestationCache {
         signing_algo: &str,
         include_tls_fingerprint: bool,
         report: AttestationReport,
+        compose_manager_attestation: Option<serde_json::Value>,
     ) {
         let response = crate::types::AttestationResponse {
             report: report.clone(),
             all_attestations: vec![report.clone()],
+            compose_manager_attestation,
         };
         let response_bytes = match serde_json::to_vec(&response) {
             Ok(bytes) => bytes::Bytes::from(bytes),
@@ -361,6 +363,56 @@ impl AttestationCache {
     }
 }
 
+/// Fetch compose-manager attestation report from the given URL.
+///
+/// Returns `None` on any error (timeout, connection refused, bad JSON, etc.)
+/// so that compose-manager unavailability never blocks inference attestation.
+pub async fn fetch_compose_manager_attestation(
+    http_client: &reqwest::Client,
+    compose_manager_url: &str,
+    nonce: Option<&str>,
+) -> Option<serde_json::Value> {
+    let mut url = match reqwest::Url::parse(compose_manager_url) {
+        Ok(u) => u,
+        Err(e) => {
+            warn!(error = %e, "Invalid compose-manager base URL");
+            return None;
+        }
+    };
+    url.set_path("/v1/attestation/report");
+    if let Some(nonce) = nonce {
+        url.query_pairs_mut().append_pair("nonce", nonce);
+    }
+    match http_client
+        .get(url)
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+            Ok(val) => Some(val),
+            Err(e) => {
+                warn!(error = %e, "Failed to parse compose-manager attestation response");
+                None
+            }
+        },
+        Ok(resp) => {
+            warn!(status = %resp.status(), "Compose-manager attestation returned non-success status");
+            None
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to fetch compose-manager attestation");
+            None
+        }
+    }
+}
+
+/// Compose-manager connection info for fetching deployment attestation.
+pub struct ComposeManagerConfig {
+    pub http_client: reqwest::Client,
+    pub url: String,
+}
+
 /// Spawn a background task that periodically refreshes cached attestation reports.
 pub fn spawn_cache_refresh_task(
     cache: Arc<AttestationCache>,
@@ -369,12 +421,20 @@ pub fn spawn_cache_refresh_task(
     gpu_no_hw_mode: bool,
     tls_cert_fingerprint: Option<String>,
     refresh_interval_secs: u64,
+    compose_manager: Option<ComposeManagerConfig>,
 ) {
     tokio::spawn(async move {
         // Initial delay to let the server start up.
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
         loop {
+            // Fetch compose-manager attestation once per refresh cycle (shared across algos).
+            let cm_attestation = if let Some(ref cm) = compose_manager {
+                fetch_compose_manager_attestation(&cm.http_client, &cm.url, None).await
+            } else {
+                None
+            };
+
             for algo in &["ecdsa", "ed25519"] {
                 let (signing_address, signing_address_bytes, signing_public_key) = match *algo {
                     "ecdsa" => (
@@ -408,7 +468,7 @@ pub fn spawn_cache_refresh_task(
                 .await
                 {
                     Ok(report) => {
-                        cache.set(algo, false, report).await;
+                        cache.set(algo, false, report, cm_attestation.clone()).await;
                         info!(algo, "Background attestation cache refresh succeeded");
                     }
                     Err(e) => {
@@ -434,7 +494,7 @@ pub fn spawn_cache_refresh_task(
                     .await
                     {
                         Ok(report) => {
-                            cache.set(algo, true, report).await;
+                            cache.set(algo, true, report, cm_attestation.clone()).await;
                         }
                         Err(e) => {
                             warn!(algo, error = %e, "Background attestation cache refresh (with TLS) failed");
@@ -838,11 +898,8 @@ pub async fn generate_attestation(
     // Generate fresh report. GPU evidence is serialized by the worker Mutex,
     // but TDX quote runs concurrently.
     let report = generate_attestation_inner(params, cache).await?;
-    if is_nonceless {
-        if let Some(cache) = cache {
-            cache.set(&signing_algo, include_tls, report.clone()).await;
-        }
-    }
+    // Don't cache here — the caller (route handler) caches after fetching
+    // compose-manager attestation so cached responses include the full chain.
 
     Ok(AttestationResult::Fresh(Box::new(report)))
 }
@@ -991,7 +1048,7 @@ mod tests {
     async fn test_attestation_cache_hit() {
         let cache = AttestationCache::new(300);
         let report = make_test_report("ecdsa", "aabb");
-        cache.set("ecdsa", false, report.clone()).await;
+        cache.set("ecdsa", false, report.clone(), None).await;
 
         let result = cache.get("ecdsa", false).await;
         assert!(result.is_some());
@@ -1002,7 +1059,7 @@ mod tests {
     async fn test_attestation_cache_miss_different_algo() {
         let cache = AttestationCache::new(300);
         cache
-            .set("ecdsa", false, make_test_report("ecdsa", "aa"))
+            .set("ecdsa", false, make_test_report("ecdsa", "aa"), None)
             .await;
 
         assert!(cache.get("ed25519", false).await.is_none());
@@ -1012,7 +1069,7 @@ mod tests {
     async fn test_attestation_cache_miss_different_tls() {
         let cache = AttestationCache::new(300);
         cache
-            .set("ecdsa", false, make_test_report("ecdsa", "aa"))
+            .set("ecdsa", false, make_test_report("ecdsa", "aa"), None)
             .await;
 
         assert!(cache.get("ecdsa", true).await.is_none());
@@ -1022,7 +1079,7 @@ mod tests {
     async fn test_attestation_cache_ttl_expiry() {
         let cache = AttestationCache::new(1);
         cache
-            .set("ecdsa", false, make_test_report("ecdsa", "aa"))
+            .set("ecdsa", false, make_test_report("ecdsa", "aa"), None)
             .await;
 
         assert!(cache.get("ecdsa", false).await.is_some());
@@ -1034,7 +1091,7 @@ mod tests {
     async fn test_cache_get_bytes_returns_preserialized() {
         let cache = AttestationCache::new(300);
         let report = make_test_report("ecdsa", "aabb");
-        cache.set("ecdsa", false, report).await;
+        cache.set("ecdsa", false, report, None).await;
 
         let bytes = cache.get_bytes("ecdsa", false).await;
         assert!(bytes.is_some());
@@ -1042,5 +1099,112 @@ mod tests {
             serde_json::from_slice(&bytes.unwrap()).expect("cached bytes should be valid JSON");
         assert_eq!(parsed["request_nonce"], "aabb");
         assert!(parsed["all_attestations"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_cache_includes_compose_manager_attestation() {
+        let cache = AttestationCache::new(300);
+        let report = make_test_report("ecdsa", "aabb");
+        let cm_attestation = serde_json::json!({
+            "actions": [{"action": "compose_up", "tag": "v1.0"}],
+            "actions_hash": "deadbeef",
+            "quote": "some_tdx_quote"
+        });
+        cache
+            .set("ecdsa", false, report, Some(cm_attestation.clone()))
+            .await;
+
+        // Verify the struct getter doesn't include compose-manager attestation
+        // (it only returns AttestationReport, not the full response)
+        let result = cache.get("ecdsa", false).await;
+        assert!(result.is_some());
+
+        // Verify pre-serialized bytes include compose_manager_attestation
+        let bytes = cache.get_bytes("ecdsa", false).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["compose_manager_attestation"], cm_attestation);
+    }
+
+    #[tokio::test]
+    async fn test_cache_omits_compose_manager_attestation_when_none() {
+        let cache = AttestationCache::new(300);
+        let report = make_test_report("ecdsa", "aabb");
+        cache.set("ecdsa", false, report, None).await;
+
+        let bytes = cache.get_bytes("ecdsa", false).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(parsed.get("compose_manager_attestation").is_none());
+    }
+}
+
+#[cfg(test)]
+mod tests_fetch_compose_manager {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_fetch_success() {
+        let mock = wiremock::MockServer::start().await;
+        let cm_response = serde_json::json!({
+            "actions": [],
+            "actions_hash": "abc123",
+            "nonce": "def456",
+            "quote": "tdx_quote_data"
+        });
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v1/attestation/report"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&cm_response))
+            .mount(&mock)
+            .await;
+
+        let client = reqwest::Client::new();
+        let result = fetch_compose_manager_attestation(&client, &mock.uri(), None).await;
+        assert_eq!(result, Some(cm_response));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_passes_nonce() {
+        let mock = wiremock::MockServer::start().await;
+        let nonce = "aa".repeat(32);
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v1/attestation/report"))
+            .and(wiremock::matchers::query_param("nonce", &nonce))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"nonce": &nonce})),
+            )
+            .mount(&mock)
+            .await;
+
+        let client = reqwest::Client::new();
+        let result = fetch_compose_manager_attestation(&client, &mock.uri(), Some(&nonce)).await;
+        assert!(result.is_some());
+        assert_eq!(result.unwrap()["nonce"], nonce);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_returns_none_on_server_error() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v1/attestation/report"))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .mount(&mock)
+            .await;
+
+        let client = reqwest::Client::new();
+        let result = fetch_compose_manager_attestation(&client, &mock.uri(), None).await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_returns_none_on_connection_refused() {
+        // Bind to an ephemeral port, then drop the listener to guarantee nothing is listening.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+        drop(listener);
+
+        let client = reqwest::Client::new();
+        let result = fetch_compose_manager_attestation(&client, &base_url, None).await;
+        assert!(result.is_none());
     }
 }

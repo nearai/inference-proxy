@@ -82,6 +82,11 @@ impl BackendPool {
         self.backends.len()
     }
 
+    /// Whether the pool is empty (always false — constructor requires ≥1 backend).
+    pub fn is_empty(&self) -> bool {
+        self.backends.is_empty()
+    }
+
     /// Select a backend using least-connections among healthy backends.
     /// If all are unhealthy, picks the least-loaded one anyway.
     pub fn select(&self) -> Arc<Backend> {

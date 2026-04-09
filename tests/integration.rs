@@ -59,6 +59,15 @@ fn build_test_app_with_rate_limit(
         startup_check_retries: 1,
         startup_check_retry_delay_secs: 0,
         startup_check_timeout_secs: 5,
+        backend_urls: vec![mock_url.to_string()],
+        health_check_interval_secs: 5,
+        health_check_max_failures: 3,
+        health_check_timeout_secs: 3,
+        images_url_override: None,
+        images_edits_url_override: None,
+        transcriptions_url_override: None,
+        rerank_url_override: None,
+        score_url_override: None,
     };
 
     // Use fixed keys for deterministic tests
@@ -85,6 +94,10 @@ fn build_test_app_with_rate_limit(
         .build_recorder()
         .handle();
 
+    let backend_pool = Arc::new(vllm_proxy_rs::backend_pool::BackendPool::new(vec![
+        mock_url.to_string(),
+    ]));
+
     let state = AppState {
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
@@ -93,6 +106,7 @@ fn build_test_app_with_rate_limit(
         http_client,
         metrics_handle,
         tls_cert_fingerprint: None,
+        backend_pool,
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(rate_per_second, rate_burst);
@@ -2806,6 +2820,15 @@ fn build_test_app_with_cloud_api(mock_url: &str, cloud_api_url: &str) -> axum::R
         startup_check_retries: 1,
         startup_check_retry_delay_secs: 0,
         startup_check_timeout_secs: 5,
+        backend_urls: vec![mock_url.to_string()],
+        health_check_interval_secs: 5,
+        health_check_max_failures: 3,
+        health_check_timeout_secs: 3,
+        images_url_override: None,
+        images_edits_url_override: None,
+        transcriptions_url_override: None,
+        rerank_url_override: None,
+        score_url_override: None,
     };
 
     let ecdsa_key: [u8; 32] = [
@@ -2829,6 +2852,10 @@ fn build_test_app_with_cloud_api(mock_url: &str, cloud_api_url: &str) -> axum::R
         .build_recorder()
         .handle();
 
+    let backend_pool = Arc::new(vllm_proxy_rs::backend_pool::BackendPool::new(vec![
+        mock_url.to_string(),
+    ]));
+
     let state = AppState {
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
@@ -2837,6 +2864,7 @@ fn build_test_app_with_cloud_api(mock_url: &str, cloud_api_url: &str) -> axum::R
         http_client,
         metrics_handle,
         tls_cert_fingerprint: None,
+        backend_pool,
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(100, 200);

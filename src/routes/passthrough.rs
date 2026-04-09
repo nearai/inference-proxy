@@ -20,9 +20,10 @@ pub async fn tokenize(
 ) -> Result<Response, AppError> {
     let request_body = read_body_with_limit(body, state.config.max_request_size).await?;
 
+    let (url, _guard) = state.backend_pool.select_url("/tokenize");
     proxy::proxy_simple(
         &state.http_client,
-        &state.config.tokenize_url,
+        &url,
         reqwest::Method::POST,
         Some(&request_body),
         "application/json",
@@ -46,7 +47,8 @@ pub async fn embeddings(
     json_passthrough_encrypted(
         state,
         body,
-        |c| &c.embeddings_url,
+        "/v1/embeddings",
+        None,
         "emb",
         |c| c.max_request_size,
         reporter,
@@ -66,11 +68,13 @@ pub async fn rerank(
 ) -> Result<Response, AppError> {
     let reporter = make_usage_reporter(auth.cloud_api_key.as_ref(), &state);
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
+    let url_override = state.config.rerank_url_override.clone();
 
     json_passthrough_encrypted(
         state,
         body,
-        |c| &c.rerank_url,
+        "/v1/rerank",
+        url_override.as_deref(),
         "rerank",
         |c| c.max_request_size,
         reporter,
@@ -90,11 +94,13 @@ pub async fn score(
 ) -> Result<Response, AppError> {
     let reporter = make_usage_reporter(auth.cloud_api_key.as_ref(), &state);
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
+    let url_override = state.config.score_url_override.clone();
 
     json_passthrough_encrypted(
         state,
         body,
-        |c| &c.score_url,
+        "/v1/score",
+        url_override.as_deref(),
         "score",
         |c| c.max_request_size,
         reporter,
@@ -114,11 +120,13 @@ pub async fn images_generations(
 ) -> Result<Response, AppError> {
     let reporter = make_usage_reporter(auth.cloud_api_key.as_ref(), &state);
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
+    let url_override = state.config.images_url_override.clone();
 
     json_passthrough_encrypted(
         state,
         body,
-        |c| &c.images_url,
+        "/v1/images/generations",
+        url_override.as_deref(),
         "img",
         |c| c.max_image_request_size,
         reporter,
@@ -194,14 +202,12 @@ pub async fn images_edits(
         chunk_transform: None,
     };
 
-    proxy::proxy_multipart_request(
-        &state.http_client,
-        &state.config.images_edits_url,
-        form,
-        &request_sha256,
-        opts,
-    )
-    .await
+    let url = match &state.config.images_edits_url_override {
+        Some(override_url) => override_url.clone(),
+        None => state.backend_pool.select_url("/v1/images/edits").0,
+    };
+
+    proxy::proxy_multipart_request(&state.http_client, &url, form, &request_sha256, opts).await
 }
 
 /// POST /v1/audio/transcriptions — multipart proxy with signing.
@@ -272,14 +278,12 @@ pub async fn audio_transcriptions(
         chunk_transform: None,
     };
 
-    proxy::proxy_multipart_request(
-        &state.http_client,
-        &state.config.transcriptions_url,
-        form,
-        &request_sha256,
-        opts,
-    )
-    .await
+    let url = match &state.config.transcriptions_url_override {
+        Some(override_url) => override_url.clone(),
+        None => state.backend_pool.select_url("/v1/audio/transcriptions").0,
+    };
+
+    proxy::proxy_multipart_request(&state.http_client, &url, form, &request_sha256, opts).await
 }
 
 /// Generic JSON passthrough with signing and optional encryption support.
@@ -287,7 +291,8 @@ pub async fn audio_transcriptions(
 async fn json_passthrough_encrypted(
     state: AppState,
     body: Body,
-    url_fn: fn(&crate::config::Config) -> &str,
+    pool_path: &str,
+    url_override: Option<&str>,
     id_prefix: &str,
     size_fn: fn(&crate::config::Config) -> usize,
     usage_reporter: Option<UsageReporter>,
@@ -330,8 +335,11 @@ async fn json_passthrough_encrypted(
         chunk_transform: None,
     };
 
-    let url = url_fn(&state.config);
-    proxy::proxy_json_request(&state.http_client, url, forward_body, opts).await
+    let url = match url_override {
+        Some(u) => u.to_string(),
+        None => state.backend_pool.select_url(pool_path).0,
+    };
+    proxy::proxy_json_request(&state.http_client, &url, forward_body, opts).await
 }
 
 /// Read a multipart field incrementally, checking cumulative size (without hashing).

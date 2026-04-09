@@ -7,9 +7,10 @@ use crate::AppState;
 
 /// GET /v1/metrics — plain text passthrough (no auth).
 pub async fn metrics(State(state): State<AppState>) -> Result<Response, AppError> {
+    let (url, _guard) = state.backend_pool.select_url("/metrics");
     proxy::proxy_simple(
         &state.http_client,
-        &state.config.metrics_url,
+        &url,
         reqwest::Method::GET,
         None,
         "text/plain; charset=utf-8",
@@ -20,9 +21,10 @@ pub async fn metrics(State(state): State<AppState>) -> Result<Response, AppError
 
 /// GET /v1/models — JSON passthrough (no auth).
 pub async fn models(State(state): State<AppState>) -> Result<Response, AppError> {
+    let (url, _guard) = state.backend_pool.select_url("/v1/models");
     proxy::proxy_simple(
         &state.http_client,
-        &state.config.models_url,
+        &url,
         reqwest::Method::GET,
         None,
         "application/json",

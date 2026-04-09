@@ -101,22 +101,12 @@ pub async fn chat_completions(
         chunk_transform,
     };
 
+    let (url, _guard) = state.backend_pool.select_url("/v1/chat/completions");
+
     if is_stream {
-        proxy::proxy_streaming_request(
-            &state.http_client,
-            &state.config.chat_completions_url,
-            modified_body,
-            opts,
-        )
-        .await
+        proxy::proxy_streaming_request(&state.http_client, &url, modified_body, opts).await
     } else {
-        proxy::proxy_json_request(
-            &state.http_client,
-            &state.config.chat_completions_url,
-            modified_body,
-            opts,
-        )
-        .await
+        proxy::proxy_json_request(&state.http_client, &url, modified_body, opts).await
     }
 }
 

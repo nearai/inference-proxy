@@ -91,6 +91,23 @@ pub struct Config {
     pub startup_check_retries: usize,
     pub startup_check_retry_delay_secs: u64,
     pub startup_check_timeout_secs: u64,
+
+    // Multi-backend support
+    /// All backend base URLs (derived from VLLM_BACKEND_URLS or VLLM_BASE_URL).
+    pub backend_urls: Vec<String>,
+    /// Health check interval in seconds (only used when multiple backends).
+    pub health_check_interval_secs: u64,
+    /// Consecutive failures before marking a backend unhealthy.
+    pub health_check_max_failures: u32,
+    /// Health check timeout in seconds.
+    pub health_check_timeout_secs: u64,
+
+    // Endpoint URL overrides (Some = explicitly set, bypasses backend pool)
+    pub images_url_override: Option<String>,
+    pub images_edits_url_override: Option<String>,
+    pub transcriptions_url_override: Option<String>,
+    pub rerank_url_override: Option<String>,
+    pub score_url_override: Option<String>,
 }
 
 impl Config {
@@ -106,14 +123,47 @@ impl Config {
         let vllm_base_url = env_or("VLLM_BASE_URL", "http://localhost:8000");
         let base = vllm_base_url.trim_end_matches('/');
 
-        let images_url = env_or("VLLM_IMAGES_URL", &format!("{base}/v1/images/generations"));
-        let images_edits_url = env_or("VLLM_IMAGES_EDITS_URL", &format!("{base}/v1/images/edits"));
-        let transcriptions_url = env_or(
-            "VLLM_TRANSCRIPTIONS_URL",
-            &format!("{base}/v1/audio/transcriptions"),
-        );
-        let rerank_url = env_or("VLLM_RERANK_URL", &format!("{base}/v1/rerank"));
-        let score_url = env_or("VLLM_SCORE_URL", &format!("{base}/v1/score"));
+        // Multi-backend: VLLM_BACKEND_URLS takes precedence over VLLM_BASE_URL
+        let backend_urls: Vec<String> = env::var("VLLM_BACKEND_URLS")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.split(',')
+                    .map(|u| u.trim().trim_end_matches('/').to_string())
+                    .filter(|u| !u.is_empty())
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![vllm_base_url.clone()]);
+        if backend_urls.is_empty() {
+            anyhow::bail!("VLLM_BACKEND_URLS is set but contains no valid URLs");
+        }
+
+        // Track which endpoint URLs are explicitly overridden (should bypass pool)
+        let images_url_override = env::var("VLLM_IMAGES_URL").ok().filter(|s| !s.is_empty());
+        let images_edits_url_override = env::var("VLLM_IMAGES_EDITS_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let transcriptions_url_override = env::var("VLLM_TRANSCRIPTIONS_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let rerank_url_override = env::var("VLLM_RERANK_URL").ok().filter(|s| !s.is_empty());
+        let score_url_override = env::var("VLLM_SCORE_URL").ok().filter(|s| !s.is_empty());
+
+        let images_url = images_url_override
+            .clone()
+            .unwrap_or_else(|| format!("{base}/v1/images/generations"));
+        let images_edits_url = images_edits_url_override
+            .clone()
+            .unwrap_or_else(|| format!("{base}/v1/images/edits"));
+        let transcriptions_url = transcriptions_url_override
+            .clone()
+            .unwrap_or_else(|| format!("{base}/v1/audio/transcriptions"));
+        let rerank_url = rerank_url_override
+            .clone()
+            .unwrap_or_else(|| format!("{base}/v1/rerank"));
+        let score_url = score_url_override
+            .clone()
+            .unwrap_or_else(|| format!("{base}/v1/score"));
 
         let git_rev = std::fs::read_to_string("/etc/.GIT_REV")
             .map(|s| s.trim().to_string())
@@ -178,6 +228,15 @@ impl Config {
             startup_check_retries: env_int("STARTUP_CHECK_RETRIES", 3),
             startup_check_retry_delay_secs: env_int("STARTUP_CHECK_RETRY_DELAY_SECS", 5) as u64,
             startup_check_timeout_secs: env_int("STARTUP_CHECK_TIMEOUT_SECS", 30) as u64,
+            backend_urls,
+            health_check_interval_secs: env_int("HEALTH_CHECK_INTERVAL_SECS", 5) as u64,
+            health_check_max_failures: env_int("HEALTH_CHECK_MAX_FAILURES", 3) as u32,
+            health_check_timeout_secs: env_int("HEALTH_CHECK_TIMEOUT_SECS", 3) as u64,
+            images_url_override,
+            images_edits_url_override,
+            transcriptions_url_override,
+            rerank_url_override,
+            score_url_override,
         };
 
         // Validate attestation cache TTL (TTL/2 is used as refresh interval, so TTL < 2 would cause a busy loop)
@@ -268,6 +327,12 @@ mod tests {
         with_env_vars(&[("MODEL_NAME", "my-model"), ("TOKEN", "secret")], || {
             // Remove optional vars to test defaults
             env::remove_var("VLLM_BASE_URL");
+            env::remove_var("VLLM_BACKEND_URLS");
+            env::remove_var("VLLM_IMAGES_URL");
+            env::remove_var("VLLM_IMAGES_EDITS_URL");
+            env::remove_var("VLLM_TRANSCRIPTIONS_URL");
+            env::remove_var("VLLM_RERANK_URL");
+            env::remove_var("VLLM_SCORE_URL");
             env::remove_var("DEV");
             env::remove_var("GPU_NO_HW_MODE");
             env::remove_var("CHAT_CACHE_EXPIRATION");
@@ -294,7 +359,76 @@ mod tests {
             assert_eq!(config.chat_cache_expiration_secs, 1200);
             assert!(!config.dev_mode);
             assert!(!config.gpu_no_hw_mode);
+            assert_eq!(config.backend_urls, vec!["http://localhost:8000"]);
+            assert!(config.images_url_override.is_none());
+            assert!(config.rerank_url_override.is_none());
         });
+    }
+
+    #[test]
+    fn test_config_backend_urls() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "model"),
+                ("TOKEN", "tok"),
+                (
+                    "VLLM_BACKEND_URLS",
+                    "http://b1:8000, http://b2:8000 , http://b3:8000/",
+                ),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(
+                    config.backend_urls,
+                    vec!["http://b1:8000", "http://b2:8000", "http://b3:8000"]
+                );
+                // vllm_base_url should still be set for backward compat
+                assert!(!config.vllm_base_url.is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_backend_urls_fallback_to_base() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "model"),
+                ("TOKEN", "tok"),
+                ("VLLM_BASE_URL", "http://myhost:9000"),
+            ],
+            || {
+                env::remove_var("VLLM_BACKEND_URLS");
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.backend_urls, vec!["http://myhost:9000"]);
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_url_overrides_tracked() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "model"),
+                ("TOKEN", "tok"),
+                (
+                    "VLLM_IMAGES_URL",
+                    "http://image-service/v1/images/generations",
+                ),
+                ("VLLM_RERANK_URL", "http://rerank-service/v1/rerank"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(
+                    config.images_url_override.as_deref(),
+                    Some("http://image-service/v1/images/generations")
+                );
+                assert_eq!(
+                    config.rerank_url_override.as_deref(),
+                    Some("http://rerank-service/v1/rerank")
+                );
+                assert!(config.score_url_override.is_none());
+            },
+        );
     }
 
     #[test]

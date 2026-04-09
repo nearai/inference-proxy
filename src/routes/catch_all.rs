@@ -121,12 +121,12 @@ pub async fn catch_all(
         hex::encode(Sha256::digest(&body_bytes))
     };
 
-    // Build backend URL
-    let base = state.config.vllm_base_url.trim_end_matches('/');
-    let backend_url = match query {
-        Some(q) => format!("{base}{path}?{q}"),
-        None => format!("{base}{path}"),
+    // Build backend URL via pool
+    let path_with_query = match query {
+        Some(q) => format!("{path}?{q}"),
+        None => path.to_string(),
     };
+    let (backend_url, _guard) = state.backend_pool.select_url(&path_with_query);
 
     debug!(method = %method, backend_url = %backend_url, "Catch-all passthrough");
 

@@ -202,9 +202,12 @@ pub async fn images_edits(
         chunk_transform: None,
     };
 
-    let url = match &state.config.images_edits_url_override {
-        Some(override_url) => override_url.clone(),
-        None => state.backend_pool.select_url("/v1/images/edits").0,
+    let (url, _guard) = match &state.config.images_edits_url_override {
+        Some(override_url) => (override_url.clone(), None),
+        None => {
+            let (u, g) = state.backend_pool.select_url("/v1/images/edits");
+            (u, Some(g))
+        }
     };
 
     proxy::proxy_multipart_request(&state.http_client, &url, form, &request_sha256, opts).await
@@ -278,9 +281,12 @@ pub async fn audio_transcriptions(
         chunk_transform: None,
     };
 
-    let url = match &state.config.transcriptions_url_override {
-        Some(override_url) => override_url.clone(),
-        None => state.backend_pool.select_url("/v1/audio/transcriptions").0,
+    let (url, _guard) = match &state.config.transcriptions_url_override {
+        Some(override_url) => (override_url.clone(), None),
+        None => {
+            let (u, g) = state.backend_pool.select_url("/v1/audio/transcriptions");
+            (u, Some(g))
+        }
     };
 
     proxy::proxy_multipart_request(&state.http_client, &url, form, &request_sha256, opts).await
@@ -335,11 +341,13 @@ async fn json_passthrough_encrypted(
         chunk_transform: None,
     };
 
-    let url = match url_override {
-        Some(u) => u.to_string(),
-        None => state.backend_pool.select_url(pool_path).0,
-    };
-    proxy::proxy_json_request(&state.http_client, &url, forward_body, opts).await
+    match url_override {
+        Some(u) => proxy::proxy_json_request(&state.http_client, u, forward_body, opts).await,
+        None => {
+            let (url, _guard) = state.backend_pool.select_url(pool_path);
+            proxy::proxy_json_request(&state.http_client, &url, forward_body, opts).await
+        }
+    }
 }
 
 /// Read a multipart field incrementally, checking cumulative size (without hashing).

@@ -126,7 +126,7 @@ pub async fn catch_all(
         Some(q) => format!("{path}?{q}"),
         None => path.to_string(),
     };
-    let (backend_url, _guard) = state.backend_pool.select_url(&path_with_query);
+    let (backend_url, backend_guard) = state.backend_pool.select_url(&path_with_query);
 
     debug!(method = %method, backend_url = %backend_url, "Catch-all passthrough");
 
@@ -206,6 +206,7 @@ pub async fn catch_all(
             request_hash: None,
             response_transform: None,
             chunk_transform: None,
+            backend_guard: Some(backend_guard),
         };
         proxy::proxy_streaming_response(response, &request_sha256, opts, axum_status).await
     } else if content_type.contains("application/json") {
@@ -231,6 +232,7 @@ pub async fn catch_all(
             request_hash: None,
             response_transform: None,
             chunk_transform: None,
+            backend_guard: None,
         };
         proxy::sign_and_cache_json_response(&response_bytes, &request_sha256, opts, axum_status)
             .await

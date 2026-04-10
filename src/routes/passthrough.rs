@@ -200,6 +200,7 @@ pub async fn images_edits(
         request_hash: None,
         response_transform,
         chunk_transform: None,
+        backend_guard: None,
     };
 
     let (url, _guard) = match &state.config.images_edits_url_override {
@@ -279,6 +280,7 @@ pub async fn audio_transcriptions(
         request_hash: None,
         response_transform,
         chunk_transform: None,
+        backend_guard: None,
     };
 
     let (url, _guard) = match &state.config.transcriptions_url_override {
@@ -329,22 +331,36 @@ async fn json_passthrough_encrypted(
         (request_body, None, None)
     };
 
-    let opts = ProxyOpts {
-        signing: state.signing.clone(),
-        cache: state.cache.clone(),
-        id_prefix: id_prefix.to_string(),
-        model_name: state.config.model_name.clone(),
-        usage_reporter,
-        usage_type,
-        request_hash: original_request_hash,
-        response_transform,
-        chunk_transform: None,
-    };
-
     match url_override {
-        Some(u) => proxy::proxy_json_request(&state.http_client, u, forward_body, opts).await,
+        Some(u) => {
+            let opts = ProxyOpts {
+                signing: state.signing.clone(),
+                cache: state.cache.clone(),
+                id_prefix: id_prefix.to_string(),
+                model_name: state.config.model_name.clone(),
+                usage_reporter,
+                usage_type,
+                request_hash: original_request_hash,
+                response_transform,
+                chunk_transform: None,
+                backend_guard: None,
+            };
+            proxy::proxy_json_request(&state.http_client, u, forward_body, opts).await
+        }
         None => {
-            let (url, _guard) = state.backend_pool.select_url(pool_path);
+            let (url, guard) = state.backend_pool.select_url(pool_path);
+            let opts = ProxyOpts {
+                signing: state.signing.clone(),
+                cache: state.cache.clone(),
+                id_prefix: id_prefix.to_string(),
+                model_name: state.config.model_name.clone(),
+                usage_reporter,
+                usage_type,
+                request_hash: original_request_hash,
+                response_transform,
+                chunk_transform: None,
+                backend_guard: Some(guard),
+            };
             proxy::proxy_json_request(&state.http_client, &url, forward_body, opts).await
         }
     }

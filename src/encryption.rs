@@ -600,6 +600,8 @@ fn decrypt_chat_message_fields(
     decrypt_field(msg, "reasoning_content", ctx, signing)?;
     decrypt_field(msg, "reasoning", ctx, signing)?;
     decrypt_field(msg, "refusal", ctx, signing)?;
+    // Top-level name field used in tool/function role messages
+    decrypt_field(msg, "name", ctx, signing)?;
 
     // audio.data
     if let Some(audio) = msg.get_mut("audio") {
@@ -670,8 +672,9 @@ fn encrypt_chat_response_choices(
     Ok(())
 }
 
-/// Encrypt token strings inside logprobs (both `content` and `refusal` arrays).
-/// Each token entry has a `token` string and optional `top_logprobs[].token` strings.
+/// Encrypt token strings and byte arrays inside logprobs (both `content` and `refusal` arrays).
+/// Each token entry has a `token` string, an optional `bytes` array (UTF-8 byte values), and
+/// optional `top_logprobs[]` entries with the same fields.
 fn encrypt_logprobs_tokens(
     logprobs: &mut serde_json::Value,
     ctx: &EncryptionContext,
@@ -681,12 +684,33 @@ fn encrypt_logprobs_tokens(
         if let Some(entries) = logprobs.get_mut(*key).and_then(|v| v.as_array_mut()) {
             for entry in entries.iter_mut() {
                 encrypt_field(entry, "token", ctx, signing)?;
+                encrypt_bytes_field(entry, ctx, signing)?;
                 if let Some(top) = entry.get_mut("top_logprobs").and_then(|t| t.as_array_mut()) {
                     for top_entry in top.iter_mut() {
                         encrypt_field(top_entry, "token", ctx, signing)?;
+                        encrypt_bytes_field(top_entry, ctx, signing)?;
                     }
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// Encrypt the `bytes` field (array of integers representing UTF-8 bytes of a token)
+/// by serializing to JSON string and encrypting. This prevents reconstructing the token
+/// from the plaintext byte array.
+fn encrypt_bytes_field(
+    obj: &mut serde_json::Value,
+    ctx: &EncryptionContext,
+    signing: &SigningPair,
+) -> Result<(), AppError> {
+    if let Some(bytes_val) = obj.get_mut("bytes") {
+        if bytes_val.is_array() {
+            let json_str =
+                serde_json::to_string(bytes_val).map_err(|e| AppError::Internal(e.into()))?;
+            let encrypted = encrypt_string(&json_str, ctx, signing)?;
+            *bytes_val = serde_json::Value::String(encrypted);
         }
     }
     Ok(())
@@ -1926,10 +1950,11 @@ mod tests {
                     "content": [
                         {
                             "token": "Hello",
+                            "bytes": [72, 101, 108, 108, 111],
                             "logprob": -0.5,
                             "top_logprobs": [
-                                {"token": "Hello", "logprob": -0.5},
-                                {"token": "Hi", "logprob": -1.2}
+                                {"token": "Hello", "bytes": [72, 101, 108, 108, 111], "logprob": -0.5},
+                                {"token": "Hi", "bytes": [72, 105], "logprob": -1.2}
                             ]
                         }
                     ]
@@ -1948,12 +1973,27 @@ mod tests {
             "Hello"
         );
 
-        // top_logprobs tokens also encrypted
+        // bytes field encrypted (serialized to JSON string)
+        let enc_bytes = logprobs["content"][0]["bytes"].as_str().unwrap();
+        assert_eq!(
+            decrypt_string(enc_bytes, &ctx, &server_pair).unwrap(),
+            "[72,101,108,108,111]"
+        );
+
+        // top_logprobs tokens and bytes also encrypted
         let enc_top = logprobs["content"][0]["top_logprobs"][1]["token"]
             .as_str()
             .unwrap();
         assert_ne!(enc_top, "Hi");
         assert_eq!(decrypt_string(enc_top, &ctx, &server_pair).unwrap(), "Hi");
+
+        let enc_top_bytes = logprobs["content"][0]["top_logprobs"][1]["bytes"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            decrypt_string(enc_top_bytes, &ctx, &server_pair).unwrap(),
+            "[72,105]"
+        );
 
         // logprob values remain as numbers (not sensitive)
         assert!(logprobs["content"][0]["logprob"].is_f64());
@@ -1998,5 +2038,42 @@ mod tests {
             "{\"location\":\"home\"}"
         );
         assert_eq!(func["name"].as_str().unwrap(), "get_weather");
+    }
+
+    #[test]
+    fn test_decrypt_name_field_in_tool_message() {
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+            version: 1,
+        };
+
+        let enc_name = encrypt_string("get_weather", &ctx, &server_pair).unwrap();
+        let enc_content = encrypt_string("72°F and sunny", &ctx, &server_pair).unwrap();
+
+        let mut request = serde_json::json!({
+            "messages": [
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "name": enc_name,
+                    "content": enc_content
+                }
+            ]
+        });
+
+        decrypt_request_fields(&mut request, Endpoint::ChatCompletions, &ctx, &server_pair)
+            .unwrap();
+
+        assert_eq!(
+            request["messages"][0]["name"].as_str().unwrap(),
+            "get_weather"
+        );
+        assert_eq!(
+            request["messages"][0]["content"].as_str().unwrap(),
+            "72°F and sunny"
+        );
     }
 }

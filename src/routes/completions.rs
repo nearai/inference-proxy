@@ -81,6 +81,8 @@ pub async fn completions(
         (None, None)
     };
 
+    let (url, guard) = state.backend_pool.select_url("/v1/completions");
+
     let opts = ProxyOpts {
         signing: state.signing.clone(),
         cache: state.cache.clone(),
@@ -91,23 +93,12 @@ pub async fn completions(
         request_hash: original_request_hash,
         response_transform,
         chunk_transform,
+        backend_guard: Some(guard),
     };
 
     if is_stream {
-        proxy::proxy_streaming_request(
-            &state.http_client,
-            &state.config.completions_url,
-            modified_body,
-            opts,
-        )
-        .await
+        proxy::proxy_streaming_request(&state.http_client, &url, modified_body, opts).await
     } else {
-        proxy::proxy_json_request(
-            &state.http_client,
-            &state.config.completions_url,
-            modified_body,
-            opts,
-        )
-        .await
+        proxy::proxy_json_request(&state.http_client, &url, modified_body, opts).await
     }
 }

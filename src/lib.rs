@@ -7,6 +7,7 @@ use tracing::Instrument;
 
 pub mod attestation;
 pub mod auth;
+pub mod backend_pool;
 pub mod cache;
 pub mod config;
 pub mod encryption;
@@ -31,6 +32,7 @@ pub struct AppState {
     /// SHA-256 hash of the TLS certificate's SPKI (Subject Public Key Info).
     /// Computed at startup when `TLS_CERT_PATH` is set.
     pub tls_cert_fingerprint: Option<String>,
+    pub backend_pool: Arc<backend_pool::BackendPool>,
 }
 
 /// Request ID middleware: generates or passes through X-Request-ID header.

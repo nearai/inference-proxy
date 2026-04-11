@@ -5,8 +5,8 @@ use tokio::net::TcpListener;
 use tracing::info;
 
 use vllm_proxy_rs::{
-    attestation, cache, config, metrics_middleware, rate_limit, request_id_middleware, routes,
-    signing, startup_checks, AppState,
+    attestation, backend_pool, cache, config, metrics_middleware, rate_limit,
+    request_id_middleware, routes, signing, startup_checks, AppState,
 };
 
 #[tokio::main]
@@ -34,22 +34,24 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .map_err(|_| anyhow::anyhow!("LISTEN_PORT must be a valid port number"))?;
 
-    // Warn if backend URL points to the proxy's own listen address
-    let backend_base = config.vllm_base_url.trim_end_matches('/');
+    // Warn if any backend URL points to the proxy's own listen address
     let self_local = format!("://localhost:{listen_port}");
     let self_ip = format!("://127.0.0.1:{listen_port}");
-    if backend_base.contains(&self_local) || backend_base.contains(&self_ip) {
-        tracing::warn!(
-            backend = %config.vllm_base_url,
-            listen_port,
-            "VLLM_BASE_URL points to the proxy's own listen port. \
-             Set VLLM_BASE_URL to the actual backend address or change LISTEN_PORT."
-        );
+    for url in &config.backend_urls {
+        let backend_base = url.trim_end_matches('/');
+        if backend_base.contains(&self_local) || backend_base.contains(&self_ip) {
+            tracing::warn!(
+                backend = %url,
+                listen_port,
+                "Backend URL points to the proxy's own listen port. \
+                 Set VLLM_BASE_URL/VLLM_BACKEND_URLS to the actual backend address or change LISTEN_PORT."
+            );
+        }
     }
 
     info!(
         model = %config.model_name,
-        backend = %config.vllm_base_url,
+        backends = ?config.backend_urls,
         listen_port,
         dev_mode = config.dev_mode,
         "Starting vllm-proxy-rs"
@@ -88,6 +90,9 @@ async fn main() -> anyhow::Result<()> {
     // Initialize metrics
     let metrics_handle = metrics_middleware::setup_metrics_recorder();
 
+    // Initialize backend pool
+    let backend_pool = Arc::new(backend_pool::BackendPool::new(config.backend_urls.clone()));
+
     // Build app state
     let model_name = config.model_name.clone();
     let state = AppState {
@@ -98,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
         http_client,
         metrics_handle,
         tls_cert_fingerprint: tls_cert_fingerprint.clone(),
+        backend_pool: backend_pool.clone(),
     };
 
     // Spawn background attestation cache refresh task.
@@ -131,6 +137,24 @@ async fn main() -> anyhow::Result<()> {
         }
     } else {
         info!("OpenAI chat compatibility check disabled (set OPENAI_CHAT_COMPATIBILITY_CHECK=true to enable)");
+    }
+
+    // Spawn backend health checks if multiple backends
+    if backend_pool.len() > 1 {
+        info!(
+            backends = backend_pool.len(),
+            interval_secs = state.config.health_check_interval_secs,
+            max_failures = state.config.health_check_max_failures,
+            "Spawning backend health checker"
+        );
+        backend_pool::spawn_health_check(
+            backend_pool,
+            state.http_client.clone(),
+            std::time::Duration::from_secs(state.config.health_check_interval_secs),
+            std::time::Duration::from_secs(state.config.health_check_timeout_secs),
+            state.config.health_check_max_failures,
+            "/v1/models",
+        );
     }
 
     // Build rate limiter

@@ -290,6 +290,10 @@ pub struct ProxyOpts {
     pub response_transform: Option<crate::encryption::ResponseTransform>,
     /// Applied to each SSE chunk JSON before forwarding to client.
     pub chunk_transform: Option<crate::encryption::ChunkTransform>,
+    /// RAII guard for backend connection tracking. For streaming requests,
+    /// this is moved into the spawned task so active_conns stays incremented
+    /// for the full duration of the stream (not just until the handler returns).
+    pub backend_guard: Option<crate::backend_pool::BackendGuard>,
 }
 
 /// Proxy a JSON request to the backend, sign the response, cache signature.
@@ -421,6 +425,7 @@ pub async fn proxy_streaming_request(
     let usage_reporter = opts.usage_reporter.clone();
     let model_name = opts.model_name.clone();
     let chunk_transform = opts.chunk_transform;
+    let backend_guard = opts.backend_guard;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
@@ -432,6 +437,9 @@ pub async fn proxy_streaming_request(
         use futures_util::StreamExt;
 
         let _guard = StreamingGuard::new();
+        // Keep backend_guard alive for the full duration of the stream
+        // so active_conns tracking is accurate for least-connections selection.
+        let _backend_guard = backend_guard;
 
         let mut byte_stream = std::pin::pin!(byte_stream);
         let mut hasher = Sha256::new();
@@ -875,6 +883,7 @@ pub async fn proxy_streaming_response(
     let usage_reporter = opts.usage_reporter.clone();
     let model_name = opts.model_name.clone();
     let chunk_transform = opts.chunk_transform;
+    let backend_guard = opts.backend_guard;
     let request_sha256 = request_sha256.to_string();
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
@@ -884,6 +893,7 @@ pub async fn proxy_streaming_response(
         use futures_util::StreamExt;
 
         let _guard = StreamingGuard::new();
+        let _backend_guard = backend_guard;
 
         let mut byte_stream = std::pin::pin!(byte_stream);
         let mut hasher = Sha256::new();
@@ -1172,6 +1182,7 @@ mod tests {
             request_hash: None,
             response_transform: None,
             chunk_transform: None,
+            backend_guard: None,
         }
     }
 

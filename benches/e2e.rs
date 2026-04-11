@@ -68,6 +68,15 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         startup_check_retries: 0,
         startup_check_retry_delay_secs: 0,
         startup_check_timeout_secs: 1,
+        backend_urls: vec![mock_url.to_string()],
+        health_check_interval_secs: 5,
+        health_check_max_failures: 3,
+        health_check_timeout_secs: 3,
+        images_url_override: None,
+        images_edits_url_override: None,
+        transcriptions_url_override: None,
+        rerank_url_override: None,
+        score_url_override: None,
     };
 
     let ecdsa = signing::EcdsaContext::from_key_bytes(&ECDSA_KEY).unwrap();
@@ -81,6 +90,8 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         .build_recorder()
         .handle();
 
+    let backend_pool = Arc::new(backend_pool::BackendPool::new(vec![mock_url.to_string()]));
+
     let state = AppState {
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
@@ -89,6 +100,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         http_client,
         metrics_handle,
         tls_cert_fingerprint: None,
+        backend_pool,
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(10000, 20000);

@@ -121,12 +121,12 @@ pub async fn catch_all(
         hex::encode(Sha256::digest(&body_bytes))
     };
 
-    // Build backend URL
-    let base = state.config.vllm_base_url.trim_end_matches('/');
-    let backend_url = match query {
-        Some(q) => format!("{base}{path}?{q}"),
-        None => format!("{base}{path}"),
+    // Build backend URL via pool
+    let path_with_query = match query {
+        Some(q) => format!("{path}?{q}"),
+        None => path.to_string(),
     };
+    let (backend_url, backend_guard) = state.backend_pool.select_url(&path_with_query);
 
     debug!(method = %method, backend_url = %backend_url, "Catch-all passthrough");
 
@@ -206,6 +206,7 @@ pub async fn catch_all(
             request_hash: None,
             response_transform: None,
             chunk_transform: None,
+            backend_guard: Some(backend_guard),
         };
         proxy::proxy_streaming_response(response, &request_sha256, opts, axum_status).await
     } else if content_type.contains("application/json") {
@@ -231,6 +232,7 @@ pub async fn catch_all(
             request_hash: None,
             response_transform: None,
             chunk_transform: None,
+            backend_guard: None,
         };
         proxy::sign_and_cache_json_response(&response_bytes, &request_sha256, opts, axum_status)
             .await

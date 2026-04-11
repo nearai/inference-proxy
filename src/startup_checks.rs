@@ -61,7 +61,7 @@ pub async fn run_startup_checks(
     config: &Config,
 ) -> Result<(), StartupCheckError> {
     info!(
-        backend = %config.vllm_base_url,
+        backends = ?config.backend_urls,
         model = %config.model_name,
         retries = config.startup_check_retries,
         retry_delay_secs = config.startup_check_retry_delay_secs,
@@ -73,43 +73,63 @@ pub async fn run_startup_checks(
     let delay = Duration::from_secs(config.startup_check_retry_delay_secs);
     let retries = config.startup_check_retries;
 
-    // Check 1: /v1/models — backend reachable, model loaded
-    run_with_retries("models", retries, delay, || {
-        check_models(client, &config.models_url, &config.model_name, timeout)
-    })
-    .await?;
-    info!(
-        "Startup check passed: model '{}' found in /v1/models",
-        config.model_name
-    );
+    // Check each backend
+    let mut any_passed = false;
+    let mut last_error = None;
 
-    // Check 2: non-streaming chat completions with tools
-    run_with_retries("chat_completions_tools", retries, delay, || {
-        check_chat_completions_with_tools(
-            client,
-            &config.chat_completions_url,
-            &config.model_name,
-            false,
-            timeout,
-        )
-    })
-    .await?;
-    info!("Startup check passed: non-streaming chat completions with tools");
+    for base_url in &config.backend_urls {
+        let base = base_url.trim_end_matches('/');
+        let models_url = format!("{base}/v1/models");
+        let chat_url = format!("{base}/v1/chat/completions");
 
-    // Check 3: streaming chat completions with tools
-    run_with_retries("chat_completions_tools_streaming", retries, delay, || {
-        check_chat_completions_with_tools(
-            client,
-            &config.chat_completions_url,
-            &config.model_name,
-            true,
-            timeout,
-        )
-    })
-    .await?;
-    info!("Startup check passed: streaming chat completions with tools");
+        info!(backend = %base_url, "Checking backend...");
 
-    info!("All startup checks passed");
+        // Check 1: /v1/models — backend reachable, model loaded
+        if let Err(e) = run_with_retries("models", retries, delay, || {
+            check_models(client, &models_url, &config.model_name, timeout)
+        })
+        .await
+        {
+            warn!(backend = %base_url, error = %e, "Backend failed models check");
+            last_error = Some(e);
+            continue;
+        }
+
+        // Check 2: non-streaming chat completions with tools
+        if let Err(e) = run_with_retries("chat_completions_tools", retries, delay, || {
+            check_chat_completions_with_tools(client, &chat_url, &config.model_name, false, timeout)
+        })
+        .await
+        {
+            warn!(backend = %base_url, error = %e, "Backend failed chat completions check");
+            last_error = Some(e);
+            continue;
+        }
+
+        // Check 3: streaming chat completions with tools
+        if let Err(e) = run_with_retries("chat_completions_tools_streaming", retries, delay, || {
+            check_chat_completions_with_tools(client, &chat_url, &config.model_name, true, timeout)
+        })
+        .await
+        {
+            warn!(backend = %base_url, error = %e, "Backend failed streaming check");
+            last_error = Some(e);
+            continue;
+        }
+
+        info!(backend = %base_url, "All checks passed");
+        any_passed = true;
+    }
+
+    if !any_passed {
+        let err = last_error.unwrap_or(StartupCheckError::ChatCompletionFailed {
+            reason: "No backends available".to_string(),
+        });
+        error!("All backends failed startup checks");
+        return Err(err);
+    }
+
+    info!("Startup checks passed");
     Ok(())
 }
 

@@ -102,7 +102,7 @@ pub fn extract_encryption_context(
             let encrypt_tool_calls = headers
                 .get("x-encrypt-tool-calls")
                 .and_then(|v| v.to_str().ok())
-                .map(|s| matches!(s.trim(), "1" | "true"))
+                .map(|s| { let s = s.trim(); s == "1" || s.eq_ignore_ascii_case("true") })
                 .unwrap_or(false);
 
             Ok(Some(EncryptionContext {
@@ -786,8 +786,7 @@ fn decrypt_tools_array(
                 if let Some(params) = func.get_mut("parameters") {
                     if let serde_json::Value::String(s) = params {
                         if !s.is_empty() {
-                            let s_owned = s.clone();
-                            let decrypted = decrypt_string(&s_owned, ctx, signing)?;
+                            let decrypted = decrypt_string(s, ctx, signing)?;
                             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&decrypted)
                             {
                                 *params = parsed;
@@ -2026,6 +2025,19 @@ mod tests {
         headers2.insert("x-encrypt-tool-calls", "1".parse().unwrap());
         let ctx2 = extract_encryption_context(&headers2).unwrap().unwrap();
         assert!(ctx2.encrypt_tool_calls);
+
+        // Case-insensitive: "True" and "TRUE" should also work
+        for val in &["True", "TRUE"] {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert("x-signing-algo", "ed25519".parse().unwrap());
+            h.insert(
+                "x-client-pub-key",
+                server_pair.ed25519.signing_public_key.parse().unwrap(),
+            );
+            h.insert("x-encrypt-tool-calls", val.parse().unwrap());
+            let c = extract_encryption_context(&h).unwrap().unwrap();
+            assert!(c.encrypt_tool_calls, "failed for value {val}");
+        }
     }
 
     #[test]

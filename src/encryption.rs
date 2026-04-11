@@ -26,6 +26,10 @@ pub struct EncryptionContext {
     pub client_pub_key: Vec<u8>,
     /// Encryption protocol version (1 = legacy NaCl box, 2 = HKDF + XChaCha20-Poly1305).
     pub version: u8,
+    /// When true, tool call arguments (`tools[].function.description/parameters` in requests
+    /// and `tool_calls[].function.arguments` in responses) are also encrypted/decrypted.
+    /// Enabled by the `X-Encrypt-Tool-Calls: true` request header.
+    pub encrypt_tool_calls: bool,
 }
 
 /// Extract encryption context from request headers.
@@ -95,10 +99,17 @@ pub fn extract_encryption_context(
                 )));
             }
 
+            let encrypt_tool_calls = headers
+                .get("x-encrypt-tool-calls")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| matches!(s.trim(), "1" | "true"))
+                .unwrap_or(false);
+
             Ok(Some(EncryptionContext {
                 algo,
                 client_pub_key: key_bytes,
                 version,
+                encrypt_tool_calls,
             }))
         }
     }
@@ -446,6 +457,9 @@ pub fn decrypt_request_fields(
                     decrypt_chat_message_fields(msg, ctx, signing)?;
                 }
             }
+            if ctx.encrypt_tool_calls {
+                decrypt_tools_array(value, ctx, signing)?;
+            }
         }
         Endpoint::Completions => {
             // prompt can be a string or an array of strings
@@ -605,6 +619,10 @@ fn decrypt_chat_message_fields(
         decrypt_field(audio, "data", ctx, signing)?;
     }
 
+    if ctx.encrypt_tool_calls {
+        decrypt_message_tool_calls(msg, ctx, signing)?;
+    }
+
     Ok(())
 }
 
@@ -623,6 +641,9 @@ fn encrypt_chat_response_choices(
                 encrypt_field(msg, "reasoning", ctx, signing)?;
                 if let Some(audio) = msg.get_mut("audio") {
                     encrypt_field(audio, "data", ctx, signing)?;
+                }
+                if ctx.encrypt_tool_calls {
+                    encrypt_message_tool_calls(msg, ctx, signing)?;
                 }
             }
         }
@@ -727,6 +748,71 @@ fn decrypt_rerank_documents(
                     decrypt_field(doc, "text", ctx, signing)?;
                 }
                 _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Decrypt `tool_calls[].function.arguments` in a single message object.
+fn decrypt_message_tool_calls(
+    msg: &mut serde_json::Value,
+    ctx: &EncryptionContext,
+    signing: &SigningPair,
+) -> Result<(), AppError> {
+    if let Some(tool_calls) = msg.get_mut("tool_calls").and_then(|tc| tc.as_array_mut()) {
+        for tc in tool_calls.iter_mut() {
+            if let Some(func) = tc.get_mut("function") {
+                decrypt_field(func, "arguments", ctx, signing)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Decrypt `tools[].function.description` and `tools[].function.parameters` in-place.
+/// The client serializes `parameters` (a JSON object) to a JSON string before encrypting it;
+/// after decryption we parse it back to a JSON value.
+fn decrypt_tools_array(
+    value: &mut serde_json::Value,
+    ctx: &EncryptionContext,
+    signing: &SigningPair,
+) -> Result<(), AppError> {
+    if let Some(tools) = value.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        for tool in tools.iter_mut() {
+            if let Some(func) = tool.get_mut("function") {
+                decrypt_field(func, "description", ctx, signing)?;
+                // parameters is a JSON object encrypted as a string — decrypt then re-parse.
+                if let Some(params) = func.get_mut("parameters") {
+                    if let serde_json::Value::String(s) = params {
+                        if !s.is_empty() {
+                            let s_owned = s.clone();
+                            let decrypted = decrypt_string(&s_owned, ctx, signing)?;
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&decrypted)
+                            {
+                                *params = parsed;
+                            } else {
+                                *params = serde_json::Value::String(decrypted);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Encrypt `tool_calls[].function.arguments` in a message/delta object.
+fn encrypt_message_tool_calls(
+    msg: &mut serde_json::Value,
+    ctx: &EncryptionContext,
+    signing: &SigningPair,
+) -> Result<(), AppError> {
+    if let Some(tool_calls) = msg.get_mut("tool_calls").and_then(|tc| tc.as_array_mut()) {
+        for tc in tool_calls.iter_mut() {
+            if let Some(func) = tc.get_mut("function") {
+                encrypt_field(func, "arguments", ctx, signing)?;
             }
         }
     }
@@ -1096,6 +1182,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_ed25519_pub,
             version: 1,
+            encrypt_tool_calls: false,
         };
 
         let plaintext = "Hello from client!";
@@ -1121,6 +1208,7 @@ mod tests {
             algo: EncryptionAlgo::Ecdsa,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_tool_calls: false,
         };
 
         let plaintext = "Hello from client!";
@@ -1139,6 +1227,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_tool_calls: false,
         };
 
         let encrypted = encrypt_string("", &ctx, &server_pair).unwrap();
@@ -1156,6 +1245,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_tool_calls: false,
         };
 
         let plaintext = "こんにちは世界 🌍 Привет мир";
@@ -1174,6 +1264,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_tool_calls: false,
         };
 
         // Encrypt "Hello" to simulate client-encrypted message
@@ -1201,6 +1292,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_tool_calls: false,
         };
 
         // Client encrypts a JSON-serialized content array
@@ -1240,6 +1332,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_tool_calls: false,
         };
 
         let mut response = serde_json::json!({
@@ -1276,6 +1369,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_tool_calls: false,
         };
 
         let mut chunk = serde_json::json!({
@@ -1307,6 +1401,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_tool_calls: false,
         };
 
         let mut response = serde_json::json!({
@@ -1330,6 +1425,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_tool_calls: false,
         };
 
         let mut response = serde_json::json!({
@@ -1359,6 +1455,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_tool_calls: false,
         };
 
         let mut response = serde_json::json!({
@@ -1386,6 +1483,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_tool_calls: false,
         };
 
         let mut response = serde_json::json!({
@@ -1409,6 +1507,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_tool_calls: false,
         };
 
         let mut response = serde_json::json!({
@@ -1494,6 +1593,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_tool_calls: false,
         };
 
         let mut chunk = serde_json::json!({
@@ -1525,6 +1625,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_tool_calls: false,
         };
 
         // Client encrypts the input string directly (matching Python proxy's decrypt_prompt)
@@ -1548,6 +1649,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_tool_calls: false,
         };
 
         // Client encrypts each string element individually (matching Python proxy)
@@ -1573,6 +1675,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_tool_calls: false,
         };
 
         let mut request = serde_json::json!({
@@ -1596,6 +1699,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_tool_calls: false,
         };
 
         // Tampered ciphertext — should fail with generic message
@@ -1626,6 +1730,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_tool_calls: false,
         };
 
         let encrypted = encrypt_string("hello", &ctx, &server_pair).unwrap();
@@ -1647,6 +1752,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_tool_calls: false,
         };
 
         let enc1 = encrypt_string("hello", &ctx, &server_pair).unwrap();
@@ -1670,6 +1776,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_tool_calls: false,
         };
 
         // Array with mixed types: encrypted strings and token ID arrays (not encrypted)
@@ -1698,5 +1805,239 @@ mod tests {
         let ctx = extract_encryption_context(&headers).unwrap().unwrap();
         assert_eq!(ctx.algo, EncryptionAlgo::Ecdsa);
         assert_eq!(ctx.client_pub_key.len(), 64);
+    }
+
+    // ── Tool call encryption tests ──────────────────────────────────
+
+    fn make_tool_call_ctx(server_pair: &SigningPair, encrypt_tool_calls: bool) -> EncryptionContext {
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+            version: 1,
+            encrypt_tool_calls,
+        }
+    }
+
+    #[test]
+    fn test_encrypt_tool_calls_in_response() {
+        let server_pair = test_signing_pair();
+        let ctx = make_tool_call_ctx(&server_pair, true);
+
+        let mut response = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "{\"location\":\"San Francisco\"}"
+                        }
+                    }]
+                }
+            }]
+        });
+
+        encrypt_response_fields(&mut response, Endpoint::ChatCompletions, &ctx, &server_pair)
+            .unwrap();
+
+        let encrypted_args = response["choices"][0]["message"]["tool_calls"][0]["function"]
+            ["arguments"]
+            .as_str()
+            .unwrap();
+        assert_ne!(encrypted_args, "{\"location\":\"San Francisco\"}");
+
+        let decrypted = decrypt_string(encrypted_args, &ctx, &server_pair).unwrap();
+        assert_eq!(decrypted, "{\"location\":\"San Francisco\"}");
+    }
+
+    #[test]
+    fn test_tool_calls_not_encrypted_without_flag() {
+        let server_pair = test_signing_pair();
+        let ctx = make_tool_call_ctx(&server_pair, false);
+
+        let args = "{\"location\":\"San Francisco\"}";
+        let mut response = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": args}
+                    }]
+                }
+            }]
+        });
+
+        encrypt_response_fields(&mut response, Endpoint::ChatCompletions, &ctx, &server_pair)
+            .unwrap();
+
+        // arguments must be unchanged when flag is off
+        assert_eq!(
+            response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap(),
+            args
+        );
+    }
+
+    #[test]
+    fn test_encrypt_tool_calls_in_streaming_chunk() {
+        let server_pair = test_signing_pair();
+        let ctx = make_tool_call_ctx(&server_pair, true);
+
+        let mut chunk = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": {"arguments": "{\"city\":\"Tokyo\"}"}
+                    }]
+                }
+            }]
+        });
+
+        encrypt_streaming_chunk(&mut chunk, Endpoint::ChatCompletions, &ctx, &server_pair)
+            .unwrap();
+
+        let encrypted = chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
+        assert_ne!(encrypted, "{\"city\":\"Tokyo\"}");
+        let decrypted = decrypt_string(encrypted, &ctx, &server_pair).unwrap();
+        assert_eq!(decrypted, "{\"city\":\"Tokyo\"}");
+    }
+
+    #[test]
+    fn test_decrypt_message_tool_calls_in_request() {
+        let server_pair = test_signing_pair();
+        let ctx = make_tool_call_ctx(&server_pair, true);
+
+        let encrypted_args =
+            encrypt_string("{\"location\":\"Paris\"}", &ctx, &server_pair).unwrap();
+
+        let mut request = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": encrypted_args
+                    }
+                }]
+            }]
+        });
+
+        decrypt_request_fields(&mut request, Endpoint::ChatCompletions, &ctx, &server_pair)
+            .unwrap();
+
+        assert_eq!(
+            request["messages"][0]["tool_calls"][0]["function"]["arguments"],
+            "{\"location\":\"Paris\"}"
+        );
+    }
+
+    #[test]
+    fn test_decrypt_tools_array_in_request() {
+        let server_pair = test_signing_pair();
+        let ctx = make_tool_call_ctx(&server_pair, true);
+
+        let encrypted_desc = encrypt_string("Get the weather", &ctx, &server_pair).unwrap();
+        let params_obj = serde_json::json!({"type": "object", "properties": {}});
+        let encrypted_params = encrypt_string(
+            &serde_json::to_string(&params_obj).unwrap(),
+            &ctx,
+            &server_pair,
+        )
+        .unwrap();
+
+        let mut request = serde_json::json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": encrypted_desc,
+                    "parameters": encrypted_params
+                }
+            }]
+        });
+
+        decrypt_request_fields(&mut request, Endpoint::ChatCompletions, &ctx, &server_pair)
+            .unwrap();
+
+        assert_eq!(
+            request["tools"][0]["function"]["description"],
+            "Get the weather"
+        );
+        assert_eq!(request["tools"][0]["function"]["parameters"], params_obj);
+    }
+
+    #[test]
+    fn test_tools_array_not_decrypted_without_flag() {
+        let server_pair = test_signing_pair();
+        let ctx = make_tool_call_ctx(&server_pair, false);
+
+        // Even if the description looks like ciphertext, it should pass through unchanged
+        let raw_desc = "plaintext description";
+        let mut request = serde_json::json!({
+            "tools": [{
+                "type": "function",
+                "function": {"name": "get_weather", "description": raw_desc}
+            }]
+        });
+
+        decrypt_request_fields(&mut request, Endpoint::ChatCompletions, &ctx, &server_pair)
+            .unwrap();
+
+        assert_eq!(
+            request["tools"][0]["function"]["description"],
+            raw_desc
+        );
+    }
+
+    #[test]
+    fn test_extract_encryption_context_encrypt_tool_calls_header() {
+        let server_pair = test_signing_pair();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-signing-algo", "ed25519".parse().unwrap());
+        headers.insert(
+            "x-client-pub-key",
+            server_pair.ed25519.signing_public_key.parse().unwrap(),
+        );
+        headers.insert("x-encrypt-tool-calls", "true".parse().unwrap());
+        let ctx = extract_encryption_context(&headers).unwrap().unwrap();
+        assert!(ctx.encrypt_tool_calls);
+
+        // Also test the "1" form
+        let mut headers2 = axum::http::HeaderMap::new();
+        headers2.insert("x-signing-algo", "ed25519".parse().unwrap());
+        headers2.insert(
+            "x-client-pub-key",
+            server_pair.ed25519.signing_public_key.parse().unwrap(),
+        );
+        headers2.insert("x-encrypt-tool-calls", "1".parse().unwrap());
+        let ctx2 = extract_encryption_context(&headers2).unwrap().unwrap();
+        assert!(ctx2.encrypt_tool_calls);
+    }
+
+    #[test]
+    fn test_extract_encryption_context_encrypt_tool_calls_default_false() {
+        let server_pair = test_signing_pair();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-signing-algo", "ed25519".parse().unwrap());
+        headers.insert(
+            "x-client-pub-key",
+            server_pair.ed25519.signing_public_key.parse().unwrap(),
+        );
+        let ctx = extract_encryption_context(&headers).unwrap().unwrap();
+        assert!(!ctx.encrypt_tool_calls);
     }
 }

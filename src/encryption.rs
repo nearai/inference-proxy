@@ -460,6 +460,21 @@ pub fn decrypt_request_fields(
             if ctx.encrypt_all_fields {
                 // tools[].function.name, .description, .parameters (JSON schema)
                 decrypt_tools_definitions(value, ctx, signing);
+                // tool_choice can be a string ("auto"/"none"/"required") or
+                // {"type":"function","function":{"name":"..."}}.
+                // Only the object form contains a sensitive function name.
+                if let Some(tc) = value.get_mut("tool_choice") {
+                    if let Some(func) = tc.get_mut("function") {
+                        try_decrypt_field(func, "name", ctx, signing);
+                    }
+                }
+                // Deprecated function_call request param: string ("auto"/"none")
+                // or {"name":"..."}.
+                if let Some(fc) = value.get_mut("function_call") {
+                    if fc.is_object() {
+                        try_decrypt_field(fc, "name", ctx, signing);
+                    }
+                }
             }
         }
         Endpoint::Completions => {
@@ -2325,5 +2340,117 @@ mod tests {
             "get_weather"
         );
         assert!(request["tools"][0]["function"]["parameters"].is_object());
+    }
+
+    #[test]
+    fn test_decrypt_tool_choice_function_name() {
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+            version: 1,
+            encrypt_all_fields: true,
+        };
+
+        let enc_name = encrypt_string("get_weather", &ctx, &server_pair).unwrap();
+        let enc_content = encrypt_string("What's the weather?", &ctx, &server_pair).unwrap();
+
+        let mut request = serde_json::json!({
+            "messages": [{"role": "user", "content": enc_content}],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": enc_name}
+            }
+        });
+
+        decrypt_request_fields(&mut request, Endpoint::ChatCompletions, &ctx, &server_pair)
+            .unwrap();
+
+        assert_eq!(
+            request["tool_choice"]["function"]["name"].as_str().unwrap(),
+            "get_weather"
+        );
+        // type field preserved
+        assert_eq!(request["tool_choice"]["type"].as_str().unwrap(), "function");
+    }
+
+    #[test]
+    fn test_tool_choice_string_passthrough() {
+        // tool_choice: "auto" / "none" / "required" should pass through unchanged
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+            version: 1,
+            encrypt_all_fields: true,
+        };
+
+        let enc_content = encrypt_string("hello", &ctx, &server_pair).unwrap();
+
+        let mut request = serde_json::json!({
+            "messages": [{"role": "user", "content": enc_content}],
+            "tool_choice": "required"
+        });
+
+        decrypt_request_fields(&mut request, Endpoint::ChatCompletions, &ctx, &server_pair)
+            .unwrap();
+
+        assert_eq!(request["tool_choice"].as_str().unwrap(), "required");
+    }
+
+    #[test]
+    fn test_decrypt_function_call_request_param() {
+        // Deprecated function_call request parameter: {"name": "..."}
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+            version: 1,
+            encrypt_all_fields: true,
+        };
+
+        let enc_name = encrypt_string("get_weather", &ctx, &server_pair).unwrap();
+        let enc_content = encrypt_string("What's the weather?", &ctx, &server_pair).unwrap();
+
+        let mut request = serde_json::json!({
+            "messages": [{"role": "user", "content": enc_content}],
+            "function_call": {"name": enc_name}
+        });
+
+        decrypt_request_fields(&mut request, Endpoint::ChatCompletions, &ctx, &server_pair)
+            .unwrap();
+
+        assert_eq!(
+            request["function_call"]["name"].as_str().unwrap(),
+            "get_weather"
+        );
+    }
+
+    #[test]
+    fn test_function_call_string_passthrough() {
+        // function_call: "auto" / "none" should pass through unchanged
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+            version: 1,
+            encrypt_all_fields: true,
+        };
+
+        let enc_content = encrypt_string("hello", &ctx, &server_pair).unwrap();
+
+        let mut request = serde_json::json!({
+            "messages": [{"role": "user", "content": enc_content}],
+            "function_call": "auto"
+        });
+
+        decrypt_request_fields(&mut request, Endpoint::ChatCompletions, &ctx, &server_pair)
+            .unwrap();
+
+        assert_eq!(request["function_call"].as_str().unwrap(), "auto");
     }
 }

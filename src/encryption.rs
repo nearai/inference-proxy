@@ -446,6 +446,8 @@ pub fn decrypt_request_fields(
                     decrypt_chat_message_fields(msg, ctx, signing)?;
                 }
             }
+            // tools[].function.name, .description, .parameters (JSON schema)
+            decrypt_tools_definitions(value, ctx, signing)?;
         }
         Endpoint::Completions => {
             // prompt can be a string or an array of strings
@@ -569,6 +571,41 @@ pub fn encrypt_streaming_chunk(
 }
 
 // ── Internal helpers ────────────────────────────────────────────────
+
+/// Decrypt tool/function definitions in the request.
+/// `tools[].function.name`, `.description`, and `.parameters` (serialized JSON schema)
+/// are user-defined and reveal what capabilities are exposed to the model.
+fn decrypt_tools_definitions(
+    value: &mut serde_json::Value,
+    ctx: &EncryptionContext,
+    signing: &SigningPair,
+) -> Result<(), AppError> {
+    if let Some(tools) = value.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        for tool in tools.iter_mut() {
+            if let Some(func) = tool.get_mut("function") {
+                decrypt_field(func, "name", ctx, signing)?;
+                decrypt_field(func, "description", ctx, signing)?;
+                // parameters is a JSON schema object — client encrypts as serialized JSON string
+                if let Some(params) = func.get_mut("parameters") {
+                    if let Some(s) = params.as_str() {
+                        if !s.is_empty() {
+                            let decrypted = decrypt_string(s, ctx, signing)?;
+                            // Restore the JSON schema object from the decrypted string
+                            if let Ok(parsed) =
+                                serde_json::from_str::<serde_json::Value>(&decrypted)
+                            {
+                                *params = parsed;
+                            } else {
+                                *params = serde_json::Value::String(decrypted);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 fn decrypt_chat_message_fields(
     msg: &mut serde_json::Value,
@@ -2074,6 +2111,57 @@ mod tests {
         assert_eq!(
             request["messages"][0]["content"].as_str().unwrap(),
             "72°F and sunny"
+        );
+    }
+
+    #[test]
+    fn test_decrypt_tools_definitions() {
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+            version: 1,
+        };
+
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"location": {"type": "string"}},
+            "required": ["location"]
+        });
+        let enc_name = encrypt_string("get_weather", &ctx, &server_pair).unwrap();
+        let enc_desc =
+            encrypt_string("Get current weather for a location", &ctx, &server_pair).unwrap();
+        let enc_params =
+            encrypt_string(&serde_json::to_string(&schema).unwrap(), &ctx, &server_pair).unwrap();
+
+        let enc_msg = encrypt_string("What's the weather?", &ctx, &server_pair).unwrap();
+        let mut request = serde_json::json!({
+            "messages": [{"role": "user", "content": enc_msg}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": enc_name,
+                    "description": enc_desc,
+                    "parameters": enc_params
+                }
+            }]
+        });
+
+        decrypt_request_fields(&mut request, Endpoint::ChatCompletions, &ctx, &server_pair)
+            .unwrap();
+
+        let func = &request["tools"][0]["function"];
+        assert_eq!(func["name"].as_str().unwrap(), "get_weather");
+        assert_eq!(
+            func["description"].as_str().unwrap(),
+            "Get current weather for a location"
+        );
+        // parameters restored to JSON object
+        assert_eq!(func["parameters"]["type"].as_str().unwrap(), "object");
+        assert_eq!(
+            func["parameters"]["required"][0].as_str().unwrap(),
+            "location"
         );
     }
 }

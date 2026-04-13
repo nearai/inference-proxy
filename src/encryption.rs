@@ -26,6 +26,11 @@ pub struct EncryptionContext {
     pub client_pub_key: Vec<u8>,
     /// Encryption protocol version (1 = legacy NaCl box, 2 = HKDF + XChaCha20-Poly1305).
     pub version: u8,
+    /// When true, encrypt/decrypt all sensitive fields (tool_calls, refusal, logprobs,
+    /// function_call, tools definitions). When false, only the legacy set (content,
+    /// reasoning_content, reasoning, audio.data) is covered.
+    /// Controlled by the `X-Encrypt-All-Fields: true` request header.
+    pub encrypt_all_fields: bool,
 }
 
 /// Extract encryption context from request headers.
@@ -95,10 +100,16 @@ pub fn extract_encryption_context(
                 )));
             }
 
+            let encrypt_all_fields = headers
+                .get("x-encrypt-all-fields")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|s| s.eq_ignore_ascii_case("true"));
+
             Ok(Some(EncryptionContext {
                 algo,
                 client_pub_key: key_bytes,
                 version,
+                encrypt_all_fields,
             }))
         }
     }
@@ -446,8 +457,10 @@ pub fn decrypt_request_fields(
                     decrypt_chat_message_fields(msg, ctx, signing)?;
                 }
             }
-            // tools[].function.name, .description, .parameters (JSON schema)
-            decrypt_tools_definitions(value, ctx, signing);
+            if ctx.encrypt_all_fields {
+                // tools[].function.name, .description, .parameters (JSON schema)
+                decrypt_tools_definitions(value, ctx, signing);
+            }
         }
         Endpoint::Completions => {
             // prompt can be a string or an array of strings
@@ -640,31 +653,34 @@ fn decrypt_chat_message_fields(
     decrypt_field(msg, "reasoning_content", ctx, signing)?;
     decrypt_field(msg, "reasoning", ctx, signing)?;
 
-    // Newly encrypted fields use try_decrypt_field for backward compatibility:
-    // existing E2EE clients may send these as plaintext.
-    try_decrypt_field(msg, "refusal", ctx, signing);
-    // Top-level name field used in tool/function role messages
-    try_decrypt_field(msg, "name", ctx, signing);
-
     // audio.data
     if let Some(audio) = msg.get_mut("audio") {
         decrypt_field(audio, "data", ctx, signing)?;
     }
 
-    // tool_calls[].function.arguments and .name
-    if let Some(tool_calls) = msg.get_mut("tool_calls").and_then(|tc| tc.as_array_mut()) {
-        for tc in tool_calls.iter_mut() {
-            if let Some(func) = tc.get_mut("function") {
-                try_decrypt_field(func, "arguments", ctx, signing);
-                try_decrypt_field(func, "name", ctx, signing);
+    // Extended fields — only when client opts in via X-Encrypt-All-Fields: true.
+    // Uses try_decrypt_field for additional safety: even with the flag, a client
+    // may not encrypt every field in the first deployment.
+    if ctx.encrypt_all_fields {
+        try_decrypt_field(msg, "refusal", ctx, signing);
+        // Top-level name field used in tool/function role messages
+        try_decrypt_field(msg, "name", ctx, signing);
+
+        // tool_calls[].function.arguments and .name
+        if let Some(tool_calls) = msg.get_mut("tool_calls").and_then(|tc| tc.as_array_mut()) {
+            for tc in tool_calls.iter_mut() {
+                if let Some(func) = tc.get_mut("function") {
+                    try_decrypt_field(func, "arguments", ctx, signing);
+                    try_decrypt_field(func, "name", ctx, signing);
+                }
             }
         }
-    }
 
-    // deprecated function_call.arguments and .name
-    if let Some(fc) = msg.get_mut("function_call") {
-        try_decrypt_field(fc, "arguments", ctx, signing);
-        try_decrypt_field(fc, "name", ctx, signing);
+        // deprecated function_call.arguments and .name
+        if let Some(fc) = msg.get_mut("function_call") {
+            try_decrypt_field(fc, "arguments", ctx, signing);
+            try_decrypt_field(fc, "name", ctx, signing);
+        }
     }
 
     Ok(())
@@ -683,31 +699,36 @@ fn encrypt_chat_response_choices(
                 encrypt_content_field(msg, ctx, signing)?;
                 encrypt_field(msg, "reasoning_content", ctx, signing)?;
                 encrypt_field(msg, "reasoning", ctx, signing)?;
-                encrypt_field(msg, "refusal", ctx, signing)?;
                 if let Some(audio) = msg.get_mut("audio") {
                     encrypt_field(audio, "data", ctx, signing)?;
                 }
 
-                // tool_calls[].function.arguments and .name
-                if let Some(tool_calls) = msg.get_mut("tool_calls").and_then(|tc| tc.as_array_mut())
-                {
-                    for tc in tool_calls.iter_mut() {
-                        if let Some(func) = tc.get_mut("function") {
-                            encrypt_field(func, "arguments", ctx, signing)?;
-                            encrypt_field(func, "name", ctx, signing)?;
+                // Extended fields — only when client opts in
+                if ctx.encrypt_all_fields {
+                    encrypt_field(msg, "refusal", ctx, signing)?;
+
+                    // tool_calls[].function.arguments and .name
+                    if let Some(tool_calls) =
+                        msg.get_mut("tool_calls").and_then(|tc| tc.as_array_mut())
+                    {
+                        for tc in tool_calls.iter_mut() {
+                            if let Some(func) = tc.get_mut("function") {
+                                encrypt_field(func, "arguments", ctx, signing)?;
+                                encrypt_field(func, "name", ctx, signing)?;
+                            }
                         }
                     }
-                }
 
-                // deprecated function_call.arguments and .name
-                if let Some(fc) = msg.get_mut("function_call") {
-                    encrypt_field(fc, "arguments", ctx, signing)?;
-                    encrypt_field(fc, "name", ctx, signing)?;
-                }
+                    // deprecated function_call.arguments and .name
+                    if let Some(fc) = msg.get_mut("function_call") {
+                        encrypt_field(fc, "arguments", ctx, signing)?;
+                        encrypt_field(fc, "name", ctx, signing)?;
+                    }
 
-                // logprobs — encrypt each token string
-                if let Some(logprobs) = choice.get_mut("logprobs") {
-                    encrypt_logprobs_tokens(logprobs, ctx, signing)?;
+                    // logprobs — encrypt each token string and bytes array
+                    if let Some(logprobs) = choice.get_mut("logprobs") {
+                        encrypt_logprobs_tokens(logprobs, ctx, signing)?;
+                    }
                 }
             }
         }
@@ -1247,6 +1268,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_ed25519_pub,
             version: 1,
+            encrypt_all_fields: false,
         };
 
         let plaintext = "Hello from client!";
@@ -1272,6 +1294,7 @@ mod tests {
             algo: EncryptionAlgo::Ecdsa,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: false,
         };
 
         let plaintext = "Hello from client!";
@@ -1290,6 +1313,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: false,
         };
 
         let encrypted = encrypt_string("", &ctx, &server_pair).unwrap();
@@ -1307,6 +1331,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: false,
         };
 
         let plaintext = "こんにちは世界 🌍 Привет мир";
@@ -1325,6 +1350,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: false,
         };
 
         // Encrypt "Hello" to simulate client-encrypted message
@@ -1352,6 +1378,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: false,
         };
 
         // Client encrypts a JSON-serialized content array
@@ -1391,6 +1418,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: false,
         };
 
         let mut response = serde_json::json!({
@@ -1427,6 +1455,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: false,
         };
 
         let mut chunk = serde_json::json!({
@@ -1458,6 +1487,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: false,
         };
 
         let mut response = serde_json::json!({
@@ -1481,6 +1511,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: false,
         };
 
         let mut response = serde_json::json!({
@@ -1510,6 +1541,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: false,
         };
 
         let mut response = serde_json::json!({
@@ -1537,6 +1569,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: false,
         };
 
         let mut response = serde_json::json!({
@@ -1560,6 +1593,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: false,
         };
 
         let mut response = serde_json::json!({
@@ -1645,6 +1679,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: false,
         };
 
         let mut chunk = serde_json::json!({
@@ -1676,6 +1711,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: false,
         };
 
         // Client encrypts the input string directly (matching Python proxy's decrypt_prompt)
@@ -1699,6 +1735,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: false,
         };
 
         // Client encrypts each string element individually (matching Python proxy)
@@ -1724,6 +1761,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: false,
         };
 
         let mut request = serde_json::json!({
@@ -1747,6 +1785,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: false,
         };
 
         // Tampered ciphertext — should fail with generic message
@@ -1777,6 +1816,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: false,
         };
 
         let encrypted = encrypt_string("hello", &ctx, &server_pair).unwrap();
@@ -1798,6 +1838,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: false,
         };
 
         let enc1 = encrypt_string("hello", &ctx, &server_pair).unwrap();
@@ -1821,6 +1862,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: false,
         };
 
         // Array with mixed types: encrypted strings and token ID arrays (not encrypted)
@@ -1859,6 +1901,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: true,
         };
 
         let mut response = serde_json::json!({
@@ -1903,6 +1946,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: true,
         };
 
         let mut chunk = serde_json::json!({
@@ -1938,6 +1982,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: true,
         };
 
         let mut response = serde_json::json!({
@@ -1970,6 +2015,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: true,
         };
 
         let mut response = serde_json::json!({
@@ -2004,6 +2050,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: true,
         };
 
         let mut response = serde_json::json!({
@@ -2072,6 +2119,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: true,
         };
 
         let enc_args = encrypt_string("{\"location\":\"home\"}", &ctx, &server_pair).unwrap();
@@ -2113,6 +2161,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: true,
         };
 
         let enc_name = encrypt_string("get_weather", &ctx, &server_pair).unwrap();
@@ -2150,6 +2199,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: true,
         };
 
         let schema = serde_json::json!({
@@ -2203,6 +2253,7 @@ mod tests {
             algo: EncryptionAlgo::Ed25519,
             client_pub_key: client_pub,
             version: 1,
+            encrypt_all_fields: false,
         };
 
         let enc_content = encrypt_string("What's the weather?", &ctx, &server_pair).unwrap();

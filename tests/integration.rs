@@ -3572,12 +3572,14 @@ async fn test_encrypted_chat_non_streaming_ed25519() {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
         version: 1,
+        encrypt_all_fields: false,
     };
 
     let dec_for_response = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: client_pub_bytes,
         version: 1,
+        encrypt_all_fields: false,
     };
 
     // Encrypt the message content (client encrypts with server's pub key)
@@ -3624,6 +3626,7 @@ async fn test_encrypted_chat_non_streaming_ed25519() {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: hex::decode(&server_pub_hex).unwrap(),
         version: 1,
+        encrypt_all_fields: false,
     };
     assert!(
         encryption::decrypt_string(encrypted_response, &wrong_ctx, &server_pair).is_err(),
@@ -3661,11 +3664,13 @@ async fn test_encrypted_chat_streaming_ed25519() {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
         version: 1,
+        encrypt_all_fields: false,
     };
     let dec_for_response = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: client_pub_bytes,
         version: 1,
+        encrypt_all_fields: false,
     };
 
     let encrypted_msg = encryption::encrypt_string("Hi", &enc_for_request, &client_pair).unwrap();
@@ -3871,11 +3876,13 @@ async fn test_encrypted_completions_ed25519() {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
         version: 1,
+        encrypt_all_fields: false,
     };
     let dec_for_response = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: client_pub_bytes,
         version: 1,
+        encrypt_all_fields: false,
     };
 
     let encrypted_prompt =
@@ -3945,6 +3952,7 @@ async fn test_encrypted_signature_covers_plaintext() {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
         version: 1,
+        encrypt_all_fields: false,
     };
 
     // Context for decrypting response (uses client's pub key, matching what the server sees)
@@ -3952,6 +3960,7 @@ async fn test_encrypted_signature_covers_plaintext() {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: client_pub_bytes,
         version: 1,
+        encrypt_all_fields: false,
     };
 
     let encrypted_msg = encryption::encrypt_string("Hi", &enc_for_request, &client_pair).unwrap();
@@ -4066,6 +4075,7 @@ async fn test_encrypted_streaming_signature_covers_transformed_bytes() {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
         version: 1,
+        encrypt_all_fields: false,
     };
 
     let encrypted_msg =
@@ -4169,11 +4179,13 @@ async fn test_encrypted_chat_non_streaming_ecdsa() {
         algo: encryption::EncryptionAlgo::Ecdsa,
         client_pub_key: server_ecdsa_pub,
         version: 1,
+        encrypt_all_fields: false,
     };
     let dec_for_response = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ecdsa,
         client_pub_key: client_ecdsa_pub,
         version: 1,
+        encrypt_all_fields: false,
     };
 
     let encrypted_content =
@@ -4242,6 +4254,7 @@ async fn test_encrypted_embeddings_ed25519() {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
         version: 1,
+        encrypt_all_fields: false,
     };
 
     // Each string element is individually encrypted (matching Python proxy)
@@ -4280,6 +4293,7 @@ async fn test_encrypted_embeddings_ed25519() {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: hex::decode(&client_pub_hex).unwrap(),
         version: 1,
+        encrypt_all_fields: false,
     };
     let decrypted =
         encryption::decrypt_string(encrypted_embedding, &dec_ctx, &client_pair).unwrap();
@@ -4317,11 +4331,13 @@ async fn test_encrypted_images_generations_ed25519() {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
         version: 1,
+        encrypt_all_fields: false,
     };
     let dec_for_response = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: client_pub_bytes,
         version: 1,
+        encrypt_all_fields: false,
     };
 
     let encrypted_prompt =
@@ -4391,11 +4407,13 @@ async fn test_encrypted_streaming_completions_ed25519() {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
         version: 1,
+        encrypt_all_fields: false,
     };
     let dec_for_response = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: client_pub_bytes,
         version: 1,
+        encrypt_all_fields: false,
     };
 
     let encrypted_prompt =
@@ -4475,11 +4493,13 @@ async fn test_encrypted_audio_transcription_signature_covers_transformed() {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
         version: 1,
+        encrypt_all_fields: false,
     };
     let dec_for_response = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: client_pub_bytes,
         version: 1,
+        encrypt_all_fields: false,
     };
 
     // Encrypt the prompt field
@@ -4660,6 +4680,7 @@ async fn test_encrypted_chat_salsa20_fallback_e2e() {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: client_pub_bytes,
         version: 1,
+        encrypt_all_fields: false,
     };
     let decrypted =
         encryption::decrypt_string(encrypted_response, &dec_for_response, &client_pair).unwrap();
@@ -4703,6 +4724,7 @@ async fn test_encrypted_chat_non_streaming_ed25519_v2() {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
         version: 2,
+        encrypt_all_fields: false,
     };
 
     let encrypted_content =
@@ -4742,6 +4764,7 @@ async fn test_encrypted_chat_non_streaming_ed25519_v2() {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: client_pub_bytes.clone(),
         version: 2,
+        encrypt_all_fields: false,
     };
     let decrypted =
         encryption::decrypt_string(encrypted_response, &dec_for_response, &client_pair).unwrap();
@@ -4752,6 +4775,7 @@ async fn test_encrypted_chat_non_streaming_ed25519_v2() {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: client_pub_bytes,
         version: 1,
+        encrypt_all_fields: false,
     };
     assert!(
         encryption::decrypt_string(encrypted_response, &v1_ctx, &client_pair).is_err(),

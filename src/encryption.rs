@@ -447,7 +447,7 @@ pub fn decrypt_request_fields(
                 }
             }
             // tools[].function.name, .description, .parameters (JSON schema)
-            decrypt_tools_definitions(value, ctx, signing)?;
+            decrypt_tools_definitions(value, ctx, signing);
         }
         Endpoint::Completions => {
             // prompt can be a string or an array of strings
@@ -575,36 +575,39 @@ pub fn encrypt_streaming_chunk(
 /// Decrypt tool/function definitions in the request.
 /// `tools[].function.name`, `.description`, and `.parameters` (serialized JSON schema)
 /// are user-defined and reveal what capabilities are exposed to the model.
+/// Uses lenient decryption — plaintext values pass through for backward compatibility.
 fn decrypt_tools_definitions(
     value: &mut serde_json::Value,
     ctx: &EncryptionContext,
     signing: &SigningPair,
-) -> Result<(), AppError> {
+) {
     if let Some(tools) = value.get_mut("tools").and_then(|t| t.as_array_mut()) {
         for tool in tools.iter_mut() {
             if let Some(func) = tool.get_mut("function") {
-                decrypt_field(func, "name", ctx, signing)?;
-                decrypt_field(func, "description", ctx, signing)?;
+                try_decrypt_field(func, "name", ctx, signing);
+                try_decrypt_field(func, "description", ctx, signing);
                 // parameters is a JSON schema object — client encrypts as serialized JSON string
                 if let Some(params) = func.get_mut("parameters") {
                     if let Some(s) = params.as_str() {
                         if !s.is_empty() {
-                            let decrypted = decrypt_string(s, ctx, signing)?;
-                            // Restore the JSON schema object from the decrypted string
-                            if let Ok(parsed) =
-                                serde_json::from_str::<serde_json::Value>(&decrypted)
-                            {
-                                *params = parsed;
-                            } else {
-                                *params = serde_json::Value::String(decrypted);
+                            if let Ok(decrypted) = decrypt_string(s, ctx, signing) {
+                                // Restore the JSON schema object from the decrypted string
+                                if let Ok(parsed) =
+                                    serde_json::from_str::<serde_json::Value>(&decrypted)
+                                {
+                                    *params = parsed;
+                                } else {
+                                    *params = serde_json::Value::String(decrypted);
+                                }
                             }
+                            // On failure, leave original value (already a JSON object)
                         }
                     }
+                    // If parameters is already an object, it was not encrypted — pass through
                 }
             }
         }
     }
-    Ok(())
 }
 
 fn decrypt_chat_message_fields(
@@ -636,9 +639,12 @@ fn decrypt_chat_message_fields(
 
     decrypt_field(msg, "reasoning_content", ctx, signing)?;
     decrypt_field(msg, "reasoning", ctx, signing)?;
-    decrypt_field(msg, "refusal", ctx, signing)?;
+
+    // Newly encrypted fields use try_decrypt_field for backward compatibility:
+    // existing E2EE clients may send these as plaintext.
+    try_decrypt_field(msg, "refusal", ctx, signing);
     // Top-level name field used in tool/function role messages
-    decrypt_field(msg, "name", ctx, signing)?;
+    try_decrypt_field(msg, "name", ctx, signing);
 
     // audio.data
     if let Some(audio) = msg.get_mut("audio") {
@@ -649,16 +655,16 @@ fn decrypt_chat_message_fields(
     if let Some(tool_calls) = msg.get_mut("tool_calls").and_then(|tc| tc.as_array_mut()) {
         for tc in tool_calls.iter_mut() {
             if let Some(func) = tc.get_mut("function") {
-                decrypt_field(func, "arguments", ctx, signing)?;
-                decrypt_field(func, "name", ctx, signing)?;
+                try_decrypt_field(func, "arguments", ctx, signing);
+                try_decrypt_field(func, "name", ctx, signing);
             }
         }
     }
 
     // deprecated function_call.arguments and .name
     if let Some(fc) = msg.get_mut("function_call") {
-        decrypt_field(fc, "arguments", ctx, signing)?;
-        decrypt_field(fc, "name", ctx, signing)?;
+        try_decrypt_field(fc, "arguments", ctx, signing);
+        try_decrypt_field(fc, "name", ctx, signing);
     }
 
     Ok(())
@@ -794,6 +800,28 @@ fn decrypt_field(
         }
     }
     Ok(())
+}
+
+/// Try to decrypt a single string field on an object, in-place.
+/// If decryption fails (e.g. field contains plaintext), the original value is preserved.
+/// This provides backward compatibility: existing E2EE clients that don't encrypt
+/// newly-added fields (tool_calls, refusal, tools, name) won't get 400 errors.
+fn try_decrypt_field(
+    obj: &mut serde_json::Value,
+    field: &str,
+    ctx: &EncryptionContext,
+    signing: &SigningPair,
+) {
+    if let Some(val) = obj.get_mut(field) {
+        if let Some(s) = val.as_str() {
+            if !s.is_empty() {
+                if let Ok(decrypted) = decrypt_string(s, ctx, signing) {
+                    *val = serde_json::Value::String(decrypted);
+                }
+                // On failure, leave original value — assume plaintext
+            }
+        }
+    }
 }
 
 /// Decrypt a field that may be a string or an array of encrypted strings.
@@ -2163,5 +2191,88 @@ mod tests {
             func["parameters"]["required"][0].as_str().unwrap(),
             "location"
         );
+    }
+
+    #[test]
+    fn test_backward_compat_plaintext_tools_and_tool_calls() {
+        // Existing E2EE clients encrypt content but send tools/tool_calls as plaintext.
+        // This must NOT fail — plaintext fields should pass through unchanged.
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        let ctx = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: client_pub,
+            version: 1,
+        };
+
+        let enc_content = encrypt_string("What's the weather?", &ctx, &server_pair).unwrap();
+        let mut request = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": enc_content},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "{\"location\":\"NYC\"}"
+                        }
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "name": "get_weather",
+                    "content": enc_content
+                }
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather for a location",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}}
+                    }
+                }
+            }]
+        });
+
+        // Must not error — plaintext tool_calls and tools pass through
+        decrypt_request_fields(&mut request, Endpoint::ChatCompletions, &ctx, &server_pair)
+            .unwrap();
+
+        // Encrypted content decrypted
+        assert_eq!(
+            request["messages"][0]["content"].as_str().unwrap(),
+            "What's the weather?"
+        );
+        // Plaintext tool_calls preserved
+        assert_eq!(
+            request["messages"][1]["tool_calls"][0]["function"]["name"]
+                .as_str()
+                .unwrap(),
+            "get_weather"
+        );
+        assert_eq!(
+            request["messages"][1]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap(),
+            "{\"location\":\"NYC\"}"
+        );
+        // Plaintext tool name preserved
+        assert_eq!(
+            request["messages"][2]["name"].as_str().unwrap(),
+            "get_weather"
+        );
+        // Plaintext tools definitions preserved (parameters stays as object)
+        assert_eq!(
+            request["tools"][0]["function"]["name"].as_str().unwrap(),
+            "get_weather"
+        );
+        assert!(request["tools"][0]["function"]["parameters"].is_object());
     }
 }

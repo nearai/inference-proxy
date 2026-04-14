@@ -4,6 +4,7 @@ use axum::middleware;
 use tokio::net::TcpListener;
 use tracing::info;
 
+use vllm_proxy_rs::ohttp_gateway::OhttpGateway;
 use vllm_proxy_rs::{
     attestation, backend_pool, cache, config, metrics_middleware, rate_limit,
     request_id_middleware, routes, signing, startup_checks, AppState,
@@ -29,10 +30,7 @@ async fn main() -> anyhow::Result<()> {
     // Load config
     let config = config::Config::from_env()?;
 
-    let listen_port: u16 = std::env::var("LISTEN_PORT")
-        .unwrap_or_else(|_| "8000".to_string())
-        .parse()
-        .map_err(|_| anyhow::anyhow!("LISTEN_PORT must be a valid port number"))?;
+    let listen_port = config.listen_port;
 
     // Warn if any backend URL points to the proxy's own listen address
     let self_local = format!("://localhost:{listen_port}");
@@ -75,6 +73,18 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
+    // Initialize OHTTP gateway if enabled
+    let ohttp_gw = if config.ohttp_enabled {
+        let gw = OhttpGateway::new(signing.ed25519.secret_bytes())?;
+        info!(
+            ohttp_key_config = %hex::encode(gw.config_bytes()),
+            "OHTTP Gateway enabled"
+        );
+        Some(Arc::new(gw))
+    } else {
+        None
+    };
+
     // Initialize caches
     let chat_cache = cache::ChatCache::new(&config.model_name, config.chat_cache_expiration_secs);
     let attestation_cache = Arc::new(attestation::AttestationCache::new(
@@ -104,6 +114,7 @@ async fn main() -> anyhow::Result<()> {
         metrics_handle,
         tls_cert_fingerprint: tls_cert_fingerprint.clone(),
         backend_pool: backend_pool.clone(),
+        ohttp_gateway: ohttp_gw,
     };
 
     // Spawn background attestation cache refresh task.

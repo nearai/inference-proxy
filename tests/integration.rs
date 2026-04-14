@@ -1,3 +1,4 @@
+use std::io::Cursor;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -68,6 +69,8 @@ fn build_test_app_with_rate_limit(
         transcriptions_url_override: None,
         rerank_url_override: None,
         score_url_override: None,
+        ohttp_enabled: false,
+        listen_port: 8000,
     };
 
     // Use fixed keys for deterministic tests
@@ -107,6 +110,7 @@ fn build_test_app_with_rate_limit(
         metrics_handle,
         tls_cert_fingerprint: None,
         backend_pool,
+        ohttp_gateway: None,
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(rate_per_second, rate_burst);
@@ -2829,6 +2833,8 @@ fn build_test_app_with_cloud_api(mock_url: &str, cloud_api_url: &str) -> axum::R
         transcriptions_url_override: None,
         rerank_url_override: None,
         score_url_override: None,
+        ohttp_enabled: false,
+        listen_port: 8000,
     };
 
     let ecdsa_key: [u8; 32] = [
@@ -2865,6 +2871,7 @@ fn build_test_app_with_cloud_api(mock_url: &str, cloud_api_url: &str) -> axum::R
         metrics_handle,
         tls_cert_fingerprint: None,
         backend_pool,
+        ohttp_gateway: None,
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(100, 200);
@@ -4809,4 +4816,626 @@ async fn test_encrypted_chat_non_streaming_ed25519_v2() {
         encryption::decrypt_string(encrypted_response, &v1_ctx, &client_pair).is_err(),
         "v1 decrypt must not work on v2 ciphertext"
     );
+}
+
+// ---- OHTTP Gateway tests ----
+
+/// Build a test app with OHTTP enabled and a real OhttpGateway in state.
+fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
+    let base = mock_url.trim_end_matches('/');
+
+    let ed25519_key: [u8; 32] = [
+        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
+        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
+        0x7f, 0x60,
+    ];
+
+    let config = config::Config {
+        model_name: "test-model".to_string(),
+        token: "test-token".to_string(),
+        vllm_base_url: mock_url.to_string(),
+        chat_completions_url: format!("{base}/v1/chat/completions"),
+        completions_url: format!("{base}/v1/completions"),
+        tokenize_url: format!("{base}/tokenize"),
+        metrics_url: format!("{base}/metrics"),
+        models_url: format!("{base}/v1/models"),
+        images_url: format!("{base}/v1/images/generations"),
+        images_edits_url: format!("{base}/v1/images/edits"),
+        transcriptions_url: format!("{base}/v1/audio/transcriptions"),
+        embeddings_url: format!("{base}/v1/embeddings"),
+        rerank_url: format!("{base}/v1/rerank"),
+        score_url: format!("{base}/v1/score"),
+        max_keepalive: 5,
+        max_request_size: 1024 * 1024,
+        max_image_request_size: 5 * 1024 * 1024,
+        max_audio_request_size: 10 * 1024 * 1024,
+        chat_cache_expiration_secs: 1200,
+        attestation_cache_ttl_secs: 300,
+        dev_mode: true,
+        gpu_no_hw_mode: true,
+        git_rev: "test-rev".to_string(),
+        rate_limit_per_second: 100,
+        rate_limit_burst_size: 200,
+        rate_limit_trust_proxy_headers: true,
+        cloud_api_url: None,
+        compose_manager_url: None,
+        tls_cert_path: None,
+        timeout_secs: 30,
+        timeout_tokenize_secs: 5,
+        openai_chat_compatibility_check_enabled: false,
+        startup_check_retries: 1,
+        startup_check_retry_delay_secs: 0,
+        startup_check_timeout_secs: 5,
+        backend_urls: vec![mock_url.to_string()],
+        health_check_interval_secs: 5,
+        health_check_max_failures: 3,
+        health_check_timeout_secs: 3,
+        images_url_override: None,
+        images_edits_url_override: None,
+        transcriptions_url_override: None,
+        rerank_url_override: None,
+        score_url_override: None,
+        ohttp_enabled: true,
+        listen_port: 0, // not used in oneshot tests
+    };
+
+    let ecdsa_key: [u8; 32] = [
+        0xac, 0x09, 0x74, 0xbe, 0xc3, 0x9a, 0x17, 0xe3, 0x6b, 0xa4, 0xa6, 0xb4, 0xd2, 0x38, 0xff,
+        0x94, 0x4b, 0xac, 0xb3, 0x5e, 0x5d, 0xc4, 0xaf, 0x0f, 0x33, 0x47, 0xe5, 0x87, 0x31, 0x79,
+        0x67, 0x0f,
+    ];
+
+    let ecdsa = signing::EcdsaContext::from_key_bytes(&ecdsa_key).unwrap();
+    let ed25519 = signing::Ed25519Context::from_key_bytes(&ed25519_key).unwrap();
+
+    let ohttp_gw = ohttp_gateway::OhttpGateway::new(ed25519.secret_bytes()).unwrap();
+
+    let signing_pair = signing::SigningPair { ecdsa, ed25519 };
+    let chat_cache = cache::ChatCache::new("test-model", 1200);
+    let http_client = reqwest::Client::new();
+
+    let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .build_recorder()
+        .handle();
+
+    let backend_pool = Arc::new(backend_pool::BackendPool::new(vec![mock_url.to_string()]));
+
+    let state = AppState {
+        config: Arc::new(config),
+        signing: Arc::new(signing_pair),
+        cache: Arc::new(chat_cache),
+        attestation_cache: Arc::new(attestation::AttestationCache::new(300)),
+        http_client,
+        metrics_handle,
+        tls_cert_fingerprint: None,
+        backend_pool,
+        ohttp_gateway: Some(Arc::new(ohttp_gw)),
+    };
+
+    let rate_limiter = rate_limit::build_rate_limiter(100, 200);
+    let rate_limit_state = rate_limit::RateLimitState {
+        limiter: rate_limiter,
+        trust_proxy_headers: true,
+    };
+
+    routes::build_router()
+        .layer(middleware::from_fn(rate_limit::rate_limit_middleware))
+        .layer(axum::Extension(rate_limit_state))
+        .layer(middleware::from_fn(request_id_middleware))
+        .with_state(state)
+}
+
+// Test 4: Config endpoint returns 404 when OHTTP disabled
+#[tokio::test]
+async fn test_ohttp_config_returns_404_when_disabled() {
+    let mock = MockServer::start().await;
+    let app = build_test_app(&mock.uri());
+
+    let response = app
+        .oneshot(
+            Request::get("/.well-known/ohttp-gateway")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// Test 5: Config endpoint returns 200 with correct content-type when enabled
+#[tokio::test]
+async fn test_ohttp_config_returns_key_config_when_enabled() {
+    let mock = MockServer::start().await;
+    let app = build_test_app_with_ohttp(&mock.uri());
+
+    let response = app
+        .oneshot(
+            Request::get("/.well-known/ohttp-gateway")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/ohttp-keys"
+    );
+
+    let body = http_body_util::BodyExt::collect(response.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    assert!(!body.is_empty());
+
+    // Verify the config bytes can be parsed by the ohttp crate
+    let config = ohttp::KeyConfig::decode(&body);
+    assert!(config.is_ok(), "Config bytes should be valid KeyConfig");
+}
+
+// Test 6: /v1/ohttp/config alias returns same bytes as well-known endpoint
+#[tokio::test]
+async fn test_ohttp_config_alias_matches_well_known() {
+    let mock = MockServer::start().await;
+
+    // Get from well-known endpoint
+    let app1 = build_test_app_with_ohttp(&mock.uri());
+    let resp1 = app1
+        .oneshot(
+            Request::get("/.well-known/ohttp-gateway")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body1 = http_body_util::BodyExt::collect(resp1.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+
+    // Get from alias endpoint
+    let app2 = build_test_app_with_ohttp(&mock.uri());
+    let resp2 = app2
+        .oneshot(
+            Request::get("/v1/ohttp/config")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body2 = http_body_util::BodyExt::collect(resp2.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+
+    assert_eq!(body1, body2);
+}
+
+// Test 7: POST /ohttp returns 404 when disabled
+#[tokio::test]
+async fn test_ohttp_relay_returns_404_when_disabled() {
+    let mock = MockServer::start().await;
+    let app = build_test_app(&mock.uri());
+
+    let response = app
+        .oneshot(
+            Request::post("/ohttp")
+                .header("content-type", "message/ohttp-req")
+                .body(Body::from(vec![0u8; 32]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// Test 8: POST /ohttp with empty body returns 400
+#[tokio::test]
+async fn test_ohttp_relay_empty_body_returns_400() {
+    let mock = MockServer::start().await;
+    let app = build_test_app_with_ohttp(&mock.uri());
+
+    let response = app
+        .oneshot(
+            Request::post("/ohttp")
+                .header("content-type", "message/ohttp-req")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+// Test 9: POST /ohttp with garbage bytes returns 400 (decapsulation fails)
+#[tokio::test]
+async fn test_ohttp_relay_garbage_body_returns_400() {
+    let mock = MockServer::start().await;
+    let app = build_test_app_with_ohttp(&mock.uri());
+
+    let response = app
+        .oneshot(
+            Request::post("/ohttp")
+                .header("content-type", "message/ohttp-req")
+                .body(Body::from(vec![0xDEu8; 100]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+// Test 13: Attestation response includes ohttp_key_config when OHTTP enabled
+#[tokio::test]
+async fn test_ohttp_attestation_includes_key_config() {
+    let mock = MockServer::start().await;
+    let app = build_test_app_with_ohttp(&mock.uri());
+
+    let response = app
+        .oneshot(
+            Request::get("/v1/attestation/report?signing_algo=ed25519")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // On non-TEE machines, attestation returns 500 (no TDX hardware).
+    // If 200, verify the field is present and valid.
+    let status = response.status();
+    if status == StatusCode::OK {
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json.get("ohttp_key_config").is_some(),
+            "ohttp_key_config should be present when OHTTP is enabled"
+        );
+        let hex_config = json["ohttp_key_config"].as_str().unwrap();
+        let config_bytes = hex::decode(hex_config).unwrap();
+        assert!(ohttp::KeyConfig::decode(&config_bytes).is_ok());
+    }
+}
+
+// Test 14: Attestation response omits ohttp_key_config when OHTTP disabled
+#[tokio::test]
+async fn test_ohttp_attestation_omits_key_config_when_disabled() {
+    let mock = MockServer::start().await;
+    let app = build_test_app(&mock.uri());
+
+    let response = app
+        .oneshot(
+            Request::get("/v1/attestation/report?signing_algo=ed25519")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    if status == StatusCode::OK {
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json.get("ohttp_key_config").is_none(),
+            "ohttp_key_config should NOT be present when OHTTP is disabled"
+        );
+    }
+}
+
+/// Build and start a real OHTTP-enabled server on a random port.
+/// Returns (base_url, server_handle, key_config_bytes).
+/// The server runs in the background; drop the handle to stop it.
+async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<()>, Vec<u8>) {
+    let base = mock_url.trim_end_matches('/');
+
+    let ed25519_key: [u8; 32] = [
+        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
+        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
+        0x7f, 0x60,
+    ];
+    let ecdsa_key: [u8; 32] = [
+        0xac, 0x09, 0x74, 0xbe, 0xc3, 0x9a, 0x17, 0xe3, 0x6b, 0xa4, 0xa6, 0xb4, 0xd2, 0x38, 0xff,
+        0x94, 0x4b, 0xac, 0xb3, 0x5e, 0x5d, 0xc4, 0xaf, 0x0f, 0x33, 0x47, 0xe5, 0x87, 0x31, 0x79,
+        0x67, 0x0f,
+    ];
+
+    // Bind first to get the port, then build config with that port.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let config = config::Config {
+        model_name: "test-model".to_string(),
+        token: "test-token".to_string(),
+        vllm_base_url: mock_url.to_string(),
+        chat_completions_url: format!("{base}/v1/chat/completions"),
+        completions_url: format!("{base}/v1/completions"),
+        tokenize_url: format!("{base}/tokenize"),
+        metrics_url: format!("{base}/metrics"),
+        models_url: format!("{base}/v1/models"),
+        images_url: format!("{base}/v1/images/generations"),
+        images_edits_url: format!("{base}/v1/images/edits"),
+        transcriptions_url: format!("{base}/v1/audio/transcriptions"),
+        embeddings_url: format!("{base}/v1/embeddings"),
+        rerank_url: format!("{base}/v1/rerank"),
+        score_url: format!("{base}/v1/score"),
+        max_keepalive: 5,
+        max_request_size: 1024 * 1024,
+        max_image_request_size: 5 * 1024 * 1024,
+        max_audio_request_size: 10 * 1024 * 1024,
+        chat_cache_expiration_secs: 1200,
+        attestation_cache_ttl_secs: 300,
+        dev_mode: true,
+        gpu_no_hw_mode: true,
+        git_rev: "test-rev".to_string(),
+        rate_limit_per_second: 100,
+        rate_limit_burst_size: 200,
+        rate_limit_trust_proxy_headers: true,
+        cloud_api_url: None,
+        compose_manager_url: None,
+        tls_cert_path: None,
+        timeout_secs: 30,
+        timeout_tokenize_secs: 5,
+        openai_chat_compatibility_check_enabled: false,
+        startup_check_retries: 1,
+        startup_check_retry_delay_secs: 0,
+        startup_check_timeout_secs: 5,
+        backend_urls: vec![mock_url.to_string()],
+        health_check_interval_secs: 5,
+        health_check_max_failures: 3,
+        health_check_timeout_secs: 3,
+        images_url_override: None,
+        images_edits_url_override: None,
+        transcriptions_url_override: None,
+        rerank_url_override: None,
+        score_url_override: None,
+        ohttp_enabled: true,
+        listen_port: port,
+    };
+
+    let ecdsa = signing::EcdsaContext::from_key_bytes(&ecdsa_key).unwrap();
+    let ed25519 = signing::Ed25519Context::from_key_bytes(&ed25519_key).unwrap();
+    let ohttp_gw = ohttp_gateway::OhttpGateway::new(ed25519.secret_bytes()).unwrap();
+    let config_bytes = ohttp_gw.config_bytes().to_vec();
+    let signing_pair = signing::SigningPair { ecdsa, ed25519 };
+
+    let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .build_recorder()
+        .handle();
+    let backend_pool = Arc::new(backend_pool::BackendPool::new(vec![mock_url.to_string()]));
+
+    let state = AppState {
+        config: Arc::new(config),
+        signing: Arc::new(signing_pair),
+        cache: Arc::new(cache::ChatCache::new("test-model", 1200)),
+        attestation_cache: Arc::new(attestation::AttestationCache::new(300)),
+        http_client: reqwest::Client::new(),
+        metrics_handle,
+        tls_cert_fingerprint: None,
+        backend_pool,
+        ohttp_gateway: Some(Arc::new(ohttp_gw)),
+    };
+
+    let rate_limiter = rate_limit::build_rate_limiter(100, 200);
+    let rate_limit_state = rate_limit::RateLimitState {
+        limiter: rate_limiter,
+        trust_proxy_headers: true,
+    };
+
+    let app = routes::build_router()
+        .layer(middleware::from_fn(rate_limit::rate_limit_middleware))
+        .layer(axum::Extension(rate_limit_state))
+        .layer(middleware::from_fn(request_id_middleware))
+        .with_state(state);
+
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let base_url = format!("http://127.0.0.1:{port}");
+    (base_url, handle, config_bytes)
+}
+
+/// Helper: create an OHTTP-encrypted request from an inner bhttp::Message.
+fn ohttp_encrypt_request(
+    config_bytes: &[u8],
+    inner_msg: &bhttp::Message,
+) -> (Vec<u8>, ohttp::ClientResponse) {
+    let mut config = ohttp::KeyConfig::decode(config_bytes).unwrap();
+    let client_request = ohttp::ClientRequest::from_config(&mut config).unwrap();
+
+    let mut bhttp_bytes = Vec::new();
+    inner_msg
+        .write_bhttp(bhttp::Mode::KnownLength, &mut bhttp_bytes)
+        .unwrap();
+
+    let (enc_request, client_response) = client_request.encapsulate(&bhttp_bytes).unwrap();
+    (enc_request, client_response)
+}
+
+/// Helper: decrypt an OHTTP response and parse the inner bhttp::Message.
+fn ohttp_decrypt_response(
+    client_response: ohttp::ClientResponse,
+    enc_response: &[u8],
+) -> bhttp::Message {
+    let bhttp_bytes = client_response.decapsulate(enc_response).unwrap();
+    bhttp::Message::read_bhttp(&mut Cursor::new(&bhttp_bytes[..])).unwrap()
+}
+
+// Test 10: Full OHTTP roundtrip — encrypt chat completion, get real response
+#[tokio::test]
+async fn test_ohttp_full_roundtrip_chat_completion() {
+    let mock = MockServer::start().await;
+
+    // Mock the backend vLLM response
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Hello from OHTTP!"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 4, "total_tokens": 9}
+        })))
+        .mount(&mock)
+        .await;
+
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock.uri()).await;
+
+    // Build inner Binary HTTP request
+    let mut inner_req = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/chat/completions".to_vec(),
+    );
+    inner_req.put_header("content-type", "application/json");
+    inner_req.put_header("authorization", "Bearer test-token");
+    let body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": false
+    });
+    inner_req.write_content(serde_json::to_vec(&body).unwrap());
+
+    // Encrypt
+    let (enc_request, client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+
+    // Send to /ohttp
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{base_url}/ohttp"))
+        .header("content-type", "message/ohttp-req")
+        .body(enc_request)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "message/ohttp-res"
+    );
+
+    let enc_response = response.bytes().await.unwrap();
+
+    // Decrypt
+    let inner_resp = ohttp_decrypt_response(client_response, &enc_response);
+
+    // Verify inner response
+    assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+
+    let resp_body: serde_json::Value = serde_json::from_slice(inner_resp.content()).unwrap();
+    assert_eq!(
+        resp_body["choices"][0]["message"]["content"],
+        "Hello from OHTTP!"
+    );
+    assert_eq!(resp_body["id"], "chatcmpl-test");
+
+    server_handle.abort();
+}
+
+// Test 11: OHTTP with missing auth in inner request → encrypted 401
+#[tokio::test]
+async fn test_ohttp_auth_enforcement_inside_envelope() {
+    let mock = MockServer::start().await;
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock.uri()).await;
+
+    // Build inner request WITHOUT authorization header
+    let mut inner_req = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/chat/completions".to_vec(),
+    );
+    inner_req.put_header("content-type", "application/json");
+    // Deliberately no "authorization" header
+    let body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": false
+    });
+    inner_req.write_content(serde_json::to_vec(&body).unwrap());
+
+    let (enc_request, client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{base_url}/ohttp"))
+        .header("content-type", "message/ohttp-req")
+        .body(enc_request)
+        .send()
+        .await
+        .unwrap();
+
+    // The OHTTP layer itself returns 200 (successful OHTTP processing).
+    // The auth failure is inside the encrypted envelope.
+    assert_eq!(response.status(), 200);
+
+    let enc_response = response.bytes().await.unwrap();
+    let inner_resp = ohttp_decrypt_response(client_response, &enc_response);
+
+    // The inner response should be 401 Unauthorized
+    assert_eq!(inner_resp.control().status().unwrap().code(), 401);
+
+    server_handle.abort();
+}
+
+// Test 12: OHTTP with inner GET request (e.g. /v1/models)
+#[tokio::test]
+async fn test_ohttp_get_request_inner() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "test-model", "object": "model"}]
+        })))
+        .mount(&mock)
+        .await;
+
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock.uri()).await;
+
+    // Build inner GET request — note: /v1/models is unauthenticated (passthrough)
+    let inner_req = bhttp::Message::request(
+        b"GET".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/models".to_vec(),
+    );
+
+    let (enc_request, client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{base_url}/ohttp"))
+        .header("content-type", "message/ohttp-req")
+        .body(enc_request)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+
+    let enc_response = response.bytes().await.unwrap();
+    let inner_resp = ohttp_decrypt_response(client_response, &enc_response);
+
+    assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+    let resp_body: serde_json::Value = serde_json::from_slice(inner_resp.content()).unwrap();
+    assert_eq!(resp_body["data"][0]["id"], "test-model");
+
+    server_handle.abort();
 }

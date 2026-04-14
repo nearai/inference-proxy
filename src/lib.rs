@@ -13,6 +13,7 @@ pub mod config;
 pub mod encryption;
 pub mod error;
 pub mod metrics_middleware;
+pub mod ohttp_gateway;
 pub mod proxy;
 pub mod rate_limit;
 pub mod routes;
@@ -33,6 +34,7 @@ pub struct AppState {
     /// Computed at startup when `TLS_CERT_PATH` is set.
     pub tls_cert_fingerprint: Option<String>,
     pub backend_pool: Arc<backend_pool::BackendPool>,
+    pub ohttp_gateway: Option<Arc<ohttp_gateway::OhttpGateway>>,
 }
 
 /// Request ID middleware: generates or passes through X-Request-ID header.

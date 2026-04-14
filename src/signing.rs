@@ -114,8 +114,8 @@ impl Ed25519Context {
         })
     }
 
-    /// Access the raw 32-byte secret key bytes (needed for NaCl box encryption).
-    pub(crate) fn secret_bytes(&self) -> &[u8; 32] {
+    /// Access the raw 32-byte secret key bytes (needed for encryption and OHTTP key derivation).
+    pub fn secret_bytes(&self) -> &[u8; 32] {
         self.signing_key.as_bytes()
     }
 

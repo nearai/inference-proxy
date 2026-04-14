@@ -4,6 +4,7 @@ pub mod chat;
 pub mod completions;
 pub mod health;
 pub mod metrics;
+pub mod ohttp;
 pub mod passthrough;
 pub mod signature;
 
@@ -47,5 +48,9 @@ pub fn build_router() -> Router<AppState> {
             post(passthrough::audio_transcriptions),
         )
         .route("/v1/signature/{chat_id}", get(signature::signature))
+        // OHTTP Gateway (RFC 9458) — unauthenticated (auth is inside envelope)
+        .route("/.well-known/ohttp-gateway", get(ohttp::ohttp_config))
+        .route("/v1/ohttp/config", get(ohttp::ohttp_config))
+        .route("/ohttp", post(ohttp::ohttp_relay))
         .fallback(catch_all::catch_all)
 }

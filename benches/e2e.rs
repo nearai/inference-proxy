@@ -77,6 +77,8 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         transcriptions_url_override: None,
         rerank_url_override: None,
         score_url_override: None,
+        ohttp_enabled: false,
+        listen_port: 8000,
     };
 
     let ecdsa = signing::EcdsaContext::from_key_bytes(&ECDSA_KEY).unwrap();
@@ -101,6 +103,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         metrics_handle,
         tls_cert_fingerprint: None,
         backend_pool,
+        ohttp_gateway: None,
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(10000, 20000);
@@ -224,7 +227,7 @@ fn bench_attestation_cache_operations(c: &mut Criterion) {
         info: serde_json::json!({"version": "1.0"}),
         tls_cert_fingerprint: None,
     };
-    rt.block_on(cache.set("ecdsa", false, report.clone(), None));
+    rt.block_on(cache.set("ecdsa", false, report.clone(), None, None));
 
     group.bench_function("cache_hit", |b| {
         b.to_async(&rt)
@@ -238,7 +241,7 @@ fn bench_attestation_cache_operations(c: &mut Criterion) {
 
     group.bench_function("cache_set", |b| {
         b.to_async(&rt)
-            .iter(|| async { cache.set("ecdsa", false, report.clone(), None).await })
+            .iter(|| async { cache.set("ecdsa", false, report.clone(), None, None).await })
     });
 
     group.finish();
@@ -273,6 +276,7 @@ fn bench_attestation_report_serialization(c: &mut Criterion) {
         report: report.clone(),
         all_attestations: vec![report],
         compose_manager_attestation: None,
+        ohttp_key_config: None,
     };
 
     c.bench_function("attestation_response_serialize", |b| {

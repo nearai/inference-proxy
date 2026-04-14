@@ -96,16 +96,33 @@ pub async fn ohttp_relay(State(state): State<AppState>, body: Body) -> Result<Re
 
     let mut request_builder = state.http_client.request(method, &loopback_url);
 
-    // Copy headers from the inner Binary HTTP message.
+    // Copy headers from the inner Binary HTTP message (byte-level to avoid
+    // panics on invalid UTF-8 header names/values).
     for field in inner_msg.header().fields() {
-        let name = std::str::from_utf8(field.name()).unwrap_or_default();
-        let value = std::str::from_utf8(field.value()).unwrap_or_default();
-        // Skip hop-by-hop headers and host (we set our own).
-        if !matches!(
-            name.to_lowercase().as_str(),
-            "host" | "transfer-encoding" | "connection"
+        let name_bytes = field.name();
+        let value_bytes = field.value();
+
+        // Skip hop-by-hop headers and host (case-insensitive).
+        if name_bytes.eq_ignore_ascii_case(b"host")
+            || name_bytes.eq_ignore_ascii_case(b"transfer-encoding")
+            || name_bytes.eq_ignore_ascii_case(b"connection")
+        {
+            continue;
+        }
+
+        match (
+            HeaderName::from_bytes(name_bytes),
+            HeaderValue::from_bytes(value_bytes),
         ) {
-            request_builder = request_builder.header(name, value);
+            (Ok(name), Ok(value)) => {
+                request_builder = request_builder.header(name, value);
+            }
+            _ => {
+                warn!(
+                    name = %String::from_utf8_lossy(name_bytes),
+                    "Skipping invalid inner OHTTP header"
+                );
+            }
         }
     }
 
@@ -128,13 +145,12 @@ pub async fn ohttp_relay(State(state): State<AppState>, body: Body) -> Result<Re
         bhttp::StatusCode::try_from(response_status).unwrap_or(bhttp::StatusCode::OK);
     let mut bhttp_response = bhttp::Message::response(bhttp_status);
 
-    // Copy response headers.
+    // Copy response headers (case-insensitive hop-by-hop filtering).
     for (name, value) in loopback_response.headers() {
-        // Skip hop-by-hop headers.
-        if !matches!(
-            name.as_str(),
-            "transfer-encoding" | "connection" | "content-length"
-        ) {
+        if !(name.as_str().eq_ignore_ascii_case("transfer-encoding")
+            || name.as_str().eq_ignore_ascii_case("connection")
+            || name.as_str().eq_ignore_ascii_case("content-length"))
+        {
             bhttp_response.put_header(name.as_str(), value.as_bytes());
         }
     }

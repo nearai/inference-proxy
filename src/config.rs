@@ -102,6 +102,11 @@ pub struct Config {
     /// Health check timeout in seconds.
     pub health_check_timeout_secs: u64,
 
+    // OHTTP Gateway (RFC 9458)
+    pub ohttp_enabled: bool,
+    /// Listen port for the proxy (used by OHTTP handler for loopback requests).
+    pub listen_port: u16,
+
     // Endpoint URL overrides (Some = explicitly set, bypasses backend pool)
     pub images_url_override: Option<String>,
     pub images_edits_url_override: Option<String>,
@@ -164,6 +169,11 @@ impl Config {
         let score_url = score_url_override
             .clone()
             .unwrap_or_else(|| format!("{base}/v1/score"));
+
+        let listen_port: u16 = env::var("LISTEN_PORT")
+            .unwrap_or_else(|_| "8000".to_string())
+            .parse()
+            .map_err(|_| anyhow::anyhow!("LISTEN_PORT must be a valid port number"))?;
 
         let git_rev = std::fs::read_to_string("/etc/.GIT_REV")
             .map(|s| s.trim().to_string())
@@ -232,6 +242,8 @@ impl Config {
             health_check_interval_secs: env_int("HEALTH_CHECK_INTERVAL_SECS", 5) as u64,
             health_check_max_failures: env_int("HEALTH_CHECK_MAX_FAILURES", 3) as u32,
             health_check_timeout_secs: env_int("HEALTH_CHECK_TIMEOUT_SECS", 3) as u64,
+            ohttp_enabled: env_bool("OHTTP_ENABLED"),
+            listen_port,
             images_url_override,
             images_edits_url_override,
             transcriptions_url_override,

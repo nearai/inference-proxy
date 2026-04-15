@@ -334,11 +334,13 @@ impl AttestationCache {
         include_tls_fingerprint: bool,
         report: AttestationReport,
         compose_manager_attestation: Option<serde_json::Value>,
+        ohttp_key_config: Option<String>,
     ) {
         let response = crate::types::AttestationResponse {
             report: report.clone(),
             all_attestations: vec![report.clone()],
             compose_manager_attestation,
+            ohttp_key_config,
         };
         let response_bytes = match serde_json::to_vec(&response) {
             Ok(bytes) => bytes::Bytes::from(bytes),
@@ -468,7 +470,9 @@ pub fn spawn_cache_refresh_task(
                 .await
                 {
                     Ok(report) => {
-                        cache.set(algo, false, report, cm_attestation.clone()).await;
+                        cache
+                            .set(algo, false, report, cm_attestation.clone(), None)
+                            .await;
                         info!(algo, "Background attestation cache refresh succeeded");
                     }
                     Err(e) => {
@@ -494,7 +498,9 @@ pub fn spawn_cache_refresh_task(
                     .await
                     {
                         Ok(report) => {
-                            cache.set(algo, true, report, cm_attestation.clone()).await;
+                            cache
+                                .set(algo, true, report, cm_attestation.clone(), None)
+                                .await;
                         }
                         Err(e) => {
                             warn!(algo, error = %e, "Background attestation cache refresh (with TLS) failed");
@@ -1048,7 +1054,7 @@ mod tests {
     async fn test_attestation_cache_hit() {
         let cache = AttestationCache::new(300);
         let report = make_test_report("ecdsa", "aabb");
-        cache.set("ecdsa", false, report.clone(), None).await;
+        cache.set("ecdsa", false, report.clone(), None, None).await;
 
         let result = cache.get("ecdsa", false).await;
         assert!(result.is_some());
@@ -1059,7 +1065,7 @@ mod tests {
     async fn test_attestation_cache_miss_different_algo() {
         let cache = AttestationCache::new(300);
         cache
-            .set("ecdsa", false, make_test_report("ecdsa", "aa"), None)
+            .set("ecdsa", false, make_test_report("ecdsa", "aa"), None, None)
             .await;
 
         assert!(cache.get("ed25519", false).await.is_none());
@@ -1069,7 +1075,7 @@ mod tests {
     async fn test_attestation_cache_miss_different_tls() {
         let cache = AttestationCache::new(300);
         cache
-            .set("ecdsa", false, make_test_report("ecdsa", "aa"), None)
+            .set("ecdsa", false, make_test_report("ecdsa", "aa"), None, None)
             .await;
 
         assert!(cache.get("ecdsa", true).await.is_none());
@@ -1079,7 +1085,7 @@ mod tests {
     async fn test_attestation_cache_ttl_expiry() {
         let cache = AttestationCache::new(1);
         cache
-            .set("ecdsa", false, make_test_report("ecdsa", "aa"), None)
+            .set("ecdsa", false, make_test_report("ecdsa", "aa"), None, None)
             .await;
 
         assert!(cache.get("ecdsa", false).await.is_some());
@@ -1091,7 +1097,7 @@ mod tests {
     async fn test_cache_get_bytes_returns_preserialized() {
         let cache = AttestationCache::new(300);
         let report = make_test_report("ecdsa", "aabb");
-        cache.set("ecdsa", false, report, None).await;
+        cache.set("ecdsa", false, report, None, None).await;
 
         let bytes = cache.get_bytes("ecdsa", false).await;
         assert!(bytes.is_some());
@@ -1111,7 +1117,7 @@ mod tests {
             "quote": "some_tdx_quote"
         });
         cache
-            .set("ecdsa", false, report, Some(cm_attestation.clone()))
+            .set("ecdsa", false, report, Some(cm_attestation.clone()), None)
             .await;
 
         // Verify the struct getter doesn't include compose-manager attestation
@@ -1129,7 +1135,7 @@ mod tests {
     async fn test_cache_omits_compose_manager_attestation_when_none() {
         let cache = AttestationCache::new(300);
         let report = make_test_report("ecdsa", "aabb");
-        cache.set("ecdsa", false, report, None).await;
+        cache.set("ecdsa", false, report, None, None).await;
 
         let bytes = cache.get_bytes("ecdsa", false).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();

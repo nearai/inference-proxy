@@ -5607,3 +5607,209 @@ async fn test_ohttp_standard_still_works_after_chunked_added() {
 
     server_handle.abort();
 }
+
+// Test: chunked OHTTP with missing auth → encrypted 401 inside envelope
+#[tokio::test]
+async fn test_ohttp_chunked_auth_enforcement() {
+    let mock = MockServer::start().await;
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock.uri()).await;
+
+    let mut inner_req = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/chat/completions".to_vec(),
+    );
+    inner_req.put_header("content-type", "application/json");
+    // No authorization header
+    inner_req.write_content(
+        serde_json::to_vec(&serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hi"}]
+        }))
+        .unwrap(),
+    );
+
+    let (status, content_type, inner_resp) =
+        ohttp_chunked_roundtrip(&base_url, &config_bytes, &inner_req).await;
+
+    assert_eq!(status, 200, "OHTTP layer should return 200");
+    assert_eq!(content_type, "message/ohttp-chunked-res");
+    assert_eq!(
+        inner_resp.control().status().unwrap().code(),
+        401,
+        "Inner response should be 401 Unauthorized"
+    );
+
+    server_handle.abort();
+}
+
+// Test: chunked OHTTP with GET /v1/models
+#[tokio::test]
+async fn test_ohttp_chunked_get_request() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "test-model", "object": "model"}]
+        })))
+        .mount(&mock)
+        .await;
+
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock.uri()).await;
+
+    let inner_req = bhttp::Message::request(
+        b"GET".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/models".to_vec(),
+    );
+
+    let (status, content_type, inner_resp) =
+        ohttp_chunked_roundtrip(&base_url, &config_bytes, &inner_req).await;
+
+    assert_eq!(status, 200);
+    assert_eq!(content_type, "message/ohttp-chunked-res");
+    assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+    let body: serde_json::Value = serde_json::from_slice(inner_resp.content()).unwrap();
+    assert_eq!(body["data"][0]["id"], "test-model");
+
+    server_handle.abort();
+}
+
+// Test: chunked OHTTP with empty body → 400
+#[tokio::test]
+async fn test_ohttp_chunked_empty_body_returns_400() {
+    let mock = MockServer::start().await;
+    let app = build_test_app_with_ohttp(&mock.uri());
+
+    let response = app
+        .oneshot(
+            Request::post("/ohttp")
+                .header("content-type", "message/ohttp-chunked-req")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+// Test: chunked OHTTP with garbage body → 400
+#[tokio::test]
+async fn test_ohttp_chunked_garbage_body_returns_400() {
+    let mock = MockServer::start().await;
+    let app = build_test_app_with_ohttp(&mock.uri());
+
+    let response = app
+        .oneshot(
+            Request::post("/ohttp")
+                .header("content-type", "message/ohttp-chunked-req")
+                .body(Body::from(vec![0xDEu8; 100]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+// Test: standard OHTTP request with chunked content-type is rejected properly
+// (chunked decapsulation fails on standard-encrypted payload)
+#[tokio::test]
+async fn test_ohttp_content_type_mismatch_returns_400() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&mock)
+        .await;
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock.uri()).await;
+
+    let inner_req = bhttp::Message::request(
+        b"GET".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/models".to_vec(),
+    );
+
+    // Encrypt with STANDARD OHTTP
+    let (enc_request, _client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+
+    // But send with CHUNKED content-type → server tries chunked decapsulation on standard payload
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{base_url}/ohttp"))
+        .header("content-type", "message/ohttp-chunked-req")
+        .body(enc_request)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        400,
+        "Mismatched content-type should fail decapsulation"
+    );
+
+    server_handle.abort();
+}
+
+// Test: chunked OHTTP with a large response body (>16KB, tests multi-chunk AEAD)
+#[tokio::test]
+async fn test_ohttp_chunked_large_response() {
+    let mock = MockServer::start().await;
+
+    // Create a response >16KB to force multiple AEAD chunks
+    let large_content = "x".repeat(32 * 1024);
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-large",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": large_content},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 8000, "total_tokens": 8005}
+        })))
+        .mount(&mock)
+        .await;
+
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock.uri()).await;
+
+    let mut inner_req = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/chat/completions".to_vec(),
+    );
+    inner_req.put_header("content-type", "application/json");
+    inner_req.put_header("authorization", "Bearer test-token");
+    inner_req.write_content(
+        serde_json::to_vec(&serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Generate a lot of text"}],
+            "stream": false
+        }))
+        .unwrap(),
+    );
+
+    let (status, content_type, inner_resp) =
+        ohttp_chunked_roundtrip(&base_url, &config_bytes, &inner_req).await;
+
+    assert_eq!(status, 200);
+    assert_eq!(content_type, "message/ohttp-chunked-res");
+    assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+
+    let body: serde_json::Value = serde_json::from_slice(inner_resp.content()).unwrap();
+    let resp_content = body["choices"][0]["message"]["content"].as_str().unwrap();
+    assert_eq!(
+        resp_content.len(),
+        32 * 1024,
+        "Full large response must survive chunked OHTTP"
+    );
+
+    server_handle.abort();
+}

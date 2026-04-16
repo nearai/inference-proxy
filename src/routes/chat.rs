@@ -56,6 +56,8 @@ pub async fn chat_completions(
 
     // For cloud API key requests with streaming, force include_usage
     // so the backend always sends token counts for billing.
+    // (Non-streaming requests also stream internally via proxy_json_request,
+    // which injects stream_options itself, so this only matters for true streaming.)
     if auth.cloud_api_key.is_some() && is_stream {
         let stream_opts = request_json
             .get("stream_options")

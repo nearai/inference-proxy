@@ -68,3 +68,9 @@ harness = false
 [[bench]]
 name = "e2e"
 harness = false
+
+[[example]]
+name = "test_ohttp"
+
+[[example]]
+name = "demo_ohttp"

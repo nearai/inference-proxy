@@ -912,12 +912,15 @@ async fn test_strip_empty_tool_calls() {
 
     let mock_server = MockServer::start().await;
 
-    // Expect the backend receives the request WITHOUT empty tool_calls
+    // Expect the backend receives the request WITHOUT empty tool_calls.
+    // The proxy injects stream: true internally, so include those fields.
     let expected_backend_body = serde_json::json!({
         "messages": [
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": "hello"}
-        ]
+        ],
+        "stream": true,
+        "stream_options": {"include_usage": true}
     });
 
     Mock::given(method("POST"))

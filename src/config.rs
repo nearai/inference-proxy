@@ -232,7 +232,7 @@ impl Config {
             rate_limit_per_second: env_int("RATE_LIMIT_PER_SECOND", 100) as u64,
             rate_limit_burst_size: env_int("RATE_LIMIT_BURST_SIZE", 200) as u32,
             rate_limit_trust_proxy_headers: !env_bool("RATE_LIMIT_NO_TRUST_PROXY"),
-            timeout_secs: 600,
+            timeout_secs: env_int("VLLM_PROXY_TIMEOUT_SECS", 3600) as u64,
             timeout_tokenize_secs: 10,
             openai_chat_compatibility_check_enabled: env_bool("OPENAI_CHAT_COMPATIBILITY_CHECK"),
             startup_check_retries: env_int("STARTUP_CHECK_RETRIES", 3),

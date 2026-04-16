@@ -296,28 +296,46 @@ pub struct ProxyOpts {
     pub backend_guard: Option<crate::backend_pool::BackendGuard>,
 }
 
-/// Proxy a JSON request to the backend, sign the response, cache signature.
+/// Proxy a non-streaming JSON request to the backend using internal streaming.
+///
+/// Sends the request to the backend with `stream: true` injected, consumes
+/// the SSE stream to reassemble a complete non-streaming response, then signs
+/// and returns it. This approach has two advantages over a plain blocking POST:
+///
+/// 1. **Cancellation**: When the downstream connection drops (e.g. cloud-api
+///    timeout), the byte stream is dropped, closing the TCP connection to the
+///    backend. The backend (SGLang/vLLM) detects the closed connection and
+///    aborts generation, preventing zombie requests from consuming GPU.
+///
+/// 2. **No idle timeout**: Tokens flow continuously (~every 80ms), so neither
+///    SLIRP idle timeouts nor intermediate proxy read timeouts fire. The
+///    reqwest client timeout becomes a "total stream time" bound rather than
+///    a "time to first byte" bound.
 pub async fn proxy_json_request(
     client: &reqwest::Client,
     url: &str,
     request_body: Vec<u8>,
     mut opts: ProxyOpts,
 ) -> Result<Response, AppError> {
+    // Hash the ORIGINAL request body for signing (before we inject stream: true).
     let request_sha256 = opts
         .request_hash
         .take()
         .unwrap_or_else(|| hex::encode(Sha256::digest(&request_body)));
 
+    // Inject stream: true and stream_options.include_usage into the body.
+    let streaming_body = inject_streaming(&request_body)?;
+
     let upstream_start = std::time::Instant::now();
     let response = client
         .post(url)
         .header("content-type", "application/json")
-        .header("accept", "application/json")
-        .body(request_body)
+        .header("accept", "text/event-stream")
+        .body(streaming_body)
         .send()
         .await
         .map_err(|e| AppError::Internal(e.into()))?;
-    metrics::histogram!("upstream_request_duration_seconds", "endpoint" => "json")
+    metrics::histogram!("upstream_request_duration_seconds", "endpoint" => "json_via_stream")
         .record(upstream_start.elapsed().as_secs_f64());
 
     let status = response.status();
@@ -330,36 +348,56 @@ pub async fn proxy_json_request(
         });
     }
 
-    let response_bytes = response
-        .bytes()
-        .await
-        .map_err(|e| AppError::Internal(e.into()))?;
+    // Check if the backend actually returned SSE. Some backends may ignore
+    // stream: true and return a plain JSON response (e.g. non-chat endpoints
+    // routed here, or backends that don't support streaming). In that case,
+    // fall back to the original non-streaming flow.
+    let is_sse = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.contains("text/event-stream"))
+        .unwrap_or(false);
 
-    // Parse response to extract/generate ID
-    let mut response_data: serde_json::Value =
-        serde_json::from_slice(&response_bytes).map_err(|e| AppError::Internal(e.into()))?;
-
-    let chat_id = match response_data.get("id").and_then(|v| v.as_str()) {
-        Some(id) => id.to_string(),
-        None => {
+    let mut response_data = if is_sse {
+        // Consume the SSE stream and reassemble into a non-streaming response.
+        let mut assembler = StreamingResponseAssembler::new();
+        {
+            use futures_util::StreamExt;
+            let mut byte_stream = std::pin::pin!(response.bytes_stream());
+            while let Some(chunk) = byte_stream.next().await {
+                let chunk = chunk.map_err(|e| AppError::Internal(e.into()))?;
+                assembler.process_chunk(&chunk);
+            }
+        }
+        assembler.into_response(&opts.id_prefix)
+    } else {
+        // Backend returned plain JSON — process as before.
+        let response_bytes = response
+            .bytes()
+            .await
+            .map_err(|e| AppError::Internal(e.into()))?;
+        let mut data: serde_json::Value =
+            serde_json::from_slice(&response_bytes).map_err(|e| AppError::Internal(e.into()))?;
+        // Generate an ID if not present.
+        if data.get("id").and_then(|v| v.as_str()).is_none() {
             let id = format!(
                 "{}-{}",
                 opts.id_prefix,
                 &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]
             );
-            if let Some(obj) = response_data.as_object_mut() {
-                obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
+            if let Some(obj) = data.as_object_mut() {
+                obj.insert("id".to_string(), serde_json::Value::String(id));
             }
-            debug!(id = %id, "Generated response ID");
-            id
         }
+        data
     };
 
     // Report usage for cloud API key requests (before encryption, needs plaintext fields)
+    let chat_id = response_data["id"].as_str().unwrap_or("").to_string();
     try_report_usage(&response_data, &chat_id, &opts);
 
     // Apply response transform (e.g., encryption) before hashing/signing.
-    // The signature covers the response bytes the client actually receives.
     if let Some(transform) = opts.response_transform.take() {
         transform(&mut response_data)?;
     }
@@ -384,6 +422,274 @@ pub async fn proxy_json_request(
         final_body,
     )
         .into_response())
+}
+
+/// Inject `"stream": true` and `"stream_options": {"include_usage": true}`
+/// into a JSON request body for internal streaming.
+fn inject_streaming(body: &[u8]) -> Result<Vec<u8>, AppError> {
+    let mut json: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| AppError::BadRequest(format!("Invalid JSON: {e}")))?;
+    json["stream"] = true.into();
+    json["stream_options"] = serde_json::json!({"include_usage": true});
+    serde_json::to_vec(&json).map_err(|e| AppError::Internal(e.into()))
+}
+
+/// Reassembles streaming SSE chunks into a single non-streaming chat completion response.
+///
+/// Processes `data:` lines from the SSE stream, concatenating `delta.content`,
+/// `delta.reasoning_content`, and merging `delta.tool_calls` by index. Produces
+/// a standard `chat.completion` JSON object.
+struct StreamingResponseAssembler {
+    line_buffer: String,
+    id: Option<String>,
+    model: Option<String>,
+    created: Option<i64>,
+    /// Per-choice state, keyed by choice index.
+    choices: Vec<ChoiceAssembler>,
+    usage: Option<serde_json::Value>,
+    metadata: Option<serde_json::Value>,
+}
+
+/// Accumulates delta fields for a single choice.
+struct ChoiceAssembler {
+    role: Option<String>,
+    content: String,
+    reasoning_content: String,
+    tool_calls: Vec<serde_json::Value>,
+    finish_reason: Option<String>,
+    logprobs: Option<serde_json::Value>,
+}
+
+impl StreamingResponseAssembler {
+    fn new() -> Self {
+        Self {
+            line_buffer: String::new(),
+            id: None,
+            model: None,
+            created: None,
+            choices: Vec::new(),
+            usage: None,
+            metadata: None,
+        }
+    }
+
+    fn process_chunk(&mut self, chunk: &[u8]) {
+        match std::str::from_utf8(chunk) {
+            Ok(s) => self.line_buffer.push_str(s),
+            Err(_) => self.line_buffer.push_str(&String::from_utf8_lossy(chunk)),
+        }
+
+        loop {
+            let Some(newline_pos) = self.line_buffer.find('\n') else {
+                break;
+            };
+
+            let line_end =
+                if newline_pos > 0 && self.line_buffer.as_bytes()[newline_pos - 1] == b'\r' {
+                    newline_pos - 1
+                } else {
+                    newline_pos
+                };
+
+            let line = &self.line_buffer[..line_end];
+            let data = line
+                .strip_prefix("data: ")
+                .or_else(|| line.strip_prefix("data:"))
+                .unwrap_or("")
+                .trim();
+
+            if !data.is_empty() && data != "[DONE]" {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
+                    self.ingest_event(&parsed);
+                }
+            }
+
+            self.line_buffer.drain(..newline_pos + 1);
+        }
+    }
+
+    fn ingest_event(&mut self, event: &serde_json::Value) {
+        // Capture top-level fields from the first event.
+        if self.id.is_none() {
+            self.id = event.get("id").and_then(|v| v.as_str()).map(String::from);
+        }
+        if self.model.is_none() {
+            self.model = event
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+        }
+        if self.created.is_none() {
+            self.created = event.get("created").and_then(|v| v.as_i64());
+        }
+        if self.metadata.is_none() {
+            if let Some(m) = event.get("metadata").filter(|v| v.is_object()) {
+                self.metadata = Some(m.clone());
+            }
+        }
+
+        // Capture usage (typically in the final chunk with empty choices).
+        if let Some(u) = event.get("usage").filter(|v| v.is_object()) {
+            self.usage = Some(u.clone());
+        }
+
+        // Process choices/deltas.
+        if let Some(choices) = event.get("choices").and_then(|v| v.as_array()) {
+            for choice in choices {
+                let index = choice.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+                // Grow the choices vec if needed.
+                while self.choices.len() <= index {
+                    self.choices.push(ChoiceAssembler::new());
+                }
+                let ca = &mut self.choices[index];
+
+                if let Some(delta) = choice.get("delta").filter(|v| v.is_object()) {
+                    if let Some(role) = delta.get("role").and_then(|v| v.as_str()) {
+                        if ca.role.is_none() {
+                            ca.role = Some(role.to_string());
+                        }
+                    }
+                    if let Some(c) = delta.get("content").and_then(|v| v.as_str()) {
+                        ca.content.push_str(c);
+                    }
+                    if let Some(r) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+                        ca.reasoning_content.push_str(r);
+                    }
+                    if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                        ca.merge_tool_calls(tcs);
+                    }
+                }
+
+                if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+                    ca.finish_reason = Some(fr.to_string());
+                }
+                if let Some(lp) = choice.get("logprobs").filter(|v| !v.is_null()) {
+                    ca.logprobs = Some(lp.clone());
+                }
+            }
+        }
+    }
+
+    /// Build the final non-streaming `chat.completion` JSON.
+    fn into_response(self, id_prefix: &str) -> serde_json::Value {
+        let id = self.id.unwrap_or_else(|| {
+            format!(
+                "{}-{}",
+                id_prefix,
+                &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]
+            )
+        });
+
+        let choices: Vec<serde_json::Value> = self
+            .choices
+            .into_iter()
+            .enumerate()
+            .map(|(i, ca)| ca.into_choice_json(i))
+            .collect();
+
+        let mut resp = serde_json::json!({
+            "id": id,
+            "object": "chat.completion",
+            "choices": choices,
+        });
+
+        if let Some(model) = self.model {
+            resp["model"] = model.into();
+        }
+        if let Some(created) = self.created {
+            resp["created"] = created.into();
+        }
+        if let Some(usage) = self.usage {
+            resp["usage"] = usage;
+        }
+        if let Some(metadata) = self.metadata {
+            resp["metadata"] = metadata;
+        }
+
+        resp
+    }
+}
+
+impl ChoiceAssembler {
+    fn new() -> Self {
+        Self {
+            role: None,
+            content: String::new(),
+            reasoning_content: String::new(),
+            tool_calls: Vec::new(),
+            finish_reason: None,
+            logprobs: None,
+        }
+    }
+
+    /// Merge streaming tool_call deltas by index.
+    ///
+    /// First delta for an index carries `id`, `type`, `function.name`.
+    /// Subsequent deltas for the same index append to `function.arguments`.
+    fn merge_tool_calls(&mut self, deltas: &[serde_json::Value]) {
+        for tc_delta in deltas {
+            let idx = tc_delta.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+            while self.tool_calls.len() <= idx {
+                self.tool_calls.push(serde_json::json!({
+                    "id": "",
+                    "type": "function",
+                    "function": {"name": "", "arguments": ""}
+                }));
+            }
+
+            let existing = &mut self.tool_calls[idx];
+
+            if let Some(id) = tc_delta.get("id").and_then(|v| v.as_str()) {
+                existing["id"] = id.into();
+            }
+            if let Some(t) = tc_delta.get("type").and_then(|v| v.as_str()) {
+                existing["type"] = t.into();
+            }
+            if let Some(func) = tc_delta.get("function").filter(|v| v.is_object()) {
+                if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                    if !name.is_empty() {
+                        existing["function"]["name"] = name.into();
+                    }
+                }
+                if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                    let prev = existing["function"]["arguments"].as_str().unwrap_or("");
+                    let mut combined = prev.to_string();
+                    combined.push_str(args);
+                    existing["function"]["arguments"] = combined.into();
+                }
+            }
+        }
+    }
+
+    fn into_choice_json(self, index: usize) -> serde_json::Value {
+        let mut message = serde_json::json!({
+            "role": self.role.unwrap_or_else(|| "assistant".to_string()),
+        });
+
+        // Include content/reasoning_content: use null when empty (matches SGLang behavior).
+        if self.content.is_empty() {
+            message["content"] = serde_json::Value::Null;
+        } else {
+            message["content"] = self.content.into();
+        }
+
+        if !self.reasoning_content.is_empty() {
+            message["reasoning_content"] = self.reasoning_content.into();
+        }
+
+        if !self.tool_calls.is_empty() {
+            message["tool_calls"] = self.tool_calls.into();
+        }
+
+        serde_json::json!({
+            "index": index,
+            "message": message,
+            "finish_reason": self.finish_reason,
+            "logprobs": self.logprobs,
+        })
+    }
 }
 
 /// Proxy a streaming SSE request. Hashes all chunks, signs at end, caches signature.
@@ -1782,5 +2088,127 @@ mod tests {
         assert!(!result.contains("secret"), "leaked data: {result}");
         assert!(result.contains("value_error: bad role"));
         assert!(result.contains("Input should be 'text' [type=literal_error]"));
+    }
+
+    // ── StreamingResponseAssembler tests ──
+
+    #[test]
+    fn test_assembler_basic_content() {
+        let mut asm = StreamingResponseAssembler::new();
+        asm.process_chunk(
+            b"data: {\"id\":\"c1\",\"model\":\"m\",\"created\":100,\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",
+        );
+        asm.process_chunk(
+            b"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello \"},\"finish_reason\":null}]}\n\n",
+        );
+        asm.process_chunk(
+            b"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world\"},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        asm.process_chunk(
+            b"data: {\"id\":\"c1\",\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\ndata: [DONE]\n\n",
+        );
+
+        let resp = asm.into_response("chatcmpl");
+        assert_eq!(resp["id"], "c1");
+        assert_eq!(resp["object"], "chat.completion");
+        assert_eq!(resp["model"], "m");
+        assert_eq!(resp["created"], 100);
+        assert_eq!(resp["choices"][0]["message"]["content"], "hello world");
+        assert_eq!(resp["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(resp["choices"][0]["finish_reason"], "stop");
+        assert_eq!(resp["usage"]["prompt_tokens"], 5);
+        assert_eq!(resp["usage"]["completion_tokens"], 2);
+    }
+
+    #[test]
+    fn test_assembler_reasoning_content() {
+        let mut asm = StreamingResponseAssembler::new();
+        asm.process_chunk(
+            b"data: {\"id\":\"r1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":null}}]}\n\n",
+        );
+        asm.process_chunk(
+            b"data: {\"id\":\"r1\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n",
+        );
+        asm.process_chunk(
+            b"data: {\"id\":\"r1\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"ing\"},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        asm.process_chunk(b"data: [DONE]\n\n");
+
+        let resp = asm.into_response("chatcmpl");
+        assert_eq!(
+            resp["choices"][0]["message"]["reasoning_content"],
+            "thinking"
+        );
+        // content should be null since it was empty
+        assert!(resp["choices"][0]["message"]["content"].is_null());
+    }
+
+    #[test]
+    fn test_assembler_tool_calls() {
+        let mut asm = StreamingResponseAssembler::new();
+        // First tool call chunk: id + name
+        asm.process_chunk(
+            b"data: {\"id\":\"t1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]}}]}\n\n",
+        );
+        // Arguments chunks
+        asm.process_chunk(
+            b"data: {\"id\":\"t1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\"\"}}]}}]}\n\n",
+        );
+        asm.process_chunk(
+            b"data: {\"id\":\"t1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\": \\\"NYC\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        );
+        asm.process_chunk(b"data: [DONE]\n\n");
+
+        let resp = asm.into_response("chatcmpl");
+        let tc = &resp["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(tc["id"], "call_1");
+        assert_eq!(tc["function"]["name"], "get_weather");
+        assert_eq!(tc["function"]["arguments"], "{\"city\": \"NYC\"}");
+    }
+
+    #[test]
+    fn test_assembler_generates_id_when_missing() {
+        let mut asm = StreamingResponseAssembler::new();
+        asm.process_chunk(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        );
+
+        let resp = asm.into_response("chatcmpl");
+        let id = resp["id"].as_str().unwrap();
+        assert!(id.starts_with("chatcmpl-"), "should generate id: {id}");
+    }
+
+    #[test]
+    fn test_assembler_split_across_chunks() {
+        let mut asm = StreamingResponseAssembler::new();
+        // Split a single SSE line across two TCP chunks
+        asm.process_chunk(b"data: {\"id\":\"s1\",\"choices\":[{\"inde");
+        asm.process_chunk(
+            b"x\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        );
+
+        let resp = asm.into_response("chatcmpl");
+        assert_eq!(resp["id"], "s1");
+        assert_eq!(resp["choices"][0]["message"]["content"], "ok");
+    }
+
+    #[test]
+    fn test_inject_streaming() {
+        let body = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
+        let result = inject_streaming(body).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(json["stream"], true);
+        assert_eq!(json["stream_options"]["include_usage"], true);
+        assert_eq!(json["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn test_inject_streaming_preserves_existing_fields() {
+        let body = br#"{"messages":[],"max_tokens":100,"temperature":0.7}"#;
+        let result = inject_streaming(body).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(json["stream"], true);
+        assert_eq!(json["max_tokens"], 100);
+        assert_eq!(json["temperature"], 0.7);
     }
 }

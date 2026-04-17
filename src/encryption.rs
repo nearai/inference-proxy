@@ -896,11 +896,9 @@ fn decrypt_rerank_documents(
     if let Some(docs) = value.get_mut("documents").and_then(|d| d.as_array_mut()) {
         for doc in docs.iter_mut() {
             match doc {
-                serde_json::Value::String(s) => {
-                    if !s.is_empty() {
-                        let decrypted = decrypt_string(s, ctx, signing)?;
-                        *s = decrypted;
-                    }
+                serde_json::Value::String(s) if !s.is_empty() => {
+                    let decrypted = decrypt_string(s, ctx, signing)?;
+                    *s = decrypted;
                 }
                 serde_json::Value::Object(_) => {
                     decrypt_field(doc, "text", ctx, signing)?;

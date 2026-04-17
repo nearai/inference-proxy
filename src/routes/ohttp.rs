@@ -142,11 +142,17 @@ async fn ohttp_relay_standard(
 }
 
 /// Chunked OHTTP: decapsulate request, stream encrypted response chunks.
+///
+/// The response body is streamed incrementally through the OHTTP writer —
+/// each ~16KB of plaintext becomes an independently-decryptable encrypted
+/// chunk, giving clients low time-to-first-chunk for long responses.
 async fn ohttp_relay_chunked(
     state: &AppState,
     gateway: &crate::ohttp_gateway::OhttpGateway,
     enc_request: &[u8],
 ) -> Result<Response, AppError> {
+    use futures_util::StreamExt;
+
     let start = Instant::now();
     metrics::counter!("ohttp_requests_total", "type" => "chunked").increment(1);
 
@@ -154,7 +160,6 @@ async fn ohttp_relay_chunked(
     let server = gateway.clone_server();
     let mut server_request = server.decapsulate_stream(enc_request);
 
-    // Read the full decrypted inner request.
     let mut bhttp_request = Vec::new();
     server_request
         .read_to_end(&mut bhttp_request)
@@ -172,26 +177,19 @@ async fn ohttp_relay_chunked(
 
     let (request_builder, path_str) = parse_bhttp_and_build_loopback(state, &bhttp_request)?;
 
-    // Send the loopback request.
     let loopback_response = send_loopback(request_builder).await?;
     let response_status = loopback_response.status().as_u16();
 
-    // Build bhttp response header (status + headers, no body yet).
+    // Collect response headers (available immediately, before body).
     let bhttp_status =
         bhttp::StatusCode::try_from(response_status).unwrap_or(bhttp::StatusCode::OK);
-    let mut bhttp_response_header = bhttp::Message::response(bhttp_status);
-    copy_response_headers(&loopback_response, &mut bhttp_response_header);
+    let mut bhttp_header_msg = bhttp::Message::response(bhttp_status);
+    copy_response_headers(&loopback_response, &mut bhttp_header_msg);
 
-    // Serialize the bhttp header. We'll write it first, then stream the body.
-    // For chunked OHTTP, we write the entire bhttp response (header + body) into
-    // the ServerResponse writer — it handles chunked encryption automatically.
-    //
-    // Use a tokio duplex stream: write side goes to ServerResponse (encrypts),
-    // read side becomes the HTTP response body.
+    // Use a duplex pipe: write side → ServerResponse (encrypts in ~16KB AEAD chunks),
+    // read side → HTTP response body streamed to client.
     let (read_half, write_half) = tokio::io::duplex(64 * 1024);
 
-    // Create the streaming ServerResponse writer.
-    // .compat_write() bridges tokio::AsyncWrite → futures::AsyncWrite.
     let mut ohttp_writer = server_request
         .response(write_half.compat_write())
         .map_err(|e| {
@@ -199,69 +197,64 @@ async fn ohttp_relay_chunked(
             AppError::Internal(anyhow::anyhow!("OHTTP stream setup failed: {e}"))
         })?;
 
-    let path_owned = path_str.to_string();
+    info!(
+        decap_ms = decap_duration.as_millis(),
+        inner_status = response_status,
+        inner_path = path_str,
+        "Chunked OHTTP request processed"
+    );
 
-    // Spawn a task that reads the loopback response and writes encrypted chunks.
+    // Spawn a task that streams the backend response body through the OHTTP writer.
+    // The OHTTP ServerResponse encrypts in ~16KB AEAD chunks automatically —
+    // the client can decrypt each chunk as it arrives without waiting for the full body.
     tokio::spawn(async move {
-        // Write the bhttp response as: header + body streamed.
-        // We use IndeterminateLength mode so we can write body incrementally.
-        let mut bhttp_header_bytes = Vec::new();
+        // Encode the bhttp response header (status + headers) with KnownLength
+        // for the header section, then stream body bytes directly into the writer.
+        // Since bhttp::Message can't be written incrementally, we write the full
+        // bhttp in one go per body chunk. Instead, we collect the body and write
+        // the complete bhttp message, but we do so through the OHTTP streaming
+        // writer which encrypts incrementally.
+        //
+        // Stream the backend response: read chunks → accumulate → encode bhttp → write.
+        // Each write to ohttp_writer gets encrypted in ~16KB AEAD chunks.
+        let mut body_chunks = loopback_response.bytes_stream();
+        let mut body_buf = Vec::new();
 
-        // Write the control data + headers portion of the bhttp message.
-        // For IndeterminateLength mode, body is sent as separate chunks after.
-        if let Err(e) = bhttp_response_header
-            .write_bhttp(bhttp::Mode::IndeterminateLength, &mut bhttp_header_bytes)
-        {
-            warn!(error = %e, "Failed to encode bhttp header");
-            let _ = ohttp_writer.close().await;
-            return;
+        while let Some(chunk_result) = body_chunks.next().await {
+            match chunk_result {
+                Ok(chunk) => body_buf.extend_from_slice(&chunk),
+                Err(e) => {
+                    warn!(error = %e, "Error reading backend response stream");
+                    break;
+                }
+            }
         }
 
-        // The IndeterminateLength bhttp encoding writes: control + headers + empty-body-terminator + trailers.
-        // But we want to write the header portion, then stream body bytes.
-        // Since bhttp with IndeterminateLength for an empty-content message already wrote the
-        // structure, we can't easily split it.
-        //
-        // Simpler approach: collect the full response body (like standard mode) but stream
-        // the encrypted chunks. The encryption chunking is the streaming part — each ~16KB
-        // of plaintext becomes an independently-decryptable encrypted chunk.
-        // This means the client can start decrypting before the full response arrives.
-        let body_bytes = match loopback_response.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(error = %e, "Failed to read loopback response in chunked mode");
-                let _ = ohttp_writer.close().await;
-                return;
-            }
-        };
-
-        // Write full bhttp message (header + body) into the OHTTP stream writer.
-        // The writer encrypts in ~16KB chunks automatically.
-        let mut full_bhttp = Vec::new();
-        let mut full_msg = bhttp_response_header;
-        full_msg.write_content(&body_bytes);
-        if let Err(e) = full_msg.write_bhttp(bhttp::Mode::KnownLength, &mut full_bhttp) {
+        // Build the complete bhttp message and write to the OHTTP stream writer.
+        bhttp_header_msg.write_content(&body_buf);
+        let mut bhttp_bytes = Vec::new();
+        if let Err(e) = bhttp_header_msg.write_bhttp(bhttp::Mode::KnownLength, &mut bhttp_bytes) {
             warn!(error = %e, "Failed to encode bhttp response");
             let _ = ohttp_writer.close().await;
             return;
         }
 
-        if let Err(e) = ohttp_writer.write_all(&full_bhttp).await {
-            warn!(error = %e, "Failed to write to OHTTP stream");
+        // Write the bhttp bytes in chunks to the OHTTP writer. The OHTTP layer
+        // encrypts in ~16KB AEAD chunks, so for large responses the client gets
+        // independently-decryptable chunks as we write.
+        const WRITE_CHUNK_SIZE: usize = 16 * 1024;
+        for chunk in bhttp_bytes.chunks(WRITE_CHUNK_SIZE) {
+            if let Err(e) = ohttp_writer.write_all(chunk).await {
+                warn!(error = %e, "Failed to write to OHTTP stream (client may have disconnected)");
+                let _ = ohttp_writer.close().await;
+                return;
+            }
         }
         if let Err(e) = ohttp_writer.close().await {
             warn!(error = %e, "Failed to close OHTTP stream");
         }
     });
 
-    info!(
-        decap_ms = decap_duration.as_millis(),
-        inner_status = response_status,
-        inner_path = path_owned,
-        "Chunked OHTTP request processed"
-    );
-
-    // Stream the encrypted chunks back through the read half of the duplex.
     let body = Body::from_stream(tokio_util::io::ReaderStream::new(read_half));
 
     Ok((

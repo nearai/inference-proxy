@@ -479,11 +479,7 @@ impl StreamingResponseAssembler {
             Err(_) => self.line_buffer.push_str(&String::from_utf8_lossy(chunk)),
         }
 
-        loop {
-            let Some(newline_pos) = self.line_buffer.find('\n') else {
-                break;
-            };
-
+        while let Some(newline_pos) = self.line_buffer.find('\n') {
             let line_end =
                 if newline_pos > 0 && self.line_buffer.as_bytes()[newline_pos - 1] == b'\r' {
                     newline_pos - 1
@@ -900,11 +896,7 @@ impl SseTransformer {
 
         let mut output = String::new();
 
-        loop {
-            let Some(newline_pos) = self.line_buffer.find('\n') else {
-                break;
-            };
-
+        while let Some(newline_pos) = self.line_buffer.find('\n') {
             // Extract the complete line including the newline
             let full_line = self.line_buffer[..=newline_pos].to_string();
             self.line_buffer.drain(..=newline_pos);
@@ -1381,11 +1373,7 @@ impl SseParser {
         // Process all complete lines in the buffer.
         // We extract state changes from borrowed data first, then mutate,
         // to avoid allocating a String copy of each line.
-        loop {
-            let Some(newline_pos) = self.line_buffer.find('\n') else {
-                break;
-            };
-
+        while let Some(newline_pos) = self.line_buffer.find('\n') {
             let line_end =
                 if newline_pos > 0 && self.line_buffer.as_bytes()[newline_pos - 1] == b'\r' {
                     newline_pos - 1

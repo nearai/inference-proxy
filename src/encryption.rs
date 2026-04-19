@@ -800,21 +800,17 @@ fn encrypt_content_field(
     ctx: &EncryptionContext,
     signing: &SigningPair,
 ) -> Result<(), AppError> {
-    if let Some(content) = msg.get_mut("content") {
-        match content {
-            serde_json::Value::String(s) => {
-                if !s.is_empty() {
-                    let encrypted = encrypt_string(s, ctx, signing)?;
-                    *s = encrypted;
-                }
-            }
-            serde_json::Value::Array(parts) => {
-                for part in parts.iter_mut() {
-                    encrypt_field(part, "text", ctx, signing)?;
-                }
-            }
-            _ => {}
+    match msg.get_mut("content") {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => {
+            let encrypted = encrypt_string(s, ctx, signing)?;
+            *s = encrypted;
         }
+        Some(serde_json::Value::Array(parts)) => {
+            for part in parts.iter_mut() {
+                encrypt_field(part, "text", ctx, signing)?;
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -868,28 +864,24 @@ fn decrypt_field_or_array(
     ctx: &EncryptionContext,
     signing: &SigningPair,
 ) -> Result<(), AppError> {
-    if let Some(val) = obj.get_mut(field) {
-        match val {
-            serde_json::Value::String(s) => {
-                if !s.is_empty() {
-                    let decrypted = decrypt_string(s, ctx, signing)?;
-                    *s = decrypted;
-                }
-            }
-            serde_json::Value::Array(arr) => {
-                for item in arr.iter_mut() {
-                    if let Some(s) = item.as_str() {
-                        if !s.is_empty() {
-                            let s_owned = s.to_string();
-                            let decrypted = decrypt_string(&s_owned, ctx, signing)?;
-                            *item = serde_json::Value::String(decrypted);
-                        }
-                    }
-                    // Non-string array elements (e.g. token ID arrays) are not encrypted
-                }
-            }
-            _ => {}
+    match obj.get_mut(field) {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => {
+            let decrypted = decrypt_string(s, ctx, signing)?;
+            *s = decrypted;
         }
+        Some(serde_json::Value::Array(arr)) => {
+            for item in arr.iter_mut() {
+                if let Some(s) = item.as_str() {
+                    if !s.is_empty() {
+                        let s_owned = s.to_string();
+                        let decrypted = decrypt_string(&s_owned, ctx, signing)?;
+                        *item = serde_json::Value::String(decrypted);
+                    }
+                }
+                // Non-string array elements (e.g. token ID arrays) are not encrypted
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -904,11 +896,9 @@ fn decrypt_rerank_documents(
     if let Some(docs) = value.get_mut("documents").and_then(|d| d.as_array_mut()) {
         for doc in docs.iter_mut() {
             match doc {
-                serde_json::Value::String(s) => {
-                    if !s.is_empty() {
-                        let decrypted = decrypt_string(s, ctx, signing)?;
-                        *s = decrypted;
-                    }
+                serde_json::Value::String(s) if !s.is_empty() => {
+                    let decrypted = decrypt_string(s, ctx, signing)?;
+                    *s = decrypted;
                 }
                 serde_json::Value::Object(_) => {
                     decrypt_field(doc, "text", ctx, signing)?;

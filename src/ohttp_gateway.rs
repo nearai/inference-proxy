@@ -44,7 +44,7 @@ impl OhttpGateway {
         &self.config_bytes
     }
 
-    /// Decapsulate a standard OHTTP request.
+    /// Decapsulate a standard OHTTP request (RFC 9458).
     ///
     /// Returns the plaintext Binary HTTP request bytes and a `ServerResponse`
     /// that must be used to encapsulate the response.
@@ -53,6 +53,14 @@ impl OhttpGateway {
         enc_request: &[u8],
     ) -> Result<(Vec<u8>, ServerResponse), ohttp::Error> {
         self.server.decapsulate(enc_request)
+    }
+
+    /// Clone the inner `Server` for use with streaming APIs.
+    ///
+    /// Needed because `Server::decapsulate_stream` consumes the server.
+    /// Use: `gateway.clone_server().decapsulate_stream(src)`.
+    pub fn clone_server(&self) -> Server {
+        self.server.clone()
     }
 }
 
@@ -102,6 +110,160 @@ mod tests {
         // Client side: decrypt response
         let decrypted = client_response.decapsulate(&enc_response).unwrap();
         assert_eq!(decrypted, inner_response);
+    }
+
+    #[tokio::test]
+    async fn test_stream_roundtrip() {
+        use futures_util::{AsyncReadExt, AsyncWriteExt};
+        use tokio_util::compat::TokioAsyncWriteCompatExt;
+
+        let gw = OhttpGateway::new(&TEST_KEY).unwrap();
+
+        // Client side: encrypt a request using the stream API
+        let mut config = KeyConfig::decode(gw.config_bytes()).unwrap();
+        let client = ohttp::ClientRequest::from_config(&mut config).unwrap();
+
+        // Write the request into a pipe, encrypted
+        let (mut request_pipe_read, request_pipe_write) = tokio::io::duplex(8192);
+        let mut client_request = client
+            .encapsulate_stream(request_pipe_write.compat_write())
+            .unwrap();
+        let inner_request = b"hello from the client";
+        client_request.write_all(inner_request).await.unwrap();
+        client_request.close().await.unwrap();
+
+        // Read the encrypted bytes from the pipe
+        let mut enc_request = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut request_pipe_read, &mut enc_request)
+            .await
+            .unwrap();
+
+        // Server side: decapsulate stream
+        let server = gw.clone_server();
+        let mut server_request = server.decapsulate_stream(&enc_request[..]);
+        let mut decrypted_request = Vec::new();
+        server_request
+            .read_to_end(&mut decrypted_request)
+            .await
+            .unwrap();
+        assert_eq!(decrypted_request, inner_request);
+
+        // Server side: write response through the stream API
+        let (mut response_pipe_read, response_pipe_write) = tokio::io::duplex(8192);
+        let mut server_response = server_request
+            .response(response_pipe_write.compat_write())
+            .unwrap();
+        let inner_response = b"hello from the server";
+        server_response.write_all(inner_response).await.unwrap();
+        server_response.close().await.unwrap();
+
+        // Read the encrypted response from the tokio duplex pipe
+        let mut enc_response = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut response_pipe_read, &mut enc_response)
+            .await
+            .unwrap();
+
+        // Client side: decrypt the response stream
+        let mut client_response = client_request.response(&enc_response[..]).unwrap();
+        let mut decrypted_response = Vec::new();
+        client_response
+            .read_to_end(&mut decrypted_response)
+            .await
+            .unwrap();
+        assert_eq!(decrypted_response, inner_response);
+    }
+
+    /// Test that a large payload (>16KB) works through the streaming API.
+    /// The ohttp crate encrypts in 16KB chunks — this verifies multi-chunk roundtrip.
+    #[tokio::test]
+    async fn test_stream_roundtrip_large_payload() {
+        use futures_util::{AsyncReadExt, AsyncWriteExt};
+        use tokio_util::compat::TokioAsyncWriteCompatExt;
+
+        let gw = OhttpGateway::new(&TEST_KEY).unwrap();
+        let mut config = KeyConfig::decode(gw.config_bytes()).unwrap();
+        let client = ohttp::ClientRequest::from_config(&mut config).unwrap();
+
+        // Small request, large response (32KB — spans 2+ AEAD chunks)
+        let inner_request = b"short request";
+        let (mut req_read, req_write) = tokio::io::duplex(8192);
+        let mut client_request = client.encapsulate_stream(req_write.compat_write()).unwrap();
+        client_request.write_all(inner_request).await.unwrap();
+        client_request.close().await.unwrap();
+        let mut enc_request = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut req_read, &mut enc_request)
+            .await
+            .unwrap();
+
+        let server = gw.clone_server();
+        let mut server_request = server.decapsulate_stream(&enc_request[..]);
+        let mut dec_req = Vec::new();
+        server_request.read_to_end(&mut dec_req).await.unwrap();
+        assert_eq!(dec_req, inner_request);
+
+        // Write a 32KB response
+        let large_response = vec![0xABu8; 32 * 1024];
+        let (mut resp_read, resp_write) = tokio::io::duplex(64 * 1024);
+        let mut server_response = server_request.response(resp_write.compat_write()).unwrap();
+        server_response.write_all(&large_response).await.unwrap();
+        server_response.close().await.unwrap();
+
+        let mut enc_response = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut resp_read, &mut enc_response)
+            .await
+            .unwrap();
+
+        // Encrypted must be larger (AEAD overhead per chunk)
+        assert!(enc_response.len() > large_response.len());
+
+        let mut client_response = client_request.response(&enc_response[..]).unwrap();
+        let mut dec_resp = Vec::new();
+        client_response.read_to_end(&mut dec_resp).await.unwrap();
+        assert_eq!(dec_resp, large_response);
+    }
+
+    /// Test that an empty response body works through the streaming API.
+    #[tokio::test]
+    async fn test_stream_roundtrip_empty_response() {
+        use futures_util::{AsyncReadExt, AsyncWriteExt};
+        use tokio_util::compat::TokioAsyncWriteCompatExt;
+
+        let gw = OhttpGateway::new(&TEST_KEY).unwrap();
+        let mut config = KeyConfig::decode(gw.config_bytes()).unwrap();
+        let client = ohttp::ClientRequest::from_config(&mut config).unwrap();
+
+        let (mut req_read, req_write) = tokio::io::duplex(8192);
+        let mut client_request = client.encapsulate_stream(req_write.compat_write()).unwrap();
+        client_request.write_all(b"request").await.unwrap();
+        client_request.close().await.unwrap();
+        let mut enc_request = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut req_read, &mut enc_request)
+            .await
+            .unwrap();
+
+        let server = gw.clone_server();
+        let mut server_request = server.decapsulate_stream(&enc_request[..]);
+        let mut dec_req = Vec::new();
+        server_request.read_to_end(&mut dec_req).await.unwrap();
+
+        // Empty response
+        let (mut resp_read, resp_write) = tokio::io::duplex(8192);
+        let mut server_response = server_request.response(resp_write.compat_write()).unwrap();
+        // Write nothing, just close
+        server_response.close().await.unwrap();
+
+        let mut enc_response = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut resp_read, &mut enc_response)
+            .await
+            .unwrap();
+
+        // Should still produce some encrypted bytes (nonce + final chunk tag)
+        assert!(!enc_response.is_empty());
+
+        let mut client_response = client_request.response(&enc_response[..]).unwrap();
+        let mut dec_resp = Vec::new();
+        client_response.read_to_end(&mut dec_resp).await.unwrap();
+        assert!(dec_resp.is_empty());
     }
 
     #[test]

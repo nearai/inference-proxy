@@ -48,7 +48,9 @@ pub fn build_router() -> Router<AppState> {
             post(passthrough::audio_transcriptions),
         )
         .route("/v1/signature/{chat_id}", get(signature::signature))
-        // OHTTP Gateway (RFC 9458) — unauthenticated (auth is inside envelope)
+        // OHTTP Gateway (RFC 9458) — POST /ohttp is unauthenticated; auth may be
+        // inside the encrypted Binary HTTP message or on the outer HTTP request
+        // (relay-injected Authorization). See `ohttp_relay` docs.
         .route("/.well-known/ohttp-gateway", get(ohttp::ohttp_config))
         .route("/v1/ohttp/config", get(ohttp::ohttp_config))
         .route("/ohttp", post(ohttp::ohttp_relay))

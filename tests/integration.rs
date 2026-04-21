@@ -5397,6 +5397,282 @@ async fn test_ohttp_auth_enforcement_inside_envelope() {
     server_handle.abort();
 }
 
+// Outer `Authorization` on POST /ohttp is merged into the inner loopback request so a
+// relay can authenticate without placing the secret inside the encrypted BHTTP payload.
+#[tokio::test]
+async fn test_ohttp_outer_authorization_relay_injected() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-relay",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Relay auth OK"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+        })))
+        .mount(&mock)
+        .await;
+
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock.uri()).await;
+
+    // Inner request: no authorization in the encrypted envelope (client has no secret).
+    let mut inner_req = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/chat/completions".to_vec(),
+    );
+    inner_req.put_header("content-type", "application/json");
+    let body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": false
+    });
+    inner_req.write_content(serde_json::to_vec(&body).unwrap());
+
+    let (enc_request, client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{base_url}/ohttp"))
+        .header("content-type", "message/ohttp-req")
+        .header("authorization", "Bearer test-token")
+        .body(enc_request)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+
+    let enc_response = response.bytes().await.unwrap();
+    let inner_resp = ohttp_decrypt_response(client_response, &enc_response);
+
+    assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+    let resp_body: serde_json::Value = serde_json::from_slice(inner_resp.content()).unwrap();
+    assert_eq!(
+        resp_body["choices"][0]["message"]["content"],
+        "Relay auth OK"
+    );
+    assert_eq!(resp_body["id"], "chatcmpl-relay");
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_ohttp_outer_bearer_scrubs_inner_x_request_hash() {
+    use sha2::{Digest, Sha256};
+
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-ohttp-scrubbed-hash",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Relay auth OK"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+        })))
+        .mount(&mock)
+        .await;
+
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock.uri()).await;
+
+    let body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": false
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+    let body_hash = hex::encode(Sha256::digest(&body_bytes));
+    let forged_hash = hex::encode(Sha256::digest(br#"{"forged":true}"#));
+
+    assert_ne!(
+        body_hash, forged_hash,
+        "test setup requires a distinct forged hash"
+    );
+
+    let mut inner_req = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/chat/completions".to_vec(),
+    );
+    inner_req.put_header("content-type", "application/json");
+    inner_req.put_header("x-request-hash", forged_hash.as_str());
+    inner_req.write_content(body_bytes);
+
+    let (enc_request, client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{base_url}/ohttp"))
+        .header("content-type", "message/ohttp-req")
+        .header("authorization", "Bearer test-token")
+        .body(enc_request)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+
+    let enc_response = response.bytes().await.unwrap();
+    let inner_resp = ohttp_decrypt_response(client_response, &enc_response);
+    assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+
+    let sig_response = client
+        .get(format!(
+            "{base_url}/v1/signature/chatcmpl-ohttp-scrubbed-hash?signing_algo=ecdsa"
+        ))
+        .header(auth_header().0, auth_header().1)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(sig_response.status(), reqwest::StatusCode::OK);
+    let sig_body: serde_json::Value = sig_response.json().await.unwrap();
+    let signed_text = sig_body["text"].as_str().unwrap();
+    assert!(
+        signed_text.starts_with(&format!("test-model:{body_hash}:")),
+        "Signed text must use the actual wire body hash after scrubbing inner X-Request-Hash"
+    );
+    assert!(
+        !signed_text.starts_with(&format!("test-model:{forged_hash}:")),
+        "Signed text must not use the client-controlled inner X-Request-Hash when outer bearer auth is used"
+    );
+
+    server_handle.abort();
+}
+
+/// Chunked OHTTP: relay-injected outer Authorization (same semantics as standard OHTTP).
+#[tokio::test]
+async fn test_ohttp_chunked_outer_authorization_relay_injected() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-relay-chunked",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Chunked relay auth OK"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+        })))
+        .mount(&mock)
+        .await;
+
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock.uri()).await;
+
+    let mut inner_req = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/chat/completions".to_vec(),
+    );
+    inner_req.put_header("content-type", "application/json");
+    let body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": false
+    });
+    inner_req.write_content(serde_json::to_vec(&body).unwrap());
+
+    let (status, content_type, inner_resp) = ohttp_chunked_roundtrip(
+        &base_url,
+        &config_bytes,
+        &inner_req,
+        Some("Bearer test-token"),
+    )
+    .await;
+
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(content_type, "message/ohttp-chunked-res");
+    assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+    let resp_body: serde_json::Value = serde_json::from_slice(inner_resp.content()).unwrap();
+    assert_eq!(
+        resp_body["choices"][0]["message"]["content"],
+        "Chunked relay auth OK"
+    );
+    assert_eq!(resp_body["id"], "chatcmpl-relay-chunked");
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_ohttp_non_bearer_outer_auth_falls_back_to_inner_authorization() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-ohttp-inner-auth",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Inner auth OK"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+        })))
+        .mount(&mock)
+        .await;
+
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock.uri()).await;
+
+    let mut inner_req = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/chat/completions".to_vec(),
+    );
+    inner_req.put_header("content-type", "application/json");
+    inner_req.put_header("authorization", "Bearer test-token");
+    let body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": false
+    });
+    inner_req.write_content(serde_json::to_vec(&body).unwrap());
+
+    let (enc_request, client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{base_url}/ohttp"))
+        .header("content-type", "message/ohttp-req")
+        .header("authorization", "Basic Zm9vOmJhcg==")
+        .body(enc_request)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+
+    let enc_response = response.bytes().await.unwrap();
+    let inner_resp = ohttp_decrypt_response(client_response, &enc_response);
+
+    assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+    let resp_body: serde_json::Value = serde_json::from_slice(inner_resp.content()).unwrap();
+    assert_eq!(
+        resp_body["choices"][0]["message"]["content"],
+        "Inner auth OK"
+    );
+    assert_eq!(resp_body["id"], "chatcmpl-ohttp-inner-auth");
+
+    server_handle.abort();
+}
+
 // Test 12: OHTTP with inner GET request (e.g. /v1/models)
 #[tokio::test]
 async fn test_ohttp_get_request_inner() {
@@ -5454,6 +5730,7 @@ async fn ohttp_chunked_roundtrip(
     base_url: &str,
     config_bytes: &[u8],
     inner_msg: &bhttp::Message,
+    outer_authorization: Option<&str>,
 ) -> (reqwest::StatusCode, String, bhttp::Message) {
     use futures_util::{AsyncReadExt, AsyncWriteExt};
     use tokio_util::compat::TokioAsyncWriteCompatExt;
@@ -5481,13 +5758,13 @@ async fn ohttp_chunked_roundtrip(
 
     // Send to gateway
     let http_client = reqwest::Client::new();
-    let response = http_client
+    let mut req = http_client
         .post(format!("{base_url}/ohttp"))
-        .header("content-type", "message/ohttp-chunked-req")
-        .body(enc_request)
-        .send()
-        .await
-        .unwrap();
+        .header("content-type", "message/ohttp-chunked-req");
+    if let Some(auth) = outer_authorization {
+        req = req.header(reqwest::header::AUTHORIZATION, auth);
+    }
+    let response = req.body(enc_request).send().await.unwrap();
 
     let status = response.status();
     let content_type = response
@@ -5546,7 +5823,7 @@ async fn test_ohttp_chunked_chat_completion() {
     inner_req.write_content(serde_json::to_vec(&body).unwrap());
 
     let (status, content_type, inner_resp) =
-        ohttp_chunked_roundtrip(&base_url, &config_bytes, &inner_req).await;
+        ohttp_chunked_roundtrip(&base_url, &config_bytes, &inner_req, None).await;
 
     assert_eq!(status, 200);
     assert_eq!(content_type, "message/ohttp-chunked-res");
@@ -5631,7 +5908,7 @@ async fn test_ohttp_chunked_auth_enforcement() {
     );
 
     let (status, content_type, inner_resp) =
-        ohttp_chunked_roundtrip(&base_url, &config_bytes, &inner_req).await;
+        ohttp_chunked_roundtrip(&base_url, &config_bytes, &inner_req, None).await;
 
     assert_eq!(status, 200, "OHTTP layer should return 200");
     assert_eq!(content_type, "message/ohttp-chunked-res");
@@ -5666,7 +5943,7 @@ async fn test_ohttp_chunked_get_request() {
     );
 
     let (status, content_type, inner_resp) =
-        ohttp_chunked_roundtrip(&base_url, &config_bytes, &inner_req).await;
+        ohttp_chunked_roundtrip(&base_url, &config_bytes, &inner_req, None).await;
 
     assert_eq!(status, 200);
     assert_eq!(content_type, "message/ohttp-chunked-res");
@@ -5797,7 +6074,7 @@ async fn test_ohttp_chunked_large_response() {
     );
 
     let (status, content_type, inner_resp) =
-        ohttp_chunked_roundtrip(&base_url, &config_bytes, &inner_req).await;
+        ohttp_chunked_roundtrip(&base_url, &config_bytes, &inner_req, None).await;
 
     assert_eq!(status, 200);
     assert_eq!(content_type, "message/ohttp-chunked-res");

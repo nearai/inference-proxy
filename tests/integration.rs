@@ -5397,6 +5397,72 @@ async fn test_ohttp_auth_enforcement_inside_envelope() {
     server_handle.abort();
 }
 
+// Outer `Authorization` on POST /ohttp is merged into the inner loopback request so a
+// relay can authenticate without placing the secret inside the encrypted BHTTP payload.
+#[tokio::test]
+async fn test_ohttp_outer_authorization_relay_injected() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-relay",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Relay auth OK"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+        })))
+        .mount(&mock)
+        .await;
+
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock.uri()).await;
+
+    // Inner request: no authorization in the encrypted envelope (client has no secret).
+    let mut inner_req = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/chat/completions".to_vec(),
+    );
+    inner_req.put_header("content-type", "application/json");
+    let body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": false
+    });
+    inner_req.write_content(serde_json::to_vec(&body).unwrap());
+
+    let (enc_request, client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{base_url}/ohttp"))
+        .header("content-type", "message/ohttp-req")
+        .header("authorization", "Bearer test-token")
+        .body(enc_request)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+
+    let enc_response = response.bytes().await.unwrap();
+    let inner_resp = ohttp_decrypt_response(client_response, &enc_response);
+
+    assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+    let resp_body: serde_json::Value = serde_json::from_slice(inner_resp.content()).unwrap();
+    assert_eq!(
+        resp_body["choices"][0]["message"]["content"],
+        "Relay auth OK"
+    );
+    assert_eq!(resp_body["id"], "chatcmpl-relay");
+
+    server_handle.abort();
+}
+
 // Test 12: OHTTP with inner GET request (e.g. /v1/models)
 #[tokio::test]
 async fn test_ohttp_get_request_inner() {

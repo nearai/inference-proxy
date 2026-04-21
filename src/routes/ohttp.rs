@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
+use axum::http::{header, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::{AsyncReadExt, AsyncWriteExt};
 use http_body_util::BodyExt;
@@ -39,6 +39,16 @@ pub async fn ohttp_config(State(state): State<AppState>) -> Result<Response, App
 /// - `message/ohttp-req` → standard OHTTP (full request/response)
 /// - `message/ohttp-chunked-req` → chunked OHTTP (streaming response)
 ///
+/// **Authorization:** An OHTTP relay can send `Authorization: Bearer …` on this
+/// HTTP request (outside the encrypted BHTTP payload). When present, it is applied
+/// to the inner loopback request and overrides any `Authorization` field inside
+/// the decrypted Binary HTTP message—so the relay can hold the API secret while
+/// clients only encrypt the request line, headers, and body they need.
+///
+/// If the outer request has no `Authorization` header, auth is taken from the
+/// inner Binary HTTP message only (backward-compatible with clients that embed
+/// the token in the encrypted envelope).
+///
 /// Auth, rate limiting, and signing are applied on the inner loopback request
 /// via the normal middleware stack.
 pub async fn ohttp_relay(
@@ -49,6 +59,8 @@ pub async fn ohttp_relay(
         .ohttp_gateway
         .as_ref()
         .ok_or_else(|| AppError::NotFound("OHTTP not enabled".to_string()))?;
+
+    let outer_authorization = request.headers().get(header::AUTHORIZATION).cloned();
 
     let chunked = request
         .headers()
@@ -68,9 +80,9 @@ pub async fn ohttp_relay(
     }
 
     if chunked {
-        ohttp_relay_chunked(&state, gateway, &enc_request).await
+        ohttp_relay_chunked(&state, gateway, &enc_request, outer_authorization).await
     } else {
-        ohttp_relay_standard(&state, gateway, &enc_request).await
+        ohttp_relay_standard(&state, gateway, &enc_request, outer_authorization).await
     }
 }
 
@@ -79,6 +91,7 @@ async fn ohttp_relay_standard(
     state: &AppState,
     gateway: &crate::ohttp_gateway::OhttpGateway,
     enc_request: &[u8],
+    outer_authorization: Option<HeaderValue>,
 ) -> Result<Response, AppError> {
     let start = Instant::now();
     metrics::counter!("ohttp_requests_total", "type" => "standard").increment(1);
@@ -93,7 +106,8 @@ async fn ohttp_relay_standard(
     metrics::histogram!("ohttp_decapsulation_duration_seconds")
         .record(decap_duration.as_secs_f64());
 
-    let (request_builder, path_str) = parse_bhttp_and_build_loopback(state, &bhttp_request)?;
+    let (request_builder, path_str) =
+        parse_bhttp_and_build_loopback(state, &bhttp_request, outer_authorization.as_ref())?;
 
     // Send the loopback request.
     let loopback_response = send_loopback(request_builder).await?;
@@ -150,6 +164,7 @@ async fn ohttp_relay_chunked(
     state: &AppState,
     gateway: &crate::ohttp_gateway::OhttpGateway,
     enc_request: &[u8],
+    outer_authorization: Option<HeaderValue>,
 ) -> Result<Response, AppError> {
     use futures_util::StreamExt;
 
@@ -175,7 +190,8 @@ async fn ohttp_relay_chunked(
     metrics::histogram!("ohttp_decapsulation_duration_seconds")
         .record(decap_duration.as_secs_f64());
 
-    let (request_builder, path_str) = parse_bhttp_and_build_loopback(state, &bhttp_request)?;
+    let (request_builder, path_str) =
+        parse_bhttp_and_build_loopback(state, &bhttp_request, outer_authorization.as_ref())?;
 
     let loopback_response = send_loopback(request_builder).await?;
     let response_status = loopback_response.status().as_u16();
@@ -272,9 +288,13 @@ async fn ohttp_relay_chunked(
 
 /// Parse a Binary HTTP request and build a loopback reqwest request.
 /// Returns (request_builder, path_str).
+///
+/// `outer_authorization`: if set (e.g. relay-injected `Authorization` on `POST /ohttp`),
+/// it is attached to the loopback request and any inner `Authorization` field is skipped.
 fn parse_bhttp_and_build_loopback(
     state: &AppState,
     bhttp_request: &[u8],
+    outer_authorization: Option<&HeaderValue>,
 ) -> Result<(reqwest::RequestBuilder, String), AppError> {
     let inner_msg = bhttp::Message::read_bhttp(&mut Cursor::new(bhttp_request)).map_err(|e| {
         warn!(error = %e, "Failed to parse Binary HTTP request");
@@ -310,6 +330,10 @@ fn parse_bhttp_and_build_loopback(
             continue;
         }
 
+        if outer_authorization.is_some() && name_bytes.eq_ignore_ascii_case(b"authorization") {
+            continue;
+        }
+
         match (
             HeaderName::from_bytes(name_bytes),
             HeaderValue::from_bytes(value_bytes),
@@ -324,6 +348,10 @@ fn parse_bhttp_and_build_loopback(
                 );
             }
         }
+    }
+
+    if let Some(auth) = outer_authorization {
+        request_builder = request_builder.header(header::AUTHORIZATION, auth.clone());
     }
 
     let inner_content = inner_msg.content().to_vec();

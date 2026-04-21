@@ -49,6 +49,19 @@ pub async fn ohttp_config(State(state): State<AppState>) -> Result<Response, App
 /// inner Binary HTTP message only (backward-compatible with clients that embed
 /// the token in the encrypted envelope).
 ///
+/// **Trusted gateway semantics:** Outer `Bearer` auth is validated the same way
+/// as a direct client call. In particular, features that apply only when the caller
+/// uses the deployment `config.token` (and not cloud `sk-` keys)—for example
+/// honoring inner `X-Request-Hash` for signing in chat routes—will apply once
+/// the relay injects that token. Encrypted inner headers still come from the end
+/// client. If the relay sits between an untrusted client and this server, **the relay
+/// must strip or override sensitive inner headers** (for example `X-Request-Hash`)
+/// when building BHTTP so clients cannot forge trusted-gateway-only behavior while
+/// the relay supplies the shared secret. Hash binding rules are documented on
+/// [`resolve_request_hash_for_signing`].
+///
+/// [`resolve_request_hash_for_signing`]: crate::routes::chat::resolve_request_hash_for_signing
+///
 /// Auth, rate limiting, and signing are applied on the inner loopback request
 /// via the normal middleware stack.
 pub async fn ohttp_relay(
@@ -319,18 +332,17 @@ fn parse_bhttp_and_build_loopback(
     let loopback_url = format!("http://127.0.0.1:{}{}", state.config.listen_port, path_str);
     let mut request_builder = state.http_client.request(method, &loopback_url);
 
+    let relay_overrides_auth = outer_authorization.is_some();
+
     for field in inner_msg.header().fields() {
         let name_bytes = field.name();
         let value_bytes = field.value();
 
-        if name_bytes.eq_ignore_ascii_case(b"host")
+        let skip = name_bytes.eq_ignore_ascii_case(b"host")
             || name_bytes.eq_ignore_ascii_case(b"transfer-encoding")
             || name_bytes.eq_ignore_ascii_case(b"connection")
-        {
-            continue;
-        }
-
-        if outer_authorization.is_some() && name_bytes.eq_ignore_ascii_case(b"authorization") {
+            || (relay_overrides_auth && name_bytes.eq_ignore_ascii_case(b"authorization"));
+        if skip {
             continue;
         }
 

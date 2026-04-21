@@ -302,8 +302,10 @@ async fn ohttp_relay_chunked(
 /// Parse a Binary HTTP request and build a loopback reqwest request.
 /// Returns (request_builder, path_str).
 ///
-/// `outer_authorization`: if set (e.g. relay-injected `Authorization` on `POST /ohttp`),
-/// it is attached to the loopback request and any inner `Authorization` field is skipped.
+/// `outer_authorization`: if it is a usable `Bearer` value (e.g. relay-injected
+/// `Authorization` on `POST /ohttp`), it is attached to the loopback request,
+/// the inner `Authorization` field is skipped, and trusted-only inner headers are
+/// scrubbed because the outer bearer establishes trusted-gateway semantics.
 fn parse_bhttp_and_build_loopback(
     state: &AppState,
     bhttp_request: &[u8],
@@ -332,7 +334,11 @@ fn parse_bhttp_and_build_loopback(
     let loopback_url = format!("http://127.0.0.1:{}{}", state.config.listen_port, path_str);
     let mut request_builder = state.http_client.request(method, &loopback_url);
 
-    let relay_overrides_auth = outer_authorization.is_some();
+    let relay_outer_bearer = outer_authorization.filter(|value| {
+        value
+            .to_str()
+            .is_ok_and(|header| header.starts_with("Bearer "))
+    });
 
     for field in inner_msg.header().fields() {
         let name_bytes = field.name();
@@ -341,7 +347,8 @@ fn parse_bhttp_and_build_loopback(
         let skip = name_bytes.eq_ignore_ascii_case(b"host")
             || name_bytes.eq_ignore_ascii_case(b"transfer-encoding")
             || name_bytes.eq_ignore_ascii_case(b"connection")
-            || (relay_overrides_auth && name_bytes.eq_ignore_ascii_case(b"authorization"));
+            || (relay_outer_bearer.is_some() && name_bytes.eq_ignore_ascii_case(b"authorization"))
+            || (relay_outer_bearer.is_some() && name_bytes.eq_ignore_ascii_case(b"x-request-hash"));
         if skip {
             continue;
         }
@@ -362,7 +369,7 @@ fn parse_bhttp_and_build_loopback(
         }
     }
 
-    if let Some(auth) = outer_authorization {
+    if let Some(auth) = relay_outer_bearer {
         request_builder = request_builder.header(header::AUTHORIZATION, auth.clone());
     }
 

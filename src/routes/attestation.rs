@@ -103,11 +103,7 @@ pub async fn attestation_report(
 
             // Cache nonce-less reports so subsequent requests get the full response
             // including compose-manager attestation.
-            let ohttp_attestation = if signing_algo == "ed25519" {
-                state.ohttp_attestation_ed25519.clone()
-            } else {
-                None
-            };
+            let ohttp_attestation = state.ohttp_attestation_ed25519.clone();
 
             // Cache nonce-less reports so subsequent requests get the full response
             // including compose-manager attestation.
@@ -124,12 +120,12 @@ pub async fn attestation_report(
                     .await;
             }
 
-            let response = AttestationResponse {
-                report: report.as_ref().clone(),
-                all_attestations: vec![*report],
-                compose_manager_attestation: cm_attestation,
+            let response = AttestationResponse::new(
+                report.as_ref().clone(),
+                vec![*report],
+                cm_attestation,
                 ohttp_attestation,
-            };
+            );
             Ok(Json(response).into_response())
         }
     }

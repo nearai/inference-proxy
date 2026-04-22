@@ -38,10 +38,32 @@ pub struct AttestationResponse {
     /// Contains the compose-manager's TDX-attested action log (deployment events).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compose_manager_attestation: Option<serde_json::Value>,
+    /// Legacy flat OHTTP key config field kept for backward compatibility.
+    /// Mirrors `ohttp_attestation.key_config` when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ohttp_key_config: Option<String>,
     /// OHTTP key attestation payload, if OHTTP is enabled.
     /// Includes key config bytes and an Ed25519 signature over `text`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ohttp_attestation: Option<OhttpAttestation>,
+}
+
+impl AttestationResponse {
+    pub fn new(
+        report: AttestationReport,
+        all_attestations: Vec<AttestationReport>,
+        compose_manager_attestation: Option<serde_json::Value>,
+        ohttp_attestation: Option<OhttpAttestation>,
+    ) -> Self {
+        let ohttp_key_config = ohttp_attestation.as_ref().map(|att| att.key_config.clone());
+        Self {
+            report,
+            all_attestations,
+            compose_manager_attestation,
+            ohttp_key_config,
+            ohttp_attestation,
+        }
+    }
 }
 
 /// Attestation payload for OHTTP key configuration.
@@ -54,6 +76,7 @@ pub struct OhttpAttestation {
     /// Hex-encoded OHTTP key configuration bytes (RFC 9458).
     pub key_config: String,
     /// Hex-encoded SHA-256 digest of decoded `key_config` bytes.
+    /// Clients verify this signature against the attested Ed25519 public key.
     pub text: String,
     /// Signature over the UTF-8 bytes of `text` (the ASCII hex digest string).
     pub signature: String,

@@ -5077,7 +5077,39 @@ async fn test_ohttp_relay_garbage_body_returns_400() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
-// Test 13: Attestation response includes ohttp_attestation when OHTTP enabled
+fn assert_ohttp_attestation_fields(json: &serde_json::Value) {
+    let ohttp_attestation = &json["ohttp_attestation"];
+    assert!(
+        !ohttp_attestation.is_null(),
+        "ohttp_attestation should be present when OHTTP is enabled"
+    );
+    let hex_config = ohttp_attestation["key_config"].as_str().unwrap();
+    assert_eq!(json["ohttp_key_config"].as_str().unwrap(), hex_config);
+    let config_bytes = hex::decode(hex_config).unwrap();
+    assert!(ohttp::KeyConfig::decode(&config_bytes).is_ok());
+    assert_eq!(
+        ohttp_attestation["signing_algo"].as_str().unwrap(),
+        "ed25519"
+    );
+    let signing_key_hex = ohttp_attestation["signing_key"].as_str().unwrap();
+    let text = ohttp_attestation["text"].as_str().unwrap();
+    let signature_hex = ohttp_attestation["signature"].as_str().unwrap();
+
+    // Verify text is SHA-256 of key_config bytes.
+    use sha2::Digest;
+    let expected_text = hex::encode(sha2::Sha256::digest(&config_bytes));
+    assert_eq!(text, expected_text);
+
+    // Verify signature over UTF-8 bytes of `text`.
+    use ed25519_dalek::Verifier;
+    let signing_key_bytes: [u8; 32] = hex::decode(signing_key_hex).unwrap().try_into().unwrap();
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&signing_key_bytes).unwrap();
+    let signature_bytes: [u8; 64] = hex::decode(signature_hex).unwrap().try_into().unwrap();
+    let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
+    assert!(verifying_key.verify(text.as_bytes(), &signature).is_ok());
+}
+
+// Test 13: Attestation response includes OHTTP fields when OHTTP enabled
 #[tokio::test]
 async fn test_ohttp_attestation_includes_key_config() {
     let mock = MockServer::start().await;
@@ -5101,34 +5133,7 @@ async fn test_ohttp_attestation_includes_key_config() {
             .unwrap()
             .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let ohttp_attestation = &json["ohttp_attestation"];
-        assert!(
-            !ohttp_attestation.is_null(),
-            "ohttp_attestation should be present when OHTTP is enabled"
-        );
-        let hex_config = ohttp_attestation["key_config"].as_str().unwrap();
-        let config_bytes = hex::decode(hex_config).unwrap();
-        assert!(ohttp::KeyConfig::decode(&config_bytes).is_ok());
-        assert_eq!(
-            ohttp_attestation["signing_algo"].as_str().unwrap(),
-            "ed25519"
-        );
-        let signing_key_hex = ohttp_attestation["signing_key"].as_str().unwrap();
-        let text = ohttp_attestation["text"].as_str().unwrap();
-        let signature_hex = ohttp_attestation["signature"].as_str().unwrap();
-
-        // Verify text is SHA-256 of key_config bytes.
-        use sha2::Digest;
-        let expected_text = hex::encode(sha2::Sha256::digest(&config_bytes));
-        assert_eq!(text, expected_text);
-
-        // Verify signature over UTF-8 bytes of `text`.
-        use ed25519_dalek::Verifier;
-        let signing_key_bytes: [u8; 32] = hex::decode(signing_key_hex).unwrap().try_into().unwrap();
-        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&signing_key_bytes).unwrap();
-        let signature_bytes: [u8; 64] = hex::decode(signature_hex).unwrap().try_into().unwrap();
-        let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
-        assert!(verifying_key.verify(text.as_bytes(), &signature).is_ok());
+        assert_ohttp_attestation_fields(&json);
     }
 }
 
@@ -5155,21 +5160,25 @@ async fn test_ohttp_attestation_omits_key_config_when_disabled() {
             .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(
+            json.get("ohttp_key_config").is_none(),
+            "ohttp_key_config should NOT be present when OHTTP is disabled"
+        );
+        assert!(
             json.get("ohttp_attestation").is_none(),
             "ohttp_attestation should NOT be present when OHTTP is disabled"
         );
     }
 }
 
-// Test 15: Attestation response omits ohttp_attestation when signing_algo=ecdsa
+// Test 15: Default attestation route keeps returning OHTTP material for compatibility
 #[tokio::test]
-async fn test_ohttp_attestation_omitted_for_ecdsa_signing_algo() {
+async fn test_ohttp_attestation_present_for_default_route() {
     let mock = MockServer::start().await;
     let app = build_test_app_with_ohttp(&mock.uri());
 
     let response = app
         .oneshot(
-            Request::get("/v1/attestation/report?signing_algo=ecdsa")
+            Request::get("/v1/attestation/report")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -5183,10 +5192,8 @@ async fn test_ohttp_attestation_omitted_for_ecdsa_signing_algo() {
             .unwrap()
             .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(
-            json.get("ohttp_attestation").is_none(),
-            "ohttp_attestation should be omitted when signing_algo is ecdsa"
-        );
+        assert_eq!(json["signing_algo"], "ecdsa");
+        assert_ohttp_attestation_fields(&json);
     }
 }
 

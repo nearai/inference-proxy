@@ -104,6 +104,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         tls_cert_fingerprint: None,
         backend_pool,
         ohttp_gateway: None,
+        ohttp_attestation_ed25519: None,
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(10000, 20000);

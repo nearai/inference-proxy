@@ -415,6 +415,27 @@ pub struct ComposeManagerConfig {
     pub url: String,
 }
 
+/// Build OHTTP attestation payload for the process-wide OHTTP gateway config.
+pub fn build_ohttp_attestation(
+    signing: &crate::signing::SigningPair,
+    gateway: &crate::ohttp_gateway::OhttpGateway,
+) -> anyhow::Result<crate::types::OhttpAttestation> {
+    let key_config = hex::encode(gateway.config_bytes());
+    let digest = sha2::Sha256::digest(gateway.config_bytes());
+    let text = hex::encode(digest);
+    let signature = signing
+        .ed25519
+        .sign(&text)
+        .map_err(|e| anyhow::anyhow!("failed to sign OHTTP attestation: {e}"))?;
+    Ok(crate::types::OhttpAttestation {
+        signing_algo: "ed25519".to_string(),
+        signing_key: signing.ed25519.signing_public_key.clone(),
+        key_config,
+        text,
+        signature,
+    })
+}
+
 /// Spawn a background task that periodically refreshes cached attestation reports.
 pub fn spawn_cache_refresh_task(
     cache: Arc<AttestationCache>,
@@ -424,6 +445,7 @@ pub fn spawn_cache_refresh_task(
     tls_cert_fingerprint: Option<String>,
     refresh_interval_secs: u64,
     compose_manager: Option<ComposeManagerConfig>,
+    ohttp_attestation_ed25519: Option<crate::types::OhttpAttestation>,
 ) {
     tokio::spawn(async move {
         // Initial delay to let the server start up.
@@ -470,8 +492,19 @@ pub fn spawn_cache_refresh_task(
                 .await
                 {
                     Ok(report) => {
+                        let ohttp_attestation = if *algo == "ed25519" {
+                            ohttp_attestation_ed25519.clone()
+                        } else {
+                            None
+                        };
                         cache
-                            .set(algo, false, report, cm_attestation.clone(), None)
+                            .set(
+                                algo,
+                                false,
+                                report,
+                                cm_attestation.clone(),
+                                ohttp_attestation,
+                            )
                             .await;
                         info!(algo, "Background attestation cache refresh succeeded");
                     }
@@ -498,8 +531,19 @@ pub fn spawn_cache_refresh_task(
                     .await
                     {
                         Ok(report) => {
+                            let ohttp_attestation = if *algo == "ed25519" {
+                                ohttp_attestation_ed25519.clone()
+                            } else {
+                                None
+                            };
                             cache
-                                .set(algo, true, report, cm_attestation.clone(), None)
+                                .set(
+                                    algo,
+                                    true,
+                                    report,
+                                    cm_attestation.clone(),
+                                    ohttp_attestation,
+                                )
                                 .await;
                         }
                         Err(e) => {

@@ -55,7 +55,7 @@ pub struct OhttpAttestation {
     pub key_config: String,
     /// Hex-encoded SHA-256 digest of decoded `key_config` bytes.
     pub text: String,
-    /// Signature over `text`.
+    /// Signature over the UTF-8 bytes of `text` (the ASCII hex digest string).
     pub signature: String,
 }
 

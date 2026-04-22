@@ -111,6 +111,7 @@ fn build_test_app_with_rate_limit(
         tls_cert_fingerprint: None,
         backend_pool,
         ohttp_gateway: None,
+        ohttp_attestation_ed25519: None,
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(rate_per_second, rate_burst);
@@ -2875,6 +2876,7 @@ fn build_test_app_with_cloud_api(mock_url: &str, cloud_api_url: &str) -> axum::R
         tls_cert_fingerprint: None,
         backend_pool,
         ohttp_gateway: None,
+        ohttp_attestation_ed25519: None,
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(100, 200);
@@ -4890,10 +4892,11 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
 
     let ecdsa = signing::EcdsaContext::from_key_bytes(&ecdsa_key).unwrap();
     let ed25519 = signing::Ed25519Context::from_key_bytes(&ed25519_key).unwrap();
-
-    let ohttp_gw = ohttp_gateway::OhttpGateway::new(ed25519.secret_bytes()).unwrap();
-
     let signing_pair = signing::SigningPair { ecdsa, ed25519 };
+
+    let ohttp_gw = ohttp_gateway::OhttpGateway::new(signing_pair.ed25519.secret_bytes()).unwrap();
+    let ohttp_attestation_ed25519 =
+        attestation::build_ohttp_attestation(&signing_pair, &ohttp_gw).unwrap();
     let chat_cache = cache::ChatCache::new("test-model", 1200);
     let http_client = reqwest::Client::new();
 
@@ -4913,6 +4916,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         tls_cert_fingerprint: None,
         backend_pool,
         ohttp_gateway: Some(Arc::new(ohttp_gw)),
+        ohttp_attestation_ed25519: Some(ohttp_attestation_ed25519),
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(100, 200);
@@ -5109,9 +5113,22 @@ async fn test_ohttp_attestation_includes_key_config() {
             ohttp_attestation["signing_algo"].as_str().unwrap(),
             "ed25519"
         );
-        assert!(ohttp_attestation["signing_key"].as_str().is_some());
-        assert!(ohttp_attestation["text"].as_str().is_some());
-        assert!(ohttp_attestation["signature"].as_str().is_some());
+        let signing_key_hex = ohttp_attestation["signing_key"].as_str().unwrap();
+        let text = ohttp_attestation["text"].as_str().unwrap();
+        let signature_hex = ohttp_attestation["signature"].as_str().unwrap();
+
+        // Verify text is SHA-256 of key_config bytes.
+        use sha2::Digest;
+        let expected_text = hex::encode(sha2::Sha256::digest(&config_bytes));
+        assert_eq!(text, expected_text);
+
+        // Verify signature over UTF-8 bytes of `text`.
+        use ed25519_dalek::Verifier;
+        let signing_key_bytes: [u8; 32] = hex::decode(signing_key_hex).unwrap().try_into().unwrap();
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&signing_key_bytes).unwrap();
+        let signature_bytes: [u8; 64] = hex::decode(signature_hex).unwrap().try_into().unwrap();
+        let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
+        assert!(verifying_key.verify(text.as_bytes(), &signature).is_ok());
     }
 }
 
@@ -5140,6 +5157,35 @@ async fn test_ohttp_attestation_omits_key_config_when_disabled() {
         assert!(
             json.get("ohttp_attestation").is_none(),
             "ohttp_attestation should NOT be present when OHTTP is disabled"
+        );
+    }
+}
+
+// Test 15: Attestation response omits ohttp_attestation when signing_algo=ecdsa
+#[tokio::test]
+async fn test_ohttp_attestation_omitted_for_ecdsa_signing_algo() {
+    let mock = MockServer::start().await;
+    let app = build_test_app_with_ohttp(&mock.uri());
+
+    let response = app
+        .oneshot(
+            Request::get("/v1/attestation/report?signing_algo=ecdsa")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    if status == StatusCode::OK {
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json.get("ohttp_attestation").is_none(),
+            "ohttp_attestation should be omitted when signing_algo is ecdsa"
         );
     }
 }
@@ -5219,6 +5265,8 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
     let ohttp_gw = ohttp_gateway::OhttpGateway::new(ed25519.secret_bytes()).unwrap();
     let config_bytes = ohttp_gw.config_bytes().to_vec();
     let signing_pair = signing::SigningPair { ecdsa, ed25519 };
+    let ohttp_attestation_ed25519 =
+        attestation::build_ohttp_attestation(&signing_pair, &ohttp_gw).unwrap();
 
     let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
         .build_recorder()
@@ -5235,6 +5283,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         tls_cert_fingerprint: None,
         backend_pool,
         ohttp_gateway: Some(Arc::new(ohttp_gw)),
+        ohttp_attestation_ed25519: Some(ohttp_attestation_ed25519),
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(100, 200);

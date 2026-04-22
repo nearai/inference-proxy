@@ -3,11 +3,10 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::Deserialize;
-use sha2::Digest;
 
 use crate::attestation::AttestationResult;
 use crate::error::AppError;
-use crate::types::{AttestationResponse, OhttpAttestation};
+use crate::types::AttestationResponse;
 use crate::AppState;
 
 #[derive(Deserialize)]
@@ -104,25 +103,11 @@ pub async fn attestation_report(
 
             // Cache nonce-less reports so subsequent requests get the full response
             // including compose-manager attestation.
-            let ohttp_attestation = state
-                .ohttp_gateway
-                .as_ref()
-                .map(|gw| {
-                    let key_config = hex::encode(gw.config_bytes());
-                    let digest = sha2::Sha256::digest(gw.config_bytes());
-                    let text = hex::encode(digest);
-                    let signature = state.signing.ed25519.sign(&text).map_err(|e| {
-                        AppError::Internal(anyhow::anyhow!("failed to sign OHTTP attestation: {e}"))
-                    })?;
-                    Ok::<OhttpAttestation, AppError>(OhttpAttestation {
-                        signing_algo: "ed25519".to_string(),
-                        signing_key: state.signing.ed25519.signing_public_key.clone(),
-                        key_config,
-                        text,
-                        signature,
-                    })
-                })
-                .transpose()?;
+            let ohttp_attestation = if signing_algo == "ed25519" {
+                state.ohttp_attestation_ed25519.clone()
+            } else {
+                None
+            };
 
             // Cache nonce-less reports so subsequent requests get the full response
             // including compose-manager attestation.

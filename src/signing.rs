@@ -119,10 +119,15 @@ impl Ed25519Context {
         self.signing_key.as_bytes()
     }
 
-    /// Sign a message. Returns hex-encoded 64-byte signature.
-    pub fn sign(&self, message: &str) -> Result<String> {
-        let signature = self.signing_key.sign(message.as_bytes());
+    /// Sign raw message bytes. Returns hex-encoded 64-byte signature.
+    pub fn sign_bytes(&self, message: &[u8]) -> Result<String> {
+        let signature = self.signing_key.sign(message);
         Ok(hex::encode(signature.to_bytes()))
+    }
+
+    /// Sign a UTF-8 message. Returns hex-encoded 64-byte signature.
+    pub fn sign(&self, message: &str) -> Result<String> {
+        self.sign_bytes(message.as_bytes())
     }
 }
 
@@ -345,6 +350,22 @@ mod tests {
             ed25519_dalek::VerifyingKey::from_bytes(pk_bytes[..32].try_into().unwrap()).unwrap();
 
         assert!(verifying_key.verify(message.as_bytes(), &signature).is_ok());
+    }
+
+    #[test]
+    fn test_ed25519_sign_bytes_and_verify() {
+        let ctx = Ed25519Context::from_key_bytes(&TEST_ED25519_KEY).unwrap();
+        let message = [0x00, 0x01, 0xFE, 0xFF, 0x42];
+
+        let sig_hex = ctx.sign_bytes(&message).unwrap();
+
+        let sig_bytes = hex::decode(&sig_hex).unwrap();
+        let signature = ed25519_dalek::Signature::from_bytes(sig_bytes[..64].try_into().unwrap());
+        let pk_bytes = hex::decode(&ctx.signing_public_key).unwrap();
+        let verifying_key =
+            ed25519_dalek::VerifyingKey::from_bytes(pk_bytes[..32].try_into().unwrap()).unwrap();
+
+        assert!(verifying_key.verify(&message, &signature).is_ok());
     }
 
     #[test]

@@ -5092,21 +5092,19 @@ fn assert_ohttp_attestation_fields(json: &serde_json::Value) {
         "ed25519"
     );
     let signing_key_hex = ohttp_attestation["signing_key"].as_str().unwrap();
-    let text = ohttp_attestation["text"].as_str().unwrap();
     let signature_hex = ohttp_attestation["signature"].as_str().unwrap();
+    assert!(
+        ohttp_attestation.get("text").is_none(),
+        "ohttp_attestation.text should be absent"
+    );
 
-    // Verify text is SHA-256 of key_config bytes.
-    use sha2::Digest;
-    let expected_text = hex::encode(sha2::Sha256::digest(&config_bytes));
-    assert_eq!(text, expected_text);
-
-    // Verify signature over UTF-8 bytes of `text`.
+    // Verify signature over decoded `key_config` bytes.
     use ed25519_dalek::Verifier;
     let signing_key_bytes: [u8; 32] = hex::decode(signing_key_hex).unwrap().try_into().unwrap();
     let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&signing_key_bytes).unwrap();
     let signature_bytes: [u8; 64] = hex::decode(signature_hex).unwrap().try_into().unwrap();
     let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
-    assert!(verifying_key.verify(text.as_bytes(), &signature).is_ok());
+    assert!(verifying_key.verify(&config_bytes, &signature).is_ok());
 }
 
 // Test 13: Attestation response includes OHTTP fields when OHTTP enabled

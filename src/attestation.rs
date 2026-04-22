@@ -421,17 +421,14 @@ pub fn build_ohttp_attestation(
     gateway: &crate::ohttp_gateway::OhttpGateway,
 ) -> anyhow::Result<crate::types::OhttpAttestation> {
     let key_config = hex::encode(gateway.config_bytes());
-    let digest = sha2::Sha256::digest(gateway.config_bytes());
-    let text = hex::encode(digest);
     let signature = signing
         .ed25519
-        .sign(&text)
+        .sign_bytes(gateway.config_bytes())
         .map_err(|e| anyhow::anyhow!("failed to sign OHTTP attestation: {e}"))?;
     Ok(crate::types::OhttpAttestation {
         signing_algo: "ed25519".to_string(),
         signing_key: signing.ed25519.signing_public_key.clone(),
         key_config,
-        text,
         signature,
     })
 }
@@ -1150,7 +1147,6 @@ mod tests {
             signing_algo: "ed25519".to_string(),
             signing_key: "11".repeat(32),
             key_config: "aa55".to_string(),
-            text: "bb66".to_string(),
             signature: "cc77".to_string(),
         };
         cache
@@ -1161,6 +1157,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed["ohttp_key_config"], "aa55");
         assert_eq!(parsed["ohttp_attestation"]["key_config"], "aa55");
+        assert!(parsed["ohttp_attestation"].get("text").is_none());
     }
 
     #[tokio::test]

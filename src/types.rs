@@ -43,7 +43,7 @@ pub struct AttestationResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ohttp_key_config: Option<String>,
     /// OHTTP key attestation payload, if OHTTP is enabled.
-    /// Includes key config bytes and an Ed25519 signature over `text`.
+    /// Includes key config bytes and an Ed25519 signature over decoded `key_config` bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ohttp_attestation: Option<OhttpAttestation>,
 }
@@ -75,10 +75,8 @@ pub struct OhttpAttestation {
     pub signing_key: String,
     /// Hex-encoded OHTTP key configuration bytes (RFC 9458).
     pub key_config: String,
-    /// Hex-encoded SHA-256 digest of decoded `key_config` bytes.
+    /// Signature over the decoded `key_config` bytes.
     /// Clients verify this signature against the attested Ed25519 public key.
-    pub text: String,
-    /// Signature over the UTF-8 bytes of `text` (the ASCII hex digest string).
     pub signature: String,
 }
 

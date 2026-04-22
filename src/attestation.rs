@@ -334,13 +334,13 @@ impl AttestationCache {
         include_tls_fingerprint: bool,
         report: AttestationReport,
         compose_manager_attestation: Option<serde_json::Value>,
-        ohttp_key_config: Option<String>,
+        ohttp_attestation: Option<crate::types::OhttpAttestation>,
     ) {
         let response = crate::types::AttestationResponse {
             report: report.clone(),
             all_attestations: vec![report.clone()],
             compose_manager_attestation,
-            ohttp_key_config,
+            ohttp_attestation,
         };
         let response_bytes = match serde_json::to_vec(&response) {
             Ok(bytes) => bytes::Bytes::from(bytes),

@@ -276,7 +276,7 @@ fn bench_attestation_report_serialization(c: &mut Criterion) {
         report: report.clone(),
         all_attestations: vec![report],
         compose_manager_attestation: None,
-        ohttp_key_config: None,
+        ohttp_attestation: None,
     };
 
     c.bench_function("attestation_response_serialize", |b| {

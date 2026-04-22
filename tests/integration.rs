@@ -5073,7 +5073,7 @@ async fn test_ohttp_relay_garbage_body_returns_400() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
-// Test 13: Attestation response includes ohttp_key_config when OHTTP enabled
+// Test 13: Attestation response includes ohttp_attestation when OHTTP enabled
 #[tokio::test]
 async fn test_ohttp_attestation_includes_key_config() {
     let mock = MockServer::start().await;
@@ -5097,17 +5097,25 @@ async fn test_ohttp_attestation_includes_key_config() {
             .unwrap()
             .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ohttp_attestation = &json["ohttp_attestation"];
         assert!(
-            json.get("ohttp_key_config").is_some(),
-            "ohttp_key_config should be present when OHTTP is enabled"
+            !ohttp_attestation.is_null(),
+            "ohttp_attestation should be present when OHTTP is enabled"
         );
-        let hex_config = json["ohttp_key_config"].as_str().unwrap();
+        let hex_config = ohttp_attestation["key_config"].as_str().unwrap();
         let config_bytes = hex::decode(hex_config).unwrap();
         assert!(ohttp::KeyConfig::decode(&config_bytes).is_ok());
+        assert_eq!(
+            ohttp_attestation["signing_algo"].as_str().unwrap(),
+            "ed25519"
+        );
+        assert!(ohttp_attestation["signing_key"].as_str().is_some());
+        assert!(ohttp_attestation["text"].as_str().is_some());
+        assert!(ohttp_attestation["signature"].as_str().is_some());
     }
 }
 
-// Test 14: Attestation response omits ohttp_key_config when OHTTP disabled
+// Test 14: Attestation response omits ohttp_attestation when OHTTP disabled
 #[tokio::test]
 async fn test_ohttp_attestation_omits_key_config_when_disabled() {
     let mock = MockServer::start().await;
@@ -5130,8 +5138,8 @@ async fn test_ohttp_attestation_omits_key_config_when_disabled() {
             .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(
-            json.get("ohttp_key_config").is_none(),
-            "ohttp_key_config should NOT be present when OHTTP is disabled"
+            json.get("ohttp_attestation").is_none(),
+            "ohttp_attestation should NOT be present when OHTTP is disabled"
         );
     }
 }

@@ -38,11 +38,25 @@ pub struct AttestationResponse {
     /// Contains the compose-manager's TDX-attested action log (deployment events).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compose_manager_attestation: Option<serde_json::Value>,
-    /// Hex-encoded OHTTP key configuration (RFC 9458), if OHTTP is enabled.
-    /// Deterministically derived from the Ed25519 signing key, so clients can
-    /// verify this key is bound to the attested TEE identity.
+    /// OHTTP key attestation payload, if OHTTP is enabled.
+    /// Includes key config bytes and an Ed25519 signature over `text`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ohttp_key_config: Option<String>,
+    pub ohttp_attestation: Option<OhttpAttestation>,
+}
+
+/// Attestation payload for OHTTP key configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OhttpAttestation {
+    /// Signing algorithm used for `signature`.
+    pub signing_algo: String,
+    /// Hex-encoded public key corresponding to the signing key.
+    pub signing_key: String,
+    /// Hex-encoded OHTTP key configuration bytes (RFC 9458).
+    pub key_config: String,
+    /// Hex-encoded SHA-256 digest of decoded `key_config` bytes.
+    pub text: String,
+    /// Signature over `text`.
+    pub signature: String,
 }
 
 /// Response for GET /v1/signature/{chat_id}.

@@ -103,10 +103,7 @@ pub async fn attestation_report(
 
             // Cache nonce-less reports so subsequent requests get the full response
             // including compose-manager attestation.
-            let ohttp_key_config = state
-                .ohttp_gateway
-                .as_ref()
-                .map(|gw| hex::encode(gw.config_bytes()));
+            let ohttp_attestation = state.ohttp_attestation_ed25519.clone();
 
             // Cache nonce-less reports so subsequent requests get the full response
             // including compose-manager attestation.
@@ -118,17 +115,17 @@ pub async fn attestation_report(
                         include_tls,
                         report.as_ref().clone(),
                         cm_attestation.clone(),
-                        ohttp_key_config.clone(),
+                        ohttp_attestation.clone(),
                     )
                     .await;
             }
 
-            let response = AttestationResponse {
-                report: report.as_ref().clone(),
-                all_attestations: vec![*report],
-                compose_manager_attestation: cm_attestation,
-                ohttp_key_config,
-            };
+            let response = AttestationResponse::new(
+                report.as_ref().clone(),
+                vec![*report],
+                cm_attestation,
+                ohttp_attestation,
+            );
             Ok(Json(response).into_response())
         }
     }

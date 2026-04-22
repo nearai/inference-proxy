@@ -111,6 +111,7 @@ fn build_test_app_with_rate_limit(
         tls_cert_fingerprint: None,
         backend_pool,
         ohttp_gateway: None,
+        ohttp_attestation_ed25519: None,
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(rate_per_second, rate_burst);
@@ -2875,6 +2876,7 @@ fn build_test_app_with_cloud_api(mock_url: &str, cloud_api_url: &str) -> axum::R
         tls_cert_fingerprint: None,
         backend_pool,
         ohttp_gateway: None,
+        ohttp_attestation_ed25519: None,
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(100, 200);
@@ -4890,10 +4892,11 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
 
     let ecdsa = signing::EcdsaContext::from_key_bytes(&ecdsa_key).unwrap();
     let ed25519 = signing::Ed25519Context::from_key_bytes(&ed25519_key).unwrap();
-
-    let ohttp_gw = ohttp_gateway::OhttpGateway::new(ed25519.secret_bytes()).unwrap();
-
     let signing_pair = signing::SigningPair { ecdsa, ed25519 };
+
+    let ohttp_gw = ohttp_gateway::OhttpGateway::new(signing_pair.ed25519.secret_bytes()).unwrap();
+    let ohttp_attestation_ed25519 =
+        attestation::build_ohttp_attestation(&signing_pair, &ohttp_gw).unwrap();
     let chat_cache = cache::ChatCache::new("test-model", 1200);
     let http_client = reqwest::Client::new();
 
@@ -4913,6 +4916,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         tls_cert_fingerprint: None,
         backend_pool,
         ohttp_gateway: Some(Arc::new(ohttp_gw)),
+        ohttp_attestation_ed25519: Some(ohttp_attestation_ed25519),
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(100, 200);
@@ -5073,7 +5077,37 @@ async fn test_ohttp_relay_garbage_body_returns_400() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
-// Test 13: Attestation response includes ohttp_key_config when OHTTP enabled
+fn assert_ohttp_attestation_fields(json: &serde_json::Value) {
+    let ohttp_attestation = &json["ohttp_attestation"];
+    assert!(
+        !ohttp_attestation.is_null(),
+        "ohttp_attestation should be present when OHTTP is enabled"
+    );
+    let hex_config = ohttp_attestation["key_config"].as_str().unwrap();
+    assert_eq!(json["ohttp_key_config"].as_str().unwrap(), hex_config);
+    let config_bytes = hex::decode(hex_config).unwrap();
+    assert!(ohttp::KeyConfig::decode(&config_bytes).is_ok());
+    assert_eq!(
+        ohttp_attestation["signing_algo"].as_str().unwrap(),
+        "ed25519"
+    );
+    let signing_key_hex = ohttp_attestation["signing_key"].as_str().unwrap();
+    let signature_hex = ohttp_attestation["signature"].as_str().unwrap();
+    assert!(
+        ohttp_attestation.get("text").is_none(),
+        "ohttp_attestation.text should be absent"
+    );
+
+    // Verify signature over decoded `key_config` bytes.
+    use ed25519_dalek::Verifier;
+    let signing_key_bytes: [u8; 32] = hex::decode(signing_key_hex).unwrap().try_into().unwrap();
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&signing_key_bytes).unwrap();
+    let signature_bytes: [u8; 64] = hex::decode(signature_hex).unwrap().try_into().unwrap();
+    let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
+    assert!(verifying_key.verify(&config_bytes, &signature).is_ok());
+}
+
+// Test 13: Attestation response includes OHTTP fields when OHTTP enabled
 #[tokio::test]
 async fn test_ohttp_attestation_includes_key_config() {
     let mock = MockServer::start().await;
@@ -5097,17 +5131,11 @@ async fn test_ohttp_attestation_includes_key_config() {
             .unwrap()
             .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(
-            json.get("ohttp_key_config").is_some(),
-            "ohttp_key_config should be present when OHTTP is enabled"
-        );
-        let hex_config = json["ohttp_key_config"].as_str().unwrap();
-        let config_bytes = hex::decode(hex_config).unwrap();
-        assert!(ohttp::KeyConfig::decode(&config_bytes).is_ok());
+        assert_ohttp_attestation_fields(&json);
     }
 }
 
-// Test 14: Attestation response omits ohttp_key_config when OHTTP disabled
+// Test 14: Attestation response omits ohttp_attestation when OHTTP disabled
 #[tokio::test]
 async fn test_ohttp_attestation_omits_key_config_when_disabled() {
     let mock = MockServer::start().await;
@@ -5133,6 +5161,37 @@ async fn test_ohttp_attestation_omits_key_config_when_disabled() {
             json.get("ohttp_key_config").is_none(),
             "ohttp_key_config should NOT be present when OHTTP is disabled"
         );
+        assert!(
+            json.get("ohttp_attestation").is_none(),
+            "ohttp_attestation should NOT be present when OHTTP is disabled"
+        );
+    }
+}
+
+// Test 15: Default attestation route keeps returning OHTTP material for compatibility
+#[tokio::test]
+async fn test_ohttp_attestation_present_for_default_route() {
+    let mock = MockServer::start().await;
+    let app = build_test_app_with_ohttp(&mock.uri());
+
+    let response = app
+        .oneshot(
+            Request::get("/v1/attestation/report")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    if status == StatusCode::OK {
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["signing_algo"], "ecdsa");
+        assert_ohttp_attestation_fields(&json);
     }
 }
 
@@ -5211,6 +5270,8 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
     let ohttp_gw = ohttp_gateway::OhttpGateway::new(ed25519.secret_bytes()).unwrap();
     let config_bytes = ohttp_gw.config_bytes().to_vec();
     let signing_pair = signing::SigningPair { ecdsa, ed25519 };
+    let ohttp_attestation_ed25519 =
+        attestation::build_ohttp_attestation(&signing_pair, &ohttp_gw).unwrap();
 
     let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
         .build_recorder()
@@ -5227,6 +5288,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         tls_cert_fingerprint: None,
         backend_pool,
         ohttp_gateway: Some(Arc::new(ohttp_gw)),
+        ohttp_attestation_ed25519: Some(ohttp_attestation_ed25519),
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(100, 200);

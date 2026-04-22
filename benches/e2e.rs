@@ -104,6 +104,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         tls_cert_fingerprint: None,
         backend_pool,
         ohttp_gateway: None,
+        ohttp_attestation_ed25519: None,
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(10000, 20000);
@@ -277,6 +278,7 @@ fn bench_attestation_report_serialization(c: &mut Criterion) {
         all_attestations: vec![report],
         compose_manager_attestation: None,
         ohttp_key_config: None,
+        ohttp_attestation: None,
     };
 
     c.bench_function("attestation_response_serialize", |b| {

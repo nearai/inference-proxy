@@ -84,6 +84,10 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    let ohttp_attestation_ed25519 = ohttp_gw
+        .as_ref()
+        .map(|gw| attestation::build_ohttp_attestation(&signing, gw))
+        .transpose()?;
 
     // Initialize caches
     let chat_cache = cache::ChatCache::new(&config.model_name, config.chat_cache_expiration_secs);
@@ -115,6 +119,7 @@ async fn main() -> anyhow::Result<()> {
         tls_cert_fingerprint: tls_cert_fingerprint.clone(),
         backend_pool: backend_pool.clone(),
         ohttp_gateway: ohttp_gw,
+        ohttp_attestation_ed25519: ohttp_attestation_ed25519.clone(),
     };
 
     // Spawn background attestation cache refresh task.
@@ -136,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
         tls_cert_fingerprint,
         state.config.attestation_cache_ttl_secs / 2,
         compose_manager,
+        ohttp_attestation_ed25519,
     );
 
     // Run OpenAI chat compatibility checks if enabled

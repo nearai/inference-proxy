@@ -35,6 +35,7 @@ pub struct AppState {
     pub tls_cert_fingerprint: Option<String>,
     pub backend_pool: Arc<backend_pool::BackendPool>,
     pub ohttp_gateway: Option<Arc<ohttp_gateway::OhttpGateway>>,
+    pub ohttp_attestation_ed25519: Option<types::OhttpAttestation>,
 }
 
 /// Request ID middleware: generates or passes through X-Request-ID header.

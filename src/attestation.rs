@@ -437,6 +437,7 @@ pub fn build_ohttp_attestation(
 }
 
 /// Spawn a background task that periodically refreshes cached attestation reports.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_cache_refresh_task(
     cache: Arc<AttestationCache>,
     model_name: String,

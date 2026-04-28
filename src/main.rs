@@ -95,11 +95,22 @@ async fn main() -> anyhow::Result<()> {
         config.attestation_cache_ttl_secs,
     ));
 
-    // Initialize HTTP client with connection pooling
-    let http_client = reqwest::Client::builder()
+    // Initialize HTTP client with connection pooling.
+    //
+    // pool_idle_timeout must be shorter than upstream keepalive_timeout
+    // (typically 75s on nginx) to avoid reusing connections the server has
+    // closed. A reused-but-closed connection surfaces as
+    // `error sending request for url ...` and produced ~12 spurious 401s/h
+    // on `/v1/check_api_key` before we capped this. (See auth.rs retry path.)
+    let mut http_builder = reqwest::Client::builder()
         .pool_max_idle_per_host(config.max_keepalive)
-        .timeout(std::time::Duration::from_secs(config.timeout_secs))
-        .build()?;
+        .timeout(std::time::Duration::from_secs(config.timeout_secs));
+    if config.pool_idle_timeout_secs > 0 {
+        http_builder = http_builder.pool_idle_timeout(std::time::Duration::from_secs(
+            config.pool_idle_timeout_secs,
+        ));
+    }
+    let http_client = http_builder.build()?;
 
     // Initialize metrics
     let metrics_handle = metrics_middleware::setup_metrics_recorder();

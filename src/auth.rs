@@ -82,7 +82,18 @@ async fn check_cloud_api_key(
             .await;
 
         let status = match result {
-            Ok(response) => response.status().as_u16(),
+            Ok(response) => {
+                let s = response.status().as_u16();
+                // Drain the body before dropping the response so reqwest can
+                // return the connection to the pool; otherwise hyper closes
+                // it. Each forced reconnect adds a fresh SYN to the QEMU
+                // hostfwd backlog (the documented backlog-1 saturation), so
+                // dropping pool reuse here would actively worsen the problem
+                // this PR is meant to mitigate. Errors during the drain
+                // don't change the auth outcome — we already have the status.
+                let _ = response.bytes().await;
+                s
+            }
             Err(e) => {
                 let kind = classify_reqwest_error(&e);
                 let chain = error_chain(&e);

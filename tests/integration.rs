@@ -40,6 +40,7 @@ fn build_test_app_with_rate_limit(
         rerank_url: format!("{base}/v1/rerank"),
         score_url: format!("{base}/v1/score"),
         max_keepalive: 5,
+        pool_idle_timeout_secs: 60,
         max_request_size: 1024 * 1024,
         max_image_request_size: 5 * 1024 * 1024,
         max_audio_request_size: 10 * 1024 * 1024,
@@ -52,6 +53,9 @@ fn build_test_app_with_rate_limit(
         rate_limit_burst_size: rate_burst,
         rate_limit_trust_proxy_headers: true,
         cloud_api_url: None,
+        cloud_api_auth_max_attempts: 1,
+        cloud_api_auth_initial_backoff_ms: 0,
+        cloud_api_auth_timeout_secs: 5,
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,
@@ -2790,6 +2794,16 @@ async fn body_to_bytes(response: axum::http::Response<Body>) -> Vec<u8> {
 
 /// Build a test app with cloud_api_url configured.
 fn build_test_app_with_cloud_api(mock_url: &str, cloud_api_url: &str) -> axum::Router {
+    build_test_app_with_cloud_api_retries(mock_url, cloud_api_url, 1, 0)
+}
+
+/// Build a test app with cloud_api_url and configurable auth retry settings.
+fn build_test_app_with_cloud_api_retries(
+    mock_url: &str,
+    cloud_api_url: &str,
+    max_attempts: usize,
+    initial_backoff_ms: u64,
+) -> axum::Router {
     let base = mock_url.trim_end_matches('/');
 
     let config = config::Config {
@@ -2808,12 +2822,16 @@ fn build_test_app_with_cloud_api(mock_url: &str, cloud_api_url: &str) -> axum::R
         rerank_url: format!("{base}/v1/rerank"),
         score_url: format!("{base}/v1/score"),
         max_keepalive: 5,
+        pool_idle_timeout_secs: 60,
         max_request_size: 1024 * 1024,
         max_image_request_size: 5 * 1024 * 1024,
         max_audio_request_size: 10 * 1024 * 1024,
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
         cloud_api_url: Some(cloud_api_url.to_string()),
+        cloud_api_auth_max_attempts: max_attempts,
+        cloud_api_auth_initial_backoff_ms: initial_backoff_ms,
+        cloud_api_auth_timeout_secs: 5,
         compose_manager_url: None,
         dev_mode: true,
         gpu_no_hw_mode: true,
@@ -3031,6 +3049,130 @@ async fn test_cloud_api_key_rate_limited() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn test_cloud_api_key_retries_after_5xx() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+
+    // First call to /v1/check_api_key returns 503; the next returns 200.
+    // wiremock matches in priority order: lower number wins, expectation
+    // limits how many times each scoped mock fires.
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&cloud_api)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})))
+        .with_priority(2)
+        .mount(&cloud_api)
+        .await;
+
+    let backend_response = serde_json::json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "model": "test-model",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&backend_response))
+        .mount(&backend)
+        .await;
+
+    let app = build_test_app_with_cloud_api_retries(&backend.uri(), &cloud_api.uri(), 3, 1);
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-retry-test-key-00000000000")
+                .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_cloud_api_key_no_retry_on_4xx() {
+    let cloud_api = MockServer::start().await;
+
+    // Always return 401. With max_attempts=3, the proxy must NOT retry — a
+    // genuine 4xx is the upstream's verdict on the token, not a transient blip.
+    let mock = Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": {"message": "Invalid API key", "type": "invalid_api_key", "param": null, "code": null}
+        })))
+        .expect(1)
+        .mount_as_scoped(&cloud_api)
+        .await;
+
+    let app = build_test_app_with_cloud_api_retries("http://unused", &cloud_api.uri(), 3, 1);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-bad-key-00000000000000000")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    drop(mock); // verifies expect(1)
+}
+
+#[tokio::test]
+async fn test_cloud_api_key_exhausts_retries_on_persistent_5xx() {
+    let cloud_api = MockServer::start().await;
+
+    // 5xx every time. With max_attempts=3, expect exactly 3 calls and a 401
+    // back to the client (we don't expose 5xx details to callers).
+    let mock = Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(3)
+        .mount_as_scoped(&cloud_api)
+        .await;
+
+    let app = build_test_app_with_cloud_api_retries("http://unused", &cloud_api.uri(), 3, 1);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-retry-test-key-00000000000")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    drop(mock); // verifies expect(3)
 }
 
 #[tokio::test]
@@ -4851,6 +4993,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         rerank_url: format!("{base}/v1/rerank"),
         score_url: format!("{base}/v1/score"),
         max_keepalive: 5,
+        pool_idle_timeout_secs: 60,
         max_request_size: 1024 * 1024,
         max_image_request_size: 5 * 1024 * 1024,
         max_audio_request_size: 10 * 1024 * 1024,
@@ -4863,6 +5006,9 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         rate_limit_burst_size: 200,
         rate_limit_trust_proxy_headers: true,
         cloud_api_url: None,
+        cloud_api_auth_max_attempts: 1,
+        cloud_api_auth_initial_backoff_ms: 0,
+        cloud_api_auth_timeout_secs: 5,
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,
@@ -5232,6 +5378,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         rerank_url: format!("{base}/v1/rerank"),
         score_url: format!("{base}/v1/score"),
         max_keepalive: 5,
+        pool_idle_timeout_secs: 60,
         max_request_size: 1024 * 1024,
         max_image_request_size: 5 * 1024 * 1024,
         max_audio_request_size: 10 * 1024 * 1024,
@@ -5244,6 +5391,9 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         rate_limit_burst_size: 200,
         rate_limit_trust_proxy_headers: true,
         cloud_api_url: None,
+        cloud_api_auth_max_attempts: 1,
+        cloud_api_auth_initial_backoff_ms: 0,
+        cloud_api_auth_timeout_secs: 5,
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,

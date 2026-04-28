@@ -39,6 +39,12 @@ pub struct Config {
 
     // Connection pool
     pub max_keepalive: usize,
+    /// How long to keep an idle HTTP connection in the pool before closing it.
+    /// Must be shorter than the upstream's keepalive_timeout to avoid
+    /// reusing connections the server has already closed (which surfaces as
+    /// `error sending request for url ...` transport errors). 0 disables
+    /// pooling entirely.
+    pub pool_idle_timeout_secs: u64,
 
     // Request size limits
     pub max_request_size: usize,
@@ -74,6 +80,13 @@ pub struct Config {
 
     // Cloud API for sk- key validation
     pub cloud_api_url: Option<String>,
+    /// Maximum attempts (initial + retries) for `POST /v1/check_api_key`.
+    /// 1 disables retry. Retries are issued only on transport errors and 5xx.
+    pub cloud_api_auth_max_attempts: usize,
+    /// Initial backoff between auth retries; doubles each attempt with full jitter.
+    pub cloud_api_auth_initial_backoff_ms: u64,
+    /// Per-attempt timeout for `POST /v1/check_api_key`.
+    pub cloud_api_auth_timeout_secs: u64,
 
     // Compose-manager attestation (deployment actions attestation)
     pub compose_manager_url: Option<String>,
@@ -218,9 +231,14 @@ impl Config {
             rerank_url,
             score_url,
             cloud_api_url,
+            cloud_api_auth_max_attempts: env_int("CLOUD_API_AUTH_MAX_ATTEMPTS", 3),
+            cloud_api_auth_initial_backoff_ms: env_int("CLOUD_API_AUTH_INITIAL_BACKOFF_MS", 100)
+                as u64,
+            cloud_api_auth_timeout_secs: env_int("CLOUD_API_AUTH_TIMEOUT_SECS", 5) as u64,
             compose_manager_url,
             tls_cert_path,
             max_keepalive: env_int("VLLM_PROXY_MAX_KEEPALIVE", 100),
+            pool_idle_timeout_secs: env_int("VLLM_PROXY_POOL_IDLE_TIMEOUT_SECS", 60) as u64,
             max_request_size: env_int("VLLM_PROXY_MAX_REQUEST_SIZE", 10 * 1024 * 1024),
             max_image_request_size: env_int("VLLM_PROXY_MAX_IMAGE_REQUEST_SIZE", 50 * 1024 * 1024),
             max_audio_request_size: env_int("VLLM_PROXY_MAX_AUDIO_REQUEST_SIZE", 100 * 1024 * 1024),

@@ -34,7 +34,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
 
     let config = config::Config {
         model_name: "bench-model".to_string(),
-        token: "bench-token".to_string(),
+        tokens: vec!["bench-token".to_string()],
         vllm_base_url: mock_url.to_string(),
         chat_completions_url: format!("{base}/v1/chat/completions"),
         completions_url: format!("{base}/v1/completions"),

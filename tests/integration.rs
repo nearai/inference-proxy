@@ -26,7 +26,7 @@ fn build_test_app_with_rate_limit(
 
     let config = config::Config {
         model_name: "test-model".to_string(),
-        token: "test-token".to_string(),
+        tokens: vec!["test-token".to_string()],
         vllm_base_url: mock_url.to_string(),
         chat_completions_url: format!("{base}/v1/chat/completions"),
         completions_url: format!("{base}/v1/completions"),
@@ -2808,7 +2808,7 @@ fn build_test_app_with_cloud_api_retries(
 
     let config = config::Config {
         model_name: "test-model".to_string(),
-        token: "test-token".to_string(),
+        tokens: vec!["test-token".to_string()],
         vllm_base_url: mock_url.to_string(),
         chat_completions_url: format!("{base}/v1/chat/completions"),
         completions_url: format!("{base}/v1/completions"),
@@ -4979,7 +4979,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
 
     let config = config::Config {
         model_name: "test-model".to_string(),
-        token: "test-token".to_string(),
+        tokens: vec!["test-token".to_string()],
         vllm_base_url: mock_url.to_string(),
         chat_completions_url: format!("{base}/v1/chat/completions"),
         completions_url: format!("{base}/v1/completions"),
@@ -5364,7 +5364,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
 
     let config = config::Config {
         model_name: "test-model".to_string(),
-        token: "test-token".to_string(),
+        tokens: vec!["test-token".to_string()],
         vllm_base_url: mock_url.to_string(),
         chat_completions_url: format!("{base}/v1/chat/completions"),
         completions_url: format!("{base}/v1/completions"),

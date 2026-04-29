@@ -21,7 +21,9 @@ fn env_bool(name: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub model_name: String,
-    pub token: String,
+    /// Accepted admin tokens. Parsed from `TOKEN` (comma-separated) so multiple
+    /// tokens can be active at once during a rotation.
+    pub tokens: Vec<String>,
 
     // Backend URLs
     pub vllm_base_url: String,
@@ -132,10 +134,15 @@ impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         let model_name = env::var("MODEL_NAME")
             .map_err(|_| anyhow::anyhow!("MODEL_NAME environment variable is required"))?;
-        let token = env::var("TOKEN")
+        let raw_tokens = env::var("TOKEN")
             .map_err(|_| anyhow::anyhow!("TOKEN environment variable is required"))?;
-        if token.is_empty() {
-            anyhow::bail!("TOKEN must not be empty");
+        let tokens: Vec<String> = raw_tokens
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if tokens.is_empty() {
+            anyhow::bail!("TOKEN must contain at least one non-empty token");
         }
 
         let vllm_base_url = env_or("VLLM_BASE_URL", "http://localhost:8000");
@@ -217,7 +224,7 @@ impl Config {
 
         let config = Config {
             model_name,
-            token,
+            tokens,
             vllm_base_url: vllm_base_url.clone(),
             chat_completions_url: format!("{base}/v1/chat/completions"),
             completions_url: format!("{base}/v1/completions"),
@@ -348,7 +355,38 @@ mod tests {
             assert!(result
                 .unwrap_err()
                 .to_string()
-                .contains("must not be empty"));
+                .contains("at least one non-empty token"));
+        });
+    }
+
+    #[test]
+    fn test_config_rejects_token_list_of_only_empties() {
+        with_env_vars(&[("MODEL_NAME", "test"), ("TOKEN", " , , ")], || {
+            let result = Config::from_env();
+            assert!(result.is_err());
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("at least one non-empty token"));
+        });
+    }
+
+    #[test]
+    fn test_config_parses_multiple_tokens() {
+        with_env_vars(
+            &[("MODEL_NAME", "test"), ("TOKEN", "tok-a, tok-b ,tok-c")],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.tokens, vec!["tok-a", "tok-b", "tok-c"]);
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_single_token_backward_compatible() {
+        with_env_vars(&[("MODEL_NAME", "test"), ("TOKEN", "only-one")], || {
+            let config = Config::from_env().unwrap();
+            assert_eq!(config.tokens, vec!["only-one"]);
         });
     }
 
@@ -370,7 +408,7 @@ mod tests {
             let config = Config::from_env().unwrap();
 
             assert_eq!(config.model_name, "my-model");
-            assert_eq!(config.token, "secret");
+            assert_eq!(config.tokens, vec!["secret"]);
             assert_eq!(config.vllm_base_url, "http://localhost:8000");
             assert_eq!(
                 config.chat_completions_url,

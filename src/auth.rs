@@ -216,7 +216,9 @@ impl FromRequestParts<AppState> for RequireAuth {
         match auth_header {
             Some(header) if header.starts_with("Bearer ") => {
                 let token = &header[7..];
-                if token_eq(token, &state.config.token) {
+                // Constant-time comparison against each configured admin token
+                // so multiple tokens can be active simultaneously (rotation).
+                if state.config.tokens.iter().any(|t| token_eq(token, t)) {
                     return Ok(RequireAuth {
                         cloud_api_key: None,
                     });

@@ -8,7 +8,7 @@ use sha2::Digest;
 use crate::auth::RequireAuth;
 use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
-use crate::proxy::{self, make_usage_reporter, ProxyOpts, UsageReporter, UsageType};
+use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageReporter, UsageType};
 use crate::routes::chat::read_body_with_limit;
 use crate::AppState;
 
@@ -201,6 +201,7 @@ pub async fn images_edits(
         response_transform,
         chunk_transform: None,
         backend_guard: None,
+        response_shape: ResponseShape::ChatCompletion,
     };
 
     let (url, _guard) = match &state.config.images_edits_url_override {
@@ -281,6 +282,7 @@ pub async fn audio_transcriptions(
         response_transform,
         chunk_transform: None,
         backend_guard: None,
+        response_shape: ResponseShape::ChatCompletion,
     };
 
     let (url, _guard) = match &state.config.transcriptions_url_override {
@@ -344,6 +346,7 @@ async fn json_passthrough_encrypted(
                 response_transform,
                 chunk_transform: None,
                 backend_guard: None,
+                response_shape: ResponseShape::ChatCompletion,
             };
             proxy::proxy_json_request(&state.http_client, u, forward_body, opts).await
         }
@@ -360,6 +363,7 @@ async fn json_passthrough_encrypted(
                 response_transform,
                 chunk_transform: None,
                 backend_guard: Some(guard),
+                response_shape: ResponseShape::ChatCompletion,
             };
             proxy::proxy_json_request(&state.http_client, &url, forward_body, opts).await
         }

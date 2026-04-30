@@ -602,6 +602,60 @@ async fn test_completions_endpoint() {
     assert_eq!(body["choices"][0]["text"], "world");
 }
 
+// Mirrors the production path: vLLM/SGLang honor the injected `stream: true`
+// and emit an SSE stream of text-completion chunks with `choices[].text`.
+// `proxy_json_request` reassembles the stream into a single non-streaming
+// response — it must emit `text_completion` shape, not chat-completion shape.
+#[tokio::test]
+async fn test_completions_endpoint_sse_reassembly() {
+    let mock_server = MockServer::start().await;
+
+    let sse_body = concat!(
+        "data: {\"id\":\"cmpl-sse-1\",\"object\":\"text_completion\",\"model\":\"test-model\",\"created\":100,\"choices\":[{\"index\":0,\"text\":\"The \",\"finish_reason\":null,\"logprobs\":null}]}\n\n",
+        "data: {\"id\":\"cmpl-sse-1\",\"choices\":[{\"index\":0,\"text\":\"capital \",\"finish_reason\":null,\"logprobs\":null}]}\n\n",
+        "data: {\"id\":\"cmpl-sse-1\",\"choices\":[{\"index\":0,\"text\":\"of France\",\"finish_reason\":\"length\",\"logprobs\":null}]}\n\n",
+        "data: {\"id\":\"cmpl-sse-1\",\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/v1/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(sse_body.as_bytes(), "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(
+                    r#"{"prompt":"The capital of France is","max_tokens":16}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response).await;
+    assert_eq!(body["id"], "cmpl-sse-1");
+    assert_eq!(body["object"], "text_completion");
+    assert_eq!(body["choices"][0]["text"], "The capital of France");
+    assert_eq!(body["choices"][0]["finish_reason"], "length");
+    assert!(
+        body["choices"][0].get("message").is_none(),
+        "text_completion response must not carry chat-shaped `message` field"
+    );
+    assert_eq!(body["usage"]["completion_tokens"], 3);
+}
+
 // ---- Embeddings ----
 
 #[tokio::test]

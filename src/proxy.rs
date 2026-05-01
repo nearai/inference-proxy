@@ -179,6 +179,22 @@ pub enum UsageType {
     ImageGeneration,
 }
 
+/// Shape of the reassembled non-streaming response when `proxy_json_request`
+/// converts an upstream SSE stream back into a single JSON body.
+///
+/// `/v1/chat/completions` and `/v1/completions` both stream when forwarded
+/// internally, but the SSE chunk shape and the final response shape differ:
+/// chat completions carry `choices[].delta.{role,content,...}` and reassemble
+/// to `{object: "chat.completion", choices: [{message: {...}}]}`, whereas
+/// text completions carry `choices[].text` and reassemble to
+/// `{object: "text_completion", choices: [{text: "..."}]}`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ResponseShape {
+    #[default]
+    ChatCompletion,
+    TextCompletion,
+}
+
 /// Build a `UsageReporter` if the request was authenticated with a cloud API key.
 pub fn make_usage_reporter(
     cloud_api_key: Option<&String>,
@@ -294,6 +310,10 @@ pub struct ProxyOpts {
     /// this is moved into the spawned task so active_conns stays incremented
     /// for the full duration of the stream (not just until the handler returns).
     pub backend_guard: Option<crate::backend_pool::BackendGuard>,
+    /// Shape of the reassembled response when forwarding an SSE stream as
+    /// a non-streaming JSON body. Defaults to `ChatCompletion`; the
+    /// `/v1/completions` route sets this to `TextCompletion`.
+    pub response_shape: ResponseShape,
 }
 
 /// Proxy a non-streaming JSON request to the backend using internal streaming.
@@ -361,7 +381,7 @@ pub async fn proxy_json_request(
 
     let mut response_data = if is_sse {
         // Consume the SSE stream and reassemble into a non-streaming response.
-        let mut assembler = StreamingResponseAssembler::new();
+        let mut assembler = StreamingResponseAssembler::new(opts.response_shape);
         {
             use futures_util::StreamExt;
             let mut byte_stream = std::pin::pin!(response.bytes_stream());
@@ -434,11 +454,15 @@ fn inject_streaming(body: &[u8]) -> Result<Vec<u8>, AppError> {
     serde_json::to_vec(&json).map_err(|e| AppError::Internal(e.into()))
 }
 
-/// Reassembles streaming SSE chunks into a single non-streaming chat completion response.
+/// Reassembles streaming SSE chunks into a single non-streaming response.
 ///
-/// Processes `data:` lines from the SSE stream, concatenating `delta.content`,
-/// `delta.reasoning_content`, and merging `delta.tool_calls` by index. Produces
-/// a standard `chat.completion` JSON object.
+/// Processes `data:` lines from the SSE stream. The capture rules and final
+/// envelope shape depend on `shape`:
+/// - `ChatCompletion`: concatenates `delta.content` / `delta.reasoning_content`,
+///   merges `delta.tool_calls` by index, and emits a `chat.completion` object
+///   with `choices[].message`.
+/// - `TextCompletion`: concatenates `choices[].text` and emits a
+///   `text_completion` object with `choices[].text`.
 struct StreamingResponseAssembler {
     line_buffer: String,
     id: Option<String>,
@@ -448,6 +472,7 @@ struct StreamingResponseAssembler {
     choices: Vec<ChoiceAssembler>,
     usage: Option<serde_json::Value>,
     metadata: Option<serde_json::Value>,
+    shape: ResponseShape,
 }
 
 /// Accumulates delta fields for a single choice.
@@ -461,7 +486,7 @@ struct ChoiceAssembler {
 }
 
 impl StreamingResponseAssembler {
-    fn new() -> Self {
+    fn new(shape: ResponseShape) -> Self {
         Self {
             line_buffer: String::new(),
             id: None,
@@ -470,6 +495,7 @@ impl StreamingResponseAssembler {
             choices: Vec::new(),
             usage: None,
             metadata: None,
+            shape,
         }
     }
 
@@ -540,20 +566,32 @@ impl StreamingResponseAssembler {
                 }
                 let ca = &mut self.choices[index];
 
-                if let Some(delta) = choice.get("delta").filter(|v| v.is_object()) {
-                    if let Some(role) = delta.get("role").and_then(|v| v.as_str()) {
-                        if ca.role.is_none() {
-                            ca.role = Some(role.to_string());
+                match self.shape {
+                    ResponseShape::ChatCompletion => {
+                        if let Some(delta) = choice.get("delta").filter(|v| v.is_object()) {
+                            if let Some(role) = delta.get("role").and_then(|v| v.as_str()) {
+                                if ca.role.is_none() {
+                                    ca.role = Some(role.to_string());
+                                }
+                            }
+                            if let Some(c) = delta.get("content").and_then(|v| v.as_str()) {
+                                ca.content.push_str(c);
+                            }
+                            if let Some(r) = delta.get("reasoning_content").and_then(|v| v.as_str())
+                            {
+                                ca.reasoning_content.push_str(r);
+                            }
+                            if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                                ca.merge_tool_calls(tcs);
+                            }
                         }
                     }
-                    if let Some(c) = delta.get("content").and_then(|v| v.as_str()) {
-                        ca.content.push_str(c);
-                    }
-                    if let Some(r) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
-                        ca.reasoning_content.push_str(r);
-                    }
-                    if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-                        ca.merge_tool_calls(tcs);
+                    ResponseShape::TextCompletion => {
+                        // vLLM/SGLang text-completion SSE chunks emit incremental
+                        // tokens at `choices[].text` (no `delta` wrapper).
+                        if let Some(t) = choice.get("text").and_then(|v| v.as_str()) {
+                            ca.content.push_str(t);
+                        }
                     }
                 }
 
@@ -567,7 +605,8 @@ impl StreamingResponseAssembler {
         }
     }
 
-    /// Build the final non-streaming `chat.completion` JSON.
+    /// Build the final non-streaming response JSON. The `object` field and
+    /// per-choice shape depend on `self.shape`.
     fn into_response(self, id_prefix: &str) -> serde_json::Value {
         let id = self.id.unwrap_or_else(|| {
             format!(
@@ -577,16 +616,22 @@ impl StreamingResponseAssembler {
             )
         });
 
+        let shape = self.shape;
         let choices: Vec<serde_json::Value> = self
             .choices
             .into_iter()
             .enumerate()
-            .map(|(i, ca)| ca.into_choice_json(i))
+            .map(|(i, ca)| ca.into_choice_json(i, shape))
             .collect();
+
+        let object = match shape {
+            ResponseShape::ChatCompletion => "chat.completion",
+            ResponseShape::TextCompletion => "text_completion",
+        };
 
         let mut resp = serde_json::json!({
             "id": id,
-            "object": "chat.completion",
+            "object": object,
             "choices": choices,
         });
 
@@ -659,32 +704,42 @@ impl ChoiceAssembler {
         }
     }
 
-    fn into_choice_json(self, index: usize) -> serde_json::Value {
-        let mut message = serde_json::json!({
-            "role": self.role.unwrap_or_else(|| "assistant".to_string()),
-        });
+    fn into_choice_json(self, index: usize, shape: ResponseShape) -> serde_json::Value {
+        match shape {
+            ResponseShape::ChatCompletion => {
+                let mut message = serde_json::json!({
+                    "role": self.role.unwrap_or_else(|| "assistant".to_string()),
+                });
 
-        // Include content/reasoning_content: use null when empty (matches SGLang behavior).
-        if self.content.is_empty() {
-            message["content"] = serde_json::Value::Null;
-        } else {
-            message["content"] = self.content.into();
+                // Include content/reasoning_content: use null when empty (matches SGLang behavior).
+                if self.content.is_empty() {
+                    message["content"] = serde_json::Value::Null;
+                } else {
+                    message["content"] = self.content.into();
+                }
+
+                if !self.reasoning_content.is_empty() {
+                    message["reasoning_content"] = self.reasoning_content.into();
+                }
+
+                if !self.tool_calls.is_empty() {
+                    message["tool_calls"] = self.tool_calls.into();
+                }
+
+                serde_json::json!({
+                    "index": index,
+                    "message": message,
+                    "finish_reason": self.finish_reason,
+                    "logprobs": self.logprobs,
+                })
+            }
+            ResponseShape::TextCompletion => serde_json::json!({
+                "index": index,
+                "text": self.content,
+                "finish_reason": self.finish_reason,
+                "logprobs": self.logprobs,
+            }),
         }
-
-        if !self.reasoning_content.is_empty() {
-            message["reasoning_content"] = self.reasoning_content.into();
-        }
-
-        if !self.tool_calls.is_empty() {
-            message["tool_calls"] = self.tool_calls.into();
-        }
-
-        serde_json::json!({
-            "index": index,
-            "message": message,
-            "finish_reason": self.finish_reason,
-            "logprobs": self.logprobs,
-        })
     }
 }
 
@@ -1477,6 +1532,7 @@ mod tests {
             response_transform: None,
             chunk_transform: None,
             backend_guard: None,
+            response_shape: ResponseShape::default(),
         }
     }
 
@@ -2082,7 +2138,7 @@ mod tests {
 
     #[test]
     fn test_assembler_basic_content() {
-        let mut asm = StreamingResponseAssembler::new();
+        let mut asm = StreamingResponseAssembler::new(ResponseShape::ChatCompletion);
         asm.process_chunk(
             b"data: {\"id\":\"c1\",\"model\":\"m\",\"created\":100,\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",
         );
@@ -2110,7 +2166,7 @@ mod tests {
 
     #[test]
     fn test_assembler_reasoning_content() {
-        let mut asm = StreamingResponseAssembler::new();
+        let mut asm = StreamingResponseAssembler::new(ResponseShape::ChatCompletion);
         asm.process_chunk(
             b"data: {\"id\":\"r1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":null}}]}\n\n",
         );
@@ -2133,7 +2189,7 @@ mod tests {
 
     #[test]
     fn test_assembler_tool_calls() {
-        let mut asm = StreamingResponseAssembler::new();
+        let mut asm = StreamingResponseAssembler::new(ResponseShape::ChatCompletion);
         // First tool call chunk: id + name
         asm.process_chunk(
             b"data: {\"id\":\"t1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]}}]}\n\n",
@@ -2156,7 +2212,7 @@ mod tests {
 
     #[test]
     fn test_assembler_generates_id_when_missing() {
-        let mut asm = StreamingResponseAssembler::new();
+        let mut asm = StreamingResponseAssembler::new(ResponseShape::ChatCompletion);
         asm.process_chunk(
             b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
         );
@@ -2168,7 +2224,7 @@ mod tests {
 
     #[test]
     fn test_assembler_split_across_chunks() {
-        let mut asm = StreamingResponseAssembler::new();
+        let mut asm = StreamingResponseAssembler::new(ResponseShape::ChatCompletion);
         // Split a single SSE line across two TCP chunks
         asm.process_chunk(b"data: {\"id\":\"s1\",\"choices\":[{\"inde");
         asm.process_chunk(
@@ -2178,6 +2234,66 @@ mod tests {
         let resp = asm.into_response("chatcmpl");
         assert_eq!(resp["id"], "s1");
         assert_eq!(resp["choices"][0]["message"]["content"], "ok");
+    }
+
+    #[test]
+    fn test_assembler_text_completion_shape() {
+        // vLLM/SGLang `/v1/completions` SSE chunks carry incremental tokens at
+        // `choices[].text` (no `delta` wrapper). The assembler must concatenate
+        // them and emit `object: text_completion` with `choices[].text`.
+        let mut asm = StreamingResponseAssembler::new(ResponseShape::TextCompletion);
+        asm.process_chunk(
+            b"data: {\"id\":\"cmpl-1\",\"object\":\"text_completion\",\"model\":\"m\",\"created\":100,\"choices\":[{\"index\":0,\"text\":\"The \",\"finish_reason\":null,\"logprobs\":null}]}\n\n",
+        );
+        asm.process_chunk(
+            b"data: {\"id\":\"cmpl-1\",\"choices\":[{\"index\":0,\"text\":\"capital \",\"finish_reason\":null,\"logprobs\":null}]}\n\n",
+        );
+        asm.process_chunk(
+            b"data: {\"id\":\"cmpl-1\",\"choices\":[{\"index\":0,\"text\":\"of France\",\"finish_reason\":\"length\",\"logprobs\":null}]}\n\n",
+        );
+        asm.process_chunk(
+            b"data: {\"id\":\"cmpl-1\",\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n\ndata: [DONE]\n\n",
+        );
+
+        let resp = asm.into_response("cmpl");
+        assert_eq!(resp["id"], "cmpl-1");
+        assert_eq!(resp["object"], "text_completion");
+        assert_eq!(resp["model"], "m");
+        assert_eq!(resp["created"], 100);
+        assert_eq!(resp["choices"][0]["text"], "The capital of France");
+        assert_eq!(resp["choices"][0]["finish_reason"], "length");
+        assert_eq!(resp["choices"][0]["index"], 0);
+        // No chat-shape fields.
+        assert!(resp["choices"][0].get("message").is_none());
+        assert_eq!(resp["usage"]["completion_tokens"], 3);
+    }
+
+    #[test]
+    fn test_assembler_text_completion_empty_emits_empty_text() {
+        // Edge case: backend emits only a finish_reason chunk with no text
+        // (e.g. when max_tokens forces termination at the prompt boundary).
+        // Assembler must still emit a valid `text` field rather than null.
+        let mut asm = StreamingResponseAssembler::new(ResponseShape::TextCompletion);
+        asm.process_chunk(
+            b"data: {\"id\":\"cmpl-2\",\"choices\":[{\"index\":0,\"text\":\"\",\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n",
+        );
+
+        let resp = asm.into_response("cmpl");
+        assert_eq!(resp["object"], "text_completion");
+        assert_eq!(resp["choices"][0]["text"], "");
+        assert!(!resp["choices"][0]["text"].is_null());
+    }
+
+    #[test]
+    fn test_assembler_text_completion_generates_id_with_cmpl_prefix() {
+        let mut asm = StreamingResponseAssembler::new(ResponseShape::TextCompletion);
+        asm.process_chunk(
+            b"data: {\"choices\":[{\"index\":0,\"text\":\"hi\",\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        );
+
+        let resp = asm.into_response("cmpl");
+        let id = resp["id"].as_str().unwrap();
+        assert!(id.starts_with("cmpl-"), "should generate id: {id}");
     }
 
     #[test]

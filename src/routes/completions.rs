@@ -6,7 +6,7 @@ use axum::response::Response;
 use crate::auth::RequireAuth;
 use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
-use crate::proxy::{self, make_usage_reporter, ProxyOpts, UsageType};
+use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageType};
 use crate::routes::chat::{read_body_with_limit, resolve_request_hash_for_signing};
 use crate::AppState;
 
@@ -94,6 +94,7 @@ pub async fn completions(
         response_transform,
         chunk_transform,
         backend_guard: Some(guard),
+        response_shape: ResponseShape::TextCompletion,
     };
 
     if is_stream {

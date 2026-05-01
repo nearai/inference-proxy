@@ -7,7 +7,7 @@ use tracing::debug;
 
 use crate::auth::RequireAuth;
 use crate::error::AppError;
-use crate::proxy::{self, make_usage_reporter, ProxyOpts, UsageType};
+use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageType};
 use crate::routes::chat::read_body_with_limit;
 use crate::AppState;
 
@@ -207,6 +207,7 @@ pub async fn catch_all(
             response_transform: None,
             chunk_transform: None,
             backend_guard: Some(backend_guard),
+            response_shape: ResponseShape::ChatCompletion,
         };
         proxy::proxy_streaming_response(response, &request_sha256, opts, axum_status).await
     } else if content_type.contains("application/json") {
@@ -233,6 +234,7 @@ pub async fn catch_all(
             response_transform: None,
             chunk_transform: None,
             backend_guard: None,
+            response_shape: ResponseShape::ChatCompletion,
         };
         proxy::sign_and_cache_json_response(&response_bytes, &request_sha256, opts, axum_status)
             .await

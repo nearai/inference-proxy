@@ -8,7 +8,7 @@ use sha2::Digest;
 use crate::auth::RequireAuth;
 use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
-use crate::proxy::{self, make_usage_reporter, ProxyOpts, UsageType};
+use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageType};
 use crate::AppState;
 
 /// POST /v1/chat/completions
@@ -104,6 +104,7 @@ pub async fn chat_completions(
         response_transform,
         chunk_transform,
         backend_guard: Some(guard),
+        response_shape: ResponseShape::ChatCompletion,
     };
 
     if is_stream {

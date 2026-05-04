@@ -223,10 +223,13 @@ async fn test_healthz_returns_503_when_dstack_socket_missing() {
     let body = body_to_json(response).await;
     assert_eq!(body["status"], "unhealthy");
     assert_eq!(body["checks"]["backend"], "ok");
+    // Stable token, not a leaked OS error or path — sensitive details go to
+    // the warn log, not the unauthenticated response body.
+    assert_eq!(body["checks"]["dstack"], "unreachable");
     let dstack = body["checks"]["dstack"].as_str().unwrap();
     assert!(
-        dstack.contains("/nonexistent/dstack.sock"),
-        "dstack error should mention the path, got: {dstack}"
+        !dstack.contains("/nonexistent"),
+        "response must not leak the configured socket path, got: {dstack}"
     );
 }
 
@@ -261,10 +264,13 @@ async fn test_healthz_returns_503_when_backend_down() {
     let body = body_to_json(response).await;
     assert_eq!(body["status"], "unhealthy");
     assert_eq!(body["checks"]["dstack"], "ok");
+    // Bucketed status token — operators get the broad failure class,
+    // the exact backend URL is only in server logs.
+    assert_eq!(body["checks"]["backend"], "http_5xx");
     let backend = body["checks"]["backend"].as_str().unwrap();
     assert!(
-        backend.contains("500"),
-        "backend error should mention status, got: {backend}"
+        !backend.contains("http://") && !backend.contains("/v1/"),
+        "response must not leak backend URL, got: {backend}"
     );
 }
 

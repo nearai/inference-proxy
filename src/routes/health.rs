@@ -5,7 +5,9 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use tokio::net::UnixStream;
+use tracing::warn;
 
+use crate::backend_pool::BackendGuard;
 use crate::AppState;
 
 /// GET / → {}
@@ -30,6 +32,16 @@ pub async fn version(State(state): State<AppState>) -> impl IntoResponse {
 const DSTACK_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 const BACKEND_PROBE_TIMEOUT: Duration = Duration::from_millis(1200);
 
+/// Stable diagnostic codes returned to unauthenticated callers. Detailed
+/// errors (paths, URLs, OS errno text) are logged server-side via tracing
+/// so operators can still debug; the response body avoids leaking internal
+/// topology to anyone who can hit `/healthz`.
+const STATUS_OK: &str = "ok";
+const DSTACK_UNREACHABLE: &str = "unreachable";
+const DSTACK_TIMEOUT: &str = "timeout";
+const BACKEND_TIMEOUT: &str = "timeout";
+const BACKEND_UNREACHABLE: &str = "unreachable";
+
 /// GET /healthz — readiness probe for upstream load balancers.
 ///
 /// Probes critical subsystems whose failure would otherwise be invisible to a
@@ -47,26 +59,29 @@ const BACKEND_PROBE_TIMEOUT: Duration = Duration::from_millis(1200);
 ///
 /// Returns 200 with `{"status":"ok","checks":{...}}` when both checks pass,
 /// 503 with `{"status":"unhealthy","checks":{...}}` otherwise. Each entry in
-/// `checks` is `"ok"` or a short error string for diagnostics.
+/// `checks` is a stable token (`"ok"`, `"unreachable"`, `"timeout"`, or
+/// `"http_<code>"`) — detailed errors (paths, URLs, OS messages) are logged
+/// server-side rather than returned to the unauthenticated caller.
 pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     let dstack_path = state.config.dstack_socket_path.clone();
-    let backend_url = {
-        let (url, _guard) = state.backend_pool.select_url("/v1/models");
-        url
-    };
+    // Hold the BackendGuard for the full probe so the backend's
+    // `active_connections` count reflects the in-flight check; otherwise the
+    // probe slot is "free" the moment we read the URL and least-connections
+    // accounting under-counts the load.
+    let (backend_url, _guard) = state.backend_pool.select_url("/v1/models");
     let client = state.http_client.clone();
 
     let (dstack_result, backend_result) = tokio::join!(
         check_dstack(&dstack_path),
-        check_backend(&client, &backend_url),
+        check_backend(&client, &backend_url, &_guard),
     );
 
     let healthy = dstack_result.is_ok() && backend_result.is_ok();
     let body = serde_json::json!({
-        "status": if healthy { "ok" } else { "unhealthy" },
+        "status": if healthy { STATUS_OK } else { "unhealthy" },
         "checks": {
-            "dstack": check_value(&dstack_result),
-            "backend": check_value(&backend_result),
+            "dstack": status_token(&dstack_result),
+            "backend": status_token(&backend_result),
         },
     });
 
@@ -78,34 +93,86 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     (status, Json(body))
 }
 
-fn check_value(result: &Result<(), String>) -> String {
+fn status_token(result: &Result<(), &'static str>) -> &'static str {
     match result {
-        Ok(()) => "ok".to_string(),
-        Err(e) => e.clone(),
+        Ok(()) => STATUS_OK,
+        Err(token) => token,
     }
 }
 
-async fn check_dstack(path: &str) -> Result<(), String> {
+async fn check_dstack(path: &str) -> Result<(), &'static str> {
     match tokio::time::timeout(DSTACK_PROBE_TIMEOUT, UnixStream::connect(path)).await {
         Ok(Ok(_stream)) => Ok(()),
-        Ok(Err(e)) => Err(format!("connect {path}: {e}")),
-        Err(_) => Err(format!(
-            "timeout after {}ms connecting to {path}",
-            DSTACK_PROBE_TIMEOUT.as_millis()
-        )),
+        Ok(Err(e)) => {
+            warn!(
+                check = "dstack",
+                socket_path = %path,
+                error = %e,
+                "dstack socket unreachable"
+            );
+            Err(DSTACK_UNREACHABLE)
+        }
+        Err(_) => {
+            warn!(
+                check = "dstack",
+                socket_path = %path,
+                timeout_ms = DSTACK_PROBE_TIMEOUT.as_millis() as u64,
+                "dstack socket connect timed out"
+            );
+            Err(DSTACK_TIMEOUT)
+        }
     }
 }
 
-async fn check_backend(client: &reqwest::Client, url: &str) -> Result<(), String> {
+async fn check_backend(
+    client: &reqwest::Client,
+    url: &str,
+    _guard: &BackendGuard,
+) -> Result<(), &'static str> {
     let send = client.get(url).timeout(BACKEND_PROBE_TIMEOUT).send();
     match send.await {
-        Ok(resp) if resp.status().is_success() => Ok(()),
-        Ok(resp) => Err(format!("GET {url} -> {}", resp.status())),
-        Err(e) if e.is_timeout() => Err(format!(
-            "timeout after {}ms GET {url}",
-            BACKEND_PROBE_TIMEOUT.as_millis()
-        )),
-        Err(e) => Err(format!("GET {url}: {e}")),
+        Ok(resp) if resp.status().is_success() => {
+            // Drain the body so reqwest can return the connection to the
+            // keep-alive pool. Without this, every probe opens a new TCP +
+            // TLS connection — wasteful at the 5s interval model-proxy uses.
+            if let Err(e) = resp.bytes().await {
+                warn!(check = "backend", url = %url, error = %e, "drain failed");
+                return Err(BACKEND_UNREACHABLE);
+            }
+            Ok(())
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let _ = resp.bytes().await;
+            warn!(check = "backend", url = %url, status = %status, "backend returned non-success");
+            Err(http_status_token(status))
+        }
+        Err(e) if e.is_timeout() => {
+            warn!(
+                check = "backend",
+                url = %url,
+                timeout_ms = BACKEND_PROBE_TIMEOUT.as_millis() as u64,
+                "backend probe timed out"
+            );
+            Err(BACKEND_TIMEOUT)
+        }
+        Err(e) => {
+            warn!(check = "backend", url = %url, error = %e, "backend probe failed");
+            Err(BACKEND_UNREACHABLE)
+        }
+    }
+}
+
+/// Map an HTTP status to a small set of stable tokens. We bucket so the
+/// response body never reveals more than the broad failure mode (bad request,
+/// rate limited, server error, etc.); the exact code is in the warn log.
+fn http_status_token(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        408 => "http_408",
+        429 => "http_429",
+        500..=599 => "http_5xx",
+        400..=499 => "http_4xx",
+        _ => BACKEND_UNREACHABLE,
     }
 }
 
@@ -127,26 +194,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dstack_check_fails_when_path_missing() {
+    async fn dstack_check_returns_unreachable_when_path_missing() {
         let result = check_dstack("/nonexistent/dstack.sock").await;
-        let err = result.unwrap_err();
-        assert!(
-            err.contains("/nonexistent/dstack.sock"),
-            "error should mention the path, got: {err}"
-        );
+        assert_eq!(result, Err(DSTACK_UNREACHABLE));
     }
 
     #[tokio::test]
-    async fn dstack_check_fails_when_path_is_regular_file() {
+    async fn dstack_check_returns_unreachable_when_path_is_regular_file() {
         // A regular file at the socket path: connect() will fail with ECONNREFUSED.
         // Mirrors the on-host failure mode where the socket doesn't exist OR exists
-        // but no daemon is listening.
+        // but no daemon is listening. Either case must surface as "unreachable",
+        // not as "ok".
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("not-a-socket");
         std::fs::write(&path, b"").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         let result = check_dstack(path.to_str().unwrap()).await;
-        assert!(result.is_err(), "regular file should not pass as a socket");
+        assert_eq!(result, Err(DSTACK_UNREACHABLE));
+    }
+
+    #[test]
+    fn http_status_token_buckets_known_classes() {
+        assert_eq!(http_status_token(StatusCode::REQUEST_TIMEOUT), "http_408");
+        assert_eq!(http_status_token(StatusCode::TOO_MANY_REQUESTS), "http_429");
+        assert_eq!(
+            http_status_token(StatusCode::INTERNAL_SERVER_ERROR),
+            "http_5xx"
+        );
+        assert_eq!(http_status_token(StatusCode::BAD_GATEWAY), "http_5xx");
+        assert_eq!(http_status_token(StatusCode::NOT_FOUND), "http_4xx");
     }
 }

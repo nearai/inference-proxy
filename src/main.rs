@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::middleware;
@@ -18,13 +17,11 @@ struct Ipv4OnlyResolver;
 impl Resolve for Ipv4OnlyResolver {
     fn resolve(&self, name: Name) -> Resolving {
         Box::pin(async move {
-            let addrs: Vec<SocketAddr> =
-                tokio::net::lookup_host(format!("{}:0", name.as_str()))
-                    .await
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
-                    .filter(|a| a.is_ipv4())
-                    .collect();
-            Ok(Box::new(addrs.into_iter()) as Addrs)
+            let addrs = tokio::net::lookup_host(format!("{}:0", name.as_str()))
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                .filter(|a| a.is_ipv4());
+            Ok(Box::new(addrs) as Addrs)
         })
     }
 }

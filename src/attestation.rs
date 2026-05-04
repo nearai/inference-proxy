@@ -813,6 +813,187 @@ pub struct AttestationParams<'a> {
     pub tls_cert_fingerprint: Option<&'a str>,
 }
 
+/// Maximum attempts for `collect_gpu_evidence_with_nonce_check`.
+///
+/// 4 attempts (1 initial + 3 retries) with exponential backoff between
+/// them. The race appears to be at the NVML/GPU-firmware level —
+/// transient, but with enough variance that a single retry isn't
+/// always enough. Worst-case wait time across all retries is bounded
+/// by `GPU_EVIDENCE_NONCE_BACKOFF_BASE_MS * (2^0 + 2^1 + 2^2)` plus
+/// the four collection latencies.
+const GPU_EVIDENCE_NONCE_MAX_ATTEMPTS: usize = 4;
+
+/// Initial backoff before the second attempt. Doubles before each
+/// subsequent retry: 100ms, 200ms, 400ms — total worst-case wait 700ms.
+/// Short enough to stay under cloud-api's per-request timeout while
+/// giving the firmware time to settle if the cause is contention.
+const GPU_EVIDENCE_NONCE_BACKOFF_BASE_MS: u64 = 100;
+
+/// SPDM-style request opcode header at the start of every per-GPU
+/// attestation report binary, observed across PASS and FAIL responses
+/// captured from production.
+const GPU_EVIDENCE_HEADER: [u8; 4] = [0x11, 0xE0, 0x01, 0xFF];
+
+/// Byte range where the per-GPU attestation report binary embeds the
+/// caller-provided nonce. Verified against captured production responses
+/// (working glm-5 capture and a tampered-evidence FAIL capture both have
+/// the request nonce at offset 4..36 of the base64-decoded `evidence`
+/// field).
+const GPU_EVIDENCE_NONCE_OFFSET: usize = 4;
+const GPU_EVIDENCE_NONCE_LEN: usize = 32;
+
+/// Decode a single per-GPU `evidence` (base64) and check that the
+/// 32-byte slice at offset 4..36 equals the caller's nonce.
+///
+/// Returns `false` if the field is missing, not base64, too short, or
+/// the nonce doesn't match (NRAS rejects all of these as
+/// `NONCE_NOT_MATCHING`/`INVALID_EVIDENCE_*`).
+///
+/// Returns `true` (fail-open) when the evidence has an SPDM header we
+/// don't recognise. Verification is best-effort — if NVIDIA bumps the
+/// request opcode in a future driver, we'd rather let NRAS render
+/// judgment than reject every PASS evidence in our fleet.
+fn evidence_has_correct_nonce(
+    evidence_entry: &serde_json::Value,
+    expected_nonce: &[u8; 32],
+) -> bool {
+    let Some(b64) = evidence_entry.get("evidence").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    use base64::Engine;
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) else {
+        return false;
+    };
+    if bytes.len() < GPU_EVIDENCE_NONCE_OFFSET + GPU_EVIDENCE_NONCE_LEN {
+        return false;
+    }
+    if bytes[..GPU_EVIDENCE_HEADER.len()] != GPU_EVIDENCE_HEADER {
+        // Unknown SPDM revision — fail open (see doc comment above).
+        return true;
+    }
+    bytes[GPU_EVIDENCE_NONCE_OFFSET..GPU_EVIDENCE_NONCE_OFFSET + GPU_EVIDENCE_NONCE_LEN]
+        == expected_nonce[..]
+}
+
+/// Why a per-GPU nonce binding check failed.
+///
+/// `NoEvidenceList` covers both "not a JSON array" and "empty array" —
+/// either way there's nothing to verify, and bubbling that up as a
+/// failure (rather than silently treating it as "all GPUs verified")
+/// is what closes the bypass Copilot flagged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NonceMismatch {
+    /// `evidence_list` was missing, not an array, or empty — no per-GPU
+    /// evidence to verify. NRAS would reject the resulting payload, and
+    /// we don't want a malformed shape to slip past as "verified".
+    NoEvidenceList,
+    /// A specific GPU's bound nonce doesn't match the request nonce.
+    GpuIndex(usize),
+}
+
+impl std::fmt::Display for NonceMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NonceMismatch::NoEvidenceList => write!(f, "evidence_list missing/empty/non-array"),
+            NonceMismatch::GpuIndex(idx) => write!(f, "GPU index {idx}"),
+        }
+    }
+}
+
+/// Walk every entry in an `evidence_list` and verify that each GPU's
+/// embedded nonce matches the request nonce. Returns `Ok(())` only when
+/// the list is a non-empty array and every entry verifies; otherwise
+/// returns the specific reason.
+fn check_evidence_nonce_binding(
+    evidences: &serde_json::Value,
+    expected_nonce: &[u8; 32],
+) -> Result<(), NonceMismatch> {
+    let arr = evidences.as_array().ok_or(NonceMismatch::NoEvidenceList)?;
+    if arr.is_empty() {
+        return Err(NonceMismatch::NoEvidenceList);
+    }
+    for (idx, entry) in arr.iter().enumerate() {
+        if !evidence_has_correct_nonce(entry, expected_nonce) {
+            return Err(NonceMismatch::GpuIndex(idx));
+        }
+    }
+    Ok(())
+}
+
+/// Collect GPU evidence and verify that the firmware bound the caller's
+/// nonce into the signed report. Retries with exponential backoff if any
+/// GPU's evidence has the wrong nonce — matching the production failure
+/// mode where NRAS rejects with `NONCE_NOT_MATCHING` (error 4010), which
+/// we believe is a race in NVML/GPU-firmware when multiple inference-proxy
+/// processes on a shared GPU host call the verifier concurrently.
+///
+/// We deliberately do **not** kill the persistent Python worker on
+/// mismatch: the worker is a thin pass-through to `cc_admin` and
+/// produces evidence successfully — just with the wrong nonce baked in
+/// some of the time. Restarting it would add ~1–2s spawn overhead per
+/// retry and briefly drop our in-process serialization, plausibly making
+/// the cross-process race worse for whichever request slips in. The
+/// backoff (100ms → 200ms → 400ms) is what gives the firmware time to
+/// settle.
+///
+/// Failures (transport errors, repeated nonce mismatches) bubble up so
+/// cloud-api can rotate to a different backend instead of submitting
+/// known-bad evidence to NRAS.
+async fn collect_gpu_evidence_with_nonce_check(
+    nonce_hex: &str,
+    nonce_bytes: &[u8; 32],
+    gpu_no_hw_mode: bool,
+    cache: Option<&AttestationCache>,
+) -> anyhow::Result<serde_json::Value> {
+    let mut last_failure: Option<NonceMismatch> = None;
+
+    for attempt in 1..=GPU_EVIDENCE_NONCE_MAX_ATTEMPTS {
+        // Backoff before retries (not before the first attempt).
+        if attempt > 1 {
+            let delay_ms = GPU_EVIDENCE_NONCE_BACKOFF_BASE_MS << (attempt - 2);
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+
+        let evidence = if let Some(cache) = cache {
+            cache
+                .collect_gpu_evidence(nonce_hex, gpu_no_hw_mode)
+                .await?
+        } else {
+            collect_gpu_evidence_subprocess(nonce_hex, gpu_no_hw_mode).await?
+        };
+
+        // `no_gpu_mode` returns canned evidence (nv-attestation-sdk fixture
+        // for hosts without GPUs); skip the nonce-binding check there since
+        // the canned bytes don't carry our nonce.
+        if gpu_no_hw_mode {
+            return Ok(evidence);
+        }
+
+        match check_evidence_nonce_binding(&evidence, nonce_bytes) {
+            Ok(()) => return Ok(evidence),
+            Err(reason) => {
+                metrics::counter!("gpu_evidence_nonce_mismatch_total").increment(1);
+                warn!(
+                    attempt,
+                    max_attempts = GPU_EVIDENCE_NONCE_MAX_ATTEMPTS,
+                    failure = %reason,
+                    "GPU evidence nonce binding check failed — collector returned evidence whose embedded nonce differs from the request nonce, or the evidence_list shape was unusable"
+                );
+                last_failure = Some(reason);
+            }
+        }
+    }
+
+    metrics::counter!("gpu_evidence_nonce_mismatch_exhausted_total").increment(1);
+    let failure = last_failure
+        .map(|r| r.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    anyhow::bail!(
+        "GPU evidence nonce binding check failed after {} attempts ({failure})",
+        GPU_EVIDENCE_NONCE_MAX_ATTEMPTS
+    )
+}
+
 /// Generate a complete attestation report (core logic, no caching).
 ///
 /// Parallelizes the two slow operations:
@@ -846,6 +1027,7 @@ async fn generate_attestation_inner(
     // GPU evidence uses the persistent Python worker (or subprocess fallback).
     let gpu_no_hw_mode = params.gpu_no_hw_mode;
     let nonce_hex_clone = nonce_hex.clone();
+    let nonce_bytes_for_verify = nonce_bytes;
     let (quote_result, gpu_evidence) = tokio::try_join!(
         async {
             let client = dstack_sdk::dstack_client::DstackClient::new(None);
@@ -855,16 +1037,14 @@ async fn generate_attestation_inner(
                 .map_err(AttestationError::Internal)
         },
         async {
-            if let Some(cache) = cache {
-                cache
-                    .collect_gpu_evidence(&nonce_hex_clone, gpu_no_hw_mode)
-                    .await
-                    .map_err(AttestationError::Internal)
-            } else {
-                collect_gpu_evidence_subprocess(&nonce_hex_clone, gpu_no_hw_mode)
-                    .await
-                    .map_err(AttestationError::Internal)
-            }
+            collect_gpu_evidence_with_nonce_check(
+                &nonce_hex_clone,
+                &nonce_bytes_for_verify,
+                gpu_no_hw_mode,
+                cache,
+            )
+            .await
+            .map_err(AttestationError::Internal)
         },
     )?;
 
@@ -1065,6 +1245,190 @@ mod tests {
         assert_eq!(payload["nonce"], "abc123");
         assert_eq!(payload["arch"], "HOPPER");
         assert_eq!(payload["evidence_list"][0]["gpu"], "H100");
+    }
+
+    /// Build a synthetic per-GPU evidence binary in the format observed in
+    /// captured production responses: 4-byte SPDM header + 32-byte nonce +
+    /// padding. Encoded as base64 so it can drop into a fake evidence_list
+    /// entry.
+    fn fake_evidence_b64(nonce: &[u8; 32]) -> String {
+        use base64::Engine;
+        let mut bytes = Vec::with_capacity(64);
+        bytes.extend_from_slice(&GPU_EVIDENCE_HEADER);
+        bytes.extend_from_slice(nonce);
+        bytes.extend_from_slice(&[0u8; 28]); // tail padding (real evidence has more)
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    }
+
+    #[test]
+    fn evidence_has_correct_nonce_accepts_matching_binding() {
+        let nonce = [0xABu8; 32];
+        let entry = serde_json::json!({"evidence": fake_evidence_b64(&nonce)});
+        assert!(evidence_has_correct_nonce(&entry, &nonce));
+    }
+
+    #[test]
+    fn evidence_has_correct_nonce_rejects_wrong_nonce() {
+        // This is the production failure mode: header is correct but
+        // bytes 4..36 are some other 32-byte value.
+        let request_nonce = [0xABu8; 32];
+        let evidence_nonce = [0xCDu8; 32];
+        let entry = serde_json::json!({"evidence": fake_evidence_b64(&evidence_nonce)});
+        assert!(!evidence_has_correct_nonce(&entry, &request_nonce));
+    }
+
+    #[test]
+    fn evidence_has_correct_nonce_rejects_missing_or_malformed_evidence() {
+        let nonce = [0xABu8; 32];
+        // Missing field
+        assert!(!evidence_has_correct_nonce(&serde_json::json!({}), &nonce));
+        // Not a string
+        assert!(!evidence_has_correct_nonce(
+            &serde_json::json!({"evidence": 42}),
+            &nonce
+        ));
+        // Not base64
+        assert!(!evidence_has_correct_nonce(
+            &serde_json::json!({"evidence": "not base64!!"}),
+            &nonce
+        ));
+        // Too short
+        use base64::Engine;
+        let short = base64::engine::general_purpose::STANDARD.encode([0u8; 10]);
+        assert!(!evidence_has_correct_nonce(
+            &serde_json::json!({"evidence": short}),
+            &nonce
+        ));
+    }
+
+    #[test]
+    fn evidence_has_correct_nonce_passes_unknown_header_through() {
+        // If NVIDIA changes the SPDM opcode header in a future driver,
+        // we don't want to fail-closed and reject every PASS evidence.
+        // The check returns true ("can't verify, assume ok") and lets
+        // NRAS make the call.
+        let nonce = [0xABu8; 32];
+        use base64::Engine;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0x99, 0x88, 0x77, 0x66]); // unknown header
+        bytes.extend_from_slice(&[0u8; 32]); // not the expected nonce
+        bytes.extend_from_slice(&[0u8; 28]);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        assert!(evidence_has_correct_nonce(
+            &serde_json::json!({"evidence": b64}),
+            &nonce
+        ));
+    }
+
+    #[test]
+    fn check_evidence_nonce_binding_finds_offending_gpu() {
+        let good_nonce = [0xABu8; 32];
+        let bad_nonce = [0xCDu8; 32];
+        // 4 GPUs: 0,1 ok, 2 mismatched, 3 ok
+        let evidences = serde_json::json!([
+            {"evidence": fake_evidence_b64(&good_nonce)},
+            {"evidence": fake_evidence_b64(&good_nonce)},
+            {"evidence": fake_evidence_b64(&bad_nonce)},
+            {"evidence": fake_evidence_b64(&good_nonce)},
+        ]);
+        assert_eq!(
+            check_evidence_nonce_binding(&evidences, &good_nonce),
+            Err(NonceMismatch::GpuIndex(2))
+        );
+    }
+
+    #[test]
+    fn check_evidence_nonce_binding_returns_ok_when_all_match() {
+        let nonce = [0xABu8; 32];
+        let evidences = serde_json::json!([
+            {"evidence": fake_evidence_b64(&nonce)},
+            {"evidence": fake_evidence_b64(&nonce)},
+            {"evidence": fake_evidence_b64(&nonce)},
+        ]);
+        assert_eq!(check_evidence_nonce_binding(&evidences, &nonce), Ok(()));
+    }
+
+    #[test]
+    fn check_evidence_nonce_binding_rejects_non_array() {
+        // Closes the bypass Copilot flagged: a non-array `evidence_list`
+        // (or any malformed shape) used to silently propagate `None` and
+        // be interpreted as "all GPUs verified". Now it surfaces as a
+        // verification failure that drives the retry path.
+        let nonce = [0xABu8; 32];
+        assert_eq!(
+            check_evidence_nonce_binding(&serde_json::json!({}), &nonce),
+            Err(NonceMismatch::NoEvidenceList)
+        );
+        assert_eq!(
+            check_evidence_nonce_binding(&serde_json::json!("string"), &nonce),
+            Err(NonceMismatch::NoEvidenceList)
+        );
+        assert_eq!(
+            check_evidence_nonce_binding(&serde_json::json!(null), &nonce),
+            Err(NonceMismatch::NoEvidenceList)
+        );
+    }
+
+    #[test]
+    fn check_evidence_nonce_binding_rejects_empty_array() {
+        let nonce = [0xABu8; 32];
+        assert_eq!(
+            check_evidence_nonce_binding(&serde_json::json!([]), &nonce),
+            Err(NonceMismatch::NoEvidenceList)
+        );
+    }
+
+    #[test]
+    fn nonce_mismatch_display_formats_clearly() {
+        // Pinned because the Display impl is what shows up in operator
+        // log lines via `failure = %reason` and in the error message
+        // bubbled up to cloud-api.
+        assert_eq!(
+            NonceMismatch::NoEvidenceList.to_string(),
+            "evidence_list missing/empty/non-array"
+        );
+        assert_eq!(NonceMismatch::GpuIndex(3).to_string(), "GPU index 3");
+    }
+
+    #[test]
+    fn nonce_check_retry_constants_are_consistent() {
+        // Pin the retry policy so tweaks are intentional. 4 attempts with
+        // 100ms exponential-doubling backoff = 100+200+400 = 700ms wait
+        // worst-case, plus four collection latencies.
+        assert_eq!(GPU_EVIDENCE_NONCE_MAX_ATTEMPTS, 4);
+        assert_eq!(GPU_EVIDENCE_NONCE_BACKOFF_BASE_MS, 100);
+        let waits: Vec<u64> = (2..=GPU_EVIDENCE_NONCE_MAX_ATTEMPTS)
+            .map(|attempt| GPU_EVIDENCE_NONCE_BACKOFF_BASE_MS << (attempt - 2))
+            .collect();
+        assert_eq!(waits, vec![100, 200, 400]);
+        assert_eq!(waits.iter().sum::<u64>(), 700);
+    }
+
+    /// Local-only sanity check against captured production NRAS payloads.
+    /// Set `NRAS_PAYLOAD` to a JSON file containing the `nvidia_payload`
+    /// (string) value pulled from a real `/v1/attestation/report` response.
+    /// Reproduces the offset assumption — bytes 4..36 of each evidence's
+    /// base64-decoded `evidence` field carry the request nonce.
+    #[test]
+    #[ignore]
+    fn evidence_nonce_offset_matches_captured_response() {
+        let path = match std::env::var("NRAS_PAYLOAD") {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("skipped: NRAS_PAYLOAD env var not set");
+                return;
+            }
+        };
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let nonce_hex = payload["nonce"].as_str().unwrap();
+        let nonce_bytes: [u8; 32] = hex::decode(nonce_hex).unwrap().try_into().unwrap();
+        let mismatch = check_evidence_nonce_binding(&payload["evidence_list"], &nonce_bytes);
+        eprintln!("captured: nonce={nonce_hex}");
+        eprintln!("captured: mismatch_index={:?}", mismatch);
+        // For a captured PASS payload we expect None; for a captured
+        // FAIL payload we expect Some(idx). Either way, the function
+        // must run cleanly — that's what this test guards.
     }
 
     fn make_test_report(algo: &str, nonce: &str) -> AttestationReport {

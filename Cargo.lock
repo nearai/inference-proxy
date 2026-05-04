@@ -5071,6 +5071,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "axum",
+ "base64",
  "bhttp",
  "bytes",
  "chacha20poly1305",

@@ -58,6 +58,19 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
 
+[dependencies.nv-attestation-sdk]
+git = "https://github.com/NVIDIA/attestation-sdk.git"
+tag = "2026.04.29"
+optional = true
+
+[features]
+# Enable the NVIDIA Attestation SDK Rust bindings as the GPU evidence
+# collection backend. Requires `libnvat.so.1` (and bindgen's clang) at
+# build time and the same shared library at runtime. When disabled
+# (default), evidence collection uses the existing Python subprocess
+# path. See `attestation_sdk.rs` for the runtime toggle.
+nv-attestation-sdk = ["dep:nv-attestation-sdk"]
+
 [dev-dependencies]
 wiremock = "0.6"
 tower = { version = "0.5", features = ["util"] }

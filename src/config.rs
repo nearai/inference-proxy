@@ -128,6 +128,12 @@ pub struct Config {
     pub transcriptions_url_override: Option<String>,
     pub rerank_url_override: Option<String>,
     pub score_url_override: Option<String>,
+
+    /// Path to the dstack guest agent unix socket. Probed by `/healthz` so
+    /// upstream load balancers can detach this instance when the socket is
+    /// unreachable (otherwise `/v1/attestation/report` silently 500s while
+    /// `/v1/models` still passes). Default: `/var/run/dstack.sock`.
+    pub dstack_socket_path: String,
 }
 
 impl Config {
@@ -274,6 +280,7 @@ impl Config {
             transcriptions_url_override,
             rerank_url_override,
             score_url_override,
+            dstack_socket_path: env_or("DSTACK_SOCKET_PATH", "/var/run/dstack.sock"),
         };
 
         // Validate attestation cache TTL (TTL/2 is used as refresh interval, so TTL < 2 would cause a busy loop)

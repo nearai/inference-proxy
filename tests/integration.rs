@@ -16,11 +16,30 @@ fn build_test_app(mock_url: &str) -> axum::Router {
     build_test_app_with_rate_limit(mock_url, 100, 200)
 }
 
+/// Build a test app with a specific dstack socket path (used by /healthz tests).
+fn build_test_app_with_dstack_socket(mock_url: &str, dstack_socket_path: &str) -> axum::Router {
+    build_test_app_inner(mock_url, 100, 200, dstack_socket_path.to_string())
+}
+
 /// Build a test app with custom rate limit settings.
 fn build_test_app_with_rate_limit(
     mock_url: &str,
     rate_per_second: u64,
     rate_burst: u32,
+) -> axum::Router {
+    build_test_app_inner(
+        mock_url,
+        rate_per_second,
+        rate_burst,
+        "/var/run/dstack.sock".to_string(),
+    )
+}
+
+fn build_test_app_inner(
+    mock_url: &str,
+    rate_per_second: u64,
+    rate_burst: u32,
+    dstack_socket_path: String,
 ) -> axum::Router {
     let base = mock_url.trim_end_matches('/');
 
@@ -75,6 +94,7 @@ fn build_test_app_with_rate_limit(
         score_url_override: None,
         ohttp_enabled: false,
         listen_port: 8000,
+        dstack_socket_path,
     };
 
     // Use fixed keys for deterministic tests
@@ -169,6 +189,116 @@ async fn test_version_endpoint() {
     let body = body_to_json(response).await;
     assert_eq!(body["version"], "test-rev");
     assert_eq!(body["type"], "proxy");
+}
+
+// ---- /healthz ----
+
+#[tokio::test]
+async fn test_healthz_returns_503_when_dstack_socket_missing() {
+    // Mock backend serves /v1/models successfully so the backend check passes.
+    // The dstack socket points at a non-existent path, so the dstack check fails
+    // and the overall response is 503 — exactly the signal an upstream LB needs
+    // to drop this instance and stop routing requests that would 500 on
+    // /v1/attestation/report.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": []})))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app_with_dstack_socket(&mock_server.uri(), "/nonexistent/dstack.sock");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = body_to_json(response).await;
+    assert_eq!(body["status"], "unhealthy");
+    assert_eq!(body["checks"]["backend"], "ok");
+    let dstack = body["checks"]["dstack"].as_str().unwrap();
+    assert!(
+        dstack.contains("/nonexistent/dstack.sock"),
+        "dstack error should mention the path, got: {dstack}"
+    );
+}
+
+#[tokio::test]
+async fn test_healthz_returns_503_when_backend_down() {
+    // Backend that always 500s — pretends sglang/vLLM is wedged.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock_server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("dstack.sock");
+    let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+    tokio::spawn(async move { while let Ok((_s, _)) = listener.accept().await {} });
+
+    let app = build_test_app_with_dstack_socket(&mock_server.uri(), socket_path.to_str().unwrap());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = body_to_json(response).await;
+    assert_eq!(body["status"], "unhealthy");
+    assert_eq!(body["checks"]["dstack"], "ok");
+    let backend = body["checks"]["backend"].as_str().unwrap();
+    assert!(
+        backend.contains("500"),
+        "backend error should mention status, got: {backend}"
+    );
+}
+
+#[tokio::test]
+async fn test_healthz_returns_200_when_all_healthy() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": []})))
+        .mount(&mock_server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("dstack.sock");
+    let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+    tokio::spawn(async move { while let Ok((_s, _)) = listener.accept().await {} });
+
+    let app = build_test_app_with_dstack_socket(&mock_server.uri(), socket_path.to_str().unwrap());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response).await;
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["checks"]["dstack"], "ok");
+    assert_eq!(body["checks"]["backend"], "ok");
 }
 
 // ---- Auth ----
@@ -2911,6 +3041,7 @@ fn build_test_app_with_cloud_api_retries(
         score_url_override: None,
         ohttp_enabled: false,
         listen_port: 8000,
+        dstack_socket_path: "/var/run/dstack.sock".to_string(),
     };
 
     let ecdsa_key: [u8; 32] = [
@@ -5082,6 +5213,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         score_url_override: None,
         ohttp_enabled: true,
         listen_port: 0, // not used in oneshot tests
+        dstack_socket_path: "/var/run/dstack.sock".to_string(),
     };
 
     let ecdsa_key: [u8; 32] = [
@@ -5467,6 +5599,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         score_url_override: None,
         ohttp_enabled: true,
         listen_port: port,
+        dstack_socket_path: "/var/run/dstack.sock".to_string(),
     };
 
     let ecdsa = signing::EcdsaContext::from_key_bytes(&ecdsa_key).unwrap();

@@ -1,8 +1,33 @@
+use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::middleware;
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use tokio::net::TcpListener;
 use tracing::info;
+
+/// DNS resolver that returns only IPv4 addresses.
+///
+/// reqwest 0.12 made hickory-dns mandatory. Hickory does A+AAAA in parallel
+/// and surfaces a hard error when the AAAA query returns SERVFAIL (which
+/// QEMU SLIRP DNS does inside CVMs). The system resolver (getaddrinfo via
+/// tokio) handles this gracefully and falls back to A-only.
+struct Ipv4OnlyResolver;
+
+impl Resolve for Ipv4OnlyResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        Box::pin(async move {
+            let addrs: Vec<SocketAddr> =
+                tokio::net::lookup_host(format!("{}:0", name.as_str()))
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                    .filter(|a| a.is_ipv4())
+                    .collect();
+            Ok(Box::new(addrs.into_iter()) as Addrs)
+        })
+    }
+}
 
 use vllm_proxy_rs::ohttp_gateway::OhttpGateway;
 use vllm_proxy_rs::{
@@ -103,6 +128,7 @@ async fn main() -> anyhow::Result<()> {
     // `error sending request for url ...` and produced ~12 spurious 401s/h
     // on `/v1/check_api_key` before we capped this. (See auth.rs retry path.)
     let mut http_builder = reqwest::Client::builder()
+        .dns_resolver(Arc::new(Ipv4OnlyResolver))
         .pool_max_idle_per_host(config.max_keepalive)
         .timeout(std::time::Duration::from_secs(config.timeout_secs));
     if config.pool_idle_timeout_secs > 0 {

@@ -1,5 +1,4 @@
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::middleware;
@@ -9,10 +8,11 @@ use tracing::info;
 
 /// DNS resolver that returns only IPv4 addresses.
 ///
-/// reqwest 0.12 made hickory-dns mandatory. Hickory does A+AAAA in parallel
-/// and surfaces a hard error when the AAAA query returns SERVFAIL (which
-/// QEMU SLIRP DNS does inside CVMs). The system resolver (getaddrinfo via
-/// tokio) handles this gracefully and falls back to A-only.
+/// reqwest 0.12 made hickory-dns mandatory. Hickory fires A+AAAA in parallel
+/// and returns a hard error when the AAAA query comes back NOERROR with no
+/// records (which QEMU SLIRP does for IPv4-only domains like cloud-api.near.ai),
+/// without falling back to the A result. The system resolver (getaddrinfo via
+/// tokio) handles this correctly.
 struct Ipv4OnlyResolver;
 
 impl Resolve for Ipv4OnlyResolver {

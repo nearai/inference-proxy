@@ -1,0 +1,11 @@
+# `cargo audit` config (also read by rustsec/audit-check@v2 in CI). The
+# ignore list mirrors `deny.toml`'s [advisories.ignore] because the two tools
+# don't share config — cargo-deny reads deny.toml, cargo-audit reads this.
+# When updating one, update the other; the comments live in deny.toml.
+
+[advisories]
+ignore = [
+    "RUSTSEC-2024-0436", # paste unmaintained, transitive via alloy-primitives
+    "RUSTSEC-2026-0118", # hickory-proto DnssecDnsHandle unbounded loop, transitive via dstack-sdk → reqwest [hickory-dns]
+    "RUSTSEC-2026-0119", # hickory-proto DNS encoding O(n^2), transitive via dstack-sdk → reqwest [hickory-dns]
+]

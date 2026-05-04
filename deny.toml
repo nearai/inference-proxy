@@ -4,15 +4,19 @@ ignore = [
     # paste is unmaintained but is a transitive dep from alloy-primitives;
     # no action we can take until alloy migrates away from it
     "RUSTSEC-2024-0436",
-    # hickory-proto 0.25 has a DoS via O(n^2) name compression while ENCODING
-    # DNS messages — only relevant when acting as a DNS server. Pulled in
-    # transitively by dstack-sdk → reqwest [hickory-dns] → hickory-resolver
-    # 0.25 → hickory-proto 0.25; reqwest only uses hickory as an async
-    # *client* resolver. No safe in-tree upgrade exists (hickory-resolver
-    # 0.25 pins hickory-proto ^0.25; bumping requires a newer reqwest, which
-    # in turn requires upstream dstack-sdk to publish a new version). Revisit
-    # when dstack-sdk drops the `hickory-dns` reqwest feature or bumps
-    # reqwest past the hickory 0.26 cutoff.
+    # hickory-proto 0.25 has two DoS advisories (RUSTSEC-2026-0118: NSEC3
+    # closest-encloser unbounded loop in DnssecDnsHandle; RUSTSEC-2026-0119:
+    # O(n^2) name compression while ENCODING DNS messages). Both are reachable
+    # only when acting as a DNS server / DNSSEC validator — reqwest only uses
+    # hickory as an async client resolver and does not validate DNSSEC, so
+    # neither code path is exercised here. Pulled in transitively by
+    # dstack-sdk → reqwest [hickory-dns] → hickory-resolver 0.25 → hickory-proto
+    # 0.25. No safe in-tree upgrade exists (hickory-resolver 0.25 pins
+    # hickory-proto ^0.25; bumping requires a newer reqwest, which in turn
+    # requires upstream dstack-sdk to publish a new version). Revisit when
+    # dstack-sdk drops the `hickory-dns` reqwest feature or bumps reqwest past
+    # the hickory 0.26 cutoff.
+    "RUSTSEC-2026-0118",
     "RUSTSEC-2026-0119",
 ]
 

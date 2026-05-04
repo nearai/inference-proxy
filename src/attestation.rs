@@ -227,18 +227,6 @@ impl AttestationCache {
             .cloned()
     }
 
-    /// Drop the persistent worker so the next `collect_gpu_evidence` call
-    /// spawns a fresh one. Used by `collect_gpu_evidence_with_nonce_check`
-    /// when the firmware returned evidence bound to the wrong nonce — we
-    /// don't yet know whether the bug is in our worker or in NVML/firmware,
-    /// but a clean process is the cheapest way to rule out worker-side
-    /// state corruption before retrying.
-    pub async fn invalidate_gpu_worker(&self) {
-        let mut worker_guard = self.gpu_worker.lock().await;
-        // Dropping the existing worker kills its child process (kill_on_drop).
-        *worker_guard = None;
-    }
-
     /// Collect GPU evidence using the persistent worker, with auto-restart.
     ///
     /// Caller must hold the gpu_semaphore permit.
@@ -827,11 +815,19 @@ pub struct AttestationParams<'a> {
 
 /// Maximum attempts for `collect_gpu_evidence_with_nonce_check`.
 ///
-/// 2 means "one retry". A single retry is enough to clear the observed
-/// production race; more attempts would add latency under sustained
-/// failure (where retrying won't help anyway) and let bad evidence sit
-/// longer in the path.
-const GPU_EVIDENCE_NONCE_MAX_ATTEMPTS: usize = 2;
+/// 4 attempts (1 initial + 3 retries) with exponential backoff between
+/// them. The race appears to be at the NVML/GPU-firmware level —
+/// transient, but with enough variance that a single retry isn't
+/// always enough. Worst-case wait time across all retries is bounded
+/// by `GPU_EVIDENCE_NONCE_BACKOFF_BASE_MS * (2^0 + 2^1 + 2^2)` plus
+/// the four collection latencies.
+const GPU_EVIDENCE_NONCE_MAX_ATTEMPTS: usize = 4;
+
+/// Initial backoff before the second attempt. Doubles before each
+/// subsequent retry: 100ms, 200ms, 400ms — total worst-case wait 700ms.
+/// Short enough to stay under cloud-api's per-request timeout while
+/// giving the firmware time to settle if the cause is contention.
+const GPU_EVIDENCE_NONCE_BACKOFF_BASE_MS: u64 = 100;
 
 /// SPDM-style request opcode header at the start of every per-GPU
 /// attestation report binary, observed across PASS and FAIL responses
@@ -895,14 +891,20 @@ fn first_mismatched_gpu_index(
 }
 
 /// Collect GPU evidence and verify that the firmware bound the caller's
-/// nonce into the signed report. Retries once if any GPU's evidence has
-/// the wrong nonce — matching the production failure mode where NRAS
-/// rejects with `NONCE_NOT_MATCHING` (error 4010), apparently caused by
-/// concurrent NVML calls across the multiple inference-proxy processes
-/// on a shared GPU host.
+/// nonce into the signed report. Retries with exponential backoff if any
+/// GPU's evidence has the wrong nonce — matching the production failure
+/// mode where NRAS rejects with `NONCE_NOT_MATCHING` (error 4010), which
+/// we believe is a race in NVML/GPU-firmware when multiple inference-proxy
+/// processes on a shared GPU host call the verifier concurrently.
 ///
-/// On retry, the persistent Python worker is killed and respawned to
-/// shake out any stale state.
+/// We deliberately do **not** kill the persistent Python worker on
+/// mismatch: the worker is a thin pass-through to `cc_admin` and
+/// produces evidence successfully — just with the wrong nonce baked in
+/// some of the time. Restarting it would add ~1–2s spawn overhead per
+/// retry and briefly drop our in-process serialization, plausibly making
+/// the cross-process race worse for whichever request slips in. The
+/// backoff (100ms → 200ms → 400ms) is what gives the firmware time to
+/// settle.
 ///
 /// Failures (transport errors, repeated nonce mismatches) bubble up so
 /// cloud-api can rotate to a different backend instead of submitting
@@ -916,6 +918,12 @@ async fn collect_gpu_evidence_with_nonce_check(
     let mut last_mismatch_idx: Option<usize> = None;
 
     for attempt in 1..=GPU_EVIDENCE_NONCE_MAX_ATTEMPTS {
+        // Backoff before retries (not before the first attempt).
+        if attempt > 1 {
+            let delay_ms = GPU_EVIDENCE_NONCE_BACKOFF_BASE_MS << (attempt - 2);
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+
         let evidence = if let Some(cache) = cache {
             cache
                 .collect_gpu_evidence(nonce_hex, gpu_no_hw_mode)
@@ -942,13 +950,6 @@ async fn collect_gpu_evidence_with_nonce_check(
                     "GPU evidence nonce binding mismatch — collector returned evidence whose embedded nonce differs from the request nonce"
                 );
                 last_mismatch_idx = Some(idx);
-                // Force a worker restart on retry so we don't immediately
-                // hit the same in-process state again. Cheap (~1s spawn).
-                if attempt < GPU_EVIDENCE_NONCE_MAX_ATTEMPTS {
-                    if let Some(cache) = cache {
-                        cache.invalidate_gpu_worker().await;
-                    }
-                }
             }
         }
     }
@@ -1320,6 +1321,20 @@ mod tests {
         // Not an array — treat as no-array, return None (caller will fail
         // higher up if the shape is wrong).
         assert!(first_mismatched_gpu_index(&serde_json::json!({}), &nonce).is_none());
+    }
+
+    #[test]
+    fn nonce_check_retry_constants_are_consistent() {
+        // Pin the retry policy so tweaks are intentional. 4 attempts with
+        // 100ms exponential-doubling backoff = 100+200+400 = 700ms wait
+        // worst-case, plus four collection latencies.
+        assert_eq!(GPU_EVIDENCE_NONCE_MAX_ATTEMPTS, 4);
+        assert_eq!(GPU_EVIDENCE_NONCE_BACKOFF_BASE_MS, 100);
+        let waits: Vec<u64> = (2..=GPU_EVIDENCE_NONCE_MAX_ATTEMPTS)
+            .map(|attempt| GPU_EVIDENCE_NONCE_BACKOFF_BASE_MS << (attempt - 2))
+            .collect();
+        assert_eq!(waits, vec![100, 200, 400]);
+        assert_eq!(waits.iter().sum::<u64>(), 700);
     }
 
     /// Local-only sanity check against captured production NRAS payloads.

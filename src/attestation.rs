@@ -227,6 +227,18 @@ impl AttestationCache {
             .cloned()
     }
 
+    /// Drop the persistent worker so the next `collect_gpu_evidence` call
+    /// spawns a fresh one. Used by `collect_gpu_evidence_with_nonce_check`
+    /// when the firmware returned evidence bound to the wrong nonce — we
+    /// don't yet know whether the bug is in our worker or in NVML/firmware,
+    /// but a clean process is the cheapest way to rule out worker-side
+    /// state corruption before retrying.
+    pub async fn invalidate_gpu_worker(&self) {
+        let mut worker_guard = self.gpu_worker.lock().await;
+        // Dropping the existing worker kills its child process (kill_on_drop).
+        *worker_guard = None;
+    }
+
     /// Collect GPU evidence using the persistent worker, with auto-restart.
     ///
     /// Caller must hold the gpu_semaphore permit.
@@ -813,6 +825,144 @@ pub struct AttestationParams<'a> {
     pub tls_cert_fingerprint: Option<&'a str>,
 }
 
+/// Maximum attempts for `collect_gpu_evidence_with_nonce_check`.
+///
+/// 2 means "one retry". A single retry is enough to clear the observed
+/// production race; more attempts would add latency under sustained
+/// failure (where retrying won't help anyway) and let bad evidence sit
+/// longer in the path.
+const GPU_EVIDENCE_NONCE_MAX_ATTEMPTS: usize = 2;
+
+/// SPDM-style request opcode header at the start of every per-GPU
+/// attestation report binary, observed across PASS and FAIL responses
+/// captured from production.
+const GPU_EVIDENCE_HEADER: [u8; 4] = [0x11, 0xE0, 0x01, 0xFF];
+
+/// Byte range where the per-GPU attestation report binary embeds the
+/// caller-provided nonce. Verified against captured production responses
+/// (working glm-5 capture and a tampered-evidence FAIL capture both have
+/// the request nonce at offset 4..36 of the base64-decoded `evidence`
+/// field).
+const GPU_EVIDENCE_NONCE_OFFSET: usize = 4;
+const GPU_EVIDENCE_NONCE_LEN: usize = 32;
+
+/// Decode a single per-GPU `evidence` (base64) and check that the
+/// 32-byte slice at offset 4..36 equals the caller's nonce.
+///
+/// Returns `false` if the field is missing, not base64, too short, has
+/// the wrong header, or the nonce doesn't match. NRAS rejects any of
+/// these as `NONCE_NOT_MATCHING`/`INVALID_EVIDENCE_*`, so they're all
+/// "wrong evidence" from our perspective.
+fn evidence_has_correct_nonce(
+    evidence_entry: &serde_json::Value,
+    expected_nonce: &[u8; 32],
+) -> bool {
+    let Some(b64) = evidence_entry.get("evidence").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    use base64::Engine;
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) else {
+        return false;
+    };
+    if bytes.len() < GPU_EVIDENCE_NONCE_OFFSET + GPU_EVIDENCE_NONCE_LEN {
+        return false;
+    }
+    if bytes[..GPU_EVIDENCE_HEADER.len()] != GPU_EVIDENCE_HEADER {
+        // Unknown format — don't claim it's right or wrong; verification
+        // is best-effort. Treat as ok so we don't fail closed on a future
+        // SPDM revision.
+        return true;
+    }
+    bytes[GPU_EVIDENCE_NONCE_OFFSET..GPU_EVIDENCE_NONCE_OFFSET + GPU_EVIDENCE_NONCE_LEN]
+        == expected_nonce[..]
+}
+
+/// Walk every entry in an `evidence_list` and find the first GPU whose
+/// embedded nonce doesn't match the request nonce. Returns `None` if all
+/// entries verify, `Some(index)` otherwise (indices are stable for log
+/// readability).
+fn first_mismatched_gpu_index(
+    evidences: &serde_json::Value,
+    expected_nonce: &[u8; 32],
+) -> Option<usize> {
+    let arr = evidences.as_array()?;
+    for (idx, entry) in arr.iter().enumerate() {
+        if !evidence_has_correct_nonce(entry, expected_nonce) {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+/// Collect GPU evidence and verify that the firmware bound the caller's
+/// nonce into the signed report. Retries once if any GPU's evidence has
+/// the wrong nonce — matching the production failure mode where NRAS
+/// rejects with `NONCE_NOT_MATCHING` (error 4010), apparently caused by
+/// concurrent NVML calls across the multiple inference-proxy processes
+/// on a shared GPU host.
+///
+/// On retry, the persistent Python worker is killed and respawned to
+/// shake out any stale state.
+///
+/// Failures (transport errors, repeated nonce mismatches) bubble up so
+/// cloud-api can rotate to a different backend instead of submitting
+/// known-bad evidence to NRAS.
+async fn collect_gpu_evidence_with_nonce_check(
+    nonce_hex: &str,
+    nonce_bytes: &[u8; 32],
+    gpu_no_hw_mode: bool,
+    cache: Option<&AttestationCache>,
+) -> anyhow::Result<serde_json::Value> {
+    let mut last_mismatch_idx: Option<usize> = None;
+
+    for attempt in 1..=GPU_EVIDENCE_NONCE_MAX_ATTEMPTS {
+        let evidence = if let Some(cache) = cache {
+            cache
+                .collect_gpu_evidence(nonce_hex, gpu_no_hw_mode)
+                .await?
+        } else {
+            collect_gpu_evidence_subprocess(nonce_hex, gpu_no_hw_mode).await?
+        };
+
+        // `no_gpu_mode` returns canned evidence (nv-attestation-sdk fixture
+        // for hosts without GPUs); skip the nonce-binding check there since
+        // the canned bytes don't carry our nonce.
+        if gpu_no_hw_mode {
+            return Ok(evidence);
+        }
+
+        match first_mismatched_gpu_index(&evidence, nonce_bytes) {
+            None => return Ok(evidence),
+            Some(idx) => {
+                metrics::counter!("gpu_evidence_nonce_mismatch_total").increment(1);
+                warn!(
+                    attempt,
+                    max_attempts = GPU_EVIDENCE_NONCE_MAX_ATTEMPTS,
+                    gpu_index = idx,
+                    "GPU evidence nonce binding mismatch — collector returned evidence whose embedded nonce differs from the request nonce"
+                );
+                last_mismatch_idx = Some(idx);
+                // Force a worker restart on retry so we don't immediately
+                // hit the same in-process state again. Cheap (~1s spawn).
+                if attempt < GPU_EVIDENCE_NONCE_MAX_ATTEMPTS {
+                    if let Some(cache) = cache {
+                        cache.invalidate_gpu_worker().await;
+                    }
+                }
+            }
+        }
+    }
+
+    metrics::counter!("gpu_evidence_nonce_mismatch_exhausted_total").increment(1);
+    anyhow::bail!(
+        "GPU evidence nonce binding mismatch after {} attempts (first mismatched GPU index: {})",
+        GPU_EVIDENCE_NONCE_MAX_ATTEMPTS,
+        last_mismatch_idx
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| "?".to_string())
+    )
+}
+
 /// Generate a complete attestation report (core logic, no caching).
 ///
 /// Parallelizes the two slow operations:
@@ -846,6 +996,7 @@ async fn generate_attestation_inner(
     // GPU evidence uses the persistent Python worker (or subprocess fallback).
     let gpu_no_hw_mode = params.gpu_no_hw_mode;
     let nonce_hex_clone = nonce_hex.clone();
+    let nonce_bytes_for_verify = nonce_bytes;
     let (quote_result, gpu_evidence) = tokio::try_join!(
         async {
             let client = dstack_sdk::dstack_client::DstackClient::new(None);
@@ -855,16 +1006,14 @@ async fn generate_attestation_inner(
                 .map_err(AttestationError::Internal)
         },
         async {
-            if let Some(cache) = cache {
-                cache
-                    .collect_gpu_evidence(&nonce_hex_clone, gpu_no_hw_mode)
-                    .await
-                    .map_err(AttestationError::Internal)
-            } else {
-                collect_gpu_evidence_subprocess(&nonce_hex_clone, gpu_no_hw_mode)
-                    .await
-                    .map_err(AttestationError::Internal)
-            }
+            collect_gpu_evidence_with_nonce_check(
+                &nonce_hex_clone,
+                &nonce_bytes_for_verify,
+                gpu_no_hw_mode,
+                cache,
+            )
+            .await
+            .map_err(AttestationError::Internal)
         },
     )?;
 
@@ -1065,6 +1214,139 @@ mod tests {
         assert_eq!(payload["nonce"], "abc123");
         assert_eq!(payload["arch"], "HOPPER");
         assert_eq!(payload["evidence_list"][0]["gpu"], "H100");
+    }
+
+    /// Build a synthetic per-GPU evidence binary in the format observed in
+    /// captured production responses: 4-byte SPDM header + 32-byte nonce +
+    /// padding. Encoded as base64 so it can drop into a fake evidence_list
+    /// entry.
+    fn fake_evidence_b64(nonce: &[u8; 32]) -> String {
+        use base64::Engine;
+        let mut bytes = Vec::with_capacity(64);
+        bytes.extend_from_slice(&GPU_EVIDENCE_HEADER);
+        bytes.extend_from_slice(nonce);
+        bytes.extend_from_slice(&[0u8; 28]); // tail padding (real evidence has more)
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    }
+
+    #[test]
+    fn evidence_has_correct_nonce_accepts_matching_binding() {
+        let nonce = [0xABu8; 32];
+        let entry = serde_json::json!({"evidence": fake_evidence_b64(&nonce)});
+        assert!(evidence_has_correct_nonce(&entry, &nonce));
+    }
+
+    #[test]
+    fn evidence_has_correct_nonce_rejects_wrong_nonce() {
+        // This is the production failure mode: header is correct but
+        // bytes 4..36 are some other 32-byte value.
+        let request_nonce = [0xABu8; 32];
+        let evidence_nonce = [0xCDu8; 32];
+        let entry = serde_json::json!({"evidence": fake_evidence_b64(&evidence_nonce)});
+        assert!(!evidence_has_correct_nonce(&entry, &request_nonce));
+    }
+
+    #[test]
+    fn evidence_has_correct_nonce_rejects_missing_or_malformed_evidence() {
+        let nonce = [0xABu8; 32];
+        // Missing field
+        assert!(!evidence_has_correct_nonce(&serde_json::json!({}), &nonce));
+        // Not a string
+        assert!(!evidence_has_correct_nonce(
+            &serde_json::json!({"evidence": 42}),
+            &nonce
+        ));
+        // Not base64
+        assert!(!evidence_has_correct_nonce(
+            &serde_json::json!({"evidence": "not base64!!"}),
+            &nonce
+        ));
+        // Too short
+        use base64::Engine;
+        let short = base64::engine::general_purpose::STANDARD.encode([0u8; 10]);
+        assert!(!evidence_has_correct_nonce(
+            &serde_json::json!({"evidence": short}),
+            &nonce
+        ));
+    }
+
+    #[test]
+    fn evidence_has_correct_nonce_passes_unknown_header_through() {
+        // If NVIDIA changes the SPDM opcode header in a future driver,
+        // we don't want to fail-closed and reject every PASS evidence.
+        // The check returns true ("can't verify, assume ok") and lets
+        // NRAS make the call.
+        let nonce = [0xABu8; 32];
+        use base64::Engine;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0x99, 0x88, 0x77, 0x66]); // unknown header
+        bytes.extend_from_slice(&[0u8; 32]); // not the expected nonce
+        bytes.extend_from_slice(&[0u8; 28]);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        assert!(evidence_has_correct_nonce(
+            &serde_json::json!({"evidence": b64}),
+            &nonce
+        ));
+    }
+
+    #[test]
+    fn first_mismatched_gpu_index_finds_offending_gpu() {
+        let good_nonce = [0xABu8; 32];
+        let bad_nonce = [0xCDu8; 32];
+        // 4 GPUs: 0,1 ok, 2 mismatched, 3 ok
+        let evidences = serde_json::json!([
+            {"evidence": fake_evidence_b64(&good_nonce)},
+            {"evidence": fake_evidence_b64(&good_nonce)},
+            {"evidence": fake_evidence_b64(&bad_nonce)},
+            {"evidence": fake_evidence_b64(&good_nonce)},
+        ]);
+        assert_eq!(first_mismatched_gpu_index(&evidences, &good_nonce), Some(2));
+    }
+
+    #[test]
+    fn first_mismatched_gpu_index_returns_none_when_all_match() {
+        let nonce = [0xABu8; 32];
+        let evidences = serde_json::json!([
+            {"evidence": fake_evidence_b64(&nonce)},
+            {"evidence": fake_evidence_b64(&nonce)},
+            {"evidence": fake_evidence_b64(&nonce)},
+        ]);
+        assert!(first_mismatched_gpu_index(&evidences, &nonce).is_none());
+    }
+
+    #[test]
+    fn first_mismatched_gpu_index_handles_non_array() {
+        let nonce = [0xABu8; 32];
+        // Not an array — treat as no-array, return None (caller will fail
+        // higher up if the shape is wrong).
+        assert!(first_mismatched_gpu_index(&serde_json::json!({}), &nonce).is_none());
+    }
+
+    /// Local-only sanity check against captured production NRAS payloads.
+    /// Set `NRAS_PAYLOAD` to a JSON file containing the `nvidia_payload`
+    /// (string) value pulled from a real `/v1/attestation/report` response.
+    /// Reproduces the offset assumption — bytes 4..36 of each evidence's
+    /// base64-decoded `evidence` field carry the request nonce.
+    #[test]
+    #[ignore]
+    fn evidence_nonce_offset_matches_captured_response() {
+        let path = match std::env::var("NRAS_PAYLOAD") {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("skipped: NRAS_PAYLOAD env var not set");
+                return;
+            }
+        };
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let nonce_hex = payload["nonce"].as_str().unwrap();
+        let nonce_bytes: [u8; 32] = hex::decode(nonce_hex).unwrap().try_into().unwrap();
+        let mismatch = first_mismatched_gpu_index(&payload["evidence_list"], &nonce_bytes);
+        eprintln!("captured: nonce={nonce_hex}");
+        eprintln!("captured: mismatch_index={:?}", mismatch);
+        // For a captured PASS payload we expect None; for a captured
+        // FAIL payload we expect Some(idx). Either way, the function
+        // must run cleanly — that's what this test guards.
     }
 
     fn make_test_report(algo: &str, nonce: &str) -> AttestationReport {

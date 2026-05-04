@@ -845,10 +845,14 @@ const GPU_EVIDENCE_NONCE_LEN: usize = 32;
 /// Decode a single per-GPU `evidence` (base64) and check that the
 /// 32-byte slice at offset 4..36 equals the caller's nonce.
 ///
-/// Returns `false` if the field is missing, not base64, too short, has
-/// the wrong header, or the nonce doesn't match. NRAS rejects any of
-/// these as `NONCE_NOT_MATCHING`/`INVALID_EVIDENCE_*`, so they're all
-/// "wrong evidence" from our perspective.
+/// Returns `false` if the field is missing, not base64, too short, or
+/// the nonce doesn't match (NRAS rejects all of these as
+/// `NONCE_NOT_MATCHING`/`INVALID_EVIDENCE_*`).
+///
+/// Returns `true` (fail-open) when the evidence has an SPDM header we
+/// don't recognise. Verification is best-effort — if NVIDIA bumps the
+/// request opcode in a future driver, we'd rather let NRAS render
+/// judgment than reject every PASS evidence in our fleet.
 fn evidence_has_correct_nonce(
     evidence_entry: &serde_json::Value,
     expected_nonce: &[u8; 32],
@@ -864,30 +868,56 @@ fn evidence_has_correct_nonce(
         return false;
     }
     if bytes[..GPU_EVIDENCE_HEADER.len()] != GPU_EVIDENCE_HEADER {
-        // Unknown format — don't claim it's right or wrong; verification
-        // is best-effort. Treat as ok so we don't fail closed on a future
-        // SPDM revision.
+        // Unknown SPDM revision — fail open (see doc comment above).
         return true;
     }
     bytes[GPU_EVIDENCE_NONCE_OFFSET..GPU_EVIDENCE_NONCE_OFFSET + GPU_EVIDENCE_NONCE_LEN]
         == expected_nonce[..]
 }
 
-/// Walk every entry in an `evidence_list` and find the first GPU whose
-/// embedded nonce doesn't match the request nonce. Returns `None` if all
-/// entries verify, `Some(index)` otherwise (indices are stable for log
-/// readability).
-fn first_mismatched_gpu_index(
-    evidences: &serde_json::Value,
-    expected_nonce: &[u8; 32],
-) -> Option<usize> {
-    let arr = evidences.as_array()?;
-    for (idx, entry) in arr.iter().enumerate() {
-        if !evidence_has_correct_nonce(entry, expected_nonce) {
-            return Some(idx);
+/// Why a per-GPU nonce binding check failed.
+///
+/// `NoEvidenceList` covers both "not a JSON array" and "empty array" —
+/// either way there's nothing to verify, and bubbling that up as a
+/// failure (rather than silently treating it as "all GPUs verified")
+/// is what closes the bypass Copilot flagged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NonceMismatch {
+    /// `evidence_list` was missing, not an array, or empty — no per-GPU
+    /// evidence to verify. NRAS would reject the resulting payload, and
+    /// we don't want a malformed shape to slip past as "verified".
+    NoEvidenceList,
+    /// A specific GPU's bound nonce doesn't match the request nonce.
+    GpuIndex(usize),
+}
+
+impl std::fmt::Display for NonceMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NonceMismatch::NoEvidenceList => write!(f, "evidence_list missing/empty/non-array"),
+            NonceMismatch::GpuIndex(idx) => write!(f, "GPU index {idx}"),
         }
     }
-    None
+}
+
+/// Walk every entry in an `evidence_list` and verify that each GPU's
+/// embedded nonce matches the request nonce. Returns `Ok(())` only when
+/// the list is a non-empty array and every entry verifies; otherwise
+/// returns the specific reason.
+fn check_evidence_nonce_binding(
+    evidences: &serde_json::Value,
+    expected_nonce: &[u8; 32],
+) -> Result<(), NonceMismatch> {
+    let arr = evidences.as_array().ok_or(NonceMismatch::NoEvidenceList)?;
+    if arr.is_empty() {
+        return Err(NonceMismatch::NoEvidenceList);
+    }
+    for (idx, entry) in arr.iter().enumerate() {
+        if !evidence_has_correct_nonce(entry, expected_nonce) {
+            return Err(NonceMismatch::GpuIndex(idx));
+        }
+    }
+    Ok(())
 }
 
 /// Collect GPU evidence and verify that the firmware bound the caller's
@@ -915,7 +945,7 @@ async fn collect_gpu_evidence_with_nonce_check(
     gpu_no_hw_mode: bool,
     cache: Option<&AttestationCache>,
 ) -> anyhow::Result<serde_json::Value> {
-    let mut last_mismatch_idx: Option<usize> = None;
+    let mut last_failure: Option<NonceMismatch> = None;
 
     for attempt in 1..=GPU_EVIDENCE_NONCE_MAX_ATTEMPTS {
         // Backoff before retries (not before the first attempt).
@@ -939,28 +969,28 @@ async fn collect_gpu_evidence_with_nonce_check(
             return Ok(evidence);
         }
 
-        match first_mismatched_gpu_index(&evidence, nonce_bytes) {
-            None => return Ok(evidence),
-            Some(idx) => {
+        match check_evidence_nonce_binding(&evidence, nonce_bytes) {
+            Ok(()) => return Ok(evidence),
+            Err(reason) => {
                 metrics::counter!("gpu_evidence_nonce_mismatch_total").increment(1);
                 warn!(
                     attempt,
                     max_attempts = GPU_EVIDENCE_NONCE_MAX_ATTEMPTS,
-                    gpu_index = idx,
-                    "GPU evidence nonce binding mismatch — collector returned evidence whose embedded nonce differs from the request nonce"
+                    failure = %reason,
+                    "GPU evidence nonce binding check failed — collector returned evidence whose embedded nonce differs from the request nonce, or the evidence_list shape was unusable"
                 );
-                last_mismatch_idx = Some(idx);
+                last_failure = Some(reason);
             }
         }
     }
 
     metrics::counter!("gpu_evidence_nonce_mismatch_exhausted_total").increment(1);
+    let failure = last_failure
+        .map(|r| r.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
     anyhow::bail!(
-        "GPU evidence nonce binding mismatch after {} attempts (first mismatched GPU index: {})",
-        GPU_EVIDENCE_NONCE_MAX_ATTEMPTS,
-        last_mismatch_idx
-            .map(|i| i.to_string())
-            .unwrap_or_else(|| "?".to_string())
+        "GPU evidence nonce binding check failed after {} attempts ({failure})",
+        GPU_EVIDENCE_NONCE_MAX_ATTEMPTS
     )
 }
 
@@ -1291,7 +1321,7 @@ mod tests {
     }
 
     #[test]
-    fn first_mismatched_gpu_index_finds_offending_gpu() {
+    fn check_evidence_nonce_binding_finds_offending_gpu() {
         let good_nonce = [0xABu8; 32];
         let bad_nonce = [0xCDu8; 32];
         // 4 GPUs: 0,1 ok, 2 mismatched, 3 ok
@@ -1301,26 +1331,63 @@ mod tests {
             {"evidence": fake_evidence_b64(&bad_nonce)},
             {"evidence": fake_evidence_b64(&good_nonce)},
         ]);
-        assert_eq!(first_mismatched_gpu_index(&evidences, &good_nonce), Some(2));
+        assert_eq!(
+            check_evidence_nonce_binding(&evidences, &good_nonce),
+            Err(NonceMismatch::GpuIndex(2))
+        );
     }
 
     #[test]
-    fn first_mismatched_gpu_index_returns_none_when_all_match() {
+    fn check_evidence_nonce_binding_returns_ok_when_all_match() {
         let nonce = [0xABu8; 32];
         let evidences = serde_json::json!([
             {"evidence": fake_evidence_b64(&nonce)},
             {"evidence": fake_evidence_b64(&nonce)},
             {"evidence": fake_evidence_b64(&nonce)},
         ]);
-        assert!(first_mismatched_gpu_index(&evidences, &nonce).is_none());
+        assert_eq!(check_evidence_nonce_binding(&evidences, &nonce), Ok(()));
     }
 
     #[test]
-    fn first_mismatched_gpu_index_handles_non_array() {
+    fn check_evidence_nonce_binding_rejects_non_array() {
+        // Closes the bypass Copilot flagged: a non-array `evidence_list`
+        // (or any malformed shape) used to silently propagate `None` and
+        // be interpreted as "all GPUs verified". Now it surfaces as a
+        // verification failure that drives the retry path.
         let nonce = [0xABu8; 32];
-        // Not an array — treat as no-array, return None (caller will fail
-        // higher up if the shape is wrong).
-        assert!(first_mismatched_gpu_index(&serde_json::json!({}), &nonce).is_none());
+        assert_eq!(
+            check_evidence_nonce_binding(&serde_json::json!({}), &nonce),
+            Err(NonceMismatch::NoEvidenceList)
+        );
+        assert_eq!(
+            check_evidence_nonce_binding(&serde_json::json!("string"), &nonce),
+            Err(NonceMismatch::NoEvidenceList)
+        );
+        assert_eq!(
+            check_evidence_nonce_binding(&serde_json::json!(null), &nonce),
+            Err(NonceMismatch::NoEvidenceList)
+        );
+    }
+
+    #[test]
+    fn check_evidence_nonce_binding_rejects_empty_array() {
+        let nonce = [0xABu8; 32];
+        assert_eq!(
+            check_evidence_nonce_binding(&serde_json::json!([]), &nonce),
+            Err(NonceMismatch::NoEvidenceList)
+        );
+    }
+
+    #[test]
+    fn nonce_mismatch_display_formats_clearly() {
+        // Pinned because the Display impl is what shows up in operator
+        // log lines via `failure = %reason` and in the error message
+        // bubbled up to cloud-api.
+        assert_eq!(
+            NonceMismatch::NoEvidenceList.to_string(),
+            "evidence_list missing/empty/non-array"
+        );
+        assert_eq!(NonceMismatch::GpuIndex(3).to_string(), "GPU index 3");
     }
 
     #[test]
@@ -1356,7 +1423,7 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let nonce_hex = payload["nonce"].as_str().unwrap();
         let nonce_bytes: [u8; 32] = hex::decode(nonce_hex).unwrap().try_into().unwrap();
-        let mismatch = first_mismatched_gpu_index(&payload["evidence_list"], &nonce_bytes);
+        let mismatch = check_evidence_nonce_binding(&payload["evidence_list"], &nonce_bytes);
         eprintln!("captured: nonce={nonce_hex}");
         eprintln!("captured: mismatch_index={:?}", mismatch);
         // For a captured PASS payload we expect None; for a captured

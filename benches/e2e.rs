@@ -83,6 +83,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         score_url_override: None,
         ohttp_enabled: false,
         listen_port: 8000,
+        dstack_socket_path: "/var/run/dstack.sock".to_string(),
     };
 
     let ecdsa = signing::EcdsaContext::from_key_bytes(&ECDSA_KEY).unwrap();

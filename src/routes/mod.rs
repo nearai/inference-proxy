@@ -18,6 +18,7 @@ pub fn build_router() -> Router<AppState> {
         // Unauthenticated health endpoints
         .route("/", get(health::root))
         .route("/version", get(health::version))
+        .route("/healthz", get(health::healthz))
         // Unauthenticated Prometheus metrics
         .route(
             "/metrics",

@@ -70,7 +70,7 @@ This is a Rust rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-pro
 - Each proxy instance needs: `MODEL_NAME`, `TOKEN`, `VLLM_BASE_URL`, `TLS_CERT_PATH`
 - Optional: `CLOUD_API_URL` (enables usage reporting + `sk-` API key auth via cloud-api), `LOG_FORMAT=json` (structured JSON logs)
 - `ATTESTATION_CACHE_TTL` (default 300s) — TTL for cached nonce-less attestation reports; background refresh runs at half-TTL
-- `DSTACK_SOCKET_PATH` (default `/var/run/dstack.sock`) — probed by `GET /healthz` so upstream load balancers (e.g. model-proxy) can detach this instance when the dstack guest-agent socket is unreachable. `/v1/models` alone won't catch this failure mode — sglang/vLLM keep serving while `/v1/attestation/report` silently 500s.
+- `DSTACK_SOCKET_PATH` (default `/var/run/dstack.sock`) — probed by `GET /healthz` so upstream load balancers (e.g. model-proxy) can detach this instance when the dstack guest-agent socket is unreachable. `/v1/models` alone won't catch this failure mode — sglang/vLLM keep serving while `/v1/attestation/report` silently 500s. The backend leg of `/healthz` probes `/health` (not `/v1/models`) since `/v1/models` serializes against the OpenAI request loop and can stall for >1s during prefill, producing spurious 503s on otherwise-healthy hosts.
 
 ### Cloud API integration
 

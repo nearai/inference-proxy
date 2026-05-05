@@ -46,7 +46,13 @@ const BACKEND_PROBE_TIMEOUT: Duration = Duration::from_millis(1200);
 /// probe path produced spurious 503s under heavy load (PR #106 follow-up,
 /// reported via Datadog `service:nginx "GET /healthz HTTP/1.1" 503` on the
 /// GLM-5.1 hosts when sglang was busy).
-const BACKEND_HEALTH_PATH: &str = "/health";
+///
+/// Also used by `backend_pool::spawn_health_check` for the per-backend
+/// liveness probe in multi-backend deployments (e.g. Qwen3.5-122B,
+/// gpt-oss). Keeping both probes on the same path means a wedged backend
+/// is dropped from both the inference-proxy's internal pool and the
+/// upstream model-proxy's pool consistently.
+pub const BACKEND_HEALTH_PATH: &str = "/health";
 
 /// Stable diagnostic codes returned to unauthenticated callers. Detailed
 /// errors (paths, URLs, OS errno text) are logged server-side via tracing

@@ -1,14 +1,39 @@
 use std::sync::Arc;
 
 use axum::middleware;
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use tokio::net::TcpListener;
 use tracing::info;
-
 use vllm_proxy_rs::ohttp_gateway::OhttpGateway;
 use vllm_proxy_rs::{
     attestation, backend_pool, cache, config, metrics_middleware, rate_limit,
     request_id_middleware, routes, signing, startup_checks, AppState,
 };
+
+/// DNS resolver that returns only IPv4 addresses.
+///
+/// reqwest 0.12 made hickory-dns mandatory. Hickory fires A+AAAA in parallel
+/// and returns a hard error when the AAAA query comes back NOERROR with no
+/// records (which QEMU SLIRP does for IPv4-only domains like cloud-api.near.ai),
+/// without falling back to the A result. The system resolver (getaddrinfo via
+/// tokio) handles this correctly.
+struct Ipv4OnlyResolver;
+
+impl Resolve for Ipv4OnlyResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        Box::pin(async move {
+            let v4: Vec<_> = tokio::net::lookup_host(format!("{}:0", name.as_str()))
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                .filter(|a| a.is_ipv4())
+                .collect();
+            if v4.is_empty() {
+                tracing::warn!(domain = %name.as_str(), "DNS returned no IPv4 addresses");
+            }
+            Ok(Box::new(v4.into_iter()) as Addrs)
+        })
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -103,6 +128,7 @@ async fn main() -> anyhow::Result<()> {
     // `error sending request for url ...` and produced ~12 spurious 401s/h
     // on `/v1/check_api_key` before we capped this. (See auth.rs retry path.)
     let mut http_builder = reqwest::Client::builder()
+        .dns_resolver(Arc::new(Ipv4OnlyResolver))
         .pool_max_idle_per_host(config.max_keepalive)
         .timeout(std::time::Duration::from_secs(config.timeout_secs));
     if config.pool_idle_timeout_secs > 0 {
@@ -246,4 +272,19 @@ async fn shutdown_signal() {
     }
 
     info!("Shutdown signal received");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[tokio::test]
+    async fn ipv4_only_resolver_filters_out_ipv6() {
+        let r = Ipv4OnlyResolver;
+        let name = reqwest::dns::Name::from_str("localhost").unwrap();
+        let addrs: Vec<_> = r.resolve(name).await.unwrap().collect();
+        assert!(!addrs.is_empty(), "localhost should resolve");
+        assert!(addrs.iter().all(|a| a.is_ipv4()), "got non-IPv4: {addrs:?}");
+    }
 }

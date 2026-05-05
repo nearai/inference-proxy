@@ -195,15 +195,15 @@ async fn test_version_endpoint() {
 
 #[tokio::test]
 async fn test_healthz_returns_503_when_dstack_socket_missing() {
-    // Mock backend serves /v1/models successfully so the backend check passes.
+    // Mock backend serves /health successfully so the backend check passes.
     // The dstack socket points at a non-existent path, so the dstack check fails
     // and the overall response is 503 — exactly the signal an upstream LB needs
     // to drop this instance and stop routing requests that would 500 on
     // /v1/attestation/report.
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": []})))
+        .and(path("/health"))
+        .respond_with(ResponseTemplate::new(200))
         .mount(&mock_server)
         .await;
 
@@ -235,10 +235,10 @@ async fn test_healthz_returns_503_when_dstack_socket_missing() {
 
 #[tokio::test]
 async fn test_healthz_returns_503_when_backend_down() {
-    // Backend that always 500s — pretends sglang/vLLM is wedged.
+    // Backend that always 500s on /health — pretends sglang/vLLM is wedged.
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/v1/models"))
+        .and(path("/health"))
         .respond_with(ResponseTemplate::new(500))
         .mount(&mock_server)
         .await;
@@ -278,8 +278,8 @@ async fn test_healthz_returns_503_when_backend_down() {
 async fn test_healthz_returns_200_when_all_healthy() {
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": []})))
+        .and(path("/health"))
+        .respond_with(ResponseTemplate::new(200))
         .mount(&mock_server)
         .await;
 

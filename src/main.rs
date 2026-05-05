@@ -181,7 +181,7 @@ async fn main() -> anyhow::Result<()> {
             std::time::Duration::from_secs(state.config.health_check_interval_secs),
             std::time::Duration::from_secs(state.config.health_check_timeout_secs),
             state.config.health_check_max_failures,
-            "/v1/models",
+            routes::health::BACKEND_HEALTH_PATH,
         );
     }
 

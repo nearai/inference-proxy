@@ -29,8 +29,30 @@ pub async fn version(State(state): State<AppState>) -> impl IntoResponse {
 /// latency is `max(DSTACK, BACKEND)` plus parsing overhead. Kept tight to
 /// stay under model-proxy's `health_check.slow_threshold_ms` (1500ms by
 /// default) — slower-than-threshold probes are treated as failures there.
+///
+/// `BACKEND_PROBE_TIMEOUT` is generous because we now hit `/health` (a
+/// lightweight FastAPI route that bypasses the inference event loop on
+/// both vLLM and SGLang); typical responses are sub-50ms. The 1200ms cap
+/// is just a safety net for pathological cases (engine wedged, link
+/// saturated) — it's still the upper bound on total handler latency.
 const DSTACK_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 const BACKEND_PROBE_TIMEOUT: Duration = Duration::from_millis(1200);
+
+/// Path used to probe the inference backend. `/health` is a lightweight
+/// FastAPI/uvicorn route on both vLLM and SGLang that does not go through
+/// the engine's request scheduler — unlike `/v1/models`, which serializes
+/// against the OpenAI-compatible request loop and can stall for >1s while
+/// the engine is mid-prefill on a large request. The original `/v1/models`
+/// probe path produced spurious 503s under heavy load (PR #106 follow-up,
+/// reported via Datadog `service:nginx "GET /healthz HTTP/1.1" 503` on the
+/// GLM-5.1 hosts when sglang was busy).
+///
+/// Also used by `backend_pool::spawn_health_check` for the per-backend
+/// liveness probe in multi-backend deployments (e.g. Qwen3.5-122B,
+/// gpt-oss). Keeping both probes on the same path means a wedged backend
+/// is dropped from both the inference-proxy's internal pool and the
+/// upstream model-proxy's pool consistently.
+pub const BACKEND_HEALTH_PATH: &str = "/health";
 
 /// Stable diagnostic codes returned to unauthenticated callers. Detailed
 /// errors (paths, URLs, OS errno text) are logged server-side via tracing
@@ -54,8 +76,11 @@ const BACKEND_UNREACHABLE: &str = "unreachable";
 ///   blocks the model in cloud-api's pubkey routing — but the backend
 ///   (sglang/vLLM) keeps serving `/v1/models`, so a `/v1/models` probe sees a
 ///   healthy backend and keeps routing traffic to it.
-/// - **inference backend**: HTTP `GET /v1/models` against a backend selected
+/// - **inference backend**: HTTP `GET /health` against a backend selected
 ///   from the pool. Catches sglang/vLLM crashes and unreachable backends.
+///   We deliberately do not use `/v1/models` here — it's served by the same
+///   handler that processes inference and can stall for over a second when
+///   the engine is mid-prefill, producing 503s on otherwise-healthy hosts.
 ///
 /// Returns 200 with `{"status":"ok","checks":{...}}` when both checks pass,
 /// 503 with `{"status":"unhealthy","checks":{...}}` otherwise. Each entry in
@@ -68,7 +93,7 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     // `active_connections` count reflects the in-flight check; otherwise the
     // probe slot is "free" the moment we read the URL and least-connections
     // accounting under-counts the load.
-    let (backend_url, _guard) = state.backend_pool.select_url("/v1/models");
+    let (backend_url, _guard) = state.backend_pool.select_url(BACKEND_HEALTH_PATH);
     let client = state.http_client.clone();
 
     let (dstack_result, backend_result) = tokio::join!(

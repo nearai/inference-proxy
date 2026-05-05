@@ -26,17 +26,17 @@ pub async fn version(State(state): State<AppState>) -> impl IntoResponse {
 // ── /healthz ────────────────────────────────────────────────────────
 
 /// Per-check budget. Both checks run concurrently, so the total handler
-/// latency is `max(DSTACK, BACKEND)` plus parsing overhead. Kept tight to
-/// stay under model-proxy's `health_check.slow_threshold_ms` (1500ms by
-/// default) — slower-than-threshold probes are treated as failures there.
+/// latency is `max(DSTACK, BACKEND)` plus parsing overhead.
 ///
-/// `BACKEND_PROBE_TIMEOUT` is generous because we now hit `/health` (a
-/// lightweight FastAPI route that bypasses the inference event loop on
-/// both vLLM and SGLang); typical responses are sub-50ms. The 1200ms cap
-/// is just a safety net for pathological cases (engine wedged, link
-/// saturated) — it's still the upper bound on total handler latency.
+/// `BACKEND_PROBE_TIMEOUT` targets `/health`, a lightweight FastAPI route
+/// that bypasses the inference event loop on both vLLM and SGLang; typical
+/// responses are sub-50ms. However, under sustained KV-cache pressure SGLang
+/// can starve the Python GIL, causing even this lightweight route to miss the
+/// previous 1200ms cap (observed on GLM-5 hosts, May 2026). 3000ms gives the
+/// backend enough headroom to recover from transient GIL saturation without
+/// prematurely marking a live host as unhealthy.
 const DSTACK_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
-const BACKEND_PROBE_TIMEOUT: Duration = Duration::from_millis(1200);
+const BACKEND_PROBE_TIMEOUT: Duration = Duration::from_millis(3000);
 
 /// Path used to probe the inference backend. `/health` is a lightweight
 /// FastAPI/uvicorn route on both vLLM and SGLang that does not go through

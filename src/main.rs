@@ -35,21 +35,6 @@ impl Resolve for Ipv4OnlyResolver {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::str::FromStr;
-
-    #[tokio::test]
-    async fn ipv4_only_resolver_filters_out_ipv6() {
-        let r = Ipv4OnlyResolver;
-        let name = reqwest::dns::Name::from_str("localhost").unwrap();
-        let addrs: Vec<_> = r.resolve(name).await.unwrap().collect();
-        assert!(!addrs.is_empty(), "localhost should resolve");
-        assert!(addrs.iter().all(|a| a.is_ipv4()), "got non-IPv4: {addrs:?}");
-    }
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize tracing
@@ -287,4 +272,19 @@ async fn shutdown_signal() {
     }
 
     info!("Shutdown signal received");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[tokio::test]
+    async fn ipv4_only_resolver_filters_out_ipv6() {
+        let r = Ipv4OnlyResolver;
+        let name = reqwest::dns::Name::from_str("localhost").unwrap();
+        let addrs: Vec<_> = r.resolve(name).await.unwrap().collect();
+        assert!(!addrs.is_empty(), "localhost should resolve");
+        assert!(addrs.iter().all(|a| a.is_ipv4()), "got non-IPv4: {addrs:?}");
+    }
 }

@@ -5,67 +5,58 @@
 #       provisioned with libnvat.so. Default off until staging validates.
 #       Even at "1" the runtime path stays Python-backed unless the env
 #       var USE_NV_ATTESTATION_SDK=true is set on the container.
+#   LIBNVAT_VERSION  → exact apt-pinned version of NVIDIA's libnvat package
+#       (see https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/).
+#       The trailing ".<timestamp>-1" suffix is part of the upstream version
+#       string and changes per build; pin it so rebuilds stay reproducible.
 ARG ENABLE_NV_ATTESTATION_SDK=0
-ARG NVAT_TAG=2026.04.29
-
-# ─────────────────────────────────────────────────────────────────────
-# Stage 0: build libnvat.so + nvat.h from NVIDIA/attestation-sdk source.
-# When the feature is disabled this stage is still emitted (cheap noop)
-# so subsequent COPY --from=nvat-builder steps don't need conditional
-# escapes. Output paths /opt/nvat/lib /opt/nvat/include always exist.
-# ─────────────────────────────────────────────────────────────────────
-# rust:1.93.0-bookworm gives us Debian + rustc/cargo in one image — the
-# SDK's CMake build uses Corrosion to compile a Rust dependency (regorus,
-# the policy engine), so cargo must be on PATH.
-FROM rust:1.93.0-bookworm AS nvat-builder
-ARG ENABLE_NV_ATTESTATION_SDK
-ARG NVAT_TAG
-RUN mkdir -p /opt/nvat/lib /opt/nvat/include && touch /opt/nvat/.empty
-RUN if [ "$ENABLE_NV_ATTESTATION_SDK" = "1" ]; then \
-        set -e && \
-        apt-get update && apt-get install -y --no-install-recommends \
-            git ca-certificates cmake ninja-build g++ pkg-config make \
-            curl perl python3 zlib1g-dev && \
-        git clone --depth 1 --branch ${NVAT_TAG} https://github.com/NVIDIA/attestation-sdk.git /src/attestation-sdk && \
-        cmake -S /src/attestation-sdk/nv-attestation-sdk-cpp -B /src/attestation-sdk/build \
-              -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON && \
-        # The SDK's CMakeLists adds OpenSSL/xmlsec/curl as ExternalProjects
-        # without BUILD_BYPRODUCTS, so ninja can't sequence libnvat.so's
-        # link step against the .a files those externals produce. Build
-        # them explicitly first, then link nvat in a second pass.
-        cmake --build /src/attestation-sdk/build \
-              --target openssl_external --target xmlsec_external --target curl_external && \
-        cmake --build /src/attestation-sdk/build --target nvat && \
-        # Stage just the runtime artifacts we need (libnvat.so* + header).
-        cp /src/attestation-sdk/build/include/nvat.h /opt/nvat/include/ && \
-        cp -P /src/attestation-sdk/build/libnvat.so* /opt/nvat/lib/ && \
-        rm -rf /src /var/lib/apt/lists/* ; \
-    fi
+ARG LIBNVAT_VERSION=1.2.1.1777487608-1
 
 # ─────────────────────────────────────────────────────────────────────
 # Stage 1: Build the Rust binary
+#
+# Switched from rust:1.93.0-bookworm (Debian 12) to ubuntu:22.04 +
+# rustup so the libnvat we link against is the same .deb the runtime
+# image installs (NVIDIA only publishes libnvat for Ubuntu 22.04/24.04;
+# no Debian 12 build). Matching distributions on both sides eliminates
+# any libssl3/libcurl4/libxml2 ABI risk.
 # ─────────────────────────────────────────────────────────────────────
-FROM rust:1.93.0-bookworm AS builder
+FROM ubuntu:22.04 AS builder
 ARG ENABLE_NV_ATTESTATION_SDK
+ARG LIBNVAT_VERSION
 
-RUN apt-get update && apt-get install -y --no-install-recommends git pkg-config \
-    && if [ "$ENABLE_NV_ATTESTATION_SDK" = "1" ]; then \
-        # bindgen needs libclang to parse nvat.h.
-        apt-get install -y --no-install-recommends clang libclang-dev; \
-    fi \
-    && rm -rf /var/lib/apt/lists/* /var/log/* /var/cache/ldconfig/aux-cache
+ENV DEBIAN_FRONTEND=noninteractive
 
-# Stage in libnvat header + .so so bindgen can link. The COPY always
-# succeeds (paths always exist, even when feature is off).
-COPY --from=nvat-builder /opt/nvat/ /opt/nvat/
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git pkg-config build-essential gcc \
+        libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust 1.93.0 (matching the previous rust:1.93.0-bookworm base).
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain 1.93.0 --profile minimal --no-modify-path
+ENV PATH=/root/.cargo/bin:$PATH
+
+# Install libnvat-dev (headers + .so symlink) and libclang for bindgen
+# only when the SDK feature is on. -dev pulls in libnvat (the runtime
+# .so) as a versioned dependency, plus libcurl4/libxml2/libxmlsec1-openssl
+# which libnvat dynamically links against.
 RUN if [ "$ENABLE_NV_ATTESTATION_SDK" = "1" ]; then \
-        cp /opt/nvat/include/nvat.h /usr/include/ && \
-        cp -P /opt/nvat/lib/libnvat.so* /usr/lib/ && \
-        ldconfig; \
+        set -e && \
+        apt-get update && apt-get install -y --no-install-recommends wget gnupg && \
+        wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb && \
+        dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb && \
+        apt-get update && apt-get install -y --no-install-recommends \
+            clang libclang-dev \
+            "libnvat-dev=${LIBNVAT_VERSION}" "libnvat=${LIBNVAT_VERSION}" && \
+        ldconfig && \
+        rm -rf /var/lib/apt/lists/* ; \
     fi
 
-# Tell the SDK's build.rs to use the system-installed header/lib we
-# just placed (vs. trying to build the C++ SDK from source again).
+# Tell nv-attestation-sdk-sys's build.rs to look for the system-installed
+# libnvat (/usr/include/nvat.h + /usr/lib/.../libnvat.so) rather than
+# trying to build the C++ SDK from a sibling source directory. No-op when
+# the Cargo feature is disabled.
 ENV NVAT_USE_SYSTEM_LIB=1
 
 WORKDIR /build
@@ -73,7 +64,8 @@ WORKDIR /build
 ARG SOURCE_DATE_EPOCH=0
 ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 
-# Resolve the cargo feature flag once and reuse below.
+# Resolve the cargo feature flag once so dependency-cache and real builds
+# agree on the feature set.
 RUN if [ "$ENABLE_NV_ATTESTATION_SDK" = "1" ]; then \
         echo "--features nv-attestation-sdk" > /tmp/cargo-features; \
     else \
@@ -102,6 +94,7 @@ RUN FEATURES=$(cat /tmp/cargo-features) && \
 # ─────────────────────────────────────────────────────────────────────
 FROM vllm/vllm-openai@sha256:014a95f21c9edf6abe0aea6b07353f96baa4ec291c427bb1176dc7c93a85845c
 ARG ENABLE_NV_ATTESTATION_SDK
+ARG LIBNVAT_VERSION
 
 ENV PYTHONUNBUFFERED=1
 
@@ -113,11 +106,16 @@ ENV PYTHONUNBUFFERED=1
 # follow-up will drop them once the SDK path proves out.
 RUN pip install --no-cache-dir nv-attestation-sdk nv-ppcie-verifier
 
-# Stage in libnvat.so for the runtime image when the feature was built.
-COPY --from=nvat-builder /opt/nvat/lib/ /opt/nvat-runtime/lib/
+# Install libnvat (runtime) when the feature is built. vllm/vllm-openai
+# already has the CUDA apt repo configured, so cuda-keyring isn't needed
+# here. apt pulls in libcurl4/libxml2/libxmlsec1-openssl as deps.
 RUN if [ "$ENABLE_NV_ATTESTATION_SDK" = "1" ]; then \
-        cp -P /opt/nvat-runtime/lib/libnvat.so* /usr/lib/ && ldconfig; \
-    fi && rm -rf /opt/nvat-runtime
+        set -e && \
+        apt-get update && apt-get install -y --no-install-recommends \
+            "libnvat=${LIBNVAT_VERSION}" && \
+        ldconfig && \
+        rm -rf /var/lib/apt/lists/* ; \
+    fi
 
 WORKDIR /app
 

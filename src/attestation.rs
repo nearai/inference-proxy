@@ -9,6 +9,19 @@ use tracing::{error, info, warn};
 
 use crate::types::AttestationReport;
 
+/// Per-call timeout for the Python evidence collector (persistent worker
+/// `collect()` and one-shot subprocess fallback).
+///
+/// Sized to fail before cloud-api's 30s HTTP timeout: when NVML hangs on
+/// a contended shared-GPU host (the production race that produces
+/// `NONCE_NOT_MATCHING` and outright hangs alike), we want to give up
+/// quickly so the existing PR #51 cache-layer retry can spawn a fresh
+/// worker and answer the same request. A 60s timeout was strictly worse
+/// — cloud-api had already disconnected by the time we recovered, and
+/// cloud-api saw a transport-level "error sending request for url"
+/// instead of the structured 5xx we'd otherwise return.
+const GPU_EVIDENCE_COLLECTION_TIMEOUT_SECS: u64 = 20;
+
 /// Cache key for nonce-less attestation reports.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 struct AttestationCacheKey {
@@ -148,14 +161,19 @@ impl GpuEvidenceWorker {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to flush GPU evidence worker stdin: {e}"))?;
 
-        // Read response (with timeout)
+        // Read response (with timeout). See GPU_EVIDENCE_COLLECTION_TIMEOUT_SECS
+        // for why this is sized to fail before cloud-api's HTTP timeout.
         let mut response_line = String::new();
         tokio::time::timeout(
-            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(GPU_EVIDENCE_COLLECTION_TIMEOUT_SECS),
             self.stdout.read_line(&mut response_line),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("GPU evidence worker timed out after 60s"))?
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "GPU evidence worker timed out after {GPU_EVIDENCE_COLLECTION_TIMEOUT_SECS}s"
+            )
+        })?
         .map_err(|e| anyhow::anyhow!("Failed to read from GPU evidence worker: {e}"))?;
 
         if response_line.is_empty() {
@@ -652,14 +670,18 @@ print(json.dumps(evidence))
     };
 
     let output = tokio::time::timeout(
-        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(GPU_EVIDENCE_COLLECTION_TIMEOUT_SECS),
         tokio::process::Command::new("python3")
             .arg("-c")
             .arg(&script)
             .output(),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("GPU evidence subprocess timed out after 60s"))?
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "GPU evidence subprocess timed out after {GPU_EVIDENCE_COLLECTION_TIMEOUT_SECS}s"
+        )
+    })?
     .map_err(|e| anyhow::anyhow!("Failed to run GPU evidence subprocess: {e}"))?;
 
     if !output.status.success() {

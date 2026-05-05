@@ -4,6 +4,11 @@ use axum::middleware;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use tokio::net::TcpListener;
 use tracing::info;
+use vllm_proxy_rs::ohttp_gateway::OhttpGateway;
+use vllm_proxy_rs::{
+    attestation, backend_pool, cache, config, metrics_middleware, rate_limit,
+    request_id_middleware, routes, signing, startup_checks, AppState,
+};
 
 /// DNS resolver that returns only IPv4 addresses.
 ///
@@ -17,20 +22,33 @@ struct Ipv4OnlyResolver;
 impl Resolve for Ipv4OnlyResolver {
     fn resolve(&self, name: Name) -> Resolving {
         Box::pin(async move {
-            let addrs = tokio::net::lookup_host(format!("{}:0", name.as_str()))
+            let v4: Vec<_> = tokio::net::lookup_host(format!("{}:0", name.as_str()))
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
-                .filter(|a| a.is_ipv4());
-            Ok(Box::new(addrs) as Addrs)
+                .filter(|a| a.is_ipv4())
+                .collect();
+            if v4.is_empty() {
+                tracing::warn!(domain = %name.as_str(), "DNS returned no IPv4 addresses");
+            }
+            Ok(Box::new(v4.into_iter()) as Addrs)
         })
     }
 }
 
-use vllm_proxy_rs::ohttp_gateway::OhttpGateway;
-use vllm_proxy_rs::{
-    attestation, backend_pool, cache, config, metrics_middleware, rate_limit,
-    request_id_middleware, routes, signing, startup_checks, AppState,
-};
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[tokio::test]
+    async fn ipv4_only_resolver_filters_out_ipv6() {
+        let r = Ipv4OnlyResolver;
+        let name = reqwest::dns::Name::from_str("localhost").unwrap();
+        let addrs: Vec<_> = r.resolve(name).await.unwrap().collect();
+        assert!(!addrs.is_empty(), "localhost should resolve");
+        assert!(addrs.iter().all(|a| a.is_ipv4()), "got non-IPv4: {addrs:?}");
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

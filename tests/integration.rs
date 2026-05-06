@@ -6495,3 +6495,103 @@ async fn test_ohttp_chunked_large_response() {
 
     server_handle.abort();
 }
+
+// Test: chunked OHTTP responses use BHTTP indeterminate-length framing.
+//
+// Guards against a regression where the proxy buffers the upstream body and
+// falls back to KnownLength framing — at that point chunked OHTTP collapses
+// back to standard OHTTP TTFT (the original Phase-1 behaviour).
+#[tokio::test]
+async fn test_ohttp_chunked_uses_indeterminate_length_framing() {
+    use futures_util::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::compat::TokioAsyncWriteCompatExt;
+
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-framing",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })))
+        .mount(&mock)
+        .await;
+
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock.uri()).await;
+
+    let mut inner_req = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/chat/completions".to_vec(),
+    );
+    inner_req.put_header("content-type", "application/json");
+    inner_req.put_header("authorization", "Bearer test-token");
+    inner_req.write_content(
+        serde_json::to_vec(&serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false
+        }))
+        .unwrap(),
+    );
+
+    let mut bhttp_bytes = Vec::new();
+    inner_req
+        .write_bhttp(bhttp::Mode::KnownLength, &mut bhttp_bytes)
+        .unwrap();
+
+    // Encrypt the request via the streaming client API so we can hold onto the
+    // ClientRequest state and decrypt the chunked response.
+    let mut config = ohttp::KeyConfig::decode(&config_bytes).unwrap();
+    let client = ohttp::ClientRequest::from_config(&mut config).unwrap();
+
+    let (mut pipe_read, pipe_write) = tokio::io::duplex(64 * 1024);
+    let mut client_request = client
+        .encapsulate_stream(pipe_write.compat_write())
+        .unwrap();
+    client_request.write_all(&bhttp_bytes).await.unwrap();
+    client_request.close().await.unwrap();
+
+    let mut enc_request = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut pipe_read, &mut enc_request)
+        .await
+        .unwrap();
+
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/ohttp"))
+        .header("content-type", "message/ohttp-chunked-req")
+        .body(enc_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let enc_response = response.bytes().await.unwrap();
+
+    let mut client_response = client_request.response(&enc_response[..]).unwrap();
+    let mut decrypted = Vec::new();
+    client_response.read_to_end(&mut decrypted).await.unwrap();
+
+    // BHTTP framing indicator (first varint of the message): 3 = response,
+    // indeterminate-length. KnownLength would encode as 1.
+    assert_eq!(
+        decrypted[0], 3,
+        "expected BHTTP indeterminate-length response framing (3), got {} — \
+         a value of 1 means the proxy reverted to buffered KnownLength encoding",
+        decrypted[0]
+    );
+
+    // And the body must still be parseable end-to-end.
+    let inner_resp = bhttp::Message::read_bhttp(&mut Cursor::new(&decrypted[..])).unwrap();
+    assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+    let body: serde_json::Value = serde_json::from_slice(inner_resp.content()).unwrap();
+    assert_eq!(body["id"], "chatcmpl-framing");
+
+    server_handle.abort();
+}

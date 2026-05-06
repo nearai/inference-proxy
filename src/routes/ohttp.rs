@@ -170,9 +170,13 @@ async fn ohttp_relay_standard(
 
 /// Chunked OHTTP: decapsulate request, stream encrypted response chunks.
 ///
-/// The response body is streamed incrementally through the OHTTP writer —
-/// each ~16KB of plaintext becomes an independently-decryptable encrypted
-/// chunk, giving clients low time-to-first-chunk for long responses.
+/// Backend body chunks are translated 1:1 into BHTTP indeterminate-length
+/// content chunks (RFC 9292 §6) and written immediately to the OHTTP writer.
+/// The OHTTP layer encrypts in ~16KB AEAD chunks, so once the BHTTP framing
+/// has emitted enough data the client can decrypt and surface partial output
+/// while the upstream is still producing — the previous implementation
+/// buffered the whole upstream body before emitting any framing, which
+/// collapsed back to the same TTFT as standard OHTTP.
 async fn ohttp_relay_chunked(
     state: &AppState,
     gateway: &crate::ohttp_gateway::OhttpGateway,
@@ -209,11 +213,10 @@ async fn ohttp_relay_chunked(
     let loopback_response = send_loopback(request_builder).await?;
     let response_status = loopback_response.status().as_u16();
 
-    // Collect response headers (available immediately, before body).
-    let bhttp_status =
-        bhttp::StatusCode::try_from(response_status).unwrap_or(bhttp::StatusCode::OK);
-    let mut bhttp_header_msg = bhttp::Message::response(bhttp_status);
-    copy_response_headers(&loopback_response, &mut bhttp_header_msg);
+    // Collect response headers (available immediately, before body) as raw
+    // (name, value) pairs — we write the BHTTP framing manually so we don't
+    // build a `bhttp::Message` here.
+    let response_headers = collect_response_headers(&loopback_response);
 
     // Use a duplex pipe: write side → ServerResponse (encrypts in ~16KB AEAD chunks),
     // read side → HTTP response body streamed to client.
@@ -234,24 +237,45 @@ async fn ohttp_relay_chunked(
     );
 
     // Spawn a task that streams the backend response body through the OHTTP writer.
-    // The OHTTP ServerResponse encrypts in ~16KB AEAD chunks automatically —
-    // the client can decrypt each chunk as it arrives without waiting for the full body.
+    // BHTTP indeterminate-length framing lets us emit each upstream chunk as a
+    // length-prefixed content chunk without knowing the total body size up front.
     tokio::spawn(async move {
-        // Encode the bhttp response header (status + headers) with KnownLength
-        // for the header section, then stream body bytes directly into the writer.
-        // Since bhttp::Message can't be written incrementally, we write the full
-        // bhttp in one go per body chunk. Instead, we collect the body and write
-        // the complete bhttp message, but we do so through the OHTTP streaming
-        // writer which encrypts incrementally.
-        //
-        // Stream the backend response: read chunks → accumulate → encode bhttp → write.
-        // Each write to ohttp_writer gets encrypted in ~16KB AEAD chunks.
-        let mut body_chunks = loopback_response.bytes_stream();
-        let mut body_buf = Vec::new();
+        // Header section: framing indicator + status + headers + terminator.
+        if let Err(e) = write_indeterminate_response_header(
+            &mut ohttp_writer,
+            response_status,
+            &response_headers,
+        )
+        .await
+        {
+            warn!(error = %e, "Failed to write BHTTP response header");
+            let _ = ohttp_writer.close().await;
+            return;
+        }
 
+        // Body section: each upstream chunk → one BHTTP content chunk.
+        let mut body_chunks = loopback_response.bytes_stream();
         while let Some(chunk_result) = body_chunks.next().await {
             match chunk_result {
-                Ok(chunk) => body_buf.extend_from_slice(&chunk),
+                Ok(chunk) if chunk.is_empty() => continue,
+                Ok(chunk) => {
+                    if let Err(e) = bhttp_write_vec(&mut ohttp_writer, &chunk).await {
+                        warn!(
+                            error = %e,
+                            "Failed to write BHTTP body chunk (client may have disconnected)"
+                        );
+                        let _ = ohttp_writer.close().await;
+                        return;
+                    }
+                    // Push the encrypted bytes downstream as soon as the OHTTP
+                    // layer has accumulated a full AEAD chunk — without flush
+                    // it only writes when its 16KB seal buffer fills up.
+                    if let Err(e) = ohttp_writer.flush().await {
+                        warn!(error = %e, "Failed to flush OHTTP stream");
+                        let _ = ohttp_writer.close().await;
+                        return;
+                    }
+                }
                 Err(e) => {
                     warn!(error = %e, "Error reading backend response stream");
                     break;
@@ -259,26 +283,19 @@ async fn ohttp_relay_chunked(
             }
         }
 
-        // Build the complete bhttp message and write to the OHTTP stream writer.
-        bhttp_header_msg.write_content(&body_buf);
-        let mut bhttp_bytes = Vec::new();
-        if let Err(e) = bhttp_header_msg.write_bhttp(bhttp::Mode::KnownLength, &mut bhttp_bytes) {
-            warn!(error = %e, "Failed to encode bhttp response");
+        // Body terminator (also serves as "empty body" if no chunks were written)
+        // followed by an empty trailer field section.
+        if let Err(e) = bhttp_write_varint(&mut ohttp_writer, 0).await {
+            warn!(error = %e, "Failed to write BHTTP body terminator");
+            let _ = ohttp_writer.close().await;
+            return;
+        }
+        if let Err(e) = bhttp_write_varint(&mut ohttp_writer, 0).await {
+            warn!(error = %e, "Failed to write BHTTP trailer terminator");
             let _ = ohttp_writer.close().await;
             return;
         }
 
-        // Write the bhttp bytes in chunks to the OHTTP writer. The OHTTP layer
-        // encrypts in ~16KB AEAD chunks, so for large responses the client gets
-        // independently-decryptable chunks as we write.
-        const WRITE_CHUNK_SIZE: usize = 16 * 1024;
-        for chunk in bhttp_bytes.chunks(WRITE_CHUNK_SIZE) {
-            if let Err(e) = ohttp_writer.write_all(chunk).await {
-                warn!(error = %e, "Failed to write to OHTTP stream (client may have disconnected)");
-                let _ = ohttp_writer.close().await;
-                return;
-            }
-        }
         if let Err(e) = ohttp_writer.close().await {
             warn!(error = %e, "Failed to close OHTTP stream");
         }
@@ -295,6 +312,95 @@ async fn ohttp_relay_chunked(
         body,
     )
         .into_response())
+}
+
+// ── BHTTP indeterminate-length streaming framing ─────────────────────
+//
+// We can't use `bhttp::Message::write_bhttp` on the streaming path because it
+// requires the whole body up front (it length-prefixes everything in a single
+// `write_vec`). For RFC 9292 §6 indeterminate-length framing the wire format is
+// just a sequence of QUIC-style varint-prefixed byte vectors, which is small
+// enough to write directly.
+
+/// Write an RFC 9000 §16 variable-length integer.
+async fn bhttp_write_varint<W>(w: &mut W, v: u64) -> std::io::Result<()>
+where
+    W: futures_util::AsyncWrite + Unpin,
+{
+    if v < (1 << 6) {
+        w.write_all(&[v as u8]).await
+    } else if v < (1 << 14) {
+        let bytes = ((v as u16) | (1 << 14)).to_be_bytes();
+        w.write_all(&bytes).await
+    } else if v < (1 << 30) {
+        let bytes = ((v as u32) | (2 << 30)).to_be_bytes();
+        w.write_all(&bytes).await
+    } else if v < (1u64 << 62) {
+        let bytes = (v | (3u64 << 62)).to_be_bytes();
+        w.write_all(&bytes).await
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "BHTTP varint value too large",
+        ))
+    }
+}
+
+/// Write a varint length-prefix followed by the bytes (BHTTP "vec" encoding).
+async fn bhttp_write_vec<W>(w: &mut W, bytes: &[u8]) -> std::io::Result<()>
+where
+    W: futures_util::AsyncWrite + Unpin,
+{
+    bhttp_write_varint(w, bytes.len() as u64).await?;
+    if !bytes.is_empty() {
+        w.write_all(bytes).await?;
+    }
+    Ok(())
+}
+
+/// Write the framing indicator + control data + header field section + terminator
+/// for an indeterminate-length BHTTP response.
+async fn write_indeterminate_response_header<W>(
+    w: &mut W,
+    status: u16,
+    headers: &[(Vec<u8>, Vec<u8>)],
+) -> std::io::Result<()>
+where
+    W: futures_util::AsyncWrite + Unpin,
+{
+    // Framing indicator: 3 = response, indeterminate-length.
+    bhttp_write_varint(w, 3).await?;
+    // Control data for response: just the status code as a varint.
+    bhttp_write_varint(w, u64::from(status)).await?;
+    // Header field section: each (name, value) as a pair of vecs, terminated
+    // by an empty-name vec (a single varint(0)).
+    for (name, value) in headers {
+        bhttp_write_vec(w, name).await?;
+        bhttp_write_vec(w, value).await?;
+    }
+    bhttp_write_varint(w, 0).await?;
+    Ok(())
+}
+
+/// Collect response headers as raw byte pairs, filtering hop-by-hop headers.
+/// `reqwest::HeaderName::as_str` is already lowercase, which matches the
+/// BHTTP requirement that field names be lowercase (RFC 9292 §3.5.2).
+fn collect_response_headers(response: &reqwest::Response) -> Vec<(Vec<u8>, Vec<u8>)> {
+    response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            let n = name.as_str();
+            if n.eq_ignore_ascii_case("transfer-encoding")
+                || n.eq_ignore_ascii_case("connection")
+                || n.eq_ignore_ascii_case("content-length")
+            {
+                None
+            } else {
+                Some((n.as_bytes().to_vec(), value.as_bytes().to_vec()))
+            }
+        })
+        .collect()
 }
 
 // ── Shared helpers ──────────────────────────────────────────────────
@@ -402,5 +508,87 @@ fn copy_response_headers(response: &reqwest::Response, bhttp_msg: &mut bhttp::Me
         {
             bhttp_msg.put_header(name.as_str(), value.as_bytes());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    use futures_util::io::Cursor as FuturesCursor;
+
+    async fn varint_bytes(v: u64) -> Vec<u8> {
+        let mut buf = FuturesCursor::new(Vec::new());
+        bhttp_write_varint(&mut buf, v).await.unwrap();
+        buf.into_inner()
+    }
+
+    #[tokio::test]
+    async fn varint_encoding_matches_quic_lengths() {
+        // 1-byte form: 0..=63
+        assert_eq!(varint_bytes(0).await, vec![0x00]);
+        assert_eq!(varint_bytes(63).await, vec![0x3f]);
+        // 2-byte form: 64..=16383
+        assert_eq!(varint_bytes(64).await, vec![0x40, 0x40]);
+        assert_eq!(varint_bytes(16383).await, vec![0x7f, 0xff]);
+        // 4-byte form: 16384..=1073741823
+        assert_eq!(varint_bytes(16384).await, vec![0x80, 0x00, 0x40, 0x00]);
+        // 8-byte form: large value
+        let big = varint_bytes(0x3fff_ffff_ffff_ffff).await;
+        assert_eq!(big.len(), 8);
+        assert_eq!(big[0], 0xff);
+    }
+
+    #[tokio::test]
+    async fn varint_roundtrips_through_bhttp_reader() {
+        // The reader is internal to bhttp, but Message::read_bhttp parses the
+        // framing indicator as a varint, so we can exercise our writer end-to-end
+        // by feeding a complete indeterminate-length message into it.
+        let mut buf = FuturesCursor::new(Vec::new());
+        write_indeterminate_response_header(
+            &mut buf,
+            200,
+            &[
+                (b"content-type".to_vec(), b"application/json".to_vec()),
+                (b"x-test".to_vec(), b"hello".to_vec()),
+            ],
+        )
+        .await
+        .unwrap();
+        // Two body chunks then body terminator + empty trailer.
+        bhttp_write_vec(&mut buf, b"{\"a\":").await.unwrap();
+        bhttp_write_vec(&mut buf, b"1}").await.unwrap();
+        bhttp_write_varint(&mut buf, 0).await.unwrap(); // body terminator
+        bhttp_write_varint(&mut buf, 0).await.unwrap(); // trailer terminator
+
+        let bytes = buf.into_inner();
+        // First byte should be the framing indicator (3 = response indeterminate).
+        assert_eq!(bytes[0], 3);
+
+        let msg = bhttp::Message::read_bhttp(&mut Cursor::new(&bytes[..])).unwrap();
+        assert_eq!(msg.control().status().unwrap().code(), 200);
+        assert_eq!(msg.content(), b"{\"a\":1}");
+        assert_eq!(
+            msg.header().get(b"content-type"),
+            Some(b"application/json".as_ref())
+        );
+        assert_eq!(msg.header().get(b"x-test"), Some(b"hello".as_ref()));
+    }
+
+    #[tokio::test]
+    async fn empty_body_roundtrips() {
+        let mut buf = FuturesCursor::new(Vec::new());
+        write_indeterminate_response_header(&mut buf, 204, &[])
+            .await
+            .unwrap();
+        // No body chunks. Single body terminator + trailer terminator.
+        bhttp_write_varint(&mut buf, 0).await.unwrap();
+        bhttp_write_varint(&mut buf, 0).await.unwrap();
+
+        let bytes = buf.into_inner();
+        let msg = bhttp::Message::read_bhttp(&mut Cursor::new(&bytes[..])).unwrap();
+        assert_eq!(msg.control().status().unwrap().code(), 204);
+        assert!(msg.content().is_empty());
     }
 }

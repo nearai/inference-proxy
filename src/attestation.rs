@@ -954,7 +954,18 @@ async fn collect_gpu_evidence_with_nonce_check(
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
 
-        let evidence = if let Some(cache) = cache {
+        // Three backends, in priority order:
+        //   1. nv-attestation-sdk (Rust → C FFI, opt-in via env var)
+        //   2. cache's persistent Python worker (existing default)
+        //   3. one-shot Python subprocess (fallback when no cache)
+        // The self-check + retry below applies regardless of which one
+        // produced the evidence.
+        let evidence = if crate::attestation_sdk::is_active() && !gpu_no_hw_mode {
+            // SDK path doesn't support no_gpu_mode (it requires real
+            // hardware via NVML); fall back to the Python paths for
+            // dev/test environments without GPUs.
+            crate::attestation_sdk::collect_gpu_evidence_via_sdk(nonce_hex).await?
+        } else if let Some(cache) = cache {
             cache
                 .collect_gpu_evidence(nonce_hex, gpu_no_hw_mode)
                 .await?

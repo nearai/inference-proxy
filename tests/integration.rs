@@ -6495,3 +6495,346 @@ async fn test_ohttp_chunked_large_response() {
 
     server_handle.abort();
 }
+
+// Test: chunked OHTTP responses use BHTTP indeterminate-length framing.
+//
+// Guards against a regression where the proxy buffers the upstream body and
+// falls back to KnownLength framing — at that point chunked OHTTP collapses
+// back to standard OHTTP TTFT (the original Phase-1 behaviour).
+#[tokio::test]
+async fn test_ohttp_chunked_uses_indeterminate_length_framing() {
+    use futures_util::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::compat::TokioAsyncWriteCompatExt;
+
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-framing",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })))
+        .mount(&mock)
+        .await;
+
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock.uri()).await;
+
+    let mut inner_req = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/chat/completions".to_vec(),
+    );
+    inner_req.put_header("content-type", "application/json");
+    inner_req.put_header("authorization", "Bearer test-token");
+    inner_req.write_content(
+        serde_json::to_vec(&serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false
+        }))
+        .unwrap(),
+    );
+
+    let mut bhttp_bytes = Vec::new();
+    inner_req
+        .write_bhttp(bhttp::Mode::KnownLength, &mut bhttp_bytes)
+        .unwrap();
+
+    // Encrypt the request via the streaming client API so we can hold onto the
+    // ClientRequest state and decrypt the chunked response.
+    let mut config = ohttp::KeyConfig::decode(&config_bytes).unwrap();
+    let client = ohttp::ClientRequest::from_config(&mut config).unwrap();
+
+    let (mut pipe_read, pipe_write) = tokio::io::duplex(64 * 1024);
+    let mut client_request = client
+        .encapsulate_stream(pipe_write.compat_write())
+        .unwrap();
+    client_request.write_all(&bhttp_bytes).await.unwrap();
+    client_request.close().await.unwrap();
+
+    let mut enc_request = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut pipe_read, &mut enc_request)
+        .await
+        .unwrap();
+
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/ohttp"))
+        .header("content-type", "message/ohttp-chunked-req")
+        .body(enc_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let enc_response = response.bytes().await.unwrap();
+
+    let mut client_response = client_request.response(&enc_response[..]).unwrap();
+    let mut decrypted = Vec::new();
+    client_response.read_to_end(&mut decrypted).await.unwrap();
+
+    // BHTTP framing indicator (first varint of the message): 3 = response,
+    // indeterminate-length. KnownLength would encode as 1.
+    assert_eq!(
+        decrypted[0], 3,
+        "expected BHTTP indeterminate-length response framing (3), got {} — \
+         a value of 1 means the proxy reverted to buffered KnownLength encoding",
+        decrypted[0]
+    );
+
+    // And the body must still be parseable end-to-end.
+    let inner_resp = bhttp::Message::read_bhttp(&mut Cursor::new(&decrypted[..])).unwrap();
+    assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+    let body: serde_json::Value = serde_json::from_slice(inner_resp.content()).unwrap();
+    assert_eq!(body["id"], "chatcmpl-framing");
+
+    server_handle.abort();
+}
+
+// Spawn a custom axum mock backend that emits SSE chunks with a deliberate
+// per-chunk delay. wiremock can't do per-chunk delays so we hand-roll one.
+//
+// Returns (base_url, abort_handle, finished_rx). `finished_rx` flips to true
+// once the mock has emitted its last SSE event — the test uses this to
+// assert "we observed decrypted bytes BEFORE the upstream finished".
+async fn spawn_streaming_mock(
+    chunks: Vec<&'static str>,
+    per_chunk_delay: std::time::Duration,
+) -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    tokio::sync::watch::Receiver<bool>,
+) {
+    use axum::body::Body as AxumBody;
+    use axum::routing::post;
+
+    let (finish_tx, finish_rx) = tokio::sync::watch::channel(false);
+    let finish_tx = Arc::new(finish_tx);
+
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        post({
+            let chunks = chunks.clone();
+            move |body: axum::body::Bytes| {
+                let chunks = chunks.clone();
+                let finish_tx = finish_tx.clone();
+                async move {
+                    let req: serde_json::Value =
+                        serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
+                    let is_stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if !is_stream {
+                        return axum::response::Response::builder()
+                            .status(400)
+                            .body(AxumBody::from("expected stream:true"))
+                            .unwrap();
+                    }
+
+                    let (tx, rx) =
+                        tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(8);
+                    tokio::spawn(async move {
+                        for c in chunks {
+                            tokio::time::sleep(per_chunk_delay).await;
+                            if tx
+                                .send(Ok(axum::body::Bytes::from_static(c.as_bytes())))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        let _ = finish_tx.send(true);
+                    });
+                    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+                    let body = AxumBody::from_stream(stream);
+                    axum::response::Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .header("cache-control", "no-cache")
+                        .body(body)
+                        .unwrap()
+                }
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (format!("http://{addr}"), handle, finish_rx)
+}
+
+// End-to-end streaming test: a slow SSE backend, the chunked OHTTP gateway,
+// a streaming-decrypt client. Asserts that the client observes decrypted
+// SSE bytes BEFORE the upstream emits its last chunk — i.e. real streaming,
+// not "buffer everything then frame the buffered bytes".
+//
+// With Phase-1 buffered framing the FIRST decrypted byte would arrive only
+// AFTER the last upstream chunk plus a small post-processing tail.
+#[tokio::test]
+async fn test_ohttp_chunked_streams_before_upstream_finishes() {
+    use std::time::{Duration, Instant};
+
+    use futures_util::{AsyncReadExt, AsyncWriteExt, StreamExt};
+    use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+    // Six SSE events, 250ms apart → ≥1.5s of upstream emission.
+    let sse_events: Vec<&'static str> = vec![
+        "data: {\"id\":\"c-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"c-2\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" from\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"c-3\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" the\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"c-4\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" streaming\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"c-5\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" mock.\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"c-6\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+    ];
+    let per_chunk_delay = Duration::from_millis(250);
+    let total_emit = per_chunk_delay * (sse_events.len() as u32);
+
+    let (mock_url, mock_handle, mut finished_rx) =
+        spawn_streaming_mock(sse_events, per_chunk_delay).await;
+
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock_url).await;
+
+    // Build the inner BHTTP request: POST /v1/chat/completions with stream:true.
+    let mut inner_req = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/chat/completions".to_vec(),
+    );
+    inner_req.put_header("content-type", "application/json");
+    inner_req.put_header("authorization", "Bearer test-token");
+    inner_req.write_content(
+        serde_json::to_vec(&serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "stream please"}],
+            "stream": true
+        }))
+        .unwrap(),
+    );
+
+    let mut bhttp_bytes = Vec::new();
+    inner_req
+        .write_bhttp(bhttp::Mode::KnownLength, &mut bhttp_bytes)
+        .unwrap();
+
+    let mut config = ohttp::KeyConfig::decode(&config_bytes).unwrap();
+    let client = ohttp::ClientRequest::from_config(&mut config).unwrap();
+
+    let (mut req_pipe_read, req_pipe_write) = tokio::io::duplex(64 * 1024);
+    let mut client_request = client
+        .encapsulate_stream(req_pipe_write.compat_write())
+        .unwrap();
+    client_request.write_all(&bhttp_bytes).await.unwrap();
+    client_request.close().await.unwrap();
+    let mut enc_request = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut req_pipe_read, &mut enc_request)
+        .await
+        .unwrap();
+
+    // Send the chunked OHTTP request and stream the response body.
+    let started = Instant::now();
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/ohttp"))
+        .header("content-type", "message/ohttp-chunked-req")
+        .body(enc_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    // Pump the encrypted response bytes from reqwest into a duplex pipe so the
+    // OHTTP ClientResponse decrypter (an AsyncRead) can consume them streaming.
+    let (mut resp_pipe_write, resp_pipe_read) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt as TokioAsyncWriteExt;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(b) => {
+                    if TokioAsyncWriteExt::write_all(&mut resp_pipe_write, &b)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+        let _ = TokioAsyncWriteExt::shutdown(&mut resp_pipe_write).await;
+    });
+
+    let mut client_response = client_request.response(resp_pipe_read.compat()).unwrap();
+
+    // Read decrypted plaintext incrementally and timestamp the first yield.
+    let mut decrypted = Vec::new();
+    let mut buf = vec![0u8; 4096];
+    let mut first_byte_at: Option<Duration> = None;
+    let mut yields = 0usize;
+
+    loop {
+        let n = client_response.read(&mut buf).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        if first_byte_at.is_none() {
+            first_byte_at = Some(started.elapsed());
+        }
+        yields += 1;
+        decrypted.extend_from_slice(&buf[..n]);
+    }
+
+    let total_elapsed = started.elapsed();
+    let upstream_done_when_decrypt_finished = *finished_rx.borrow();
+    let _ = finished_rx.changed().await;
+
+    let first_byte_at = first_byte_at.expect("never received any decrypted bytes");
+
+    // Sanity: BHTTP framing parses end-to-end and contains every SSE event.
+    let inner_resp = bhttp::Message::read_bhttp(&mut Cursor::new(&decrypted[..])).unwrap();
+    assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+    let body_str = String::from_utf8_lossy(inner_resp.content()).to_string();
+    assert!(body_str.contains("\"c-1\""), "missing first SSE event");
+    assert!(body_str.contains("\"c-6\""), "missing final SSE event");
+    assert!(body_str.contains("[DONE]"));
+
+    println!(
+        "streaming-test results:\n  upstream emit window: ~{:?}\n  TTFB (first decrypted byte): {:?}\n  total elapsed: {:?}\n  read yields: {}\n  upstream finished by decrypt-end? {}",
+        total_emit,
+        first_byte_at,
+        total_elapsed,
+        yields,
+        upstream_done_when_decrypt_finished
+    );
+
+    // Streaming assertion: we should have seen the first decrypted byte well
+    // before the upstream finished. With a 1.5s upstream and this PR's
+    // streaming framing TTFB is ≈ 250–400ms; with buffered framing it was
+    // ≥1.5s.
+    assert!(
+        first_byte_at < total_emit,
+        "first decrypted byte arrived at {first_byte_at:?}, but the upstream needed at least \
+         {total_emit:?} to emit all chunks — proxy must be buffering the body"
+    );
+    // Tighter bound: comfortably under the upstream window even on slow CI.
+    assert!(
+        first_byte_at < total_emit / 2 + Duration::from_millis(500),
+        "first decrypted byte at {first_byte_at:?}, expected ≪ {total_emit:?} on a streaming gateway"
+    );
+    // Multiple yields confirm chunks arrive separately, not bundled.
+    assert!(
+        yields > 1,
+        "expected multiple decrypted yields, got {yields} — gateway likely shipped one big AEAD chunk"
+    );
+
+    server_handle.abort();
+    mock_handle.abort();
+}

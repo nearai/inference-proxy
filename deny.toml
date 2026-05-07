@@ -4,6 +4,9 @@ ignore = [
     # paste is unmaintained but is a transitive dep from alloy-primitives;
     # no action we can take until alloy migrates away from it
     "RUSTSEC-2024-0436",
+    # derivative is unmaintained — transitive dep from dstack-sdk -> alloy
+    # -> ruint -> ark-ff. Informational only (no security issue).
+    "RUSTSEC-2024-0388",
     # hickory-proto 0.25 has two DoS advisories (RUSTSEC-2026-0118: NSEC3
     # closest-encloser unbounded loop in DnssecDnsHandle; RUSTSEC-2026-0119:
     # O(n^2) name compression while ENCODING DNS messages). Both are reachable

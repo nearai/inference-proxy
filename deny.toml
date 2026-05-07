@@ -48,3 +48,9 @@ wildcards = "allow"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+allow-git = [
+    # NVIDIA's attestation SDK Rust bindings (libnvat FFI). Not yet on
+    # crates.io; pinned to release tag 2026.04.29 in Cargo.toml. Optional
+    # `nv-attestation-sdk` feature only — default builds don't pull this.
+    "https://github.com/NVIDIA/attestation-sdk.git",
+]

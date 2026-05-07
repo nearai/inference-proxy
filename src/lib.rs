@@ -6,6 +6,7 @@ use axum::response::Response;
 use tracing::Instrument;
 
 pub mod attestation;
+pub mod attestation_sdk;
 pub mod auth;
 pub mod backend_pool;
 pub mod cache;

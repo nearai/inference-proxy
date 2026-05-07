@@ -57,6 +57,14 @@ jobs:
           sudo apt-get install -y skopeo jq
 
       - name: Build and push reproducible image
+        env:
+          # Build with the nv-attestation-sdk Cargo feature so the
+          # runtime image ships libnvat.so. Independent of whether the
+          # SDK code path is actually used at runtime — that's still
+          # gated by the USE_NV_ATTESTATION_SDK env var on the CVM.
+          # Lets a single image flip between Python and SDK backends
+          # via env-var change, no rebuild.
+          ENABLE_NV_ATTESTATION_SDK: "1"
         run: |
           ./build-image.sh --push "${{ env.IMAGE_REFERENCE }}"
 

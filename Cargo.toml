@@ -48,7 +48,7 @@ regex = "1"
 hex = "0.4"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
-rand = "0.9"
+rand = "0.10"
 percent-encoding = "2"
 bytes = "1"
 thiserror = "2"

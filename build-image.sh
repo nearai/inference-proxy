@@ -50,8 +50,15 @@ if [ "$PUSH" = false ]; then
     BUILD_OUTPUTS+=(--output "type=docker,name=$TEMP_TAG,rewrite-timestamp=true")
 fi
 
+# ENABLE_NV_ATTESTATION_SDK=1 → build with the nv-attestation-sdk Cargo
+# feature, link against libnvat.so, and ship libnvat in the runtime image
+# (adds ~5 MB and ~30s of apt install). Defaults to 0 so local dev
+# builds stay unchanged; the production CI workflow flips it to 1.
+: "${ENABLE_NV_ATTESTATION_SDK:=0}"
+
 docker buildx build --builder buildkit_20 --no-cache --platform linux/amd64 \
     --build-arg SOURCE_DATE_EPOCH="0" \
+    --build-arg "ENABLE_NV_ATTESTATION_SDK=${ENABLE_NV_ATTESTATION_SDK}" \
     "${BUILD_OUTPUTS[@]}" .
 
 if [ "$?" -ne 0 ]; then

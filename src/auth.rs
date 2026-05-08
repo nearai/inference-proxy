@@ -1,6 +1,5 @@
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
-use rand::Rng;
 use subtle::ConstantTimeEq;
 use tracing::warn;
 
@@ -197,7 +196,7 @@ fn backoff_delay(initial_ms: u64, attempt: usize) -> std::time::Duration {
     }
     let exp = (attempt as u32).saturating_sub(1).min(10);
     let upper = initial_ms.saturating_mul(1u64 << exp).min(5_000);
-    let jitter = rand::rng().random_range(0..=upper);
+    let jitter = rand::random_range(0..=upper);
     std::time::Duration::from_millis(jitter)
 }
 

@@ -95,6 +95,8 @@ fn build_test_app_inner(
         ohttp_enabled: false,
         listen_port: 8000,
         dstack_socket_path,
+        gpu_evidence_delegate_url: None,
+        gpu_evidence_delegate_timeout_secs: 30,
     };
 
     // Use fixed keys for deterministic tests
@@ -3048,6 +3050,8 @@ fn build_test_app_with_cloud_api_retries(
         ohttp_enabled: false,
         listen_port: 8000,
         dstack_socket_path: "/var/run/dstack.sock".to_string(),
+        gpu_evidence_delegate_url: None,
+        gpu_evidence_delegate_timeout_secs: 30,
     };
 
     let ecdsa_key: [u8; 32] = [
@@ -5220,6 +5224,8 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         ohttp_enabled: true,
         listen_port: 0, // not used in oneshot tests
         dstack_socket_path: "/var/run/dstack.sock".to_string(),
+        gpu_evidence_delegate_url: None,
+        gpu_evidence_delegate_timeout_secs: 30,
     };
 
     let ecdsa_key: [u8; 32] = [
@@ -5606,6 +5612,8 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         ohttp_enabled: true,
         listen_port: port,
         dstack_socket_path: "/var/run/dstack.sock".to_string(),
+        gpu_evidence_delegate_url: None,
+        gpu_evidence_delegate_timeout_secs: 30,
     };
 
     let ecdsa = signing::EcdsaContext::from_key_bytes(&ecdsa_key).unwrap();

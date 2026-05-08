@@ -56,6 +56,12 @@ pub async fn attestation_report(
     }
 
     let include_tls = query.include_tls_fingerprint.unwrap_or(false);
+    let delegate_ctx = state.config.gpu_evidence_delegate_url.as_ref().map(|_| {
+        crate::attestation::DelegateContext {
+            config: &state.config,
+            http_client: &state.http_client,
+        }
+    });
     let result = crate::attestation::generate_attestation(
         crate::attestation::AttestationParams {
             model_name: &state.config.model_name,
@@ -72,6 +78,7 @@ pub async fn attestation_report(
             },
         },
         Some(&state.attestation_cache),
+        delegate_ctx.as_ref(),
     )
     .await
     .map_err(|e| match e {

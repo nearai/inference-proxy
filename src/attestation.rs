@@ -624,14 +624,7 @@ fn parse_nonce(nonce: Option<&str>) -> Result<[u8; 32], AttestationError> {
             arr.copy_from_slice(&bytes);
             Ok(arr)
         }
-        None => {
-            let mut arr = [0u8; 32];
-            use rand::rand_core::TryRngCore;
-            rand::rngs::OsRng
-                .try_fill_bytes(&mut arr)
-                .expect("Failed to generate random nonce bytes");
-            Ok(arr)
-        }
+        None => Ok(rand::random()),
     }
 }
 

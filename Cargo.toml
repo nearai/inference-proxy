@@ -22,15 +22,15 @@ dstack-sdk = "0.1.2"
 # Crypto
 k256 = { version = "0.13", features = ["ecdsa", "ecdh"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-sha2 = "0.10"
+sha2 = "0.11"
 x509-parser = "0.18"
-sha3 = "0.10"
+sha3 = "0.11"
 subtle = "2.5"
 crypto_box = { version = "0.9", features = ["chacha20"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 chacha20poly1305 = "0.10"
 aes-gcm = "0.10"
-hkdf = "0.12"
+hkdf = "0.13"
 ohttp = { version = "0.7", features = ["server", "stream", "rust-hpke"] }
 bhttp = "0.7"
 
@@ -48,7 +48,7 @@ regex = "1"
 hex = "0.4"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
-rand = "0.9"
+rand = "0.10"
 percent-encoding = "2"
 bytes = "1"
 thiserror = "2"

@@ -1502,6 +1502,73 @@ async fn test_streaming_signature_cached_and_verifiable() {
     assert_eq!(sig_hex.len(), 132); // 65 bytes hex + "0x"
 }
 
+// ---- Internal endpoints (delegate proxy) ----
+
+#[tokio::test]
+async fn test_internal_gpu_evidence_requires_auth() {
+    // The internal route is for sibling proxies on the same host;
+    // it MUST require auth to keep the loop guard meaningful.
+    let app = build_test_app("http://unused");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/gpu_evidence")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"nonce":"00"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_internal_gpu_evidence_rejects_short_nonce() {
+    // Short / non-hex / wrong-length nonces should be a clean 400,
+    // not a deeper 500 from the SDK / Python paths.
+    let app = build_test_app("http://unused");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/gpu_evidence")
+                .header(auth_header().0, auth_header().1)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"nonce":"deadbeef"}"#)) // only 4 bytes
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_internal_gpu_evidence_rejects_non_hex_nonce() {
+    let app = build_test_app("http://unused");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/gpu_evidence")
+                .header(auth_header().0, auth_header().1)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"nonce":"not-hex-at-all-with-some-padding-to-pretend-32-bytes!!!!!!!!"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
 // ---- Attestation endpoint ----
 
 #[tokio::test]

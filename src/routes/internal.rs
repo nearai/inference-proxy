@@ -39,8 +39,11 @@ pub async fn gpu_evidence(
     _auth: RequireAuth,
     Json(req): Json<DelegateRequest>,
 ) -> Result<Json<DelegateResponse>, AppError> {
-    // Validate the nonce up front so we surface a clean 400 instead of
-    // a generic 500 from `parse_nonce` deep in the call stack.
+    // Decode + length-check the nonce up front so a malformed request
+    // surfaces a clean 400 instead of a generic 500 from the SDK /
+    // Python paths deep in the call stack. We need the bytes anyway
+    // for `collect_gpu_evidence_with_nonce_check` to verify the
+    // self-check binding at offset 4..36.
     let nonce_bytes: [u8; 32] = hex::decode(&req.nonce)
         .ok()
         .and_then(|v| <[u8; 32]>::try_from(v).ok())

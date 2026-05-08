@@ -70,9 +70,10 @@ pub struct DelegateResponse {
 }
 
 /// Returns true when the operator has configured a delegate URL via
-/// `GPU_EVIDENCE_DELEGATE_URL`. Cheap to call (just an `Option::is_some`
-/// on the cached config); the dispatch in `attestation.rs` calls it
-/// once per evidence-collection attempt.
+/// `GPU_EVIDENCE_DELEGATE_URL`. Currently unused by the dispatch path
+/// in `attestation.rs` (which checks the `Option<&DelegateContext>`
+/// the caller passes in directly), but kept as a single source of
+/// truth for "is delegation configured?" if other callers need it.
 pub fn is_active(cfg: &crate::config::Config) -> bool {
     cfg.gpu_evidence_delegate_url.is_some()
 }
@@ -87,10 +88,13 @@ pub fn is_active(cfg: &crate::config::Config) -> bool {
 ///
 /// Caller-side timeout comes from
 /// `cfg.gpu_evidence_delegate_timeout_secs`. Network errors and
-/// non-2xx responses bubble up as `anyhow::Error`; the calling
-/// retry loop in `collect_gpu_evidence_with_nonce_check` will
-/// retry-with-backoff up to its configured budget, then surface a
-/// clean error to cloud-api so it rotates to a different backend.
+/// non-2xx responses bubble up as `anyhow::Error`. Note that the
+/// outer retry loop in `collect_gpu_evidence_with_nonce_check`
+/// only retries on *nonce mismatches* (the firmware race we're
+/// guarding against) — transport failures from the delegate
+/// short-circuit the loop and are surfaced to cloud-api so it can
+/// rotate to a different backend, rather than burning the retry
+/// budget on a delegate that's flat-out down.
 pub async fn collect_via_delegate(
     cfg: &crate::config::Config,
     http_client: &reqwest::Client,
@@ -106,7 +110,28 @@ pub async fn collect_via_delegate(
             "collect_via_delegate: no admin TOKEN configured to authenticate with delegate"
         )
     })?;
+    collect_via_delegate_inner(
+        http_client,
+        base_url,
+        token,
+        Duration::from_secs(cfg.gpu_evidence_delegate_timeout_secs),
+        nonce_hex,
+        gpu_no_hw_mode,
+    )
+    .await
+}
 
+/// Lower-level helper that doesn't require a full `Config` — kept
+/// `pub(crate)` so unit tests can drive it against a wiremock server
+/// without standing up the whole config struct.
+pub(crate) async fn collect_via_delegate_inner(
+    http_client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    timeout: Duration,
+    nonce_hex: &str,
+    gpu_no_hw_mode: bool,
+) -> anyhow::Result<serde_json::Value> {
     let url = format!("{base_url}/internal/gpu_evidence");
     let req = DelegateRequest {
         nonce: nonce_hex.to_string(),
@@ -115,7 +140,7 @@ pub async fn collect_via_delegate(
 
     let response = http_client
         .post(&url)
-        .timeout(Duration::from_secs(cfg.gpu_evidence_delegate_timeout_secs))
+        .timeout(timeout)
         .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
         .json(&req)
         .send()
@@ -124,13 +149,13 @@ pub async fn collect_via_delegate(
 
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!(
-            "delegate {url} returned HTTP {status}: {}",
-            // Cap body in the error message; some error responses can
-            // be large (full evidence payloads on certain misconfigs).
-            body.chars().take(500).collect::<String>()
-        );
+        // Read at most ERROR_BODY_CAP bytes — some error responses can
+        // carry full evidence payloads on certain misconfigs and we
+        // don't want to allocate megabytes just to log a snippet.
+        const ERROR_BODY_CAP: usize = 2048;
+        let bytes = response.bytes().await.unwrap_or_default();
+        let snippet = String::from_utf8_lossy(&bytes[..bytes.len().min(ERROR_BODY_CAP)]);
+        anyhow::bail!("delegate {url} returned HTTP {status}: {}", snippet);
     }
 
     let parsed: DelegateResponse = response
@@ -167,5 +192,84 @@ mod tests {
         let resp: DelegateResponse = serde_json::from_str(body).unwrap();
         assert!(resp.evidence_list.is_array());
         assert_eq!(resp.evidence_list.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn collect_via_delegate_inner_forwards_request_and_unwraps_evidence_list() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let nonce = "a".repeat(64);
+
+        Mock::given(method("POST"))
+            .and(path("/internal/gpu_evidence"))
+            .and(header("authorization", "Bearer test-token"))
+            .and(body_json(serde_json::json!({
+                "nonce": nonce,
+                "no_gpu_mode": false,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "evidence_list": [{"arch": "HOPPER", "evidence": "…"}],
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let evidence_list = collect_via_delegate_inner(
+            &client,
+            &server.uri(),
+            "test-token",
+            Duration::from_secs(5),
+            &nonce,
+            false,
+        )
+        .await
+        .expect("delegate call succeeded");
+
+        // Caller receives the unwrapped `evidence_list` array, ready
+        // to splice into the outer nvidia_payload.
+        let arr = evidence_list.as_array().expect("evidence_list is an array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["arch"], "HOPPER");
+    }
+
+    #[tokio::test]
+    async fn collect_via_delegate_inner_surfaces_non_2xx_with_capped_body() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // 8 KiB body — should be truncated to ~2 KiB in the error message.
+        let big_body = "x".repeat(8192);
+
+        Mock::given(method("POST"))
+            .and(path("/internal/gpu_evidence"))
+            .respond_with(ResponseTemplate::new(503).set_body_string(big_body))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let err = collect_via_delegate_inner(
+            &client,
+            &server.uri(),
+            "test-token",
+            Duration::from_secs(5),
+            &"b".repeat(64),
+            false,
+        )
+        .await
+        .expect_err("delegate should surface non-2xx as Err");
+
+        let msg = format!("{err}");
+        assert!(msg.contains("503"), "error preserves status: {msg}");
+        // Body cap is 2048 bytes; allow some slack for the surrounding
+        // template ("delegate <url> returned HTTP 503: <snippet>").
+        assert!(
+            msg.len() < 4096,
+            "error message should be capped, got {} bytes",
+            msg.len()
+        );
     }
 }

@@ -36,7 +36,8 @@
 mod inner {
     use anyhow::Context;
     use nv_attestation_sdk::{GpuEvidenceSource, Nonce, NvatSdk, SdkOptions};
-    use tokio::sync::OnceCell;
+    use std::time::Instant;
+    use tokio::sync::{Mutex, OnceCell};
 
     /// Process-lifetime SDK handle.
     ///
@@ -45,6 +46,34 @@ mod inner {
     /// `nvat_sdk_shutdown`. We initialize once at first use and never
     /// drop (the `OnceCell` outlives anything that would call us).
     static SDK: OnceCell<NvatSdk> = OnceCell::const_new();
+
+    /// Serializes GPU evidence collection across all in-process callers.
+    ///
+    /// **Why**: NVML and the GPU firmware do not handle concurrent
+    /// attestation queries from a single process gracefully — under load,
+    /// the C++ SDK's `GpuEvidenceSource::collect` returns errors that
+    /// surface as TCP RSTs to clients. Reproduced 2026-05-08 on gpu07
+    /// GLM-5 with 5 concurrent /v1/attestation/report calls: rounds 4–10
+    /// returned 5/5 `Connection reset by peer` after rounds 1–3 worked
+    /// fine. The Python path doesn't show this because `AttestationCache`
+    /// has its own `gpu_worker: Mutex<...>` that already serializes
+    /// `cc_admin.collect_gpu_evidence_remote` calls — we lost that
+    /// serialization when bypassing the cache for the SDK path.
+    ///
+    /// Cost: serial NVML calls add wait time when concurrency is high.
+    /// In practice cloud-api fires ~10 parallel discovery calls per
+    /// model per refresh (every 5min), spread across backends; per-proxy
+    /// concurrency is typically 2–5. With NVML evidence collection at
+    /// ~1.5–2.5s per call on H100/H200, the worst-case wait under the
+    /// Mutex for 5 queued requests is ~10s — within cloud-api's
+    /// per-request timeout, and far better than the alternative (the
+    /// proxy returning RSTs to half its callers).
+    ///
+    /// We deliberately use `tokio::sync::Mutex` (not std) so contended
+    /// callers yield to the runtime instead of blocking the whole
+    /// thread; the lock is held across `spawn_blocking`, so awaiting
+    /// it is effectively awaiting "your turn at the SDK".
+    static EVIDENCE_COLLECTION: Mutex<()> = Mutex::const_new(());
 
     async fn ensure_sdk_initialized() -> anyhow::Result<()> {
         SDK.get_or_try_init(|| async {
@@ -69,10 +98,24 @@ mod inner {
     /// Runs on a blocking-pool thread so the (`!Send`) source/nonce/
     /// collection objects never cross await points, and so the FFI
     /// calls can't stall the async runtime.
+    ///
+    /// Serialized by `EVIDENCE_COLLECTION` so only one NVML call is in
+    /// flight per process — see that static's docs for why.
     pub async fn collect_gpu_evidence_via_sdk(
         nonce_hex: &str,
     ) -> anyhow::Result<serde_json::Value> {
         ensure_sdk_initialized().await?;
+
+        // Acquire the per-process serialization lock before we kick off
+        // the FFI call. Wait time is observable via the metric below;
+        // a sustained non-zero `gpu_evidence_sdk_lock_wait_total` is the
+        // signal that NVML is the bottleneck under the current load.
+        let wait_start = Instant::now();
+        let _permit = EVIDENCE_COLLECTION.lock().await;
+        let wait_ms = wait_start.elapsed().as_millis() as u64;
+        if wait_ms > 0 {
+            metrics::counter!("gpu_evidence_sdk_lock_wait_total").increment(wait_ms);
+        }
 
         let nonce_hex_owned = nonce_hex.to_string();
         let json_str: String = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
@@ -88,6 +131,9 @@ mod inner {
         })
         .await
         .context("spawn_blocking for SDK evidence collection")??;
+
+        // _permit dropped here, releasing the next waiter.
+        drop(_permit);
 
         serde_json::from_str(&json_str).context("parsing SDK evidence JSON")
     }

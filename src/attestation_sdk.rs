@@ -100,25 +100,37 @@ mod inner {
     /// calls can't stall the async runtime.
     ///
     /// Serialized by `EVIDENCE_COLLECTION` so only one NVML call is in
-    /// flight per process — see that static's docs for why.
+    /// flight per process. **The lock guard is moved into the
+    /// `spawn_blocking` closure** so it's released only when the
+    /// blocking thread finishes, not when the outer future is dropped.
+    /// If we kept the guard on the async side and the caller cancelled
+    /// (HTTP timeout), the guard would drop immediately while the
+    /// `spawn_blocking` task kept running on the pool; the next caller
+    /// would then acquire the lock and start a *concurrent* NVML call
+    /// against the orphaned previous one, defeating the whole point.
     pub async fn collect_gpu_evidence_via_sdk(
         nonce_hex: &str,
     ) -> anyhow::Result<serde_json::Value> {
         ensure_sdk_initialized().await?;
 
-        // Acquire the per-process serialization lock before we kick off
-        // the FFI call. Wait time is observable via the metric below;
-        // a sustained non-zero `gpu_evidence_sdk_lock_wait_total` is the
-        // signal that NVML is the bottleneck under the current load.
-        let wait_start = Instant::now();
-        let _permit = EVIDENCE_COLLECTION.lock().await;
-        let wait_ms = wait_start.elapsed().as_millis() as u64;
-        if wait_ms > 0 {
-            metrics::counter!("gpu_evidence_sdk_lock_wait_total").increment(wait_ms);
-        }
-
         let nonce_hex_owned = nonce_hex.to_string();
+
+        // Wait for our turn at NVML; record the wait. Histogram (not
+        // counter) so dashboards see the p50/p99 distribution — matches
+        // the `*_duration_seconds` convention used elsewhere in this
+        // crate (proxy.rs, metrics_middleware.rs, signing.rs).
+        let wait_start = Instant::now();
+        let permit = EVIDENCE_COLLECTION.lock().await;
+        metrics::histogram!("gpu_evidence_sdk_lock_wait_duration_seconds")
+            .record(wait_start.elapsed().as_secs_f64());
+        metrics::counter!("gpu_evidence_sdk_lock_acquisitions_total").increment(1);
+
         let json_str: String = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+            // Move the guard into the blocking closure so the lock is
+            // held for the full FFI lifetime regardless of caller-side
+            // cancellation (see fn doc).
+            let _permit = permit;
+
             // Per SDK guidance, create a fresh source per call rather
             // than sharing across threads — `GpuEvidenceSource` is
             // `!Send + !Sync`. NVML init lives inside `from_nvml`.
@@ -128,12 +140,11 @@ mod inner {
                 .collect(&nonce)
                 .context("GpuEvidenceSource::collect")?;
             evidence.to_json().context("GpuEvidenceCollection::to_json")
+            // _permit dropped here as the closure returns, releasing
+            // the next waiter.
         })
         .await
         .context("spawn_blocking for SDK evidence collection")??;
-
-        // _permit dropped here, releasing the next waiter.
-        drop(_permit);
 
         serde_json::from_str(&json_str).context("parsing SDK evidence JSON")
     }

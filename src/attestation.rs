@@ -433,6 +433,15 @@ pub struct ComposeManagerConfig {
     pub url: String,
 }
 
+/// Owned-lifetime version of `DelegateContext` used by the background
+/// cache refresh task (which doesn't have access to the request-scoped
+/// `&Config`/`&Client`). Holds a clone of the `reqwest::Client` and an
+/// `Arc<Config>` so the spawned task is `'static`.
+pub struct DelegateRefreshConfig {
+    pub config: Arc<crate::config::Config>,
+    pub http_client: reqwest::Client,
+}
+
 /// Build OHTTP attestation payload for the process-wide OHTTP gateway config.
 pub fn build_ohttp_attestation(
     signing: &crate::signing::SigningPair,
@@ -462,6 +471,7 @@ pub fn spawn_cache_refresh_task(
     refresh_interval_secs: u64,
     compose_manager: Option<ComposeManagerConfig>,
     ohttp_attestation_ed25519: Option<crate::types::OhttpAttestation>,
+    delegate_refresh: Option<DelegateRefreshConfig>,
 ) {
     tokio::spawn(async move {
         // Initial delay to let the server start up.
@@ -492,6 +502,10 @@ pub fn spawn_cache_refresh_task(
 
                 // Refresh without TLS fingerprint (most common).
                 // GPU evidence serialization is handled by the worker Mutex.
+                let delegate_ctx = delegate_refresh.as_ref().map(|d| DelegateContext {
+                    config: &d.config,
+                    http_client: &d.http_client,
+                });
                 match generate_attestation_inner(
                     AttestationParams {
                         model_name: &model_name,
@@ -504,6 +518,7 @@ pub fn spawn_cache_refresh_task(
                         tls_cert_fingerprint: None,
                     },
                     Some(&cache),
+                    delegate_ctx.as_ref(),
                 )
                 .await
                 {
@@ -526,6 +541,10 @@ pub fn spawn_cache_refresh_task(
 
                 // Also refresh with TLS fingerprint if configured.
                 if let Some(ref fp) = tls_cert_fingerprint {
+                    let delegate_ctx = delegate_refresh.as_ref().map(|d| DelegateContext {
+                        config: &d.config,
+                        http_client: &d.http_client,
+                    });
                     match generate_attestation_inner(
                         AttestationParams {
                             model_name: &model_name,
@@ -538,6 +557,7 @@ pub fn spawn_cache_refresh_task(
                             tls_cert_fingerprint: Some(fp.as_str()),
                         },
                         Some(&cache),
+                        delegate_ctx.as_ref(),
                     )
                     .await
                     {
@@ -828,6 +848,17 @@ pub struct AttestationParams<'a> {
     pub tls_cert_fingerprint: Option<&'a str>,
 }
 
+/// Context the delegate-dispatch path needs at the call site.
+///
+/// Carries the resolved `Config` (for the delegate URL/timeout/auth
+/// token) and the shared `reqwest::Client` we use across the proxy.
+/// Lifetime-bound to the caller's `AppState` so we don't clone the
+/// client per request.
+pub struct DelegateContext<'a> {
+    pub config: &'a crate::config::Config,
+    pub http_client: &'a reqwest::Client,
+}
+
 /// Maximum attempts for `collect_gpu_evidence_with_nonce_check`.
 ///
 /// 4 attempts (1 initial + 3 retries) with exponential backoff between
@@ -954,11 +985,12 @@ fn check_evidence_nonce_binding(
 /// Failures (transport errors, repeated nonce mismatches) bubble up so
 /// cloud-api can rotate to a different backend instead of submitting
 /// known-bad evidence to NRAS.
-async fn collect_gpu_evidence_with_nonce_check(
+pub(crate) async fn collect_gpu_evidence_with_nonce_check(
     nonce_hex: &str,
     nonce_bytes: &[u8; 32],
     gpu_no_hw_mode: bool,
     cache: Option<&AttestationCache>,
+    delegate_ctx: Option<&DelegateContext<'_>>,
 ) -> anyhow::Result<serde_json::Value> {
     let mut last_failure: Option<NonceMismatch> = None;
 
@@ -969,13 +1001,28 @@ async fn collect_gpu_evidence_with_nonce_check(
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
 
-        // Three backends, in priority order:
-        //   1. nv-attestation-sdk (Rust → C FFI, opt-in via env var)
-        //   2. cache's persistent Python worker (existing default)
-        //   3. one-shot Python subprocess (fallback when no cache)
+        // Four backends, in priority order:
+        //   1. delegate proxy (HTTP, opt-in via GPU_EVIDENCE_DELEGATE_URL)
+        //      — used to serialize NVML across multiple proxies sharing a
+        //      host. Only the delegate touches local NVML.
+        //   2. nv-attestation-sdk (Rust → C FFI, opt-in via env var)
+        //   3. cache's persistent Python worker (existing default)
+        //   4. one-shot Python subprocess (fallback when no cache)
         // The self-check + retry below applies regardless of which one
-        // produced the evidence.
-        let evidence = if crate::attestation_sdk::is_active() && !gpu_no_hw_mode {
+        // produced the evidence — including evidence returned by the
+        // delegate (defense in depth, plus catches the rare "delegate
+        // returned 200 but with bytes from a different request").
+        let evidence = if let Some(dctx) = delegate_ctx.filter(|_| !gpu_no_hw_mode) {
+            // Delegate path. `gpu_no_hw_mode` doesn't make sense across
+            // an HTTP hop; fall through to local paths if it's set.
+            crate::gpu_evidence_delegate::collect_via_delegate(
+                dctx.config,
+                dctx.http_client,
+                nonce_hex,
+                gpu_no_hw_mode,
+            )
+            .await?
+        } else if crate::attestation_sdk::is_active() && !gpu_no_hw_mode {
             // SDK path doesn't support no_gpu_mode (it requires real
             // hardware via NVML); fall back to the Python paths for
             // dev/test environments without GPUs.
@@ -1030,6 +1077,7 @@ async fn collect_gpu_evidence_with_nonce_check(
 async fn generate_attestation_inner(
     params: AttestationParams<'_>,
     cache: Option<&AttestationCache>,
+    delegate_ctx: Option<&DelegateContext<'_>>,
 ) -> Result<AttestationReport, AttestationError> {
     let nonce_bytes = parse_nonce(params.nonce)?;
     let nonce_hex = hex::encode(nonce_bytes);
@@ -1068,6 +1116,7 @@ async fn generate_attestation_inner(
                 &nonce_bytes_for_verify,
                 gpu_no_hw_mode,
                 cache,
+                delegate_ctx,
             )
             .await
             .map_err(AttestationError::Internal)
@@ -1125,6 +1174,7 @@ pub enum AttestationResult {
 pub async fn generate_attestation(
     params: AttestationParams<'_>,
     cache: Option<&AttestationCache>,
+    delegate_ctx: Option<&DelegateContext<'_>>,
 ) -> Result<AttestationResult, AttestationError> {
     let is_nonceless = params.nonce.is_none();
     let include_tls = params.tls_cert_fingerprint.is_some();
@@ -1141,7 +1191,7 @@ pub async fn generate_attestation(
 
     // Generate fresh report. GPU evidence is serialized by the worker Mutex,
     // but TDX quote runs concurrently.
-    let report = generate_attestation_inner(params, cache).await?;
+    let report = generate_attestation_inner(params, cache, delegate_ctx).await?;
     // Don't cache here — the caller (route handler) caches after fetching
     // compose-manager attestation so cached responses include the full chain.
 

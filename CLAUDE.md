@@ -12,6 +12,13 @@ cargo fmt                # Format code
 
 No special env vars needed for tests — integration tests use wiremock and fixed signing keys.
 
+For changes that touch NVML, the libnvat SDK FFI, dstack TDX, or
+proxy-to-proxy contracts (e.g. `/internal/gpu_evidence`), `cargo test`
+isn't enough — see [docs/testing-on-cvm.md](docs/testing-on-cvm.md)
+for the real-CVM smoke-test recipe (build a branch image with
+`gh workflow run build.yml --ref <branch>`, deploy a 2-proxy stack
+inside a gpu0X CVM, probe both happy and leader-down paths).
+
 ## Architecture
 
 This is a Rust rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-proxy). It proxies OpenAI-compatible API requests to a vLLM/sglang backend, adding cryptographic signing and TEE attestation.

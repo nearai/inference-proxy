@@ -170,6 +170,12 @@ async fn main() -> anyhow::Result<()> {
                 http_client: state.http_client.clone(),
                 url: url.clone(),
             });
+    let delegate_refresh = state.config.gpu_evidence_delegate_url.as_ref().map(|_| {
+        attestation::DelegateRefreshConfig {
+            config: state.config.clone(),
+            http_client: state.http_client.clone(),
+        }
+    });
     attestation::spawn_cache_refresh_task(
         attestation_cache,
         model_name,
@@ -179,6 +185,7 @@ async fn main() -> anyhow::Result<()> {
         state.config.attestation_cache_ttl_secs / 2,
         compose_manager,
         ohttp_attestation_ed25519,
+        delegate_refresh,
     );
 
     // Run OpenAI chat compatibility checks if enabled

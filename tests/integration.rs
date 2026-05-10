@@ -95,6 +95,8 @@ fn build_test_app_inner(
         ohttp_enabled: false,
         listen_port: 8000,
         dstack_socket_path,
+        gpu_evidence_delegate_url: None,
+        gpu_evidence_delegate_timeout_secs: 30,
     };
 
     // Use fixed keys for deterministic tests
@@ -1498,6 +1500,73 @@ async fn test_streaming_signature_cached_and_verifiable() {
     let sig_hex = sig_body["signature"].as_str().unwrap();
     assert!(sig_hex.starts_with("0x"));
     assert_eq!(sig_hex.len(), 132); // 65 bytes hex + "0x"
+}
+
+// ---- Internal endpoints (delegate proxy) ----
+
+#[tokio::test]
+async fn test_internal_gpu_evidence_requires_auth() {
+    // The internal route is for sibling proxies on the same host;
+    // it MUST require auth to keep the loop guard meaningful.
+    let app = build_test_app("http://unused");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/gpu_evidence")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"nonce":"00"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_internal_gpu_evidence_rejects_short_nonce() {
+    // Short / non-hex / wrong-length nonces should be a clean 400,
+    // not a deeper 500 from the SDK / Python paths.
+    let app = build_test_app("http://unused");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/gpu_evidence")
+                .header(auth_header().0, auth_header().1)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"nonce":"deadbeef"}"#)) // only 4 bytes
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_internal_gpu_evidence_rejects_non_hex_nonce() {
+    let app = build_test_app("http://unused");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/gpu_evidence")
+                .header(auth_header().0, auth_header().1)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"nonce":"not-hex-at-all-with-some-padding-to-pretend-32-bytes!!!!!!!!"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 // ---- Attestation endpoint ----
@@ -3048,6 +3117,8 @@ fn build_test_app_with_cloud_api_retries(
         ohttp_enabled: false,
         listen_port: 8000,
         dstack_socket_path: "/var/run/dstack.sock".to_string(),
+        gpu_evidence_delegate_url: None,
+        gpu_evidence_delegate_timeout_secs: 30,
     };
 
     let ecdsa_key: [u8; 32] = [
@@ -5220,6 +5291,8 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         ohttp_enabled: true,
         listen_port: 0, // not used in oneshot tests
         dstack_socket_path: "/var/run/dstack.sock".to_string(),
+        gpu_evidence_delegate_url: None,
+        gpu_evidence_delegate_timeout_secs: 30,
     };
 
     let ecdsa_key: [u8; 32] = [
@@ -5606,6 +5679,8 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         ohttp_enabled: true,
         listen_port: port,
         dstack_socket_path: "/var/run/dstack.sock".to_string(),
+        gpu_evidence_delegate_url: None,
+        gpu_evidence_delegate_timeout_secs: 30,
     };
 
     let ecdsa = signing::EcdsaContext::from_key_bytes(&ecdsa_key).unwrap();

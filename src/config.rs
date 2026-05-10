@@ -93,6 +93,23 @@ pub struct Config {
     // Compose-manager attestation (deployment actions attestation)
     pub compose_manager_url: Option<String>,
 
+    // GPU evidence delegation (host-level NVML serialization)
+    /// HTTP base URL of another inference-proxy on the same host that
+    /// owns NVML evidence collection (e.g. `http://vllm-proxy-leader:8000`).
+    /// When set, this proxy forwards GPU evidence requests to the
+    /// delegate's `POST /internal/gpu_evidence` endpoint instead of
+    /// calling NVML locally. The intent is to serialize NVML access
+    /// across the *host*, not just within one process — multiple
+    /// inference-proxy instances sharing the same physical GPUs were
+    /// observed to race at the firmware level (see #107). When unset,
+    /// the proxy collects evidence locally via the SDK or Python path.
+    pub gpu_evidence_delegate_url: Option<String>,
+    /// Per-attempt timeout for the delegate HTTP call. Default 30s —
+    /// the delegate's own evidence collection plus its NVML wait
+    /// dominates this; we want enough headroom to not surface as
+    /// timeouts under contended load.
+    pub gpu_evidence_delegate_timeout_secs: u64,
+
     // OpenAI Chat Compatibility Checks
     // Validates that hosted models (qwen, glm, etc.) send OpenAI-compliant responses:
     // - /v1/models API format
@@ -249,6 +266,12 @@ impl Config {
                 as u64,
             cloud_api_auth_timeout_secs: env_int("CLOUD_API_AUTH_TIMEOUT_SECS", 5) as u64,
             compose_manager_url,
+            gpu_evidence_delegate_url: env::var("GPU_EVIDENCE_DELEGATE_URL")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.trim_end_matches('/').to_string()),
+            gpu_evidence_delegate_timeout_secs: env_int("GPU_EVIDENCE_DELEGATE_TIMEOUT_SECS", 30)
+                as u64,
             tls_cert_path,
             max_keepalive: env_int("VLLM_PROXY_MAX_KEEPALIVE", 100),
             pool_idle_timeout_secs: env_int("VLLM_PROXY_POOL_IDLE_TIMEOUT_SECS", 60) as u64,

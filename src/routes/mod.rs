@@ -3,6 +3,7 @@ pub mod catch_all;
 pub mod chat;
 pub mod completions;
 pub mod health;
+pub mod internal;
 pub mod metrics;
 pub mod ohttp;
 pub mod passthrough;
@@ -49,6 +50,9 @@ pub fn build_router() -> Router<AppState> {
             post(passthrough::audio_transcriptions),
         )
         .route("/v1/signature/{chat_id}", get(signature::signature))
+        // Internal — sibling proxies on the same host call this when
+        // configured with GPU_EVIDENCE_DELEGATE_URL pointed at us.
+        .route("/internal/gpu_evidence", post(internal::gpu_evidence))
         // OHTTP Gateway (RFC 9458) — POST /ohttp is unauthenticated; auth may be
         // inside the encrypted Binary HTTP message or on the outer HTTP request
         // (relay-injected Authorization). See `ohttp_relay` docs.

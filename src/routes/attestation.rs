@@ -62,6 +62,14 @@ pub async fn attestation_report(
             http_client: &state.http_client,
         }
     });
+    // Snapshot the current TLS fingerprint into a local so its `&str` is
+    // alive for the `AttestationParams` borrow below. The tracker's value
+    // may have just been refreshed by the background cache task.
+    let tls_fp_snapshot = if include_tls {
+        state.tls_cert_fingerprint.current()
+    } else {
+        None
+    };
     let result = crate::attestation::generate_attestation(
         crate::attestation::AttestationParams {
             model_name: &state.config.model_name,
@@ -71,11 +79,7 @@ pub async fn attestation_report(
             signing_address_bytes: &signing_address_bytes,
             nonce: query.nonce.as_deref(),
             gpu_no_hw_mode: state.config.gpu_no_hw_mode,
-            tls_cert_fingerprint: if include_tls {
-                state.tls_cert_fingerprint.as_deref()
-            } else {
-                None
-            },
+            tls_cert_fingerprint: tls_fp_snapshot.as_deref(),
         },
         Some(&state.attestation_cache),
         delegate_ctx.as_ref(),

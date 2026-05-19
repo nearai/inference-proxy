@@ -108,7 +108,9 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         attestation_cache: Arc::new(attestation::AttestationCache::new(300)),
         http_client,
         metrics_handle,
-        tls_cert_fingerprint: None,
+        tls_cert_fingerprint: Arc::new(
+            attestation::TlsCertTracker::new(None).expect("tracker for None path"),
+        ),
         backend_pool,
         ohttp_gateway: None,
         ohttp_attestation_ed25519: None,

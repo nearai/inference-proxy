@@ -577,7 +577,14 @@ impl StreamingResponseAssembler {
                             if let Some(c) = delta.get("content").and_then(|v| v.as_str()) {
                                 ca.content.push_str(c);
                             }
-                            if let Some(r) = delta.get("reasoning_content").and_then(|v| v.as_str())
+                            // Some upstream parsers (vLLM `qwen3` reasoning parser) emit
+                            // `delta.reasoning` instead of the standard `delta.reasoning_content`;
+                            // accept either so non-streaming clients of Qwen reasoning models
+                            // see reasoning text in the assembled response.
+                            if let Some(r) = delta
+                                .get("reasoning_content")
+                                .and_then(|v| v.as_str())
+                                .or_else(|| delta.get("reasoning").and_then(|v| v.as_str()))
                             {
                                 ca.reasoning_content.push_str(r);
                             }
@@ -803,7 +810,7 @@ pub async fn proxy_streaming_request(
         let mut parser = SseParser::new();
         let mut upstream_error = false;
         let mut downstream_closed = false;
-        let mut transformer = chunk_transform.map(SseTransformer::new);
+        let mut transformer = SseTransformer::new(chunk_transform);
 
         loop {
             tokio::select! {
@@ -812,22 +819,18 @@ pub async fn proxy_streaming_request(
                         Some(Ok(chunk)) => {
                             parser.process_chunk(&chunk);
 
-                            // Transform (encrypt) the chunk if needed, then hash
+                            // Normalize (and encrypt, if active) the chunk, then hash
                             // what the client actually receives for signatures.
-                            let to_send = if let Some(ref mut xform) = transformer {
-                                match xform.process_chunk(&chunk) {
-                                    Ok(transformed) => transformed,
-                                    Err(e) => {
-                                        error!(error = %e, "Stream encryption failed");
-                                        let _ = tx.send(Err(std::io::Error::other(
-                                            "Stream encryption failed",
-                                        ))).await;
-                                        upstream_error = true;
-                                        break;
-                                    }
+                            let to_send = match transformer.process_chunk(&chunk) {
+                                Ok(transformed) => transformed,
+                                Err(e) => {
+                                    error!(error = %e, "Stream transform failed");
+                                    let _ = tx.send(Err(std::io::Error::other(
+                                        "Stream transform failed",
+                                    ))).await;
+                                    upstream_error = true;
+                                    break;
                                 }
-                            } else {
-                                chunk
                             };
                             hasher.update(&to_send);
 
@@ -855,23 +858,21 @@ pub async fn proxy_streaming_request(
 
         // Flush any remaining buffered content in the transformer
         if !upstream_error && !downstream_closed {
-            if let Some(ref mut xform) = transformer {
-                match xform.flush() {
-                    Ok(flushed) if !flushed.is_empty() => {
-                        hasher.update(&flushed);
-                        if tx.send(Ok(flushed)).await.is_err() {
-                            downstream_closed = true;
-                        }
+            match transformer.flush() {
+                Ok(flushed) if !flushed.is_empty() => {
+                    hasher.update(&flushed);
+                    if tx.send(Ok(flushed)).await.is_err() {
+                        downstream_closed = true;
                     }
-                    Err(e) => {
-                        error!(error = %e, "Stream encryption flush failed");
-                        let _ = tx
-                            .send(Err(std::io::Error::other("Stream encryption failed")))
-                            .await;
-                        upstream_error = true;
-                    }
-                    _ => {}
                 }
+                Err(e) => {
+                    error!(error = %e, "Stream transform flush failed");
+                    let _ = tx
+                        .send(Err(std::io::Error::other("Stream transform failed")))
+                        .await;
+                    upstream_error = true;
+                }
+                _ => {}
             }
         }
 
@@ -926,18 +927,41 @@ pub async fn proxy_streaming_request(
         .unwrap())
 }
 
+/// Normalize OpenAI-compat chat completion streaming chunks emitted by upstream
+/// reasoning parsers that use the non-standard `delta.reasoning` field
+/// (vLLM `qwen3` parser as of v0.10) so downstream clients see the standard
+/// `delta.reasoning_content` field consistently across reasoning models.
+/// If both fields are present the existing `reasoning_content` is kept.
+fn normalize_chat_chunk(val: &mut serde_json::Value) {
+    let Some(choices) = val.get_mut("choices").and_then(|c| c.as_array_mut()) else {
+        return;
+    };
+    for choice in choices {
+        let Some(delta) = choice.get_mut("delta").and_then(|d| d.as_object_mut()) else {
+            continue;
+        };
+        if delta.contains_key("reasoning") && !delta.contains_key("reasoning_content") {
+            if let Some(v) = delta.remove("reasoning") {
+                delta.insert("reasoning_content".to_string(), v);
+            }
+        }
+    }
+}
+
 /// Line-buffered SSE transformer that handles data split across chunk boundaries.
+/// Always normalizes chat completion chunks (`delta.reasoning` → `delta.reasoning_content`)
+/// and optionally applies an additional transform (e.g. encryption).
 /// Fail-closed: if a data line contains JSON that cannot be transformed, the stream errors.
 struct SseTransformer {
     line_buffer: String,
-    transform: crate::encryption::ChunkTransform,
+    extra_transform: Option<crate::encryption::ChunkTransform>,
 }
 
 impl SseTransformer {
-    fn new(transform: crate::encryption::ChunkTransform) -> Self {
+    fn new(extra_transform: Option<crate::encryption::ChunkTransform>) -> Self {
         Self {
             line_buffer: String::new(),
-            transform,
+            extra_transform,
         }
     }
 
@@ -968,10 +992,13 @@ impl SseTransformer {
                     let mut parsed: serde_json::Value =
                         serde_json::from_str(data).map_err(|e| {
                             AppError::Internal(anyhow::anyhow!(
-                                "Failed to parse SSE data for encryption: {e}"
+                                "Failed to parse SSE data line: {e}"
                             ))
                         })?;
-                    (self.transform)(&mut parsed)?;
+                    normalize_chat_chunk(&mut parsed);
+                    if let Some(ref extra) = self.extra_transform {
+                        (extra)(&mut parsed)?;
+                    }
                     let re_serialized =
                         serde_json::to_string(&parsed).map_err(|e| AppError::Internal(e.into()))?;
                     output.push_str("data: ");
@@ -1008,11 +1035,12 @@ impl SseTransformer {
             let data = data.trim();
             if !data.is_empty() && data != "[DONE]" {
                 let mut parsed: serde_json::Value = serde_json::from_str(data).map_err(|e| {
-                    AppError::Internal(anyhow::anyhow!(
-                        "Failed to parse SSE data for encryption: {e}"
-                    ))
+                    AppError::Internal(anyhow::anyhow!("Failed to parse SSE data line: {e}"))
                 })?;
-                (self.transform)(&mut parsed)?;
+                normalize_chat_chunk(&mut parsed);
+                if let Some(ref extra) = self.extra_transform {
+                    (extra)(&mut parsed)?;
+                }
                 let re_serialized =
                     serde_json::to_string(&parsed).map_err(|e| AppError::Internal(e.into()))?;
                 let mut output = String::from("data: ");
@@ -1253,7 +1281,7 @@ pub async fn proxy_streaming_response(
         let mut parser = SseParser::new();
         let mut upstream_error = false;
         let mut downstream_closed = false;
-        let mut transformer = chunk_transform.map(SseTransformer::new);
+        let mut transformer = SseTransformer::new(chunk_transform);
 
         loop {
             tokio::select! {
@@ -1262,22 +1290,18 @@ pub async fn proxy_streaming_response(
                         Some(Ok(chunk)) => {
                             parser.process_chunk(&chunk);
 
-                            // Transform (encrypt) the chunk if needed, then hash
+                            // Normalize (and encrypt, if active) the chunk, then hash
                             // what the client actually receives for signatures.
-                            let to_send = if let Some(ref mut xform) = transformer {
-                                match xform.process_chunk(&chunk) {
-                                    Ok(transformed) => transformed,
-                                    Err(e) => {
-                                        error!(error = %e, "Stream encryption failed");
-                                        let _ = tx.send(Err(std::io::Error::other(
-                                            "Stream encryption failed",
-                                        ))).await;
-                                        upstream_error = true;
-                                        break;
-                                    }
+                            let to_send = match transformer.process_chunk(&chunk) {
+                                Ok(transformed) => transformed,
+                                Err(e) => {
+                                    error!(error = %e, "Stream transform failed");
+                                    let _ = tx.send(Err(std::io::Error::other(
+                                        "Stream transform failed",
+                                    ))).await;
+                                    upstream_error = true;
+                                    break;
                                 }
-                            } else {
-                                chunk
                             };
 
                             hasher.update(&to_send);
@@ -1306,23 +1330,21 @@ pub async fn proxy_streaming_response(
 
         // Flush any remaining buffered content in the transformer
         if !upstream_error && !downstream_closed {
-            if let Some(ref mut xform) = transformer {
-                match xform.flush() {
-                    Ok(flushed) if !flushed.is_empty() => {
-                        hasher.update(&flushed);
-                        if tx.send(Ok(flushed)).await.is_err() {
-                            downstream_closed = true;
-                        }
+            match transformer.flush() {
+                Ok(flushed) if !flushed.is_empty() => {
+                    hasher.update(&flushed);
+                    if tx.send(Ok(flushed)).await.is_err() {
+                        downstream_closed = true;
                     }
-                    Err(e) => {
-                        error!(error = %e, "Stream encryption flush failed");
-                        let _ = tx
-                            .send(Err(std::io::Error::other("Stream encryption failed")))
-                            .await;
-                        upstream_error = true;
-                    }
-                    _ => {}
                 }
+                Err(e) => {
+                    error!(error = %e, "Stream transform flush failed");
+                    let _ = tx
+                        .send(Err(std::io::Error::other("Stream transform failed")))
+                        .await;
+                    upstream_error = true;
+                }
+                _ => {}
             }
         }
 
@@ -1819,7 +1841,7 @@ mod tests {
             Ok(())
         });
 
-        let mut transformer = SseTransformer::new(transform);
+        let mut transformer = SseTransformer::new(Some(transform));
 
         // First chunk: incomplete line
         let out1 = transformer.process_chunk(b"data: {\"text\":\"hel").unwrap();
@@ -1843,7 +1865,7 @@ mod tests {
             Ok(())
         });
 
-        let mut transformer = SseTransformer::new(transform);
+        let mut transformer = SseTransformer::new(Some(transform));
         let chunk = b"data: {\"x\":\"a\"}\ndata: {\"x\":\"b\"}\n\n";
         let out = transformer.process_chunk(chunk).unwrap();
         let out_str = std::str::from_utf8(&out).unwrap();
@@ -1855,7 +1877,7 @@ mod tests {
     fn test_sse_transformer_fail_closed_on_bad_json() {
         let transform: ChunkTransform = Arc::new(|_| Ok(()));
 
-        let mut transformer = SseTransformer::new(transform);
+        let mut transformer = SseTransformer::new(Some(transform));
         // Invalid JSON in data line
         let result = transformer.process_chunk(b"data: {not json}\n");
         assert!(result.is_err(), "Should fail-closed on bad JSON");
@@ -1866,7 +1888,7 @@ mod tests {
         let transform: ChunkTransform =
             Arc::new(|_| Err(AppError::Internal(anyhow::anyhow!("transform failed"))));
 
-        let mut transformer = SseTransformer::new(transform);
+        let mut transformer = SseTransformer::new(Some(transform));
         let result = transformer.process_chunk(b"data: {\"x\":1}\n");
         assert!(result.is_err(), "Should fail-closed on transform error");
     }
@@ -1875,7 +1897,7 @@ mod tests {
     fn test_sse_transformer_passes_through_done_and_empty_lines() {
         let transform: ChunkTransform = Arc::new(|_| Ok(()));
 
-        let mut transformer = SseTransformer::new(transform);
+        let mut transformer = SseTransformer::new(Some(transform));
         let chunk = b"data: [DONE]\n\n";
         let out = transformer.process_chunk(chunk).unwrap();
         let out_str = std::str::from_utf8(&out).unwrap();
@@ -1896,7 +1918,7 @@ mod tests {
             Ok(())
         });
 
-        let mut transformer = SseTransformer::new(transform);
+        let mut transformer = SseTransformer::new(Some(transform));
 
         // Send a partial chunk with no trailing newline
         let chunk = b"data: {\"text\":\"hello\"}";
@@ -1925,7 +1947,7 @@ mod tests {
     fn test_sse_transformer_flush_empty_buffer() {
         let transform: ChunkTransform = Arc::new(|_| Ok(()));
 
-        let mut transformer = SseTransformer::new(transform);
+        let mut transformer = SseTransformer::new(Some(transform));
         let flushed = transformer.flush().unwrap();
         assert!(flushed.is_empty());
     }
@@ -1935,7 +1957,7 @@ mod tests {
         // A [DONE] marker buffered without trailing newline should pass through unchanged.
         let transform: ChunkTransform = Arc::new(|_| Ok(()));
 
-        let mut transformer = SseTransformer::new(transform);
+        let mut transformer = SseTransformer::new(Some(transform));
         let chunk = b"data: [DONE]";
         let out = transformer.process_chunk(chunk).unwrap();
         assert!(out.is_empty());
@@ -1943,6 +1965,129 @@ mod tests {
         let flushed = transformer.flush().unwrap();
         let flushed_str = std::str::from_utf8(&flushed).unwrap();
         assert!(flushed_str.contains("[DONE]"));
+    }
+
+    // ── normalize_chat_chunk + SseTransformer normalization tests ──
+
+    #[test]
+    fn test_normalize_renames_delta_reasoning() {
+        let mut v = serde_json::json!({
+            "choices": [{"index": 0, "delta": {"reasoning": "Thinking..."}}]
+        });
+        normalize_chat_chunk(&mut v);
+        assert_eq!(
+            v["choices"][0]["delta"]["reasoning_content"],
+            serde_json::Value::String("Thinking...".into())
+        );
+        assert!(v["choices"][0]["delta"].get("reasoning").is_none());
+    }
+
+    #[test]
+    fn test_normalize_keeps_reasoning_content_when_both_present() {
+        let mut v = serde_json::json!({
+            "choices": [{"index": 0, "delta": {
+                "reasoning": "raw",
+                "reasoning_content": "canonical"
+            }}]
+        });
+        normalize_chat_chunk(&mut v);
+        // reasoning_content stays canonical; reasoning is left as-is (we only
+        // rename when reasoning_content is absent, to avoid clobbering).
+        assert_eq!(
+            v["choices"][0]["delta"]["reasoning_content"],
+            serde_json::Value::String("canonical".into())
+        );
+    }
+
+    #[test]
+    fn test_normalize_passthrough_when_no_reasoning() {
+        let mut v = serde_json::json!({
+            "choices": [{"index": 0, "delta": {"content": "hi"}}]
+        });
+        let before = v.clone();
+        normalize_chat_chunk(&mut v);
+        assert_eq!(v, before);
+    }
+
+    #[test]
+    fn test_normalize_handles_missing_choices_or_delta() {
+        // No choices array (e.g. usage-only final chunk).
+        let mut v = serde_json::json!({"usage": {"prompt_tokens": 1}});
+        let before = v.clone();
+        normalize_chat_chunk(&mut v);
+        assert_eq!(v, before);
+
+        // Choices with no delta (text completion shape).
+        let mut v = serde_json::json!({"choices": [{"text": "hello"}]});
+        let before = v.clone();
+        normalize_chat_chunk(&mut v);
+        assert_eq!(v, before);
+    }
+
+    #[test]
+    fn test_sse_transformer_normalizes_without_extra_transform() {
+        let mut transformer = SseTransformer::new(None);
+        let chunk = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"think\"}}]}\n";
+        let out = transformer.process_chunk(chunk).unwrap();
+        let out_str = std::str::from_utf8(&out).unwrap();
+        assert!(
+            out_str.contains("\"reasoning_content\":\"think\""),
+            "Got: {out_str}"
+        );
+        assert!(
+            !out_str.contains("\"reasoning\":\"think\""),
+            "Got: {out_str}"
+        );
+    }
+
+    #[test]
+    fn test_sse_transformer_normalize_then_extra_transform() {
+        // Extra transform runs after normalization — it should see reasoning_content.
+        let extra: ChunkTransform = Arc::new(|v| {
+            let saw_reasoning_content = v["choices"][0]["delta"].get("reasoning_content").is_some();
+            v["saw_reasoning_content"] = serde_json::Value::Bool(saw_reasoning_content);
+            Ok(())
+        });
+        let mut transformer = SseTransformer::new(Some(extra));
+        let chunk = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"x\"}}]}\n";
+        let out = transformer.process_chunk(chunk).unwrap();
+        let out_str = std::str::from_utf8(&out).unwrap();
+        assert!(
+            out_str.contains("\"saw_reasoning_content\":true"),
+            "Got: {out_str}"
+        );
+        assert!(
+            out_str.contains("\"reasoning_content\":\"x\""),
+            "Got: {out_str}"
+        );
+    }
+
+    #[test]
+    fn test_assembler_accumulates_delta_reasoning_fallback() {
+        // Upstream emits `delta.reasoning` (vLLM qwen3 parser); assembler should
+        // still surface it as `reasoning_content` in the assembled message.
+        let mut asm = StreamingResponseAssembler::new(ResponseShape::ChatCompletion);
+        asm.process_chunk(
+            b"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n",
+        );
+        asm.process_chunk(
+            b"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"Step 1\"}}]}\n",
+        );
+        asm.process_chunk(
+            b"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" Step 2\"}}]}\n",
+        );
+        asm.process_chunk(
+            b"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n",
+        );
+        asm.process_chunk(b"data: [DONE]\n");
+
+        let resp = asm.into_response("chatcmpl");
+        let msg = &resp["choices"][0]["message"];
+        assert_eq!(msg["content"], serde_json::Value::String("hi".into()));
+        assert_eq!(
+            msg["reasoning_content"],
+            serde_json::Value::String("Step 1 Step 2".into())
+        );
     }
 
     // --- sanitize_validation_errors tests ---

@@ -345,6 +345,17 @@ impl AttestationCache {
         None
     }
 
+    /// Drop every cached report. Called after the TLS cert rotates so the
+    /// next request regenerates a TDX quote bound to the new fingerprint
+    /// rather than serving a stale, soon-to-fail report from cache.
+    pub async fn clear_all(&self) {
+        let mut reports = self.reports.write().await;
+        let n = reports.len();
+        reports.clear();
+        drop(reports);
+        info!(invalidated_entries = n, "Attestation cache cleared");
+    }
+
     /// Store a report in the cache, pre-serializing to JSON bytes.
     pub async fn set(
         &self,
@@ -467,7 +478,7 @@ pub fn spawn_cache_refresh_task(
     model_name: String,
     signing: Arc<crate::signing::SigningPair>,
     gpu_no_hw_mode: bool,
-    tls_cert_fingerprint: Option<String>,
+    tls_cert_tracker: Arc<TlsCertTracker>,
     refresh_interval_secs: u64,
     compose_manager: Option<ComposeManagerConfig>,
     ohttp_attestation_ed25519: Option<crate::types::OhttpAttestation>,
@@ -478,6 +489,14 @@ pub fn spawn_cache_refresh_task(
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
         loop {
+            // Reconcile our cached TLS-cert SPKI with whatever the ingress
+            // sidecar wrote to disk. If certbot just renewed the cert, the
+            // tracker swaps to the new hash and the cache is cleared so the
+            // next request regenerates a TDX quote bound to it.
+            if tls_cert_tracker.refresh_if_changed().is_some() {
+                cache.clear_all().await;
+            }
+
             // Fetch compose-manager attestation once per refresh cycle (shared across algos).
             let cm_attestation = if let Some(ref cm) = compose_manager {
                 fetch_compose_manager_attestation(&cm.http_client, &cm.url, None).await
@@ -539,8 +558,10 @@ pub fn spawn_cache_refresh_task(
                     }
                 }
 
-                // Also refresh with TLS fingerprint if configured.
-                if let Some(ref fp) = tls_cert_fingerprint {
+                // Also refresh with TLS fingerprint if configured. Read the
+                // current value through the tracker — it may have just been
+                // updated by `refresh_if_changed` above.
+                if let Some(ref fp) = tls_cert_tracker.current() {
                     let delegate_ctx = delegate_refresh.as_ref().map(|d| DelegateContext {
                         config: &d.config,
                         http_client: &d.http_client,
@@ -738,6 +759,148 @@ pub fn compute_spki_hash(cert_path: &str) -> anyhow::Result<String> {
     let spki_der = cert.tbs_certificate.subject_pki.raw;
     let hash = Sha256::digest(spki_der);
     Ok(hex::encode(hash))
+}
+
+/// Tracks the SHA-256 SPKI hash of the local TLS certificate and refreshes it
+/// when the file on disk changes.
+///
+/// We previously snapshotted the fingerprint at startup and reused it for the
+/// lifetime of the process. That broke whenever certbot (running in the
+/// co-located `cvm-ingress` sidecar) renewed the cert — nginx picked up the
+/// new cert immediately via `nginx -s reload`, but the inference-proxy kept
+/// reporting the pre-renewal SPKI in its attestation. Cloud-api pinned the
+/// stale fingerprint, then rejected the actual (post-renewal) cert at TLS
+/// handshake time, producing the 503-on-attestation-report bursts we hunted
+/// down on staging.
+///
+/// The tracker is consulted on every request via [`Self::current`] (cheap
+/// `RwLock` read) and reconciled with the on-disk cert via
+/// [`Self::refresh_if_changed`] inside the background attestation refresh
+/// task. We use `mtime` as a coarse change signal because the renewal daemon
+/// rewrites the file atomically, so any actual rotation advances `mtime`. A
+/// touch that doesn't change the content is rehashed but produces no
+/// fingerprint change and triggers no cache invalidation.
+pub struct TlsCertTracker {
+    /// Configured cert path. `None` when `TLS_CERT_PATH` is unset, in which
+    /// case the tracker is permanently inert.
+    cert_path: Option<String>,
+    inner: std::sync::RwLock<TlsCertTrackerState>,
+}
+
+#[derive(Debug)]
+struct TlsCertTrackerState {
+    /// Latest hash that the rest of the process should report. `None` when
+    /// no cert path is configured.
+    fingerprint: Option<String>,
+    /// Last observed mtime; used as the cheap "did anything change?" gate.
+    last_mtime: Option<std::time::SystemTime>,
+}
+
+impl TlsCertTracker {
+    /// Build a tracker, seeding the fingerprint and `mtime` from disk.
+    ///
+    /// Returns `Err` only when `cert_path` is configured but the initial read
+    /// fails — preserving the existing startup contract that an unreadable
+    /// `TLS_CERT_PATH` is fatal.
+    pub fn new(cert_path: Option<String>) -> anyhow::Result<Self> {
+        let inner = match &cert_path {
+            Some(path) => {
+                let last_mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+                let fingerprint = Some(compute_spki_hash(path)?);
+                info!(
+                    tls_cert_path = %path,
+                    fingerprint = %fingerprint.as_deref().unwrap_or(""),
+                    "TLS certificate SPKI hash computed"
+                );
+                TlsCertTrackerState {
+                    fingerprint,
+                    last_mtime,
+                }
+            }
+            None => TlsCertTrackerState {
+                fingerprint: None,
+                last_mtime: None,
+            },
+        };
+        Ok(Self {
+            cert_path,
+            inner: std::sync::RwLock::new(inner),
+        })
+    }
+
+    /// Current fingerprint (cloned). Hot path; called on every attestation.
+    pub fn current(&self) -> Option<String> {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .fingerprint
+            .clone()
+    }
+
+    /// Re-stat the cert file. If its `mtime` advanced, re-compute the SPKI
+    /// hash; if the hash actually changed, swap it into the tracker.
+    ///
+    /// Returns `Some(new_fingerprint)` when the fingerprint changed, `None`
+    /// otherwise (no path configured, file unchanged, file unreadable, or the
+    /// content was touched but produced an identical hash). The boolean
+    /// distinction matters to the caller: a non-`None` return is the signal
+    /// to invalidate the attestation cache so the next request regenerates
+    /// a TDX quote bound to the new fingerprint.
+    pub fn refresh_if_changed(&self) -> Option<String> {
+        let path = self.cert_path.as_deref()?;
+
+        let new_mtime = match std::fs::metadata(path).and_then(|m| m.modified()) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                warn!(
+                    tls_cert_path = %path,
+                    error = %e,
+                    "failed to stat TLS cert file, keeping cached fingerprint"
+                );
+                return None;
+            }
+        };
+
+        let old_mtime = self
+            .inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_mtime;
+        if new_mtime == old_mtime {
+            return None;
+        }
+
+        let new_fp = match compute_spki_hash(path) {
+            Ok(fp) => fp,
+            Err(e) => {
+                warn!(
+                    tls_cert_path = %path,
+                    error = %e,
+                    "failed to re-hash TLS cert after rotation, keeping cached fingerprint"
+                );
+                return None;
+            }
+        };
+
+        let mut state = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let changed = state.fingerprint.as_deref() != Some(new_fp.as_str());
+        state.fingerprint = Some(new_fp.clone());
+        state.last_mtime = new_mtime;
+        drop(state);
+
+        if changed {
+            info!(
+                tls_cert_path = %path,
+                fingerprint = %new_fp,
+                "TLS cert SPKI fingerprint updated after on-disk rotation"
+            );
+            Some(new_fp)
+        } else {
+            // mtime advanced but content was the same (touch-only). Don't
+            // bother invalidating the cache.
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1705,5 +1868,185 @@ mod tests_fetch_compose_manager {
         let client = reqwest::Client::new();
         let result = fetch_compose_manager_attestation(&client, &base_url, None).await;
         assert!(result.is_none());
+    }
+}
+
+#[cfg(test)]
+mod tests_tls_tracker {
+    use super::TlsCertTracker;
+    use std::fs;
+    use std::io::Write;
+
+    // Same valid PEM as `tests_spki`. Duplicated here so the two test
+    // modules stay independent.
+    const TEST_CERT_PEM_A: &str = r#"-----BEGIN CERTIFICATE-----
+MIIDEzCCAfugAwIBAgIUc8i7HuXjfzh0UgxHI50TZ5VvEMswDQYJKoZIhvcNAQEL
+BQAwGTEXMBUGA1UEAwwOdGVzdC1sb2NhbGhvc3QwHhcNMjYwMjEzMTMwODAzWhcN
+MzYwMjExMTMwODAzWjAZMRcwFQYDVQQDDA50ZXN0LWxvY2FsaG9zdDCCASIwDQYJ
+KoZIhvcNAQEBBQADggEPADCCAQoCggEBAJ3j+xeMEJ9c4nfYNXLOFwkdBU1lxI/u
+qWHCnHoNwbmVFBZDvksf9jv8KQwfqaOj8VwBVHat1rbpkgCkcwVHnmZBB6DjDhhs
+2wp8MDnjHR58J3tqvgZmrf6Dp4TkziwAlGWHM//wI9km8KWr0cX2p/z3YfHOWj3F
+yaRbJ6b/QFJ3fyuk8UY9d9WlKG91wPX8Oeg3d2rSiAXx3daO/MbkRroT2XpKaYux
+qTDsxAWRqxkCcQsdHxXG+rbA3HPTpirNWDxLRmxm0Q8PCEFG9EF+Mu1XVmOgkUTp
+7p98vdwtP3c6HnfoMkpobfEUmTbtcXkJHMTPr2IrqxMC/8I+8+F5lrMCAwEAAaNT
+MFEwHQYDVR0OBBYEFJsscWLVB2QcCxb9PxMMG9vxZZ/8MB8GA1UdIwQYMBaAFJss
+cWLVB2QcCxb9PxMMG9vxZZ/8MA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQEL
+BQADggEBAIPwnN16vmNi26XppI4E6TzOY4EXyqhPhtGNeos7Hxsw6DXKA28iaaOW
+xnH5LeNFP1//9hojTCo/w6CS4BWJNlGoFPfAHIAHFAIVkqOcmO+YLGYotcR67ftd
+loGVCS8p4a88M7X2JeziizPlssmbzQkcAGQ3latUu5O6wxUATFFWmdPELhm8xRdW
+qB2wGiBhxD46CKcMKZrtW+P8SjhhxXEJ2x+UYdSxXSTTnrBAZi23yo4TNFVXw5jA
+Tw4GxEVK193pwe3l749yk1dkJkxAfRCavr3BVP5Br53GWHVFBDOR2tPw83frzTBJ
+nU+jXBG7tgClr/DntUBJx+xfNWpxLKE=
+-----END CERTIFICATE-----
+"#;
+
+    // A distinct self-signed cert. Public key differs from PEM_A so any
+    // honest re-hash produces a different SPKI fingerprint.
+    const TEST_CERT_PEM_B: &str = r#"-----BEGIN CERTIFICATE-----
+MIIDEzCCAfugAwIBAgIUCF/LqQXgEWr2ZmQrYTNMaM1GsUowDQYJKoZIhvcNAQEL
+BQAwGTEXMBUGA1UEAwwOdGVzdC10cmFja2VyLWIwHhcNMjYwNTE5MTEzNTE4WhcN
+MzYwNTE2MTEzNTE4WjAZMRcwFQYDVQQDDA50ZXN0LXRyYWNrZXItYjCCASIwDQYJ
+KoZIhvcNAQEBBQADggEPADCCAQoCggEBALZYU2Q9XtlxoWFS5LcNEb0y5vMM/Z38
+2Fh10omoAiBlkTGtu5eHdM5DFqg4HTnjxh8ch6+OSmZ3sPIMKkUZyp9hgd3y4L53
+GLmSkug5cNcM5qoGvmUL01NivzlEQAp8A2SrsqfCb29+pqO5tauhciHynKFSitW7
++nr9fVg2BML4kIOUDrAjejv+tL9X8AwKpuWmClZoYgyoJRZ63Wxql/b1eeCedXy4
++P0Ri1iF3M1pCD7DKSGomlNhA69zfBmjW3Fhofejewps9jv8EnPrO54fA6mB4msm
+LJRRi0UH/+1Nst8mUCbfd9wj8nUwDTwqTNRD2Yn1530ZIMjwtyqBZb8CAwEAAaNT
+MFEwHQYDVR0OBBYEFE6+caJsXpeQu5CgIxOqDZSRg3tDMB8GA1UdIwQYMBaAFE6+
+caJsXpeQu5CgIxOqDZSRg3tDMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQEL
+BQADggEBAKN5RyjfQ5sxA8E1effeL8UVXQsY3T/8bFL6FSHMCT+4AQQqhZN5Edpo
+oDzzP/OEyb9Xu+ZKyL4PhLQPDiTcRalY67Cgc8F3AsC1uo+mtbwthU8vew+xA89J
+jQV2HpRTfPhYNVycb0wEoTZPB8Xo9Lb4mSmUwiP9WrrttiQXBHvJhnFC6l5ymS69
+4TiavnAdLTuNnWvNj4Rm9dXiwayWJGxU7veNzwPzLL41WFgrvjcbYqDw+tqlQl4o
+vPKm1JDghjp3Oa6sER4/Ei9k/gqh0h2eCAIRHW36HC/pvKVYM3dAJUhkMv7HKpQc
+7qBO0wxl/8MPbMS2gs7vcfJVV9jHGJ4=
+-----END CERTIFICATE-----
+"#;
+
+    fn write_cert(path: &std::path::Path, pem: &str) {
+        let mut f = fs::File::create(path).expect("create cert");
+        f.write_all(pem.as_bytes()).expect("write cert");
+    }
+
+    /// Returns a unique temp path under /tmp for a test PEM.
+    fn tmp_path(suffix: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        p.push(format!(
+            "tracker_{}_{}_{}.pem",
+            suffix,
+            std::process::id(),
+            id
+        ));
+        p
+    }
+
+    #[test]
+    fn none_path_yields_inert_tracker() {
+        let t = TlsCertTracker::new(None).expect("None must construct");
+        assert!(t.current().is_none());
+        assert!(t.refresh_if_changed().is_none());
+    }
+
+    #[test]
+    fn fails_when_cert_unreadable_at_init() {
+        // Path that surely doesn't exist.
+        let path = "/nonexistent/should-not-exist/tracker.pem";
+        let res = TlsCertTracker::new(Some(path.to_string()));
+        assert!(res.is_err(), "expected init failure for missing cert");
+    }
+
+    #[test]
+    fn current_returns_initial_hash() {
+        let path = tmp_path("initial");
+        write_cert(&path, TEST_CERT_PEM_A);
+        let t = TlsCertTracker::new(Some(path.to_string_lossy().into_owned()))
+            .expect("init must succeed");
+        let fp = t.current().expect("fingerprint expected");
+        // Cleanup before assertion so a panic doesn't leak the file.
+        let _ = fs::remove_file(&path);
+        assert_eq!(fp.len(), 64, "SHA-256 hex = 64 chars");
+    }
+
+    #[test]
+    fn refresh_detects_rotation_to_distinct_cert() {
+        let path = tmp_path("rotate");
+        write_cert(&path, TEST_CERT_PEM_A);
+        let t = TlsCertTracker::new(Some(path.to_string_lossy().into_owned()))
+            .expect("init must succeed");
+        let fp_a = t.current().expect("fingerprint A");
+
+        // Bump mtime forward so the `==` check trips even when the OS has a
+        // 1-second mtime granularity. `set_file_mtime` from the stdlib isn't
+        // available, but writing a different cert atomically and sleeping
+        // briefly is reliable enough for a unit test.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        write_cert(&path, TEST_CERT_PEM_B);
+
+        let new_fp = t.refresh_if_changed();
+        let final_fp = t.current();
+        let _ = fs::remove_file(&path);
+
+        let new_fp = new_fp.expect("rotation must surface a new fingerprint");
+        assert_ne!(new_fp, fp_a, "fingerprint must differ after rotation");
+        assert_eq!(final_fp.as_deref(), Some(new_fp.as_str()));
+    }
+
+    #[test]
+    fn refresh_is_no_op_when_unchanged() {
+        let path = tmp_path("noop");
+        write_cert(&path, TEST_CERT_PEM_A);
+        let t = TlsCertTracker::new(Some(path.to_string_lossy().into_owned()))
+            .expect("init must succeed");
+        let before = t.current();
+        let res = t.refresh_if_changed();
+        let after = t.current();
+        let _ = fs::remove_file(&path);
+
+        assert!(res.is_none(), "no rotation, no return value");
+        assert_eq!(before, after, "fingerprint must not move");
+    }
+
+    #[test]
+    fn refresh_is_no_op_when_content_identical_after_touch() {
+        let path = tmp_path("touch");
+        write_cert(&path, TEST_CERT_PEM_A);
+        let t = TlsCertTracker::new(Some(path.to_string_lossy().into_owned()))
+            .expect("init must succeed");
+        let before = t.current();
+
+        // Re-write the same content. mtime advances but the hash doesn't.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        write_cert(&path, TEST_CERT_PEM_A);
+        let res = t.refresh_if_changed();
+        let after = t.current();
+        let _ = fs::remove_file(&path);
+
+        assert!(
+            res.is_none(),
+            "identical content rewrite must not signal rotation"
+        );
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn refresh_handles_missing_file_gracefully() {
+        let path = tmp_path("vanish");
+        write_cert(&path, TEST_CERT_PEM_A);
+        let t = TlsCertTracker::new(Some(path.to_string_lossy().into_owned()))
+            .expect("init must succeed");
+        let before = t.current();
+
+        // File disappears. tracker must keep the cached value and not panic.
+        let _ = fs::remove_file(&path);
+        let res = t.refresh_if_changed();
+        let after = t.current();
+
+        assert!(res.is_none(), "missing file: no rotation signal");
+        assert_eq!(
+            before, after,
+            "missing file must not clear the cached fingerprint"
+        );
     }
 }

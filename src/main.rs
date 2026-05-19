@@ -88,15 +88,12 @@ async fn main() -> anyhow::Result<()> {
         "Signing keys ready"
     );
 
-    // Compute TLS certificate fingerprint if configured
-    let tls_cert_fingerprint = match &config.tls_cert_path {
-        Some(path) => {
-            let hash = attestation::compute_spki_hash(path)?;
-            info!(tls_cert_path = %path, fingerprint = %hash, "TLS certificate SPKI hash computed");
-            Some(hash)
-        }
-        None => None,
-    };
+    // Track the TLS certificate's SPKI hash. The tracker seeds itself from
+    // disk at startup, then the background attestation cache refresh task
+    // re-stats the cert on every tick and picks up renewals automatically.
+    let tls_cert_fingerprint = Arc::new(attestation::TlsCertTracker::new(
+        config.tls_cert_path.clone(),
+    )?);
 
     // Initialize OHTTP gateway if enabled
     let ohttp_gw = if config.ohttp_enabled {

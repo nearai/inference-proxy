@@ -134,7 +134,9 @@ fn build_test_app_inner(
         attestation_cache: Arc::new(vllm_proxy_rs::attestation::AttestationCache::new(300)),
         http_client,
         metrics_handle,
-        tls_cert_fingerprint: None,
+        tls_cert_fingerprint: Arc::new(
+            vllm_proxy_rs::attestation::TlsCertTracker::new(None).expect("tracker for None path"),
+        ),
         backend_pool,
         ohttp_gateway: None,
         ohttp_attestation_ed25519: None,
@@ -3153,7 +3155,9 @@ fn build_test_app_with_cloud_api_retries(
         attestation_cache: Arc::new(vllm_proxy_rs::attestation::AttestationCache::new(300)),
         http_client,
         metrics_handle,
-        tls_cert_fingerprint: None,
+        tls_cert_fingerprint: Arc::new(
+            vllm_proxy_rs::attestation::TlsCertTracker::new(None).expect("tracker for None path"),
+        ),
         backend_pool,
         ohttp_gateway: None,
         ohttp_attestation_ed25519: None,
@@ -5324,7 +5328,9 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         attestation_cache: Arc::new(attestation::AttestationCache::new(300)),
         http_client,
         metrics_handle,
-        tls_cert_fingerprint: None,
+        tls_cert_fingerprint: Arc::new(
+            vllm_proxy_rs::attestation::TlsCertTracker::new(None).expect("tracker for None path"),
+        ),
         backend_pool,
         ohttp_gateway: Some(Arc::new(ohttp_gw)),
         ohttp_attestation_ed25519: Some(ohttp_attestation_ed25519),
@@ -5703,7 +5709,9 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         attestation_cache: Arc::new(attestation::AttestationCache::new(300)),
         http_client: reqwest::Client::new(),
         metrics_handle,
-        tls_cert_fingerprint: None,
+        tls_cert_fingerprint: Arc::new(
+            vllm_proxy_rs::attestation::TlsCertTracker::new(None).expect("tracker for None path"),
+        ),
         backend_pool,
         ohttp_gateway: Some(Arc::new(ohttp_gw)),
         ohttp_attestation_ed25519: Some(ohttp_attestation_ed25519),

@@ -321,6 +321,18 @@ pub struct ProxyOpts {
     pub extra_upstream_headers: Vec<(String, String)>,
 }
 
+impl ProxyOpts {
+    /// Extract a named tracing header value from `extra_upstream_headers`.
+    /// Returns an empty string if the header is absent.
+    pub fn tracing_header(&self, name: &str) -> &str {
+        self.extra_upstream_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("")
+    }
+}
+
 /// Proxy a non-streaming JSON request to the backend using internal streaming.
 ///
 /// Sends the request to the backend with `stream: true` injected, consumes
@@ -430,18 +442,6 @@ pub async fn proxy_json_request(
     // Mirrors the log emitted by proxy_streaming_request so both paths are
     // queryable in Datadog by request_id / org_id.
     {
-        let log_request_id = opts
-            .extra_upstream_headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("x-request-id"))
-            .map(|(_, v)| v.as_str())
-            .unwrap_or("");
-        let log_org_id = opts
-            .extra_upstream_headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("x-org-id"))
-            .map(|(_, v)| v.as_str())
-            .unwrap_or("");
         let input_tokens = response_data
             .pointer("/usage/prompt_tokens")
             .and_then(|v| v.as_i64())
@@ -452,8 +452,8 @@ pub async fn proxy_json_request(
             .unwrap_or(0);
         let total_ms = upstream_start.elapsed().as_millis();
         info!(
-            request_id = %log_request_id,
-            org_id = %log_org_id,
+            request_id = %opts.tracing_header("x-request-id"),
+            org_id = %opts.tracing_header("x-org-id"),
             model = %opts.model_name,
             chat_id = %chat_id,
             input_tokens,
@@ -834,26 +834,16 @@ pub async fn proxy_streaming_request(
         });
     }
 
+    // Extract tracing IDs before any partial moves from opts.
+    let log_request_id = opts.tracing_header("x-request-id").to_string();
+    let log_org_id = opts.tracing_header("x-org-id").to_string();
+
     let signing = opts.signing.clone();
     let cache = opts.cache.clone();
     let usage_reporter = opts.usage_reporter.clone();
     let model_name = opts.model_name.clone();
     let chunk_transform = opts.chunk_transform;
     let backend_guard = opts.backend_guard;
-
-    // Extract tracing IDs from extra headers for the completion log.
-    let log_request_id = opts
-        .extra_upstream_headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("x-request-id"))
-        .map(|(_, v)| v.clone())
-        .unwrap_or_default();
-    let log_org_id = opts
-        .extra_upstream_headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("x-org-id"))
-        .map(|(_, v)| v.clone())
-        .unwrap_or_default();
 
     let stream_start = upstream_start; // reuse — measures time from send() to stream done
 
@@ -1343,6 +1333,11 @@ pub async fn proxy_streaming_response(
     opts: ProxyOpts,
     status: StatusCode,
 ) -> Result<Response, AppError> {
+    // Extract tracing IDs before any partial moves from opts.
+    let log_request_id = opts.tracing_header("x-request-id").to_string();
+    let log_org_id = opts.tracing_header("x-org-id").to_string();
+    let stream_start = std::time::Instant::now();
+
     let signing = opts.signing.clone();
     let cache = opts.cache.clone();
     let usage_reporter = opts.usage_reporter.clone();
@@ -1350,21 +1345,6 @@ pub async fn proxy_streaming_response(
     let chunk_transform = opts.chunk_transform;
     let backend_guard = opts.backend_guard;
     let request_sha256 = request_sha256.to_string();
-
-    // Extract tracing IDs for the completion log.
-    let log_request_id = opts
-        .extra_upstream_headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("x-request-id"))
-        .map(|(_, v)| v.clone())
-        .unwrap_or_default();
-    let log_org_id = opts
-        .extra_upstream_headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("x-org-id"))
-        .map(|(_, v)| v.clone())
-        .unwrap_or_default();
-    let stream_start = std::time::Instant::now();
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 

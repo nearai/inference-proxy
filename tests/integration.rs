@@ -7022,7 +7022,12 @@ async fn test_request_id_echoed_in_response() {
         response.headers().contains_key("x-request-id"),
         "response missing x-request-id header"
     );
-    let echoed = response.headers().get("x-request-id").unwrap().to_str().unwrap();
+    let echoed = response
+        .headers()
+        .get("x-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap();
     assert!(!echoed.is_empty(), "echoed x-request-id is empty");
 }
 

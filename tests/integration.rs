@@ -6921,3 +6921,107 @@ async fn test_ohttp_chunked_streams_before_upstream_finishes() {
     server_handle.abort();
     mock_handle.abort();
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Tracing header propagation tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Verify that X-Request-Id / X-Org-Id / X-Workspace-Id sent by cloud-api are
+/// forwarded to the upstream backend.
+#[tokio::test]
+async fn test_tracing_headers_propagated_to_upstream() {
+    let mock_server = MockServer::start().await;
+
+    // Upstream SSE response — minimal but valid
+    let sse_body =
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1,\"total_tokens\":6}}\n\ndata: [DONE]\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("x-request-id", "test-req-id-123"))
+        .and(header("x-org-id", "org-abc"))
+        .and(header("x-workspace-id", "ws-xyz"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse_body, "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json")
+                .header("x-request-id", "test-req-id-123")
+                .header("x-org-id", "org-abc")
+                .header("x-workspace-id", "ws-xyz")
+                .body(Body::from(
+                    r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // The mock only matches if all three tracing headers reached the upstream.
+    // A 200 here means the headers were present; any other status means the mock
+    // didn't match (wiremock returns 404 on no-match by default).
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "upstream did not receive the expected tracing headers"
+    );
+}
+
+/// Verify that X-Request-Id is echoed back in the response even when it wasn't
+/// present on the incoming request (middleware generates a fresh UUID).
+#[tokio::test]
+async fn test_request_id_echoed_in_response() {
+    let mock_server = MockServer::start().await;
+
+    let sse_body =
+        "data: {\"id\":\"chatcmpl-2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}\n\ndata: [DONE]\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse_body, "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    // The middleware should echo a request-id header (either the one we sent or a generated one).
+    assert!(
+        response.headers().contains_key("x-request-id"),
+        "response missing x-request-id header"
+    );
+    let echoed = response.headers().get("x-request-id").unwrap().to_str().unwrap();
+    assert!(!echoed.is_empty(), "echoed x-request-id is empty");
+}

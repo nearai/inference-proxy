@@ -314,6 +314,11 @@ pub struct ProxyOpts {
     /// a non-streaming JSON body. Defaults to `ChatCompletion`; the
     /// `/v1/completions` route sets this to `TextCompletion`.
     pub response_shape: ResponseShape,
+    /// Extra HTTP headers to forward to the upstream backend.
+    /// Used to propagate tracing correlation IDs (X-Request-Id, X-Org-Id,
+    /// X-Workspace-Id) from cloud-api through to vLLM/SGLang so they appear
+    /// in engine-level logs alongside token usage.
+    pub extra_upstream_headers: Vec<(String, String)>,
 }
 
 /// Proxy a non-streaming JSON request to the backend using internal streaming.
@@ -347,10 +352,14 @@ pub async fn proxy_json_request(
     let streaming_body = inject_streaming(&request_body)?;
 
     let upstream_start = std::time::Instant::now();
-    let response = client
+    let mut req = client
         .post(url)
         .header("content-type", "application/json")
-        .header("accept", "text/event-stream")
+        .header("accept", "text/event-stream");
+    for (k, v) in &opts.extra_upstream_headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    let response = req
         .body(streaming_body)
         .send()
         .await
@@ -763,10 +772,14 @@ pub async fn proxy_streaming_request(
         .unwrap_or_else(|| hex::encode(Sha256::digest(&request_body)));
 
     let upstream_start = std::time::Instant::now();
-    let response = client
+    let mut req = client
         .post(url)
         .header("content-type", "application/json")
-        .header("accept", "text/event-stream")
+        .header("accept", "text/event-stream");
+    for (k, v) in &opts.extra_upstream_headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    let response = req
         .body(request_body)
         .send()
         .await
@@ -790,6 +803,22 @@ pub async fn proxy_streaming_request(
     let model_name = opts.model_name.clone();
     let chunk_transform = opts.chunk_transform;
     let backend_guard = opts.backend_guard;
+
+    // Extract tracing IDs from extra headers for the completion log.
+    let log_request_id = opts
+        .extra_upstream_headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-request-id"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    let log_org_id = opts
+        .extra_upstream_headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-org-id"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+
+    let stream_start = upstream_start; // reuse — measures time from send() to stream done
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
@@ -903,6 +932,22 @@ pub async fn proxy_streaming_request(
                     });
                     spawn_usage_report(reporter, body);
                 }
+
+                // Structured completion log — one line per successful streaming request.
+                // Carries org_id/request_id propagated from cloud-api so this line is
+                // joinable with cloud-api and nginx logs in Datadog.
+                let (input_tokens, output_tokens) = parser.usage.unwrap_or((0, 0));
+                let total_ms = stream_start.elapsed().as_millis();
+                info!(
+                    request_id = %log_request_id,
+                    org_id = %log_org_id,
+                    model = %model_name,
+                    chat_id = %id,
+                    input_tokens,
+                    output_tokens,
+                    total_duration_ms = total_ms,
+                    "request completed"
+                );
             } else {
                 error!("Chat id could not be extracted from the completed streaming response");
             }
@@ -1555,6 +1600,7 @@ mod tests {
             chunk_transform: None,
             backend_guard: None,
             response_shape: ResponseShape::default(),
+            extra_upstream_headers: vec![],
         }
     }
 

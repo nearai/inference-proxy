@@ -44,6 +44,9 @@ pub struct AppState {
 }
 
 /// Request ID middleware: generates or passes through X-Request-ID header.
+/// Also reads X-Org-Id and X-Workspace-Id (propagated by cloud-api) and
+/// attaches them to the tracing span so every log line within the request
+/// carries them in Datadog.
 pub async fn request_id_middleware(mut request: Request<axum::body::Body>, next: Next) -> Response {
     let request_id = request
         .headers()
@@ -51,6 +54,20 @@ pub async fn request_id_middleware(mut request: Request<axum::body::Body>, next:
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    let org_id = request
+        .headers()
+        .get("x-org-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let workspace_id = request
+        .headers()
+        .get("x-workspace-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
 
     // Store in request extensions for handlers
     request.extensions_mut().insert(request_id.clone());
@@ -61,6 +78,8 @@ pub async fn request_id_middleware(mut request: Request<axum::body::Body>, next:
     let span = tracing::info_span!(
         "request",
         request_id = %request_id,
+        org_id = %org_id,
+        workspace_id = %workspace_id,
         method = %method,
         path = %path,
     );

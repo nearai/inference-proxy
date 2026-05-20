@@ -426,6 +426,43 @@ pub async fn proxy_json_request(
     let chat_id = response_data["id"].as_str().unwrap_or("").to_string();
     try_report_usage(&response_data, &chat_id, &opts);
 
+    // Structured completion log — one line per successful non-streaming request.
+    // Mirrors the log emitted by proxy_streaming_request so both paths are
+    // queryable in Datadog by request_id / org_id.
+    {
+        let log_request_id = opts
+            .extra_upstream_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("x-request-id"))
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        let log_org_id = opts
+            .extra_upstream_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("x-org-id"))
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        let input_tokens = response_data
+            .pointer("/usage/prompt_tokens")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let output_tokens = response_data
+            .pointer("/usage/completion_tokens")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let total_ms = upstream_start.elapsed().as_millis();
+        info!(
+            request_id = %log_request_id,
+            org_id = %log_org_id,
+            model = %opts.model_name,
+            chat_id = %chat_id,
+            input_tokens,
+            output_tokens,
+            total_duration_ms = total_ms,
+            "request completed"
+        );
+    }
+
     // Apply response transform (e.g., encryption) before hashing/signing.
     if let Some(transform) = opts.response_transform.take() {
         transform(&mut response_data)?;
@@ -1107,9 +1144,11 @@ pub async fn proxy_multipart_request(
     mut opts: ProxyOpts,
 ) -> Result<Response, AppError> {
     let upstream_start = std::time::Instant::now();
-    let response = client
-        .post(url)
-        .multipart(form)
+    let mut req = client.post(url).multipart(form);
+    for (k, v) in &opts.extra_upstream_headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    let response = req
         .send()
         .await
         .map_err(|e| AppError::Internal(e.into()))?;
@@ -1312,6 +1351,21 @@ pub async fn proxy_streaming_response(
     let backend_guard = opts.backend_guard;
     let request_sha256 = request_sha256.to_string();
 
+    // Extract tracing IDs for the completion log.
+    let log_request_id = opts
+        .extra_upstream_headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-request-id"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    let log_org_id = opts
+        .extra_upstream_headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-org-id"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    let stream_start = std::time::Instant::now();
+
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
     let byte_stream = response.bytes_stream();
@@ -1419,6 +1473,20 @@ pub async fn proxy_streaming_response(
                     });
                     spawn_usage_report(reporter, body);
                 }
+
+                // Structured completion log — one line per successful streaming response.
+                let (input_tokens, output_tokens) = parser.usage.unwrap_or((0, 0));
+                let total_ms = stream_start.elapsed().as_millis();
+                info!(
+                    request_id = %log_request_id,
+                    org_id = %log_org_id,
+                    model = %model_name,
+                    chat_id = %id,
+                    input_tokens,
+                    output_tokens,
+                    total_duration_ms = total_ms,
+                    "request completed"
+                );
             } else {
                 error!("Chat id could not be extracted from the completed streaming response");
             }

@@ -7025,3 +7025,54 @@ async fn test_request_id_echoed_in_response() {
     let echoed = response.headers().get("x-request-id").unwrap().to_str().unwrap();
     assert!(!echoed.is_empty(), "echoed x-request-id is empty");
 }
+
+/// Verify that tracing headers are also forwarded on the non-streaming path
+/// (proxy_json_request, used when stream: false).
+#[tokio::test]
+async fn test_tracing_headers_propagated_non_streaming() {
+    let mock_server = MockServer::start().await;
+
+    // Non-streaming JSON response — proxy_json_request POSTs with stream:true internally
+    // and reassembles the SSE into a single JSON body, so we return SSE here.
+    let sse_body =
+        "data: {\"id\":\"chatcmpl-ns1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-ns1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":1,\"total_tokens\":5}}\n\ndata: [DONE]\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("x-request-id", "ns-req-id-999"))
+        .and(header("x-org-id", "org-ns"))
+        .and(header("x-workspace-id", "ws-ns"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse_body, "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json")
+                .header("x-request-id", "ns-req-id-999")
+                .header("x-org-id", "org-ns")
+                .header("x-workspace-id", "ws-ns")
+                .body(Body::from(
+                    r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"stream":false}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "upstream did not receive tracing headers on non-streaming path"
+    );
+}

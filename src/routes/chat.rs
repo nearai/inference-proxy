@@ -249,7 +249,10 @@ mod tests {
         ]);
         let extracted = extract_tracing_headers(&headers);
         assert_eq!(extracted.len(), 3);
-        assert!(extracted.contains(&("x-request-id".to_string(), "550e8400-e29b-41d4-a716-446655440000".to_string())));
+        assert!(extracted.contains(&(
+            "x-request-id".to_string(),
+            "550e8400-e29b-41d4-a716-446655440000".to_string()
+        )));
         assert!(extracted.contains(&("x-org-id".to_string(), "org-uuid-123".to_string())));
         assert!(extracted.contains(&("x-workspace-id".to_string(), "ws-uuid-456".to_string())));
         // Authorization must not be extracted
@@ -258,12 +261,13 @@ mod tests {
 
     #[test]
     fn test_extract_tracing_headers_partial() {
-        let headers = headers_with(&[
-            ("x-request-id", "req-abc"),
-        ]);
+        let headers = headers_with(&[("x-request-id", "req-abc")]);
         let extracted = extract_tracing_headers(&headers);
         assert_eq!(extracted.len(), 1);
-        assert_eq!(extracted[0], ("x-request-id".to_string(), "req-abc".to_string()));
+        assert_eq!(
+            extracted[0],
+            ("x-request-id".to_string(), "req-abc".to_string())
+        );
     }
 
     #[test]

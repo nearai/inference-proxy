@@ -59,15 +59,15 @@ pub async fn request_id_middleware(mut request: Request<axum::body::Body>, next:
         .headers()
         .get("x-org-id")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+        .map(|s| s.to_string())
+        .unwrap_or_default();
 
     let workspace_id = request
         .headers()
         .get("x-workspace-id")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+        .map(|s| s.to_string())
+        .unwrap_or_default();
 
     // Store in request extensions for handlers
     request.extensions_mut().insert(request_id.clone());

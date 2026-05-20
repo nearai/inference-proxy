@@ -333,6 +333,20 @@ impl ProxyOpts {
     }
 }
 
+/// Apply extra upstream tracing headers to a `reqwest::RequestBuilder`.
+///
+/// Centralises the header-injection loop that would otherwise be duplicated
+/// in every proxy function that builds an outbound request.
+fn apply_tracing_headers(
+    mut req: reqwest::RequestBuilder,
+    headers: &[(String, String)],
+) -> reqwest::RequestBuilder {
+    for (k, v) in headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    req
+}
+
 /// Proxy a non-streaming JSON request to the backend using internal streaming.
 ///
 /// Sends the request to the backend with `stream: true` injected, consumes
@@ -364,13 +378,13 @@ pub async fn proxy_json_request(
     let streaming_body = inject_streaming(&request_body)?;
 
     let upstream_start = std::time::Instant::now();
-    let mut req = client
-        .post(url)
-        .header("content-type", "application/json")
-        .header("accept", "text/event-stream");
-    for (k, v) in &opts.extra_upstream_headers {
-        req = req.header(k.as_str(), v.as_str());
-    }
+    let req = apply_tracing_headers(
+        client
+            .post(url)
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream"),
+        &opts.extra_upstream_headers,
+    );
     let response = req
         .body(streaming_body)
         .send()
@@ -454,6 +468,7 @@ pub async fn proxy_json_request(
         info!(
             request_id = %opts.tracing_header("x-request-id"),
             org_id = %opts.tracing_header("x-org-id"),
+            workspace_id = %opts.tracing_header("x-workspace-id"),
             model = %opts.model_name,
             chat_id = %chat_id,
             input_tokens,
@@ -809,13 +824,13 @@ pub async fn proxy_streaming_request(
         .unwrap_or_else(|| hex::encode(Sha256::digest(&request_body)));
 
     let upstream_start = std::time::Instant::now();
-    let mut req = client
-        .post(url)
-        .header("content-type", "application/json")
-        .header("accept", "text/event-stream");
-    for (k, v) in &opts.extra_upstream_headers {
-        req = req.header(k.as_str(), v.as_str());
-    }
+    let req = apply_tracing_headers(
+        client
+            .post(url)
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream"),
+        &opts.extra_upstream_headers,
+    );
     let response = req
         .body(request_body)
         .send()
@@ -837,6 +852,7 @@ pub async fn proxy_streaming_request(
     // Extract tracing IDs before any partial moves from opts.
     let log_request_id = opts.tracing_header("x-request-id").to_string();
     let log_org_id = opts.tracing_header("x-org-id").to_string();
+    let log_workspace_id = opts.tracing_header("x-workspace-id").to_string();
 
     let signing = opts.signing.clone();
     let cache = opts.cache.clone();
@@ -968,6 +984,7 @@ pub async fn proxy_streaming_request(
                 info!(
                     request_id = %log_request_id,
                     org_id = %log_org_id,
+                    workspace_id = %log_workspace_id,
                     model = %model_name,
                     chat_id = %id,
                     input_tokens,
@@ -1134,14 +1151,11 @@ pub async fn proxy_multipart_request(
     mut opts: ProxyOpts,
 ) -> Result<Response, AppError> {
     let upstream_start = std::time::Instant::now();
-    let mut req = client.post(url).multipart(form);
-    for (k, v) in &opts.extra_upstream_headers {
-        req = req.header(k.as_str(), v.as_str());
-    }
-    let response = req
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(e.into()))?;
+    let req = apply_tracing_headers(
+        client.post(url).multipart(form),
+        &opts.extra_upstream_headers,
+    );
+    let response = req.send().await.map_err(|e| AppError::Internal(e.into()))?;
     metrics::histogram!("upstream_request_duration_seconds", "endpoint" => "multipart")
         .record(upstream_start.elapsed().as_secs_f64());
 
@@ -1336,6 +1350,7 @@ pub async fn proxy_streaming_response(
     // Extract tracing IDs before any partial moves from opts.
     let log_request_id = opts.tracing_header("x-request-id").to_string();
     let log_org_id = opts.tracing_header("x-org-id").to_string();
+    let log_workspace_id = opts.tracing_header("x-workspace-id").to_string();
     let stream_start = std::time::Instant::now();
 
     let signing = opts.signing.clone();
@@ -1460,6 +1475,7 @@ pub async fn proxy_streaming_response(
                 info!(
                     request_id = %log_request_id,
                     org_id = %log_org_id,
+                    workspace_id = %log_workspace_id,
                     model = %model_name,
                     chat_id = %id,
                     input_tokens,

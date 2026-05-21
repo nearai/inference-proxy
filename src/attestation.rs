@@ -362,7 +362,7 @@ impl AttestationCache {
         signing_algo: &str,
         include_tls_fingerprint: bool,
         report: AttestationReport,
-        compose_manager_attestation: Option<serde_json::Value>,
+        compose_manager_attestation: Option<Box<serde_json::value::RawValue>>,
         ohttp_attestation: Option<crate::types::OhttpAttestation>,
     ) {
         let response = crate::types::AttestationResponse::new(
@@ -396,13 +396,18 @@ impl AttestationCache {
 
 /// Fetch compose-manager attestation report from the given URL.
 ///
+/// Returns the raw response body as a `RawValue` so the bytes compose-manager
+/// signed are forwarded verbatim. This preserves the `sha256(actions) ==
+/// actions_hash` binding for downstream verifiers — re-parsing through
+/// `serde_json::Value` would reorder object keys alphabetically and break it.
+///
 /// Returns `None` on any error (timeout, connection refused, bad JSON, etc.)
 /// so that compose-manager unavailability never blocks inference attestation.
 pub async fn fetch_compose_manager_attestation(
     http_client: &reqwest::Client,
     compose_manager_url: &str,
     nonce: Option<&str>,
-) -> Option<serde_json::Value> {
+) -> Option<Box<serde_json::value::RawValue>> {
     let mut url = match reqwest::Url::parse(compose_manager_url) {
         Ok(u) => u,
         Err(e) => {
@@ -420,10 +425,16 @@ pub async fn fetch_compose_manager_attestation(
         .send()
         .await
     {
-        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
-            Ok(val) => Some(val),
+        Ok(resp) if resp.status().is_success() => match resp.text().await {
+            Ok(body) => match serde_json::value::RawValue::from_string(body) {
+                Ok(raw) => Some(raw),
+                Err(e) => {
+                    warn!(error = %e, "Compose-manager attestation response was not valid JSON");
+                    None
+                }
+            },
             Err(e) => {
-                warn!(error = %e, "Failed to parse compose-manager attestation response");
+                warn!(error = %e, "Failed to read compose-manager attestation response body");
                 None
             }
         },
@@ -1767,13 +1778,12 @@ mod tests {
     async fn test_cache_includes_compose_manager_attestation() {
         let cache = AttestationCache::new(300);
         let report = make_test_report("ecdsa", "aabb");
-        let cm_attestation = serde_json::json!({
-            "actions": [{"action": "compose_up", "tag": "v1.0"}],
-            "actions_hash": "deadbeef",
-            "quote": "some_tdx_quote"
-        });
+        // Use a hand-rolled string with non-alphabetical key order so the
+        // assertion below also catches any reordering regression.
+        let cm_raw = r#"{"quote":"some_tdx_quote","actions_hash":"deadbeef","actions":[{"action":"compose_up","tag":"v1.0"}]}"#;
+        let cm_attestation = serde_json::value::RawValue::from_string(cm_raw.to_string()).unwrap();
         cache
-            .set("ecdsa", false, report, Some(cm_attestation.clone()), None)
+            .set("ecdsa", false, report, Some(cm_attestation), None)
             .await;
 
         // Verify the struct getter doesn't include compose-manager attestation
@@ -1781,10 +1791,13 @@ mod tests {
         let result = cache.get("ecdsa", false).await;
         assert!(result.is_some());
 
-        // Verify pre-serialized bytes include compose_manager_attestation
+        // Verify pre-serialized bytes preserve the exact bytes (key order included).
         let bytes = cache.get_bytes("ecdsa", false).await.unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(parsed["compose_manager_attestation"], cm_attestation);
+        let body = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            body.contains(cm_raw),
+            "compose_manager_attestation should round-trip byte-exact; got body: {body}"
+        );
     }
 
     #[tokio::test]
@@ -1797,6 +1810,65 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(parsed.get("compose_manager_attestation").is_none());
     }
+
+    /// Regression: a verifier must be able to recover `actions_hash` by
+    /// re-hashing the `actions` field as it appears in inference-proxy's
+    /// response. Previously the value was held as `serde_json::Value` which
+    /// alphabetized object keys on re-serialization, breaking this binding.
+    #[tokio::test]
+    async fn test_actions_hash_round_trips_via_cache() {
+        use sha2::{Digest, Sha256};
+
+        let cache = AttestationCache::new(300);
+        let report = make_test_report("ecdsa", "aabb");
+
+        // Mimic compose-manager: serialize an actions list (struct field order),
+        // hash it, then embed both in the attestation body.
+        let actions_json = r#"[{"timestamp":"2026-05-21T10:01:40Z","action":"compose_up","tag":"v0.0.169","commit":"8e71b71b","file":"small-models.yaml","file_sha256":"7f60fb50"}]"#;
+        let actions_hash = hex::encode(Sha256::digest(actions_json.as_bytes()));
+        let cm_raw =
+            format!(r#"{{"actions":{actions_json},"actions_hash":"{actions_hash}","quote":"q"}}"#);
+        let cm_attestation = serde_json::value::RawValue::from_string(cm_raw.clone()).unwrap();
+
+        cache
+            .set("ecdsa", false, report, Some(cm_attestation), None)
+            .await;
+
+        // Verifier path: parse the response, extract the actions field, hash it.
+        let bytes = cache.get_bytes("ecdsa", false).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let cm = &parsed["compose_manager_attestation"];
+
+        // `serde_json::Value` reorders keys, so we cannot recover actions by
+        // re-serializing `cm["actions"]`. Instead, the response embeds the raw
+        // compose-manager body — locate the substring and hash directly.
+        let body = std::str::from_utf8(&bytes).unwrap();
+        let needle = r#""actions":"#;
+        let start = body.find(needle).unwrap() + needle.len();
+        // Walk until the matching close-bracket of the JSON array.
+        let mut depth = 0i32;
+        let mut end = start;
+        for (i, c) in body[start..].char_indices() {
+            match c {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = start + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let extracted = &body[start..end];
+        let recomputed = hex::encode(Sha256::digest(extracted.as_bytes()));
+        assert_eq!(
+            recomputed,
+            cm["actions_hash"].as_str().unwrap(),
+            "verifier must be able to recompute actions_hash from raw response bytes"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1806,41 +1878,51 @@ mod tests_fetch_compose_manager {
     #[tokio::test]
     async fn test_fetch_success() {
         let mock = wiremock::MockServer::start().await;
-        let cm_response = serde_json::json!({
-            "actions": [],
-            "actions_hash": "abc123",
-            "nonce": "def456",
-            "quote": "tdx_quote_data"
-        });
+        // Use a hand-rolled body so we control the exact byte sequence and
+        // verify the fetcher forwards it verbatim (no key reordering, no
+        // re-formatting).
+        let cm_body =
+            r#"{"quote":"tdx_quote_data","actions":[],"actions_hash":"abc123","nonce":"def456"}"#;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/v1/attestation/report"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&cm_response))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string(cm_body)
+                    .insert_header("content-type", "application/json"),
+            )
             .mount(&mock)
             .await;
 
         let client = reqwest::Client::new();
         let result = fetch_compose_manager_attestation(&client, &mock.uri(), None).await;
-        assert_eq!(result, Some(cm_response));
+        let raw = result.expect("expected successful fetch");
+        assert_eq!(
+            raw.get(),
+            cm_body,
+            "RawValue bytes must match upstream response byte-for-byte"
+        );
     }
 
     #[tokio::test]
     async fn test_fetch_passes_nonce() {
         let mock = wiremock::MockServer::start().await;
         let nonce = "aa".repeat(32);
+        let body = format!(r#"{{"nonce":"{nonce}"}}"#);
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/v1/attestation/report"))
             .and(wiremock::matchers::query_param("nonce", &nonce))
             .respond_with(
                 wiremock::ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"nonce": &nonce})),
+                    .set_body_string(body.clone())
+                    .insert_header("content-type", "application/json"),
             )
             .mount(&mock)
             .await;
 
         let client = reqwest::Client::new();
         let result = fetch_compose_manager_attestation(&client, &mock.uri(), Some(&nonce)).await;
-        assert!(result.is_some());
-        assert_eq!(result.unwrap()["nonce"], nonce);
+        let raw = result.expect("expected successful fetch");
+        assert_eq!(raw.get(), body);
     }
 
     #[tokio::test]

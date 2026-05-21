@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 
 /// Cached signature data for a chat completion, stored in the cache.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,8 +37,13 @@ pub struct AttestationResponse {
     pub all_attestations: Vec<AttestationReport>,
     /// Compose-manager deployment attestation, if available.
     /// Contains the compose-manager's TDX-attested action log (deployment events).
+    ///
+    /// Stored as `RawValue` so the byte-exact JSON received from compose-manager
+    /// is forwarded verbatim. Re-parsing via `serde_json::Value` reorders keys
+    /// alphabetically and breaks the `sha256(actions) == actions_hash` binding
+    /// that ties the action log to the embedded TDX quote's `report_data`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub compose_manager_attestation: Option<serde_json::Value>,
+    pub compose_manager_attestation: Option<Box<RawValue>>,
     /// Legacy flat OHTTP key config field kept for backward compatibility.
     /// Mirrors `ohttp_attestation.key_config` when present.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -52,7 +58,7 @@ impl AttestationResponse {
     pub fn new(
         report: AttestationReport,
         all_attestations: Vec<AttestationReport>,
-        compose_manager_attestation: Option<serde_json::Value>,
+        compose_manager_attestation: Option<Box<RawValue>>,
         ohttp_attestation: Option<OhttpAttestation>,
     ) -> Self {
         let ohttp_key_config = ohttp_attestation.as_ref().map(|att| att.key_config.clone());

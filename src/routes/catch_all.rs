@@ -208,6 +208,7 @@ pub async fn catch_all(
             chunk_transform: None,
             backend_guard: Some(backend_guard),
             response_shape: ResponseShape::ChatCompletion,
+            tracing_ids: None,
         };
         proxy::proxy_streaming_response(response, &request_sha256, opts, axum_status).await
     } else if content_type.contains("application/json") {
@@ -235,6 +236,7 @@ pub async fn catch_all(
             chunk_transform: None,
             backend_guard: None,
             response_shape: ResponseShape::ChatCompletion,
+            tracing_ids: None,
         };
         proxy::sign_and_cache_json_response(&response_bytes, &request_sha256, opts, axum_status)
             .await

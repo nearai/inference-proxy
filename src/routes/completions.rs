@@ -95,6 +95,7 @@ pub async fn completions(
         chunk_transform,
         backend_guard: Some(guard),
         response_shape: ResponseShape::TextCompletion,
+        tracing_ids: None,
     };
 
     if is_stream {

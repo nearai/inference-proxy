@@ -10,7 +10,7 @@ use tracing::{debug, error, info, warn};
 use crate::cache::ChatCache;
 use crate::error::AppError;
 use crate::signing::SigningPair;
-use crate::AppState;
+use crate::{AppState, TracingIds};
 
 /// Parsed upstream error info for logging and re-wrapping.
 pub struct UpstreamErrorInfo {
@@ -314,6 +314,41 @@ pub struct ProxyOpts {
     /// a non-streaming JSON body. Defaults to `ChatCompletion`; the
     /// `/v1/completions` route sets this to `TextCompletion`.
     pub response_shape: ResponseShape,
+    /// Tracing correlation IDs (request_id / org_id / workspace_id) parsed by
+    /// `request_id_middleware`. When `Some`, the corresponding headers are
+    /// forwarded to the upstream engine and emitted on the per-request log
+    /// line. Routes that don't carry org context (completions, passthrough)
+    /// leave this `None`.
+    pub tracing_ids: Option<TracingIds>,
+}
+
+/// Apply upstream tracing headers to a `reqwest::RequestBuilder`. No-op when
+/// `tracing_ids` is `None`.
+fn apply_tracing_headers(
+    mut req: reqwest::RequestBuilder,
+    tracing_ids: Option<&TracingIds>,
+) -> reqwest::RequestBuilder {
+    let Some(ids) = tracing_ids else {
+        return req;
+    };
+    for (k, v) in ids.upstream_headers() {
+        req = req.header(k, v);
+    }
+    req
+}
+
+/// Owned `(request_id, org_id, workspace_id)` strings for emission on the
+/// per-request log line. Each value defaults to `""` when absent — matches the
+/// pre-refactor behavior so existing Datadog queries keep working.
+fn log_ids_or_empty(tracing_ids: &Option<TracingIds>) -> (String, String, String) {
+    match tracing_ids {
+        Some(ids) => (
+            ids.request_id.clone(),
+            ids.org_id_or_empty().to_string(),
+            ids.workspace_id_or_empty().to_string(),
+        ),
+        None => (String::new(), String::new(), String::new()),
+    }
 }
 
 /// Proxy a non-streaming JSON request to the backend using internal streaming.
@@ -347,10 +382,14 @@ pub async fn proxy_json_request(
     let streaming_body = inject_streaming(&request_body)?;
 
     let upstream_start = std::time::Instant::now();
-    let response = client
-        .post(url)
-        .header("content-type", "application/json")
-        .header("accept", "text/event-stream")
+    let req = apply_tracing_headers(
+        client
+            .post(url)
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream"),
+        opts.tracing_ids.as_ref(),
+    );
+    let response = req
         .body(streaming_body)
         .send()
         .await
@@ -439,6 +478,33 @@ pub async fn proxy_json_request(
     // Report usage for cloud API key requests (before encryption, needs plaintext fields)
     let chat_id = response_data["id"].as_str().unwrap_or("").to_string();
     try_report_usage(&response_data, &chat_id, &opts);
+
+    // Structured completion log — one line per successful non-streaming request.
+    // Mirrors the log emitted by proxy_streaming_request so both paths are
+    // queryable in Datadog by request_id / org_id.
+    {
+        let input_tokens = response_data
+            .pointer("/usage/prompt_tokens")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let output_tokens = response_data
+            .pointer("/usage/completion_tokens")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let total_ms = upstream_start.elapsed().as_millis();
+        let (log_request_id, log_org_id, log_workspace_id) = log_ids_or_empty(&opts.tracing_ids);
+        info!(
+            request_id = %log_request_id,
+            org_id = %log_org_id,
+            workspace_id = %log_workspace_id,
+            model = %opts.model_name,
+            chat_id = %chat_id,
+            input_tokens,
+            output_tokens,
+            total_duration_ms = total_ms,
+            "request completed"
+        );
+    }
 
     // Apply response transform (e.g., encryption) before hashing/signing.
     if let Some(transform) = opts.response_transform.take() {
@@ -809,10 +875,14 @@ pub async fn proxy_streaming_request(
         .unwrap_or_else(|| hex::encode(Sha256::digest(&request_body)));
 
     let upstream_start = std::time::Instant::now();
-    let response = client
-        .post(url)
-        .header("content-type", "application/json")
-        .header("accept", "text/event-stream")
+    let req = apply_tracing_headers(
+        client
+            .post(url)
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream"),
+        opts.tracing_ids.as_ref(),
+    );
+    let response = req
         .body(request_body)
         .send()
         .await
@@ -829,6 +899,9 @@ pub async fn proxy_streaming_request(
             body,
         });
     }
+
+    // Capture log fields before any partial moves from opts.
+    let (log_request_id, log_org_id, log_workspace_id) = log_ids_or_empty(&opts.tracing_ids);
 
     let signing = opts.signing.clone();
     let cache = opts.cache.clone();
@@ -949,6 +1022,23 @@ pub async fn proxy_streaming_request(
                     });
                     spawn_usage_report(reporter, body);
                 }
+
+                // Structured completion log — one line per successful streaming request.
+                // Carries org_id/request_id propagated from cloud-api so this line is
+                // joinable with cloud-api and nginx logs in Datadog.
+                let (input_tokens, output_tokens) = parser.usage.unwrap_or((0, 0));
+                let total_ms = upstream_start.elapsed().as_millis();
+                info!(
+                    request_id = %log_request_id,
+                    org_id = %log_org_id,
+                    workspace_id = %log_workspace_id,
+                    model = %model_name,
+                    chat_id = %id,
+                    input_tokens,
+                    output_tokens,
+                    total_duration_ms = total_ms,
+                    "request completed"
+                );
             } else {
                 error!("Chat id could not be extracted from the completed streaming response");
             }
@@ -1108,12 +1198,8 @@ pub async fn proxy_multipart_request(
     mut opts: ProxyOpts,
 ) -> Result<Response, AppError> {
     let upstream_start = std::time::Instant::now();
-    let response = client
-        .post(url)
-        .multipart(form)
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(e.into()))?;
+    let req = apply_tracing_headers(client.post(url).multipart(form), opts.tracing_ids.as_ref());
+    let response = req.send().await.map_err(|e| AppError::Internal(e.into()))?;
     metrics::histogram!("upstream_request_duration_seconds", "endpoint" => "multipart")
         .record(upstream_start.elapsed().as_secs_f64());
 
@@ -1305,6 +1391,10 @@ pub async fn proxy_streaming_response(
     opts: ProxyOpts,
     status: StatusCode,
 ) -> Result<Response, AppError> {
+    // Capture log fields before any partial moves from opts.
+    let (log_request_id, log_org_id, log_workspace_id) = log_ids_or_empty(&opts.tracing_ids);
+    let stream_start = std::time::Instant::now();
+
     let signing = opts.signing.clone();
     let cache = opts.cache.clone();
     let usage_reporter = opts.usage_reporter.clone();
@@ -1420,6 +1510,21 @@ pub async fn proxy_streaming_response(
                     });
                     spawn_usage_report(reporter, body);
                 }
+
+                // Structured completion log — one line per successful streaming response.
+                let (input_tokens, output_tokens) = parser.usage.unwrap_or((0, 0));
+                let total_ms = stream_start.elapsed().as_millis();
+                info!(
+                    request_id = %log_request_id,
+                    org_id = %log_org_id,
+                    workspace_id = %log_workspace_id,
+                    model = %model_name,
+                    chat_id = %id,
+                    input_tokens,
+                    output_tokens,
+                    total_duration_ms = total_ms,
+                    "request completed"
+                );
             } else {
                 error!("Chat id could not be extracted from the completed streaming response");
             }
@@ -1601,6 +1706,7 @@ mod tests {
             chunk_transform: None,
             backend_guard: None,
             response_shape: ResponseShape::default(),
+            tracing_ids: None,
         }
     }
 

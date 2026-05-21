@@ -2,6 +2,7 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::Response;
+use axum::Extension;
 
 use sha2::Digest;
 
@@ -9,12 +10,13 @@ use crate::auth::RequireAuth;
 use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
 use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageType};
-use crate::AppState;
+use crate::{AppState, TracingIds};
 
 /// POST /v1/chat/completions
 pub async fn chat_completions(
     State(state): State<AppState>,
     auth: RequireAuth,
+    Extension(tracing_ids): Extension<TracingIds>,
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
@@ -105,6 +107,7 @@ pub async fn chat_completions(
         chunk_transform,
         backend_guard: Some(guard),
         response_shape: ResponseShape::ChatCompletion,
+        tracing_ids: Some(tracing_ids),
     };
 
     if is_stream {

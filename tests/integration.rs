@@ -796,6 +796,54 @@ async fn test_completions_endpoint_sse_reassembly() {
     assert_eq!(body["usage"]["completion_tokens"], 3);
 }
 
+// ---- SSE error chunk propagation ----
+
+/// SGLang's `--max-queued-requests` abort emits `data: {"error": {...}}` then
+/// `data: {...,"choices":[],"usage":{0,0,0}}` then `[DONE]`, so the upstream
+/// returns HTTP 200 with a valid SSE shape. proxy_json_request must detect the
+/// error chunk and propagate the upstream status (503) rather than signing the
+/// empty-choices body and returning HTTP 200 to the caller.
+#[tokio::test]
+async fn test_chat_sse_queue_full_propagates_503() {
+    let mock_server = MockServer::start().await;
+
+    let sse_body = concat!(
+        "data: {\"error\":{\"object\":\"error\",\"message\":\"The request queue is full.\",\"type\":\"SERVICE_UNAVAILABLE\",\"code\":503}}\n\n",
+        "data: {\"id\":\"chatcmpl-q1\",\"object\":\"chat.completion.chunk\",\"model\":\"test-model\",\"created\":100,\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(sse_body.as_bytes(), "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(
+                    r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = body_to_json(response).await;
+    assert_eq!(body["error"]["message"], "The request queue is full.");
+    assert_eq!(body["error"]["type"], "SERVICE_UNAVAILABLE");
+}
+
 // ---- Embeddings ----
 
 #[tokio::test]

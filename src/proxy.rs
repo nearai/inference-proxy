@@ -390,6 +390,29 @@ pub async fn proxy_json_request(
                 assembler.process_chunk(&chunk);
             }
         }
+        // If the stream surfaced an upstream error chunk (e.g. SGLang queue-full
+        // abort), propagate it as a real upstream error. Otherwise the empty
+        // `choices: []` final chunk would be signed and returned as HTTP 200,
+        // hiding the failure from cloud-api's retry logic.
+        if let Some(err) = assembler.take_error() {
+            let status_code = err
+                .get("code")
+                .and_then(|v| v.as_u64())
+                .and_then(|c| u16::try_from(c).ok())
+                .and_then(|c| StatusCode::from_u16(c).ok())
+                .unwrap_or(StatusCode::BAD_GATEWAY);
+            let body_bytes = Bytes::from(
+                serde_json::to_vec(&serde_json::json!({ "error": err }))
+                    .map_err(|e| AppError::Internal(e.into()))?,
+            );
+            let reqwest_status = reqwest::StatusCode::from_u16(status_code.as_u16())
+                .unwrap_or(reqwest::StatusCode::BAD_GATEWAY);
+            log_upstream_error(reqwest_status, url, &body_bytes);
+            return Err(AppError::Upstream {
+                status: status_code,
+                body: body_bytes,
+            });
+        }
         assembler.into_response(&opts.id_prefix)
     } else {
         // Backend returned plain JSON — process as before.
@@ -473,6 +496,13 @@ struct StreamingResponseAssembler {
     usage: Option<serde_json::Value>,
     metadata: Option<serde_json::Value>,
     shape: ResponseShape,
+    /// First `event["error"]` object seen in the stream. SGLang aborts (e.g.
+    /// `--max-queued-requests` overflow) emit `data: {"error": {...}}` then
+    /// continue with `[DONE]` plus an empty-choices/zero-usage chunk, so the
+    /// upstream returns HTTP 200 with a valid SSE shape. Capturing this lets
+    /// the caller surface a real upstream error instead of returning a
+    /// phantom HTTP 200 + empty choices.
+    error: Option<serde_json::Value>,
 }
 
 /// Accumulates delta fields for a single choice.
@@ -496,7 +526,13 @@ impl StreamingResponseAssembler {
             usage: None,
             metadata: None,
             shape,
+            error: None,
         }
+    }
+
+    /// Returns the upstream error chunk captured during stream processing, if any.
+    fn take_error(&mut self) -> Option<serde_json::Value> {
+        self.error.take()
     }
 
     fn process_chunk(&mut self, chunk: &[u8]) {
@@ -531,6 +567,16 @@ impl StreamingResponseAssembler {
     }
 
     fn ingest_event(&mut self, event: &serde_json::Value) {
+        // Capture the first upstream error chunk. SGLang surfaces aborts
+        // (queue-full, priority-disabled, waiting timeout) by emitting
+        // `data: {"error": {"object":"error","message":"...","type":"...","code":<http_status>}}`
+        // mid-stream while keeping the SSE response otherwise well-formed.
+        if self.error.is_none() {
+            if let Some(err) = event.get("error").filter(|v| v.is_object()) {
+                self.error = Some(err.clone());
+            }
+        }
+
         // Capture top-level fields from the first event.
         if self.id.is_none() {
             self.id = event.get("id").and_then(|v| v.as_str()).map(String::from);
@@ -2439,6 +2485,58 @@ mod tests {
         let resp = asm.into_response("cmpl");
         let id = resp["id"].as_str().unwrap();
         assert!(id.starts_with("cmpl-"), "should generate id: {id}");
+    }
+
+    #[test]
+    fn test_assembler_captures_sglang_queue_full_abort() {
+        // SGLang's `--max-queued-requests` abort emits an error data chunk
+        // mid-stream, then continues with an empty-choices/zero-usage chunk
+        // and `[DONE]`. The assembler must capture the error so the caller
+        // can surface it as a real upstream error instead of returning HTTP
+        // 200 with empty choices.
+        let mut asm = StreamingResponseAssembler::new(ResponseShape::ChatCompletion);
+        asm.process_chunk(
+            b"data: {\"error\":{\"object\":\"error\",\"message\":\"The request queue is full.\",\"type\":\"SERVICE_UNAVAILABLE\",\"code\":503}}\n\n",
+        );
+        asm.process_chunk(
+            b"data: {\"id\":\"chatcmpl-abc\",\"object\":\"chat.completion.chunk\",\"model\":\"glm-5.1\",\"created\":1779313724,\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}\n\n",
+        );
+        asm.process_chunk(b"data: [DONE]\n\n");
+
+        let err = asm.take_error().expect("error chunk must be captured");
+        assert_eq!(err["code"], 503);
+        assert_eq!(err["type"], "SERVICE_UNAVAILABLE");
+        assert_eq!(err["message"], "The request queue is full.");
+        // Subsequent take returns None.
+        assert!(asm.take_error().is_none());
+    }
+
+    #[test]
+    fn test_assembler_ignores_non_object_error_field() {
+        // A `null` or string `error` field on a chunk must not be mistaken
+        // for an upstream abort.
+        let mut asm = StreamingResponseAssembler::new(ResponseShape::ChatCompletion);
+        asm.process_chunk(
+            b"data: {\"id\":\"c1\",\"error\":null,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        );
+        assert!(asm.take_error().is_none());
+        let resp = asm.into_response("chatcmpl");
+        assert_eq!(resp["choices"][0]["message"]["content"], "hi");
+    }
+
+    #[test]
+    fn test_assembler_keeps_first_error_chunk() {
+        // If the stream emits multiple error chunks (defensive — not observed
+        // in practice), keep the first so we surface the original failure.
+        let mut asm = StreamingResponseAssembler::new(ResponseShape::ChatCompletion);
+        asm.process_chunk(
+            b"data: {\"error\":{\"object\":\"error\",\"message\":\"first\",\"type\":\"SERVICE_UNAVAILABLE\",\"code\":503}}\n\n",
+        );
+        asm.process_chunk(
+            b"data: {\"error\":{\"object\":\"error\",\"message\":\"second\",\"type\":\"INTERNAL\",\"code\":500}}\n\n",
+        );
+        let err = asm.take_error().unwrap();
+        assert_eq!(err["message"], "first");
     }
 
     #[test]

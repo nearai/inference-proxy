@@ -202,7 +202,7 @@ pub async fn images_edits(
         chunk_transform: None,
         backend_guard: None,
         response_shape: ResponseShape::ChatCompletion,
-        extra_upstream_headers: vec![],
+        tracing_ids: None,
     };
 
     let (url, _guard) = match &state.config.images_edits_url_override {
@@ -284,7 +284,7 @@ pub async fn audio_transcriptions(
         chunk_transform: None,
         backend_guard: None,
         response_shape: ResponseShape::ChatCompletion,
-        extra_upstream_headers: vec![],
+        tracing_ids: None,
     };
 
     let (url, _guard) = match &state.config.transcriptions_url_override {
@@ -349,7 +349,7 @@ async fn json_passthrough_encrypted(
                 chunk_transform: None,
                 backend_guard: None,
                 response_shape: ResponseShape::ChatCompletion,
-                extra_upstream_headers: vec![],
+                tracing_ids: None,
             };
             proxy::proxy_json_request(&state.http_client, u, forward_body, opts).await
         }
@@ -367,7 +367,7 @@ async fn json_passthrough_encrypted(
                 chunk_transform: None,
                 backend_guard: Some(guard),
                 response_shape: ResponseShape::ChatCompletion,
-                extra_upstream_headers: vec![],
+                tracing_ids: None,
             };
             proxy::proxy_json_request(&state.http_client, &url, forward_body, opts).await
         }

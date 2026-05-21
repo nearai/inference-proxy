@@ -10,7 +10,7 @@ use tracing::{debug, error, info, warn};
 use crate::cache::ChatCache;
 use crate::error::AppError;
 use crate::signing::SigningPair;
-use crate::AppState;
+use crate::{AppState, TracingIds};
 
 /// Parsed upstream error info for logging and re-wrapping.
 pub struct UpstreamErrorInfo {
@@ -314,37 +314,41 @@ pub struct ProxyOpts {
     /// a non-streaming JSON body. Defaults to `ChatCompletion`; the
     /// `/v1/completions` route sets this to `TextCompletion`.
     pub response_shape: ResponseShape,
-    /// Extra HTTP headers to forward to the upstream backend.
-    /// Used to propagate tracing correlation IDs (X-Request-Id, X-Org-Id,
-    /// X-Workspace-Id) from cloud-api through to vLLM/SGLang so they appear
-    /// in engine-level logs alongside token usage.
-    pub extra_upstream_headers: Vec<(String, String)>,
+    /// Tracing correlation IDs (request_id / org_id / workspace_id) parsed by
+    /// `request_id_middleware`. When `Some`, the corresponding headers are
+    /// forwarded to the upstream engine and emitted on the per-request log
+    /// line. Routes that don't carry org context (completions, passthrough)
+    /// leave this `None`.
+    pub tracing_ids: Option<TracingIds>,
 }
 
-impl ProxyOpts {
-    /// Extract a named tracing header value from `extra_upstream_headers`.
-    /// Returns an empty string if the header is absent.
-    pub fn tracing_header(&self, name: &str) -> &str {
-        self.extra_upstream_headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
-            .unwrap_or("")
-    }
-}
-
-/// Apply extra upstream tracing headers to a `reqwest::RequestBuilder`.
-///
-/// Centralises the header-injection loop that would otherwise be duplicated
-/// in every proxy function that builds an outbound request.
+/// Apply upstream tracing headers to a `reqwest::RequestBuilder`. No-op when
+/// `tracing_ids` is `None`.
 fn apply_tracing_headers(
     mut req: reqwest::RequestBuilder,
-    headers: &[(String, String)],
+    tracing_ids: Option<&TracingIds>,
 ) -> reqwest::RequestBuilder {
-    for (k, v) in headers {
-        req = req.header(k.as_str(), v.as_str());
+    let Some(ids) = tracing_ids else {
+        return req;
+    };
+    for (k, v) in ids.upstream_headers() {
+        req = req.header(k, v);
     }
     req
+}
+
+/// Owned `(request_id, org_id, workspace_id)` strings for emission on the
+/// per-request log line. Each value defaults to `""` when absent — matches the
+/// pre-refactor behavior so existing Datadog queries keep working.
+fn log_ids_or_empty(tracing_ids: &Option<TracingIds>) -> (String, String, String) {
+    match tracing_ids {
+        Some(ids) => (
+            ids.request_id.clone(),
+            ids.org_id_or_empty().to_string(),
+            ids.workspace_id_or_empty().to_string(),
+        ),
+        None => (String::new(), String::new(), String::new()),
+    }
 }
 
 /// Proxy a non-streaming JSON request to the backend using internal streaming.
@@ -383,7 +387,7 @@ pub async fn proxy_json_request(
             .post(url)
             .header("content-type", "application/json")
             .header("accept", "text/event-stream"),
-        &opts.extra_upstream_headers,
+        opts.tracing_ids.as_ref(),
     );
     let response = req
         .body(streaming_body)
@@ -465,10 +469,11 @@ pub async fn proxy_json_request(
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
         let total_ms = upstream_start.elapsed().as_millis();
+        let (log_request_id, log_org_id, log_workspace_id) = log_ids_or_empty(&opts.tracing_ids);
         info!(
-            request_id = %opts.tracing_header("x-request-id"),
-            org_id = %opts.tracing_header("x-org-id"),
-            workspace_id = %opts.tracing_header("x-workspace-id"),
+            request_id = %log_request_id,
+            org_id = %log_org_id,
+            workspace_id = %log_workspace_id,
             model = %opts.model_name,
             chat_id = %chat_id,
             input_tokens,
@@ -829,7 +834,7 @@ pub async fn proxy_streaming_request(
             .post(url)
             .header("content-type", "application/json")
             .header("accept", "text/event-stream"),
-        &opts.extra_upstream_headers,
+        opts.tracing_ids.as_ref(),
     );
     let response = req
         .body(request_body)
@@ -849,10 +854,8 @@ pub async fn proxy_streaming_request(
         });
     }
 
-    // Extract tracing IDs before any partial moves from opts.
-    let log_request_id = opts.tracing_header("x-request-id").to_string();
-    let log_org_id = opts.tracing_header("x-org-id").to_string();
-    let log_workspace_id = opts.tracing_header("x-workspace-id").to_string();
+    // Capture log fields before any partial moves from opts.
+    let (log_request_id, log_org_id, log_workspace_id) = log_ids_or_empty(&opts.tracing_ids);
 
     let signing = opts.signing.clone();
     let cache = opts.cache.clone();
@@ -860,8 +863,6 @@ pub async fn proxy_streaming_request(
     let model_name = opts.model_name.clone();
     let chunk_transform = opts.chunk_transform;
     let backend_guard = opts.backend_guard;
-
-    let stream_start = upstream_start; // reuse — measures time from send() to stream done
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
@@ -980,7 +981,7 @@ pub async fn proxy_streaming_request(
                 // Carries org_id/request_id propagated from cloud-api so this line is
                 // joinable with cloud-api and nginx logs in Datadog.
                 let (input_tokens, output_tokens) = parser.usage.unwrap_or((0, 0));
-                let total_ms = stream_start.elapsed().as_millis();
+                let total_ms = upstream_start.elapsed().as_millis();
                 info!(
                     request_id = %log_request_id,
                     org_id = %log_org_id,
@@ -1151,10 +1152,7 @@ pub async fn proxy_multipart_request(
     mut opts: ProxyOpts,
 ) -> Result<Response, AppError> {
     let upstream_start = std::time::Instant::now();
-    let req = apply_tracing_headers(
-        client.post(url).multipart(form),
-        &opts.extra_upstream_headers,
-    );
+    let req = apply_tracing_headers(client.post(url).multipart(form), opts.tracing_ids.as_ref());
     let response = req.send().await.map_err(|e| AppError::Internal(e.into()))?;
     metrics::histogram!("upstream_request_duration_seconds", "endpoint" => "multipart")
         .record(upstream_start.elapsed().as_secs_f64());
@@ -1347,10 +1345,8 @@ pub async fn proxy_streaming_response(
     opts: ProxyOpts,
     status: StatusCode,
 ) -> Result<Response, AppError> {
-    // Extract tracing IDs before any partial moves from opts.
-    let log_request_id = opts.tracing_header("x-request-id").to_string();
-    let log_org_id = opts.tracing_header("x-org-id").to_string();
-    let log_workspace_id = opts.tracing_header("x-workspace-id").to_string();
+    // Capture log fields before any partial moves from opts.
+    let (log_request_id, log_org_id, log_workspace_id) = log_ids_or_empty(&opts.tracing_ids);
     let stream_start = std::time::Instant::now();
 
     let signing = opts.signing.clone();
@@ -1664,7 +1660,7 @@ mod tests {
             chunk_transform: None,
             backend_guard: None,
             response_shape: ResponseShape::default(),
-            extra_upstream_headers: vec![],
+            tracing_ids: None,
         }
     }
 

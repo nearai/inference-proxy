@@ -2,6 +2,7 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::Response;
+use axum::Extension;
 
 use sha2::Digest;
 
@@ -9,12 +10,13 @@ use crate::auth::RequireAuth;
 use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
 use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageType};
-use crate::AppState;
+use crate::{AppState, TracingIds};
 
 /// POST /v1/chat/completions
 pub async fn chat_completions(
     State(state): State<AppState>,
     auth: RequireAuth,
+    Extension(tracing_ids): Extension<TracingIds>,
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
@@ -93,10 +95,6 @@ pub async fn chat_completions(
 
     let (url, guard) = state.backend_pool.select_url("/v1/chat/completions");
 
-    // Collect tracing correlation headers propagated from cloud-api so they
-    // are forwarded to the upstream engine and appear in the completion log.
-    let extra_upstream_headers = extract_tracing_headers(&headers);
-
     let opts = ProxyOpts {
         signing: state.signing.clone(),
         cache: state.cache.clone(),
@@ -109,7 +107,7 @@ pub async fn chat_completions(
         chunk_transform,
         backend_guard: Some(guard),
         response_shape: ResponseShape::ChatCompletion,
-        extra_upstream_headers,
+        tracing_ids: Some(tracing_ids),
     };
 
     if is_stream {
@@ -202,78 +200,4 @@ pub async fn read_body_with_limit(body: Body, max_size: usize) -> Result<Vec<u8>
         result.extend_from_slice(&chunk);
     }
     Ok(result)
-}
-
-/// Extract tracing correlation headers propagated by cloud-api.
-///
-/// Returns a vec of `(header-name, value)` pairs for headers that are present
-/// and have valid ASCII values. Missing or invalid headers are silently skipped.
-/// The returned pairs are forwarded to the upstream engine so they appear in
-/// vLLM/SGLang logs alongside token usage, enabling cross-service correlation.
-pub fn extract_tracing_headers(headers: &HeaderMap) -> Vec<(String, String)> {
-    let names = ["x-request-id", "x-org-id", "x-workspace-id"];
-    names
-        .iter()
-        .filter_map(|name| {
-            headers
-                .get(*name)
-                .and_then(|v| v.to_str().ok())
-                .map(|v| (name.to_string(), v.to_string()))
-        })
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::http::HeaderMap;
-
-    fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
-        let mut m = HeaderMap::new();
-        for (k, v) in pairs {
-            m.insert(
-                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
-                axum::http::HeaderValue::from_str(v).unwrap(),
-            );
-        }
-        m
-    }
-
-    #[test]
-    fn test_extract_tracing_headers_all_present() {
-        let headers = headers_with(&[
-            ("x-request-id", "550e8400-e29b-41d4-a716-446655440000"),
-            ("x-org-id", "org-uuid-123"),
-            ("x-workspace-id", "ws-uuid-456"),
-            ("authorization", "Bearer sk-something"),
-        ]);
-        let extracted = extract_tracing_headers(&headers);
-        assert_eq!(extracted.len(), 3);
-        assert!(extracted.contains(&(
-            "x-request-id".to_string(),
-            "550e8400-e29b-41d4-a716-446655440000".to_string()
-        )));
-        assert!(extracted.contains(&("x-org-id".to_string(), "org-uuid-123".to_string())));
-        assert!(extracted.contains(&("x-workspace-id".to_string(), "ws-uuid-456".to_string())));
-        // Authorization must not be extracted
-        assert!(!extracted.iter().any(|(k, _)| k == "authorization"));
-    }
-
-    #[test]
-    fn test_extract_tracing_headers_partial() {
-        let headers = headers_with(&[("x-request-id", "req-abc")]);
-        let extracted = extract_tracing_headers(&headers);
-        assert_eq!(extracted.len(), 1);
-        assert_eq!(
-            extracted[0],
-            ("x-request-id".to_string(), "req-abc".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_tracing_headers_none_present() {
-        let headers = headers_with(&[("authorization", "Bearer sk-x")]);
-        let extracted = extract_tracing_headers(&headers);
-        assert!(extracted.is_empty());
-    }
 }

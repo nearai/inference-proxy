@@ -17,7 +17,7 @@ futures-util = "0.3"
 http-body-util = "0.1"
 
 # dstack SDK
-dstack-sdk = "0.1.2"
+dstack-sdk = "0.1.3"
 
 # Crypto
 k256 = { version = "0.13", features = ["ecdsa", "ecdh"] }

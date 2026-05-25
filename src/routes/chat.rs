@@ -100,7 +100,7 @@ pub async fn chat_completions(
         cache: state.cache.clone(),
         id_prefix: "chatcmpl".to_string(),
         model_name: state.config.model_name.clone(),
-        usage_reporter: make_usage_reporter(auth.cloud_api_key.as_ref(), &state),
+        usage_reporter: make_usage_reporter(&auth, &state),
         usage_type: UsageType::ChatCompletion,
         request_hash: original_request_hash,
         response_transform,

@@ -41,7 +41,7 @@ pub async fn embeddings(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
-    let reporter = make_usage_reporter(auth.cloud_api_key.as_ref(), &state);
+    let reporter = make_usage_reporter(&auth, &state);
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
 
     json_passthrough_encrypted(
@@ -66,7 +66,7 @@ pub async fn rerank(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
-    let reporter = make_usage_reporter(auth.cloud_api_key.as_ref(), &state);
+    let reporter = make_usage_reporter(&auth, &state);
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
     let url_override = state.config.rerank_url_override.clone();
 
@@ -92,7 +92,7 @@ pub async fn score(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
-    let reporter = make_usage_reporter(auth.cloud_api_key.as_ref(), &state);
+    let reporter = make_usage_reporter(&auth, &state);
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
     let url_override = state.config.score_url_override.clone();
 
@@ -118,7 +118,7 @@ pub async fn images_generations(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
-    let reporter = make_usage_reporter(auth.cloud_api_key.as_ref(), &state);
+    let reporter = make_usage_reporter(&auth, &state);
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
     let url_override = state.config.images_url_override.clone();
 
@@ -195,7 +195,7 @@ pub async fn images_edits(
         cache: state.cache.clone(),
         id_prefix: "img".to_string(),
         model_name: state.config.model_name.clone(),
-        usage_reporter: make_usage_reporter(auth.cloud_api_key.as_ref(), &state),
+        usage_reporter: make_usage_reporter(&auth, &state),
         usage_type: UsageType::ImageGeneration,
         request_hash: None,
         response_transform,
@@ -277,7 +277,7 @@ pub async fn audio_transcriptions(
         cache: state.cache.clone(),
         id_prefix: "trans".to_string(),
         model_name: state.config.model_name.clone(),
-        usage_reporter: make_usage_reporter(auth.cloud_api_key.as_ref(), &state),
+        usage_reporter: make_usage_reporter(&auth, &state),
         usage_type: UsageType::ChatCompletion,
         request_hash: None,
         response_transform,

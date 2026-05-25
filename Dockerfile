@@ -21,7 +21,7 @@ ARG LIBNVAT_VERSION=1.2.1.1777487608-1
 # no Debian 12 build). Matching distributions on both sides eliminates
 # any libssl3/libcurl4/libxml2 ABI risk.
 # ─────────────────────────────────────────────────────────────────────
-FROM ubuntu:22.04 AS builder
+FROM ubuntu:22.04@sha256:4f838adc7181d9039ac795a7d0aba05a9bd9ecd480d294483169c5def983b64d AS builder
 ARG ENABLE_NV_ATTESTATION_SDK
 ARG LIBNVAT_VERSION
 

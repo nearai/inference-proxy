@@ -316,21 +316,44 @@ fn spawn_usage_report(reporter: &UsageReporter, mut body: serde_json::Value) {
         // Inject subject identity into the body. Cloud-api's
         // `/v1/internal/usage` handler reads these instead of deriving
         // them from the sk-bearer.
-        if let serde_json::Value::Object(map) = &mut body {
-            // `unwrap` is fine — both `Option`s are checked by
-            // `can_use_service_token_path` above.
-            map.insert(
-                "organization_id".to_string(),
-                serde_json::Value::String(reporter.org_id.clone().unwrap()),
-            );
-            map.insert(
-                "workspace_id".to_string(),
-                serde_json::Value::String(reporter.workspace_id.clone().unwrap()),
-            );
-            map.insert(
-                "api_key_id".to_string(),
-                serde_json::Value::String(reporter.api_key_id.clone().unwrap()),
-            );
+        match &mut body {
+            serde_json::Value::Object(map) => {
+                // `unwrap` is fine — all four `Option`s are checked by
+                // `can_use_service_token_path` above.
+                map.insert(
+                    "organization_id".to_string(),
+                    serde_json::Value::String(reporter.org_id.clone().unwrap()),
+                );
+                map.insert(
+                    "workspace_id".to_string(),
+                    serde_json::Value::String(reporter.workspace_id.clone().unwrap()),
+                );
+                map.insert(
+                    "api_key_id".to_string(),
+                    serde_json::Value::String(reporter.api_key_id.clone().unwrap()),
+                );
+            }
+            other => {
+                // Today every `try_report_usage` call site builds the
+                // body via `serde_json::json!({…})` so it's always an
+                // object. Guard against a future caller passing
+                // something else: drop the report rather than send
+                // un-attributable bytes to cloud-api, which would
+                // silently fail to write a usage row and lose billing.
+                warn!(
+                    body_kind = %match other {
+                        serde_json::Value::Null => "null",
+                        serde_json::Value::Bool(_) => "bool",
+                        serde_json::Value::Number(_) => "number",
+                        serde_json::Value::String(_) => "string",
+                        serde_json::Value::Array(_) => "array",
+                        serde_json::Value::Object(_) => unreachable!(),
+                    },
+                    "Skipping service-token usage report: body is not a JSON object — \
+                     identity fields can't be injected, refusing to send unattributable report"
+                );
+                return;
+            }
         }
         (
             format!("{}/v1/internal/usage", reporter.cloud_api_url),

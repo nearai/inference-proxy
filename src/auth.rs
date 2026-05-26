@@ -1,5 +1,6 @@
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
+use serde::Deserialize;
 use subtle::ConstantTimeEq;
 use tracing::warn;
 
@@ -12,8 +13,38 @@ use crate::AppState;
 ///
 /// If authentication was via a cloud API key (`sk-` prefix),
 /// `cloud_api_key` contains the key for downstream usage reporting.
+/// `org_id`, `workspace_id`, and `api_key_id` carry the subject identity
+/// parsed from the `/v1/check_api_key` response — populated when cloud-api
+/// returns them, left as `None` against older cloud-api builds that don't
+/// surface those fields yet.
 pub struct RequireAuth {
     pub cloud_api_key: Option<String>,
+    pub org_id: Option<String>,
+    pub workspace_id: Option<String>,
+    pub api_key_id: Option<String>,
+}
+
+/// Subject identity extracted from a successful `/v1/check_api_key` response.
+/// Each field is `Option` so we degrade gracefully when paired with a
+/// cloud-api version that doesn't surface that field yet.
+#[derive(Debug, Default, Clone)]
+pub struct AuthSubject {
+    pub org_id: Option<String>,
+    pub workspace_id: Option<String>,
+    pub api_key_id: Option<String>,
+}
+
+/// On-the-wire shape of `/v1/check_api_key`'s success body. Cloud-api uses
+/// `organization_id` (and PR #635 onward also `workspace_id`); `api_key_id`
+/// is a follow-up addition. We deserialize lenient on all of them.
+#[derive(Debug, Deserialize)]
+struct CheckApiKeyResponse {
+    #[serde(default)]
+    organization_id: Option<String>,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    api_key_id: Option<String>,
 }
 
 /// Constant-time token comparison to prevent timing attacks.
@@ -60,13 +91,15 @@ fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
 ///
 /// Retries on transport errors and 5xx responses with exponential backoff and
 /// full jitter. Terminal responses (200/402/429 and other 4xx) return
-/// immediately.
+/// immediately. On 200, parses the response body for the subject identity
+/// (`organization_id`, `workspace_id`, `api_key_id`) — any missing field
+/// degrades to `None` so older cloud-api builds keep working.
 async fn check_cloud_api_key(
     http_client: &reqwest::Client,
     config: &Config,
     cloud_api_url: &str,
     token: &str,
-) -> Result<(), AppError> {
+) -> Result<AuthSubject, AppError> {
     let url = format!("{cloud_api_url}/v1/check_api_key");
     let max_attempts = config.cloud_api_auth_max_attempts.max(1);
     let per_attempt_timeout = std::time::Duration::from_secs(config.cloud_api_auth_timeout_secs);
@@ -80,7 +113,7 @@ async fn check_cloud_api_key(
             .send()
             .await;
 
-        let status = match result {
+        let (status, body_bytes) = match result {
             Ok(response) => {
                 let s = response.status().as_u16();
                 // Drain the body before dropping the response so reqwest can
@@ -90,8 +123,8 @@ async fn check_cloud_api_key(
                 // dropping pool reuse here would actively worsen the problem
                 // this PR is meant to mitigate. Errors during the drain
                 // don't change the auth outcome — we already have the status.
-                let _ = response.bytes().await;
-                s
+                let body = response.bytes().await.unwrap_or_default();
+                (s, body)
             }
             Err(e) => {
                 let kind = classify_reqwest_error(&e);
@@ -138,7 +171,18 @@ async fn check_cloud_api_key(
         match status {
             200 => {
                 metrics::counter!("cloud_api_auth_attempts_total", "outcome" => "ok").increment(1);
-                return Ok(());
+                // Older cloud-api builds may return a non-JSON body or omit
+                // identity fields. Tolerate both shapes: any parse failure
+                // or missing field downgrades to `None` and the caller
+                // keeps using the legacy reporting path.
+                let subject = serde_json::from_slice::<CheckApiKeyResponse>(&body_bytes)
+                    .map(|r| AuthSubject {
+                        org_id: r.organization_id,
+                        workspace_id: r.workspace_id,
+                        api_key_id: r.api_key_id,
+                    })
+                    .unwrap_or_default();
+                return Ok(subject);
             }
             402 => {
                 metrics::counter!(
@@ -220,13 +264,16 @@ impl FromRequestParts<AppState> for RequireAuth {
                 if state.config.tokens.iter().any(|t| token_eq(token, t)) {
                     return Ok(RequireAuth {
                         cloud_api_key: None,
+                        org_id: None,
+                        workspace_id: None,
+                        api_key_id: None,
                     });
                 }
 
                 // Fallback: validate sk- tokens against cloud API
                 if token.starts_with("sk-") {
                     if let Some(cloud_api_url) = &state.config.cloud_api_url {
-                        check_cloud_api_key(
+                        let subject = check_cloud_api_key(
                             &state.http_client,
                             &state.config,
                             cloud_api_url,
@@ -235,6 +282,9 @@ impl FromRequestParts<AppState> for RequireAuth {
                         .await?;
                         return Ok(RequireAuth {
                             cloud_api_key: Some(token.to_string()),
+                            org_id: subject.org_id,
+                            workspace_id: subject.workspace_id,
+                            api_key_id: subject.api_key_id,
                         });
                     }
                 }
@@ -369,6 +419,40 @@ mod tests {
         for _ in 0..50 {
             assert!(backoff_delay(10_000, 5).as_millis() as u64 <= 5_000);
         }
+    }
+
+    #[test]
+    fn test_check_api_key_response_full_shape() {
+        // Cloud-api with both #635 and the future api_key_id addition shipped.
+        let body = br#"{"valid":true,"organization_id":"org-uuid",
+            "workspace_id":"ws-uuid","api_key_id":"key-uuid"}"#;
+        let parsed: CheckApiKeyResponse = serde_json::from_slice(body).unwrap();
+        assert_eq!(parsed.organization_id.as_deref(), Some("org-uuid"));
+        assert_eq!(parsed.workspace_id.as_deref(), Some("ws-uuid"));
+        assert_eq!(parsed.api_key_id.as_deref(), Some("key-uuid"));
+    }
+
+    #[test]
+    fn test_check_api_key_response_pre_635_shape() {
+        // Older cloud-api built before #635: only organization_id is surfaced.
+        // workspace_id and api_key_id must degrade to None so the reporter
+        // falls back to the legacy sk- path.
+        let body = br#"{"valid":true,"organization_id":"org-uuid"}"#;
+        let parsed: CheckApiKeyResponse = serde_json::from_slice(body).unwrap();
+        assert_eq!(parsed.organization_id.as_deref(), Some("org-uuid"));
+        assert!(parsed.workspace_id.is_none());
+        assert!(parsed.api_key_id.is_none());
+    }
+
+    #[test]
+    fn test_check_api_key_response_completely_missing() {
+        // Hypothetical future cloud-api or a malformed body — must not
+        // panic, must yield all-None.
+        let body = br#"{"valid":true}"#;
+        let parsed: CheckApiKeyResponse = serde_json::from_slice(body).unwrap();
+        assert!(parsed.organization_id.is_none());
+        assert!(parsed.workspace_id.is_none());
+        assert!(parsed.api_key_id.is_none());
     }
 
     #[test]

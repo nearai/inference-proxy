@@ -193,7 +193,7 @@ pub async fn catch_all(
         .unwrap_or("")
         .to_string();
 
-    let reporter = make_usage_reporter(auth.cloud_api_key.as_ref(), &state);
+    let reporter = make_usage_reporter(&auth, &state);
 
     if content_type.contains("text/event-stream") {
         let opts = ProxyOpts {

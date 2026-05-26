@@ -89,6 +89,15 @@ pub struct Config {
     pub cloud_api_auth_initial_backoff_ms: u64,
     /// Per-attempt timeout for `POST /v1/check_api_key`.
     pub cloud_api_auth_timeout_secs: u64,
+    /// Shared service-token presented to cloud-api on the new `/v1/internal/usage`
+    /// path. When set AND the auth response carried `organization_id +
+    /// workspace_id + api_key_id`, the usage reporter switches off the
+    /// legacy `Bearer sk-…` → `/v1/usage` path and posts to
+    /// `/v1/internal/usage` with this token as `Bearer` and the subject
+    /// identity carried in the body. When unset (or when the auth response
+    /// is missing identity fields, e.g. against an older cloud-api), the
+    /// reporter falls back to the legacy path verbatim.
+    pub cloud_api_usage_token: Option<String>,
 
     // Compose-manager attestation (deployment actions attestation)
     pub compose_manager_url: Option<String>,
@@ -265,6 +274,9 @@ impl Config {
             cloud_api_auth_initial_backoff_ms: env_int("CLOUD_API_AUTH_INITIAL_BACKOFF_MS", 100)
                 as u64,
             cloud_api_auth_timeout_secs: env_int("CLOUD_API_AUTH_TIMEOUT_SECS", 5) as u64,
+            cloud_api_usage_token: env::var("CLOUD_API_USAGE_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty()),
             compose_manager_url,
             gpu_evidence_delegate_url: env::var("GPU_EVIDENCE_DELEGATE_URL")
                 .ok()

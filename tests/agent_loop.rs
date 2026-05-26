@@ -940,7 +940,8 @@ async fn e2ee_without_encrypt_all_fields_encrypts_tool_result() {
     assert_eq!(response.status(), StatusCode::OK);
 
     let body = body_to_string(response).await;
-    // Locate the nearai_tool_result chunk.
+
+    // ── nearai_tool_result.output must be encrypted ──────────────────
     let tool_result_chunk = body
         .lines()
         .find(|l| l.contains("nearai_tool_result"))
@@ -952,16 +953,72 @@ async fn e2ee_without_encrypt_all_fields_encrypts_tool_result() {
     let output = parsed["choices"][0]["delta"]["nearai_tool_result"]["output"]
         .as_str()
         .expect("output field is a string");
-
-    // The plaintext "Example A" / "First snippet" must NOT appear on the
-    // wire — the output should be encrypted (NaCl box hex blob).
     assert!(
         !output.contains("Example A") && !output.contains("First snippet"),
         "tool result output was sent plaintext under E2EE: {output}"
     );
-    // And the encrypted output should round-trip back to plaintext for the client.
-    let decrypted =
+    let decrypted_output =
         encryption::decrypt_string(output, &dec_for_response, &client_pair).expect("decrypt");
-    assert!(decrypted.contains("Example A"));
-    assert!(decrypted.contains("First snippet"));
+    assert!(decrypted_output.contains("Example A"));
+    assert!(decrypted_output.contains("First snippet"));
+
+    // ── tool_calls[].function.{name,arguments} must also be encrypted
+    // even though the client never sent X-Encrypt-All-Fields. The
+    // arguments field holds the model-generated search query, which is the
+    // same privacy class as the user's original prompt.
+    //
+    // (Note: the synthetic `nearai_tool_result` envelope legitimately
+    // contains a plaintext `name` field identifying which server-side tool
+    // ran. That's metadata, not user data — its value is a fixed string
+    // controlled by the proxy. Sensitive fields on the envelope —
+    // `output` — are encrypted, checked above.)
+
+    // Find a chunk carrying the assembled tool_call function args. The
+    // upstream emits the args delta on its own chunk; the encrypt path
+    // replaces the string in-place so the chunk still has the field shape
+    // but its value is ciphertext.
+    let chunks: Vec<serde_json::Value> = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|s| *s != "[DONE]")
+        .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .collect();
+
+    let args_ciphertext = chunks
+        .iter()
+        .find_map(|chunk| {
+            chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .expect("expected a tool_calls function.arguments chunk");
+    assert!(
+        !args_ciphertext.contains("query") && !args_ciphertext.contains("rust"),
+        "function.arguments was sent plaintext under E2EE: {args_ciphertext}"
+    );
+    let decrypted_args =
+        encryption::decrypt_string(&args_ciphertext, &dec_for_response, &client_pair)
+            .expect("decrypt arguments");
+    assert!(
+        decrypted_args.contains(r#""query":"rust""#),
+        "decrypted args did not match expected query: {decrypted_args}"
+    );
+
+    // function.name on the model-generated tool_call should also be
+    // ciphertext (round-trips to "web_context_search").
+    let name_ciphertext = chunks
+        .iter()
+        .find_map(|chunk| {
+            chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["name"]
+                .as_str()
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .expect("expected a tool_calls function.name chunk");
+    assert_ne!(name_ciphertext, "web_context_search");
+    let decrypted_name =
+        encryption::decrypt_string(&name_ciphertext, &dec_for_response, &client_pair)
+            .expect("decrypt name");
+    assert_eq!(decrypted_name, "web_context_search");
 }

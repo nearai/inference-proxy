@@ -73,10 +73,18 @@ pub async fn chat_completions(
             ));
         }
 
-        // Build chunk transform if E2EE is active; the loop emits synthetic
-        // `nearai_tool_result` chunks that the transform encrypts alongside
-        // the model's deltas.
-        let chunk_transform = enc_ctx.map(|ctx| {
+        // Build chunk transform if E2EE is active. The agent loop is the
+        // privacy-critical path — both our synthetic `nearai_tool_result`
+        // chunks AND the model's own `tool_calls[].function.{name,arguments}`
+        // (which contain the search query the model just generated from the
+        // user's E2EE-decrypted prompt) must travel encrypted. Force
+        // `encrypt_all_fields: true` on the context used to build this
+        // transform so clients don't need to remember to send
+        // `X-Encrypt-All-Fields: true` to get the full privacy guarantee.
+        // This only affects the agent-loop path; the regular chat path
+        // below still honors the client's `X-Encrypt-All-Fields` choice.
+        let chunk_transform = enc_ctx.map(|mut ctx| {
+            ctx.encrypt_all_fields = true;
             encryption::make_chunk_transform(Endpoint::ChatCompletions, ctx, state.signing.clone())
         });
         return agent_loop::run_chat_completion(

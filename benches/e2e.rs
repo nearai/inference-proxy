@@ -87,6 +87,10 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         dstack_socket_path: "/var/run/dstack.sock".to_string(),
         gpu_evidence_delegate_url: None,
         gpu_evidence_delegate_timeout_secs: 30,
+        web_context_search_url: None,
+        web_context_search_api_key: None,
+        agent_loop_max_iterations: 5,
+        web_context_search_timeout_secs: 30,
     };
 
     let ecdsa = signing::EcdsaContext::from_key_bytes(&ECDSA_KEY).unwrap();

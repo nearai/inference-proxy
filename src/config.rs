@@ -160,6 +160,21 @@ pub struct Config {
     /// unreachable (otherwise `/v1/attestation/report` silently 500s while
     /// `/v1/models` still passes). Default: `/var/run/dstack.sock`.
     pub dstack_socket_path: String,
+
+    // Agent loop (server-side web_context_search tool)
+    /// Brave LLM Context API endpoint. When unset, requests advertising the
+    /// `{"type":"web_context_search"}` tool are rejected with 400. All
+    /// tool execution happens inside the CVM; the query is the only thing
+    /// that egresses, going directly to Brave under TLS.
+    pub web_context_search_url: Option<String>,
+    /// Brave subscription token for the LLM Context endpoint. Sent as
+    /// `X-Subscription-Token`. Required when `web_context_search_url` is set.
+    pub web_context_search_api_key: Option<String>,
+    /// Hard cap on tool-call iterations within a single chat completion.
+    /// Once hit, the loop emits a synthetic terminator chunk and stops.
+    pub agent_loop_max_iterations: u32,
+    /// Per-tool-call timeout for the Brave HTTP request.
+    pub web_context_search_timeout_secs: u64,
 }
 
 impl Config {
@@ -316,6 +331,18 @@ impl Config {
             rerank_url_override,
             score_url_override,
             dstack_socket_path: env_or("DSTACK_SOCKET_PATH", "/var/run/dstack.sock"),
+            web_context_search_url: env::var("WEB_CONTEXT_SEARCH_URL")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            web_context_search_api_key: env::var("WEB_CONTEXT_SEARCH_API_KEY")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            // `env_int` returns `usize`; on 64-bit hosts a user-supplied value
+            // > u32::MAX would silently wrap. `try_from` surfaces it as a
+            // config error instead so a typo can't become a tiny iteration cap.
+            agent_loop_max_iterations: u32::try_from(env_int("AGENT_LOOP_MAX_ITERATIONS", 5))
+                .map_err(|_| anyhow::anyhow!("AGENT_LOOP_MAX_ITERATIONS exceeds the u32 range"))?,
+            web_context_search_timeout_secs: env_int("WEB_CONTEXT_SEARCH_TIMEOUT_SECS", 30) as u64,
         };
 
         // Validate attestation cache TTL (TTL/2 is used as refresh interval, so TTL < 2 would cause a busy loop)
@@ -332,6 +359,19 @@ impl Config {
         }
         if config.startup_check_timeout_secs == 0 {
             anyhow::bail!("STARTUP_CHECK_TIMEOUT_SECS must be greater than 0");
+        }
+
+        // Agent loop: URL and key must both be set or both unset; iteration cap must be positive.
+        if config.web_context_search_url.is_some() != config.web_context_search_api_key.is_some() {
+            anyhow::bail!(
+                "WEB_CONTEXT_SEARCH_URL and WEB_CONTEXT_SEARCH_API_KEY must both be set or both unset"
+            );
+        }
+        if config.agent_loop_max_iterations == 0 {
+            anyhow::bail!("AGENT_LOOP_MAX_ITERATIONS must be at least 1");
+        }
+        if config.web_context_search_timeout_secs == 0 {
+            anyhow::bail!("WEB_CONTEXT_SEARCH_TIMEOUT_SECS must be greater than 0");
         }
 
         Ok(config)

@@ -1,0 +1,1104 @@
+//! Server-side agent loop for `/v1/chat/completions`.
+//!
+//! Opt-in via a single namespaced tool: `{"type":"web_context_search"}`. When
+//! that exact tool is present (no other tools, streaming on, Brave creds
+//! configured), this module drives a tool-call loop entirely inside the CVM:
+//! the model emits a tool call, we call the Brave LLM Context API, splice the
+//! result back into the conversation as a synthetic SSE chunk, and re-issue
+//! the upstream request until the model stops asking for tools.
+//!
+//! Anything that doesn't match the trigger falls through to the existing
+//! pass-through path in `routes::chat`. Nothing about non-agent-loop requests
+//! changes.
+//!
+//! Privacy: the only thing that egresses the CVM is the search query, going
+//! directly to Brave under TLS. Tool args and results live in process memory
+//! for the lifetime of the request and are dropped on completion. No state is
+//! kept in `AppState`.
+
+use std::time::{Duration, Instant};
+
+use axum::body::Body;
+use axum::http::StatusCode;
+use axum::response::Response;
+use bytes::Bytes;
+use futures_util::StreamExt;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use tracing::{debug, error, info, warn};
+
+use crate::auth::RequireAuth;
+use crate::encryption::ChunkTransform;
+use crate::error::AppError;
+use crate::proxy::{make_usage_reporter, spawn_usage_report};
+use crate::{AppState, TracingIds};
+
+pub const WEB_CONTEXT_SEARCH_TOOL_NAME: &str = "web_context_search";
+
+const NEARAI_TOOL_RESULT_KEY: &str = "nearai_tool_result";
+const NEARAI_LOOP_TERMINATED_KEY: &str = "nearai_loop_terminated";
+
+/// True iff the request's `tools` field is exactly one entry of type
+/// `web_context_search`. Mixed tool types or multiple entries return false
+/// and let the request flow through the existing pass-through path.
+pub fn is_web_context_search_request(request_json: &Value) -> bool {
+    let Some(tools) = request_json.get("tools").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    tools.len() == 1
+        && tools[0].get("type").and_then(|v| v.as_str()) == Some(WEB_CONTEXT_SEARCH_TOOL_NAME)
+}
+
+/// Drive an agent loop for a `/v1/chat/completions` request.
+///
+/// Preconditions (checked by the caller in `routes::chat`):
+/// - `request_json` has been decrypted in place (if E2EE is active)
+/// - `request_json.tools == [{"type":"web_context_search"}]`
+/// - `request_json.stream == true`
+/// - `state.config.web_context_search_url` and `..._api_key` are set
+///
+/// `request_hash` is the SHA-256 of the original wire body, used unchanged in
+/// the signed text — signature semantics match the non-loop path.
+pub async fn run_chat_completion(
+    state: AppState,
+    auth: RequireAuth,
+    tracing_ids: TracingIds,
+    request_hash: String,
+    mut request_json: Value,
+    chunk_transform: Option<ChunkTransform>,
+) -> Result<Response, AppError> {
+    // Rewrite our namespaced tool into a standard OpenAI `function` so the
+    // upstream engine (vLLM/SGLang) emits tool_calls in its usual shape.
+    rewrite_tool_for_upstream(&mut request_json);
+
+    // Force stream + usage so we can splice tool results between iterations
+    // and report aggregated token usage at the end.
+    request_json["stream"] = true.into();
+    let mut stream_opts = request_json
+        .get("stream_options")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    stream_opts.insert("include_usage".into(), true.into());
+    request_json["stream_options"] = Value::Object(stream_opts);
+
+    // Pick one backend; reuse it across every iteration so the engine can
+    // prefix-cache across rounds (each iteration's prompt = prior iteration +
+    // a few new messages, so the cache hit rate should be very high).
+    let (upstream_url, backend_guard) = state.backend_pool.select_url("/v1/chat/completions");
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+
+    let http_client = state.http_client.clone();
+    let signing = state.signing.clone();
+    let cache = state.cache.clone();
+    let model_name = state.config.model_name.clone();
+    let max_iterations = state.config.agent_loop_max_iterations;
+    let brave_url = state
+        .config
+        .web_context_search_url
+        .clone()
+        .expect("caller verified web_context_search_url is set");
+    let brave_key = state
+        .config
+        .web_context_search_api_key
+        .clone()
+        .expect("caller verified web_context_search_api_key is set");
+    let tool_timeout = Duration::from_secs(state.config.web_context_search_timeout_secs);
+    let usage_reporter = make_usage_reporter(&auth, &state);
+
+    tokio::spawn(async move {
+        let _backend_guard = backend_guard;
+        let outcome = drive_loop(LoopCtx {
+            client: &http_client,
+            upstream_url: &upstream_url,
+            request_json: &mut request_json,
+            tx: &tx,
+            chunk_transform: chunk_transform.as_ref(),
+            max_iterations,
+            brave_url: &brave_url,
+            brave_key: &brave_key,
+            tool_timeout,
+            tracing_ids: &tracing_ids,
+        })
+        .await;
+
+        match outcome {
+            Ok(result) => {
+                if let Some(ref chat_id) = result.chat_id {
+                    let response_sha256 = hex::encode(result.hasher.finalize());
+                    let text = format!("{model_name}:{request_hash}:{response_sha256}");
+                    match signing.sign_chat(&text) {
+                        Ok(signed) => {
+                            if let Ok(signed_json) = serde_json::to_string(&signed) {
+                                cache.set_chat(chat_id, &signed_json);
+                            }
+                        }
+                        Err(e) => error!(error = %e, "Signing failed for agent loop response"),
+                    }
+                    if let Some(reporter) = usage_reporter.as_ref() {
+                        if result.input_tokens > 0 || result.output_tokens > 0 {
+                            let body = json!({
+                                "type": "chat_completion",
+                                "model": reporter.model_name,
+                                "input_tokens": result.input_tokens,
+                                "output_tokens": result.output_tokens,
+                                "id": chat_id,
+                            });
+                            spawn_usage_report(reporter, body);
+                        }
+                    }
+                    info!(
+                        request_id = %tracing_ids.request_id,
+                        org_id = %tracing_ids.org_id_or_empty(),
+                        workspace_id = %tracing_ids.workspace_id_or_empty(),
+                        model = %model_name,
+                        chat_id = %chat_id,
+                        iterations = result.iterations,
+                        terminated_by = %result.terminated_by,
+                        input_tokens = result.input_tokens,
+                        output_tokens = result.output_tokens,
+                        "agent loop completed"
+                    );
+                } else {
+                    warn!("Agent loop completed without observing a chat id; skipping signature");
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "Agent loop failed");
+                let _ = tx
+                    .send(Err(std::io::Error::other(format!("agent loop: {e}"))))
+                    .await;
+            }
+        }
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let body = Body::from_stream(stream);
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(body)
+        .expect("response builder"))
+}
+
+/// Replace `{"type":"web_context_search"}` with a standard function tool so
+/// the upstream engine knows how to advertise it to the model. The function
+/// surface is intentionally narrow: only `query`. Brave-specific tuning
+/// (count, max_urls, threshold, …) is fixed on our side; clients don't get
+/// to influence it via the tool schema, which keeps the prompt surface small
+/// and the result shape predictable.
+fn rewrite_tool_for_upstream(request_json: &mut Value) {
+    request_json["tools"] = json!([{
+        "type": "function",
+        "function": {
+            "name": WEB_CONTEXT_SEARCH_TOOL_NAME,
+            "description": "Search the web for source-grounded context to answer the user's question. Use this when up-to-date or citable information is needed. The query may include Brave search operators (quoted phrases, `site:`, `filetype:`, `-` to exclude).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query string."
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }
+        }
+    }]);
+}
+
+struct LoopCtx<'a> {
+    client: &'a reqwest::Client,
+    upstream_url: &'a str,
+    request_json: &'a mut Value,
+    tx: &'a tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    chunk_transform: Option<&'a ChunkTransform>,
+    max_iterations: u32,
+    brave_url: &'a str,
+    brave_key: &'a str,
+    tool_timeout: Duration,
+    tracing_ids: &'a TracingIds,
+}
+
+struct LoopResult {
+    chat_id: Option<String>,
+    hasher: Sha256,
+    iterations: u32,
+    input_tokens: u64,
+    output_tokens: u64,
+    terminated_by: &'static str,
+}
+
+async fn drive_loop(ctx: LoopCtx<'_>) -> Result<LoopResult, AppError> {
+    let mut hasher = Sha256::new();
+    let mut chat_id: Option<String> = None;
+    let mut model_echo: Option<String> = None;
+    let mut created: Option<i64> = None;
+    let mut total_input_tokens: u64 = 0;
+    let mut total_output_tokens: u64 = 0;
+    let mut iterations: u32 = 0;
+    let terminated_by;
+
+    loop {
+        if iterations >= ctx.max_iterations {
+            emit_max_iterations_terminator(
+                ctx.tx,
+                ctx.chunk_transform,
+                &mut hasher,
+                chat_id.as_deref(),
+                model_echo.as_deref(),
+                created,
+            )
+            .await?;
+            forward_done(ctx.tx, &mut hasher).await?;
+            terminated_by = "max_iterations";
+            break;
+        }
+
+        iterations += 1;
+        let iter_started = Instant::now();
+
+        let iter_outcome = run_iteration(IterCtx {
+            client: ctx.client,
+            upstream_url: ctx.upstream_url,
+            request_body: &serde_json::to_vec(ctx.request_json)
+                .map_err(|e| AppError::Internal(e.into()))?,
+            tx: ctx.tx,
+            hasher: &mut hasher,
+            chunk_transform: ctx.chunk_transform,
+            rewrite_id_to: if iterations > 1 {
+                chat_id.as_deref()
+            } else {
+                None
+            },
+            tracing_ids: ctx.tracing_ids,
+        })
+        .await?;
+
+        if chat_id.is_none() {
+            chat_id = iter_outcome.chat_id.clone();
+        }
+        if model_echo.is_none() {
+            model_echo = iter_outcome.model.clone();
+        }
+        if created.is_none() {
+            created = iter_outcome.created;
+        }
+        total_input_tokens = total_input_tokens.saturating_add(iter_outcome.input_tokens);
+        total_output_tokens = total_output_tokens.saturating_add(iter_outcome.output_tokens);
+
+        debug!(
+            iteration = iterations,
+            finish_reason = iter_outcome.finish_reason.as_deref().unwrap_or(""),
+            tool_calls = iter_outcome.tool_calls.len(),
+            upstream_ms = iter_started.elapsed().as_millis() as u64,
+            "agent loop iteration"
+        );
+
+        let is_tool_call_iteration = iter_outcome.finish_reason.as_deref() == Some("tool_calls")
+            && !iter_outcome.tool_calls.is_empty()
+            && all_calls_are_web_context_search(&iter_outcome.tool_calls);
+
+        if !is_tool_call_iteration {
+            // Model produced a final answer (stop / length / content_filter) or
+            // called something we don't handle. `run_iteration` swallows the
+            // upstream `[DONE]` so the loop can decide whether to continue;
+            // since we're done, emit it now to close the SSE stream.
+            forward_done(ctx.tx, &mut hasher).await?;
+            terminated_by = match iter_outcome.finish_reason.as_deref() {
+                Some(r) => match r {
+                    "stop" => "model_stop",
+                    "length" => "model_length",
+                    "tool_calls" => "client_side_tool",
+                    other => str_to_static(other),
+                },
+                None => "upstream_eof",
+            };
+            break;
+        }
+
+        // Execute each web_context_search tool call serially (Phase 1).
+        // Emit one synthetic chunk per result, then append the assistant
+        // + tool messages to the conversation for the next iteration.
+        let mut tool_messages: Vec<Value> = Vec::with_capacity(iter_outcome.tool_calls.len());
+        for tc in &iter_outcome.tool_calls {
+            let tool_call_id = tc
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let args_str = tc
+                .get("function")
+                .and_then(|f| f.get("arguments"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("{}");
+            let query = parse_query(args_str);
+
+            let (status, output) = match query {
+                Some(q) if !q.is_empty() => {
+                    let started = Instant::now();
+                    match brave_llm_context_search(
+                        ctx.client,
+                        ctx.brave_url,
+                        ctx.brave_key,
+                        &q,
+                        ctx.tool_timeout,
+                        ctx.tracing_ids,
+                    )
+                    .await
+                    {
+                        Ok(text) => {
+                            info!(
+                                tool = WEB_CONTEXT_SEARCH_TOOL_NAME,
+                                tool_call_id = %tool_call_id,
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                output_chars = text.len(),
+                                "tool ok"
+                            );
+                            ("ok", text)
+                        }
+                        Err(BraveError::Timeout) => {
+                            warn!(
+                                tool = WEB_CONTEXT_SEARCH_TOOL_NAME,
+                                tool_call_id = %tool_call_id,
+                                "tool timeout"
+                            );
+                            (
+                                "timeout",
+                                "Web search timed out. Please answer using your existing knowledge or ask the user for more detail.".to_string(),
+                            )
+                        }
+                        Err(BraveError::Other(msg)) => {
+                            warn!(
+                                tool = WEB_CONTEXT_SEARCH_TOOL_NAME,
+                                tool_call_id = %tool_call_id,
+                                error = %msg,
+                                "tool error"
+                            );
+                            (
+                                "error",
+                                "Web search failed. Please answer using your existing knowledge or ask the user for more detail.".to_string(),
+                            )
+                        }
+                    }
+                }
+                _ => {
+                    warn!(
+                        tool = WEB_CONTEXT_SEARCH_TOOL_NAME,
+                        tool_call_id = %tool_call_id,
+                        "tool arguments missing or invalid; skipping search"
+                    );
+                    (
+                        "error",
+                        "Tool arguments were missing or invalid; no search performed.".to_string(),
+                    )
+                }
+            };
+
+            emit_tool_result_chunk(
+                ctx.tx,
+                ctx.chunk_transform,
+                &mut hasher,
+                chat_id.as_deref(),
+                model_echo.as_deref(),
+                created,
+                &tool_call_id,
+                status,
+                &output,
+            )
+            .await?;
+
+            tool_messages.push(json!({
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": output,
+            }));
+        }
+
+        // Append the assistant tool_calls message + tool result messages
+        // to the conversation for the next iteration.
+        let messages = ctx
+            .request_json
+            .get_mut("messages")
+            .and_then(|m| m.as_array_mut())
+            .ok_or_else(|| AppError::Internal(anyhow::anyhow!("messages array missing")))?;
+        messages.push(json!({
+            "role": "assistant",
+            "tool_calls": iter_outcome.tool_calls,
+        }));
+        for m in tool_messages {
+            messages.push(m);
+        }
+    }
+
+    Ok(LoopResult {
+        chat_id,
+        hasher,
+        iterations,
+        input_tokens: total_input_tokens,
+        output_tokens: total_output_tokens,
+        terminated_by,
+    })
+}
+
+/// Bridge to give us `&'static str` for less-common finish_reason values
+/// without leaking the original. We only care about a few well-known
+/// reasons; anything else collapses to a single bucket for metrics.
+fn str_to_static(reason: &str) -> &'static str {
+    match reason {
+        "content_filter" => "content_filter",
+        _ => "other",
+    }
+}
+
+fn all_calls_are_web_context_search(tool_calls: &[Value]) -> bool {
+    !tool_calls.is_empty()
+        && tool_calls.iter().all(|tc| {
+            tc.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str())
+                == Some(WEB_CONTEXT_SEARCH_TOOL_NAME)
+        })
+}
+
+fn parse_query(arguments: &str) -> Option<String> {
+    let parsed: Value = serde_json::from_str(arguments).ok()?;
+    parsed
+        .get("query")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+}
+
+// ── single iteration ────────────────────────────────────────────────
+
+struct IterCtx<'a> {
+    client: &'a reqwest::Client,
+    upstream_url: &'a str,
+    request_body: &'a [u8],
+    tx: &'a tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    hasher: &'a mut Sha256,
+    chunk_transform: Option<&'a ChunkTransform>,
+    /// When set, rewrite each forwarded chunk's `id` to this value so the
+    /// client sees one logical completion across loop iterations.
+    rewrite_id_to: Option<&'a str>,
+    tracing_ids: &'a TracingIds,
+}
+
+struct IterOutcome {
+    chat_id: Option<String>,
+    model: Option<String>,
+    created: Option<i64>,
+    finish_reason: Option<String>,
+    tool_calls: Vec<Value>,
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
+async fn run_iteration(ctx: IterCtx<'_>) -> Result<IterOutcome, AppError> {
+    let mut req = ctx
+        .client
+        .post(ctx.upstream_url)
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream");
+    for (k, v) in ctx.tracing_ids.upstream_headers() {
+        req = req.header(k, v);
+    }
+    let response = req
+        .body(ctx.request_body.to_vec())
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(e.into()))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.bytes().await.unwrap_or_default();
+        return Err(AppError::Upstream {
+            status: StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            body,
+        });
+    }
+
+    let mut byte_stream = std::pin::pin!(response.bytes_stream());
+    let mut line_buf = String::new();
+    let mut outcome = IterOutcome {
+        chat_id: None,
+        model: None,
+        created: None,
+        finish_reason: None,
+        tool_calls: Vec::new(),
+        input_tokens: 0,
+        output_tokens: 0,
+    };
+
+    // SSE line loop. We hold off forwarding `[DONE]` until the caller decides
+    // whether to continue looping; everything else is forwarded as it arrives.
+    let mut saw_done = false;
+    while !saw_done {
+        match byte_stream.next().await {
+            Some(Ok(chunk)) => {
+                let s = std::str::from_utf8(&chunk)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|_| String::from_utf8_lossy(&chunk).into_owned());
+                line_buf.push_str(&s);
+
+                while let Some(nl) = line_buf.find('\n') {
+                    let line: String = line_buf.drain(..=nl).collect();
+                    let trimmed = line.trim_end_matches(['\n', '\r']);
+                    let data = trimmed
+                        .strip_prefix("data: ")
+                        .or_else(|| trimmed.strip_prefix("data:"));
+
+                    if let Some(data) = data {
+                        let data = data.trim();
+                        if data == "[DONE]" {
+                            saw_done = true;
+                            break;
+                        }
+                        if data.is_empty() {
+                            continue;
+                        }
+                        let mut parsed: Value = match serde_json::from_str(data) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                warn!(error = %e, "agent loop: failed to parse upstream SSE line");
+                                continue;
+                            }
+                        };
+                        ingest_chunk_metadata(&parsed, &mut outcome);
+
+                        if let Some(new_id) = ctx.rewrite_id_to {
+                            if parsed.get("id").is_some() {
+                                parsed["id"] = Value::String(new_id.to_string());
+                            }
+                        }
+
+                        if let Some(transform) = ctx.chunk_transform {
+                            transform(&mut parsed)?;
+                        }
+
+                        let serialized = serde_json::to_string(&parsed)
+                            .map_err(|e| AppError::Internal(e.into()))?;
+                        let mut emit = String::with_capacity(serialized.len() + 8);
+                        emit.push_str("data: ");
+                        emit.push_str(&serialized);
+                        emit.push_str("\n\n");
+                        let bytes = emit.into_bytes();
+                        ctx.hasher.update(&bytes);
+                        if ctx.tx.send(Ok(Bytes::from(bytes))).await.is_err() {
+                            return Err(AppError::Internal(anyhow::anyhow!("client disconnected")));
+                        }
+                    } else if !trimmed.is_empty() {
+                        // Non-data line (comment, event:, id:, retry:). Forward verbatim.
+                        let bytes = line.into_bytes();
+                        ctx.hasher.update(&bytes);
+                        if ctx.tx.send(Ok(Bytes::from(bytes))).await.is_err() {
+                            return Err(AppError::Internal(anyhow::anyhow!("client disconnected")));
+                        }
+                    }
+                    // blank line: drop (we re-emit `\n\n` after each data line)
+                }
+            }
+            Some(Err(e)) => return Err(AppError::Internal(e.into())),
+            None => break, // upstream closed before [DONE]
+        }
+    }
+
+    Ok(outcome)
+}
+
+fn ingest_chunk_metadata(event: &Value, outcome: &mut IterOutcome) {
+    if outcome.chat_id.is_none() {
+        outcome.chat_id = event.get("id").and_then(|v| v.as_str()).map(String::from);
+    }
+    if outcome.model.is_none() {
+        outcome.model = event
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+    }
+    if outcome.created.is_none() {
+        outcome.created = event.get("created").and_then(|v| v.as_i64());
+    }
+
+    if let Some(usage) = event.get("usage").filter(|v| v.is_object()) {
+        if let Some(p) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
+            outcome.input_tokens = outcome.input_tokens.saturating_add(p);
+        }
+        if let Some(c) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
+            outcome.output_tokens = outcome.output_tokens.saturating_add(c);
+        }
+    }
+
+    if let Some(choices) = event.get("choices").and_then(|v| v.as_array()) {
+        for choice in choices {
+            if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+                outcome.finish_reason = Some(fr.to_string());
+            }
+            if let Some(delta) = choice.get("delta").filter(|v| v.is_object()) {
+                if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                    merge_tool_call_deltas(&mut outcome.tool_calls, tcs);
+                }
+            }
+        }
+    }
+}
+
+/// Merge incremental tool_call deltas into the cumulative list, indexed by
+/// the upstream `index` field. Mirrors `ChoiceAssembler::merge_tool_calls`
+/// in `proxy.rs`; duplicated here so this module stays self-contained.
+fn merge_tool_call_deltas(acc: &mut Vec<Value>, deltas: &[Value]) {
+    for delta in deltas {
+        let idx = delta.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        while acc.len() <= idx {
+            acc.push(json!({
+                "id": "",
+                "type": "function",
+                "function": {"name": "", "arguments": ""}
+            }));
+        }
+        let existing = &mut acc[idx];
+        if let Some(id) = delta.get("id").and_then(|v| v.as_str()) {
+            existing["id"] = id.into();
+        }
+        if let Some(t) = delta.get("type").and_then(|v| v.as_str()) {
+            existing["type"] = t.into();
+        }
+        if let Some(func) = delta.get("function").filter(|v| v.is_object()) {
+            if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                if !name.is_empty() {
+                    existing["function"]["name"] = name.into();
+                }
+            }
+            if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                let prev = existing["function"]["arguments"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                existing["function"]["arguments"] = Value::String(prev + args);
+            }
+        }
+    }
+}
+
+// ── synthetic chunks ────────────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+async fn emit_tool_result_chunk(
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    chunk_transform: Option<&ChunkTransform>,
+    hasher: &mut Sha256,
+    chat_id: Option<&str>,
+    model: Option<&str>,
+    created: Option<i64>,
+    tool_call_id: &str,
+    status: &str,
+    output: &str,
+) -> Result<(), AppError> {
+    let mut chunk = json!({
+        "id": chat_id.unwrap_or(""),
+        "object": "chat.completion.chunk",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                NEARAI_TOOL_RESULT_KEY: {
+                    "tool_call_id": tool_call_id,
+                    "name": WEB_CONTEXT_SEARCH_TOOL_NAME,
+                    "status": status,
+                    "output": output,
+                }
+            }
+        }]
+    });
+    if let Some(m) = model {
+        chunk["model"] = m.into();
+    }
+    if let Some(c) = created {
+        chunk["created"] = c.into();
+    }
+    if let Some(transform) = chunk_transform {
+        transform(&mut chunk)?;
+    }
+    let serialized = serde_json::to_string(&chunk).map_err(|e| AppError::Internal(e.into()))?;
+    let bytes = format!("data: {serialized}\n\n").into_bytes();
+    hasher.update(&bytes);
+    tx.send(Ok(Bytes::from(bytes)))
+        .await
+        .map_err(|_| AppError::Internal(anyhow::anyhow!("client disconnected")))?;
+    Ok(())
+}
+
+async fn emit_max_iterations_terminator(
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    chunk_transform: Option<&ChunkTransform>,
+    hasher: &mut Sha256,
+    chat_id: Option<&str>,
+    model: Option<&str>,
+    created: Option<i64>,
+) -> Result<(), AppError> {
+    let mut chunk = json!({
+        "id": chat_id.unwrap_or(""),
+        "object": "chat.completion.chunk",
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "stop",
+            NEARAI_LOOP_TERMINATED_KEY: "max_iterations"
+        }]
+    });
+    if let Some(m) = model {
+        chunk["model"] = m.into();
+    }
+    if let Some(c) = created {
+        chunk["created"] = c.into();
+    }
+    if let Some(transform) = chunk_transform {
+        transform(&mut chunk)?;
+    }
+    let serialized = serde_json::to_string(&chunk).map_err(|e| AppError::Internal(e.into()))?;
+    let bytes = format!("data: {serialized}\n\n").into_bytes();
+    hasher.update(&bytes);
+    tx.send(Ok(Bytes::from(bytes)))
+        .await
+        .map_err(|_| AppError::Internal(anyhow::anyhow!("client disconnected")))?;
+    Ok(())
+}
+
+async fn forward_done(
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    hasher: &mut Sha256,
+) -> Result<(), AppError> {
+    let bytes: Bytes = Bytes::from_static(b"data: [DONE]\n\n");
+    hasher.update(&bytes);
+    tx.send(Ok(bytes))
+        .await
+        .map_err(|_| AppError::Internal(anyhow::anyhow!("client disconnected")))
+}
+
+// ── Brave LLM Context API ───────────────────────────────────────────
+
+enum BraveError {
+    Timeout,
+    Other(String),
+}
+
+/// Hit Brave's LLM Context endpoint and return a model-ready text block.
+///
+/// Defaults match cloud-api's `WebContextSearchToolExecutor` so behavior is
+/// consistent between `/v1/responses` (in cloud-api) and the in-CVM loop.
+async fn brave_llm_context_search(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    query: &str,
+    timeout: Duration,
+    tracing_ids: &TracingIds,
+) -> Result<String, BraveError> {
+    // Cloud-api defaults (see crates/services/src/responses/tools/web_context_search.rs).
+    let query_params: [(&str, &str); 9] = [
+        ("q", query),
+        ("count", "20"),
+        ("maximum_number_of_urls", "20"),
+        ("maximum_number_of_tokens", "8192"),
+        ("maximum_number_of_snippets", "50"),
+        ("maximum_number_of_tokens_per_url", "4096"),
+        ("maximum_number_of_snippets_per_url", "50"),
+        ("context_threshold_mode", "balanced"),
+        ("spellcheck", "true"),
+    ];
+
+    let mut req = client
+        .get(url)
+        .header("X-Subscription-Token", api_key)
+        .header("Accept", "application/json")
+        .timeout(timeout)
+        .query(&query_params);
+    // Propagate request_id only if it was inbound; org/workspace IDs are not
+    // forwarded to third-party APIs.
+    if tracing_ids.request_id_inbound {
+        req = req.header("x-request-id", tracing_ids.request_id.as_str());
+    }
+
+    let response = req.send().await.map_err(|e| {
+        if e.is_timeout() {
+            BraveError::Timeout
+        } else {
+            BraveError::Other(format!("brave request failed: {}", error_category(&e)))
+        }
+    })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(BraveError::Other(format!("brave HTTP {}", status.as_u16())));
+    }
+
+    let body = response.text().await.map_err(|e| {
+        BraveError::Other(format!("brave body read failed: {}", error_category(&e)))
+    })?;
+
+    let parsed: BraveContextResponse = serde_json::from_str(&body)
+        .map_err(|e| BraveError::Other(format!("brave JSON parse failed: {e}")))?;
+
+    Ok(format_context_response(&parsed))
+}
+
+fn error_category(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        "timeout"
+    } else if e.is_connect() {
+        "connect"
+    } else if e.is_request() {
+        "request"
+    } else if e.is_body() {
+        "body"
+    } else if e.is_decode() {
+        "decode"
+    } else {
+        "unknown"
+    }
+}
+
+/// Brave LLM Context response shape (subset). Mirror of cloud-api's
+/// `BraveContextResponse` — only the fields we use.
+#[derive(serde::Deserialize)]
+struct BraveContextResponse {
+    #[serde(default)]
+    grounding: BraveContextGrounding,
+    #[serde(default)]
+    sources: std::collections::HashMap<String, BraveContextSource>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct BraveContextGrounding {
+    #[serde(default)]
+    generic: Vec<BraveContextResult>,
+}
+
+#[derive(serde::Deserialize)]
+struct BraveContextResult {
+    url: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    snippets: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct BraveContextSource {
+    #[serde(default)]
+    title: Option<String>,
+}
+
+/// Render the Brave context payload as a plaintext block the model can
+/// consume directly. Skips entries with no URL or no usable snippets; falls
+/// back to sources[url].title when the grounding entry has no title of its
+/// own. Mirrors `context_response_to_web_results` in cloud-api/brave.rs.
+fn format_context_response(resp: &BraveContextResponse) -> String {
+    let mut out = String::new();
+    let mut n: u32 = 0;
+    for entry in &resp.grounding.generic {
+        let url = entry.url.trim();
+        if url.is_empty() {
+            continue;
+        }
+        let snippets: Vec<&str> = entry
+            .snippets
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if snippets.is_empty() {
+            continue;
+        }
+        let title = entry
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                resp.sources
+                    .get(url)
+                    .and_then(|s| s.title.as_deref())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| url.to_string());
+        n += 1;
+        if n > 1 {
+            out.push_str("\n\n");
+        }
+        out.push_str(&format!("[{n}] {title}\n{url}\n"));
+        out.push_str(&snippets.join("\n\n"));
+    }
+    if out.is_empty() {
+        "No results.".to_string()
+    } else {
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opt_in_detects_exact_single_tool() {
+        let req = json!({"tools": [{"type": "web_context_search"}]});
+        assert!(is_web_context_search_request(&req));
+    }
+
+    #[test]
+    fn opt_in_rejects_mixed_tools() {
+        let req = json!({"tools": [
+            {"type": "web_context_search"},
+            {"type": "function", "function": {"name": "x"}}
+        ]});
+        assert!(!is_web_context_search_request(&req));
+    }
+
+    #[test]
+    fn opt_in_rejects_function_only() {
+        let req = json!({"tools": [{"type": "function", "function": {"name": "x"}}]});
+        assert!(!is_web_context_search_request(&req));
+    }
+
+    #[test]
+    fn opt_in_rejects_no_tools() {
+        let req = json!({"messages": []});
+        assert!(!is_web_context_search_request(&req));
+    }
+
+    #[test]
+    fn opt_in_rejects_two_web_context_search_entries() {
+        let req = json!({"tools": [
+            {"type": "web_context_search"},
+            {"type": "web_context_search"}
+        ]});
+        assert!(!is_web_context_search_request(&req));
+    }
+
+    #[test]
+    fn rewrite_tool_replaces_with_function_def() {
+        let mut req = json!({"tools": [{"type": "web_context_search"}]});
+        rewrite_tool_for_upstream(&mut req);
+        let tools = req["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], WEB_CONTEXT_SEARCH_TOOL_NAME);
+        assert!(tools[0]["function"]["parameters"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::String("query".to_string())));
+    }
+
+    #[test]
+    fn parse_query_handles_well_formed() {
+        assert_eq!(
+            parse_query(r#"{"query":"  hello world  "}"#),
+            Some("hello world".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_query_handles_malformed() {
+        assert_eq!(parse_query("not json"), None);
+        assert_eq!(parse_query("{}"), None);
+        assert_eq!(parse_query(r#"{"other":"x"}"#), None);
+    }
+
+    #[test]
+    fn merge_tool_call_deltas_assembles_split_arguments() {
+        let mut acc: Vec<Value> = Vec::new();
+        merge_tool_call_deltas(
+            &mut acc,
+            &[json!({
+                "index": 0,
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "web_context_search", "arguments": ""}
+            })],
+        );
+        merge_tool_call_deltas(
+            &mut acc,
+            &[json!({
+                "index": 0,
+                "function": {"arguments": r#"{"query":"#}
+            })],
+        );
+        merge_tool_call_deltas(
+            &mut acc,
+            &[json!({
+                "index": 0,
+                "function": {"arguments": r#""rust"}"#}
+            })],
+        );
+        assert_eq!(acc.len(), 1);
+        assert_eq!(acc[0]["id"], "call_1");
+        assert_eq!(acc[0]["function"]["name"], "web_context_search");
+        assert_eq!(acc[0]["function"]["arguments"], r#"{"query":"rust"}"#);
+    }
+
+    #[test]
+    fn all_calls_predicate_requires_correct_name() {
+        let calls = vec![json!({"function": {"name": "web_context_search"}})];
+        assert!(all_calls_are_web_context_search(&calls));
+        let bad = vec![json!({"function": {"name": "something_else"}})];
+        assert!(!all_calls_are_web_context_search(&bad));
+        let mixed = vec![
+            json!({"function": {"name": "web_context_search"}}),
+            json!({"function": {"name": "other"}}),
+        ];
+        assert!(!all_calls_are_web_context_search(&mixed));
+    }
+
+    #[test]
+    fn format_context_response_renders_block() {
+        let resp = BraveContextResponse {
+            grounding: BraveContextGrounding {
+                generic: vec![
+                    BraveContextResult {
+                        url: "https://example.com/a".to_string(),
+                        title: Some("Title A".to_string()),
+                        snippets: vec!["snippet 1".to_string(), "snippet 2".to_string()],
+                    },
+                    BraveContextResult {
+                        url: "".to_string(), // empty url — skip
+                        title: Some("skipped".to_string()),
+                        snippets: vec!["x".to_string()],
+                    },
+                    BraveContextResult {
+                        url: "https://example.com/b".to_string(),
+                        title: None,
+                        snippets: vec!["only".to_string()],
+                    },
+                ],
+            },
+            sources: std::collections::HashMap::from([(
+                "https://example.com/b".to_string(),
+                BraveContextSource {
+                    title: Some("Source B Title".to_string()),
+                },
+            )]),
+        };
+        let out = format_context_response(&resp);
+        assert!(out.contains("[1] Title A"));
+        assert!(out.contains("https://example.com/a"));
+        assert!(out.contains("snippet 1\n\nsnippet 2"));
+        assert!(out.contains("[2] Source B Title"));
+        assert!(out.contains("https://example.com/b"));
+        assert!(!out.contains("skipped"));
+    }
+
+    #[test]
+    fn format_context_response_empty_falls_back_to_no_results() {
+        let resp = BraveContextResponse {
+            grounding: BraveContextGrounding::default(),
+            sources: std::collections::HashMap::new(),
+        };
+        assert_eq!(format_context_response(&resp), "No results.");
+    }
+}

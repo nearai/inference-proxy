@@ -5,6 +5,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use tracing::Instrument;
 
+pub mod agent_loop;
 pub mod attestation;
 pub mod attestation_sdk;
 pub mod auth;

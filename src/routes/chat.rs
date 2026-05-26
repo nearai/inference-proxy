@@ -6,6 +6,7 @@ use axum::Extension;
 
 use sha2::Digest;
 
+use crate::agent_loop;
 use crate::auth::RequireAuth;
 use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
@@ -35,11 +36,8 @@ pub async fn chat_completions(
     // honored when authenticated with config.token (trusted gateway); sk- clients
     // always bind signatures to the wire body so they cannot forge a hash for a
     // different payload.
-    let original_request_hash = Some(resolve_request_hash_for_signing(
-        &headers,
-        &request_body,
-        auth.cloud_api_key.is_none(),
-    ));
+    let request_hash =
+        resolve_request_hash_for_signing(&headers, &request_body, auth.cloud_api_key.is_none());
 
     // Decrypt request fields if encryption is active
     if let Some(ref ctx) = enc_ctx {
@@ -55,6 +53,42 @@ pub async fn chat_completions(
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+
+    // Server-side agent loop opt-in: the request advertises exactly
+    // `{"type":"web_context_search"}` and nothing else. Requires streaming
+    // (we splice tool-result chunks between iterations) and Brave creds
+    // configured on this CVM. Anything that doesn't match falls through to
+    // the existing pass-through path below, byte-for-byte identical.
+    if agent_loop::is_web_context_search_request(&request_json) {
+        if !is_stream {
+            return Err(AppError::BadRequest(
+                "web_context_search requires stream:true".to_string(),
+            ));
+        }
+        if state.config.web_context_search_url.is_none()
+            || state.config.web_context_search_api_key.is_none()
+        {
+            return Err(AppError::BadRequest(
+                "web_context_search is not configured on this deployment".to_string(),
+            ));
+        }
+
+        // Build chunk transform if E2EE is active; the loop emits synthetic
+        // `nearai_tool_result` chunks that the transform encrypts alongside
+        // the model's deltas.
+        let chunk_transform = enc_ctx.map(|ctx| {
+            encryption::make_chunk_transform(Endpoint::ChatCompletions, ctx, state.signing.clone())
+        });
+        return agent_loop::run_chat_completion(
+            state,
+            auth,
+            tracing_ids,
+            request_hash,
+            request_json,
+            chunk_transform,
+        )
+        .await;
+    }
 
     // For cloud API key requests with streaming, force include_usage
     // so the backend always sends token counts for billing.
@@ -102,7 +136,7 @@ pub async fn chat_completions(
         model_name: state.config.model_name.clone(),
         usage_reporter: make_usage_reporter(&auth, &state),
         usage_type: UsageType::ChatCompletion,
-        request_hash: original_request_hash,
+        request_hash: Some(request_hash),
         response_transform,
         chunk_transform,
         backend_guard: Some(guard),

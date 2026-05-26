@@ -310,7 +310,7 @@ fn try_report_usage(response_data: &serde_json::Value, id: &str, opts: &ProxyOpt
 /// service-token path (`/v1/internal/usage`) when [`UsageReporter::can_use_service_token_path`]
 /// is true; otherwise falls back to the legacy sk-bearer path
 /// (`/v1/usage`) verbatim.
-fn spawn_usage_report(reporter: &UsageReporter, mut body: serde_json::Value) {
+pub fn spawn_usage_report(reporter: &UsageReporter, mut body: serde_json::Value) {
     let client = reporter.http_client.clone();
     let (url, auth, mode) = if reporter.can_use_service_token_path() {
         // Inject subject identity into the body. Cloud-api's

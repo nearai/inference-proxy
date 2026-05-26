@@ -740,6 +740,16 @@ fn encrypt_chat_response_choices(
                         encrypt_field(fc, "name", ctx, signing)?;
                     }
 
+                    // Synthetic agent-loop tool result chunk (streaming only).
+                    // Emitted by `agent_loop::run_chat_completion` between
+                    // iterations as `delta.nearai_tool_result.output`. The
+                    // string is what the model consumes on the next iteration,
+                    // so it must travel encrypted alongside the rest of the
+                    // chat stream.
+                    if let Some(tool_result) = msg.get_mut("nearai_tool_result") {
+                        encrypt_field(tool_result, "output", ctx, signing)?;
+                    }
+
                     // logprobs — encrypt each token string and bytes array
                     if let Some(logprobs) = choice.get_mut("logprobs") {
                         encrypt_logprobs_tokens(logprobs, ctx, signing)?;

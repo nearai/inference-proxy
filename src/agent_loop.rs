@@ -87,6 +87,21 @@ pub async fn run_chat_completion(
     // a few new messages, so the cache hit rate should be very high).
     let (upstream_url, backend_guard) = state.backend_pool.select_url("/v1/chat/completions");
 
+    // Send the first upstream request synchronously so its HTTP status
+    // propagates to the caller. Without this, a 400/429/503 from upstream
+    // on iteration 0 would arrive as a 200 text/event-stream followed by a
+    // broken / empty body, hiding the real failure from the client. Only
+    // when this first call succeeds do we return 200 + spawn the loop.
+    let first_request_body =
+        serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?;
+    let first_response = send_upstream(
+        &state.http_client,
+        &upstream_url,
+        first_request_body,
+        &tracing_ids,
+    )
+    .await?;
+
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
     let http_client = state.http_client.clone();
@@ -112,18 +127,21 @@ pub async fn run_chat_completion(
         // duration, the same way `proxy_streaming_request` does.
         let _streaming_guard = StreamingGuard::new();
         let _backend_guard = backend_guard;
-        let outcome = drive_loop(LoopCtx {
-            client: &http_client,
-            upstream_url: &upstream_url,
-            request_json: &mut request_json,
-            tx: &tx,
-            chunk_transform: chunk_transform.as_ref(),
-            max_iterations,
-            brave_url: &brave_url,
-            brave_key: &brave_key,
-            tool_timeout,
-            tracing_ids: &tracing_ids,
-        })
+        let outcome = drive_loop(
+            LoopCtx {
+                client: &http_client,
+                upstream_url: &upstream_url,
+                request_json: &mut request_json,
+                tx: &tx,
+                chunk_transform: chunk_transform.as_ref(),
+                max_iterations,
+                brave_url: &brave_url,
+                brave_key: &brave_key,
+                tool_timeout,
+                tracing_ids: &tracing_ids,
+            },
+            first_response,
+        )
         .await;
 
         match outcome {
@@ -199,6 +217,10 @@ pub async fn run_chat_completion(
 /// (count, max_urls, threshold, …) is fixed on our side; clients don't get
 /// to influence it via the tool schema, which keeps the prompt surface small
 /// and the result shape predictable.
+///
+/// Also forces `parallel_tool_calls: false`. Phase 1 caps execution at one
+/// tool call per iteration; instructing the model not to emit more than one
+/// keeps the upstream from producing tool calls we'd then drop.
 fn rewrite_tool_for_upstream(request_json: &mut Value) {
     request_json["tools"] = json!([{
         "type": "function",
@@ -218,6 +240,8 @@ fn rewrite_tool_for_upstream(request_json: &mut Value) {
             }
         }
     }]);
+    // Phase 1: serialize tool calls — at most one per iteration.
+    request_json["parallel_tool_calls"] = false.into();
 }
 
 struct LoopCtx<'a> {
@@ -246,7 +270,10 @@ struct LoopResult {
     completed_cleanly: bool,
 }
 
-async fn drive_loop(ctx: LoopCtx<'_>) -> Result<LoopResult, AppError> {
+async fn drive_loop(
+    ctx: LoopCtx<'_>,
+    first_response: reqwest::Response,
+) -> Result<LoopResult, AppError> {
     let mut hasher = Sha256::new();
     let mut chat_id: Option<String> = None;
     let mut model_echo: Option<String> = None;
@@ -256,6 +283,10 @@ async fn drive_loop(ctx: LoopCtx<'_>) -> Result<LoopResult, AppError> {
     let mut iterations: u32 = 0;
     let terminated_by;
     let mut completed_cleanly = false;
+    // The iter-0 upstream Response is already in hand (see
+    // `run_chat_completion`); subsequent iterations build their own via
+    // `send_upstream`.
+    let mut next_response: Option<reqwest::Response> = Some(first_response);
 
     loop {
         // Bail out early if the client has gone away — avoids issuing another
@@ -281,24 +312,68 @@ async fn drive_loop(ctx: LoopCtx<'_>) -> Result<LoopResult, AppError> {
             break;
         }
 
+        // Acquire the upstream Response for this iteration. Iter 0 reuses
+        // the synchronous first call from `run_chat_completion`; iter 1+
+        // sends now, racing the send against client disconnect.
+        let response = match next_response.take() {
+            Some(r) => r,
+            None => {
+                let body = serde_json::to_vec(ctx.request_json)
+                    .map_err(|e| AppError::Internal(e.into()))?;
+                let send_outcome = tokio::select! {
+                    r = send_upstream(ctx.client, ctx.upstream_url, body, ctx.tracing_ids) => Some(r),
+                    _ = ctx.tx.closed() => None,
+                };
+                let Some(send_outcome) = send_outcome else {
+                    terminated_by = "client_disconnect";
+                    break;
+                };
+                match send_outcome {
+                    Ok(r) => r,
+                    Err(AppError::Upstream { status, body }) => {
+                        warn!(
+                            status = %status,
+                            "upstream returned non-2xx mid-loop"
+                        );
+                        // Surface the failure to the client as an SSE error
+                        // chunk so they don't see a silent stall. No `[DONE]`
+                        // and no signature — this is not a successful
+                        // completion.
+                        emit_upstream_error_chunk(
+                            ctx.tx,
+                            ctx.chunk_transform,
+                            &mut hasher,
+                            chat_id.as_deref(),
+                            model_echo.as_deref(),
+                            created,
+                            status.as_u16(),
+                            &body,
+                        )
+                        .await?;
+                        terminated_by = "upstream_error";
+                        break;
+                    }
+                    Err(other) => return Err(other),
+                }
+            }
+        };
+
         iterations += 1;
         let iter_started = Instant::now();
 
-        let iter_outcome = run_iteration(IterCtx {
-            client: ctx.client,
-            upstream_url: ctx.upstream_url,
-            request_body: serde_json::to_vec(ctx.request_json)
-                .map_err(|e| AppError::Internal(e.into()))?,
-            tx: ctx.tx,
-            hasher: &mut hasher,
-            chunk_transform: ctx.chunk_transform,
-            rewrite_id_to: if iterations > 1 {
-                chat_id.as_deref()
-            } else {
-                None
+        let iter_outcome = run_iteration(
+            IterCtx {
+                tx: ctx.tx,
+                hasher: &mut hasher,
+                chunk_transform: ctx.chunk_transform,
+                rewrite_id_to: if iterations > 1 {
+                    chat_id.as_deref()
+                } else {
+                    None
+                },
             },
-            tracing_ids: ctx.tracing_ids,
-        })
+            response,
+        )
         .await?;
 
         if chat_id.is_none() {
@@ -328,9 +403,22 @@ async fn drive_loop(ctx: LoopCtx<'_>) -> Result<LoopResult, AppError> {
             break;
         }
 
+        // Upstream surfaced an inline error chunk (e.g. SGLang abort).
+        // The error chunk itself is already on the wire to the client;
+        // we just refuse to forward `[DONE]` or sign over an aborted
+        // generation.
+        if iter_outcome.upstream_error.is_some() {
+            terminated_by = "upstream_error";
+            break;
+        }
+
+        // Phase 1: cap at exactly one tool call per iteration. We force
+        // `parallel_tool_calls: false` upstream; if a model still emits
+        // multiple (some engines ignore the flag), fall through to the
+        // non-loop path so we never silently drop a tool call.
         let is_tool_call_iteration = iter_outcome.saw_done
             && iter_outcome.finish_reason.as_deref() == Some("tool_calls")
-            && !iter_outcome.tool_calls.is_empty()
+            && iter_outcome.tool_calls.len() == 1
             && all_calls_are_web_context_search(&iter_outcome.tool_calls);
 
         if !is_tool_call_iteration {
@@ -357,10 +445,11 @@ async fn drive_loop(ctx: LoopCtx<'_>) -> Result<LoopResult, AppError> {
             break;
         }
 
-        // Execute each web_context_search tool call serially (Phase 1).
-        // Emit one synthetic chunk per result, then append the assistant
-        // + tool messages to the conversation for the next iteration.
+        // Execute the tool call (Phase 1: exactly one). Emit one synthetic
+        // chunk with the result, then append the assistant + tool messages
+        // to the conversation for the next iteration.
         let mut tool_messages: Vec<Value> = Vec::with_capacity(iter_outcome.tool_calls.len());
+        let mut disconnected_in_tool = false;
         for tc in &iter_outcome.tool_calls {
             let tool_call_id = tc
                 .get("id")
@@ -377,16 +466,31 @@ async fn drive_loop(ctx: LoopCtx<'_>) -> Result<LoopResult, AppError> {
             let (status, output) = match query {
                 Some(q) if !q.is_empty() => {
                     let started = Instant::now();
-                    match brave_llm_context_search(
-                        ctx.client,
-                        ctx.brave_url,
-                        ctx.brave_key,
-                        &q,
-                        ctx.tool_timeout,
-                        ctx.tracing_ids,
-                    )
-                    .await
-                    {
+                    // Race the Brave call against client disconnect: if the
+                    // client goes away while we're waiting on Brave, abort
+                    // promptly rather than holding the request open until
+                    // the search finishes.
+                    let brave_result = tokio::select! {
+                        r = brave_llm_context_search(
+                            ctx.client,
+                            ctx.brave_url,
+                            ctx.brave_key,
+                            &q,
+                            ctx.tool_timeout,
+                            ctx.tracing_ids,
+                        ) => Some(r),
+                        _ = ctx.tx.closed() => None,
+                    };
+                    let Some(brave_result) = brave_result else {
+                        info!(
+                            tool = WEB_CONTEXT_SEARCH_TOOL_NAME,
+                            tool_call_id = %tool_call_id,
+                            "client disconnected during tool execution"
+                        );
+                        disconnected_in_tool = true;
+                        break;
+                    };
+                    match brave_result {
                         Ok(text) => {
                             info!(
                                 tool = WEB_CONTEXT_SEARCH_TOOL_NAME,
@@ -455,6 +559,11 @@ async fn drive_loop(ctx: LoopCtx<'_>) -> Result<LoopResult, AppError> {
             }));
         }
 
+        if disconnected_in_tool {
+            terminated_by = "client_disconnect";
+            break;
+        }
+
         // Append the assistant tool_calls message + tool result messages
         // to the conversation for the next iteration.
         let messages = ctx
@@ -513,16 +622,12 @@ fn parse_query(arguments: &str) -> Option<String> {
 // ── single iteration ────────────────────────────────────────────────
 
 struct IterCtx<'a> {
-    client: &'a reqwest::Client,
-    upstream_url: &'a str,
-    request_body: Vec<u8>,
     tx: &'a tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
     hasher: &'a mut Sha256,
     chunk_transform: Option<&'a ChunkTransform>,
     /// When set, rewrite each forwarded chunk's `id` to this value so the
     /// client sees one logical completion across loop iterations.
     rewrite_id_to: Option<&'a str>,
-    tracing_ids: &'a TracingIds,
 }
 
 struct IterOutcome {
@@ -541,32 +646,20 @@ struct IterOutcome {
     /// True iff the downstream channel closed mid-iteration (client went
     /// away). Drive_loop short-circuits and skips signing in that case.
     client_disconnected: bool,
+    /// First top-level `{"error": {...}}` SSE chunk seen mid-stream. SGLang
+    /// surfaces aborts (queue overflow, priority disabled, waiting timeout)
+    /// this way while keeping the response otherwise well-formed; treating
+    /// these as upstream failure prevents signing a "successful" response
+    /// over an aborted generation.
+    upstream_error: Option<Value>,
 }
 
-async fn run_iteration(ctx: IterCtx<'_>) -> Result<IterOutcome, AppError> {
-    let mut req = ctx
-        .client
-        .post(ctx.upstream_url)
-        .header("content-type", "application/json")
-        .header("accept", "text/event-stream");
-    for (k, v) in ctx.tracing_ids.upstream_headers() {
-        req = req.header(k, v);
-    }
-    let response = req
-        .body(ctx.request_body)
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(e.into()))?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.bytes().await.unwrap_or_default();
-        return Err(AppError::Upstream {
-            status: StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-            body,
-        });
-    }
-
+async fn run_iteration(
+    ctx: IterCtx<'_>,
+    response: reqwest::Response,
+) -> Result<IterOutcome, AppError> {
+    // The HTTP status was already checked by `send_upstream` before we
+    // reached this iteration. Here we only consume the response body.
     let mut byte_stream = std::pin::pin!(response.bytes_stream());
     // Raw byte buffer — `from_utf8_lossy` on per-chunk slices would corrupt
     // multi-byte UTF-8 characters split across chunk boundaries (replacing
@@ -583,6 +676,7 @@ async fn run_iteration(ctx: IterCtx<'_>) -> Result<IterOutcome, AppError> {
         output_tokens: 0,
         saw_done: false,
         client_disconnected: false,
+        upstream_error: None,
     };
 
     // SSE line loop. We hold off forwarding `[DONE]` until the caller decides
@@ -687,6 +781,16 @@ async fn run_iteration(ctx: IterCtx<'_>) -> Result<IterOutcome, AppError> {
 }
 
 fn ingest_chunk_metadata(event: &Value, outcome: &mut IterOutcome) {
+    // SGLang and friends surface mid-stream aborts as a top-level
+    // `{"error": {...}}` chunk while otherwise emitting a well-formed SSE
+    // (including `[DONE]`). Capturing this lets the loop refuse to sign or
+    // forward `[DONE]` over an aborted generation.
+    if outcome.upstream_error.is_none() {
+        if let Some(err) = event.get("error").filter(|v| v.is_object()) {
+            outcome.upstream_error = Some(err.clone());
+        }
+    }
+
     if outcome.chat_id.is_none() {
         outcome.chat_id = event.get("id").and_then(|v| v.as_str()).map(String::from);
     }
@@ -760,6 +864,42 @@ fn merge_tool_call_deltas(acc: &mut Vec<Value>, deltas: &[Value]) {
     }
 }
 
+// ── upstream send ───────────────────────────────────────────────────
+
+/// Issue one upstream chat-completions request and return the streaming
+/// response. Maps non-2xx into `AppError::Upstream` so the caller can decide
+/// whether to surface the failure as an HTTP error (iter 0, before
+/// returning to the client) or as an inline SSE error chunk (iter 1+).
+async fn send_upstream(
+    client: &reqwest::Client,
+    upstream_url: &str,
+    body: Vec<u8>,
+    tracing_ids: &TracingIds,
+) -> Result<reqwest::Response, AppError> {
+    let mut req = client
+        .post(upstream_url)
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream");
+    for (k, v) in tracing_ids.upstream_headers() {
+        req = req.header(k, v);
+    }
+    let response = req
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(e.into()))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.bytes().await.unwrap_or_default();
+        return Err(AppError::Upstream {
+            status: StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            body,
+        });
+    }
+    Ok(response)
+}
+
 // ── synthetic chunks ────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -795,6 +935,56 @@ async fn emit_tool_result_chunk(
     if let Some(c) = created {
         chunk["created"] = c.into();
     }
+    if let Some(transform) = chunk_transform {
+        transform(&mut chunk)?;
+    }
+    let serialized = serde_json::to_string(&chunk).map_err(|e| AppError::Internal(e.into()))?;
+    let bytes = format!("data: {serialized}\n\n").into_bytes();
+    hasher.update(&bytes);
+    tx.send(Ok(Bytes::from(bytes)))
+        .await
+        .map_err(|_| AppError::Internal(anyhow::anyhow!("client disconnected")))?;
+    Ok(())
+}
+
+/// Emit an OpenAI-shaped error chunk to the client when an upstream
+/// iteration past iter 0 returns non-2xx. We've already sent
+/// `200 text/event-stream` headers, so we can't change the HTTP status;
+/// instead surface the failure as a `data: {"error": {...}}` chunk and
+/// close the stream without `[DONE]` so the response isn't signed.
+#[allow(clippy::too_many_arguments)]
+async fn emit_upstream_error_chunk(
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    chunk_transform: Option<&ChunkTransform>,
+    hasher: &mut Sha256,
+    chat_id: Option<&str>,
+    model: Option<&str>,
+    created: Option<i64>,
+    status_code: u16,
+    upstream_body: &[u8],
+) -> Result<(), AppError> {
+    // Don't leak upstream body bytes verbatim — they could contain provider
+    // internals. Surface the status code only.
+    let _ = upstream_body;
+    let mut chunk = json!({
+        "id": chat_id.unwrap_or(""),
+        "object": "chat.completion.chunk",
+        "choices": [],
+        "error": {
+            "message": format!("upstream returned HTTP {status_code} on a follow-up tool-loop iteration"),
+            "type": "upstream_error",
+            "code": status_code.to_string(),
+        }
+    });
+    if let Some(m) = model {
+        chunk["model"] = m.into();
+    }
+    if let Some(c) = created {
+        chunk["created"] = c.into();
+    }
+    // Pass through the chunk transform so E2EE clients still get a
+    // well-formed (encrypted-where-applicable) error chunk. The `error`
+    // object itself has no encryptable string fields by design.
     if let Some(transform) = chunk_transform {
         transform(&mut chunk)?;
     }

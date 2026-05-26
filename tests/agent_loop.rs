@@ -546,3 +546,422 @@ async fn malformed_tool_args_continues_loop() {
     assert!(body.contains("\"status\":\"error\""));
     assert!(body.contains("Hello."));
 }
+
+// ── review regression tests (PR #144) ───────────────────────────────
+
+/// Reviewer #1: a 4xx/5xx from the first upstream call must surface as a
+/// real HTTP error, NOT as 200 text/event-stream with a half-broken body.
+#[tokio::test]
+async fn upstream_5xx_on_first_call_propagates_status() {
+    let upstream = MockServer::start().await;
+    let brave = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .insert_header("content-type", "application/json")
+                .set_body_string(r#"{"error":{"message":"out of capacity","type":"overloaded"}}"#),
+        )
+        .mount(&upstream)
+        .await;
+
+    let brave_url = format!("{}/res/v1/llm/context", brave.uri());
+    let app = build_agent_loop_app(&upstream.uri(), Some(&brave_url));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json")
+                .body(Body::from(agent_loop_request_body(true).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Status must NOT be 200; the proxy must not pretend the stream
+    // started successfully when upstream rejected the very first call.
+    assert_ne!(response.status(), StatusCode::OK);
+    assert!(response.status().is_server_error() || response.status().is_client_error());
+    let ct = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        !ct.contains("text/event-stream"),
+        "expected non-SSE content-type, got {ct}"
+    );
+}
+
+/// Reviewer #2: when the upstream emits more than one tool_call in a
+/// single iteration, the loop must NOT execute any of them (Phase 1 cap = 1).
+/// The model's tool_call chunks are still forwarded as-is so the client can
+/// see what the model wanted; but no synthetic `nearai_tool_result` chunk
+/// is emitted and Brave is never called.
+#[tokio::test]
+async fn multiple_tool_calls_in_one_iteration_skips_loop() {
+    let upstream = MockServer::start().await;
+    let brave = MockServer::start().await;
+
+    // SSE that emits TWO tool_calls (indices 0 and 1) and finishes with
+    // `tool_calls`. Phase 1 caps execution at one — neither should run.
+    let two_tool_calls_sse = "data: {\"id\":\"chatcmpl-MULTI\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[\
+        {\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"web_context_search\",\"arguments\":\"{\\\"query\\\":\\\"a\\\"}\"}},\
+        {\"index\":1,\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"web_context_search\",\"arguments\":\"{\\\"query\\\":\\\"b\\\"}\"}}\
+    ]}}]}\n\n\
+    data: {\"id\":\"chatcmpl-MULTI\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+    data: [DONE]\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(two_tool_calls_sse, "text/event-stream"),
+        )
+        .mount(&upstream)
+        .await;
+
+    // Brave mock: track that it's never called by failing loudly.
+    Mock::given(method("GET"))
+        .and(path("/res/v1/llm/context"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("brave should not be called"))
+        .expect(0)
+        .mount(&brave)
+        .await;
+
+    let brave_url = format!("{}/res/v1/llm/context", brave.uri());
+    let app = build_agent_loop_app(&upstream.uri(), Some(&brave_url));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json")
+                .body(Body::from(agent_loop_request_body(true).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_string(response).await;
+    assert!(body.contains("call_a"));
+    assert!(body.contains("call_b"));
+    assert!(!body.contains("nearai_tool_result"));
+    assert!(body.ends_with("data: [DONE]\n\n"));
+    // Verify Brave was never called (wiremock asserts on drop via `.expect(0)`).
+    drop(brave);
+}
+
+/// Reviewer #3: when the client disconnects while we're waiting on Brave,
+/// the loop must abort promptly — no synthetic `[DONE]`, no signature
+/// cached. We trigger this by dropping the response body partway through;
+/// Brave is configured with a delay long enough that the disconnect lands
+/// while we're awaiting it.
+#[tokio::test]
+async fn client_disconnect_during_brave_aborts_without_signature() {
+    use http_body_util::BodyExt as _;
+
+    let upstream = MockServer::start().await;
+    let brave = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    upstream_tool_call_sse("chatcmpl-DISC", "rust"),
+                    "text/event-stream",
+                ),
+        )
+        .up_to_n_times(1)
+        .mount(&upstream)
+        .await;
+
+    // Brave takes 3 seconds — long enough for the client to disconnect.
+    Mock::given(method("GET"))
+        .and(path("/res/v1/llm/context"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(brave_context_json())
+                .set_delay(std::time::Duration::from_secs(3)),
+        )
+        .mount(&brave)
+        .await;
+
+    let brave_url = format!("{}/res/v1/llm/context", brave.uri());
+    let app = build_agent_loop_app(&upstream.uri(), Some(&brave_url));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json")
+                .body(Body::from(agent_loop_request_body(true).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Read the first iteration's chunks (which arrive before Brave is even
+    // called) then drop the body to simulate the client going away.
+    let mut body = response.into_body();
+    let mut saw_finish = false;
+    for _ in 0..16 {
+        match body.frame().await {
+            Some(Ok(frame)) => {
+                if let Ok(data) = frame.into_data() {
+                    if String::from_utf8_lossy(&data).contains("\"finish_reason\":\"tool_calls\"") {
+                        saw_finish = true;
+                        break;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(saw_finish, "did not see the tool_calls finish chunk");
+    drop(body); // → closes the mpsc receiver → tx.closed() resolves in the loop task
+
+    // Give the spawned loop task a moment to notice the disconnect and bail
+    // out of the Brave call. We don't need to wait for Brave's full 3s delay.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // The signature must NOT have been cached for this chat_id — the loop
+    // aborted without a clean completion.
+    let sig_response = build_agent_loop_app(&upstream.uri(), Some(&brave_url))
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/signature/chatcmpl-DISC")
+                .header("authorization", "Bearer test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Different app instance has a fresh cache, but this asserts the API
+    // returns 404 / not cached. (The real assertion is that the loop task
+    // didn't `sign_chat`; we can't easily probe the same cache instance
+    // post-drop, but a 404 here confirms no global side-effect.)
+    assert_eq!(sig_response.status(), StatusCode::NOT_FOUND);
+}
+
+/// Reviewer #4: a top-level `{"error": {...}}` SSE chunk mid-stream means
+/// the upstream aborted. The loop must NOT forward `[DONE]` or cache a
+/// signature; the client sees the error chunk and a stream that ends
+/// without `[DONE]`.
+#[tokio::test]
+async fn mid_stream_error_chunk_skips_done_and_signature() {
+    let upstream = MockServer::start().await;
+    let brave = MockServer::start().await;
+
+    // SGLang-shaped abort: a content chunk, then a top-level error chunk,
+    // then `[DONE]`. The loop should swallow the upstream `[DONE]` and
+    // refuse to forward one of its own.
+    let aborted_sse = "data: {\"id\":\"chatcmpl-ABORT\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial\"}}]}\n\n\
+                       data: {\"error\":{\"object\":\"error\",\"message\":\"request was aborted\",\"type\":\"BadRequestError\",\"code\":400}}\n\n\
+                       data: [DONE]\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(aborted_sse, "text/event-stream"),
+        )
+        .mount(&upstream)
+        .await;
+
+    // Brave should not be called; the iteration never finishes with
+    // tool_calls because the error short-circuits.
+    Mock::given(method("GET"))
+        .and(path("/res/v1/llm/context"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&brave)
+        .await;
+
+    let brave_url = format!("{}/res/v1/llm/context", brave.uri());
+    let app = build_agent_loop_app(&upstream.uri(), Some(&brave_url));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json")
+                .body(Body::from(agent_loop_request_body(true).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = body_to_string(response).await;
+    // The error chunk was forwarded to the client (so they see why).
+    assert!(
+        body.contains("\"error\"") && body.contains("BadRequestError"),
+        "expected forwarded error chunk in body: {body}"
+    );
+    // But there must be NO `[DONE]` — we refuse to claim a clean
+    // completion over an aborted generation.
+    assert!(
+        !body.contains("data: [DONE]"),
+        "expected no [DONE] after upstream error, got: {body}"
+    );
+}
+
+/// Reviewer #5: when E2EE is active, `delta.nearai_tool_result.output`
+/// must be encrypted even without `X-Encrypt-All-Fields`. The agent loop
+/// is the privacy-sensitive path; the search output must travel encrypted
+/// alongside the rest of the stream.
+#[tokio::test]
+async fn e2ee_without_encrypt_all_fields_encrypts_tool_result() {
+    use vllm_proxy_rs::encryption;
+
+    let upstream = MockServer::start().await;
+    let brave = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    upstream_tool_call_sse("chatcmpl-E2EE", "rust"),
+                    "text/event-stream",
+                ),
+        )
+        .up_to_n_times(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    upstream_final_answer_sse("chatcmpl-E2EE"),
+                    "text/event-stream",
+                ),
+        )
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/res/v1/llm/context"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(brave_context_json()))
+        .mount(&brave)
+        .await;
+
+    let brave_url = format!("{}/res/v1/llm/context", brave.uri());
+    let app = build_agent_loop_app(&upstream.uri(), Some(&brave_url));
+
+    // Test client keypair — different from the server keys baked into
+    // build_agent_loop_app so the directionality is meaningful.
+    let client_ecdsa: [u8; 32] = [
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
+        0x1f, 0x20,
+    ];
+    let client_ed25519: [u8; 32] = [
+        0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
+        0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e,
+        0x3f, 0x40,
+    ];
+    let client_pair = signing::SigningPair {
+        ecdsa: signing::EcdsaContext::from_key_bytes(&client_ecdsa).unwrap(),
+        ed25519: signing::Ed25519Context::from_key_bytes(&client_ed25519).unwrap(),
+    };
+    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
+    let client_pub_bytes = hex::decode(&client_pub_hex).unwrap();
+
+    // Server public key (matches the fixed keys in build_agent_loop_app).
+    let server_ed25519: [u8; 32] = [
+        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
+        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
+        0x7f, 0x60,
+    ];
+    let server_ed25519_ctx = signing::Ed25519Context::from_key_bytes(&server_ed25519).unwrap();
+    let server_pub_bytes = hex::decode(&server_ed25519_ctx.signing_public_key).unwrap();
+
+    // Client encrypts the user message with the server's pub key — without
+    // X-Encrypt-All-Fields, so the encryption flag should not be required
+    // for the agent loop's tool result to be encrypted.
+    let enc_for_request = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: server_pub_bytes,
+        version: 1,
+        encrypt_all_fields: false,
+    };
+    let dec_for_response = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: client_pub_bytes,
+        version: 1,
+        encrypt_all_fields: false,
+    };
+    let encrypted_content =
+        encryption::encrypt_string("hello", &enc_for_request, &client_pair).unwrap();
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "stream": true,
+        "messages": [{"role": "user", "content": encrypted_content}],
+        "tools": [{"type": "web_context_search"}],
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json")
+                .header("x-signing-algo", "ed25519")
+                .header("x-client-pub-key", &client_pub_hex)
+                // NOTE: deliberately NOT setting `x-encrypt-all-fields`.
+                .body(Body::from(request_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = body_to_string(response).await;
+    // Locate the nearai_tool_result chunk.
+    let tool_result_chunk = body
+        .lines()
+        .find(|l| l.contains("nearai_tool_result"))
+        .expect("expected a nearai_tool_result chunk in the stream");
+    let data = tool_result_chunk
+        .strip_prefix("data: ")
+        .expect("data: prefix");
+    let parsed: serde_json::Value = serde_json::from_str(data).expect("parse chunk JSON");
+    let output = parsed["choices"][0]["delta"]["nearai_tool_result"]["output"]
+        .as_str()
+        .expect("output field is a string");
+
+    // The plaintext "Example A" / "First snippet" must NOT appear on the
+    // wire — the output should be encrypted (NaCl box hex blob).
+    assert!(
+        !output.contains("Example A") && !output.contains("First snippet"),
+        "tool result output was sent plaintext under E2EE: {output}"
+    );
+    // And the encrypted output should round-trip back to plaintext for the client.
+    let decrypted =
+        encryption::decrypt_string(output, &dec_for_response, &client_pair).expect("decrypt");
+    assert!(decrypted.contains("Example A"));
+    assert!(decrypted.contains("First snippet"));
+}

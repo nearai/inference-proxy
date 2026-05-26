@@ -698,7 +698,11 @@ async fn client_disconnect_during_brave_aborts_without_signature() {
         .await;
 
     let brave_url = format!("{}/res/v1/llm/context", brave.uri());
+    // Clone the router so the signature-endpoint check below hits the
+    // SAME `AppState` (and therefore the SAME `ChatCache`) that the loop
+    // task would have written to on a clean completion.
     let app = build_agent_loop_app(&upstream.uri(), Some(&brave_url));
+    let app_for_sig = app.clone();
 
     let response = app
         .oneshot(
@@ -738,9 +742,11 @@ async fn client_disconnect_during_brave_aborts_without_signature() {
     // out of the Brave call. We don't need to wait for Brave's full 3s delay.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    // The signature must NOT have been cached for this chat_id — the loop
-    // aborted without a clean completion.
-    let sig_response = build_agent_loop_app(&upstream.uri(), Some(&brave_url))
+    // Hit the signature endpoint on the SAME app instance (cloned above);
+    // its cache is the same one the loop task would have used if it had
+    // completed cleanly. A 404 proves the loop did NOT cache anything
+    // for this chat_id — i.e., it aborted on disconnect before signing.
+    let sig_response = app_for_sig
         .oneshot(
             Request::builder()
                 .method("GET")
@@ -751,10 +757,6 @@ async fn client_disconnect_during_brave_aborts_without_signature() {
         )
         .await
         .unwrap();
-    // Different app instance has a fresh cache, but this asserts the API
-    // returns 404 / not cached. (The real assertion is that the loop task
-    // didn't `sign_chat`; we can't easily probe the same cache instance
-    // post-drop, but a 404 here confirms no global side-effect.)
     assert_eq!(sig_response.status(), StatusCode::NOT_FOUND);
 }
 
@@ -811,13 +813,20 @@ async fn mid_stream_error_chunk_skips_done_and_signature() {
     assert_eq!(response.status(), StatusCode::OK);
 
     let body = body_to_string(response).await;
-    // The error chunk was forwarded to the client (so they see why).
+    // We surface a sanitized error chunk (controlled message text) so the
+    // client knows something failed, but we do NOT pass through
+    // upstream-provided strings — `error.message` could carry user data
+    // an upstream backend echoed back.
     assert!(
-        body.contains("\"error\"") && body.contains("BadRequestError"),
-        "expected forwarded error chunk in body: {body}"
+        body.contains("upstream emitted an error chunk"),
+        "expected sanitized error chunk in body: {body}"
     );
-    // But there must be NO `[DONE]` — we refuse to claim a clean
-    // completion over an aborted generation.
+    // The upstream's own error message and type must NOT appear on the wire.
+    assert!(
+        !body.contains("BadRequestError") && !body.contains("request was aborted"),
+        "upstream error.message/type leaked verbatim to the client: {body}"
+    );
+    // And NO `[DONE]` — aborted generation is not a clean completion.
     assert!(
         !body.contains("data: [DONE]"),
         "expected no [DONE] after upstream error, got: {body}"
@@ -1021,4 +1030,265 @@ async fn e2ee_without_encrypt_all_fields_encrypts_tool_result() {
         encryption::decrypt_string(&name_ciphertext, &dec_for_response, &client_pair)
             .expect("decrypt name");
     assert_eq!(decrypted_name, "web_context_search");
+}
+
+// ── second-round review regression tests ────────────────────────────
+
+/// PR #144 round 3: top-level upstream `data: {"error": ...}` chunks must
+/// NOT be forwarded verbatim — backends sometimes echo input/prompt
+/// fragments in `error.message`, and under E2EE that's data we decrypted
+/// inside the CVM. The loop must replace the upstream chunk with a
+/// sanitized synthetic error chunk whose text is controlled by the proxy.
+#[tokio::test]
+async fn upstream_error_message_does_not_leak_prompt_or_query() {
+    let upstream = MockServer::start().await;
+    let brave = MockServer::start().await;
+
+    // Upstream emits an error chunk whose `message` echoes a sensitive
+    // marker string from the user's prompt — simulating a backend that
+    // includes the validation input in error messages.
+    let secret = "TOPSECRET_USER_PROMPT_MARKER_42";
+    let leaky_error_sse = format!(
+        "data: {{\"error\":{{\"object\":\"error\",\"message\":\"validation failed for prompt: '{secret}'\",\"type\":\"BadRequestError\",\"code\":400}}}}\n\n\
+         data: [DONE]\n\n"
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(leaky_error_sse, "text/event-stream"),
+        )
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/res/v1/llm/context"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&brave)
+        .await;
+
+    let brave_url = format!("{}/res/v1/llm/context", brave.uri());
+    let app = build_agent_loop_app(&upstream.uri(), Some(&brave_url));
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "stream": true,
+        "messages": [{"role": "user", "content": secret}],
+        "tools": [{"type": "web_context_search"}],
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json")
+                .body(Body::from(request_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = body_to_string(response).await;
+    // Sanitized synthetic error chunk reached the client.
+    assert!(
+        body.contains("upstream emitted an error chunk"),
+        "expected sanitized error chunk in body: {body}"
+    );
+    // The upstream error.message that included the prompt MUST NOT appear
+    // anywhere on the wire.
+    assert!(
+        !body.contains(secret),
+        "prompt fragment leaked via upstream error.message: {body}"
+    );
+    // And no [DONE] — aborted generation is not a clean completion.
+    assert!(
+        !body.contains("data: [DONE]"),
+        "expected no [DONE] after upstream error chunk: {body}"
+    );
+}
+
+/// PR #144 round 3 (P2): Brave responses are size-capped. A misconfigured
+/// or compromised search backend returning a multi-megabyte body must
+/// not allocate unbounded memory in the proxy. Instead we surface it as
+/// a tool error and let the loop continue.
+#[tokio::test]
+async fn brave_response_oversized_body_is_rejected() {
+    let upstream = MockServer::start().await;
+    let brave = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    upstream_tool_call_sse("chatcmpl-OVERSIZE", "rust"),
+                    "text/event-stream",
+                ),
+        )
+        .up_to_n_times(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    upstream_final_answer_sse("chatcmpl-OVERSIZE"),
+                    "text/event-stream",
+                ),
+        )
+        .mount(&upstream)
+        .await;
+
+    // Brave returns 3 MiB of valid JSON — above the 2 MiB cap.
+    let huge_url = format!("https://example.com/{}", "a".repeat(3 * 1024 * 1024));
+    let oversized = serde_json::json!({
+        "grounding": {
+            "generic": [{
+                "url": huge_url,
+                "title": "huge",
+                "snippets": ["x"]
+            }]
+        }
+    });
+    Mock::given(method("GET"))
+        .and(path("/res/v1/llm/context"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(oversized))
+        .mount(&brave)
+        .await;
+
+    let brave_url = format!("{}/res/v1/llm/context", brave.uri());
+    let app = build_agent_loop_app(&upstream.uri(), Some(&brave_url));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json")
+                .body(Body::from(agent_loop_request_body(true).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = body_to_string(response).await;
+    // The oversized response should be surfaced as a tool error result,
+    // not a successful tool call. The loop continues and the model gets
+    // a chance to respond.
+    assert!(body.contains("nearai_tool_result"));
+    assert!(body.contains("\"status\":\"error\""));
+    // The leaked huge URL must NOT appear on the wire — we rejected the
+    // response before parsing/forwarding.
+    assert!(
+        !body.contains(&"a".repeat(2048)),
+        "oversized response payload leaked into stream"
+    );
+    // Loop still completes normally on the next iteration.
+    assert!(body.contains("Hello."));
+    assert!(body.ends_with("data: [DONE]\n\n"));
+}
+
+/// PR #144 round 3 (P2): the formatted tool output emitted to the client
+/// AND fed back to the model is capped, even if Brave returns a valid
+/// but very large response that respects raw-body limits.
+#[tokio::test]
+async fn brave_formatted_output_is_truncated() {
+    let upstream = MockServer::start().await;
+    let brave = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    upstream_tool_call_sse("chatcmpl-TRUNC", "rust"),
+                    "text/event-stream",
+                ),
+        )
+        .up_to_n_times(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    upstream_final_answer_sse("chatcmpl-TRUNC"),
+                    "text/event-stream",
+                ),
+        )
+        .mount(&upstream)
+        .await;
+
+    // 200 entries × ~600 bytes snippet → ~120 KB formatted output, well
+    // above the 32 KiB cap. Body itself is ~150 KB JSON — under the 2 MiB
+    // body cap so the body read succeeds.
+    let mut entries = Vec::with_capacity(200);
+    for i in 0..200 {
+        entries.push(serde_json::json!({
+            "url": format!("https://example.com/page-{i}"),
+            "title": format!("Title {i}"),
+            "snippets": [format!("snippet-{i}-{}", "x".repeat(500))],
+        }));
+    }
+    let big = serde_json::json!({
+        "grounding": {"generic": entries}
+    });
+    Mock::given(method("GET"))
+        .and(path("/res/v1/llm/context"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(big))
+        .mount(&brave)
+        .await;
+
+    let brave_url = format!("{}/res/v1/llm/context", brave.uri());
+    let app = build_agent_loop_app(&upstream.uri(), Some(&brave_url));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json")
+                .body(Body::from(agent_loop_request_body(true).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = body_to_string(response).await;
+    let tool_result_chunk = body
+        .lines()
+        .find(|l| l.contains("nearai_tool_result"))
+        .expect("expected a nearai_tool_result chunk");
+    let parsed: serde_json::Value =
+        serde_json::from_str(tool_result_chunk.strip_prefix("data: ").unwrap())
+            .expect("parse chunk JSON");
+    let output = parsed["choices"][0]["delta"]["nearai_tool_result"]["output"]
+        .as_str()
+        .expect("output field is a string");
+
+    // Cap is 32 KiB; allow some slack for the truncation marker.
+    assert!(
+        output.len() <= 32 * 1024 + 64,
+        "tool output not truncated to cap: {} bytes",
+        output.len()
+    );
+    assert!(
+        output.contains("[truncated]"),
+        "expected truncation marker in capped output"
+    );
 }

@@ -38,6 +38,18 @@ pub const WEB_CONTEXT_SEARCH_TOOL_NAME: &str = "web_context_search";
 const NEARAI_TOOL_RESULT_KEY: &str = "nearai_tool_result";
 const NEARAI_LOOP_TERMINATED_KEY: &str = "nearai_loop_terminated";
 
+/// Hard cap on bytes read from Brave's response body. The defaults we send
+/// (`maximum_number_of_tokens=8192`, `maximum_number_of_urls=20`) should
+/// produce well under this; the cap is a backstop against a misconfigured
+/// or malicious search endpoint that returns an unbounded body.
+const BRAVE_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Hard cap on the formatted tool output that we emit downstream and feed
+/// back to the model on the next iteration. Independent of Brave's input
+/// caps so we don't depend on the upstream respecting them. Beyond this,
+/// the output is truncated with a marker.
+const MAX_FORMATTED_OUTPUT_BYTES: usize = 32 * 1024;
+
 /// True iff the request's `tools` field is exactly one entry of type
 /// `web_context_search`. Mixed tool types or multiple entries return false
 /// and let the request flow through the existing pass-through path.
@@ -338,16 +350,22 @@ async fn drive_loop(
                         // Surface the failure to the client as an SSE error
                         // chunk so they don't see a silent stall. No `[DONE]`
                         // and no signature — this is not a successful
-                        // completion.
-                        emit_upstream_error_chunk(
+                        // completion. The `body` from upstream is dropped
+                        // (not forwarded) because it can contain
+                        // provider-side internals or user data.
+                        let _ = body;
+                        let status_code = status.as_u16();
+                        let code_str = status_code.to_string();
+                        emit_synthetic_error_chunk(
                             ctx.tx,
                             ctx.chunk_transform,
                             &mut hasher,
                             chat_id.as_deref(),
                             model_echo.as_deref(),
                             created,
-                            status.as_u16(),
-                            &body,
+                            &format!("upstream returned HTTP {status_code} on a follow-up tool-loop iteration"),
+                            "upstream_error",
+                            Some(&code_str),
                         )
                         .await?;
                         terminated_by = "upstream_error";
@@ -722,6 +740,33 @@ async fn run_iteration(
                                 };
                                 ingest_chunk_metadata(&parsed, &mut outcome);
 
+                                // SGLang and friends emit top-level
+                                // `{"error": {...}}` chunks on aborts.
+                                // Do NOT forward the upstream chunk
+                                // verbatim — `error.message` is outside
+                                // what the chunk transform encrypts, and
+                                // backends may put validation
+                                // input/request details (which under E2EE
+                                // is data we decrypted inside the CVM)
+                                // into it. Replace with a sanitized
+                                // synthetic error chunk and abort the
+                                // iteration.
+                                if outcome.upstream_error.is_some() {
+                                    emit_synthetic_error_chunk(
+                                        ctx.tx,
+                                        ctx.chunk_transform,
+                                        ctx.hasher,
+                                        outcome.chat_id.as_deref(),
+                                        outcome.model.as_deref(),
+                                        outcome.created,
+                                        "upstream emitted an error chunk; response was aborted",
+                                        "upstream_error",
+                                        None,
+                                    )
+                                    .await?;
+                                    break 'outer;
+                                }
+
                                 if let Some(new_id) = ctx.rewrite_id_to {
                                     if parsed.get("id").is_some() {
                                         parsed["id"] = Value::String(new_id.to_string());
@@ -947,34 +992,36 @@ async fn emit_tool_result_chunk(
     Ok(())
 }
 
-/// Emit an OpenAI-shaped error chunk to the client when an upstream
-/// iteration past iter 0 returns non-2xx. We've already sent
-/// `200 text/event-stream` headers, so we can't change the HTTP status;
-/// instead surface the failure as a `data: {"error": {...}}` chunk and
-/// close the stream without `[DONE]` so the response isn't signed.
+/// Emit a sanitized OpenAI-shaped error chunk to the client when an
+/// upstream failure happens after `200 text/event-stream` headers have
+/// already been sent. The message text is controlled by us — we don't
+/// pass through upstream-provided strings, which under E2EE could
+/// contain prompt fragments or other user data the upstream backend
+/// echoed back. Closing without `[DONE]` keeps the response unsigned.
 #[allow(clippy::too_many_arguments)]
-async fn emit_upstream_error_chunk(
+async fn emit_synthetic_error_chunk(
     tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
     chunk_transform: Option<&ChunkTransform>,
     hasher: &mut Sha256,
     chat_id: Option<&str>,
     model: Option<&str>,
     created: Option<i64>,
-    status_code: u16,
-    upstream_body: &[u8],
+    message: &str,
+    error_type: &str,
+    code: Option<&str>,
 ) -> Result<(), AppError> {
-    // Don't leak upstream body bytes verbatim — they could contain provider
-    // internals. Surface the status code only.
-    let _ = upstream_body;
+    let mut error = json!({
+        "message": message,
+        "type": error_type,
+    });
+    if let Some(c) = code {
+        error["code"] = c.into();
+    }
     let mut chunk = json!({
         "id": chat_id.unwrap_or(""),
         "object": "chat.completion.chunk",
         "choices": [],
-        "error": {
-            "message": format!("upstream returned HTTP {status_code} on a follow-up tool-loop iteration"),
-            "type": "upstream_error",
-            "code": status_code.to_string(),
-        }
+        "error": error,
     });
     if let Some(m) = model {
         chunk["model"] = m.into();
@@ -982,9 +1029,10 @@ async fn emit_upstream_error_chunk(
     if let Some(c) = created {
         chunk["created"] = c.into();
     }
-    // Pass through the chunk transform so E2EE clients still get a
-    // well-formed (encrypted-where-applicable) error chunk. The `error`
-    // object itself has no encryptable string fields by design.
+    // Pass through the chunk transform for shape parity with normal
+    // chunks. The `error` object has no encryptable string fields under
+    // the current transform — but the message text we put here is
+    // controlled by us, so this is safe regardless.
     if let Some(transform) = chunk_transform {
         transform(&mut chunk)?;
     }
@@ -1101,11 +1149,25 @@ async fn brave_llm_context_search(
         return Err(BraveError::Other(format!("brave HTTP {}", status.as_u16())));
     }
 
-    let body = response.text().await.map_err(|e| {
-        BraveError::Other(format!("brave body read failed: {}", error_category(&e)))
-    })?;
+    // Read the body in chunks so we can enforce a hard size cap regardless
+    // of `Content-Length`. The defaults we send keep responses well under
+    // `BRAVE_MAX_RESPONSE_BYTES`; this cap is a backstop in case the search
+    // endpoint is misconfigured or compromised.
+    let mut body_bytes: Vec<u8> = Vec::with_capacity(16 * 1024);
+    let mut body_stream = response.bytes_stream();
+    while let Some(chunk) = body_stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            BraveError::Other(format!("brave body read failed: {}", error_category(&e)))
+        })?;
+        if body_bytes.len().saturating_add(chunk.len()) > BRAVE_MAX_RESPONSE_BYTES {
+            return Err(BraveError::Other(format!(
+                "brave response exceeded {BRAVE_MAX_RESPONSE_BYTES}-byte cap"
+            )));
+        }
+        body_bytes.extend_from_slice(&chunk);
+    }
 
-    let parsed: BraveContextResponse = serde_json::from_str(&body)
+    let parsed: BraveContextResponse = serde_json::from_slice(&body_bytes)
         .map_err(|e| BraveError::Other(format!("brave JSON parse failed: {e}")))?;
 
     Ok(format_context_response(&parsed))
@@ -1162,10 +1224,16 @@ struct BraveContextSource {
 /// consume directly. Skips entries with no URL or no usable snippets; falls
 /// back to sources[url].title when the grounding entry has no title of its
 /// own. Mirrors `context_response_to_web_results` in cloud-api/brave.rs.
+///
+/// Truncates at `MAX_FORMATTED_OUTPUT_BYTES` with a marker, since we don't
+/// want to depend on Brave honoring its input caps. The truncated output
+/// is what we both emit to the client AND feed back to the model on the
+/// next iteration, so this also bounds prompt growth across iterations.
 fn format_context_response(resp: &BraveContextResponse) -> String {
     let mut out = String::new();
     let mut n: u32 = 0;
-    for entry in &resp.grounding.generic {
+    let mut truncated = false;
+    'outer: for entry in &resp.grounding.generic {
         let url = entry.url.trim();
         if url.is_empty() {
             continue;
@@ -1195,11 +1263,26 @@ fn format_context_response(resp: &BraveContextResponse) -> String {
             })
             .unwrap_or_else(|| url.to_string());
         n += 1;
-        if n > 1 {
-            out.push_str("\n\n");
+        let separator = if n > 1 { "\n\n" } else { "" };
+        let header = format!("{separator}[{n}] {title}\n{url}\n");
+        let joined = snippets.join("\n\n");
+        for piece in [header.as_str(), joined.as_str()] {
+            if out.len() + piece.len() > MAX_FORMATTED_OUTPUT_BYTES {
+                let remaining = MAX_FORMATTED_OUTPUT_BYTES.saturating_sub(out.len());
+                // Find a UTF-8 char boundary at or before `remaining`.
+                let mut cut = remaining;
+                while cut > 0 && !piece.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                out.push_str(&piece[..cut]);
+                truncated = true;
+                break 'outer;
+            }
+            out.push_str(piece);
         }
-        out.push_str(&format!("[{n}] {title}\n{url}\n"));
-        out.push_str(&snippets.join("\n\n"));
+    }
+    if truncated {
+        out.push_str("\n[truncated]");
     }
     if out.is_empty() {
         "No results.".to_string()

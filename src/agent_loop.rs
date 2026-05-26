@@ -30,7 +30,7 @@ use tracing::{debug, error, info, warn};
 use crate::auth::RequireAuth;
 use crate::encryption::ChunkTransform;
 use crate::error::AppError;
-use crate::proxy::{make_usage_reporter, spawn_usage_report};
+use crate::proxy::{make_usage_reporter, normalize_chat_chunk, spawn_usage_report, StreamingGuard};
 use crate::{AppState, TracingIds};
 
 pub const WEB_CONTEXT_SEARCH_TOOL_NAME: &str = "web_context_search";
@@ -108,6 +108,9 @@ pub async fn run_chat_completion(
     let usage_reporter = make_usage_reporter(&auth, &state);
 
     tokio::spawn(async move {
+        // Keep the streaming_connections gauge accurate for the full loop
+        // duration, the same way `proxy_streaming_request` does.
+        let _streaming_guard = StreamingGuard::new();
         let _backend_guard = backend_guard;
         let outcome = drive_loop(LoopCtx {
             client: &http_client,
@@ -125,43 +128,50 @@ pub async fn run_chat_completion(
 
         match outcome {
             Ok(result) => {
-                if let Some(ref chat_id) = result.chat_id {
-                    let response_sha256 = hex::encode(result.hasher.finalize());
-                    let text = format!("{model_name}:{request_hash}:{response_sha256}");
-                    match signing.sign_chat(&text) {
-                        Ok(signed) => {
-                            if let Ok(signed_json) = serde_json::to_string(&signed) {
-                                cache.set_chat(chat_id, &signed_json);
-                            }
-                        }
-                        Err(e) => error!(error = %e, "Signing failed for agent loop response"),
-                    }
-                    if let Some(reporter) = usage_reporter.as_ref() {
-                        if result.input_tokens > 0 || result.output_tokens > 0 {
-                            let body = json!({
-                                "type": "chat_completion",
-                                "model": reporter.model_name,
-                                "input_tokens": result.input_tokens,
-                                "output_tokens": result.output_tokens,
-                                "id": chat_id,
-                            });
-                            spawn_usage_report(reporter, body);
-                        }
-                    }
-                    info!(
-                        request_id = %tracing_ids.request_id,
-                        org_id = %tracing_ids.org_id_or_empty(),
-                        workspace_id = %tracing_ids.workspace_id_or_empty(),
-                        model = %model_name,
-                        chat_id = %chat_id,
-                        iterations = result.iterations,
-                        terminated_by = %result.terminated_by,
-                        input_tokens = result.input_tokens,
-                        output_tokens = result.output_tokens,
-                        "agent loop completed"
-                    );
-                } else {
+                info!(
+                    request_id = %tracing_ids.request_id,
+                    org_id = %tracing_ids.org_id_or_empty(),
+                    workspace_id = %tracing_ids.workspace_id_or_empty(),
+                    model = %model_name,
+                    chat_id = %result.chat_id.as_deref().unwrap_or(""),
+                    iterations = result.iterations,
+                    terminated_by = %result.terminated_by,
+                    input_tokens = result.input_tokens,
+                    output_tokens = result.output_tokens,
+                    completed_cleanly = result.completed_cleanly,
+                    "agent loop completed"
+                );
+                // Only sign / cache / report when the stream closed cleanly
+                // (final `[DONE]` was sent downstream). Mirrors
+                // `proxy_streaming_request` which keys on `parser.seen_done`.
+                if !result.completed_cleanly {
+                    return;
+                }
+                let Some(chat_id) = result.chat_id.as_deref() else {
                     warn!("Agent loop completed without observing a chat id; skipping signature");
+                    return;
+                };
+                let response_sha256 = hex::encode(result.hasher.finalize());
+                let text = format!("{model_name}:{request_hash}:{response_sha256}");
+                match signing.sign_chat(&text) {
+                    Ok(signed) => {
+                        if let Ok(signed_json) = serde_json::to_string(&signed) {
+                            cache.set_chat(chat_id, &signed_json);
+                        }
+                    }
+                    Err(e) => error!(error = %e, "Signing failed for agent loop response"),
+                }
+                if let Some(reporter) = usage_reporter.as_ref() {
+                    if result.input_tokens > 0 || result.output_tokens > 0 {
+                        let body = json!({
+                            "type": "chat_completion",
+                            "model": reporter.model_name,
+                            "input_tokens": result.input_tokens,
+                            "output_tokens": result.output_tokens,
+                            "id": chat_id,
+                        });
+                        spawn_usage_report(reporter, body);
+                    }
                 }
             }
             Err(e) => {
@@ -230,6 +240,10 @@ struct LoopResult {
     input_tokens: u64,
     output_tokens: u64,
     terminated_by: &'static str,
+    /// True only if the loop closed cleanly (model stop / max_iterations
+    /// terminator) and the final `[DONE]` was sent downstream. False on
+    /// client disconnect or upstream stream ending without a `[DONE]`.
+    completed_cleanly: bool,
 }
 
 async fn drive_loop(ctx: LoopCtx<'_>) -> Result<LoopResult, AppError> {
@@ -241,8 +255,16 @@ async fn drive_loop(ctx: LoopCtx<'_>) -> Result<LoopResult, AppError> {
     let mut total_output_tokens: u64 = 0;
     let mut iterations: u32 = 0;
     let terminated_by;
+    let mut completed_cleanly = false;
 
     loop {
+        // Bail out early if the client has gone away — avoids issuing another
+        // upstream LLM request or a Brave call we'd only throw away on send.
+        if ctx.tx.is_closed() {
+            terminated_by = "client_disconnect";
+            break;
+        }
+
         if iterations >= ctx.max_iterations {
             emit_max_iterations_terminator(
                 ctx.tx,
@@ -255,6 +277,7 @@ async fn drive_loop(ctx: LoopCtx<'_>) -> Result<LoopResult, AppError> {
             .await?;
             forward_done(ctx.tx, &mut hasher).await?;
             terminated_by = "max_iterations";
+            completed_cleanly = true;
             break;
         }
 
@@ -264,7 +287,7 @@ async fn drive_loop(ctx: LoopCtx<'_>) -> Result<LoopResult, AppError> {
         let iter_outcome = run_iteration(IterCtx {
             client: ctx.client,
             upstream_url: ctx.upstream_url,
-            request_body: &serde_json::to_vec(ctx.request_json)
+            request_body: serde_json::to_vec(ctx.request_json)
                 .map_err(|e| AppError::Internal(e.into()))?,
             tx: ctx.tx,
             hasher: &mut hasher,
@@ -294,19 +317,32 @@ async fn drive_loop(ctx: LoopCtx<'_>) -> Result<LoopResult, AppError> {
             iteration = iterations,
             finish_reason = iter_outcome.finish_reason.as_deref().unwrap_or(""),
             tool_calls = iter_outcome.tool_calls.len(),
+            saw_done = iter_outcome.saw_done,
             upstream_ms = iter_started.elapsed().as_millis() as u64,
             "agent loop iteration"
         );
 
-        let is_tool_call_iteration = iter_outcome.finish_reason.as_deref() == Some("tool_calls")
+        // Client disconnected mid-iteration.
+        if iter_outcome.client_disconnected {
+            terminated_by = "client_disconnect";
+            break;
+        }
+
+        let is_tool_call_iteration = iter_outcome.saw_done
+            && iter_outcome.finish_reason.as_deref() == Some("tool_calls")
             && !iter_outcome.tool_calls.is_empty()
             && all_calls_are_web_context_search(&iter_outcome.tool_calls);
 
         if !is_tool_call_iteration {
-            // Model produced a final answer (stop / length / content_filter) or
-            // called something we don't handle. `run_iteration` swallows the
-            // upstream `[DONE]` so the loop can decide whether to continue;
-            // since we're done, emit it now to close the SSE stream.
+            // If the upstream stream didn't carry a `[DONE]` (transport
+            // failure, abrupt EOF, mid-stream error chunk), do NOT synthesize
+            // one — that would mislead the client and produce a cached
+            // signature over an incomplete response. Drop the stream and let
+            // the spawn task surface an error.
+            if !iter_outcome.saw_done {
+                terminated_by = "upstream_eof";
+                break;
+            }
             forward_done(ctx.tx, &mut hasher).await?;
             terminated_by = match iter_outcome.finish_reason.as_deref() {
                 Some(r) => match r {
@@ -317,6 +353,7 @@ async fn drive_loop(ctx: LoopCtx<'_>) -> Result<LoopResult, AppError> {
                 },
                 None => "upstream_eof",
             };
+            completed_cleanly = true;
             break;
         }
 
@@ -441,6 +478,7 @@ async fn drive_loop(ctx: LoopCtx<'_>) -> Result<LoopResult, AppError> {
         input_tokens: total_input_tokens,
         output_tokens: total_output_tokens,
         terminated_by,
+        completed_cleanly,
     })
 }
 
@@ -477,7 +515,7 @@ fn parse_query(arguments: &str) -> Option<String> {
 struct IterCtx<'a> {
     client: &'a reqwest::Client,
     upstream_url: &'a str,
-    request_body: &'a [u8],
+    request_body: Vec<u8>,
     tx: &'a tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
     hasher: &'a mut Sha256,
     chunk_transform: Option<&'a ChunkTransform>,
@@ -495,6 +533,14 @@ struct IterOutcome {
     tool_calls: Vec<Value>,
     input_tokens: u64,
     output_tokens: u64,
+    /// True iff the upstream stream terminated with a `data: [DONE]` line.
+    /// Drive_loop only forwards a downstream `[DONE]` and signs the response
+    /// when this is true; an abrupt EOF or a transport error must NOT be
+    /// presented to the client as a clean completion.
+    saw_done: bool,
+    /// True iff the downstream channel closed mid-iteration (client went
+    /// away). Drive_loop short-circuits and skips signing in that case.
+    client_disconnected: bool,
 }
 
 async fn run_iteration(ctx: IterCtx<'_>) -> Result<IterOutcome, AppError> {
@@ -507,7 +553,7 @@ async fn run_iteration(ctx: IterCtx<'_>) -> Result<IterOutcome, AppError> {
         req = req.header(k, v);
     }
     let response = req
-        .body(ctx.request_body.to_vec())
+        .body(ctx.request_body)
         .send()
         .await
         .map_err(|e| AppError::Internal(e.into()))?;
@@ -522,7 +568,11 @@ async fn run_iteration(ctx: IterCtx<'_>) -> Result<IterOutcome, AppError> {
     }
 
     let mut byte_stream = std::pin::pin!(response.bytes_stream());
-    let mut line_buf = String::new();
+    // Raw byte buffer — `from_utf8_lossy` on per-chunk slices would corrupt
+    // multi-byte UTF-8 characters split across chunk boundaries (replacing
+    // partial bytes with U+FFFD permanently). We hold raw bytes until a full
+    // `\n`-terminated line is in hand and only then decode.
+    let mut byte_buf: Vec<u8> = Vec::with_capacity(8 * 1024);
     let mut outcome = IterOutcome {
         chat_id: None,
         model: None,
@@ -531,78 +581,105 @@ async fn run_iteration(ctx: IterCtx<'_>) -> Result<IterOutcome, AppError> {
         tool_calls: Vec::new(),
         input_tokens: 0,
         output_tokens: 0,
+        saw_done: false,
+        client_disconnected: false,
     };
 
     // SSE line loop. We hold off forwarding `[DONE]` until the caller decides
     // whether to continue looping; everything else is forwarded as it arrives.
-    let mut saw_done = false;
-    while !saw_done {
-        match byte_stream.next().await {
-            Some(Ok(chunk)) => {
-                let s = std::str::from_utf8(&chunk)
-                    .map(str::to_owned)
-                    .unwrap_or_else(|_| String::from_utf8_lossy(&chunk).into_owned());
-                line_buf.push_str(&s);
+    // `select!` on `tx.closed()` lets us abort promptly when the client drops
+    // mid-stream, matching `proxy_streaming_request`.
+    'outer: loop {
+        tokio::select! {
+            chunk = byte_stream.next() => {
+                match chunk {
+                    Some(Ok(chunk)) => {
+                        byte_buf.extend_from_slice(&chunk);
 
-                while let Some(nl) = line_buf.find('\n') {
-                    let line: String = line_buf.drain(..=nl).collect();
-                    let trimmed = line.trim_end_matches(['\n', '\r']);
-                    let data = trimmed
-                        .strip_prefix("data: ")
-                        .or_else(|| trimmed.strip_prefix("data:"));
-
-                    if let Some(data) = data {
-                        let data = data.trim();
-                        if data == "[DONE]" {
-                            saw_done = true;
-                            break;
-                        }
-                        if data.is_empty() {
-                            continue;
-                        }
-                        let mut parsed: Value = match serde_json::from_str(data) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                warn!(error = %e, "agent loop: failed to parse upstream SSE line");
+                        while let Some(nl) = byte_buf.iter().position(|b| *b == b'\n') {
+                            let line_bytes: Vec<u8> = byte_buf.drain(..=nl).collect();
+                            // Skip if the line isn't valid UTF-8 — SSE lines
+                            // are required to be UTF-8 by spec; we don't try
+                            // to recover from malformed upstream data.
+                            let Ok(line) = std::str::from_utf8(&line_bytes) else {
+                                warn!("agent loop: skipping non-UTF-8 SSE line");
                                 continue;
+                            };
+                            let trimmed = line.trim_end_matches(['\n', '\r']);
+                            let data = trimmed
+                                .strip_prefix("data: ")
+                                .or_else(|| trimmed.strip_prefix("data:"));
+
+                            if let Some(data) = data {
+                                let data = data.trim();
+                                if data == "[DONE]" {
+                                    outcome.saw_done = true;
+                                    break 'outer;
+                                }
+                                if data.is_empty() {
+                                    continue;
+                                }
+                                let mut parsed: Value = match serde_json::from_str(data) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        warn!(error = %e, "agent loop: failed to parse upstream SSE line");
+                                        continue;
+                                    }
+                                };
+                                ingest_chunk_metadata(&parsed, &mut outcome);
+
+                                if let Some(new_id) = ctx.rewrite_id_to {
+                                    if parsed.get("id").is_some() {
+                                        parsed["id"] = Value::String(new_id.to_string());
+                                    }
+                                }
+
+                                // Match the non-loop path's behavior:
+                                // upstream reasoning parsers that emit
+                                // `delta.reasoning` get normalized to
+                                // `delta.reasoning_content` so clients see
+                                // a consistent field name across both paths.
+                                normalize_chat_chunk(&mut parsed);
+
+                                if let Some(transform) = ctx.chunk_transform {
+                                    transform(&mut parsed)?;
+                                }
+
+                                let serialized = serde_json::to_string(&parsed)
+                                    .map_err(|e| AppError::Internal(e.into()))?;
+                                let mut emit = String::with_capacity(serialized.len() + 8);
+                                emit.push_str("data: ");
+                                emit.push_str(&serialized);
+                                emit.push_str("\n\n");
+                                let bytes = emit.into_bytes();
+                                ctx.hasher.update(&bytes);
+                                if ctx.tx.send(Ok(Bytes::from(bytes))).await.is_err() {
+                                    outcome.client_disconnected = true;
+                                    break 'outer;
+                                }
+                            } else if !trimmed.is_empty() {
+                                // Non-data line (comment, event:, id:, retry:). Forward verbatim.
+                                let bytes = line_bytes.clone();
+                                ctx.hasher.update(&bytes);
+                                if ctx.tx.send(Ok(Bytes::from(bytes))).await.is_err() {
+                                    outcome.client_disconnected = true;
+                                    break 'outer;
+                                }
                             }
-                        };
-                        ingest_chunk_metadata(&parsed, &mut outcome);
-
-                        if let Some(new_id) = ctx.rewrite_id_to {
-                            if parsed.get("id").is_some() {
-                                parsed["id"] = Value::String(new_id.to_string());
-                            }
-                        }
-
-                        if let Some(transform) = ctx.chunk_transform {
-                            transform(&mut parsed)?;
-                        }
-
-                        let serialized = serde_json::to_string(&parsed)
-                            .map_err(|e| AppError::Internal(e.into()))?;
-                        let mut emit = String::with_capacity(serialized.len() + 8);
-                        emit.push_str("data: ");
-                        emit.push_str(&serialized);
-                        emit.push_str("\n\n");
-                        let bytes = emit.into_bytes();
-                        ctx.hasher.update(&bytes);
-                        if ctx.tx.send(Ok(Bytes::from(bytes))).await.is_err() {
-                            return Err(AppError::Internal(anyhow::anyhow!("client disconnected")));
-                        }
-                    } else if !trimmed.is_empty() {
-                        // Non-data line (comment, event:, id:, retry:). Forward verbatim.
-                        let bytes = line.into_bytes();
-                        ctx.hasher.update(&bytes);
-                        if ctx.tx.send(Ok(Bytes::from(bytes))).await.is_err() {
-                            return Err(AppError::Internal(anyhow::anyhow!("client disconnected")));
+                            // blank line: drop (we re-emit `\n\n` after each data line)
                         }
                     }
-                    // blank line: drop (we re-emit `\n\n` after each data line)
+                    Some(Err(e)) => return Err(AppError::Internal(e.into())),
+                    None => break, // upstream closed before [DONE]
                 }
             }
-            Some(Err(e)) => return Err(AppError::Internal(e.into())),
-            None => break, // upstream closed before [DONE]
+            _ = ctx.tx.closed() => {
+                // Client disconnected while we were waiting for upstream
+                // bytes — abort promptly so we don't keep GPU work going
+                // and don't fire another Brave call.
+                outcome.client_disconnected = true;
+                break 'outer;
+            }
         }
     }
 

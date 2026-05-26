@@ -6,7 +6,6 @@
 //! `VLLM_BACKEND_URLS` in `Config`.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -525,9 +524,8 @@ async fn malformed_tool_args_continues_loop() {
     let brave_url = format!("{}/res/v1/llm/context", brave.uri());
     let app = build_agent_loop_app(&upstream.uri(), Some(&brave_url));
 
-    // No Brave mock — if the loop incorrectly tried to call it, the request
-    // would hang or fail. The error path should not hit Brave at all.
-    let _ = Duration::from_millis(1); // touch import
+    // No Brave mock registered — if the loop incorrectly tried to call it,
+    // the request would hang or fail. The error path should not hit Brave.
 
     let response = app
         .oneshot(

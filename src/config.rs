@@ -337,7 +337,11 @@ impl Config {
             web_context_search_api_key: env::var("WEB_CONTEXT_SEARCH_API_KEY")
                 .ok()
                 .filter(|s| !s.is_empty()),
-            agent_loop_max_iterations: env_int("AGENT_LOOP_MAX_ITERATIONS", 5) as u32,
+            // `env_int` returns `usize`; on 64-bit hosts a user-supplied value
+            // > u32::MAX would silently wrap. `try_from` surfaces it as a
+            // config error instead so a typo can't become a tiny iteration cap.
+            agent_loop_max_iterations: u32::try_from(env_int("AGENT_LOOP_MAX_ITERATIONS", 5))
+                .map_err(|_| anyhow::anyhow!("AGENT_LOOP_MAX_ITERATIONS exceeds the u32 range"))?,
             web_context_search_timeout_secs: env_int("WEB_CONTEXT_SEARCH_TIMEOUT_SECS", 30) as u64,
         };
 
@@ -365,6 +369,9 @@ impl Config {
         }
         if config.agent_loop_max_iterations == 0 {
             anyhow::bail!("AGENT_LOOP_MAX_ITERATIONS must be at least 1");
+        }
+        if config.web_context_search_timeout_secs == 0 {
+            anyhow::bail!("WEB_CONTEXT_SEARCH_TIMEOUT_SECS must be greater than 0");
         }
 
         Ok(config)

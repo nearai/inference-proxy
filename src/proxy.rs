@@ -310,7 +310,7 @@ fn try_report_usage(response_data: &serde_json::Value, id: &str, opts: &ProxyOpt
 /// service-token path (`/v1/internal/usage`) when [`UsageReporter::can_use_service_token_path`]
 /// is true; otherwise falls back to the legacy sk-bearer path
 /// (`/v1/usage`) verbatim.
-pub fn spawn_usage_report(reporter: &UsageReporter, mut body: serde_json::Value) {
+pub(crate) fn spawn_usage_report(reporter: &UsageReporter, mut body: serde_json::Value) {
     let client = reporter.http_client.clone();
     let (url, auth, mode) = if reporter.can_use_service_token_path() {
         // Inject subject identity into the body. Cloud-api's
@@ -1169,7 +1169,7 @@ pub async fn proxy_streaming_request(
 /// (vLLM `qwen3` parser as of v0.10) so downstream clients see the standard
 /// `delta.reasoning_content` field consistently across reasoning models.
 /// If both fields are present the existing `reasoning_content` is kept.
-fn normalize_chat_chunk(val: &mut serde_json::Value) {
+pub(crate) fn normalize_chat_chunk(val: &mut serde_json::Value) {
     let Some(choices) = val.get_mut("choices").and_then(|c| c.as_array_mut()) else {
         return;
     };
@@ -1652,10 +1652,10 @@ pub async fn proxy_streaming_response(
 
 /// Drop guard that tracks the streaming_connections gauge.
 /// Increments on creation, decrements on drop — guarantees they stay paired.
-struct StreamingGuard;
+pub(crate) struct StreamingGuard;
 
 impl StreamingGuard {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         metrics::gauge!("streaming_connections").increment(1);
         Self
     }

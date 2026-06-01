@@ -3,6 +3,7 @@ use axum::extract::multipart::Field;
 use axum::extract::{Multipart, State};
 use axum::http::HeaderMap;
 use axum::response::Response;
+use axum::Extension;
 use sha2::Digest;
 
 use crate::auth::RequireAuth;
@@ -10,7 +11,7 @@ use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
 use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageReporter, UsageType};
 use crate::routes::chat::read_body_with_limit;
-use crate::AppState;
+use crate::{AppState, TracingIds};
 
 /// POST /v1/tokenize — simple proxy, no signing.
 pub async fn tokenize(
@@ -38,6 +39,7 @@ pub async fn tokenize(
 pub async fn embeddings(
     State(state): State<AppState>,
     auth: RequireAuth,
+    Extension(tracing_ids): Extension<TracingIds>,
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
@@ -53,6 +55,7 @@ pub async fn embeddings(
         |c| c.max_request_size,
         reporter,
         UsageType::ChatCompletion,
+        tracing_ids,
         enc_ctx,
         Endpoint::Embeddings,
     )
@@ -63,6 +66,7 @@ pub async fn embeddings(
 pub async fn rerank(
     State(state): State<AppState>,
     auth: RequireAuth,
+    Extension(tracing_ids): Extension<TracingIds>,
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
@@ -79,6 +83,7 @@ pub async fn rerank(
         |c| c.max_request_size,
         reporter,
         UsageType::ChatCompletion,
+        tracing_ids,
         enc_ctx,
         Endpoint::Rerank,
     )
@@ -89,6 +94,7 @@ pub async fn rerank(
 pub async fn score(
     State(state): State<AppState>,
     auth: RequireAuth,
+    Extension(tracing_ids): Extension<TracingIds>,
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
@@ -105,6 +111,7 @@ pub async fn score(
         |c| c.max_request_size,
         reporter,
         UsageType::ChatCompletion,
+        tracing_ids,
         enc_ctx,
         Endpoint::Score,
     )
@@ -115,6 +122,7 @@ pub async fn score(
 pub async fn images_generations(
     State(state): State<AppState>,
     auth: RequireAuth,
+    Extension(tracing_ids): Extension<TracingIds>,
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
@@ -131,6 +139,7 @@ pub async fn images_generations(
         |c| c.max_image_request_size,
         reporter,
         UsageType::ImageGeneration,
+        tracing_ids,
         enc_ctx,
         Endpoint::ImagesGenerations,
     )
@@ -141,6 +150,7 @@ pub async fn images_generations(
 pub async fn images_edits(
     State(state): State<AppState>,
     auth: RequireAuth,
+    Extension(tracing_ids): Extension<TracingIds>,
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Response, AppError> {
@@ -202,7 +212,7 @@ pub async fn images_edits(
         chunk_transform: None,
         backend_guard: None,
         response_shape: ResponseShape::ChatCompletion,
-        tracing_ids: None,
+        tracing_ids: Some(tracing_ids),
     };
 
     let (url, _guard) = match &state.config.images_edits_url_override {
@@ -220,6 +230,7 @@ pub async fn images_edits(
 pub async fn audio_transcriptions(
     State(state): State<AppState>,
     auth: RequireAuth,
+    Extension(tracing_ids): Extension<TracingIds>,
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Response, AppError> {
@@ -284,7 +295,7 @@ pub async fn audio_transcriptions(
         chunk_transform: None,
         backend_guard: None,
         response_shape: ResponseShape::ChatCompletion,
-        tracing_ids: None,
+        tracing_ids: Some(tracing_ids),
     };
 
     let (url, _guard) = match &state.config.transcriptions_url_override {
@@ -309,6 +320,7 @@ async fn json_passthrough_encrypted(
     size_fn: fn(&crate::config::Config) -> usize,
     usage_reporter: Option<UsageReporter>,
     usage_type: UsageType,
+    tracing_ids: TracingIds,
     enc_ctx: Option<encryption::EncryptionContext>,
     endpoint: Endpoint,
 ) -> Result<Response, AppError> {
@@ -349,7 +361,7 @@ async fn json_passthrough_encrypted(
                 chunk_transform: None,
                 backend_guard: None,
                 response_shape: ResponseShape::ChatCompletion,
-                tracing_ids: None,
+                tracing_ids: Some(tracing_ids.clone()),
             };
             proxy::proxy_json_request(&state.http_client, u, forward_body, opts).await
         }
@@ -367,7 +379,7 @@ async fn json_passthrough_encrypted(
                 chunk_transform: None,
                 backend_guard: Some(guard),
                 response_shape: ResponseShape::ChatCompletion,
-                tracing_ids: None,
+                tracing_ids: Some(tracing_ids),
             };
             proxy::proxy_json_request(&state.http_client, &url, forward_body, opts).await
         }

@@ -2,18 +2,20 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::Response;
+use axum::Extension;
 
 use crate::auth::RequireAuth;
 use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
 use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageType};
 use crate::routes::chat::{read_body_with_limit, resolve_request_hash_for_signing};
-use crate::AppState;
+use crate::{AppState, TracingIds};
 
 /// POST /v1/completions
 pub async fn completions(
     State(state): State<AppState>,
     auth: RequireAuth,
+    Extension(tracing_ids): Extension<TracingIds>,
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
@@ -95,7 +97,7 @@ pub async fn completions(
         chunk_transform,
         backend_guard: Some(guard),
         response_shape: ResponseShape::TextCompletion,
-        tracing_ids: None,
+        tracing_ids: Some(tracing_ids),
     };
 
     if is_stream {

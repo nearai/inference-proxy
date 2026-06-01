@@ -2,6 +2,7 @@ use axum::body::Body;
 use axum::extract::{OriginalUri, State};
 use axum::http::{HeaderMap, Method};
 use axum::response::Response;
+use axum::Extension;
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
@@ -9,7 +10,7 @@ use crate::auth::RequireAuth;
 use crate::error::AppError;
 use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageType};
 use crate::routes::chat::read_body_with_limit;
-use crate::AppState;
+use crate::{AppState, TracingIds};
 
 /// Headers to exclude when forwarding requests to the backend.
 const EXCLUDED_REQUEST_HEADERS: &[&str] = &[
@@ -96,6 +97,7 @@ fn validate_path(path: &str) -> Result<(), AppError> {
 pub async fn catch_all(
     State(state): State<AppState>,
     auth: RequireAuth,
+    Extension(tracing_ids): Extension<TracingIds>,
     method: Method,
     uri: OriginalUri,
     headers: HeaderMap,
@@ -208,7 +210,7 @@ pub async fn catch_all(
             chunk_transform: None,
             backend_guard: Some(backend_guard),
             response_shape: ResponseShape::ChatCompletion,
-            tracing_ids: None,
+            tracing_ids: Some(tracing_ids.clone()),
         };
         proxy::proxy_streaming_response(response, &request_sha256, opts, axum_status).await
     } else if content_type.contains("application/json") {
@@ -236,7 +238,7 @@ pub async fn catch_all(
             chunk_transform: None,
             backend_guard: None,
             response_shape: ResponseShape::ChatCompletion,
-            tracing_ids: None,
+            tracing_ids: Some(tracing_ids),
         };
         proxy::sign_and_cache_json_response(&response_bytes, &request_sha256, opts, axum_status)
             .await

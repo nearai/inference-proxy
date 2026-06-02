@@ -56,8 +56,8 @@ jobs:
           ENABLE_NV_ATTESTATION_SDK: "1"
         run: |
           ./build-image.sh
-          echo "sha=$(sha256sum oci.tar | awk '{print $1}')" >> "$GITHUB_OUTPUT"
-          rm -f oci.tar
+          mv oci.tar oci1.tar
+          echo "sha=$(sha256sum oci1.tar | awk '{print $1}')" >> "$GITHUB_OUTPUT"
 
       - name: Second build
         id: second
@@ -65,19 +65,45 @@ jobs:
           ENABLE_NV_ATTESTATION_SDK: "1"
         run: |
           ./build-image.sh
-          echo "sha=$(sha256sum oci.tar | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          mv oci.tar oci2.tar
+          echo "sha=$(sha256sum oci2.tar | awk '{print $1}')" >> "$GITHUB_OUTPUT"
 
       - name: Compare builds
         run: |
-          if [ "${{ steps.first.outputs.sha }}" != "${{ steps.second.outputs.sha }}" ]; then
-            echo "::error::Two builds of the same commit produced different OCI archives"
-            echo "  first:  ${{ steps.first.outputs.sha }}"
-            echo "  second: ${{ steps.second.outputs.sha }}"
-            exit 1
+          if [ "${{ steps.first.outputs.sha }}" = "${{ steps.second.outputs.sha }}" ]; then
+            {
+              echo "## Reproducible build"
+              echo ""
+              echo "- OCI sha256 (both builds): \`${{ steps.first.outputs.sha }}\`"
+              echo "- ENABLE_NV_ATTESTATION_SDK: \`1\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
-          {
-            echo "## Reproducible build"
-            echo ""
-            echo "- OCI sha256 (both builds): \`${{ steps.first.outputs.sha }}\`"
-            echo "- ENABLE_NV_ATTESTATION_SDK: \`1\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::Two builds of the same commit produced different OCI archives"
+          echo "first:  ${{ steps.first.outputs.sha }}"
+          echo "second: ${{ steps.second.outputs.sha }}"
+
+          # Localise the drift: which layer(s) differ, and which files within them.
+          set +e
+          skopeo copy oci-archive:oci1.tar dir:d1 >/dev/null 2>&1
+          skopeo copy oci-archive:oci2.tar dir:d2 >/dev/null 2>&1
+          jq -r '.layers[].digest' d1/manifest.json > L1
+          jq -r '.layers[].digest' d2/manifest.json > L2
+          echo "=== layers (idx: same | DIFF) ==="
+          paste L1 L2 | nl -ba | while read -r idx a b; do
+            if [ "$a" = "$b" ]; then echo "  $idx: same"; else echo "  $idx: DIFF $a vs $b"; fi
+          done
+          echo "=== files differing inside each DIFF layer ==="
+          n=$(wc -l < L1)
+          for i in $(seq 1 "$n"); do
+            a=$(sed -n "${i}p" L1); b=$(sed -n "${i}p" L2)
+            [ "$a" = "$b" ] && continue
+            echo "--- layer $i ---"
+            rm -rf x1 x2; mkdir x1 x2
+            tar -C x1 -xf "d1/${a#sha256:}" 2>/dev/null
+            tar -C x2 -xf "d2/${b#sha256:}" 2>/dev/null
+            diff <(cd x1 && find . -type f -exec sha256sum {} + 2>/dev/null | sort -k2) \
+                 <(cd x2 && find . -type f -exec sha256sum {} + 2>/dev/null | sort -k2) \
+              | grep -E '^[<>]' | awk '{print $1, $3}' | head -60
+          done
+          exit 1

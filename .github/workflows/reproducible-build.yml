@@ -1,0 +1,112 @@
+name: Reproducible Build
+
+# Builds the same commit twice and diffs the OCI archive — the image must be
+# bit-for-bit reproducible. Per-build drift IS caught here because the two
+# builds run minutes apart: e.g. the pip `.pyc` build-timestamp issue (#148)
+# and the apt/dpkg/ldconfig log artifacts (#151) each made every build differ.
+#
+# `build.yml` only builds & pushes once, so reproducibility was never verified.
+#
+# SECURITY: this is a public repo and the build runs on a self-hosted `infra`
+# runner executing PR-controlled code (build-image.sh / Dockerfile). Running
+# untrusted PR code there would be an infra-compromise risk, so this does NOT
+# trigger on `pull_request` (matching build.yml). It runs on push to main
+# (post-merge, trusted) and on manual workflow_dispatch — a maintainer can
+# dispatch it against a PR branch (`--ref <branch>`) to verify reproducibility
+# before merging.
+on:
+  push:
+    branches: [main]
+    # Every input that can affect oci.tar — keep in sync with the Dockerfile's
+    # COPY sources (Cargo manifests, src/, benches/, gpu_evidence_worker.py) plus
+    # the build script and .dockerignore (build context). A merge touching any of
+    # these must re-run the check, or a reproducibility regression introduced via
+    # e.g. a new dependency could slip past the gate.
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "build-image.sh"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "benches/**"
+      - "gpu_evidence_worker.py"
+      - ".github/workflows/reproducible-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-reproducibility:
+    name: Verify reproducibility
+    runs-on: [self-hosted, infra]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo jq
+
+      # Build with the same flag the production image ships with
+      # (ENABLE_NV_ATTESTATION_SDK=1) so we verify the artifact that is
+      # actually deployed, including the libnvat apt layer.
+      - name: First build
+        id: first
+        env:
+          ENABLE_NV_ATTESTATION_SDK: "1"
+        run: |
+          ./build-image.sh
+          mv oci.tar oci1.tar
+          echo "sha=$(sha256sum oci1.tar | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Second build
+        id: second
+        env:
+          ENABLE_NV_ATTESTATION_SDK: "1"
+        run: |
+          ./build-image.sh
+          mv oci.tar oci2.tar
+          echo "sha=$(sha256sum oci2.tar | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Compare builds
+        run: |
+          if [ "${{ steps.first.outputs.sha }}" = "${{ steps.second.outputs.sha }}" ]; then
+            {
+              echo "## Reproducible build"
+              echo ""
+              echo "- OCI sha256 (both builds): \`${{ steps.first.outputs.sha }}\`"
+              echo "- ENABLE_NV_ATTESTATION_SDK: \`1\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "::error::Two builds of the same commit produced different OCI archives"
+          echo "first:  ${{ steps.first.outputs.sha }}"
+          echo "second: ${{ steps.second.outputs.sha }}"
+
+          # Localise the drift: which layer(s) differ, and which files within them.
+          set +e
+          skopeo copy oci-archive:oci1.tar dir:d1 >/dev/null 2>&1
+          skopeo copy oci-archive:oci2.tar dir:d2 >/dev/null 2>&1
+          jq -r '.layers[].digest' d1/manifest.json > L1
+          jq -r '.layers[].digest' d2/manifest.json > L2
+          echo "=== layers (idx: same | DIFF) ==="
+          paste L1 L2 | nl -ba | while read -r idx a b; do
+            if [ "$a" = "$b" ]; then echo "  $idx: same"; else echo "  $idx: DIFF $a vs $b"; fi
+          done
+          echo "=== files differing inside each DIFF layer ==="
+          n=$(wc -l < L1)
+          for i in $(seq 1 "$n"); do
+            a=$(sed -n "${i}p" L1); b=$(sed -n "${i}p" L2)
+            [ "$a" = "$b" ] && continue
+            echo "--- layer $i ---"
+            rm -rf x1 x2; mkdir x1 x2
+            tar -C x1 -xf "d1/${a#sha256:}" 2>/dev/null
+            tar -C x2 -xf "d2/${b#sha256:}" 2>/dev/null
+            diff <(cd x1 && find . -type f -exec sha256sum {} + 2>/dev/null | sort -k2) \
+                 <(cd x2 && find . -type f -exec sha256sum {} + 2>/dev/null | sort -k2) \
+              | grep -E '^[<>]' | awk '{print $1, $3}' | head -60
+          done
+          exit 1

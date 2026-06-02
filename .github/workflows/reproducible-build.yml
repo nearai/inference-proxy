@@ -1,0 +1,83 @@
+name: Reproducible Build
+
+# Builds the same commit twice and diffs the OCI archive — the image must be
+# bit-for-bit reproducible. Unlike date-granularity drift (which a same-run
+# double-build can miss), per-build drift IS caught here because the two
+# builds run minutes apart: e.g. the pip `.pyc` build-timestamp issue fixed in
+# #148 made every build differ, so two builds would not match.
+#
+# `build.yml` only builds & pushes once, so reproducibility was never verified.
+#
+# Scoped to the files that define the build output (Cargo.lock catches a new
+# nondeterministic dependency); src changes compile deterministically and are
+# left to `workflow_dispatch`. The build is heavy (CUDA runtime base) and runs
+# on the shared self-hosted runner, so it deliberately does not fire on every
+# PR — widen `paths` or add a `schedule` if you want broader coverage.
+on:
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - "build-image.sh"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/reproducible-build.yml"
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - "build-image.sh"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/reproducible-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-reproducibility:
+    name: Verify reproducibility
+    runs-on: [self-hosted, infra]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo jq
+
+      # Build with the same flag the production image ships with
+      # (ENABLE_NV_ATTESTATION_SDK=1) so we verify the artifact that is
+      # actually deployed, including the libnvat apt layer.
+      - name: First build
+        id: first
+        env:
+          ENABLE_NV_ATTESTATION_SDK: "1"
+        run: |
+          ./build-image.sh
+          echo "sha=$(sha256sum oci.tar | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          rm -f oci.tar
+
+      - name: Second build
+        id: second
+        env:
+          ENABLE_NV_ATTESTATION_SDK: "1"
+        run: |
+          ./build-image.sh
+          echo "sha=$(sha256sum oci.tar | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Compare builds
+        run: |
+          if [ "${{ steps.first.outputs.sha }}" != "${{ steps.second.outputs.sha }}" ]; then
+            echo "::error::Two builds of the same commit produced different OCI archives"
+            echo "  first:  ${{ steps.first.outputs.sha }}"
+            echo "  second: ${{ steps.second.outputs.sha }}"
+            exit 1
+          fi
+          {
+            echo "## Reproducible build"
+            echo ""
+            echo "- OCI sha256 (both builds): \`${{ steps.first.outputs.sha }}\`"
+            echo "- ENABLE_NV_ATTESTATION_SDK: \`1\`"
+          } >> "$GITHUB_STEP_SUMMARY"

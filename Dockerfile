@@ -9,8 +9,16 @@
 #       (see https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/).
 #       The trailing ".<timestamp>-1" suffix is part of the upstream version
 #       string and changes per build; pin it so rebuilds stay reproducible.
+#   NV_ATTESTATION_SDK_VERSION / NV_PPCIE_VERIFIER_VERSION → exact PyPI
+#       versions of the GPU-attestation Python packages installed in the
+#       runtime image. Left unpinned, pip resolves whatever is current at
+#       build time — a drift source; pin them for the same reason as
+#       LIBNVAT_VERSION. (Their direct deps are mostly == pinned upstream;
+#       a few transitive ranges — nvidia-ml-py, requests — can still float.)
 ARG ENABLE_NV_ATTESTATION_SDK=0
 ARG LIBNVAT_VERSION=1.2.1.1777487608-1
+ARG NV_ATTESTATION_SDK_VERSION=2.7.3
+ARG NV_PPCIE_VERIFIER_VERSION=2.0.0
 
 # ─────────────────────────────────────────────────────────────────────
 # Stage 1: Build the Rust binary
@@ -95,6 +103,8 @@ RUN FEATURES=$(cat /tmp/cargo-features) && \
 FROM vllm/vllm-openai@sha256:014a95f21c9edf6abe0aea6b07353f96baa4ec291c427bb1176dc7c93a85845c
 ARG ENABLE_NV_ATTESTATION_SDK
 ARG LIBNVAT_VERSION
+ARG NV_ATTESTATION_SDK_VERSION
+ARG NV_PPCIE_VERIFIER_VERSION
 
 ENV PYTHONUNBUFFERED=1
 
@@ -111,7 +121,9 @@ ENV PYTHONUNBUFFERED=1
 # rewrite-timestamp normalizes tar mtimes but not the bytes inside a .pyc.
 # Skipping compilation keeps the layer deterministic; CPython compiles the
 # modules in memory on first import at runtime (negligible for this service).
-RUN pip install --no-cache-dir --no-compile nv-attestation-sdk nv-ppcie-verifier
+RUN pip install --no-cache-dir --no-compile \
+        "nv-attestation-sdk==${NV_ATTESTATION_SDK_VERSION}" \
+        "nv-ppcie-verifier==${NV_PPCIE_VERIFIER_VERSION}"
 
 # Install libnvat (runtime) when the feature is built. vllm/vllm-openai
 # already has the CUDA apt repo configured, so cuda-keyring isn't needed

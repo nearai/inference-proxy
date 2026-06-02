@@ -104,7 +104,14 @@ ENV PYTHONUNBUFFERED=1
 # When ENABLE_NV_ATTESTATION_SDK=1 these are still installed for the
 # Python fallback path (USE_NV_ATTESTATION_SDK=false at runtime); a
 # follow-up will drop them once the SDK path proves out.
-RUN pip install --no-cache-dir nv-attestation-sdk nv-ppcie-verifier
+# --no-compile: do NOT byte-compile .pyc at build time. CPython stamps each
+# timestamp-invalidated .pyc with the source file's mtime, and pip writes the
+# .py files with the current wall-clock mtime — so the .pyc embed the build
+# time and this layer (hence the image digest) changes on every build.
+# rewrite-timestamp normalizes tar mtimes but not the bytes inside a .pyc.
+# Skipping compilation keeps the layer deterministic; CPython compiles the
+# modules in memory on first import at runtime (negligible for this service).
+RUN pip install --no-cache-dir --no-compile nv-attestation-sdk nv-ppcie-verifier
 
 # Install libnvat (runtime) when the feature is built. vllm/vllm-openai
 # already has the CUDA apt repo configured, so cuda-keyring isn't needed

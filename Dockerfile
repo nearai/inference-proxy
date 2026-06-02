@@ -128,12 +128,19 @@ RUN pip install --no-cache-dir --no-compile \
 # Install libnvat (runtime) when the feature is built. vllm/vllm-openai
 # already has the CUDA apt repo configured, so cuda-keyring isn't needed
 # here. apt pulls in libcurl4/libxml2/libxmlsec1-openssl as deps.
+#
+# Reproducibility: apt/dpkg write per-line timestamps to their logs and
+# ldconfig writes a non-deterministic aux-cache, all of which get baked into
+# this layer and make the image digest change on every build. Remove them in
+# the same RUN (rewrite-timestamp only normalizes tar mtimes, not file bytes).
 RUN if [ "$ENABLE_NV_ATTESTATION_SDK" = "1" ]; then \
         set -e && \
         apt-get update && apt-get install -y --no-install-recommends \
             "libnvat=${LIBNVAT_VERSION}" && \
         ldconfig && \
-        rm -rf /var/lib/apt/lists/* ; \
+        rm -rf /var/lib/apt/lists/* \
+               /var/log/apt/*.log /var/log/dpkg.log /var/log/alternatives.log \
+               /var/cache/ldconfig/aux-cache ; \
     fi
 
 WORKDIR /app

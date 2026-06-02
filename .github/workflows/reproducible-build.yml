@@ -1,26 +1,20 @@
 name: Reproducible Build
 
 # Builds the same commit twice and diffs the OCI archive — the image must be
-# bit-for-bit reproducible. Unlike date-granularity drift (which a same-run
-# double-build can miss), per-build drift IS caught here because the two
-# builds run minutes apart: e.g. the pip `.pyc` build-timestamp issue fixed in
-# #148 made every build differ, so two builds would not match.
+# bit-for-bit reproducible. Per-build drift IS caught here because the two
+# builds run minutes apart: e.g. the pip `.pyc` build-timestamp issue (#148)
+# and the apt/dpkg/ldconfig log artifacts (#151) each made every build differ.
 #
 # `build.yml` only builds & pushes once, so reproducibility was never verified.
 #
-# Scoped to the files that define the build output (Cargo.lock catches a new
-# nondeterministic dependency); src changes compile deterministically and are
-# left to `workflow_dispatch`. The build is heavy (CUDA runtime base) and runs
-# on the shared self-hosted runner, so it deliberately does not fire on every
-# PR — widen `paths` or add a `schedule` if you want broader coverage.
+# SECURITY: this is a public repo and the build runs on a self-hosted `infra`
+# runner executing PR-controlled code (build-image.sh / Dockerfile). Running
+# untrusted PR code there would be an infra-compromise risk, so this does NOT
+# trigger on `pull_request` (matching build.yml). It runs on push to main
+# (post-merge, trusted) and on manual workflow_dispatch — a maintainer can
+# dispatch it against a PR branch (`--ref <branch>`) to verify reproducibility
+# before merging.
 on:
-  pull_request:
-    paths:
-      - "Dockerfile"
-      - "build-image.sh"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/reproducible-build.yml"
   push:
     branches: [main]
     paths:

@@ -133,13 +133,18 @@ RUN pip install --no-cache-dir --no-compile \
 # ldconfig writes a non-deterministic aux-cache, all of which get baked into
 # this layer and make the image digest change on every build. Remove them in
 # the same RUN (rewrite-timestamp only normalizes tar mtimes, not file bytes).
+# Clean the whole /var/log/apt dir, not just *.log: apt also writes
+# eipp.log.xz (the EIPP solver log), whose embedded APT-IDs drift as the
+# package indices change between build days — a *.log glob misses the .xz and
+# leaves a cross-day-non-reproducible layer that the same-day reproducible-build
+# double-build cannot catch.
 RUN if [ "$ENABLE_NV_ATTESTATION_SDK" = "1" ]; then \
         set -e && \
         apt-get update && apt-get install -y --no-install-recommends \
             "libnvat=${LIBNVAT_VERSION}" && \
         ldconfig && \
         rm -rf /var/lib/apt/lists/* \
-               /var/log/apt/*.log /var/log/dpkg.log /var/log/alternatives.log \
+               /var/log/apt/* /var/log/dpkg.log /var/log/alternatives.log \
                /var/cache/ldconfig/aux-cache ; \
     fi
 

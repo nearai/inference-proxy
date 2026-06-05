@@ -1152,8 +1152,51 @@ pub async fn proxy_streaming_request(
             }
         }
 
+        let completed_cleanly = !upstream_error && !downstream_closed && parser.seen_done;
+
+        // Bill for the tokens the backend already produced, even when the stream
+        // did NOT finish cleanly (nearai/infra#98). A client disconnect
+        // (`downstream_closed`) or a mid-stream upstream error still consumes GPU
+        // tokens that must be billed. cloud-api requests
+        // `stream_options.continuous_usage_stats`, so `parser.usage` holds the
+        // running cumulative token counts from the last chunk we saw — the best
+        // available figure at the point of interruption. Usage reporting is
+        // idempotent on cloud-api's side (keyed by chat id), so a clean stream
+        // that also reports here is deduplicated rather than double-billed.
+        //
+        // Signing/caching stays gated on a clean [DONE] below: a partial response
+        // cannot be cryptographically verified by the client, so we must not sign
+        // it — but the tokens were still spent and must be billed.
+        if let (Some(reporter), Some((input, output)), Some(id)) =
+            (&usage_reporter, parser.usage, parser.chat_id.as_ref())
+        {
+            let body = serde_json::json!({
+                "type": "chat_completion",
+                "model": reporter.model_name,
+                "input_tokens": input,
+                "output_tokens": output,
+                "id": id,
+            });
+            spawn_usage_report(reporter, body);
+
+            if !completed_cleanly {
+                info!(
+                    request_id = %log_request_id,
+                    org_id = %log_org_id,
+                    workspace_id = %log_workspace_id,
+                    chat_id = %id,
+                    input_tokens = input,
+                    output_tokens = output,
+                    upstream_error,
+                    downstream_closed,
+                    seen_done = parser.seen_done,
+                    "Reported usage for interrupted stream"
+                );
+            }
+        }
+
         // Only sign and cache for a fully completed stream
-        if !upstream_error && !downstream_closed && parser.seen_done {
+        if completed_cleanly {
             let response_sha256 = hex::encode(hasher.finalize());
             if let Some(ref id) = parser.chat_id {
                 let text = format!("{model_name}:{request_sha256}:{response_sha256}");
@@ -1166,18 +1209,6 @@ pub async fn proxy_streaming_request(
                     Err(e) => {
                         error!(error = %e, "Signing failed for streaming response");
                     }
-                }
-
-                // Report usage for cloud API key requests
-                if let (Some(reporter), Some((input, output))) = (&usage_reporter, parser.usage) {
-                    let body = serde_json::json!({
-                        "type": "chat_completion",
-                        "model": reporter.model_name,
-                        "input_tokens": input,
-                        "output_tokens": output,
-                        "id": id,
-                    });
-                    spawn_usage_report(reporter, body);
                 }
 
                 // Structured completion log — one line per successful streaming request.

@@ -3794,13 +3794,20 @@ async fn test_usage_reported_for_interrupted_stream_without_done() {
 data: {\"id\":\"chatcmpl-interrupted\",\"choices\":[{\"delta\":{\"content\":\"hel\"},\"index\":0}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":1,\"total_tokens\":9}}\n\n\
 data: {\"id\":\"chatcmpl-interrupted\",\"choices\":[{\"delta\":{\"content\":\"lo\"},\"index\":0}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10}}\n\n";
 
+    // The mock only matches if the proxy forwards continuous_usage_stats:true —
+    // this is what makes the running per-chunk usage above a reachable production
+    // path (without it, real backends only send usage in the final chunk, which
+    // an interrupted stream never reaches). `expect(1)` fails the test otherwise.
+    use wiremock::matchers::body_string_contains;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
+        .and(body_string_contains("\"continuous_usage_stats\":true"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
                 .set_body_string(sse_body),
         )
+        .expect(1)
         .mount(&backend)
         .await;
 

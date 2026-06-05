@@ -1160,9 +1160,10 @@ pub async fn proxy_streaming_request(
         // tokens that must be billed. cloud-api requests
         // `stream_options.continuous_usage_stats`, so `parser.usage` holds the
         // running cumulative token counts from the last chunk we saw — the best
-        // available figure at the point of interruption. Usage reporting is
-        // idempotent on cloud-api's side (keyed by chat id), so a clean stream
-        // that also reports here is deduplicated rather than double-billed.
+        // available figure at the point of interruption. The reporter only exists
+        // for direct sk- requests (RequireAuth.cloud_api_key); cloud-api's own
+        // InterceptStream is not in that path, so this is the sole biller and there
+        // is no double-billing.
         //
         // Signing/caching stays gated on a clean [DONE] below: a partial response
         // cannot be cryptographically verified by the client, so we must not sign

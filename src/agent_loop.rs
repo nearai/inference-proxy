@@ -171,9 +171,43 @@ pub async fn run_chat_completion(
                     completed_cleanly = result.completed_cleanly,
                     "agent loop completed"
                 );
-                // Only sign / cache / report when the stream closed cleanly
-                // (final `[DONE]` was sent downstream). Mirrors
-                // `proxy_streaming_request` which keys on `parser.seen_done`.
+                // Bill for the tokens already produced, even when the loop did
+                // NOT finish cleanly (client disconnect or mid-loop error). The
+                // loop accumulates usage across iterations, so result.{input,output}_tokens
+                // hold the partial total at the point of interruption. This must not
+                // be gated on a clean [DONE] (nearai/infra#98) — mirrors the same fix
+                // in `proxy_streaming_request`. The reporter only exists for direct
+                // sk- requests (RequireAuth.cloud_api_key); cloud-api's own
+                // InterceptStream is not in that path, so this is the sole biller —
+                // no double-billing. Reported at most once per loop (one chat id).
+                if let (Some(reporter), Some(chat_id)) =
+                    (usage_reporter.as_ref(), result.chat_id.as_deref())
+                {
+                    if result.input_tokens > 0 || result.output_tokens > 0 {
+                        let body = json!({
+                            "type": "chat_completion",
+                            "model": reporter.model_name,
+                            "input_tokens": result.input_tokens,
+                            "output_tokens": result.output_tokens,
+                            "id": chat_id,
+                        });
+                        spawn_usage_report(reporter, body);
+                        if !result.completed_cleanly {
+                            info!(
+                                request_id = %tracing_ids.request_id,
+                                org_id = %tracing_ids.org_id_or_empty(),
+                                workspace_id = %tracing_ids.workspace_id_or_empty(),
+                                chat_id = %chat_id,
+                                input_tokens = result.input_tokens,
+                                output_tokens = result.output_tokens,
+                                "Reported usage for interrupted agent loop"
+                            );
+                        }
+                    }
+                }
+
+                // Only sign / cache when the stream closed cleanly (final `[DONE]`
+                // was sent downstream): a partial response cannot be verified.
                 if !result.completed_cleanly {
                     return;
                 }
@@ -190,18 +224,6 @@ pub async fn run_chat_completion(
                         }
                     }
                     Err(e) => error!(error = %e, "Signing failed for agent loop response"),
-                }
-                if let Some(reporter) = usage_reporter.as_ref() {
-                    if result.input_tokens > 0 || result.output_tokens > 0 {
-                        let body = json!({
-                            "type": "chat_completion",
-                            "model": reporter.model_name,
-                            "input_tokens": result.input_tokens,
-                            "output_tokens": result.output_tokens,
-                            "id": chat_id,
-                        });
-                        spawn_usage_report(reporter, body);
-                    }
                 }
             }
             Err(e) => {

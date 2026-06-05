@@ -167,8 +167,11 @@ pub async fn catch_all(
             .unwrap_or_else(|_| bytes::Bytes::from("{}"));
         let error_info =
             crate::proxy::log_upstream_error(upstream_status, &backend_url, &error_body);
-        let axum_status = axum::http::StatusCode::from_u16(upstream_status.as_u16())
-            .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+        // Downgrade a backend 5xx to 400 when it's really a client media-fetch
+        // 4xx (e.g. a UA-gated image URL), so it isn't retried/masked as a 502
+        // (nearai/cloud-api#606). See proxy::effective_error_status.
+        let axum_status =
+            crate::proxy::effective_error_status(upstream_status.as_u16(), error_info.as_ref());
         return Err(AppError::UpstreamParsed {
             status: axum_status,
             message: error_info

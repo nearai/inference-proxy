@@ -160,6 +160,59 @@ pub(crate) fn log_upstream_error(
     info
 }
 
+/// Map an upstream error to the status we return downstream, downgrading a
+/// backend 5xx to **400** when the failure is really a *client media-fetch 4xx*.
+///
+/// vLLM/SGLang fetch caller-supplied image/video URLs server-side and wrap a
+/// failed fetch as a generic HTTP 500 whose JSON `message` is the aiohttp
+/// `ClientResponseError.__str__` — `NNN, message='...', url='...'` (or the
+/// requests form `NNN Client Error: ... for url: ...`). When that embedded
+/// fetch status is a 4xx the fault is the caller's URL (e.g. Wikimedia 403s a
+/// default User-Agent), not our backend: forwarding the 500 makes cloud-api
+/// retry the identical request across providers and ultimately surface a
+/// misleading 502 "model unavailable" (nearai/cloud-api#606).
+///
+/// We normalize to **400**, never the raw 4xx: cloud-api maps upstream
+/// 401/403/407 to 5xx (it assumes those signal *our* backend credentials), so
+/// returning the literal 403 would just round-trip back into a 502.
+/// Takes the already-parsed [`UpstreamErrorInfo`] (from [`log_upstream_error`])
+/// to avoid re-parsing/sanitizing the body on the error path.
+pub(crate) fn effective_error_status(
+    upstream_status: u16,
+    info: Option<&UpstreamErrorInfo>,
+) -> StatusCode {
+    let passthrough = StatusCode::from_u16(upstream_status).unwrap_or(StatusCode::BAD_GATEWAY);
+    // Only reinterpret server errors; a genuine 4xx is already correct.
+    if !(500..600).contains(&upstream_status) {
+        return passthrough;
+    }
+    match info {
+        Some(info) if message_is_client_fetch_4xx(&info.message) => StatusCode::BAD_REQUEST,
+        _ => passthrough,
+    }
+}
+
+/// True when an upstream error `message` describes a client media-URL fetch that
+/// the remote host answered with an explicit **4xx**. Anchored on `url=` /
+/// `for url:` so only genuine outbound-URL fetches qualify (the only per-request
+/// outbound HTTP the engine performs), never an incidental 4-something elsewhere.
+fn message_is_client_fetch_4xx(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    if !lower.contains("url=") && !lower.contains("for url:") {
+        return false;
+    }
+    // The pattern only matches 4xx codes, so a match is sufficient — no need to
+    // capture/parse the number back out.
+    static FETCH_4XX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        // aiohttp ClientResponseError str:  `NNN, message=`
+        // aiohttp exception status field:   `status=NNN`
+        // requests/urllib:                  `NNN client error:`
+        regex::Regex::new(r"\b4\d\d, message=|status=4\d\d\b|\b4\d\d client error:")
+            .expect("static regex compiles")
+    });
+    FETCH_4XX.is_match(&lower)
+}
+
 /// Reports usage to the cloud API for billing.
 ///
 /// Two reporting modes coexist for the in-flight Phase 2 migration:
@@ -501,9 +554,9 @@ pub async fn proxy_json_request(
     let status = response.status();
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
-        log_upstream_error(status, url, &body);
+        let info = log_upstream_error(status, url, &body);
         return Err(AppError::Upstream {
-            status: StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            status: effective_error_status(status.as_u16(), info.as_ref()),
             body,
         });
     }
@@ -547,9 +600,12 @@ pub async fn proxy_json_request(
             );
             let reqwest_status = reqwest::StatusCode::from_u16(status_code.as_u16())
                 .unwrap_or(reqwest::StatusCode::BAD_GATEWAY);
-            log_upstream_error(reqwest_status, url, &body_bytes);
+            let info = log_upstream_error(reqwest_status, url, &body_bytes);
             return Err(AppError::Upstream {
-                status: status_code,
+                // A client media-fetch failure can arrive as an SSE error chunk
+                // with code:500 + `403, message='…', url='…'` — downgrade to 400
+                // here too so it isn't retried/masked as a 502 (cloud-api#606).
+                status: effective_error_status(status_code.as_u16(), info.as_ref()),
                 body: body_bytes,
             });
         }
@@ -994,9 +1050,9 @@ pub async fn proxy_streaming_request(
     let status = response.status();
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
-        log_upstream_error(status, url, &body);
+        let info = log_upstream_error(status, url, &body);
         return Err(AppError::Upstream {
-            status: StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            status: effective_error_status(status.as_u16(), info.as_ref()),
             body,
         });
     }
@@ -1307,9 +1363,9 @@ pub async fn proxy_multipart_request(
     let status = response.status();
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
-        log_upstream_error(status, url, &body);
+        let info = log_upstream_error(status, url, &body);
         return Err(AppError::Upstream {
-            status: StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            status: effective_error_status(status.as_u16(), info.as_ref()),
             body,
         });
     }
@@ -1400,9 +1456,9 @@ pub async fn proxy_simple(
     let status = response.status();
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
-        log_upstream_error(status, url, &body);
+        let info = log_upstream_error(status, url, &body);
         return Err(AppError::Upstream {
-            status: StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            status: effective_error_status(status.as_u16(), info.as_ref()),
             body,
         });
     }
@@ -2090,6 +2146,61 @@ mod tests {
             "This model's maximum context length is 2048 tokens"
         );
         assert_eq!(info.error_type, "BadRequestError");
+    }
+
+    /// Parse `body` the way the proxy does (via `log_upstream_error`) and apply
+    /// `effective_error_status` — mirrors the real call sites.
+    fn eff(status: u16, body: &[u8]) -> StatusCode {
+        effective_error_status(status, parse_upstream_error(body).as_ref())
+    }
+
+    #[test]
+    fn test_effective_status_downgrades_client_fetch_4xx_to_400() {
+        // The real nearai/cloud-api#606 case: vLLM wraps a client image-URL
+        // fetch that the remote host 4xx'd as a generic 500. We must surface 400.
+        for body in [
+            br#"{"message":"403, message='Forbidden', url='https://upload.wikimedia.org/x.jpg'","type":"InternalServerError"}"#.as_slice(),
+            br#"{"message":"400, message='Bad Request', url='https://host/x.jpg'"}"#.as_slice(),
+            br#"{"message":"404, message='Not Found', url='https://host/x.jpg'"}"#.as_slice(),
+            br#"{"message":"403 Client Error: Forbidden for url: https://host/x.png"}"#.as_slice(),
+            br#"{"error":{"message":"ClientResponseError, status=403, message='Forbidden', url='https://host/x'"}}"#.as_slice(),
+        ] {
+            assert_eq!(
+                eff(500, body),
+                StatusCode::BAD_REQUEST,
+                "expected 5xx->400 for client-fetch 4xx body: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn test_effective_status_keeps_5xx_when_not_a_client_4xx() {
+        // Remote host answered 5xx → transient, must stay retryable (5xx).
+        let f503 = br#"{"message":"503, message='Service Unavailable', url='https://host/x.jpg'"}"#;
+        assert_eq!(eff(500, f503), StatusCode::INTERNAL_SERVER_ERROR);
+        // Genuine backend error unrelated to a fetch → unchanged.
+        let oom = br#"{"message":"CUDA out of memory","type":"InternalServerError"}"#;
+        assert_eq!(eff(500, oom), StatusCode::INTERNAL_SERVER_ERROR);
+        // A 4-something with no url anchor must NOT be mistaken for a fetch 4xx.
+        let noturl = br#"{"message":"requested 450 message tokens exceed the limit"}"#;
+        assert_eq!(eff(500, noturl), StatusCode::INTERNAL_SERVER_ERROR);
+        // Unparseable body (None info) → unchanged.
+        assert_eq!(
+            effective_error_status(500, None),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn test_effective_status_passes_through_non_5xx() {
+        // A genuine upstream 4xx is already correct — never rewrite it.
+        let body = br#"{"message":"400, message='Bad Request', url='https://host/x'"}"#;
+        assert_eq!(eff(400, body), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            eff(404, br#"{"message":"not found"}"#),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[test]

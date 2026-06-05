@@ -849,6 +849,50 @@ async fn test_chat_sse_queue_full_propagates_503() {
     assert_eq!(body["error"]["type"], "SERVICE_UNAVAILABLE");
 }
 
+/// A client media-fetch failure can arrive through the same SSE-reassembly path
+/// (proxy_json_request injects stream:true) as an error chunk with code:500 and
+/// the aiohttp `403, message='...', url='...'` shape. It must be downgraded to
+/// 400 — not propagated as 500 — so cloud-api doesn't retry/mask it as a
+/// misleading 502 (nearai/cloud-api#606, PR review).
+#[tokio::test]
+async fn test_chat_sse_client_media_fetch_4xx_becomes_400() {
+    let mock_server = MockServer::start().await;
+
+    let sse_body = concat!(
+        "data: {\"error\":{\"object\":\"error\",\"message\":\"403, message='Forbidden', url='https://upload.wikimedia.org/x.jpg'\",\"type\":\"InternalServerError\",\"code\":500}}\n\n",
+        "data: {\"id\":\"chatcmpl-m1\",\"object\":\"chat.completion.chunk\",\"model\":\"test-model\",\"created\":100,\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(sse_body.as_bytes(), "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(
+                    r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // 500 embedded fetch-4xx → downgraded to 400 (was 500 before the fix).
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
 // ---- Embeddings ----
 
 #[tokio::test]

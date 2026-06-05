@@ -171,7 +171,7 @@ pub async fn catch_all(
         // 4xx (e.g. a UA-gated image URL), so it isn't retried/masked as a 502
         // (nearai/cloud-api#606). See proxy::effective_error_status.
         let axum_status =
-            crate::proxy::effective_error_status(upstream_status.as_u16(), &error_body);
+            crate::proxy::effective_error_status(upstream_status.as_u16(), error_info.as_ref());
         return Err(AppError::UpstreamParsed {
             status: axum_status,
             message: error_info

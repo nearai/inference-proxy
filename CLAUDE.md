@@ -81,6 +81,6 @@ This is a Rust rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-pro
 
 ### Cloud API integration
 
-- `CLOUD_API_URL` enables two features: (1) `sk-live-`/`sk-test-` API key validation via `POST /v1/check_api_key`, (2) fire-and-forget usage reporting via `POST /v1/usage`
-- Usage reporting is in `proxy.rs`: `spawn_usage_report()` sends model name + token counts; failures only logged as warnings
+- `CLOUD_API_URL` enables two features: (1) `sk-live-`/`sk-test-` API key validation via `POST /v1/check_api_key`, (2) fire-and-forget usage reporting via `POST /v1/internal/usage`
+- Usage reporting is in `proxy.rs`: `spawn_usage_report()` posts to `/v1/internal/usage` with the shared `CLOUD_API_USAGE_TOKEN` as Bearer and the subject identity (org/workspace/api_key_id, from the `/v1/check_api_key` response) in the body. The legacy `sk-`-authenticated `POST /v1/usage` endpoint was removed from cloud-api; if `CLOUD_API_USAGE_TOKEN` (or any identity field) is missing, reporting is **skipped with an error log** — there is no fallback. Failures are logged as warnings.
 - **MODEL_NAME must exactly match `model_name` in cloud-api's model table** — cloud-api does NOT check model aliases, so a mismatch causes silent 404s on usage reporting

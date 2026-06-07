@@ -3190,7 +3190,9 @@ fn build_test_app_with_cloud_api_retries(
         cloud_api_auth_max_attempts: max_attempts,
         cloud_api_auth_initial_backoff_ms: initial_backoff_ms,
         cloud_api_auth_timeout_secs: 5,
-        cloud_api_usage_token: None,
+        // Usage is reported via the service-token /v1/internal/usage path only;
+        // configure the token so usage-reporting tests exercise the real path.
+        cloud_api_usage_token: Some("test-usage-token".to_string()),
         compose_manager_url: None,
         dev_mode: true,
         gpu_no_hw_mode: true,
@@ -3615,7 +3617,7 @@ async fn wait_for_usage_request(cloud_api: &MockServer, min_count: usize) {
         let reqs = cloud_api.received_requests().await.unwrap_or_default();
         let usage_reqs: Vec<_> = reqs
             .iter()
-            .filter(|r| r.url.path() == "/v1/usage")
+            .filter(|r| r.url.path() == "/v1/internal/usage")
             .collect();
         if usage_reqs.len() >= min_count {
             return;
@@ -3630,7 +3632,7 @@ async fn get_usage_requests(cloud_api: &MockServer) -> Vec<serde_json::Value> {
         .await
         .unwrap_or_default()
         .iter()
-        .filter(|r| r.url.path() == "/v1/usage")
+        .filter(|r| r.url.path() == "/v1/internal/usage")
         .map(|r| serde_json::from_slice(&r.body).unwrap())
         .collect()
 }
@@ -3642,12 +3644,16 @@ async fn test_usage_reported_for_cloud_api_key_non_streaming() {
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-test",
+            "workspace_id": "ws-test",
+            "api_key_id": "key-test"
+        })))
         .mount(&cloud_api)
         .await;
 
     Mock::given(method("POST"))
-        .and(path("/v1/usage"))
+        .and(path("/v1/internal/usage"))
         .respond_with(ResponseTemplate::new(200))
         .mount(&cloud_api)
         .await;
@@ -3704,12 +3710,16 @@ async fn test_usage_reported_for_streaming_chat_with_cloud_api_key() {
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-test",
+            "workspace_id": "ws-test",
+            "api_key_id": "key-test"
+        })))
         .mount(&cloud_api)
         .await;
 
     Mock::given(method("POST"))
-        .and(path("/v1/usage"))
+        .and(path("/v1/internal/usage"))
         .respond_with(ResponseTemplate::new(200))
         .mount(&cloud_api)
         .await;
@@ -3763,6 +3773,11 @@ data: [DONE]\n\n";
     assert_eq!(usage_reqs[0]["type"], "chat_completion");
     assert_eq!(usage_reqs[0]["input_tokens"], 8);
     assert_eq!(usage_reqs[0]["output_tokens"], 3);
+    // Reported via the service-token /v1/internal/usage path: cloud-api attributes
+    // the usage from these identity fields in the body (not from an sk- bearer).
+    assert_eq!(usage_reqs[0]["organization_id"], "org-test");
+    assert_eq!(usage_reqs[0]["workspace_id"], "ws-test");
+    assert_eq!(usage_reqs[0]["api_key_id"], "key-test");
 }
 
 /// Regression test for nearai/infra#98: an interrupted stream (no `[DONE]`,
@@ -3778,12 +3793,16 @@ async fn test_usage_reported_for_interrupted_stream_without_done() {
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-test",
+            "workspace_id": "ws-test",
+            "api_key_id": "key-test"
+        })))
         .mount(&cloud_api)
         .await;
 
     Mock::given(method("POST"))
-        .and(path("/v1/usage"))
+        .and(path("/v1/internal/usage"))
         .respond_with(ResponseTemplate::new(200))
         .mount(&cloud_api)
         .await;
@@ -3917,13 +3936,17 @@ async fn test_usage_report_failure_does_not_affect_response() {
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-test",
+            "workspace_id": "ws-test",
+            "api_key_id": "key-test"
+        })))
         .mount(&cloud_api)
         .await;
 
     // Usage endpoint returns 500 — should not affect the client response
     Mock::given(method("POST"))
-        .and(path("/v1/usage"))
+        .and(path("/v1/internal/usage"))
         .respond_with(ResponseTemplate::new(500))
         .mount(&cloud_api)
         .await;
@@ -3973,12 +3996,16 @@ async fn test_usage_reported_for_image_generation() {
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-test",
+            "workspace_id": "ws-test",
+            "api_key_id": "key-test"
+        })))
         .mount(&cloud_api)
         .await;
 
     Mock::given(method("POST"))
-        .and(path("/v1/usage"))
+        .and(path("/v1/internal/usage"))
         .respond_with(ResponseTemplate::new(200))
         .mount(&cloud_api)
         .await;
@@ -4032,12 +4059,16 @@ async fn test_usage_reported_for_embeddings() {
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-test",
+            "workspace_id": "ws-test",
+            "api_key_id": "key-test"
+        })))
         .mount(&cloud_api)
         .await;
 
     Mock::given(method("POST"))
-        .and(path("/v1/usage"))
+        .and(path("/v1/internal/usage"))
         .respond_with(ResponseTemplate::new(200))
         .mount(&cloud_api)
         .await;
@@ -4091,7 +4122,11 @@ async fn test_streaming_includes_usage_injected_for_cloud_key() {
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-test",
+            "workspace_id": "ws-test",
+            "api_key_id": "key-test"
+        })))
         .mount(&cloud_api)
         .await;
 

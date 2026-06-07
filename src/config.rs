@@ -89,14 +89,13 @@ pub struct Config {
     pub cloud_api_auth_initial_backoff_ms: u64,
     /// Per-attempt timeout for `POST /v1/check_api_key`.
     pub cloud_api_auth_timeout_secs: u64,
-    /// Shared service-token presented to cloud-api on the new `/v1/internal/usage`
-    /// path. When set AND the auth response carried `organization_id +
-    /// workspace_id + api_key_id`, the usage reporter switches off the
-    /// legacy `Bearer sk-…` → `/v1/usage` path and posts to
-    /// `/v1/internal/usage` with this token as `Bearer` and the subject
-    /// identity carried in the body. When unset (or when the auth response
-    /// is missing identity fields, e.g. against an older cloud-api), the
-    /// reporter falls back to the legacy path verbatim.
+    /// Shared service-token presented to cloud-api on the `/v1/internal/usage`
+    /// path. Required for usage reporting: when set AND the auth response carried
+    /// `organization_id + workspace_id + api_key_id`, the reporter posts to
+    /// `/v1/internal/usage` with this token as `Bearer` and the subject identity
+    /// in the body. When unset (or the auth response is missing identity fields),
+    /// usage reporting is skipped — cloud-api removed the legacy `Bearer sk-…`
+    /// `/v1/usage` endpoint, so there is no fallback.
     pub cloud_api_usage_token: Option<String>,
 
     // Compose-manager attestation (deployment actions attestation)

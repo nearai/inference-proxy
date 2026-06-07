@@ -84,7 +84,12 @@ pub async fn run_chat_completion(
     rewrite_tool_for_upstream(&mut request_json);
 
     // Force stream + usage so we can splice tool results between iterations
-    // and report aggregated token usage at the end.
+    // and report aggregated token usage at the end. continuous_usage_stats is
+    // required (not just include_usage) so every chunk carries running cumulative
+    // usage: on an interrupted loop (client disconnect before the final chunk) we
+    // still have token counts to bill (nearai/infra#98). Because the counts are
+    // cumulative per chunk, `ingest_chunk_metadata` keeps the latest value rather
+    // than summing — otherwise this would overbill.
     request_json["stream"] = true.into();
     let mut stream_opts = request_json
         .get("stream_options")
@@ -92,6 +97,7 @@ pub async fn run_chat_completion(
         .cloned()
         .unwrap_or_default();
     stream_opts.insert("include_usage".into(), true.into());
+    stream_opts.insert("continuous_usage_stats".into(), true.into());
     request_json["stream_options"] = Value::Object(stream_opts);
 
     // Pick one backend; reuse it across every iteration so the engine can
@@ -871,12 +877,19 @@ fn ingest_chunk_metadata(event: &Value, outcome: &mut IterOutcome) {
         outcome.created = event.get("created").and_then(|v| v.as_i64());
     }
 
+    // With continuous_usage_stats, every chunk carries the *cumulative* usage
+    // for this iteration, so keep the latest value rather than summing — summing
+    // would multiply-count the cumulative total and overbill. The last
+    // usage-bearing chunk holds the iteration's final totals. (With plain
+    // include_usage there is only one usage chunk, so this is equivalent.)
+    // drive_loop sums these per-iteration totals across iterations, which is
+    // correct: each iteration is a separate upstream call with its own counts.
     if let Some(usage) = event.get("usage").filter(|v| v.is_object()) {
         if let Some(p) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
-            outcome.input_tokens = outcome.input_tokens.saturating_add(p);
+            outcome.input_tokens = p;
         }
         if let Some(c) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
-            outcome.output_tokens = outcome.output_tokens.saturating_add(c);
+            outcome.output_tokens = c;
         }
     }
 

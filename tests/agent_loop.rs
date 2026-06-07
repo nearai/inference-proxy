@@ -12,7 +12,7 @@ use axum::http::{Request, StatusCode};
 use axum::middleware;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use vllm_proxy_rs::*;
@@ -168,11 +168,14 @@ fn upstream_final_answer_sse(chat_id: &str) -> String {
     )
 }
 
-/// vLLM-shaped SSE for a final answer turn that carries usage but is cut off
-/// before `[DONE]` — i.e. an interrupted/aborted stream.
+/// vLLM-shaped SSE for a final answer turn that carries *cumulative* usage on
+/// every chunk (continuous_usage_stats) but is cut off before `[DONE]` — i.e. an
+/// interrupted/aborted stream. The completion count climbs 1→2→3 across chunks;
+/// a correct biller keeps the latest (3), a buggy one that sums would report 6.
 fn upstream_final_answer_sse_no_done(chat_id: &str) -> String {
     format!(
-        "data: {{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"Hello.\"}}}}]}}\n\n\
+        "data: {{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"Hel\"}}}}],\"usage\":{{\"prompt_tokens\":15,\"completion_tokens\":1,\"total_tokens\":16}}}}\n\n\
+         data: {{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"lo.\"}}}}],\"usage\":{{\"prompt_tokens\":15,\"completion_tokens\":2,\"total_tokens\":17}}}}\n\n\
          data: {{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":15,\"completion_tokens\":3,\"total_tokens\":18}}}}\n\n",
         id = chat_id,
     )
@@ -1332,9 +1335,13 @@ async fn interrupted_agent_loop_reports_usage_without_signature() {
         .mount(&cloud_api)
         .await;
 
-    // Single turn: a final answer carrying usage (15 in / 3 out) but no [DONE].
+    // Single turn: a final answer carrying cumulative usage on every chunk
+    // (1→2→3 completion tokens) but no [DONE]. The mock only matches if the loop
+    // forces continuous_usage_stats — otherwise a real backend wouldn't emit the
+    // per-chunk usage this interrupted case depends on. `expect(1)` enforces it.
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
+        .and(body_string_contains("\"continuous_usage_stats\":true"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
@@ -1343,6 +1350,7 @@ async fn interrupted_agent_loop_reports_usage_without_signature() {
                     "text/event-stream",
                 ),
         )
+        .expect(1)
         .mount(&upstream)
         .await;
 
@@ -1384,6 +1392,8 @@ async fn interrupted_agent_loop_reports_usage_without_signature() {
     }
     let usage = usage_body.expect("interrupted agent loop must still report usage");
     assert_eq!(usage["type"], "chat_completion");
+    // Latest cumulative usage, NOT the sum of the per-chunk cumulative values
+    // (summing the 3 chunks would overbill to 45 in / 6 out).
     assert_eq!(usage["input_tokens"], 15);
     assert_eq!(usage["output_tokens"], 3);
     assert_eq!(usage["id"], "chatcmpl-INT");

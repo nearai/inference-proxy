@@ -98,8 +98,13 @@ pub async fn chat_completions(
         .await;
     }
 
-    // For cloud API key requests with streaming, force include_usage
-    // so the backend always sends token counts for billing.
+    // For cloud API key requests with streaming, force include_usage AND
+    // continuous_usage_stats so the backend sends running cumulative token
+    // counts on every chunk — not just the final one. This is what makes an
+    // interrupted stream billable (nearai/infra#98): on a client disconnect or
+    // upstream error before [DONE] the last chunk we saw still carries usage, so
+    // `proxy_streaming_request` can report partial usage. include_usage alone only
+    // emits usage in the final chunk, which an interrupted stream never reaches.
     // (Non-streaming requests also stream internally via proxy_json_request,
     // which injects stream_options itself, so this only matters for true streaming.)
     if auth.cloud_api_key.is_some() && is_stream {
@@ -110,6 +115,7 @@ pub async fn chat_completions(
             .unwrap_or_default();
         let mut stream_opts = stream_opts;
         stream_opts.insert("include_usage".into(), true.into());
+        stream_opts.insert("continuous_usage_stats".into(), true.into());
         request_json["stream_options"] = serde_json::Value::Object(stream_opts);
     }
 

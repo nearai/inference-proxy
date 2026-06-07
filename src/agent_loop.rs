@@ -84,7 +84,12 @@ pub async fn run_chat_completion(
     rewrite_tool_for_upstream(&mut request_json);
 
     // Force stream + usage so we can splice tool results between iterations
-    // and report aggregated token usage at the end.
+    // and report aggregated token usage at the end. continuous_usage_stats is
+    // required (not just include_usage) so every chunk carries running cumulative
+    // usage: on an interrupted loop (client disconnect before the final chunk) we
+    // still have token counts to bill (nearai/infra#98). Because the counts are
+    // cumulative per chunk, `ingest_chunk_metadata` keeps the latest value rather
+    // than summing — otherwise this would overbill.
     request_json["stream"] = true.into();
     let mut stream_opts = request_json
         .get("stream_options")
@@ -92,6 +97,7 @@ pub async fn run_chat_completion(
         .cloned()
         .unwrap_or_default();
     stream_opts.insert("include_usage".into(), true.into());
+    stream_opts.insert("continuous_usage_stats".into(), true.into());
     request_json["stream_options"] = Value::Object(stream_opts);
 
     // Pick one backend; reuse it across every iteration so the engine can
@@ -171,9 +177,43 @@ pub async fn run_chat_completion(
                     completed_cleanly = result.completed_cleanly,
                     "agent loop completed"
                 );
-                // Only sign / cache / report when the stream closed cleanly
-                // (final `[DONE]` was sent downstream). Mirrors
-                // `proxy_streaming_request` which keys on `parser.seen_done`.
+                // Bill for the tokens already produced, even when the loop did
+                // NOT finish cleanly (client disconnect or mid-loop error). The
+                // loop accumulates usage across iterations, so result.{input,output}_tokens
+                // hold the partial total at the point of interruption. This must not
+                // be gated on a clean [DONE] (nearai/infra#98) — mirrors the same fix
+                // in `proxy_streaming_request`. The reporter only exists for direct
+                // sk- requests (RequireAuth.cloud_api_key); cloud-api's own
+                // InterceptStream is not in that path, so this is the sole biller —
+                // no double-billing. Reported at most once per loop (one chat id).
+                if let (Some(reporter), Some(chat_id)) =
+                    (usage_reporter.as_ref(), result.chat_id.as_deref())
+                {
+                    if result.input_tokens > 0 || result.output_tokens > 0 {
+                        let body = json!({
+                            "type": "chat_completion",
+                            "model": reporter.model_name,
+                            "input_tokens": result.input_tokens,
+                            "output_tokens": result.output_tokens,
+                            "id": chat_id,
+                        });
+                        spawn_usage_report(reporter, body);
+                        if !result.completed_cleanly {
+                            info!(
+                                request_id = %tracing_ids.request_id,
+                                org_id = %tracing_ids.org_id_or_empty(),
+                                workspace_id = %tracing_ids.workspace_id_or_empty(),
+                                chat_id = %chat_id,
+                                input_tokens = result.input_tokens,
+                                output_tokens = result.output_tokens,
+                                "Reported usage for interrupted agent loop"
+                            );
+                        }
+                    }
+                }
+
+                // Only sign / cache when the stream closed cleanly (final `[DONE]`
+                // was sent downstream): a partial response cannot be verified.
                 if !result.completed_cleanly {
                     return;
                 }
@@ -190,18 +230,6 @@ pub async fn run_chat_completion(
                         }
                     }
                     Err(e) => error!(error = %e, "Signing failed for agent loop response"),
-                }
-                if let Some(reporter) = usage_reporter.as_ref() {
-                    if result.input_tokens > 0 || result.output_tokens > 0 {
-                        let body = json!({
-                            "type": "chat_completion",
-                            "model": reporter.model_name,
-                            "input_tokens": result.input_tokens,
-                            "output_tokens": result.output_tokens,
-                            "id": chat_id,
-                        });
-                        spawn_usage_report(reporter, body);
-                    }
                 }
             }
             Err(e) => {
@@ -849,12 +877,19 @@ fn ingest_chunk_metadata(event: &Value, outcome: &mut IterOutcome) {
         outcome.created = event.get("created").and_then(|v| v.as_i64());
     }
 
+    // With continuous_usage_stats, every chunk carries the *cumulative* usage
+    // for this iteration, so keep the latest value rather than summing — summing
+    // would multiply-count the cumulative total and overbill. The last
+    // usage-bearing chunk holds the iteration's final totals. (With plain
+    // include_usage there is only one usage chunk, so this is equivalent.)
+    // drive_loop sums these per-iteration totals across iterations, which is
+    // correct: each iteration is a separate upstream call with its own counts.
     if let Some(usage) = event.get("usage").filter(|v| v.is_object()) {
         if let Some(p) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
-            outcome.input_tokens = outcome.input_tokens.saturating_add(p);
+            outcome.input_tokens = p;
         }
         if let Some(c) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
-            outcome.output_tokens = outcome.output_tokens.saturating_add(c);
+            outcome.output_tokens = c;
         }
     }
 

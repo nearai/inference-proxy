@@ -48,8 +48,11 @@ pub async fn completions(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // For cloud API key requests with streaming, force include_usage
-    // so the backend always sends token counts for billing.
+    // For cloud API key requests with streaming, force include_usage AND
+    // continuous_usage_stats so the backend sends running cumulative token counts
+    // on every chunk, making an interrupted stream billable (nearai/infra#98).
+    // include_usage alone only emits usage in the final chunk, which a stream
+    // interrupted before [DONE] never reaches.
     if auth.cloud_api_key.is_some() && is_stream {
         let stream_opts = request_json
             .get("stream_options")
@@ -58,6 +61,7 @@ pub async fn completions(
             .unwrap_or_default();
         let mut stream_opts = stream_opts;
         stream_opts.insert("include_usage".into(), true.into());
+        stream_opts.insert("continuous_usage_stats".into(), true.into());
         request_json["stream_options"] = serde_json::Value::Object(stream_opts);
     }
 

@@ -3765,6 +3765,102 @@ data: [DONE]\n\n";
     assert_eq!(usage_reqs[0]["output_tokens"], 3);
 }
 
+/// Regression test for nearai/infra#98: an interrupted stream (no `[DONE]`,
+/// e.g. client disconnect or mid-stream upstream error) must still report the
+/// tokens already produced. cloud-api enables `continuous_usage_stats`, so each
+/// chunk carries running cumulative usage; the last value seen is the partial
+/// figure we bill. The signature must still be withheld — a partial response
+/// cannot be verified.
+#[tokio::test]
+async fn test_usage_reported_for_interrupted_stream_without_done() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_api)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/usage"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_api)
+        .await;
+
+    // Running cumulative usage on each chunk (continuous_usage_stats), then the
+    // stream is cut off mid-flight — no final empty-choices chunk and no [DONE].
+    let sse_body = "\
+data: {\"id\":\"chatcmpl-interrupted\",\"choices\":[{\"delta\":{\"content\":\"hel\"},\"index\":0}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":1,\"total_tokens\":9}}\n\n\
+data: {\"id\":\"chatcmpl-interrupted\",\"choices\":[{\"delta\":{\"content\":\"lo\"},\"index\":0}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10}}\n\n";
+
+    // The mock only matches if the proxy forwards continuous_usage_stats:true —
+    // this is what makes the running per-chunk usage above a reachable production
+    // path (without it, real backends only send usage in the final chunk, which
+    // an interrupted stream never reaches). `expect(1)` fails the test otherwise.
+    use wiremock::matchers::body_string_contains;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("\"continuous_usage_stats\":true"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_body),
+        )
+        .expect(1)
+        .mount(&backend)
+        .await;
+
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": true
+    });
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Consume the streaming body so the background task finishes
+    use http_body_util::BodyExt;
+    let _ = response.into_body().collect().await;
+
+    // Usage IS reported with the last cumulative counts seen before interruption.
+    wait_for_usage_request(&cloud_api, 1).await;
+    let usage_reqs = get_usage_requests(&cloud_api).await;
+    assert_eq!(usage_reqs.len(), 1, "Expected exactly one usage report");
+    assert_eq!(usage_reqs[0]["type"], "chat_completion");
+    assert_eq!(usage_reqs[0]["input_tokens"], 8);
+    assert_eq!(usage_reqs[0]["output_tokens"], 2);
+
+    // ...but the signature is still withheld: a partial stream cannot be verified.
+    let sig_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/signature/chatcmpl-interrupted?signing_algo=ecdsa")
+                .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sig_response.status(), StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn test_no_usage_reported_for_proxy_token() {
     let backend = MockServer::start().await;

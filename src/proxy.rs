@@ -359,6 +359,50 @@ fn try_report_usage(response_data: &serde_json::Value, id: &str, opts: &ProxyOpt
     spawn_usage_report(reporter, body);
 }
 
+/// Report token usage to cloud-api when a streaming response finalizes — even if
+/// it did NOT complete cleanly (client disconnect, upstream error, or no `[DONE]`).
+/// Billing must not depend on a clean `[DONE]` (nearai/infra#98): the tokens were
+/// already produced. The caller keeps signing/caching gated on clean completion;
+/// a partial response cannot be verified, but it was still billed.
+///
+/// Shared by `proxy_streaming_request` and `proxy_streaming_response` so both
+/// streaming paths bill identically. The reporter only exists for direct `sk-`
+/// requests (`RequireAuth.cloud_api_key`); cloud-api's own `InterceptStream` is
+/// not in that path, so this is the sole biller and there is no double-billing.
+fn report_stream_usage_on_finalize(
+    usage_reporter: &Option<UsageReporter>,
+    usage: Option<(i64, i64)>,
+    chat_id: Option<&str>,
+    completed_cleanly: bool,
+    log_request_id: &str,
+    log_org_id: &str,
+    log_workspace_id: &str,
+) {
+    let (Some(reporter), Some((input, output)), Some(id)) = (usage_reporter, usage, chat_id) else {
+        return;
+    };
+    let body = serde_json::json!({
+        "type": "chat_completion",
+        "model": reporter.model_name,
+        "input_tokens": input,
+        "output_tokens": output,
+        "id": id,
+    });
+    spawn_usage_report(reporter, body);
+
+    if !completed_cleanly {
+        info!(
+            request_id = %log_request_id,
+            org_id = %log_org_id,
+            workspace_id = %log_workspace_id,
+            chat_id = %id,
+            input_tokens = input,
+            output_tokens = output,
+            "Reported usage for interrupted stream"
+        );
+    }
+}
+
 /// Fire-and-forget POST to the cloud API usage endpoint. Picks the
 /// service-token path (`/v1/internal/usage`) when [`UsageReporter::can_use_service_token_path`]
 /// is true; otherwise falls back to the legacy sk-bearer path
@@ -1152,8 +1196,26 @@ pub async fn proxy_streaming_request(
             }
         }
 
+        let completed_cleanly = !upstream_error && !downstream_closed && parser.seen_done;
+
+        // Bill for the tokens the backend already produced, even when the stream
+        // did NOT finish cleanly (nearai/infra#98). With continuous_usage_stats
+        // forced on cloud-key streaming (routes/chat.rs, routes/completions.rs),
+        // `parser.usage` holds the running cumulative counts from the last chunk
+        // we saw — the best figure at the point of interruption. Signing/caching
+        // stays gated on a clean [DONE] below.
+        report_stream_usage_on_finalize(
+            &usage_reporter,
+            parser.usage,
+            parser.chat_id.as_deref(),
+            completed_cleanly,
+            &log_request_id,
+            &log_org_id,
+            &log_workspace_id,
+        );
+
         // Only sign and cache for a fully completed stream
-        if !upstream_error && !downstream_closed && parser.seen_done {
+        if completed_cleanly {
             let response_sha256 = hex::encode(hasher.finalize());
             if let Some(ref id) = parser.chat_id {
                 let text = format!("{model_name}:{request_sha256}:{response_sha256}");
@@ -1166,18 +1228,6 @@ pub async fn proxy_streaming_request(
                     Err(e) => {
                         error!(error = %e, "Signing failed for streaming response");
                     }
-                }
-
-                // Report usage for cloud API key requests
-                if let (Some(reporter), Some((input, output))) = (&usage_reporter, parser.usage) {
-                    let body = serde_json::json!({
-                        "type": "chat_completion",
-                        "model": reporter.model_name,
-                        "input_tokens": input,
-                        "output_tokens": output,
-                        "id": id,
-                    });
-                    spawn_usage_report(reporter, body);
                 }
 
                 // Structured completion log — one line per successful streaming request.
@@ -1641,7 +1691,24 @@ pub async fn proxy_streaming_response(
             }
         }
 
-        if !upstream_error && !downstream_closed && parser.seen_done {
+        let completed_cleanly = !upstream_error && !downstream_closed && parser.seen_done;
+
+        // Bill for tokens already produced even on an interrupted stream
+        // (nearai/infra#98). Shared with proxy_streaming_request so both
+        // streaming proxy paths have identical billing semantics. This path is
+        // reachable from the authenticated catch-all SSE proxy. Signing/caching
+        // stays gated on a clean [DONE] below.
+        report_stream_usage_on_finalize(
+            &usage_reporter,
+            parser.usage,
+            parser.chat_id.as_deref(),
+            completed_cleanly,
+            &log_request_id,
+            &log_org_id,
+            &log_workspace_id,
+        );
+
+        if completed_cleanly {
             let response_sha256 = hex::encode(hasher.finalize());
             if let Some(ref id) = parser.chat_id {
                 let text = format!("{model_name}:{request_sha256}:{response_sha256}");
@@ -1654,18 +1721,6 @@ pub async fn proxy_streaming_response(
                     Err(e) => {
                         error!(error = %e, "Signing failed for streaming response");
                     }
-                }
-
-                // Report usage for cloud API key requests
-                if let (Some(reporter), Some((input, output))) = (&usage_reporter, parser.usage) {
-                    let body = serde_json::json!({
-                        "type": "chat_completion",
-                        "model": reporter.model_name,
-                        "input_tokens": input,
-                        "output_tokens": output,
-                        "id": id,
-                    });
-                    spawn_usage_report(reporter, body);
                 }
 
                 // Structured completion log — one line per successful streaming response.

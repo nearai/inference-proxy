@@ -12,7 +12,7 @@ use axum::http::{Request, StatusCode};
 use axum::middleware;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use vllm_proxy_rs::*;
@@ -20,6 +20,14 @@ use vllm_proxy_rs::*;
 // ── test app builder ────────────────────────────────────────────────
 
 fn build_agent_loop_app(upstream_mock_url: &str, brave_url: Option<&str>) -> axum::Router {
+    build_agent_loop_app_with_cloud(upstream_mock_url, brave_url, None)
+}
+
+fn build_agent_loop_app_with_cloud(
+    upstream_mock_url: &str,
+    brave_url: Option<&str>,
+    cloud_api_url: Option<&str>,
+) -> axum::Router {
     let base = upstream_mock_url.trim_end_matches('/');
     let config = config::Config {
         model_name: "test-model".to_string(),
@@ -49,7 +57,7 @@ fn build_agent_loop_app(upstream_mock_url: &str, brave_url: Option<&str>) -> axu
         rate_limit_per_second: 1000,
         rate_limit_burst_size: 2000,
         rate_limit_trust_proxy_headers: true,
-        cloud_api_url: None,
+        cloud_api_url: cloud_api_url.map(String::from),
         cloud_api_auth_max_attempts: 1,
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
@@ -156,6 +164,19 @@ fn upstream_final_answer_sse(chat_id: &str) -> String {
         "data: {{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"Hello.\"}}}}]}}\n\n\
          data: {{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":15,\"completion_tokens\":3,\"total_tokens\":18}}}}\n\n\
          data: [DONE]\n\n",
+        id = chat_id,
+    )
+}
+
+/// vLLM-shaped SSE for a final answer turn that carries *cumulative* usage on
+/// every chunk (continuous_usage_stats) but is cut off before `[DONE]` — i.e. an
+/// interrupted/aborted stream. The completion count climbs 1→2→3 across chunks;
+/// a correct biller keeps the latest (3), a buggy one that sums would report 6.
+fn upstream_final_answer_sse_no_done(chat_id: &str) -> String {
+    format!(
+        "data: {{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"Hel\"}}}}],\"usage\":{{\"prompt_tokens\":15,\"completion_tokens\":1,\"total_tokens\":16}}}}\n\n\
+         data: {{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"lo.\"}}}}],\"usage\":{{\"prompt_tokens\":15,\"completion_tokens\":2,\"total_tokens\":17}}}}\n\n\
+         data: {{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":15,\"completion_tokens\":3,\"total_tokens\":18}}}}\n\n",
         id = chat_id,
     )
 }
@@ -1291,4 +1312,103 @@ async fn brave_formatted_output_is_truncated() {
         output.contains("[truncated]"),
         "expected truncation marker in capped output"
     );
+}
+
+/// Regression test for nearai/infra#98: an interrupted agent loop (the final
+/// upstream turn carries usage but is cut off before `[DONE]`) must still bill
+/// the tokens already produced — while still withholding the signature, since
+/// the response is incomplete and cannot be verified.
+#[tokio::test]
+async fn interrupted_agent_loop_reports_usage_without_signature() {
+    let upstream = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+
+    // sk- key validation succeeds → usage reporter is active for this request.
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_api)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/usage"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_api)
+        .await;
+
+    // Single turn: a final answer carrying cumulative usage on every chunk
+    // (1→2→3 completion tokens) but no [DONE]. The mock only matches if the loop
+    // forces continuous_usage_stats — otherwise a real backend wouldn't emit the
+    // per-chunk usage this interrupted case depends on. `expect(1)` enforces it.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("\"continuous_usage_stats\":true"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    upstream_final_answer_sse_no_done("chatcmpl-INT"),
+                    "text/event-stream",
+                ),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    // Brave configured (so the agent-loop path engages) but never actually
+    // called — the single turn finishes with "stop", not a tool call.
+    let app = build_agent_loop_app_with_cloud(
+        &upstream.uri(),
+        Some("http://brave.invalid/res/v1/llm/context"),
+        Some(&cloud_api.uri()),
+    );
+    let app_for_sig = app.clone();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-test-interrupted-loop-key")
+                .header("content-type", "application/json")
+                .body(Body::from(agent_loop_request_body(true).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Drain the stream so the spawned loop task runs to completion.
+    let _ = response.into_body().collect().await;
+
+    // Usage is reported (fire-and-forget) even though the stream never saw [DONE].
+    let mut usage_body = None;
+    for _ in 0..50 {
+        let reqs = cloud_api.received_requests().await.unwrap();
+        if let Some(req) = reqs.iter().find(|r| r.url.path() == "/v1/usage") {
+            usage_body = Some(serde_json::from_slice::<serde_json::Value>(&req.body).unwrap());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let usage = usage_body.expect("interrupted agent loop must still report usage");
+    assert_eq!(usage["type"], "chat_completion");
+    // Latest cumulative usage, NOT the sum of the per-chunk cumulative values
+    // (summing the 3 chunks would overbill to 45 in / 6 out).
+    assert_eq!(usage["input_tokens"], 15);
+    assert_eq!(usage["output_tokens"], 3);
+    assert_eq!(usage["id"], "chatcmpl-INT");
+
+    // ...but no signature is cached over the incomplete response.
+    let sig_response = app_for_sig
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/signature/chatcmpl-INT")
+                .header("authorization", "Bearer test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sig_response.status(), StatusCode::NOT_FOUND);
 }

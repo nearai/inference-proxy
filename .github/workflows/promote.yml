@@ -28,8 +28,10 @@ jobs:
     environment: production
     steps:
       - name: Validate confirmation
+        env:
+          CONFIRM: ${{ inputs.confirm }}
         run: |
-          if [ "${{ inputs.confirm }}" != "promote" ]; then
+          if [ "$CONFIRM" != "promote" ]; then
             echo "Confirmation input must be exactly 'promote'" >&2
             exit 1
           fi

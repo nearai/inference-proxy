@@ -215,30 +215,23 @@ fn message_is_client_fetch_4xx(message: &str) -> bool {
 
 /// Reports usage to the cloud API for billing.
 ///
-/// Two reporting modes coexist for the in-flight Phase 2 migration:
-///
-/// 1. **Legacy** (default): post the user's billing event to
-///    `POST {cloud_api_url}/v1/usage` with `Authorization: Bearer {api_key}`
-///    (the caller's `sk-…`). Cloud-api derives org/workspace/api_key_id from
-///    the sk- on its side.
-/// 2. **Service-token** (gated on `cloud_api_usage_token`): post to
-///    `POST {cloud_api_url}/v1/internal/usage` with `Authorization: Bearer
-///    {cloud_api_usage_token}` (a shared infrastructure secret) and carry
-///    `organization_id` + `workspace_id` + `api_key_id` in the body so
-///    cloud-api can attribute the usage without an sk-. Falls back to
-///    legacy if any of those three identity fields is `None` (e.g. older
-///    cloud-api builds whose `/v1/check_api_key` doesn't expose them).
+/// Posts to `POST {cloud_api_url}/v1/internal/usage` with `Authorization:
+/// Bearer {cloud_api_usage_token}` (a shared infrastructure secret) and carries
+/// `organization_id` + `workspace_id` + `api_key_id` in the body so cloud-api
+/// can attribute the usage. The legacy `sk-`-authenticated `POST /v1/usage`
+/// path has been removed from cloud-api, so reporting is skipped (with an error
+/// log) when the usage token or any identity field is missing — rather than
+/// posting to a deleted endpoint.
 #[derive(Clone)]
 pub struct UsageReporter {
     pub http_client: reqwest::Client,
     pub cloud_api_url: String,
-    /// The user's sk- key. Always required so the legacy fall-back path
-    /// can authenticate against cloud-api.
-    pub api_key: String,
     pub model_name: String,
     /// Shared infrastructure token for the service-token reporting path.
-    /// `Some` enables the new `/v1/internal/usage` path provided all three
-    /// identity fields below are also `Some`.
+    /// Required: usage is reported only via `/v1/internal/usage`. cloud-api
+    /// removed the legacy `sk-`-authenticated `POST /v1/usage` endpoint, so
+    /// reporting is skipped (with an error log) when this or any identity
+    /// field below is missing.
     pub cloud_api_usage_token: Option<String>,
     pub org_id: Option<String>,
     pub workspace_id: Option<String>,
@@ -246,11 +239,10 @@ pub struct UsageReporter {
 }
 
 impl UsageReporter {
-    /// Whether the service-token reporting path can be used right now. The
-    /// caller is expected to be backwards-compatible: if this returns false
-    /// (because either the token isn't configured or the auth response was
-    /// missing identity fields), the legacy `sk-`-bearer path is used
-    /// instead.
+    /// Whether the service-token reporting path can be used. False when the
+    /// usage token isn't configured or the auth response was missing identity
+    /// fields; in that case usage reporting is skipped (the legacy `sk-`-bearer
+    /// `/v1/usage` endpoint no longer exists on cloud-api).
     fn can_use_service_token_path(&self) -> bool {
         self.cloud_api_usage_token.is_some()
             && self.org_id.is_some()
@@ -286,20 +278,22 @@ pub enum ResponseShape {
 }
 
 /// Build a `UsageReporter` if the request was authenticated with a cloud API
-/// key. The reporter captures the user's sk- key for the legacy path plus
-/// the subject identity (`org_id` / `workspace_id` / `api_key_id`) and the
-/// shared `cloud_api_usage_token` (both from auth response + config) so the
-/// new service-token path can be used when all of them are present.
+/// key. The reporter captures the subject identity (`org_id` / `workspace_id` /
+/// `api_key_id`) from the auth response plus the configured shared
+/// `cloud_api_usage_token`, so usage can be reported via the service-token
+/// `/v1/internal/usage` path. Returns `None` for non-`sk-` (proxy-token) requests.
 pub fn make_usage_reporter(
     auth: &crate::auth::RequireAuth,
     state: &AppState,
 ) -> Option<UsageReporter> {
-    let key = auth.cloud_api_key.as_ref()?;
+    // Gate: a reporter exists only for direct sk- requests. The key value
+    // itself is no longer stored — usage is attributed via the identity fields
+    // below, not the sk-.
+    auth.cloud_api_key.as_ref()?;
     let url = state.config.cloud_api_url.as_ref()?;
     Some(UsageReporter {
         http_client: state.http_client.clone(),
         cloud_api_url: url.clone(),
-        api_key: key.clone(),
         model_name: state.config.model_name.clone(),
         cloud_api_usage_token: state.config.cloud_api_usage_token.clone(),
         org_id: auth.org_id.clone(),
@@ -403,67 +397,70 @@ fn report_stream_usage_on_finalize(
     }
 }
 
-/// Fire-and-forget POST to the cloud API usage endpoint. Picks the
-/// service-token path (`/v1/internal/usage`) when [`UsageReporter::can_use_service_token_path`]
-/// is true; otherwise falls back to the legacy sk-bearer path
-/// (`/v1/usage`) verbatim.
+/// Fire-and-forget POST of a usage event to cloud-api's `/v1/internal/usage`
+/// (service-token authenticated). The legacy `sk-`-authenticated `/v1/usage`
+/// endpoint has been removed from cloud-api, so when the service-token path is
+/// unavailable (missing usage token or identity fields) we log an error and
+/// skip — never post to the deleted endpoint.
 pub(crate) fn spawn_usage_report(reporter: &UsageReporter, mut body: serde_json::Value) {
-    let client = reporter.http_client.clone();
-    let (url, auth, mode) = if reporter.can_use_service_token_path() {
-        // Inject subject identity into the body. Cloud-api's
-        // `/v1/internal/usage` handler reads these instead of deriving
-        // them from the sk-bearer.
-        match &mut body {
-            serde_json::Value::Object(map) => {
-                // `unwrap` is fine — all four `Option`s are checked by
-                // `can_use_service_token_path` above.
-                map.insert(
-                    "organization_id".to_string(),
-                    serde_json::Value::String(reporter.org_id.clone().unwrap()),
-                );
-                map.insert(
-                    "workspace_id".to_string(),
-                    serde_json::Value::String(reporter.workspace_id.clone().unwrap()),
-                );
-                map.insert(
-                    "api_key_id".to_string(),
-                    serde_json::Value::String(reporter.api_key_id.clone().unwrap()),
-                );
-            }
-            other => {
-                // Today every `try_report_usage` call site builds the
-                // body via `serde_json::json!({…})` so it's always an
-                // object. Guard against a future caller passing
-                // something else: drop the report rather than send
-                // un-attributable bytes to cloud-api, which would
-                // silently fail to write a usage row and lose billing.
-                warn!(
-                    body_kind = %match other {
-                        serde_json::Value::Null => "null",
-                        serde_json::Value::Bool(_) => "bool",
-                        serde_json::Value::Number(_) => "number",
-                        serde_json::Value::String(_) => "string",
-                        serde_json::Value::Array(_) => "array",
-                        serde_json::Value::Object(_) => unreachable!(),
-                    },
-                    "Skipping service-token usage report: body is not a JSON object — \
-                     identity fields can't be injected, refusing to send unattributable report"
-                );
-                return;
-            }
+    if !reporter.can_use_service_token_path() {
+        // No fallback exists anymore. This is a misconfiguration (usage token
+        // not set) or an auth response missing identity fields — surface it
+        // loudly rather than silently dropping billing.
+        error!(
+            has_usage_token = reporter.cloud_api_usage_token.is_some(),
+            has_org = reporter.org_id.is_some(),
+            has_workspace = reporter.workspace_id.is_some(),
+            has_api_key_id = reporter.api_key_id.is_some(),
+            "Skipping usage report: service-token path unavailable and the legacy \
+             /v1/usage endpoint is removed — usage NOT billed"
+        );
+        return;
+    }
+
+    // Inject subject identity into the body. Cloud-api's `/v1/internal/usage`
+    // handler reads these to attribute the usage.
+    match &mut body {
+        serde_json::Value::Object(map) => {
+            // `unwrap` is fine — all three `Option`s are checked by
+            // `can_use_service_token_path` above.
+            map.insert(
+                "organization_id".to_string(),
+                serde_json::Value::String(reporter.org_id.clone().unwrap()),
+            );
+            map.insert(
+                "workspace_id".to_string(),
+                serde_json::Value::String(reporter.workspace_id.clone().unwrap()),
+            );
+            map.insert(
+                "api_key_id".to_string(),
+                serde_json::Value::String(reporter.api_key_id.clone().unwrap()),
+            );
         }
-        (
-            format!("{}/v1/internal/usage", reporter.cloud_api_url),
-            format!("Bearer {}", reporter.cloud_api_usage_token.clone().unwrap()),
-            "service_token",
-        )
-    } else {
-        (
-            format!("{}/v1/usage", reporter.cloud_api_url),
-            format!("Bearer {}", reporter.api_key),
-            "sk_legacy",
-        )
-    };
+        other => {
+            // Today every call site builds the body via `serde_json::json!({…})`
+            // so it's always an object. Guard against a future caller passing
+            // something else: drop the report rather than send un-attributable
+            // bytes to cloud-api, which would silently fail to write a usage row.
+            warn!(
+                body_kind = %match other {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "bool",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::String(_) => "string",
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::Object(_) => unreachable!(),
+                },
+                "Skipping usage report: body is not a JSON object — identity fields \
+                 can't be injected, refusing to send unattributable report"
+            );
+            return;
+        }
+    }
+
+    let client = reporter.http_client.clone();
+    let url = format!("{}/v1/internal/usage", reporter.cloud_api_url);
+    let auth = format!("Bearer {}", reporter.cloud_api_usage_token.clone().unwrap());
     tokio::spawn(async move {
         match client
             .post(&url)
@@ -474,9 +471,9 @@ pub(crate) fn spawn_usage_report(reporter: &UsageReporter, mut body: serde_json:
             .await
         {
             Ok(resp) if !resp.status().is_success() => {
-                warn!(status = %resp.status(), mode, "Usage reporting returned non-success");
+                warn!(status = %resp.status(), "Usage reporting returned non-success");
             }
-            Err(e) => warn!(error = %e, mode, "Usage reporting failed"),
+            Err(e) => warn!(error = %e, "Usage reporting failed"),
             _ => {}
         }
     });
@@ -1899,7 +1896,6 @@ mod tests {
         UsageReporter {
             http_client: reqwest::Client::new(),
             cloud_api_url: "http://cloud-api.invalid".to_string(),
-            api_key: "sk-test-key".to_string(),
             model_name: "test-model".to_string(),
             cloud_api_usage_token: usage_token.map(String::from),
             org_id: org_id.map(String::from),
@@ -1916,12 +1912,13 @@ mod tests {
                 .can_use_service_token_path()
         );
 
-        // Token missing: legacy path even if identity is fully populated.
+        // Token missing: reporting is skipped (no legacy fallback) even if
+        // identity is fully populated.
         assert!(
             !reporter_with(None, Some("org"), Some("ws"), Some("key")).can_use_service_token_path()
         );
 
-        // Any identity field missing: legacy path. Mirrors the
+        // Any identity field missing: reporting is skipped. Mirrors the
         // "older cloud-api hasn't shipped /v1/check_api_key changes yet"
         // case where the auth response returned `None`s.
         for (org, ws, key) in [
@@ -1936,7 +1933,7 @@ mod tests {
             );
         }
 
-        // Nothing configured: legacy path.
+        // Nothing configured: reporting is skipped.
         assert!(!reporter_with(None, None, None, None).can_use_service_token_path());
     }
 

@@ -61,7 +61,7 @@ fn build_agent_loop_app_with_cloud(
         cloud_api_auth_max_attempts: 1,
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
-        cloud_api_usage_token: None,
+        cloud_api_usage_token: Some("test-usage-token".to_string()),
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,
@@ -1324,13 +1324,18 @@ async fn interrupted_agent_loop_reports_usage_without_signature() {
     let cloud_api = MockServer::start().await;
 
     // sk- key validation succeeds → usage reporter is active for this request.
+    // Identity fields enable the service-token /v1/internal/usage reporting path.
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-test",
+            "workspace_id": "ws-test",
+            "api_key_id": "key-test"
+        })))
         .mount(&cloud_api)
         .await;
     Mock::given(method("POST"))
-        .and(path("/v1/usage"))
+        .and(path("/v1/internal/usage"))
         .respond_with(ResponseTemplate::new(200))
         .mount(&cloud_api)
         .await;
@@ -1384,7 +1389,7 @@ async fn interrupted_agent_loop_reports_usage_without_signature() {
     let mut usage_body = None;
     for _ in 0..50 {
         let reqs = cloud_api.received_requests().await.unwrap();
-        if let Some(req) = reqs.iter().find(|r| r.url.path() == "/v1/usage") {
+        if let Some(req) = reqs.iter().find(|r| r.url.path() == "/v1/internal/usage") {
             usage_body = Some(serde_json::from_slice::<serde_json::Value>(&req.body).unwrap());
             break;
         }

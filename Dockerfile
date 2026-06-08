@@ -121,7 +121,15 @@ ENV PYTHONUNBUFFERED=1
 # rewrite-timestamp normalizes tar mtimes but not the bytes inside a .pyc.
 # Skipping compilation keeps the layer deterministic; CPython compiles the
 # modules in memory on first import at runtime (negligible for this service).
-RUN pip install --no-cache-dir --no-compile \
+#
+# -c attestation-constraints.txt: nv-attestation-sdk/-ppcie-verifier pin their
+# transitive deps loosely, so without a lock pip resolves cryptography, urllib3,
+# setuptools, etc. to whatever is newest on PyPI — making this layer (and the
+# image digest) drift across build days. The committed constraints file pins the
+# full closure so the install is reproducible. Bind-mounted (not COPY'd) so it
+# adds no layer and leaves nothing in the image.
+RUN --mount=type=bind,source=attestation-constraints.txt,target=/run/attestation-constraints.txt \
+    pip install --no-cache-dir --no-compile -c /run/attestation-constraints.txt \
         "nv-attestation-sdk==${NV_ATTESTATION_SDK_VERSION}" \
         "nv-ppcie-verifier==${NV_PPCIE_VERIFIER_VERSION}"
 

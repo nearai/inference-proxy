@@ -38,7 +38,7 @@ jobs:
             TAG=${GITHUB_REF_NAME#v}
             echo "Using '${TAG}' image tag for ${GITHUB_REF_NAME} tag"
           elif [[ "${GITHUB_REF_TYPE}" == 'branch' ]]; then
-            TAG=$(if [[ "${GITHUB_REF_NAME}" == 'main' ]]; then echo 'latest'; else echo 'dev'; fi)
+            TAG=$(if [[ "${GITHUB_REF_NAME}" == 'main' ]]; then echo 'staging'; else echo 'dev'; fi)
             echo "Using '${TAG}' image tag for ${GITHUB_REF_NAME} branch"
           else
             echo "Unsupported ref type: ${GITHUB_REF_TYPE}" >&2
@@ -50,6 +50,9 @@ jobs:
             exit 1
           fi
           echo "IMAGE_REFERENCE=${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:${TAG}" >> "$GITHUB_ENV"
+          if [[ "${GITHUB_REF_TYPE}" == 'branch' && "${GITHUB_REF_NAME}" == 'main' ]]; then
+            echo "ALSO_TAG_STAGING_STAMP=true" >> "$GITHUB_ENV"
+          fi
 
       - name: Install build dependencies
         run: |
@@ -91,6 +94,16 @@ jobs:
         run: |
           cosign sign --yes "${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}@${{ env.IMAGE_DIGEST }}"
 
+      - name: Push immutable staging tag
+        if: env.ALSO_TAG_STAGING_STAMP == 'true'
+        run: |
+          set -euo pipefail
+          SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          STAMP=$(date -u +%Y%m%d)
+          STAGING_STAMPED_REF="${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:staging-${STAMP}-${SHORT_SHA}"
+          skopeo copy oci-archive:./oci.tar "docker://${STAGING_STAMPED_REF}"
+          echo "STAGING_STAMPED_REFERENCE=${STAGING_STAMPED_REF}" >> "$GITHUB_ENV"
+
       - name: Generate build summary
         run: |
           {
@@ -99,4 +112,7 @@ jobs:
             echo "- tag: \`${{ env.IMAGE_REFERENCE }}\`"
             echo "- digest: \`${{ env.IMAGE_DIGEST }}\`"
             echo "- sigstore: https://search.sigstore.dev/?hash=${{ env.IMAGE_DIGEST }}"
+            if [[ "${{ env.ALSO_TAG_STAGING_STAMP }}" == "true" ]]; then
+              echo "- staging stamped: \`${{ env.STAGING_STAMPED_REFERENCE }}\`"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"

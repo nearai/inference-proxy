@@ -251,7 +251,8 @@ impl UsageReporter {
     }
 }
 
-/// What kind of usage to extract from the response.
+/// What kind of usage to extract from the response, and the `inference_type`
+/// label to report it under.
 #[derive(Clone, Default)]
 pub enum UsageType {
     /// Extract prompt_tokens / completion_tokens from the `usage` object.
@@ -259,6 +260,14 @@ pub enum UsageType {
     ChatCompletion,
     /// Count items in the `data` array (for image generation).
     ImageGeneration,
+    /// Input-token-billed, output-less kinds. They share the embeddings
+    /// response shape (top-level `usage.prompt_tokens`, no completion
+    /// tokens) and differ only in the reported label, so cloud-api records
+    /// the correct `inference_type` instead of mislabeling them as
+    /// `chat_completion`. See nearai/infra#169.
+    Embedding,
+    Rerank,
+    Score,
 }
 
 /// Shape of the reassembled non-streaming response when `proxy_json_request`
@@ -302,18 +311,19 @@ pub fn make_usage_reporter(
     })
 }
 
-/// Extract usage from a parsed JSON response and fire-and-forget a report to the cloud API.
-fn try_report_usage(response_data: &serde_json::Value, id: &str, opts: &ProxyOpts) {
-    let reporter = match &opts.usage_reporter {
-        Some(r) => r,
-        None => return,
-    };
-    let body = match &opts.usage_type {
+/// Build the `/v1/internal/usage` request body for a parsed response, or
+/// `None` when there is nothing billable to report. Pure (no I/O) so it can
+/// be unit-tested directly; `try_report_usage` wraps it with the
+/// fire-and-forget send.
+fn build_usage_body(
+    usage_type: &UsageType,
+    response_data: &serde_json::Value,
+    model_name: &str,
+    id: &str,
+) -> Option<serde_json::Value> {
+    match usage_type {
         UsageType::ChatCompletion => {
-            let usage = match response_data.get("usage") {
-                Some(u) => u,
-                None => return,
-            };
+            let usage = response_data.get("usage")?;
             let input = usage
                 .get("prompt_tokens")
                 .and_then(|v| v.as_i64())
@@ -323,15 +333,15 @@ fn try_report_usage(response_data: &serde_json::Value, id: &str, opts: &ProxyOpt
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
             if input == 0 && output == 0 {
-                return;
+                return None;
             }
-            serde_json::json!({
+            Some(serde_json::json!({
                 "type": "chat_completion",
-                "model": reporter.model_name,
+                "model": model_name,
                 "input_tokens": input,
                 "output_tokens": output,
                 "id": id,
-            })
+            }))
         }
         UsageType::ImageGeneration => {
             let count = response_data
@@ -340,17 +350,56 @@ fn try_report_usage(response_data: &serde_json::Value, id: &str, opts: &ProxyOpt
                 .map(|a| a.len())
                 .unwrap_or(0);
             if count == 0 {
-                return;
+                return None;
             }
-            serde_json::json!({
+            Some(serde_json::json!({
                 "type": "image_generation",
-                "model": reporter.model_name,
+                "model": model_name,
                 "image_count": count,
                 "id": id,
-            })
+            }))
         }
+        UsageType::Embedding => input_only_usage_body("embedding", response_data, model_name, id),
+        UsageType::Rerank => input_only_usage_body("rerank", response_data, model_name, id),
+        UsageType::Score => input_only_usage_body("score", response_data, model_name, id),
+    }
+}
+
+/// Build the body for an input-token-billed, output-less kind
+/// (`embedding`/`rerank`/`score`): the input token count comes from the
+/// top-level `usage.prompt_tokens`, and only that count is reported under
+/// the given `inference_type` label.
+fn input_only_usage_body(
+    type_label: &str,
+    response_data: &serde_json::Value,
+    model_name: &str,
+    id: &str,
+) -> Option<serde_json::Value> {
+    let input = response_data
+        .get("usage")?
+        .get("prompt_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    if input == 0 {
+        return None;
+    }
+    Some(serde_json::json!({
+        "type": type_label,
+        "model": model_name,
+        "input_tokens": input,
+        "id": id,
+    }))
+}
+
+/// Extract usage from a parsed JSON response and fire-and-forget a report to the cloud API.
+fn try_report_usage(response_data: &serde_json::Value, id: &str, opts: &ProxyOpts) {
+    let Some(reporter) = &opts.usage_reporter else {
+        return;
     };
-    spawn_usage_report(reporter, body);
+    if let Some(body) = build_usage_body(&opts.usage_type, response_data, &reporter.model_name, id)
+    {
+        spawn_usage_report(reporter, body);
+    }
 }
 
 /// Report token usage to cloud-api when a streaming response finalizes — even if
@@ -2035,6 +2084,71 @@ mod tests {
 
         // Nothing configured: reporting is skipped.
         assert!(!reporter_with(None, None, None, None).can_use_service_token_path());
+    }
+
+    #[test]
+    fn test_build_usage_body_chat_completion() {
+        let resp = serde_json::json!({
+            "usage": {"prompt_tokens": 12, "completion_tokens": 7}
+        });
+        let body = build_usage_body(&UsageType::ChatCompletion, &resp, "m", "id-1").unwrap();
+        assert_eq!(body["type"], "chat_completion");
+        assert_eq!(body["model"], "m");
+        assert_eq!(body["input_tokens"], 12);
+        assert_eq!(body["output_tokens"], 7);
+        assert_eq!(body["id"], "id-1");
+    }
+
+    #[test]
+    fn test_build_usage_body_image_generation() {
+        let resp = serde_json::json!({"data": [{}, {}, {}]});
+        let body = build_usage_body(&UsageType::ImageGeneration, &resp, "m", "id-2").unwrap();
+        assert_eq!(body["type"], "image_generation");
+        assert_eq!(body["image_count"], 3);
+        assert!(body.get("input_tokens").is_none());
+    }
+
+    #[test]
+    fn test_build_usage_body_input_only_kinds_label_and_shape() {
+        // embedding / rerank / score share the embeddings response shape
+        // (top-level usage.prompt_tokens, no completion tokens) and report
+        // input-only usage under their own label (nearai/infra#169).
+        let resp = serde_json::json!({
+            "usage": {"prompt_tokens": 42, "total_tokens": 42}
+        });
+        for (ty, label) in [
+            (UsageType::Embedding, "embedding"),
+            (UsageType::Rerank, "rerank"),
+            (UsageType::Score, "score"),
+        ] {
+            let body = build_usage_body(&ty, &resp, "m", "id-3").unwrap();
+            assert_eq!(body["type"], label, "wrong label for {label}");
+            assert_eq!(body["input_tokens"], 42);
+            // No output_tokens for input-only kinds — cloud-api's wire
+            // variant carries input_tokens only.
+            assert!(
+                body.get("output_tokens").is_none(),
+                "{label} must not report output_tokens"
+            );
+            assert_eq!(body["id"], "id-3");
+        }
+    }
+
+    #[test]
+    fn test_build_usage_body_returns_none_when_nothing_billable() {
+        // No usage object at all.
+        assert!(
+            build_usage_body(&UsageType::Embedding, &serde_json::json!({}), "m", "x").is_none()
+        );
+        // Zero tokens.
+        let zero = serde_json::json!({"usage": {"prompt_tokens": 0}});
+        assert!(build_usage_body(&UsageType::Rerank, &zero, "m", "x").is_none());
+        // Chat with both token counts zero.
+        let zero_chat = serde_json::json!({"usage": {"prompt_tokens": 0, "completion_tokens": 0}});
+        assert!(build_usage_body(&UsageType::ChatCompletion, &zero_chat, "m", "x").is_none());
+        // Empty image data array.
+        let no_images = serde_json::json!({"data": []});
+        assert!(build_usage_body(&UsageType::ImageGeneration, &no_images, "m", "x").is_none());
     }
 
     /// Build a ProxyOpts with fixed signing keys for deterministic tests.

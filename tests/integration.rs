@@ -4108,9 +4108,15 @@ async fn test_usage_reported_for_embeddings() {
     wait_for_usage_request(&cloud_api, 1).await;
     let usage_reqs = get_usage_requests(&cloud_api).await;
     assert_eq!(usage_reqs.len(), 1, "Expected exactly one usage report");
-    assert_eq!(usage_reqs[0]["type"], "chat_completion");
+    // Embeddings now report under their own input-only label instead of
+    // being mislabeled as chat_completion (nearai/infra#169). The
+    // input-only wire variant carries no output_tokens field.
+    assert_eq!(usage_reqs[0]["type"], "embedding");
     assert_eq!(usage_reqs[0]["input_tokens"], 4);
-    assert_eq!(usage_reqs[0]["output_tokens"], 0);
+    assert!(
+        usage_reqs[0].get("output_tokens").is_none(),
+        "embedding usage must not report output_tokens"
+    );
 }
 
 #[tokio::test]

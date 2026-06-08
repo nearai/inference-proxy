@@ -1,0 +1,69 @@
+# Pinned transitive closure for the NVIDIA GPU-attestation Python deps installed
+# in the runtime stage (nv-attestation-sdk / nv-ppcie-verifier — see Dockerfile).
+#
+# WHY: nv-attestation-sdk and nv-ppcie-verifier pin their *direct* deps loosely,
+# so pip resolves several transitive packages (cryptography, urllib3, setuptools,
+# coverage, …) to whatever is newest on PyPI at build time. That makes the pip
+# layer — and therefore the vllm-proxy-rs image digest — drift across build days
+# even though the layer is reproducible within a single day (so the same-day
+# reproducible-build.yml check cannot catch it). Pinning the full closure makes
+# the install resolve identically regardless of when it runs.
+#
+# These are constraints (not requirements): they cap versions only for packages
+# pip actually installs; they do not force-install anything on their own. The two
+# top-level packages stay controlled by the Dockerfile build-args
+# (NV_ATTESTATION_SDK_VERSION / NV_PPCIE_VERIFIER_VERSION).
+#
+# REGENERATE when bumping NV_ATTESTATION_SDK_VERSION / NV_PPCIE_VERIFIER_VERSION:
+#   docker run --rm --entrypoint bash <vllm-openai base> -c \
+#     'pip install --quiet --dry-run --report /tmp/r.json \
+#        nv-attestation-sdk==<ver> nv-ppcie-verifier==<ver> && \
+#      python3 -c "import json;[print(p[\"metadata\"][\"name\"]+\"==\"+p[\"metadata\"][\"version\"]) \
+#        for p in sorted(json.load(open(\"/tmp/r.json\"))[\"install\"], key=lambda x:x[\"metadata\"][\"name\"].lower())]"'
+# then drop the two nv-attestation-sdk / nv-ppcie-verifier lines.
+#
+# Resolved against vllm/vllm-openai (Python 3.12) for SDK 2.7.3 / PPCIE 2.0.0.
+asn1==2.7.0
+astroid==3.1.0
+black==24.3.0
+build==1.2.1
+click==8.1.7
+coverage==7.14.1
+cryptography==43.0.1
+dill==0.3.8
+docutils==0.23
+ecdsa==0.18.0
+elementpath==4.8.0
+enum-compat==0.0.3
+id==1.6.1
+iniconfig==2.3.0
+isort==5.13.2
+lxml==4.9.4
+mccabe==0.7.0
+mypy_extensions==1.1.0
+nh3==0.3.5
+nv-local-gpu-verifier==2.7.3
+nvidia-ml-py==12.550.52
+parameterized==0.9.0
+pathspec==0.12.1
+platformdirs==4.10.0
+pluggy==1.6.0
+prettytable==3.17.0
+PyJWT==2.7.0
+pylint==3.1.0
+pyOpenSSL==24.2.1
+pytest==8.1.1
+pytest-cov==5.0.0
+readme_renderer==44.0
+requests-toolbelt==1.0.0
+rfc3986==2.0.0
+setuptools==80.9.0
+signxml==3.2.0
+timeout-decorator==0.5.0
+tomlkit==0.12.4
+twine==6.2.0
+typing_extensions==4.10.0
+urllib3==2.6.3
+wcwidth==0.8.1
+wheel==0.43.0
+xmlschema==2.2.3

@@ -816,6 +816,9 @@ struct StreamingResponseAssembler {
     /// the caller surface a real upstream error instead of returning a
     /// phantom HTTP 200 + empty choices.
     error: Option<serde_json::Value>,
+    /// Unknown top-level fields seen in the stream (e.g. sglang `sglext`),
+    /// preserved verbatim so they survive reassembly. Last-writer-wins.
+    top_extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Accumulates delta fields for a single choice.
@@ -826,6 +829,26 @@ struct ChoiceAssembler {
     tool_calls: Vec<serde_json::Value>,
     finish_reason: Option<String>,
     logprobs: Option<serde_json::Value>,
+    /// Unknown per-choice and per-delta fields, preserved verbatim and emitted
+    /// as choice-level siblings of `message`. This is how `delta.hidden_states`
+    /// (sglang `return_hidden_states`) survives reassembly — it maps onto the
+    /// native non-streaming `choices[].hidden_states`. Last-writer-wins, which
+    /// for sglang is the final hidden-states chunk (last-token states), since
+    /// the proxy forces `stream:true` upstream.
+    extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Merge preserved unknown fields into an assembled object, without
+/// overwriting fields we already populated.
+fn merge_extra(target: &mut serde_json::Value, extra: serde_json::Map<String, serde_json::Value>) {
+    if extra.is_empty() {
+        return;
+    }
+    if let Some(obj) = target.as_object_mut() {
+        for (k, v) in extra {
+            obj.entry(k).or_insert(v);
+        }
+    }
 }
 
 impl StreamingResponseAssembler {
@@ -840,6 +863,7 @@ impl StreamingResponseAssembler {
             metadata: None,
             shape,
             error: None,
+            top_extra: serde_json::Map::new(),
         }
     }
 
@@ -914,6 +938,28 @@ impl StreamingResponseAssembler {
             self.usage = Some(u.clone());
         }
 
+        // Preserve unknown top-level fields (e.g. sglang `sglext`) verbatim,
+        // so they survive reassembly instead of being silently dropped.
+        if let Some(obj) = event.as_object() {
+            for (k, v) in obj {
+                if v.is_null()
+                    || matches!(
+                        k.as_str(),
+                        "id" | "object"
+                            | "model"
+                            | "created"
+                            | "choices"
+                            | "usage"
+                            | "metadata"
+                            | "error"
+                    )
+                {
+                    continue;
+                }
+                self.top_extra.insert(k.clone(), v.clone());
+            }
+        }
+
         // Process choices/deltas.
         if let Some(choices) = event.get("choices").and_then(|v| v.as_array()) {
             for choice in choices {
@@ -950,6 +996,27 @@ impl StreamingResponseAssembler {
                             if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                                 ca.merge_tool_calls(tcs);
                             }
+                            // Preserve unknown delta fields (e.g. sglang
+                            // `delta.hidden_states` from return_hidden_states),
+                            // hoisted to choice level to match the native
+                            // non-streaming `choices[].hidden_states` shape.
+                            if let Some(delta_obj) = delta.as_object() {
+                                for (k, v) in delta_obj {
+                                    if v.is_null()
+                                        || matches!(
+                                            k.as_str(),
+                                            "role"
+                                                | "content"
+                                                | "reasoning"
+                                                | "reasoning_content"
+                                                | "tool_calls"
+                                        )
+                                    {
+                                        continue;
+                                    }
+                                    ca.extra.insert(k.clone(), v.clone());
+                                }
+                            }
                         }
                     }
                     ResponseShape::TextCompletion => {
@@ -966,6 +1033,27 @@ impl StreamingResponseAssembler {
                 }
                 if let Some(lp) = choice.get("logprobs").filter(|v| !v.is_null()) {
                     ca.logprobs = Some(lp.clone());
+                }
+
+                // Preserve unknown choice-level fields (e.g. `matched_stop`, or
+                // a per-choice `hidden_states`) verbatim.
+                if let Some(obj) = choice.as_object() {
+                    for (k, v) in obj {
+                        if v.is_null()
+                            || matches!(
+                                k.as_str(),
+                                "index"
+                                    | "delta"
+                                    | "text"
+                                    | "finish_reason"
+                                    | "logprobs"
+                                    | "message"
+                            )
+                        {
+                            continue;
+                        }
+                        ca.extra.insert(k.clone(), v.clone());
+                    }
                 }
             }
         }
@@ -1014,6 +1102,9 @@ impl StreamingResponseAssembler {
             resp["metadata"] = metadata;
         }
 
+        // Re-attach any unknown top-level provider fields (e.g. sglang `sglext`).
+        merge_extra(&mut resp, self.top_extra);
+
         resp
     }
 }
@@ -1027,6 +1118,7 @@ impl ChoiceAssembler {
             tool_calls: Vec::new(),
             finish_reason: None,
             logprobs: None,
+            extra: serde_json::Map::new(),
         }
     }
 
@@ -1092,19 +1184,27 @@ impl ChoiceAssembler {
                     message["tool_calls"] = self.tool_calls.into();
                 }
 
-                serde_json::json!({
+                let mut choice = serde_json::json!({
                     "index": index,
                     "message": message,
                     "finish_reason": self.finish_reason,
                     "logprobs": self.logprobs,
-                })
+                });
+                // Re-attach preserved per-choice fields (e.g. hidden_states)
+                // as siblings of `message`, matching native sglang.
+                merge_extra(&mut choice, self.extra);
+                choice
             }
-            ResponseShape::TextCompletion => serde_json::json!({
-                "index": index,
-                "text": self.content,
-                "finish_reason": self.finish_reason,
-                "logprobs": self.logprobs,
-            }),
+            ResponseShape::TextCompletion => {
+                let mut choice = serde_json::json!({
+                    "index": index,
+                    "text": self.content,
+                    "finish_reason": self.finish_reason,
+                    "logprobs": self.logprobs,
+                });
+                merge_extra(&mut choice, self.extra);
+                choice
+            }
         }
     }
 }
@@ -2887,6 +2987,35 @@ mod tests {
         assert_eq!(resp["choices"][0]["finish_reason"], "stop");
         assert_eq!(resp["usage"]["prompt_tokens"], 5);
         assert_eq!(resp["usage"]["completion_tokens"], 2);
+    }
+
+    #[test]
+    fn test_assembler_preserves_hidden_states_and_unknown_fields() {
+        // sglang `return_hidden_states` streams activations in a dedicated chunk
+        // as `choices[].delta.hidden_states`. Because the proxy forces upstream
+        // streaming and reassembles, the assembler must keep them (hoisted to
+        // choice level, matching native non-streaming `choices[].hidden_states`),
+        // plus any other unknown provider fields (top-level + per-choice).
+        let mut asm = StreamingResponseAssembler::new(ResponseShape::ChatCompletion);
+        asm.process_chunk(
+            b"data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}],\"sglext\":{\"spec_verify_ct\":3}}\n\n",
+        );
+        asm.process_chunk(
+            b"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"hidden_states\":[[0.1,0.2]]},\"finish_reason\":\"stop\",\"matched_stop\":2}]}\n\n",
+        );
+        asm.process_chunk(b"data: [DONE]\n\n");
+
+        let resp = asm.into_response("chatcmpl");
+
+        // Normal content still assembles, known fields are not clobbered.
+        assert_eq!(resp["choices"][0]["message"]["content"], "hi");
+        assert_eq!(resp["choices"][0]["finish_reason"], "stop");
+        // hidden_states preserved at CHOICE level (sibling of message), not inside it.
+        assert_eq!(resp["choices"][0]["hidden_states"][0][1], 0.2);
+        assert!(resp["choices"][0]["message"].get("hidden_states").is_none());
+        // Other unknown fields preserved: per-choice `matched_stop` + top-level `sglext`.
+        assert_eq!(resp["choices"][0]["matched_stop"], 2);
+        assert_eq!(resp["sglext"]["spec_verify_ct"], 3);
     }
 
     #[test]

@@ -8,6 +8,10 @@ ignore = [
     # transitive via ark-ff (arkworks). No action available until ark-ff
     # migrates off it. Advisory entered the DB 2026-06-06.
     "RUSTSEC-2024-0388",
+    # proc-macro-error2 unmaintained (informational only, not a vulnerability);
+    # transitive build-dep, no action available until upstreams migrate off it.
+    # Same advisory cloud-api ignored in nearai/cloud-api#733.
+    "RUSTSEC-2026-0173",
 ]
 
 [licenses]

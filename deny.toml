@@ -4,6 +4,10 @@ ignore = [
     # paste is unmaintained but is a transitive dep from alloy-primitives;
     # no action we can take until alloy migrates away from it
     "RUSTSEC-2024-0436",
+    # derivative is unmaintained (informational only, not a vulnerability);
+    # transitive via ark-ff (arkworks). No action available until ark-ff
+    # migrates off it. Advisory entered the DB 2026-06-06.
+    "RUSTSEC-2024-0388",
 ]
 
 [licenses]

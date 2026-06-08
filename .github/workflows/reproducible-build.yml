@@ -18,10 +18,11 @@ on:
   push:
     branches: [main]
     # Every input that can affect oci.tar — keep in sync with the Dockerfile's
-    # COPY sources (Cargo manifests, src/, benches/, gpu_evidence_worker.py) plus
-    # the build script and .dockerignore (build context). A merge touching any of
-    # these must re-run the check, or a reproducibility regression introduced via
-    # e.g. a new dependency could slip past the gate.
+    # COPY/bind sources (Cargo manifests, src/, benches/, gpu_evidence_worker.py,
+    # attestation-constraints.txt) plus the build script and .dockerignore (build
+    # context). A merge touching any of these must re-run the check, or a
+    # reproducibility regression introduced via e.g. a new dependency could slip
+    # past the gate.
     paths:
       - "Dockerfile"
       - ".dockerignore"
@@ -31,6 +32,7 @@ on:
       - "src/**"
       - "benches/**"
       - "gpu_evidence_worker.py"
+      - "attestation-constraints.txt"
       - ".github/workflows/reproducible-build.yml"
   workflow_dispatch:
 

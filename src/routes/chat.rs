@@ -53,12 +53,8 @@ pub async fn chat_completions(
     // to the engine, so a flood of dead URLs can't load the model. Runs only when
     // the request actually contains images; conservative/fail-open otherwise.
     // See nearai/infra#159, #172.
-    crate::image_validation::reject_invalid_images(
-        &request_json,
-        &state.http_client,
-        &state.config.image_validation(),
-    )
-    .await?;
+    crate::image_validation::reject_invalid_images(&request_json, &state.config.image_validation())
+        .await?;
 
     let is_stream = request_json
         .get("stream")

@@ -315,7 +315,7 @@ impl Config {
             image_validation_enabled: !env_bool("VLLM_PROXY_IMAGE_VALIDATION_DISABLED"),
             image_validation_timeout_secs: env_int("VLLM_PROXY_IMAGE_VALIDATION_TIMEOUT_SECS", 5)
                 as u64,
-            image_validation_max_bytes: env_int("VLLM_PROXY_IMAGE_VALIDATION_MAX_BYTES", 65536),
+            image_validation_max_bytes: env_int("VLLM_PROXY_IMAGE_VALIDATION_MAX_BYTES", 2048),
             image_validation_max_concurrency: env_int(
                 "VLLM_PROXY_IMAGE_VALIDATION_MAX_CONCURRENCY",
                 8,

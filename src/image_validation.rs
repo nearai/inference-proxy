@@ -15,32 +15,42 @@
 //! ## Conservative by design (fail-open)
 //! It only rejects inputs it can *positively* identify as bad: a URL that can't
 //! be fetched (DNS/connect/timeout/non-2xx), content that sniffs as
-//! HTML/text/JSON, or a `data:` payload that isn't valid base64. Anything
-//! ambiguous (unknown-but-not-textual bytes, unusual schemes, unknown content
-//! types) is **passed through** so the engine stays the source of truth and
-//! valid multimodal traffic is never broken by an over-eager check.
+//! HTML/text/JSON, or a `data:` payload that isn't decodable base64 under any
+//! common alphabet. Anything ambiguous (unknown-but-not-textual bytes, unusual
+//! schemes, unknown content types) is **passed through** so the engine stays
+//! the source of truth and valid multimodal traffic is never broken.
 //!
 //! ## SSRF
-//! Because this introduces an outbound fetch of client-controlled URLs, hosts
-//! that resolve to private/loopback/link-local/metadata ranges are refused
-//! (SGLang already fetches these today, so this is a net security improvement,
-//! not a new exposure). Pre-resolution is best-effort (TOCTOU is accepted; the
-//! threat model here is dead public URLs, not active SSRF).
+//! This introduces an outbound fetch of client-controlled URLs, so the
+//! validation client is hardened against reaching internal addresses:
+//!   * a dedicated [`reqwest::Client`] whose DNS resolver ([`SsrfResolver`])
+//!     refuses any **domain** that resolves to a private/loopback/link-local/
+//!     metadata range — this covers the initial request *and every redirect
+//!     hop* (redirects are still followed, so legitimately-redirecting image
+//!     URLs keep working);
+//!   * a redirect policy that additionally refuses hops to a disallowed **IP
+//!     literal** (the resolver isn't consulted for literals);
+//!   * an explicit check on the initial URL's host when it is an IP literal.
+//!
+//! SGLang already fetches these URLs today, so this is a net security
+//! improvement, not a new exposure.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use base64::Engine as _;
 use futures_util::stream::{self, StreamExt};
 use reqwest::header::CONTENT_TYPE;
 use serde_json::Value;
+use url::Host;
 
 use crate::error::AppError;
 
-/// Bytes sniffed from the head of a response/data payload to classify it.
-const SNIFF_LEN: usize = 512;
 /// Defensive cap on images validated per request (avoids unbounded fan-out).
 const MAX_IMAGES_PER_REQUEST: usize = 64;
+/// Redirect hops followed by the validation client.
+const MAX_REDIRECTS: usize = 5;
 
 /// Generic, content-free rejection message. Never echoes the URL or any user
 /// data (see proxy.rs sanitization rules / privacy requirements).
@@ -51,12 +61,15 @@ const REJECT_MSG: &str = "One or more image inputs could not be fetched or are n
 pub struct ImageValidationConfig {
     pub enabled: bool,
     pub timeout: Duration,
-    /// Max bytes read from a fetched image before giving up (only the head is
-    /// needed to sniff; we never buffer whole images).
+    /// Max bytes downloaded from a fetched image before classifying it. Only
+    /// the head is needed to sniff the type; the whole image is never buffered.
     pub max_bytes: usize,
     pub max_concurrency: usize,
-    /// Allow private/loopback hosts (set in tests so wiremock on 127.0.0.1
-    /// works; never enabled in production).
+    /// Allow private/loopback **IP-literal** hosts on the initial URL (set in
+    /// tests so wiremock on 127.0.0.1 works; never enabled in production).
+    /// Note: the client's [`SsrfResolver`] still blocks *domains* that resolve
+    /// to private ranges regardless of this flag — tests therefore use literal
+    /// loopback URLs, which bypass DNS.
     pub allow_private_hosts: bool,
 }
 
@@ -74,7 +87,6 @@ enum Verdict {
 /// image is plausibly valid. `request_json` must already be decrypted.
 pub async fn reject_invalid_images(
     request_json: &Value,
-    http_client: &reqwest::Client,
     cfg: &ImageValidationConfig,
 ) -> Result<(), AppError> {
     if !cfg.enabled {
@@ -89,7 +101,7 @@ pub async fn reject_invalid_images(
     // Each URL is moved into its own future (owning the String) so the buffered
     // stream stays `Send` for the axum handler.
     let mut results = stream::iter(urls.into_iter().take(MAX_IMAGES_PER_REQUEST))
-        .map(|url| async move { validate_one(&url, http_client, cfg).await })
+        .map(|url| async move { validate_one(&url, cfg).await })
         .buffer_unordered(cfg.max_concurrency.max(1));
 
     while let Some(verdict) = results.next().await {
@@ -129,11 +141,11 @@ fn collect_image_urls(request_json: &Value) -> Vec<String> {
     urls
 }
 
-async fn validate_one(url: &str, client: &reqwest::Client, cfg: &ImageValidationConfig) -> Verdict {
+async fn validate_one(url: &str, cfg: &ImageValidationConfig) -> Verdict {
     if let Some(rest) = url.strip_prefix("data:") {
         validate_data_url(rest)
     } else if url.starts_with("http://") || url.starts_with("https://") {
-        validate_http_url(url, client, cfg).await
+        validate_http_url(url, cfg).await
     } else if url.starts_with("file:") || url.starts_with("ftp:") || url.starts_with("gopher:") {
         // Dangerous / never a valid web image — refuse outright.
         Verdict::Reject
@@ -149,11 +161,11 @@ fn validate_data_url(rest: &str) -> Verdict {
         return Verdict::Reject; // malformed data URL
     };
     if meta.contains("base64") {
-        // Trim whitespace/newlines that some clients embed in base64.
-        let cleaned: String = data.chars().filter(|c| !c.is_whitespace()).collect();
-        match base64::engine::general_purpose::STANDARD.decode(cleaned.as_bytes()) {
-            Ok(bytes) => classify_bytes(&bytes, None),
-            Err(_) => Verdict::Reject, // not valid base64 → can't be a real image
+        match decode_b64_lenient(data) {
+            // The declared media type is client-controlled and is exactly what
+            // lies in the mislabeled cases — classify the bytes, not the label.
+            Some(bytes) => classify_bytes(&bytes, None),
+            None => Verdict::Reject, // not decodable base64 under any alphabet
         }
     } else {
         // Percent-encoded / plain data URLs are rare; don't risk a false reject.
@@ -161,30 +173,49 @@ fn validate_data_url(rest: &str) -> Verdict {
     }
 }
 
-async fn validate_http_url(
-    url: &str,
-    client: &reqwest::Client,
-    cfg: &ImageValidationConfig,
-) -> Verdict {
+/// Decode base64 tolerantly: try standard and URL-safe alphabets, padded and
+/// unpadded. Whitespace (newlines clients embed) is stripped first. Returns
+/// `None` only when the payload decodes under none of them.
+fn decode_b64_lenient(data: &str) -> Option<Vec<u8>> {
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+    let cleaned: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+    for engine in [STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD] {
+        if let Ok(bytes) = engine.decode(cleaned.as_bytes()) {
+            return Some(bytes);
+        }
+    }
+    None
+}
+
+async fn validate_http_url(url: &str, cfg: &ImageValidationConfig) -> Verdict {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return Verdict::Reject;
     };
-    let Some(host) = parsed.host_str() else {
-        return Verdict::Reject;
-    };
-    let port = parsed
-        .port_or_known_default()
-        .unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
 
-    // SSRF guard: refuse hosts that resolve to non-public ranges.
-    if !cfg.allow_private_hosts && resolves_to_private(host, port).await {
-        return Verdict::Reject;
+    // SSRF guard for the *initial* URL when it's an IP literal: the client's
+    // resolver isn't consulted for literals. Domains (initial + redirect hops)
+    // are guarded by SsrfResolver; literal redirect hops by the redirect policy.
+    match parsed.host() {
+        None => return Verdict::Reject,
+        Some(Host::Ipv4(ip)) if !cfg.allow_private_hosts && is_disallowed_ip(IpAddr::V4(ip)) => {
+            return Verdict::Reject;
+        }
+        Some(Host::Ipv6(ip)) if !cfg.allow_private_hosts && is_disallowed_ip(IpAddr::V6(ip)) => {
+            return Verdict::Reject;
+        }
+        _ => {}
     }
 
-    let resp = match client.get(url).timeout(cfg.timeout).send().await {
+    let resp = match validation_client()
+        .get(url)
+        .timeout(cfg.timeout)
+        .send()
+        .await
+    {
         Ok(r) if r.status().is_success() => r,
-        // Unfetchable (DNS/connect/timeout) or non-2xx → the engine would fail
-        // on the same payload. Reject.
+        // Unfetchable (DNS/connect/timeout), blocked by the SSRF resolver, a
+        // redirect we refused to follow, or non-2xx → the engine would fail on
+        // the same payload. Reject.
         _ => return Verdict::Reject,
     };
 
@@ -194,15 +225,17 @@ async fn validate_http_url(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_ascii_lowercase());
 
-    // Read only the head — enough to sniff magic bytes; never buffer the image.
-    let cap = cfg.max_bytes.max(SNIFF_LEN);
-    let mut head = Vec::with_capacity(SNIFF_LEN.min(cap));
+    // Download only the head (bounded by max_bytes) — enough to sniff the type;
+    // never buffer the whole image.
+    let cap = cfg.max_bytes.max(64);
+    let mut head = Vec::new();
     let mut body = resp.bytes_stream();
     while let Some(chunk) = body.next().await {
         match chunk {
             Ok(b) => {
                 head.extend_from_slice(&b);
-                if head.len() >= SNIFF_LEN || head.len() >= cap {
+                if head.len() >= cap {
+                    head.truncate(cap);
                     break;
                 }
             }
@@ -211,6 +244,65 @@ async fn validate_http_url(
     }
 
     classify_bytes(&head, content_type.as_deref())
+}
+
+/// The dedicated client used for image validation fetches. Built once.
+///
+/// Differs from the shared client in two security-relevant ways: it resolves
+/// through [`SsrfResolver`] (rejects domains pointing at non-public ranges) and
+/// uses a redirect policy that refuses hops to disallowed IP literals while
+/// still following ordinary redirects (so valid redirecting image URLs work).
+fn validation_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        let redirect = reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= MAX_REDIRECTS {
+                return attempt.stop();
+            }
+            // Block redirects to a disallowed IP literal. Domain hops are
+            // guarded by SsrfResolver during connection.
+            let blocked = match attempt.url().host() {
+                Some(Host::Ipv4(ip)) => is_disallowed_ip(IpAddr::V4(ip)),
+                Some(Host::Ipv6(ip)) => is_disallowed_ip(IpAddr::V6(ip)),
+                _ => false,
+            };
+            if blocked {
+                attempt.stop()
+            } else {
+                attempt.follow()
+            }
+        });
+        reqwest::Client::builder()
+            .redirect(redirect)
+            .dns_resolver(Arc::new(SsrfResolver))
+            .build()
+            .expect("build image-validation reqwest client")
+    })
+}
+
+/// A reqwest DNS resolver that resolves IPv4-only (matching the proxy's main
+/// client, which avoids IPv6-unreachable stalls inside CVMs) and refuses any
+/// name that resolves to a non-public address — closing SSRF via the initial
+/// domain and via redirect hops alike, with the checked IP equal to the
+/// connected IP (no resolve-then-connect TOCTOU window).
+struct SsrfResolver;
+
+impl reqwest::dns::Resolve for SsrfResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host(format!("{}:0", name.as_str()))
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                .filter(|a| a.is_ipv4())
+                .collect();
+            if addrs.iter().any(|a| is_disallowed_ip(a.ip())) {
+                return Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                    "image host resolves to a non-public address",
+                ));
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
 }
 
 /// Decide whether bytes (and optional content-type) are a plausible image.
@@ -310,32 +402,6 @@ fn looks_textual(b: &[u8]) -> bool {
         || s.starts_with(b"[")
 }
 
-/// Best-effort resolve `host` and report whether it maps to a non-public range
-/// (loopback/private/link-local/CGNAT/metadata/ULA). Resolution failure is
-/// treated as "not private" so the subsequent fetch produces the real
-/// unfetchable verdict (a dead public host shouldn't be mistaken for SSRF).
-async fn resolves_to_private(host: &str, port: u16) -> bool {
-    // Literal IP?
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return is_disallowed_ip(ip);
-    }
-    match tokio::net::lookup_host((host, port)).await {
-        Ok(addrs) => {
-            let mut any = false;
-            for a in addrs {
-                any = true;
-                if is_disallowed_ip(a.ip()) {
-                    return true; // reject if ANY resolved IP is internal
-                }
-            }
-            // If it didn't resolve to anything, let the fetch decide.
-            let _ = any;
-            false
-        }
-        Err(_) => false,
-    }
-}
-
 fn is_disallowed_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -371,7 +437,7 @@ mod tests {
         ImageValidationConfig {
             enabled: true,
             timeout: Duration::from_secs(2),
-            max_bytes: 65536,
+            max_bytes: 2048,
             max_concurrency: 4,
             allow_private_hosts: true,
         }
@@ -429,7 +495,6 @@ mod tests {
 
     #[test]
     fn classify_uses_content_type_then_magic() {
-        // HTML error page masquerading as an image URL → reject.
         assert_eq!(
             classify_bytes(
                 b"<!doctype html><html>login</html>",
@@ -437,17 +502,14 @@ mod tests {
             ),
             Verdict::Reject
         );
-        // Real PNG → pass even with a missing/odd content type.
         assert_eq!(
             classify_bytes(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A], None),
             Verdict::Pass
         );
-        // image/* content type → pass regardless of (truncated) bytes.
         assert_eq!(
             classify_bytes(&[0x00, 0x01], Some("image/png")),
             Verdict::Pass
         );
-        // Unknown binary, no content type → fail-open (pass).
         assert_eq!(
             classify_bytes(&[0x00, 0x01, 0x02, 0x03], None),
             Verdict::Pass
@@ -463,19 +525,32 @@ mod tests {
             validate_data_url(&format!("image/png;base64,{png}")),
             Verdict::Pass
         );
-        // base64 of an HTML page → reject.
+        // base64 of an HTML page → reject (bytes sniff as HTML despite image/* label).
         let html = base64::engine::general_purpose::STANDARD.encode("<!doctype html><html></html>");
         assert_eq!(
             validate_data_url(&format!("image/png;base64,{html}")),
             Verdict::Reject
         );
-        // Invalid base64 → reject.
+        // Truly non-base64 → reject.
         assert_eq!(
-            validate_data_url("image/png;base64,!!!notb64!!!"),
+            validate_data_url("image/png;base64,!!! not base64 @@@"),
             Verdict::Reject
         );
         // Malformed (no comma) → reject.
         assert_eq!(validate_data_url("image/png;base64"), Verdict::Reject);
+    }
+
+    #[test]
+    fn data_url_url_safe_and_unpadded_decode() {
+        // URL-safe alphabet + no padding must NOT be false-rejected: a PNG
+        // header has bytes that encode with `-`/`_` and would fail STANDARD.
+        let raw = [0xFB, 0xFF, 0xBFu8]; // -> "+/+/" std, "-_-_" url-safe
+        let url_safe = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
+        // Decodes fine; bytes are unknown/non-textual → fail-open Pass.
+        assert_eq!(
+            validate_data_url(&format!("image/png;base64,{url_safe}")),
+            Verdict::Pass
+        );
     }
 
     #[test]
@@ -519,9 +594,7 @@ mod tests {
         });
         let mut c = cfg();
         c.enabled = false;
-        assert!(reject_invalid_images(&v, &reqwest::Client::new(), &c)
-            .await
-            .is_ok());
+        assert!(reject_invalid_images(&v, &c).await.is_ok());
     }
 
     #[tokio::test]
@@ -531,8 +604,43 @@ mod tests {
                 {"type":"image_url","image_url":{"url":"file:///etc/passwd"}}
             ]}]
         });
-        let err = reject_invalid_images(&v, &reqwest::Client::new(), &cfg()).await;
-        assert!(matches!(err, Err(AppError::BadRequest(_))));
+        assert!(matches!(
+            reject_invalid_images(&v, &cfg()).await,
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn ipv6_literal_internal_host_rejected_without_fetch() {
+        // Regression: bracketed IPv6 literals must be classified via host(),
+        // not host_str(), so an internal IPv6 literal is refused.
+        let mut c = cfg();
+        c.allow_private_hosts = false;
+        for url in ["http://[::1]:8000/x.png", "http://[fc00::1]/x.png"] {
+            let v = serde_json::json!({"messages":[{"role":"user","content":[
+                {"type":"image_url","image_url":{"url": url}}
+            ]}]});
+            assert!(
+                matches!(
+                    reject_invalid_images(&v, &c).await,
+                    Err(AppError::BadRequest(_))
+                ),
+                "{url} should be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ssrf_blocks_loopback_literal_when_not_allowed() {
+        let mut c = cfg();
+        c.allow_private_hosts = false;
+        let v = serde_json::json!({"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":"http://127.0.0.1:1/x.png"}}
+        ]}]});
+        assert!(matches!(
+            reject_invalid_images(&v, &c).await,
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[tokio::test]
@@ -541,7 +649,6 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
-        // A dead Facebook-style link that 200s with an HTML login page.
         Mock::given(method("GET"))
             .and(path("/html.jpg"))
             .respond_with(
@@ -551,7 +658,6 @@ mod tests {
             )
             .mount(&server)
             .await;
-        // A real PNG.
         Mock::given(method("GET"))
             .and(path("/real.png"))
             .respond_with(
@@ -561,44 +667,23 @@ mod tests {
             )
             .mount(&server)
             .await;
-        // Everything else 404s.
 
-        let client = reqwest::Client::new();
+        // wiremock binds to a 127.0.0.1 *literal*, so DNS (and SsrfResolver) is
+        // never consulted; allow_private_hosts lets the literal pre-check pass.
         let c = cfg();
-
         let req = |p: &str| {
             serde_json::json!({"messages":[{"role":"user","content":[
                 {"type":"image_url","image_url":{"url": format!("{}{}", server.uri(), p)}}
             ]}]})
         };
 
-        // HTML masquerading as an image → reject.
         assert!(matches!(
-            reject_invalid_images(&req("/html.jpg"), &client, &c).await,
+            reject_invalid_images(&req("/html.jpg"), &c).await,
             Err(AppError::BadRequest(_))
         ));
-        // Real PNG → pass.
-        assert!(reject_invalid_images(&req("/real.png"), &client, &c)
-            .await
-            .is_ok());
-        // Unreachable (404) → reject.
+        assert!(reject_invalid_images(&req("/real.png"), &c).await.is_ok());
         assert!(matches!(
-            reject_invalid_images(&req("/missing.png"), &client, &c).await,
-            Err(AppError::BadRequest(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn ssrf_blocks_loopback_when_not_allowed() {
-        // With private hosts disallowed (production default), a loopback image
-        // URL is refused without any fetch.
-        let mut c = cfg();
-        c.allow_private_hosts = false;
-        let v = serde_json::json!({"messages":[{"role":"user","content":[
-            {"type":"image_url","image_url":{"url":"http://127.0.0.1:1/x.png"}}
-        ]}]});
-        assert!(matches!(
-            reject_invalid_images(&v, &reqwest::Client::new(), &c).await,
+            reject_invalid_images(&req("/missing.png"), &c).await,
             Err(AppError::BadRequest(_))
         ));
     }

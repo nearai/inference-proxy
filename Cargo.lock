@@ -5322,6 +5322,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "wiremock",
  "x25519-dalek",

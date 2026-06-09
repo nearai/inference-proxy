@@ -63,6 +63,12 @@ fn build_test_app_inner(
         max_request_size: 1024 * 1024,
         max_image_request_size: 5 * 1024 * 1024,
         max_audio_request_size: 10 * 1024 * 1024,
+        // Off by default in tests so existing fixtures are unaffected; the
+        // dedicated image-validation tests build their own enabled config.
+        image_validation_enabled: false,
+        image_validation_timeout_secs: 5,
+        image_validation_max_bytes: 65536,
+        image_validation_max_concurrency: 8,
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
         dev_mode: true,
@@ -3184,6 +3190,12 @@ fn build_test_app_with_cloud_api_retries(
         max_request_size: 1024 * 1024,
         max_image_request_size: 5 * 1024 * 1024,
         max_audio_request_size: 10 * 1024 * 1024,
+        // Off by default in tests so existing fixtures are unaffected; the
+        // dedicated image-validation tests build their own enabled config.
+        image_validation_enabled: false,
+        image_validation_timeout_secs: 5,
+        image_validation_max_bytes: 65536,
+        image_validation_max_concurrency: 8,
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
         cloud_api_url: Some(cloud_api_url.to_string()),
@@ -5502,6 +5514,12 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         max_request_size: 1024 * 1024,
         max_image_request_size: 5 * 1024 * 1024,
         max_audio_request_size: 10 * 1024 * 1024,
+        // Off by default in tests so existing fixtures are unaffected; the
+        // dedicated image-validation tests build their own enabled config.
+        image_validation_enabled: false,
+        image_validation_timeout_secs: 5,
+        image_validation_max_bytes: 65536,
+        image_validation_max_concurrency: 8,
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
         dev_mode: true,
@@ -5897,6 +5915,12 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         max_request_size: 1024 * 1024,
         max_image_request_size: 5 * 1024 * 1024,
         max_audio_request_size: 10 * 1024 * 1024,
+        // Off by default in tests so existing fixtures are unaffected; the
+        // dedicated image-validation tests build their own enabled config.
+        image_validation_enabled: false,
+        image_validation_timeout_secs: 5,
+        image_validation_max_bytes: 65536,
+        image_validation_max_concurrency: 8,
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
         dev_mode: true,

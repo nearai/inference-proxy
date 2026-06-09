@@ -53,6 +53,14 @@ pub struct Config {
     pub max_image_request_size: usize,
     pub max_audio_request_size: usize,
 
+    // Pre-dispatch image validation (reject unfetchable/non-image inputs before
+    // they reach the engine — nearai/infra#159, #172). Enabled by default; set
+    // VLLM_PROXY_IMAGE_VALIDATION_DISABLED=1 to turn off.
+    pub image_validation_enabled: bool,
+    pub image_validation_timeout_secs: u64,
+    pub image_validation_max_bytes: usize,
+    pub image_validation_max_concurrency: usize,
+
     // Cache
     pub chat_cache_expiration_secs: u64,
     /// TTL for cached nonce-less attestation reports (seconds).
@@ -304,6 +312,14 @@ impl Config {
             max_request_size: env_int("VLLM_PROXY_MAX_REQUEST_SIZE", 10 * 1024 * 1024),
             max_image_request_size: env_int("VLLM_PROXY_MAX_IMAGE_REQUEST_SIZE", 50 * 1024 * 1024),
             max_audio_request_size: env_int("VLLM_PROXY_MAX_AUDIO_REQUEST_SIZE", 100 * 1024 * 1024),
+            image_validation_enabled: !env_bool("VLLM_PROXY_IMAGE_VALIDATION_DISABLED"),
+            image_validation_timeout_secs: env_int("VLLM_PROXY_IMAGE_VALIDATION_TIMEOUT_SECS", 5)
+                as u64,
+            image_validation_max_bytes: env_int("VLLM_PROXY_IMAGE_VALIDATION_MAX_BYTES", 65536),
+            image_validation_max_concurrency: env_int(
+                "VLLM_PROXY_IMAGE_VALIDATION_MAX_CONCURRENCY",
+                8,
+            ),
             chat_cache_expiration_secs: env_int("CHAT_CACHE_EXPIRATION", 1200) as u64,
             attestation_cache_ttl_secs: env_int("ATTESTATION_CACHE_TTL", 300) as u64,
             dev_mode: env_bool("DEV"),
@@ -374,6 +390,18 @@ impl Config {
         }
 
         Ok(config)
+    }
+
+    /// Build the runtime config for pre-dispatch image validation.
+    pub fn image_validation(&self) -> crate::image_validation::ImageValidationConfig {
+        crate::image_validation::ImageValidationConfig {
+            enabled: self.image_validation_enabled,
+            timeout: std::time::Duration::from_secs(self.image_validation_timeout_secs),
+            max_bytes: self.image_validation_max_bytes,
+            max_concurrency: self.image_validation_max_concurrency,
+            // Production never allows private hosts; only tests opt in.
+            allow_private_hosts: false,
+        }
     }
 }
 

@@ -7,4 +7,5 @@
 ignore = [
     "RUSTSEC-2024-0436", # paste unmaintained, transitive via alloy-primitives
     "RUSTSEC-2024-0388", # derivative unmaintained, transitive via ark-ff (arkworks)
+    "RUSTSEC-2026-0173", # proc-macro-error2 unmaintained, build-time transitive via alloy-sol-macro
 ]

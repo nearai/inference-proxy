@@ -96,11 +96,18 @@ pub async fn reject_invalid_images(
     if urls.is_empty() {
         return Ok(());
     }
+    // Reject (don't silently skip) requests over the per-request image cap —
+    // otherwise a bad image hiding past the cap would be forwarded unchecked.
+    if urls.len() > MAX_IMAGES_PER_REQUEST {
+        return Err(AppError::BadRequest(format!(
+            "Too many image inputs in a single request (max {MAX_IMAGES_PER_REQUEST})."
+        )));
+    }
 
-    // Validate with bounded concurrency; short-circuit on the first bad image.
-    // Each URL is moved into its own future (owning the String) so the buffered
-    // stream stays `Send` for the axum handler.
-    let mut results = stream::iter(urls.into_iter().take(MAX_IMAGES_PER_REQUEST))
+    // Validate ALL images with bounded concurrency; short-circuit on the first
+    // bad one. Each URL is moved into its own future (owning the String) so the
+    // buffered stream stays `Send` for the axum handler.
+    let mut results = stream::iter(urls.into_iter())
         .map(|url| async move { validate_one(&url, cfg).await })
         .buffer_unordered(cfg.max_concurrency.max(1));
 
@@ -314,20 +321,25 @@ fn classify_bytes(bytes: &[u8], content_type: Option<&str>) -> Verdict {
     if bytes.is_empty() {
         return Verdict::Reject;
     }
-    if let Some(ct) = content_type {
-        let ct = ct.split(';').next().unwrap_or("").trim();
-        if ct.starts_with("image/") || ct.starts_with("video/") {
-            return Verdict::Pass;
-        }
-        if is_textual_content_type(ct) {
-            return Verdict::Reject;
-        }
+    // The actual bytes win over the (attacker/server-controlled) content type:
+    // a dead URL serving an HTML/JSON error page with `Content-Type: image/png`
+    // must still be rejected. Real images never match these markers, so this
+    // can't false-reject a genuine image regardless of its declared type.
+    if looks_textual(bytes) {
+        return Verdict::Reject;
     }
     if is_image_magic(bytes) {
         return Verdict::Pass;
     }
-    if looks_textual(bytes) {
-        return Verdict::Reject;
+    // Bytes are inconclusive — fall back to the content type as a tiebreaker.
+    if let Some(ct) = content_type {
+        let ct = ct.split(';').next().unwrap_or("").trim();
+        if is_textual_content_type(ct) {
+            return Verdict::Reject;
+        }
+        if ct.starts_with("image/") || ct.starts_with("video/") {
+            return Verdict::Pass;
+        }
     }
     // Unknown but not obviously textual — let the engine be the judge.
     Verdict::Pass
@@ -544,6 +556,57 @@ mod tests {
         );
         // Malformed (no comma) → reject.
         assert_eq!(validate_data_url("image/png;base64"), Verdict::Reject);
+    }
+
+    #[test]
+    fn html_body_with_image_content_type_is_rejected() {
+        // A dead URL / hostile server returning an HTML (or JSON) error page
+        // with an image/* content type must NOT pass — the bytes win.
+        assert_eq!(
+            classify_bytes(b"<!doctype html><html>nope</html>", Some("image/png")),
+            Verdict::Reject
+        );
+        assert_eq!(
+            classify_bytes(b"{\"error\":\"gone\"}", Some("image/jpeg")),
+            Verdict::Reject
+        );
+        // A genuine image is still accepted whatever the declared type.
+        assert_eq!(
+            classify_bytes(&[0xFF, 0xD8, 0xFF, 0xE0], Some("application/octet-stream")),
+            Verdict::Pass
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_request_over_image_cap() {
+        // A request with more images than the cap is rejected outright, so a
+        // bad image hidden past the cap can't slip through unvalidated.
+        let png = base64::engine::general_purpose::STANDARD
+            .encode([0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        let parts: Vec<_> = (0..=MAX_IMAGES_PER_REQUEST)
+            .map(|_| serde_json::json!({"type":"image_url","image_url":{"url": format!("data:image/png;base64,{png}")}}))
+            .collect();
+        let v = serde_json::json!({"messages":[{"role":"user","content": parts}]});
+        assert!(matches!(
+            reject_invalid_images(&v, &cfg()).await,
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn validates_all_images_not_just_first() {
+        // A valid image first, a bad one second → the request is still rejected
+        // (every image is validated, not just the first).
+        let png = base64::engine::general_purpose::STANDARD
+            .encode([0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        let v = serde_json::json!({"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url": format!("data:image/png;base64,{png}")}},
+            {"type":"image_url","image_url":{"url":"file:///etc/passwd"}}
+        ]}]});
+        assert!(matches!(
+            reject_invalid_images(&v, &cfg()).await,
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[test]

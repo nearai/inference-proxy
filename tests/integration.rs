@@ -18,7 +18,13 @@ fn build_test_app(mock_url: &str) -> axum::Router {
 
 /// Build a test app with a specific dstack socket path (used by /healthz tests).
 fn build_test_app_with_dstack_socket(mock_url: &str, dstack_socket_path: &str) -> axum::Router {
-    build_test_app_inner(mock_url, 100, 200, dstack_socket_path.to_string())
+    build_test_app_inner(mock_url, 100, 200, dstack_socket_path.to_string(), false)
+}
+
+/// Build a test app with pre-dispatch image validation enabled (and private
+/// hosts allowed so loopback wiremock image URLs are reachable).
+fn build_test_app_with_image_validation(mock_url: &str) -> axum::Router {
+    build_test_app_inner(mock_url, 100, 200, "/var/run/dstack.sock".to_string(), true)
 }
 
 /// Build a test app with custom rate limit settings.
@@ -32,6 +38,7 @@ fn build_test_app_with_rate_limit(
         rate_per_second,
         rate_burst,
         "/var/run/dstack.sock".to_string(),
+        false,
     )
 }
 
@@ -40,6 +47,7 @@ fn build_test_app_inner(
     rate_per_second: u64,
     rate_burst: u32,
     dstack_socket_path: String,
+    image_validation: bool,
 ) -> axum::Router {
     let base = mock_url.trim_end_matches('/');
 
@@ -65,10 +73,11 @@ fn build_test_app_inner(
         max_audio_request_size: 10 * 1024 * 1024,
         // Off by default in tests so existing fixtures are unaffected; the
         // dedicated image-validation tests build their own enabled config.
-        image_validation_enabled: false,
+        image_validation_enabled: image_validation,
         image_validation_timeout_secs: 5,
-        image_validation_max_bytes: 65536,
+        image_validation_max_bytes: 8192,
         image_validation_max_concurrency: 8,
+        image_validation_allow_private_hosts: image_validation,
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
         dev_mode: true,
@@ -411,6 +420,94 @@ async fn test_chat_completions_non_streaming() {
     let body = body_to_json(response).await;
     assert_eq!(body["id"], "chatcmpl-test123");
     assert_eq!(body["choices"][0]["message"]["content"], "Hello!");
+}
+
+#[tokio::test]
+async fn test_chat_completions_image_validation_rejects_bad_image() {
+    // Handler-level wiring: with image validation enabled, a request carrying a
+    // clearly-bad image (dangerous scheme) is rejected at the proxy with a 400
+    // and OpenAI error shape — before reaching the backend.
+    let mock_server = MockServer::start().await;
+    // Backend mock present but must NOT be hit (validation rejects first).
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"x"})))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app_with_image_validation(&mock_server.uri());
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {"url": "file:///etc/passwd"}}
+        ]}],
+        "stream": false
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(response).await;
+    assert!(
+        body["error"]["message"].is_string(),
+        "expected OpenAI error shape, got: {body}"
+    );
+    // The generic message must not echo the offending URL.
+    assert!(!body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("/etc/passwd"));
+}
+
+#[tokio::test]
+async fn test_chat_completions_image_validation_allows_text_only() {
+    // Control: validation enabled but a text-only request passes through to the
+    // backend unchanged (validation is a no-op without image parts).
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-ok",
+            "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role":"assistant","content":"hi"}, "finish_reason":"stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app_with_image_validation(&mock_server.uri());
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": false
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 // ---- Streaming chat completions ----
@@ -3194,8 +3291,9 @@ fn build_test_app_with_cloud_api_retries(
         // dedicated image-validation tests build their own enabled config.
         image_validation_enabled: false,
         image_validation_timeout_secs: 5,
-        image_validation_max_bytes: 65536,
+        image_validation_max_bytes: 8192,
         image_validation_max_concurrency: 8,
+        image_validation_allow_private_hosts: false,
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
         cloud_api_url: Some(cloud_api_url.to_string()),
@@ -5518,8 +5616,9 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         // dedicated image-validation tests build their own enabled config.
         image_validation_enabled: false,
         image_validation_timeout_secs: 5,
-        image_validation_max_bytes: 65536,
+        image_validation_max_bytes: 8192,
         image_validation_max_concurrency: 8,
+        image_validation_allow_private_hosts: false,
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
         dev_mode: true,
@@ -5919,8 +6018,9 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         // dedicated image-validation tests build their own enabled config.
         image_validation_enabled: false,
         image_validation_timeout_secs: 5,
-        image_validation_max_bytes: 65536,
+        image_validation_max_bytes: 8192,
         image_validation_max_concurrency: 8,
+        image_validation_allow_private_hosts: false,
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
         dev_mode: true,

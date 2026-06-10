@@ -47,10 +47,13 @@ use url::Host;
 
 use crate::error::AppError;
 
-/// Defensive cap on images validated per request (avoids unbounded fan-out).
+/// Cap on remote (http/https) images fetched per request.
 const MAX_IMAGES_PER_REQUEST: usize = 64;
 /// Redirect hops followed by the validation client.
 const MAX_REDIRECTS: usize = 5;
+/// How many decoded bytes of a `data:` base64 payload to materialize for
+/// type-sniffing (bounds allocation regardless of the payload's true size).
+const SNIFF_DECODE_BYTES: usize = 4096;
 
 /// Generic, content-free rejection message. Never echoes the URL or any user
 /// data (see proxy.rs sanitization rules / privacy requirements).
@@ -92,15 +95,29 @@ pub async fn reject_invalid_images(
     if !cfg.enabled {
         return Ok(());
     }
-    let urls = collect_image_urls(request_json);
+    let urls = match collect_image_urls(request_json) {
+        Ok(u) => u,
+        Err(()) => {
+            tracing::debug!(
+                reason = "malformed_image_part",
+                "image validation rejected request"
+            );
+            return Err(AppError::BadRequest(
+                "Malformed image_url in request.".to_string(),
+            ));
+        }
+    };
     if urls.is_empty() {
         return Ok(());
     }
-    // Reject (don't silently skip) requests over the per-request image cap —
-    // otherwise a bad image hiding past the cap would be forwarded unchecked.
-    if urls.len() > MAX_IMAGES_PER_REQUEST {
+    // Only remote (http/https) URLs are fetched; count those against the cap so
+    // long multi-turn vision histories full of cheap, locally-validated `data:`
+    // URLs aren't rejected. Reject (don't silently skip) when the cap is hit so
+    // a bad image past it can't slip through unvalidated.
+    let remote = urls.iter().filter(|u| is_remote_scheme(u)).count();
+    if remote > MAX_IMAGES_PER_REQUEST {
         return Err(AppError::BadRequest(format!(
-            "Too many image inputs in a single request (max {MAX_IMAGES_PER_REQUEST})."
+            "Too many remote image inputs in a single request (max {MAX_IMAGES_PER_REQUEST})."
         )));
     }
 
@@ -119,46 +136,71 @@ pub async fn reject_invalid_images(
     Ok(())
 }
 
-/// Collect every `image_url.url` string from `messages[*].content[*]`.
-/// Content may be a string (no images) or an array of typed parts; only the
-/// array form carries images.
-fn collect_image_urls(request_json: &Value) -> Vec<String> {
+/// Collect every image URL from `messages[*].content[*]` typed parts. Content
+/// may be a string (no images) or an array of typed parts; only the array form
+/// carries images.
+///
+/// Returns `Err(())` if an `image_url` part is structurally malformed — the
+/// `image_url` value is neither an object with a string `url` nor a bare string
+/// URL. Such a request is rejected rather than silently dropping the part and
+/// forwarding an unvalidated value to a lenient engine.
+fn collect_image_urls(request_json: &Value) -> Result<Vec<String>, ()> {
     let mut urls = Vec::new();
     let Some(messages) = request_json.get("messages").and_then(|m| m.as_array()) else {
-        return urls;
+        return Ok(urls);
     };
     for msg in messages {
         let Some(parts) = msg.get("content").and_then(|c| c.as_array()) else {
             continue;
         };
         for part in parts {
-            // OpenAI shape: {"type":"image_url","image_url":{"url":"..."}}
             if part.get("type").and_then(|t| t.as_str()) != Some("image_url") {
                 continue;
             }
-            if let Some(url) = part
-                .get("image_url")
-                .and_then(|iu| iu.get("url"))
-                .and_then(|u| u.as_str())
-            {
-                urls.push(url.to_string());
+            match part.get("image_url") {
+                // Standard shape: {"url": "..."} (extra fields like `detail` ok).
+                Some(Value::Object(obj)) => match obj.get("url").and_then(|u| u.as_str()) {
+                    Some(u) => urls.push(u.to_string()),
+                    None => return Err(()),
+                },
+                // Lenient string shape `{"image_url":"http://…"}` — validate it.
+                Some(Value::String(s)) => urls.push(s.clone()),
+                // type=image_url but image_url missing or not object/string → malformed.
+                _ => return Err(()),
             }
         }
     }
-    urls
+    Ok(urls)
+}
+
+/// Whether `url`'s scheme is http/https (case-insensitive). These are the only
+/// schemes that trigger an outbound fetch.
+fn is_remote_scheme(url: &str) -> bool {
+    matches!(
+        url.split_once(':')
+            .map(|(s, _)| s.to_ascii_lowercase())
+            .as_deref(),
+        Some("http") | Some("https")
+    )
 }
 
 async fn validate_one(url: &str, cfg: &ImageValidationConfig) -> Verdict {
-    if let Some(rest) = url.strip_prefix("data:") {
-        validate_data_url(rest)
-    } else if url.starts_with("http://") || url.starts_with("https://") {
-        validate_http_url(url, cfg).await
-    } else if url.starts_with("file:") || url.starts_with("ftp:") || url.starts_with("gopher:") {
-        // Dangerous / never a valid web image — refuse outright.
-        Verdict::Reject
-    } else {
-        // Unknown scheme: don't assume; let the engine handle it (fail-open).
-        Verdict::Pass
+    // URL schemes are case-insensitive (RFC 3986) — normalize before matching
+    // so `HTTP://`, `DATA:`, `FILE:///` can't bypass validation or the
+    // dangerous-scheme refusal.
+    let (scheme, rest) = match url.split_once(':') {
+        Some((s, r)) => (s.to_ascii_lowercase(), r),
+        None => return Verdict::Pass, // no scheme — let the engine decide
+    };
+    match scheme.as_str() {
+        "data" => validate_data_url(rest),
+        "http" | "https" => validate_http_url(url, cfg).await,
+        "file" | "ftp" | "gopher" => {
+            // Dangerous / never a valid web image — refuse outright.
+            tracing::debug!(reason = "dangerous_scheme", "image validation rejected");
+            Verdict::Reject
+        }
+        _ => Verdict::Pass, // unknown scheme: don't assume (fail-open)
     }
 }
 
@@ -168,11 +210,14 @@ fn validate_data_url(rest: &str) -> Verdict {
         return Verdict::Reject; // malformed data URL
     };
     if meta.contains("base64") {
-        match decode_b64_lenient(data) {
+        match decode_b64_prefix(data) {
             // The declared media type is client-controlled and is exactly what
             // lies in the mislabeled cases — classify the bytes, not the label.
             Some(bytes) => classify_bytes(&bytes, None),
-            None => Verdict::Reject, // not decodable base64 under any alphabet
+            None => {
+                tracing::debug!(reason = "data_url_bad_base64", "image validation rejected");
+                Verdict::Reject // not decodable base64 under any alphabet
+            }
         }
     } else {
         // Percent-encoded / plain data URLs are rare; don't risk a false reject.
@@ -180,18 +225,32 @@ fn validate_data_url(rest: &str) -> Verdict {
     }
 }
 
-/// Decode base64 tolerantly: try standard and URL-safe alphabets, padded and
-/// unpadded. Whitespace (newlines clients embed) is stripped first. Returns
-/// `None` only when the payload decodes under none of them.
-fn decode_b64_lenient(data: &str) -> Option<Vec<u8>> {
+/// Decode the head of a base64 payload for type-sniffing. Tries standard and
+/// URL-safe alphabets, padded and unpadded; embedded whitespace is stripped.
+/// The input is truncated to roughly `SNIFF_DECODE_BYTES` worth of base64
+/// first, so a large `data:` URL isn't fully allocated (four times) just to
+/// read its header. Returns `None` only when the head decodes under no alphabet.
+fn decode_b64_prefix(data: &str) -> Option<Vec<u8>> {
     use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
     let cleaned: String = data.chars().filter(|c| !c.is_whitespace()).collect();
-    for engine in [STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD] {
-        if let Ok(bytes) = engine.decode(cleaned.as_bytes()) {
-            return Some(bytes);
+    let cap_chars = (SNIFF_DECODE_BYTES / 3 + 1) * 4; // multiple of 4
+    if cleaned.len() <= cap_chars {
+        for engine in [STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD] {
+            if let Ok(bytes) = engine.decode(cleaned.as_bytes()) {
+                return Some(bytes);
+            }
         }
+        None
+    } else {
+        // Decode just the 4-char-aligned prefix (no trailing padding → no-pad).
+        let prefix = &cleaned.as_bytes()[..cap_chars];
+        for engine in [STANDARD_NO_PAD, URL_SAFE_NO_PAD] {
+            if let Ok(bytes) = engine.decode(prefix) {
+                return Some(bytes);
+            }
+        }
+        None
     }
-    None
 }
 
 async fn validate_http_url(url: &str, cfg: &ImageValidationConfig) -> Verdict {
@@ -205,26 +264,57 @@ async fn validate_http_url(url: &str, cfg: &ImageValidationConfig) -> Verdict {
     match parsed.host() {
         None => return Verdict::Reject,
         Some(Host::Ipv4(ip)) if !cfg.allow_private_hosts && is_disallowed_ip(IpAddr::V4(ip)) => {
+            tracing::debug!(reason = "ssrf_ip_literal", "image validation rejected");
             return Verdict::Reject;
         }
         Some(Host::Ipv6(ip)) if !cfg.allow_private_hosts && is_disallowed_ip(IpAddr::V6(ip)) => {
+            tracing::debug!(reason = "ssrf_ip_literal", "image validation rejected");
             return Verdict::Reject;
         }
         _ => {}
     }
 
+    // Global cap on concurrent outbound fetches across ALL requests, so a flood
+    // can't turn the proxy into an unbounded fetcher (FD/socket pressure). The
+    // per-request `buffer_unordered` bound is layered on top.
+    let _permit = global_fetch_semaphore(cfg.max_concurrency).acquire().await;
+
+    // Present like a normal client: many image CDNs gate on User-Agent/Accept
+    // (see catch_all.rs / cloud-api#606). A UA-less request would 403 here while
+    // the engine's fetcher succeeds, producing false rejects.
     let resp = match validation_client()
         .get(url)
         .timeout(cfg.timeout)
+        .header(
+            reqwest::header::USER_AGENT,
+            "Mozilla/5.0 (compatible; nearai-inference-proxy/1.0; +https://near.ai)",
+        )
+        .header(reqwest::header::ACCEPT, "image/*,*/*;q=0.8")
         .send()
         .await
     {
-        Ok(r) if r.status().is_success() => r,
-        // Unfetchable (DNS/connect/timeout), blocked by the SSRF resolver, a
-        // redirect we refused to follow, or non-2xx → the engine would fail on
-        // the same payload. Reject.
-        _ => return Verdict::Reject,
+        Ok(r) => r,
+        // Transport failure (DNS/connect/timeout) or blocked by SsrfResolver →
+        // a definitive failure the engine would also hit. Reject.
+        Err(_) => {
+            tracing::debug!(reason = "fetch_error", "image validation rejected");
+            return Verdict::Reject;
+        }
     };
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
+        // Definitively gone.
+        tracing::debug!(status = %status.as_u16(), reason = "http_gone", "image validation rejected");
+        return Verdict::Reject;
+    }
+    if !status.is_success() {
+        // Ambiguous (401/403/429, 5xx, stopped redirect, other 4xx): could be
+        // UA-gating, rate-limiting, or transient. Per fail-open, let the engine
+        // be the judge rather than emit a false 400.
+        tracing::debug!(status = %status.as_u16(), reason = "http_ambiguous_pass", "image validation passthrough");
+        return Verdict::Pass;
+    }
 
     let content_type = resp
         .headers()
@@ -250,7 +340,18 @@ async fn validate_http_url(url: &str, cfg: &ImageValidationConfig) -> Verdict {
         }
     }
 
-    classify_bytes(&head, content_type.as_deref())
+    let verdict = classify_bytes(&head, content_type.as_deref());
+    if verdict == Verdict::Reject {
+        tracing::debug!(reason = "non_image_body", "image validation rejected");
+    }
+    verdict
+}
+
+/// Global cap on concurrent outbound image-validation fetches, shared across
+/// all requests. Sized once from `max_concurrency` on first use.
+fn global_fetch_semaphore(permits: usize) -> &'static tokio::sync::Semaphore {
+    static SEM: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+    SEM.get_or_init(|| tokio::sync::Semaphore::new(permits.max(1)))
 }
 
 /// The dedicated client used for image validation fetches. Built once.
@@ -331,6 +432,12 @@ fn classify_bytes(bytes: &[u8], content_type: Option<&str>) -> Verdict {
     if is_image_magic(bytes) {
         return Verdict::Pass;
     }
+    // No image magic and the head is essentially printable text (e.g. a plain
+    // "Not Found" body or a base64-encoded text blob): not a decodable raster
+    // image. Real images are binary, so this won't false-reject one.
+    if is_mostly_text(bytes) {
+        return Verdict::Reject;
+    }
     // Bytes are inconclusive — fall back to the content type as a tiebreaker.
     if let Some(ct) = content_type {
         let ct = ct.split(';').next().unwrap_or("").trim();
@@ -343,6 +450,21 @@ fn classify_bytes(bytes: &[u8], content_type: Option<&str>) -> Verdict {
     }
     // Unknown but not obviously textual — let the engine be the judge.
     Verdict::Pass
+}
+
+/// Heuristic: the head is (almost) entirely printable ASCII / common
+/// whitespace, with no image magic — i.e. plain text, not a raster image.
+/// Requires a little signal (>= 8 bytes) to avoid misjudging tiny heads, and a
+/// high printable ratio so genuinely-binary image data is never flagged.
+fn is_mostly_text(b: &[u8]) -> bool {
+    if b.len() < 8 {
+        return false; // too little signal — fail-open
+    }
+    let printable = b
+        .iter()
+        .filter(|&&c| c == b'\t' || c == b'\n' || c == b'\r' || (0x20..=0x7E).contains(&c))
+        .count();
+    printable * 100 >= b.len() * 95
 }
 
 fn is_textual_content_type(ct: &str) -> bool {
@@ -475,17 +597,41 @@ mod tests {
         });
         assert_eq!(
             collect_image_urls(&v),
-            vec![
+            Ok(vec![
                 "https://x/a.png".to_string(),
                 "data:image/png;base64,AAAA".to_string()
-            ]
+            ])
         );
     }
 
     #[test]
     fn text_only_request_has_no_images() {
         let v = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
-        assert!(collect_image_urls(&v).is_empty());
+        assert!(collect_image_urls(&v).unwrap().is_empty());
+    }
+
+    #[test]
+    fn string_form_image_url_is_collected() {
+        let v = serde_json::json!({"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":"https://x/a.png"}
+        ]}]});
+        assert_eq!(
+            collect_image_urls(&v),
+            Ok(vec!["https://x/a.png".to_string()])
+        );
+    }
+
+    #[test]
+    fn malformed_image_url_part_is_error() {
+        // type=image_url but image_url is a number / missing url → malformed.
+        for bad in [
+            serde_json::json!({"type":"image_url","image_url": 42}),
+            serde_json::json!({"type":"image_url","image_url": {"detail":"high"}}),
+            serde_json::json!({"type":"image_url"}),
+        ] {
+            let v = serde_json::json!({"messages":[{"role":"user","content":[bad]}]});
+            assert_eq!(collect_image_urls(&v), Err(()));
+        }
     }
 
     #[test]
@@ -578,19 +724,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_request_over_image_cap() {
-        // A request with more images than the cap is rejected outright, so a
-        // bad image hidden past the cap can't slip through unvalidated.
-        let png = base64::engine::general_purpose::STANDARD
-            .encode([0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    async fn rejects_request_over_remote_image_cap() {
+        // More than the cap of *remote* images → reject outright (before any
+        // fetch), so a bad image past the cap can't slip through unvalidated.
         let parts: Vec<_> = (0..=MAX_IMAGES_PER_REQUEST)
-            .map(|_| serde_json::json!({"type":"image_url","image_url":{"url": format!("data:image/png;base64,{png}")}}))
+            .map(|i| serde_json::json!({"type":"image_url","image_url":{"url": format!("https://example.invalid/{i}.png")}}))
             .collect();
         let v = serde_json::json!({"messages":[{"role":"user","content": parts}]});
         assert!(matches!(
             reject_invalid_images(&v, &cfg()).await,
             Err(AppError::BadRequest(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn data_urls_do_not_count_against_remote_cap() {
+        // Long multi-turn histories full of cheap, locally-validated `data:`
+        // URLs (well over the remote cap) must NOT be rejected.
+        let png = base64::engine::general_purpose::STANDARD
+            .encode([0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        let parts: Vec<_> = (0..MAX_IMAGES_PER_REQUEST + 10)
+            .map(|_| serde_json::json!({"type":"image_url","image_url":{"url": format!("data:image/png;base64,{png}")}}))
+            .collect();
+        let v = serde_json::json!({"messages":[{"role":"user","content": parts}]});
+        assert!(reject_invalid_images(&v, &cfg()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn uppercase_schemes_are_not_bypassed() {
+        // Case-insensitive scheme handling: dangerous + data schemes in any case.
+        let html = base64::engine::general_purpose::STANDARD.encode("<!doctype html><html></html>");
+        for url in [
+            "FILE:///etc/passwd".to_string(),
+            "File:///etc/passwd".to_string(),
+            format!("DATA:image/png;base64,{html}"),
+        ] {
+            let v = serde_json::json!({"messages":[{"role":"user","content":[
+                {"type":"image_url","image_url":{"url": url}}
+            ]}]});
+            assert!(
+                matches!(
+                    reject_invalid_images(&v, &cfg()).await,
+                    Err(AppError::BadRequest(_))
+                ),
+                "{url} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_text_body_is_rejected() {
+        // No image magic + (almost) all printable text → not a raster image.
+        assert_eq!(
+            classify_bytes(b"Not Found: the requested object does not exist.", None),
+            Verdict::Reject
+        );
+        assert!(is_mostly_text(b"this is just plain text, not an image"));
+        assert!(!is_mostly_text(&[
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46
+        ]));
+        // base64 of plain text in a data URL → reject.
+        let txt =
+            base64::engine::general_purpose::STANDARD.encode("totally not an image, just words");
+        assert_eq!(
+            validate_data_url(&format!("image/png;base64,{txt}")),
+            Verdict::Reject
+        );
     }
 
     #[tokio::test]

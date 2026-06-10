@@ -54,12 +54,18 @@ pub struct Config {
     pub max_audio_request_size: usize,
 
     // Pre-dispatch image validation (reject unfetchable/non-image inputs before
-    // they reach the engine — nearai/infra#159, #172). Enabled by default; set
-    // VLLM_PROXY_IMAGE_VALIDATION_DISABLED=1 to turn off.
+    // they reach the engine — nearai/infra#159, #172). Env vars:
+    //   VLLM_PROXY_IMAGE_VALIDATION_DISABLED=1          disable (default: on)
+    //   VLLM_PROXY_IMAGE_VALIDATION_TIMEOUT_SECS=5      per-fetch timeout
+    //   VLLM_PROXY_IMAGE_VALIDATION_MAX_BYTES=8192      head bytes read to sniff
+    //   VLLM_PROXY_IMAGE_VALIDATION_MAX_CONCURRENCY=8   global concurrent fetches
+    //   VLLM_PROXY_IMAGE_VALIDATION_ALLOW_PRIVATE_HOSTS=1  permit private/loopback
+    //       image hosts (tests / trusted internal deployments; default: off)
     pub image_validation_enabled: bool,
     pub image_validation_timeout_secs: u64,
     pub image_validation_max_bytes: usize,
     pub image_validation_max_concurrency: usize,
+    pub image_validation_allow_private_hosts: bool,
 
     // Cache
     pub chat_cache_expiration_secs: u64,
@@ -315,10 +321,13 @@ impl Config {
             image_validation_enabled: !env_bool("VLLM_PROXY_IMAGE_VALIDATION_DISABLED"),
             image_validation_timeout_secs: env_int("VLLM_PROXY_IMAGE_VALIDATION_TIMEOUT_SECS", 5)
                 as u64,
-            image_validation_max_bytes: env_int("VLLM_PROXY_IMAGE_VALIDATION_MAX_BYTES", 2048),
+            image_validation_max_bytes: env_int("VLLM_PROXY_IMAGE_VALIDATION_MAX_BYTES", 8192),
             image_validation_max_concurrency: env_int(
                 "VLLM_PROXY_IMAGE_VALIDATION_MAX_CONCURRENCY",
                 8,
+            ),
+            image_validation_allow_private_hosts: env_bool(
+                "VLLM_PROXY_IMAGE_VALIDATION_ALLOW_PRIVATE_HOSTS",
             ),
             chat_cache_expiration_secs: env_int("CHAT_CACHE_EXPIRATION", 1200) as u64,
             attestation_cache_ttl_secs: env_int("ATTESTATION_CACHE_TTL", 300) as u64,
@@ -399,8 +408,7 @@ impl Config {
             timeout: std::time::Duration::from_secs(self.image_validation_timeout_secs),
             max_bytes: self.image_validation_max_bytes,
             max_concurrency: self.image_validation_max_concurrency,
-            // Production never allows private hosts; only tests opt in.
-            allow_private_hosts: false,
+            allow_private_hosts: self.image_validation_allow_private_hosts,
         }
     }
 }

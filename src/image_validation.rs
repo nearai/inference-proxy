@@ -308,6 +308,12 @@ impl reqwest::dns::Resolve for SsrfResolver {
 /// Decide whether bytes (and optional content-type) are a plausible image.
 /// Returns `Reject` only for *positively* non-image content.
 fn classify_bytes(bytes: &[u8], content_type: Option<&str>) -> Verdict {
+    // Empty payload is positively not a decodable image — reject regardless of
+    // any (client-controlled) content type. Covers empty `data:` base64 bodies
+    // and empty/204 HTTP responses, which would otherwise still hit the engine.
+    if bytes.is_empty() {
+        return Verdict::Reject;
+    }
     if let Some(ct) = content_type {
         let ct = ct.split(';').next().unwrap_or("").trim();
         if ct.starts_with("image/") || ct.starts_with("video/") {
@@ -541,6 +547,16 @@ mod tests {
     }
 
     #[test]
+    fn empty_payload_is_rejected() {
+        // Empty bytes are positively not a decodable image — reject even when a
+        // (client-controlled) image content-type claims otherwise.
+        assert_eq!(classify_bytes(&[], None), Verdict::Reject);
+        assert_eq!(classify_bytes(&[], Some("image/png")), Verdict::Reject);
+        // Empty base64 data URL (`data:image/png;base64,`) decodes to no bytes.
+        assert_eq!(validate_data_url("image/png;base64,"), Verdict::Reject);
+    }
+
+    #[test]
     fn data_url_url_safe_and_unpadded_decode() {
         // URL-safe alphabet + no padding must NOT be false-rejected: a PNG
         // header has bytes that encode with `-`/`_` and would fail STANDARD.
@@ -667,6 +683,18 @@ mod tests {
             )
             .mount(&server)
             .await;
+        // 200 with an empty body but an image content-type.
+        Mock::given(method("GET"))
+            .and(path("/empty.png"))
+            .respond_with(ResponseTemplate::new(200).insert_header("content-type", "image/png"))
+            .mount(&server)
+            .await;
+        // 204 No Content (success status, no body).
+        Mock::given(method("GET"))
+            .and(path("/nocontent.png"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
 
         // wiremock binds to a 127.0.0.1 *literal*, so DNS (and SsrfResolver) is
         // never consulted; allow_private_hosts lets the literal pre-check pass.
@@ -684,6 +712,15 @@ mod tests {
         assert!(reject_invalid_images(&req("/real.png"), &c).await.is_ok());
         assert!(matches!(
             reject_invalid_images(&req("/missing.png"), &c).await,
+            Err(AppError::BadRequest(_))
+        ));
+        // Empty body (even with image content-type) and 204 → reject.
+        assert!(matches!(
+            reject_invalid_images(&req("/empty.png"), &c).await,
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            reject_invalid_images(&req("/nocontent.png"), &c).await,
             Err(AppError::BadRequest(_))
         ));
     }

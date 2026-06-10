@@ -107,7 +107,7 @@ pub async fn reject_invalid_images(
     // Validate ALL images with bounded concurrency; short-circuit on the first
     // bad one. Each URL is moved into its own future (owning the String) so the
     // buffered stream stays `Send` for the axum handler.
-    let mut results = stream::iter(urls.into_iter())
+    let mut results = stream::iter(urls)
         .map(|url| async move { validate_one(&url, cfg).await })
         .buffer_unordered(cfg.max_concurrency.max(1));
 

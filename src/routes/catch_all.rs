@@ -113,16 +113,17 @@ pub async fn catch_all(
 
     // Defense-in-depth: a chat-completions *alias* (e.g. a trailing slash, which
     // the backend may accept) lands here instead of the dedicated handler, which
-    // would skip image validation entirely. Validate any JSON body that carries
-    // image inputs (no-op otherwise). Gated on a JSON content-type so we don't
-    // parse large binary/audio bodies. Note: E2EE request fields aren't decrypted
-    // on this path, but an encrypted blob simply isn't a fetchable URL → fail-open.
+    // would skip image validation entirely. Keep this path-gated so unrelated
+    // forwarded JSON endpoints do not trigger outbound image-validation fetches.
+    // Also keep the parse under the normal JSON request cap; catch-all accepts
+    // larger bodies because content type is unknown.
+    let is_chat_completions_alias = path.trim_end_matches('/') == "/v1/chat/completions";
     let is_json = headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .map(|c| c.to_ascii_lowercase().contains("json"))
         .unwrap_or(false);
-    if is_json {
+    if is_chat_completions_alias && is_json && body_bytes.len() <= state.config.max_request_size {
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
             crate::image_validation::reject_invalid_images(&json, &state.config.image_validation())
                 .await?;

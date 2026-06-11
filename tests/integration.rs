@@ -79,6 +79,7 @@ fn build_test_app_inner(
         image_validation_max_concurrency: 8,
         image_validation_allow_private_hosts: image_validation,
         image_validation_reject_non_rgb_images: false,
+        image_validation_reject_single_channel_images: false,
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
         dev_mode: true,
@@ -511,6 +512,43 @@ async fn test_catch_all_chat_alias_runs_image_validation() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = body_to_json(response).await;
     assert!(body["error"]["message"].is_string());
+}
+
+#[tokio::test]
+async fn test_catch_all_non_chat_json_skips_image_validation() {
+    // The catch-all image-validation hook is only for chat-completions aliases.
+    // Other forwarded JSON endpoints must not parse/fetch arbitrary
+    // image_url-shaped fields or turn them into local 400s.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/completions/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"x"})))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app_with_image_validation(&mock_server.uri());
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "file:///etc/passwd"}}
+        ]}]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions/")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -3335,6 +3373,7 @@ fn build_test_app_with_cloud_api_retries(
         image_validation_max_concurrency: 8,
         image_validation_allow_private_hosts: false,
         image_validation_reject_non_rgb_images: false,
+        image_validation_reject_single_channel_images: false,
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
         cloud_api_url: Some(cloud_api_url.to_string()),
@@ -5661,6 +5700,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         image_validation_max_concurrency: 8,
         image_validation_allow_private_hosts: false,
         image_validation_reject_non_rgb_images: false,
+        image_validation_reject_single_channel_images: false,
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
         dev_mode: true,
@@ -6064,6 +6104,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         image_validation_max_concurrency: 8,
         image_validation_allow_private_hosts: false,
         image_validation_reject_non_rgb_images: false,
+        image_validation_reject_single_channel_images: false,
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
         dev_mode: true,

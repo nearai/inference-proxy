@@ -78,10 +78,13 @@ pub struct ImageValidationConfig {
     /// to private IP *literals* are always refused regardless, since redirect
     /// targets are server-controlled and must never be trusted to point inward.
     pub allow_private_hosts: bool,
-    /// Reject decisively non-RGB raster images. This is enabled by default for
-    /// Gemma-4 deployments because current SGLang Gemma-4 can crash its vision
-    /// tower on grayscale/RGBA image tensors before it normalizes to RGB.
+    /// Reject decisively non-RGB raster images. This is strict opt-in because
+    /// RGBA, CMYK, and palette handling still need real-engine verification.
     pub reject_non_rgb_images: bool,
+    /// Reject observed one-channel PNG/JPEG headers for Gemma-4 deployments.
+    /// This is narrower than `reject_non_rgb_images` and is auto-enabled for
+    /// Gemma-4 because the production crash shape matched 1-channel patches.
+    pub reject_single_channel_images: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -184,6 +187,7 @@ fn collect_image_urls(request_json: &Value) -> Result<Vec<String>, ()> {
 /// Whether `url`'s scheme is http/https (case-insensitive). These are the only
 /// schemes that trigger an outbound fetch.
 fn is_remote_scheme(url: &str) -> bool {
+    let url = normalize_image_url_input(url);
     matches!(
         url.split_once(':')
             .map(|(s, _)| s.to_ascii_lowercase())
@@ -193,15 +197,21 @@ fn is_remote_scheme(url: &str) -> bool {
 }
 
 async fn validate_one(url: &str, cfg: &ImageValidationConfig) -> Verdict {
-    // URL schemes are case-insensitive (RFC 3986) — normalize before matching
-    // so `HTTP://`, `DATA:`, `FILE:///` can't bypass validation or the
-    // dangerous-scheme refusal.
+    // URL schemes are case-insensitive (RFC 3986), and common URL parsers
+    // ignore leading ASCII whitespace/control characters. Normalize before
+    // matching so `HTTP://`, ` DATA:`, and ` FILE:///` can't bypass validation
+    // or the dangerous-scheme refusal.
+    let url = normalize_image_url_input(url);
     let (scheme, rest) = match url.split_once(':') {
         Some((s, r)) => (s.to_ascii_lowercase(), r),
         None => return Verdict::Pass, // no scheme — let the engine decide
     };
     match scheme.as_str() {
-        "data" => validate_data_url_with_policy(rest, cfg.reject_non_rgb_images),
+        "data" => validate_data_url_with_policy(
+            rest,
+            cfg.reject_non_rgb_images,
+            cfg.reject_single_channel_images,
+        ),
         "http" | "https" => validate_http_url(url, cfg).await,
         "file" | "ftp" | "gopher" => {
             // Dangerous / never a valid web image — refuse outright.
@@ -212,13 +222,21 @@ async fn validate_one(url: &str, cfg: &ImageValidationConfig) -> Verdict {
     }
 }
 
+fn normalize_image_url_input(url: &str) -> &str {
+    url.trim_start_matches(|c: char| c.is_ascii_whitespace() || c.is_ascii_control())
+}
+
 /// `rest` is the part after `data:` — e.g. `image/png;base64,iVBOR...`.
 #[cfg(test)]
 fn validate_data_url(rest: &str) -> Verdict {
-    validate_data_url_with_policy(rest, false)
+    validate_data_url_with_policy(rest, false, false)
 }
 
-fn validate_data_url_with_policy(rest: &str, reject_non_rgb_images: bool) -> Verdict {
+fn validate_data_url_with_policy(
+    rest: &str,
+    reject_non_rgb_images: bool,
+    reject_single_channel_images: bool,
+) -> Verdict {
     let Some((meta, data)) = rest.split_once(',') else {
         return Verdict::Reject; // malformed data URL
     };
@@ -226,7 +244,12 @@ fn validate_data_url_with_policy(rest: &str, reject_non_rgb_images: bool) -> Ver
         match decode_b64_prefix(data) {
             // The declared media type is client-controlled and is exactly what
             // lies in the mislabeled cases — classify the bytes, not the label.
-            Some(bytes) => classify_bytes_with_policy(&bytes, None, reject_non_rgb_images),
+            Some(bytes) => classify_bytes_with_policy(
+                &bytes,
+                None,
+                reject_non_rgb_images,
+                reject_single_channel_images,
+            ),
             None => {
                 tracing::debug!(reason = "data_url_bad_base64", "image validation rejected");
                 Verdict::Reject // not decodable base64 under any alphabet
@@ -384,8 +407,12 @@ async fn validate_http_url(url: &str, cfg: &ImageValidationConfig) -> Verdict {
         }
     }
 
-    let verdict =
-        classify_bytes_with_policy(&head, content_type.as_deref(), cfg.reject_non_rgb_images);
+    let verdict = classify_bytes_with_policy(
+        &head,
+        content_type.as_deref(),
+        cfg.reject_non_rgb_images,
+        cfg.reject_single_channel_images,
+    );
     if verdict == Verdict::Reject {
         tracing::debug!(reason = "non_image_body", "image validation rejected");
     }
@@ -479,13 +506,14 @@ impl reqwest::dns::Resolve for SsrfResolver {
 /// Returns `Reject` only for *positively* non-image content.
 #[cfg(test)]
 fn classify_bytes(bytes: &[u8], content_type: Option<&str>) -> Verdict {
-    classify_bytes_with_policy(bytes, content_type, false)
+    classify_bytes_with_policy(bytes, content_type, false, false)
 }
 
 fn classify_bytes_with_policy(
     bytes: &[u8],
     content_type: Option<&str>,
     reject_non_rgb_images: bool,
+    reject_single_channel_images: bool,
 ) -> Verdict {
     // Empty payload is positively not a decodable image — reject regardless of
     // any (client-controlled) content type. Covers empty `data:` base64 bodies
@@ -500,7 +528,7 @@ fn classify_bytes_with_policy(
     if looks_textual(bytes) {
         return Verdict::Reject;
     }
-    if reject_non_rgb_images && is_decisively_non_rgb_raster(bytes) {
+    if is_rejected_raster(bytes, reject_non_rgb_images, reject_single_channel_images) {
         return Verdict::Reject;
     }
     if is_image_magic(bytes) {
@@ -529,16 +557,25 @@ fn classify_bytes_with_policy(
 #[derive(Debug, PartialEq, Eq)]
 enum RgbCompatibility {
     RgbCompatible,
-    NonRgb,
+    SingleChannel,
+    OtherNonRgb,
     Unknown,
 }
 
 /// Header-only detection for image formats where channel count is available in
 /// the head. Used only as a Gemma-4 crash guard: current SGLang Gemma-4 expects
-/// 3-channel RGB patches (`16 * 16 * 3 = 768`) and can crash on non-RGB tensors
-/// such as grayscale JPEG (`16 * 16 * 1 = 256`). Inconclusive formats fail open.
-fn is_decisively_non_rgb_raster(bytes: &[u8]) -> bool {
-    matches!(rgb_compatibility(bytes), RgbCompatibility::NonRgb)
+/// 3-channel RGB patches (`16 * 16 * 3 = 768`) and has crashed on one-channel
+/// inputs (`16 * 16 * 1 = 256`). Inconclusive formats fail open.
+fn is_rejected_raster(
+    bytes: &[u8],
+    reject_non_rgb_images: bool,
+    reject_single_channel_images: bool,
+) -> bool {
+    match rgb_compatibility(bytes) {
+        RgbCompatibility::SingleChannel => reject_single_channel_images || reject_non_rgb_images,
+        RgbCompatibility::OtherNonRgb => reject_non_rgb_images,
+        RgbCompatibility::RgbCompatible | RgbCompatibility::Unknown => false,
+    }
 }
 
 fn rgb_compatibility(bytes: &[u8]) -> RgbCompatibility {
@@ -558,8 +595,9 @@ fn png_rgb_compatibility(bytes: &[u8]) -> RgbCompatibility {
         return RgbCompatibility::Unknown;
     }
     match bytes[25] {
-        0 | 3 | 4 | 6 => RgbCompatibility::NonRgb, // grayscale, indexed palette/P-mode, grayscale+alpha, RGBA
-        2 => RgbCompatibility::RgbCompatible,      // RGB
+        0 => RgbCompatibility::SingleChannel,       // grayscale
+        3 | 4 | 6 => RgbCompatibility::OtherNonRgb, // indexed palette/P-mode, grayscale+alpha, RGBA
+        2 => RgbCompatibility::RgbCompatible,       // RGB
         _ => RgbCompatibility::Unknown,
     }
 }
@@ -599,10 +637,10 @@ fn jpeg_rgb_compatibility(bytes: &[u8]) -> RgbCompatibility {
             if payload.len() < 6 {
                 return RgbCompatibility::Unknown;
             }
-            return if payload[5] == 3 {
-                RgbCompatibility::RgbCompatible
-            } else {
-                RgbCompatibility::NonRgb
+            return match payload[5] {
+                1 => RgbCompatibility::SingleChannel,
+                3 => RgbCompatibility::RgbCompatible,
+                _ => RgbCompatibility::OtherNonRgb,
             };
         }
         i += segment_len;
@@ -758,6 +796,7 @@ mod tests {
             max_concurrency: 4,
             allow_private_hosts: true,
             reject_non_rgb_images: false,
+            reject_single_channel_images: false,
         }
     }
 
@@ -916,43 +955,60 @@ mod tests {
     }
 
     #[test]
-    fn non_rgb_guard_rejects_decisive_png_and_jpeg_headers_when_enabled() {
+    fn single_channel_guard_rejects_observed_crash_headers_when_enabled() {
         let gray_jpeg = minimal_jpeg_with_components(1);
         let rgb_jpeg = minimal_jpeg_with_components(3);
-        let cmyk_jpeg = minimal_jpeg_with_components(4);
         let gray_png = minimal_png_with_color_type(0);
-        let palette_png = minimal_png_with_color_type(3);
         let rgb_png = minimal_png_with_color_type(2);
-        let rgba_png = minimal_png_with_color_type(6);
 
-        for non_rgb in [&gray_jpeg, &cmyk_jpeg, &gray_png, &palette_png, &rgba_png] {
+        for single_channel in [&gray_jpeg, &gray_png] {
             assert_eq!(
-                classify_bytes_with_policy(non_rgb, Some("image/png"), true),
+                classify_bytes_with_policy(single_channel, Some("image/png"), false, true),
                 Verdict::Reject
             );
             assert_eq!(
-                classify_bytes_with_policy(non_rgb, Some("image/png"), false),
+                classify_bytes_with_policy(single_channel, Some("image/png"), false, false),
                 Verdict::Pass
             );
         }
+
         for rgb in [&rgb_jpeg, &rgb_png] {
             assert_eq!(
-                classify_bytes_with_policy(rgb, Some("image/png"), true),
+                classify_bytes_with_policy(rgb, Some("image/png"), false, true),
                 Verdict::Pass
             );
         }
     }
 
     #[test]
-    fn data_url_non_rgb_guard_rejects_grayscale_jpeg_when_enabled() {
+    fn strict_non_rgb_guard_rejects_alpha_palette_and_cmyk_headers_when_enabled() {
+        let cmyk_jpeg = minimal_jpeg_with_components(4);
+        let palette_png = minimal_png_with_color_type(3);
+        let gray_alpha_png = minimal_png_with_color_type(4);
+        let rgba_png = minimal_png_with_color_type(6);
+
+        for strict_only in [&cmyk_jpeg, &palette_png, &gray_alpha_png, &rgba_png] {
+            assert_eq!(
+                classify_bytes_with_policy(strict_only, Some("image/png"), true, false),
+                Verdict::Reject
+            );
+            assert_eq!(
+                classify_bytes_with_policy(strict_only, Some("image/png"), false, true),
+                Verdict::Pass
+            );
+        }
+    }
+
+    #[test]
+    fn data_url_single_channel_guard_rejects_grayscale_jpeg_when_enabled() {
         let gray_jpeg =
             base64::engine::general_purpose::STANDARD.encode(minimal_jpeg_with_components(1));
         assert_eq!(
-            validate_data_url_with_policy(&format!("image/jpeg;base64,{gray_jpeg}"), true),
+            validate_data_url_with_policy(&format!("image/jpeg;base64,{gray_jpeg}"), false, true),
             Verdict::Reject
         );
         assert_eq!(
-            validate_data_url_with_policy(&format!("image/jpeg;base64,{gray_jpeg}"), false),
+            validate_data_url_with_policy(&format!("image/jpeg;base64,{gray_jpeg}"), false, false),
             Verdict::Pass
         );
     }
@@ -1004,13 +1060,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uppercase_schemes_are_not_bypassed() {
-        // Case-insensitive scheme handling: dangerous + data schemes in any case.
+    async fn uppercase_and_leading_space_schemes_are_not_bypassed() {
+        // Case-insensitive and parser-like leading-space handling: dangerous,
+        // data, and remote schemes must still hit their validation paths.
         let html = base64::engine::general_purpose::STANDARD.encode("<!doctype html><html></html>");
         for url in [
             "FILE:///etc/passwd".to_string(),
             "File:///etc/passwd".to_string(),
+            " FILE:///etc/passwd".to_string(),
             format!("DATA:image/png;base64,{html}"),
+            format!("\tdata:image/png;base64,{html}"),
+            " http://127.0.0.1:1/x.png".to_string(),
         ] {
             let v = serde_json::json!({"messages":[{"role":"user","content":[
                 {"type":"image_url","image_url":{"url": url}}

@@ -400,9 +400,12 @@ impl AttestationCache {
 /// signed are forwarded verbatim. This preserves the exact `actions` field
 /// serialization for downstream verifiers that extract and hash it.
 ///
-/// With alphabetical-key canonicalization (compose-manager PR #36),
-/// `serde_json::Value` would also produce correct key ordering, but RawValue
-/// is still preferred to avoid any risk of re-serialization divergence.
+/// Once compose-manager adopts alphabetical-key canonicalization
+/// (PR nearai/compose-manager#36), `serde_json::Value` will produce the
+/// same key ordering — but `RawValue` remains necessary to guard against
+/// other re-serialization divergences (whitespace, escapes, number
+/// formatting) and staggered rollouts where some CVMs still emit
+/// struct-declaration-order JSON.
 ///
 /// Returns `None` on any error (timeout, connection refused, bad JSON, etc.)
 /// so that compose-manager unavailability never blocks inference attestation.
@@ -1816,10 +1819,17 @@ mod tests {
 
     /// Regression: a verifier must be able to recover `actions_hash` by
     /// re-hashing the `actions` field as it appears in inference-proxy's
-    /// response. compose-manager now canonicalizes with alphabetical key
-    /// ordering so `serde_json::Value` (which also sorts alphabetically)
-    /// produces the same serialization — but the response still uses
-    /// `RawValue` to preserve exact bytes.
+    /// response. The `compose_manager_attestation` field is held as `RawValue`
+    /// to forward the exact bytes from compose-manager — re-parsing through
+    /// `serde_json::Value` can reorder keys or otherwise diverge from the
+    /// original serialization, breaking the hash binding.
+    ///
+    /// Once compose-manager adopts alphabetical-key canonicalization
+    /// (PR nearai/compose-manager#36), `serde_json::Value` will produce the
+    /// same key ordering — but `RawValue` remains necessary to guard against
+    /// other re-serialization divergences (whitespace, escapes, number
+    /// formatting) and staggered rollouts where some CVMs still emit
+    /// struct-declaration-order JSON.
     #[tokio::test]
     async fn test_actions_hash_round_trips_via_cache() {
         use sha2::{Digest, Sha256};
@@ -1827,9 +1837,11 @@ mod tests {
         let cache = AttestationCache::new(300);
         let report = make_test_report("ecdsa", "aabb");
 
-        // Mimic compose-manager: serialize an actions list (alphabetical key
-        // order per canonicalization rules), hash it, embed both.
-        let actions_json = r#"[{"action":"compose_up","commit":"8e71b71b","file":"small-models.yaml","file_sha256":"7f60fb50","tag":"v0.0.169","timestamp":"2026-05-21T10:01:40Z"}]"#;
+        // Use NON-alphabetical (struct-declaration-order) keys to verify the
+        // RawValue byte-exactness invariant: a verifier hashing the raw bytes
+        // gets the same result as compose-manager. This is the case that
+        // `serde_json::Value` would break (it alphabetizes keys).
+        let actions_json = r#"[{"timestamp":"2026-05-21T10:01:40Z","action":"compose_up","tag":"v0.0.169","commit":"8e71b71b","file":"small-models.yaml","file_sha256":"7f60fb50"}]"#;
         let actions_hash = hex::encode(Sha256::digest(actions_json.as_bytes()));
         let cm_raw =
             format!(r#"{{"actions":{actions_json},"actions_hash":"{actions_hash}","quote":"q"}}"#);
@@ -1839,16 +1851,13 @@ mod tests {
             .set("ecdsa", false, report, Some(cm_attestation), None)
             .await;
 
-        // Verifier path: parse the response, extract the actions field, hash it.
+        // Verifier path: extract the raw bytes of the `actions` field and
+        // hash them. Bracket-matching on the raw body avoids re-parsing
+        // through `serde_json::Value` which would reorder keys.
         let bytes = cache.get_bytes("ecdsa", false).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let cm = &parsed["compose_manager_attestation"];
 
-        // With alphabetical-key canonicalization, `serde_json::Value`
-        // re-serialization also sorts keys alphabetically — so re-serializing
-        // `cm["actions"]` now produces the correct hash. But we still extract
-        // from raw bytes via bracket-matching to verify the RawValue path
-        // works correctly (this is what production verifiers should do).
         let body = std::str::from_utf8(&bytes).unwrap();
         let needle = r#""actions":"#;
         let start = body.find(needle).unwrap() + needle.len();
@@ -1876,8 +1885,47 @@ mod tests {
             "verifier must be able to recompute actions_hash from raw response bytes"
         );
 
-        // Also verify that re-serializing through serde_json::Value (now that
-        // keys are alphabetical) produces the same hash.
+        // Confirm that serde_json::Value re-serialization DOES NOT match
+        // when keys are non-alphabetical — this is the regression the test
+        // exists to catch.
+        let re_serialized = serde_json::to_string(&cm["actions"]).unwrap();
+        let re_hash = hex::encode(Sha256::digest(re_serialized.as_bytes()));
+        assert_ne!(
+            re_hash,
+            cm["actions_hash"].as_str().unwrap(),
+            "serde_json::Value must NOT produce the same hash for non-alphabetical keys \
+             — if this assertion fails, the RawValue byte-exactness invariant is untested"
+        );
+    }
+
+    /// Once compose-manager adopts alphabetical-key canonicalization
+    /// (PR nearai/compose-manager#36), `serde_json::Value` will sort keys
+    /// the same way, so re-serialization round-trips correctly. This test
+    /// verifies that property with an alphabetical-key fixture.
+    #[tokio::test]
+    async fn test_actions_hash_round_trips_with_alphabetical_keys() {
+        use sha2::{Digest, Sha256};
+
+        let cache = AttestationCache::new(300);
+        let report = make_test_report("ecdsa", "aabb");
+
+        // Alphabetical key order (as compose-manager will produce after #36)
+        let actions_json = r#"[{"action":"compose_up","commit":"8e71b71b","file":"small-models.yaml","file_sha256":"7f60fb50","tag":"v0.0.169","timestamp":"2026-05-21T10:01:40Z"}]"#;
+        let actions_hash = hex::encode(Sha256::digest(actions_json.as_bytes()));
+        let cm_raw =
+            format!(r#"{{"actions":{actions_json},"actions_hash":"{actions_hash}","quote":"q"}}"#);
+        let cm_attestation = serde_json::value::RawValue::from_string(cm_raw.clone()).unwrap();
+
+        cache
+            .set("ecdsa", false, report, Some(cm_attestation), None)
+            .await;
+
+        let bytes = cache.get_bytes("ecdsa", false).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let cm = &parsed["compose_manager_attestation"];
+
+        // Both raw-byte extraction and serde_json::Value re-serialization
+        // should produce the correct hash when keys are alphabetical.
         let re_serialized = serde_json::to_string(&cm["actions"]).unwrap();
         let re_hash = hex::encode(Sha256::digest(re_serialized.as_bytes()));
         assert_eq!(

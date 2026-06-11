@@ -41,6 +41,11 @@ pub struct AttestationResponse {
     /// Stored as `RawValue` so the byte-exact JSON received from compose-manager
     /// is forwarded verbatim, preserving the exact `actions` field serialization
     /// for verifiers that recompute `sha256(actions) == actions_hash`.
+    ///
+    /// Once compose-manager adopts alphabetical-key canonicalization
+    /// (PR nearai/compose-manager#36), `serde_json::Value` would produce the
+    /// same key ordering — but `RawValue` remains necessary to guard against
+    /// other re-serialization divergences and staggered rollouts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compose_manager_attestation: Option<Box<RawValue>>,
     /// Legacy flat OHTTP key config field kept for backward compatibility.

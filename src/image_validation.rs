@@ -121,6 +121,15 @@ pub async fn reject_invalid_images(
     if urls.is_empty() {
         return Ok(());
     }
+    // Dedup: N copies of one URL would otherwise trigger N identical fetches
+    // against the origin (on top of the engine's own), amplifying load for no
+    // benefit.
+    let mut seen = std::collections::HashSet::new();
+    let urls: Vec<String> = urls
+        .into_iter()
+        .filter(|u| seen.insert(u.clone()))
+        .collect();
+
     // Only remote (http/https) URLs are fetched; count those against the cap so
     // long multi-turn vision histories full of cheap, locally-validated `data:`
     // URLs aren't rejected. Reject (don't silently skip) when the cap is hit so
@@ -132,19 +141,34 @@ pub async fn reject_invalid_images(
         )));
     }
 
-    // Validate ALL images with bounded concurrency; short-circuit on the first
-    // bad one. Each URL is moved into its own future (owning the String) so the
-    // buffered stream stays `Send` for the axum handler.
-    let mut results = stream::iter(urls)
-        .map(|url| async move { validate_one(&url, cfg).await })
-        .buffer_unordered(cfg.max_concurrency.max(1));
-
-    while let Some(verdict) = results.next().await {
-        if verdict == Verdict::Reject {
-            return Err(AppError::BadRequest(REJECT_MSG.to_string()));
+    // Overall deadline for the whole validation pass (~3× the per-fetch timeout)
+    // so many slow remote URLs can't stretch validation latency unbounded; on
+    // expiry we fail-open and let the engine be the judge.
+    let deadline = cfg.timeout.saturating_mul(3);
+    let check = async {
+        // Validate ALL images with bounded concurrency; short-circuit on the
+        // first bad one. Each URL is moved into its own future (owning the
+        // String) so the buffered stream stays `Send` for the axum handler.
+        let mut results = stream::iter(urls)
+            .map(|url| async move { validate_one(&url, cfg).await })
+            .buffer_unordered(cfg.max_concurrency.max(1));
+        while let Some(verdict) = results.next().await {
+            if verdict == Verdict::Reject {
+                return Err(AppError::BadRequest(REJECT_MSG.to_string()));
+            }
+        }
+        Ok(())
+    };
+    match tokio::time::timeout(deadline, check).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(
+                reason = "validation_deadline",
+                "image validation passthrough"
+            );
+            Ok(())
         }
     }
-    Ok(())
 }
 
 /// Collect every image URL from `messages[*].content[*]` typed parts. Content

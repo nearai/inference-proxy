@@ -76,6 +76,11 @@ pub struct Config {
     //       rejection. By default Gemma-4 model names reject only observed
     //       one-channel crash inputs; broader RGBA/CMYK/palette rejection is
     //       opt-in until real-engine verification covers those classes.
+    // NOTE: the validation fetcher bypasses system proxies (no_proxy) and uses
+    // rustls/webpki-roots. Deployments whose outbound HTTP requires an egress
+    // proxy (HTTPS_PROXY) or a custom CA that the engine trusts but rustls does
+    // not should set _DISABLED=1 — otherwise remote-image requests 400 on a
+    // connect/TLS error while the engine itself fetches fine.
     pub image_validation_enabled: bool,
     pub image_validation_timeout_secs: u64,
     pub image_validation_max_bytes: usize,

@@ -111,19 +111,17 @@ pub async fn catch_all(
     // Read body (use max_audio_request_size = 100MB since content type is unknown)
     let body_bytes = read_body_with_limit(body, state.config.max_audio_request_size).await?;
 
-    // Defense-in-depth: a chat-completions *alias* (e.g. a trailing slash, which
-    // the backend may accept) lands here instead of the dedicated handler, which
-    // would skip image validation entirely. Keep this path-gated so unrelated
-    // forwarded JSON endpoints do not trigger outbound image-validation fetches.
-    // Also keep the parse under the normal JSON request cap; catch-all accepts
-    // larger bodies because content type is unknown.
-    let is_chat_completions_alias = path.trim_end_matches('/') == "/v1/chat/completions";
-    let is_json = headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .map(|c| c.to_ascii_lowercase().contains("json"))
-        .unwrap_or(false);
-    if is_chat_completions_alias && is_json && body_bytes.len() <= state.config.max_request_size {
+    // Defense-in-depth: a chat-completions *alias* (e.g. a trailing slash or a
+    // percent-encoded path the backend decodes) lands here instead of the
+    // dedicated handler, which would skip image validation entirely. Compare
+    // against the percent-DECODED path so `/v1/chat/%63ompletions` is still
+    // gated. Don't gate on content-type — starlette/uvicorn parse JSON
+    // regardless of the header — but keep the parse under the normal JSON
+    // request cap so a huge body can't pressure the proxy via `serde_json`
+    // (catch-all otherwise accepts up to 100 MB since content type is unknown).
+    let decoded_path = percent_encoding::percent_decode_str(path).decode_utf8_lossy();
+    let is_chat_completions_alias = decoded_path.trim_end_matches('/') == "/v1/chat/completions";
+    if is_chat_completions_alias && body_bytes.len() <= state.config.max_request_size {
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
             crate::image_validation::reject_invalid_images(&json, &state.config.image_validation())
                 .await?;

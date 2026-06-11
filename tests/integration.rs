@@ -515,6 +515,37 @@ async fn test_catch_all_chat_alias_runs_image_validation() {
 }
 
 #[tokio::test]
+async fn test_catch_all_percent_encoded_chat_alias_runs_image_validation() {
+    // `/v1/chat/%63ompletions` (c = %63) misses the exact axum route but a
+    // uvicorn backend decodes it. catch_all compares the percent-DECODED path,
+    // so the alias is still validated (bad image → 400, backend not hit).
+    let mock_server = MockServer::start().await;
+    let app = build_test_app_with_image_validation(&mock_server.uri());
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "file:///etc/passwd"}}
+        ]}],
+        "stream": false
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/%63ompletions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn test_catch_all_non_chat_json_skips_image_validation() {
     // The catch-all image-validation hook is only for chat-completions aliases.
     // Other forwarded JSON endpoints must not parse/fetch arbitrary

@@ -14,11 +14,12 @@
 //!
 //! ## Conservative by design (fail-open)
 //! It only rejects inputs it can *positively* identify as bad: a URL that can't
-//! be fetched (DNS/connect/timeout/non-2xx), content that sniffs as
-//! HTML/text/JSON, or a `data:` payload that isn't decodable base64 under any
-//! common alphabet. Anything ambiguous (unknown-but-not-textual bytes, unusual
-//! schemes, unknown content types) is **passed through** so the engine stays
-//! the source of truth and valid multimodal traffic is never broken.
+//! be fetched (DNS/connect/timeout) or is definitively gone (404/410), content that sniffs as
+//! HTML/text/JSON, a `data:` payload that isn't decodable base64 under any
+//! common alphabet, or (when enabled for Gemma-4) a raster image header that is
+//! decisively non-RGB. Anything ambiguous (unknown-but-not-textual bytes,
+//! unusual schemes, unknown content types) is **passed through** so the engine
+//! stays the source of truth and valid multimodal traffic is never broken.
 //!
 //! ## SSRF
 //! This introduces an outbound fetch of client-controlled URLs, so the
@@ -57,8 +58,9 @@ const SNIFF_DECODE_BYTES: usize = 4096;
 
 /// Generic, content-free rejection message. Never echoes the URL or any user
 /// data (see proxy.rs sanitization rules / privacy requirements).
-const REJECT_MSG: &str = "One or more image inputs could not be fetched or are not a valid image. \
-     Ensure each image URL is reachable and resolves to a real image.";
+const REJECT_MSG: &str =
+    "One or more image inputs could not be fetched or are not a supported image for this model. \
+     Ensure each image URL is reachable and resolves to a compatible image.";
 
 #[derive(Debug, Clone)]
 pub struct ImageValidationConfig {
@@ -68,12 +70,16 @@ pub struct ImageValidationConfig {
     /// the head is needed to sniff the type; the whole image is never buffered.
     pub max_bytes: usize,
     pub max_concurrency: usize,
-    /// Allow private/loopback **IP-literal** hosts on the initial URL (set in
-    /// tests so wiremock on 127.0.0.1 works; never enabled in production).
-    /// Note: the client's [`SsrfResolver`] still blocks *domains* that resolve
-    /// to private ranges regardless of this flag — tests therefore use literal
-    /// loopback URLs, which bypass DNS.
+    /// Permit private/loopback image hosts — both initial IP literals and
+    /// domains that resolve to private ranges. Set in tests (loopback wiremock)
+    /// and for trusted internal deployments; off in production. Redirect hops
+    /// to private IP *literals* are always refused regardless, since redirect
+    /// targets are server-controlled and must never be trusted to point inward.
     pub allow_private_hosts: bool,
+    /// Reject decisively non-RGB raster images. This is enabled by default for
+    /// Gemma-4 deployments because current SGLang Gemma-4 can crash its vision
+    /// tower on grayscale/RGBA image tensors before it normalizes to RGB.
+    pub reject_non_rgb_images: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -193,7 +199,7 @@ async fn validate_one(url: &str, cfg: &ImageValidationConfig) -> Verdict {
         None => return Verdict::Pass, // no scheme — let the engine decide
     };
     match scheme.as_str() {
-        "data" => validate_data_url(rest),
+        "data" => validate_data_url_with_policy(rest, cfg.reject_non_rgb_images),
         "http" | "https" => validate_http_url(url, cfg).await,
         "file" | "ftp" | "gopher" => {
             // Dangerous / never a valid web image — refuse outright.
@@ -205,15 +211,20 @@ async fn validate_one(url: &str, cfg: &ImageValidationConfig) -> Verdict {
 }
 
 /// `rest` is the part after `data:` — e.g. `image/png;base64,iVBOR...`.
+#[cfg(test)]
 fn validate_data_url(rest: &str) -> Verdict {
+    validate_data_url_with_policy(rest, false)
+}
+
+fn validate_data_url_with_policy(rest: &str, reject_non_rgb_images: bool) -> Verdict {
     let Some((meta, data)) = rest.split_once(',') else {
         return Verdict::Reject; // malformed data URL
     };
-    if meta.contains("base64") {
+    if meta.to_ascii_lowercase().contains("base64") {
         match decode_b64_prefix(data) {
             // The declared media type is client-controlled and is exactly what
             // lies in the mislabeled cases — classify the bytes, not the label.
-            Some(bytes) => classify_bytes(&bytes, None),
+            Some(bytes) => classify_bytes_with_policy(&bytes, None, reject_non_rgb_images),
             None => {
                 tracing::debug!(reason = "data_url_bad_base64", "image validation rejected");
                 Verdict::Reject // not decodable base64 under any alphabet
@@ -277,12 +288,31 @@ async fn validate_http_url(url: &str, cfg: &ImageValidationConfig) -> Verdict {
     // Global cap on concurrent outbound fetches across ALL requests, so a flood
     // can't turn the proxy into an unbounded fetcher (FD/socket pressure). The
     // per-request `buffer_unordered` bound is layered on top.
-    let _permit = global_fetch_semaphore(cfg.max_concurrency).acquire().await;
+    //
+    // The acquire itself is bounded by `timeout`: under saturation we must not
+    // queue (and thereby block) legitimate requests unboundedly — the DoS would
+    // just move from the GPU to the proxy. On expiry we fail-open (Pass) and let
+    // the engine handle it, rather than holding the request.
+    let _permit = match tokio::time::timeout(
+        cfg.timeout,
+        global_fetch_semaphore(cfg.max_concurrency).acquire(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        _ => {
+            tracing::debug!(
+                reason = "validator_saturated",
+                "image validation passthrough"
+            );
+            return Verdict::Pass;
+        }
+    };
 
     // Present like a normal client: many image CDNs gate on User-Agent/Accept
     // (see catch_all.rs / cloud-api#606). A UA-less request would 403 here while
     // the engine's fetcher succeeds, producing false rejects.
-    let resp = match validation_client()
+    let resp = match validation_client(cfg.allow_private_hosts)
         .get(url)
         .timeout(cfg.timeout)
         .header(
@@ -340,7 +370,8 @@ async fn validate_http_url(url: &str, cfg: &ImageValidationConfig) -> Verdict {
         }
     }
 
-    let verdict = classify_bytes(&head, content_type.as_deref());
+    let verdict =
+        classify_bytes_with_policy(&head, content_type.as_deref(), cfg.reject_non_rgb_images);
     if verdict == Verdict::Reject {
         tracing::debug!(reason = "non_image_body", "image validation rejected");
     }
@@ -360,29 +391,43 @@ fn global_fetch_semaphore(permits: usize) -> &'static tokio::sync::Semaphore {
 /// through [`SsrfResolver`] (rejects domains pointing at non-public ranges) and
 /// uses a redirect policy that refuses hops to disallowed IP literals while
 /// still following ordinary redirects (so valid redirecting image URLs work).
-fn validation_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
+fn validation_client(allow_private_hosts: bool) -> &'static reqwest::Client {
+    static PUBLIC_ONLY_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    static PRIVATE_ALLOWED_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    let client = if allow_private_hosts {
+        &PRIVATE_ALLOWED_CLIENT
+    } else {
+        &PUBLIC_ONLY_CLIENT
+    };
+    client.get_or_init(|| {
         let redirect = reqwest::redirect::Policy::custom(|attempt| {
             if attempt.previous().len() >= MAX_REDIRECTS {
                 return attempt.stop();
             }
-            // Block redirects to a disallowed IP literal. Domain hops are
-            // guarded by SsrfResolver during connection.
+            // Refuse redirects to a disallowed IP literal (regardless of
+            // allow_private_hosts — redirect targets are server-controlled and
+            // must never be trusted to point inward). Domain hops are guarded
+            // by SsrfResolver during connection.
             let blocked = match attempt.url().host() {
                 Some(Host::Ipv4(ip)) => is_disallowed_ip(IpAddr::V4(ip)),
                 Some(Host::Ipv6(ip)) => is_disallowed_ip(IpAddr::V6(ip)),
                 _ => false,
             };
             if blocked {
-                attempt.stop()
+                // IMPORTANT: `error()`, not `stop()`. `stop()` returns the 3xx
+                // response, which downstream treats as an ambiguous non-2xx and
+                // passes through (fail-open) — defeating the SSRF guard. An
+                // error surfaces as a transport failure → Reject.
+                attempt.error("redirect to a non-public address refused")
             } else {
                 attempt.follow()
             }
         });
         reqwest::Client::builder()
             .redirect(redirect)
-            .dns_resolver(Arc::new(SsrfResolver))
+            .dns_resolver(Arc::new(SsrfResolver {
+                allow_private_hosts,
+            }))
             .build()
             .expect("build image-validation reqwest client")
     })
@@ -393,17 +438,21 @@ fn validation_client() -> &'static reqwest::Client {
 /// name that resolves to a non-public address — closing SSRF via the initial
 /// domain and via redirect hops alike, with the checked IP equal to the
 /// connected IP (no resolve-then-connect TOCTOU window).
-struct SsrfResolver;
+struct SsrfResolver {
+    allow_private_hosts: bool,
+}
 
 impl reqwest::dns::Resolve for SsrfResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let allow_private_hosts = self.allow_private_hosts;
         Box::pin(async move {
             let addrs: Vec<SocketAddr> = tokio::net::lookup_host(format!("{}:0", name.as_str()))
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
                 .filter(|a| a.is_ipv4())
                 .collect();
-            if addrs.iter().any(|a| is_disallowed_ip(a.ip())) {
+            // Honor allow_private_hosts for resolved domains (not just literals).
+            if !allow_private_hosts && addrs.iter().any(|a| is_disallowed_ip(a.ip())) {
                 return Err(Box::<dyn std::error::Error + Send + Sync>::from(
                     "image host resolves to a non-public address",
                 ));
@@ -415,7 +464,16 @@ impl reqwest::dns::Resolve for SsrfResolver {
 
 /// Decide whether bytes (and optional content-type) are a plausible image.
 /// Returns `Reject` only for *positively* non-image content.
+#[cfg(test)]
 fn classify_bytes(bytes: &[u8], content_type: Option<&str>) -> Verdict {
+    classify_bytes_with_policy(bytes, content_type, false)
+}
+
+fn classify_bytes_with_policy(
+    bytes: &[u8],
+    content_type: Option<&str>,
+    reject_non_rgb_images: bool,
+) -> Verdict {
     // Empty payload is positively not a decodable image — reject regardless of
     // any (client-controlled) content type. Covers empty `data:` base64 bodies
     // and empty/204 HTTP responses, which would otherwise still hit the engine.
@@ -427,6 +485,9 @@ fn classify_bytes(bytes: &[u8], content_type: Option<&str>) -> Verdict {
     // must still be rejected. Real images never match these markers, so this
     // can't false-reject a genuine image regardless of its declared type.
     if looks_textual(bytes) {
+        return Verdict::Reject;
+    }
+    if reject_non_rgb_images && is_decisively_non_rgb_raster(bytes) {
         return Verdict::Reject;
     }
     if is_image_magic(bytes) {
@@ -450,6 +511,97 @@ fn classify_bytes(bytes: &[u8], content_type: Option<&str>) -> Verdict {
     }
     // Unknown but not obviously textual — let the engine be the judge.
     Verdict::Pass
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RgbCompatibility {
+    RgbCompatible,
+    NonRgb,
+    Unknown,
+}
+
+/// Header-only detection for image formats where channel count is available in
+/// the head. Used only as a Gemma-4 crash guard: current SGLang Gemma-4 expects
+/// 3-channel RGB patches (`16 * 16 * 3 = 768`) and can crash on non-RGB tensors
+/// such as grayscale JPEG (`16 * 16 * 1 = 256`). Inconclusive formats fail open.
+fn is_decisively_non_rgb_raster(bytes: &[u8]) -> bool {
+    matches!(rgb_compatibility(bytes), RgbCompatibility::NonRgb)
+}
+
+fn rgb_compatibility(bytes: &[u8]) -> RgbCompatibility {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return png_rgb_compatibility(bytes);
+    }
+    if bytes.starts_with(&[0xFF, 0xD8]) {
+        return jpeg_rgb_compatibility(bytes);
+    }
+    RgbCompatibility::Unknown
+}
+
+fn png_rgb_compatibility(bytes: &[u8]) -> RgbCompatibility {
+    // PNG: signature(8), IHDR length(4), "IHDR"(4), width(4), height(4),
+    // bit depth(1), color type(1). Color type is byte 25.
+    if bytes.len() <= 25 || &bytes[12..16] != b"IHDR" {
+        return RgbCompatibility::Unknown;
+    }
+    match bytes[25] {
+        0 | 4 | 6 => RgbCompatibility::NonRgb, // grayscale, grayscale+alpha, RGBA
+        2 | 3 => RgbCompatibility::RgbCompatible, // RGB or indexed-color palette
+        _ => RgbCompatibility::Unknown,
+    }
+}
+
+fn jpeg_rgb_compatibility(bytes: &[u8]) -> RgbCompatibility {
+    let mut i = 2; // after SOI
+    while i + 4 <= bytes.len() {
+        while i < bytes.len() && bytes[i] != 0xFF {
+            i += 1;
+        }
+        while i < bytes.len() && bytes[i] == 0xFF {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return RgbCompatibility::Unknown;
+        }
+        let marker = bytes[i];
+        i += 1;
+
+        // Standalone markers with no segment length.
+        if marker == 0x01 || (0xD0..=0xD9).contains(&marker) {
+            continue;
+        }
+        // Start of scan: channel count was not found in the header we have.
+        if marker == 0xDA {
+            return RgbCompatibility::Unknown;
+        }
+        if i + 2 > bytes.len() {
+            return RgbCompatibility::Unknown;
+        }
+        let segment_len = u16::from_be_bytes([bytes[i], bytes[i + 1]]) as usize;
+        if segment_len < 2 || i + segment_len > bytes.len() {
+            return RgbCompatibility::Unknown;
+        }
+        let payload = &bytes[i + 2..i + segment_len];
+        if is_jpeg_sof_marker(marker) {
+            if payload.len() < 6 {
+                return RgbCompatibility::Unknown;
+            }
+            return if payload[5] == 3 {
+                RgbCompatibility::RgbCompatible
+            } else {
+                RgbCompatibility::NonRgb
+            };
+        }
+        i += segment_len;
+    }
+    RgbCompatibility::Unknown
+}
+
+fn is_jpeg_sof_marker(marker: u8) -> bool {
+    matches!(
+        marker,
+        0xC0 | 0xC1 | 0xC2 | 0xC3 | 0xC5 | 0xC6 | 0xC7 | 0xC9 | 0xCA | 0xCB | 0xCD | 0xCE | 0xCF
+    )
 }
 
 /// Heuristic: the head is (almost) entirely printable ASCII / common
@@ -554,6 +706,9 @@ fn is_disallowed_ip(ip: IpAddr) -> bool {
                 || v4.is_documentation()
                 || o[0] == 0                                   // 0.0.0.0/8
                 || (o[0] == 100 && (o[1] & 0xC0) == 0x40)      // 100.64.0.0/10 CGNAT
+                || (224..=239).contains(&o[0])                 // 224.0.0.0/4 multicast
+                || o[0] >= 240                                 // 240.0.0.0/4 reserved
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) // 198.18.0.0/15 benchmark
                 || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24
         }
         IpAddr::V6(v6) => {
@@ -565,6 +720,15 @@ fn is_disallowed_ip(ip: IpAddr) -> bool {
                 || v6.is_unspecified()
                 || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
                 || (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+                || (
+                    seg[0] == 0x0064
+                        && seg[1] == 0xff9b
+                        && seg[2] == 0
+                        && seg[3] == 0
+                        && seg[4] == 0
+                        && seg[5] == 0
+                ) // 64:ff9b::/96 NAT64 well-known prefix
+                || (seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0x0001) // 64:ff9b:1::/48
         }
     }
 }
@@ -580,7 +744,41 @@ mod tests {
             max_bytes: 2048,
             max_concurrency: 4,
             allow_private_hosts: true,
+            reject_non_rgb_images: false,
         }
+    }
+
+    fn minimal_jpeg_with_components(components: u8) -> Vec<u8> {
+        let mut bytes = vec![
+            0xFF, 0xD8, // SOI
+            0xFF, 0xC0, // SOF0
+        ];
+        let segment_len: u16 = 8 + (components as u16 * 3);
+        bytes.extend_from_slice(&segment_len.to_be_bytes());
+        bytes.extend_from_slice(&[
+            0x08, // precision
+            0x00, 0x01, // height
+            0x00, 0x01, // width
+            components,
+        ]);
+        for id in 1..=components {
+            bytes.extend_from_slice(&[id, 0x11, 0x00]);
+        }
+        bytes
+    }
+
+    fn minimal_png_with_color_type(color_type: u8) -> Vec<u8> {
+        let mut bytes = vec![
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, // signature
+            0x00, 0x00, 0x00, 0x0D, // IHDR length
+            b'I', b'H', b'D', b'R', // IHDR
+            0x00, 0x00, 0x00, 0x01, // width
+            0x00, 0x00, 0x00, 0x01, // height
+            0x08, // bit depth
+            color_type,
+        ];
+        bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // compression/filter/interlace + partial CRC
+        bytes
     }
 
     #[test]
@@ -702,6 +900,47 @@ mod tests {
         );
         // Malformed (no comma) → reject.
         assert_eq!(validate_data_url("image/png;base64"), Verdict::Reject);
+    }
+
+    #[test]
+    fn non_rgb_guard_rejects_decisive_png_and_jpeg_headers_when_enabled() {
+        let gray_jpeg = minimal_jpeg_with_components(1);
+        let rgb_jpeg = minimal_jpeg_with_components(3);
+        let cmyk_jpeg = minimal_jpeg_with_components(4);
+        let gray_png = minimal_png_with_color_type(0);
+        let rgb_png = minimal_png_with_color_type(2);
+        let rgba_png = minimal_png_with_color_type(6);
+
+        for non_rgb in [&gray_jpeg, &cmyk_jpeg, &gray_png, &rgba_png] {
+            assert_eq!(
+                classify_bytes_with_policy(non_rgb, Some("image/png"), true),
+                Verdict::Reject
+            );
+            assert_eq!(
+                classify_bytes_with_policy(non_rgb, Some("image/png"), false),
+                Verdict::Pass
+            );
+        }
+        for rgb in [&rgb_jpeg, &rgb_png] {
+            assert_eq!(
+                classify_bytes_with_policy(rgb, Some("image/png"), true),
+                Verdict::Pass
+            );
+        }
+    }
+
+    #[test]
+    fn data_url_non_rgb_guard_rejects_grayscale_jpeg_when_enabled() {
+        let gray_jpeg =
+            base64::engine::general_purpose::STANDARD.encode(minimal_jpeg_with_components(1));
+        assert_eq!(
+            validate_data_url_with_policy(&format!("image/jpeg;base64,{gray_jpeg}"), true),
+            Verdict::Reject
+        );
+        assert_eq!(
+            validate_data_url_with_policy(&format!("image/jpeg;base64,{gray_jpeg}"), false),
+            Verdict::Pass
+        );
     }
 
     #[test]
@@ -840,10 +1079,15 @@ mod tests {
             "169.254.169.254",
             "172.16.0.1",
             "100.64.0.1",
+            "198.18.0.1",
+            "224.0.0.1",
+            "240.0.0.1",
             "0.0.0.0",
             "::1",
             "fe80::1",
             "fc00::1",
+            "64:ff9b::0808:0808",
+            "64:ff9b:1::1",
         ] {
             assert!(
                 is_disallowed_ip(ip.parse().unwrap()),
@@ -985,5 +1229,63 @@ mod tests {
             reject_invalid_images(&req("/nocontent.png"), &c).await,
             Err(AppError::BadRequest(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn redirect_to_private_ip_literal_is_rejected() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redirect.png"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", "http://169.254.169.254/latest/meta-data/"),
+            )
+            .mount(&server)
+            .await;
+
+        let c = cfg();
+        let req = serde_json::json!({"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url": format!("{}/redirect.png", server.uri())}}
+        ]}]});
+        assert!(matches!(
+            reject_invalid_images(&req, &c).await,
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn named_private_hosts_honor_allow_private_hosts() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/real.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
+            )
+            .mount(&server)
+            .await;
+
+        let loopback_url = server.uri().replace("127.0.0.1", "localhost");
+        let req = serde_json::json!({"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url": format!("{loopback_url}/real.png")}}
+        ]}]});
+
+        let mut blocked = cfg();
+        blocked.allow_private_hosts = false;
+        assert!(matches!(
+            reject_invalid_images(&req, &blocked).await,
+            Err(AppError::BadRequest(_))
+        ));
+
+        let mut allowed = cfg();
+        allowed.allow_private_hosts = true;
+        assert!(reject_invalid_images(&req, &allowed).await.is_ok());
     }
 }

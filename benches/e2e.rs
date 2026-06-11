@@ -57,6 +57,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         image_validation_max_bytes: 8192,
         image_validation_max_concurrency: 8,
         image_validation_allow_private_hosts: false,
+        image_validation_reject_non_rgb_images: false,
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
         dev_mode: true,

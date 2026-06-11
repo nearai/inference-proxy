@@ -111,6 +111,24 @@ pub async fn catch_all(
     // Read body (use max_audio_request_size = 100MB since content type is unknown)
     let body_bytes = read_body_with_limit(body, state.config.max_audio_request_size).await?;
 
+    // Defense-in-depth: a chat-completions *alias* (e.g. a trailing slash, which
+    // the backend may accept) lands here instead of the dedicated handler, which
+    // would skip image validation entirely. Validate any JSON body that carries
+    // image inputs (no-op otherwise). Gated on a JSON content-type so we don't
+    // parse large binary/audio bodies. Note: E2EE request fields aren't decrypted
+    // on this path, but an encrypted blob simply isn't a fetchable URL → fail-open.
+    let is_json = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|c| c.to_ascii_lowercase().contains("json"))
+        .unwrap_or(false);
+    if is_json {
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+            crate::image_validation::reject_invalid_images(&json, &state.config.image_validation())
+                .await?;
+        }
+    }
+
     // Compute request hash
     let request_sha256 = if body_bytes.is_empty() {
         // For bodyless requests, hash the path+query

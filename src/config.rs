@@ -12,10 +12,21 @@ fn env_int(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn parse_bool(v: &str) -> bool {
+    matches!(v.to_lowercase().as_str(), "1" | "true" | "yes")
+}
+
 fn env_bool(name: &str) -> bool {
-    env::var(name)
-        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    env::var(name).map(|v| parse_bool(&v)).unwrap_or(false)
+}
+
+fn env_bool_optional(name: &str) -> Option<bool> {
+    env::var(name).ok().map(|v| parse_bool(&v))
+}
+
+fn is_gemma4_model_name(model_name: &str) -> bool {
+    let name = model_name.to_ascii_lowercase();
+    name.contains("gemma-4") || name.contains("gemma4")
 }
 
 #[derive(Debug, Clone)]
@@ -61,11 +72,15 @@ pub struct Config {
     //   VLLM_PROXY_IMAGE_VALIDATION_MAX_CONCURRENCY=8   global concurrent fetches
     //   VLLM_PROXY_IMAGE_VALIDATION_ALLOW_PRIVATE_HOSTS=1  permit private/loopback
     //       image hosts (tests / trusted internal deployments; default: off)
+    //   VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB=0|1  force non-RGB rejection;
+    //       by default this is enabled only for Gemma-4 model names to prevent
+    //       SGLang Gemma-4 vision-tower crashes on grayscale/RGBA images.
     pub image_validation_enabled: bool,
     pub image_validation_timeout_secs: u64,
     pub image_validation_max_bytes: usize,
     pub image_validation_max_concurrency: usize,
     pub image_validation_allow_private_hosts: bool,
+    pub image_validation_reject_non_rgb_images: bool,
 
     // Cache
     pub chat_cache_expiration_secs: u64,
@@ -282,6 +297,10 @@ impl Config {
             .filter(|s| !s.is_empty())
             .map(|s| s.trim_end_matches('/').to_string());
 
+        let image_validation_reject_non_rgb_images =
+            env_bool_optional("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB")
+                .unwrap_or_else(|| is_gemma4_model_name(&model_name));
+
         let config = Config {
             model_name,
             tokens,
@@ -329,6 +348,7 @@ impl Config {
             image_validation_allow_private_hosts: env_bool(
                 "VLLM_PROXY_IMAGE_VALIDATION_ALLOW_PRIVATE_HOSTS",
             ),
+            image_validation_reject_non_rgb_images,
             chat_cache_expiration_secs: env_int("CHAT_CACHE_EXPIRATION", 1200) as u64,
             attestation_cache_ttl_secs: env_int("ATTESTATION_CACHE_TTL", 300) as u64,
             dev_mode: env_bool("DEV"),
@@ -409,6 +429,7 @@ impl Config {
             max_bytes: self.image_validation_max_bytes,
             max_concurrency: self.image_validation_max_concurrency,
             allow_private_hosts: self.image_validation_allow_private_hosts,
+            reject_non_rgb_images: self.image_validation_reject_non_rgb_images,
         }
     }
 }
@@ -521,6 +542,7 @@ mod tests {
             env::remove_var("DEV");
             env::remove_var("GPU_NO_HW_MODE");
             env::remove_var("CHAT_CACHE_EXPIRATION");
+            env::remove_var("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB");
 
             let config = Config::from_env().unwrap();
 
@@ -547,7 +569,28 @@ mod tests {
             assert_eq!(config.backend_urls, vec!["http://localhost:8000"]);
             assert!(config.images_url_override.is_none());
             assert!(config.rerank_url_override.is_none());
+            assert!(!config.image_validation_reject_non_rgb_images);
         });
+    }
+
+    #[test]
+    fn test_gemma4_enables_non_rgb_guard_by_default_with_env_override() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "RedHatAI/gemma-4-31B-it-FP8-Dynamic"),
+                ("TOKEN", "tok"),
+                ("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB", "0"),
+            ],
+            || {
+                env::remove_var("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB");
+                let config = Config::from_env().unwrap();
+                assert!(config.image_validation_reject_non_rgb_images);
+
+                env::set_var("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB", "0");
+                let config = Config::from_env().unwrap();
+                assert!(!config.image_validation_reject_non_rgb_images);
+            },
+        );
     }
 
     #[test]

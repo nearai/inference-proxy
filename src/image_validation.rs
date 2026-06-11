@@ -14,8 +14,8 @@
 //!
 //! ## Conservative by design (fail-open)
 //! It only rejects inputs it can *positively* identify as bad: a URL that can't
-//! be fetched (DNS/connect/timeout) or is definitively gone (404/410), content that sniffs as
-//! HTML/text/JSON, a `data:` payload that isn't decodable base64 under any
+//! be fetched because of DNS/connect failures or is definitively gone
+//! (404/410), content that sniffs as HTML/text/JSON, a `data:` payload that isn't decodable base64 under any
 //! common alphabet, or (when enabled for Gemma-4) a raster image header that is
 //! decisively non-RGB. Anything ambiguous (unknown-but-not-textual bytes,
 //! unusual schemes, unknown content types) is **passed through** so the engine
@@ -55,6 +55,8 @@ const MAX_REDIRECTS: usize = 5;
 /// How many decoded bytes of a `data:` base64 payload to materialize for
 /// type-sniffing (bounds allocation regardless of the payload's true size).
 const SNIFF_DECODE_BYTES: usize = 4096;
+const IMAGE_VALIDATION_USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
 /// Generic, content-free rejection message. Never echoes the URL or any user
 /// data (see proxy.rs sanitization rules / privacy requirements).
@@ -243,9 +245,10 @@ fn validate_data_url_with_policy(rest: &str, reject_non_rgb_images: bool) -> Ver
 /// read its header. Returns `None` only when the head decodes under no alphabet.
 fn decode_b64_prefix(data: &str) -> Option<Vec<u8>> {
     use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
-    let cleaned: String = data.chars().filter(|c| !c.is_whitespace()).collect();
     let cap_chars = (SNIFF_DECODE_BYTES / 3 + 1) * 4; // multiple of 4
-    if cleaned.len() <= cap_chars {
+    let mut cleaned_chars = data.chars().filter(|c| !c.is_whitespace());
+    let cleaned: String = cleaned_chars.by_ref().take(cap_chars).collect();
+    if cleaned_chars.next().is_none() {
         for engine in [STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD] {
             if let Ok(bytes) = engine.decode(cleaned.as_bytes()) {
                 return Some(bytes);
@@ -254,9 +257,8 @@ fn decode_b64_prefix(data: &str) -> Option<Vec<u8>> {
         None
     } else {
         // Decode just the 4-char-aligned prefix (no trailing padding → no-pad).
-        let prefix = &cleaned.as_bytes()[..cap_chars];
         for engine in [STANDARD_NO_PAD, URL_SAFE_NO_PAD] {
-            if let Ok(bytes) = engine.decode(prefix) {
+            if let Ok(bytes) = engine.decode(cleaned.as_bytes()) {
                 return Some(bytes);
             }
         }
@@ -315,17 +317,18 @@ async fn validate_http_url(url: &str, cfg: &ImageValidationConfig) -> Verdict {
     let resp = match validation_client(cfg.allow_private_hosts)
         .get(url)
         .timeout(cfg.timeout)
-        .header(
-            reqwest::header::USER_AGENT,
-            "Mozilla/5.0 (compatible; nearai-inference-proxy/1.0; +https://near.ai)",
-        )
+        .header(reqwest::header::USER_AGENT, IMAGE_VALIDATION_USER_AGENT)
         .header(reqwest::header::ACCEPT, "image/*,*/*;q=0.8")
         .send()
         .await
     {
         Ok(r) => r,
-        // Transport failure (DNS/connect/timeout) or blocked by SsrfResolver →
-        // a definitive failure the engine would also hit. Reject.
+        // DNS/connect failure or blocked by SsrfResolver → a definitive failure
+        // the engine would also hit. Timeouts are ambiguous and fail open.
+        Err(err) if err.is_timeout() => {
+            tracing::debug!(reason = "fetch_timeout", "image validation passthrough");
+            return Verdict::Pass;
+        }
         Err(_) => {
             tracing::debug!(reason = "fetch_error", "image validation rejected");
             return Verdict::Reject;
@@ -365,6 +368,17 @@ async fn validate_http_url(url: &str, cfg: &ImageValidationConfig) -> Verdict {
                     head.truncate(cap);
                     break;
                 }
+            }
+            Err(err) if err.is_timeout() => {
+                tracing::debug!(reason = "body_timeout", "image validation passthrough");
+                return Verdict::Pass;
+            }
+            Err(_) if head.is_empty() => {
+                tracing::debug!(
+                    reason = "body_error_before_bytes",
+                    "image validation passthrough"
+                );
+                return Verdict::Pass;
             }
             Err(_) => break, // truncated read; classify what we have
         }
@@ -434,11 +448,10 @@ fn validation_client(allow_private_hosts: bool) -> &'static reqwest::Client {
     })
 }
 
-/// A reqwest DNS resolver that resolves IPv4-only (matching the proxy's main
-/// client, which avoids IPv6-unreachable stalls inside CVMs) and refuses any
-/// name that resolves to a non-public address — closing SSRF via the initial
-/// domain and via redirect hops alike, with the checked IP equal to the
-/// connected IP (no resolve-then-connect TOCTOU window).
+/// A reqwest DNS resolver that refuses any name that resolves to a non-public
+/// address — closing SSRF via the initial domain and via redirect hops alike,
+/// with the checked IP equal to the connected IP (no resolve-then-connect
+/// TOCTOU window).
 struct SsrfResolver {
     allow_private_hosts: bool,
 }
@@ -450,7 +463,6 @@ impl reqwest::dns::Resolve for SsrfResolver {
             let addrs: Vec<SocketAddr> = tokio::net::lookup_host(format!("{}:0", name.as_str()))
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
-                .filter(|a| a.is_ipv4())
                 .collect();
             // Honor allow_private_hosts for resolved domains (not just literals).
             if !allow_private_hosts && addrs.iter().any(|a| is_disallowed_ip(a.ip())) {
@@ -546,8 +558,8 @@ fn png_rgb_compatibility(bytes: &[u8]) -> RgbCompatibility {
         return RgbCompatibility::Unknown;
     }
     match bytes[25] {
-        0 | 4 | 6 => RgbCompatibility::NonRgb, // grayscale, grayscale+alpha, RGBA
-        2 | 3 => RgbCompatibility::RgbCompatible, // RGB or indexed-color palette
+        0 | 3 | 4 | 6 => RgbCompatibility::NonRgb, // grayscale, indexed palette/P-mode, grayscale+alpha, RGBA
+        2 => RgbCompatibility::RgbCompatible,      // RGB
         _ => RgbCompatibility::Unknown,
     }
 }
@@ -909,10 +921,11 @@ mod tests {
         let rgb_jpeg = minimal_jpeg_with_components(3);
         let cmyk_jpeg = minimal_jpeg_with_components(4);
         let gray_png = minimal_png_with_color_type(0);
+        let palette_png = minimal_png_with_color_type(3);
         let rgb_png = minimal_png_with_color_type(2);
         let rgba_png = minimal_png_with_color_type(6);
 
-        for non_rgb in [&gray_jpeg, &cmyk_jpeg, &gray_png, &rgba_png] {
+        for non_rgb in [&gray_jpeg, &cmyk_jpeg, &gray_png, &palette_png, &rgba_png] {
             assert_eq!(
                 classify_bytes_with_policy(non_rgb, Some("image/png"), true),
                 Verdict::Reject
@@ -1255,6 +1268,33 @@ mod tests {
             reject_invalid_images(&req, &c).await,
             Err(AppError::BadRequest(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn redirect_chain_exhaustion_fails_open() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let server_uri = server.uri().replace("127.0.0.1", "localhost");
+        for i in 0..=MAX_REDIRECTS {
+            let current = format!("/r{i}.png");
+            let next = format!("/r{}.png", i + 1);
+            Mock::given(method("GET"))
+                .and(path(current))
+                .respond_with(
+                    ResponseTemplate::new(302)
+                        .insert_header("location", format!("{server_uri}{next}")),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let c = cfg();
+        let req = serde_json::json!({"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url": format!("{server_uri}/r0.png")}}
+        ]}]});
+        assert!(reject_invalid_images(&req, &c).await.is_ok());
     }
 
     #[tokio::test]

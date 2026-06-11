@@ -121,7 +121,12 @@ pub async fn catch_all(
     // (catch-all otherwise accepts up to 100 MB since content type is unknown).
     let decoded_path = percent_encoding::percent_decode_str(path).decode_utf8_lossy();
     let is_chat_completions_alias = decoded_path.trim_end_matches('/') == "/v1/chat/completions";
-    if is_chat_completions_alias && body_bytes.len() <= state.config.max_request_size {
+    if is_chat_completions_alias && body_bytes.len() > state.config.max_request_size {
+        return Err(AppError::PayloadTooLarge {
+            max_size: state.config.max_request_size,
+        });
+    }
+    if is_chat_completions_alias {
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
             crate::image_validation::reject_invalid_images(&json, &state.config.image_validation())
                 .await?;

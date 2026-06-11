@@ -546,6 +546,46 @@ async fn test_catch_all_percent_encoded_chat_alias_runs_image_validation() {
 }
 
 #[tokio::test]
+async fn test_catch_all_chat_alias_over_json_cap_is_rejected() {
+    // A chat-completions alias lands in catch_all, whose generic body limit is
+    // larger than the normal JSON chat limit. It must still enforce the chat
+    // limit instead of forwarding an oversized padded request around the
+    // dedicated route and image-validation parse.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"x"})))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app_with_image_validation(&mock_server.uri());
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "padding": "x".repeat(1024 * 1024)
+    });
+    let body = serde_json::to_vec(&request_body).unwrap();
+    assert!(body.len() > 1024 * 1024);
+    assert!(body.len() < 10 * 1024 * 1024);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions/")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
 async fn test_catch_all_non_chat_json_skips_image_validation() {
     // The catch-all image-validation hook is only for chat-completions aliases.
     // Other forwarded JSON endpoints must not parse/fetch arbitrary

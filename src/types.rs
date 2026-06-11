@@ -39,9 +39,8 @@ pub struct AttestationResponse {
     /// Contains the compose-manager's TDX-attested action log (deployment events).
     ///
     /// Stored as `RawValue` so the byte-exact JSON received from compose-manager
-    /// is forwarded verbatim. Re-parsing via `serde_json::Value` reorders keys
-    /// alphabetically and breaks the `sha256(actions) == actions_hash` binding
-    /// that ties the action log to the embedded TDX quote's `report_data`.
+    /// is forwarded verbatim, preserving the exact `actions` field serialization
+    /// for verifiers that recompute `sha256(actions) == actions_hash`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compose_manager_attestation: Option<Box<RawValue>>,
     /// Legacy flat OHTTP key config field kept for backward compatibility.

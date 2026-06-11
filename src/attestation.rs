@@ -397,9 +397,12 @@ impl AttestationCache {
 /// Fetch compose-manager attestation report from the given URL.
 ///
 /// Returns the raw response body as a `RawValue` so the bytes compose-manager
-/// signed are forwarded verbatim. This preserves the `sha256(actions) ==
-/// actions_hash` binding for downstream verifiers — re-parsing through
-/// `serde_json::Value` would reorder object keys alphabetically and break it.
+/// signed are forwarded verbatim. This preserves the exact `actions` field
+/// serialization for downstream verifiers that extract and hash it.
+///
+/// With alphabetical-key canonicalization (compose-manager PR #36),
+/// `serde_json::Value` would also produce correct key ordering, but RawValue
+/// is still preferred to avoid any risk of re-serialization divergence.
 ///
 /// Returns `None` on any error (timeout, connection refused, bad JSON, etc.)
 /// so that compose-manager unavailability never blocks inference attestation.
@@ -1813,8 +1816,10 @@ mod tests {
 
     /// Regression: a verifier must be able to recover `actions_hash` by
     /// re-hashing the `actions` field as it appears in inference-proxy's
-    /// response. Previously the value was held as `serde_json::Value` which
-    /// alphabetized object keys on re-serialization, breaking this binding.
+    /// response. compose-manager now canonicalizes with alphabetical key
+    /// ordering so `serde_json::Value` (which also sorts alphabetically)
+    /// produces the same serialization — but the response still uses
+    /// `RawValue` to preserve exact bytes.
     #[tokio::test]
     async fn test_actions_hash_round_trips_via_cache() {
         use sha2::{Digest, Sha256};
@@ -1822,9 +1827,9 @@ mod tests {
         let cache = AttestationCache::new(300);
         let report = make_test_report("ecdsa", "aabb");
 
-        // Mimic compose-manager: serialize an actions list (struct field order),
-        // hash it, then embed both in the attestation body.
-        let actions_json = r#"[{"timestamp":"2026-05-21T10:01:40Z","action":"compose_up","tag":"v0.0.169","commit":"8e71b71b","file":"small-models.yaml","file_sha256":"7f60fb50"}]"#;
+        // Mimic compose-manager: serialize an actions list (alphabetical key
+        // order per canonicalization rules), hash it, embed both.
+        let actions_json = r#"[{"action":"compose_up","commit":"8e71b71b","file":"small-models.yaml","file_sha256":"7f60fb50","tag":"v0.0.169","timestamp":"2026-05-21T10:01:40Z"}]"#;
         let actions_hash = hex::encode(Sha256::digest(actions_json.as_bytes()));
         let cm_raw =
             format!(r#"{{"actions":{actions_json},"actions_hash":"{actions_hash}","quote":"q"}}"#);
@@ -1839,9 +1844,11 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let cm = &parsed["compose_manager_attestation"];
 
-        // `serde_json::Value` reorders keys, so we cannot recover actions by
-        // re-serializing `cm["actions"]`. Instead, the response embeds the raw
-        // compose-manager body — locate the substring and hash directly.
+        // With alphabetical-key canonicalization, `serde_json::Value`
+        // re-serialization also sorts keys alphabetically — so re-serializing
+        // `cm["actions"]` now produces the correct hash. But we still extract
+        // from raw bytes via bracket-matching to verify the RawValue path
+        // works correctly (this is what production verifiers should do).
         let body = std::str::from_utf8(&bytes).unwrap();
         let needle = r#""actions":"#;
         let start = body.find(needle).unwrap() + needle.len();
@@ -1867,6 +1874,16 @@ mod tests {
             recomputed,
             cm["actions_hash"].as_str().unwrap(),
             "verifier must be able to recompute actions_hash from raw response bytes"
+        );
+
+        // Also verify that re-serializing through serde_json::Value (now that
+        // keys are alphabetical) produces the same hash.
+        let re_serialized = serde_json::to_string(&cm["actions"]).unwrap();
+        let re_hash = hex::encode(Sha256::digest(re_serialized.as_bytes()));
+        assert_eq!(
+            re_hash,
+            cm["actions_hash"].as_str().unwrap(),
+            "alphabetical canonicalization makes serde_json::Value round-trip correctly"
         );
     }
 }

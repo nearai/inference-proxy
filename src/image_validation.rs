@@ -424,6 +424,7 @@ fn validation_client(allow_private_hosts: bool) -> &'static reqwest::Client {
             }
         });
         reqwest::Client::builder()
+            .no_proxy()
             .redirect(redirect)
             .dns_resolver(Arc::new(SsrfResolver {
                 allow_private_hosts,

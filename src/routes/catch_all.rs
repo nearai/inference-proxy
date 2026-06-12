@@ -111,6 +111,28 @@ pub async fn catch_all(
     // Read body (use max_audio_request_size = 100MB since content type is unknown)
     let body_bytes = read_body_with_limit(body, state.config.max_audio_request_size).await?;
 
+    // Defense-in-depth: a chat-completions *alias* (e.g. a trailing slash or a
+    // percent-encoded path the backend decodes) lands here instead of the
+    // dedicated handler, which would skip image validation entirely. Compare
+    // against the percent-DECODED path so `/v1/chat/%63ompletions` is still
+    // gated. Don't gate on content-type — starlette/uvicorn parse JSON
+    // regardless of the header — but keep the parse under the normal JSON
+    // request cap so a huge body can't pressure the proxy via `serde_json`
+    // (catch-all otherwise accepts up to 100 MB since content type is unknown).
+    let decoded_path = percent_encoding::percent_decode_str(path).decode_utf8_lossy();
+    let is_chat_completions_alias = decoded_path.trim_end_matches('/') == "/v1/chat/completions";
+    if is_chat_completions_alias && body_bytes.len() > state.config.max_request_size {
+        return Err(AppError::PayloadTooLarge {
+            max_size: state.config.max_request_size,
+        });
+    }
+    if is_chat_completions_alias {
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+            crate::image_validation::reject_invalid_images(&json, &state.config.image_validation())
+                .await?;
+        }
+    }
+
     // Compute request hash
     let request_sha256 = if body_bytes.is_empty() {
         // For bodyless requests, hash the path+query

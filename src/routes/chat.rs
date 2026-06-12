@@ -49,6 +49,13 @@ pub async fn chat_completions(
         )?;
     }
 
+    // Reject clearly-bad image inputs (unfetchable / non-image) before forwarding
+    // to the engine, so a flood of dead URLs can't load the model. Runs only when
+    // the request actually contains images; conservative/fail-open otherwise.
+    // See nearai/infra#159, #172.
+    crate::image_validation::reject_invalid_images(&request_json, &state.config.image_validation())
+        .await?;
+
     let is_stream = request_json
         .get("stream")
         .and_then(|v| v.as_bool())

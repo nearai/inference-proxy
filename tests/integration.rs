@@ -18,7 +18,13 @@ fn build_test_app(mock_url: &str) -> axum::Router {
 
 /// Build a test app with a specific dstack socket path (used by /healthz tests).
 fn build_test_app_with_dstack_socket(mock_url: &str, dstack_socket_path: &str) -> axum::Router {
-    build_test_app_inner(mock_url, 100, 200, dstack_socket_path.to_string())
+    build_test_app_inner(mock_url, 100, 200, dstack_socket_path.to_string(), false)
+}
+
+/// Build a test app with pre-dispatch image validation enabled (and private
+/// hosts allowed so loopback wiremock image URLs are reachable).
+fn build_test_app_with_image_validation(mock_url: &str) -> axum::Router {
+    build_test_app_inner(mock_url, 100, 200, "/var/run/dstack.sock".to_string(), true)
 }
 
 /// Build a test app with custom rate limit settings.
@@ -32,6 +38,7 @@ fn build_test_app_with_rate_limit(
         rate_per_second,
         rate_burst,
         "/var/run/dstack.sock".to_string(),
+        false,
     )
 }
 
@@ -40,6 +47,7 @@ fn build_test_app_inner(
     rate_per_second: u64,
     rate_burst: u32,
     dstack_socket_path: String,
+    image_validation: bool,
 ) -> axum::Router {
     let base = mock_url.trim_end_matches('/');
 
@@ -63,6 +71,15 @@ fn build_test_app_inner(
         max_request_size: 1024 * 1024,
         max_image_request_size: 5 * 1024 * 1024,
         max_audio_request_size: 10 * 1024 * 1024,
+        // Off by default in tests so existing fixtures are unaffected; the
+        // dedicated image-validation tests build their own enabled config.
+        image_validation_enabled: image_validation,
+        image_validation_timeout_secs: 5,
+        image_validation_max_bytes: 8192,
+        image_validation_max_concurrency: 8,
+        image_validation_allow_private_hosts: image_validation,
+        image_validation_reject_non_rgb_images: false,
+        image_validation_reject_single_channel_images: false,
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
         dev_mode: true,
@@ -405,6 +422,241 @@ async fn test_chat_completions_non_streaming() {
     let body = body_to_json(response).await;
     assert_eq!(body["id"], "chatcmpl-test123");
     assert_eq!(body["choices"][0]["message"]["content"], "Hello!");
+}
+
+#[tokio::test]
+async fn test_chat_completions_image_validation_rejects_bad_image() {
+    // Handler-level wiring: with image validation enabled, a request carrying a
+    // clearly-bad image (dangerous scheme) is rejected at the proxy with a 400
+    // and OpenAI error shape — before reaching the backend.
+    let mock_server = MockServer::start().await;
+    // Backend mock present but must NOT be hit (validation rejects first).
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"x"})))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app_with_image_validation(&mock_server.uri());
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {"url": "file:///etc/passwd"}}
+        ]}],
+        "stream": false
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(response).await;
+    assert!(
+        body["error"]["message"].is_string(),
+        "expected OpenAI error shape, got: {body}"
+    );
+    // The generic message must not echo the offending URL.
+    assert!(!body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("/etc/passwd"));
+}
+
+#[tokio::test]
+async fn test_catch_all_chat_alias_runs_image_validation() {
+    // A trailing-slash chat-completions alias lands in catch_all. It must still
+    // run image validation so backend-accepted aliases cannot bypass the guard.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"x"})))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app_with_image_validation(&mock_server.uri());
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "file:///etc/passwd"}}
+        ]}],
+        "stream": false
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions/")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(response).await;
+    assert!(body["error"]["message"].is_string());
+}
+
+#[tokio::test]
+async fn test_catch_all_percent_encoded_chat_alias_runs_image_validation() {
+    // `/v1/chat/%63ompletions` (c = %63) misses the exact axum route but a
+    // uvicorn backend decodes it. catch_all compares the percent-DECODED path,
+    // so the alias is still validated (bad image → 400, backend not hit).
+    let mock_server = MockServer::start().await;
+    let app = build_test_app_with_image_validation(&mock_server.uri());
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "file:///etc/passwd"}}
+        ]}],
+        "stream": false
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/%63ompletions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_catch_all_chat_alias_over_json_cap_is_rejected() {
+    // A chat-completions alias lands in catch_all, whose generic body limit is
+    // larger than the normal JSON chat limit. It must still enforce the chat
+    // limit instead of forwarding an oversized padded request around the
+    // dedicated route and image-validation parse.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"x"})))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app_with_image_validation(&mock_server.uri());
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "padding": "x".repeat(1024 * 1024)
+    });
+    let body = serde_json::to_vec(&request_body).unwrap();
+    assert!(body.len() > 1024 * 1024);
+    assert!(body.len() < 10 * 1024 * 1024);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions/")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn test_catch_all_non_chat_json_skips_image_validation() {
+    // The catch-all image-validation hook is only for chat-completions aliases.
+    // Other forwarded JSON endpoints must not parse/fetch arbitrary
+    // image_url-shaped fields or turn them into local 400s.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/completions/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"x"})))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app_with_image_validation(&mock_server.uri());
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "file:///etc/passwd"}}
+        ]}]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions/")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_chat_completions_image_validation_allows_text_only() {
+    // Control: validation enabled but a text-only request passes through to the
+    // backend unchanged (validation is a no-op without image parts).
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-ok",
+            "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role":"assistant","content":"hi"}, "finish_reason":"stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app_with_image_validation(&mock_server.uri());
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": false
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 // ---- Streaming chat completions ----
@@ -3184,6 +3436,15 @@ fn build_test_app_with_cloud_api_retries(
         max_request_size: 1024 * 1024,
         max_image_request_size: 5 * 1024 * 1024,
         max_audio_request_size: 10 * 1024 * 1024,
+        // Off by default in tests so existing fixtures are unaffected; the
+        // dedicated image-validation tests build their own enabled config.
+        image_validation_enabled: false,
+        image_validation_timeout_secs: 5,
+        image_validation_max_bytes: 8192,
+        image_validation_max_concurrency: 8,
+        image_validation_allow_private_hosts: false,
+        image_validation_reject_non_rgb_images: false,
+        image_validation_reject_single_channel_images: false,
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
         cloud_api_url: Some(cloud_api_url.to_string()),
@@ -4319,6 +4580,74 @@ async fn test_encrypted_chat_non_streaming_ed25519() {
         encryption::decrypt_string(encrypted_response, &wrong_ctx, &server_pair).is_err(),
         "Server should not be able to decrypt response meant for client"
     );
+}
+
+#[tokio::test]
+async fn test_encrypted_chat_image_validation_rejects_decrypted_bad_image() {
+    use vllm_proxy_rs::encryption;
+
+    let mock_server = MockServer::start().await;
+    let client_pair = test_client_signing_pair();
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"x"})))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app_with_image_validation(&mock_server.uri());
+
+    let server_pub_hex = test_ed25519_pub_key_hex();
+    let server_pub_bytes = hex::decode(&server_pub_hex).unwrap();
+    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
+
+    let enc_for_request = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: server_pub_bytes,
+        version: 1,
+        encrypt_all_fields: false,
+    };
+
+    let content = serde_json::json!([
+        {"type": "text", "text": "what is this"},
+        {"type": "image_url", "image_url": {"url": "file:///etc/passwd"}}
+    ]);
+    let encrypted_content = encryption::encrypt_string(
+        &serde_json::to_string(&content).unwrap(),
+        &enc_for_request,
+        &client_pair,
+    )
+    .unwrap();
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": encrypted_content}],
+        "stream": false
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header("x-signing-algo", "ed25519")
+                .header("x-client-pub-key", &client_pub_hex)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(response).await;
+    assert!(body["error"]["message"].is_string());
+    assert!(!body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("/etc/passwd"));
 }
 
 #[tokio::test]
@@ -5502,6 +5831,15 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         max_request_size: 1024 * 1024,
         max_image_request_size: 5 * 1024 * 1024,
         max_audio_request_size: 10 * 1024 * 1024,
+        // Off by default in tests so existing fixtures are unaffected; the
+        // dedicated image-validation tests build their own enabled config.
+        image_validation_enabled: false,
+        image_validation_timeout_secs: 5,
+        image_validation_max_bytes: 8192,
+        image_validation_max_concurrency: 8,
+        image_validation_allow_private_hosts: false,
+        image_validation_reject_non_rgb_images: false,
+        image_validation_reject_single_channel_images: false,
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
         dev_mode: true,
@@ -5897,6 +6235,15 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         max_request_size: 1024 * 1024,
         max_image_request_size: 5 * 1024 * 1024,
         max_audio_request_size: 10 * 1024 * 1024,
+        // Off by default in tests so existing fixtures are unaffected; the
+        // dedicated image-validation tests build their own enabled config.
+        image_validation_enabled: false,
+        image_validation_timeout_secs: 5,
+        image_validation_max_bytes: 8192,
+        image_validation_max_concurrency: 8,
+        image_validation_allow_private_hosts: false,
+        image_validation_reject_non_rgb_images: false,
+        image_validation_reject_single_channel_images: false,
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
         dev_mode: true,

@@ -15,6 +15,7 @@ pub mod config;
 pub mod encryption;
 pub mod error;
 pub mod gpu_evidence_delegate;
+pub mod image_validation;
 pub mod metrics_middleware;
 pub mod ohttp_gateway;
 pub mod proxy;

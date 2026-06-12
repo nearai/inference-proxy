@@ -12,10 +12,29 @@ fn env_int(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn parse_bool(v: &str) -> bool {
+    matches!(v.to_lowercase().as_str(), "1" | "true" | "yes")
+}
+
 fn env_bool(name: &str) -> bool {
-    env::var(name)
-        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    env::var(name).map(|v| parse_bool(&v)).unwrap_or(false)
+}
+
+fn env_bool_optional(name: &str) -> Option<bool> {
+    env::var(name).ok().map(|v| parse_bool(&v))
+}
+
+fn is_gemma4_model_name(model_name: &str) -> bool {
+    let name = model_name.to_ascii_lowercase();
+    ["gemma-4", "gemma4"].iter().any(|needle| {
+        name.match_indices(needle).any(|(idx, _)| {
+            name[idx + needle.len()..]
+                .chars()
+                .next()
+                .map(|c| !c.is_ascii_alphanumeric())
+                .unwrap_or(true)
+        })
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +71,31 @@ pub struct Config {
     pub max_request_size: usize,
     pub max_image_request_size: usize,
     pub max_audio_request_size: usize,
+
+    // Pre-dispatch image validation (reject unfetchable/non-image inputs before
+    // they reach the engine — nearai/infra#159, #172). Env vars:
+    //   VLLM_PROXY_IMAGE_VALIDATION_DISABLED=1          disable (default: on)
+    //   VLLM_PROXY_IMAGE_VALIDATION_TIMEOUT_SECS=5      per-fetch timeout
+    //   VLLM_PROXY_IMAGE_VALIDATION_MAX_BYTES=8192      head bytes read to sniff
+    //   VLLM_PROXY_IMAGE_VALIDATION_MAX_CONCURRENCY=8   global concurrent fetches
+    //   VLLM_PROXY_IMAGE_VALIDATION_ALLOW_PRIVATE_HOSTS=1  permit private/loopback
+    //       image hosts (tests / trusted internal deployments; default: off)
+    //   VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB=0|1  force broad non-RGB
+    //       rejection. By default Gemma-4 model names reject only observed
+    //       one-channel crash inputs; broader RGBA/CMYK/palette rejection is
+    //       opt-in until real-engine verification covers those classes.
+    // NOTE: the validation fetcher bypasses system proxies (no_proxy) and uses
+    // rustls/webpki-roots. Deployments whose outbound HTTP requires an egress
+    // proxy (HTTPS_PROXY) or a custom CA that the engine trusts but rustls does
+    // not should set _DISABLED=1 — otherwise remote-image requests 400 on a
+    // connect/TLS error while the engine itself fetches fine.
+    pub image_validation_enabled: bool,
+    pub image_validation_timeout_secs: u64,
+    pub image_validation_max_bytes: usize,
+    pub image_validation_max_concurrency: usize,
+    pub image_validation_allow_private_hosts: bool,
+    pub image_validation_reject_non_rgb_images: bool,
+    pub image_validation_reject_single_channel_images: bool,
 
     // Cache
     pub chat_cache_expiration_secs: u64,
@@ -268,6 +312,14 @@ impl Config {
             .filter(|s| !s.is_empty())
             .map(|s| s.trim_end_matches('/').to_string());
 
+        let image_validation_reject_non_rgb_override =
+            env_bool_optional("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB");
+        let image_validation_reject_single_channel_images =
+            image_validation_reject_non_rgb_override
+                .unwrap_or_else(|| is_gemma4_model_name(&model_name));
+        let image_validation_reject_non_rgb_images =
+            image_validation_reject_non_rgb_override.unwrap_or(false);
+
         let config = Config {
             model_name,
             tokens,
@@ -304,6 +356,19 @@ impl Config {
             max_request_size: env_int("VLLM_PROXY_MAX_REQUEST_SIZE", 10 * 1024 * 1024),
             max_image_request_size: env_int("VLLM_PROXY_MAX_IMAGE_REQUEST_SIZE", 50 * 1024 * 1024),
             max_audio_request_size: env_int("VLLM_PROXY_MAX_AUDIO_REQUEST_SIZE", 100 * 1024 * 1024),
+            image_validation_enabled: !env_bool("VLLM_PROXY_IMAGE_VALIDATION_DISABLED"),
+            image_validation_timeout_secs: env_int("VLLM_PROXY_IMAGE_VALIDATION_TIMEOUT_SECS", 5)
+                as u64,
+            image_validation_max_bytes: env_int("VLLM_PROXY_IMAGE_VALIDATION_MAX_BYTES", 8192),
+            image_validation_max_concurrency: env_int(
+                "VLLM_PROXY_IMAGE_VALIDATION_MAX_CONCURRENCY",
+                8,
+            ),
+            image_validation_allow_private_hosts: env_bool(
+                "VLLM_PROXY_IMAGE_VALIDATION_ALLOW_PRIVATE_HOSTS",
+            ),
+            image_validation_reject_non_rgb_images,
+            image_validation_reject_single_channel_images,
             chat_cache_expiration_secs: env_int("CHAT_CACHE_EXPIRATION", 1200) as u64,
             attestation_cache_ttl_secs: env_int("ATTESTATION_CACHE_TTL", 300) as u64,
             dev_mode: env_bool("DEV"),
@@ -374,6 +439,19 @@ impl Config {
         }
 
         Ok(config)
+    }
+
+    /// Build the runtime config for pre-dispatch image validation.
+    pub fn image_validation(&self) -> crate::image_validation::ImageValidationConfig {
+        crate::image_validation::ImageValidationConfig {
+            enabled: self.image_validation_enabled,
+            timeout: std::time::Duration::from_secs(self.image_validation_timeout_secs),
+            max_bytes: self.image_validation_max_bytes,
+            max_concurrency: self.image_validation_max_concurrency,
+            allow_private_hosts: self.image_validation_allow_private_hosts,
+            reject_non_rgb_images: self.image_validation_reject_non_rgb_images,
+            reject_single_channel_images: self.image_validation_reject_single_channel_images,
+        }
     }
 }
 
@@ -485,6 +563,7 @@ mod tests {
             env::remove_var("DEV");
             env::remove_var("GPU_NO_HW_MODE");
             env::remove_var("CHAT_CACHE_EXPIRATION");
+            env::remove_var("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB");
 
             let config = Config::from_env().unwrap();
 
@@ -511,7 +590,87 @@ mod tests {
             assert_eq!(config.backend_urls, vec!["http://localhost:8000"]);
             assert!(config.images_url_override.is_none());
             assert!(config.rerank_url_override.is_none());
+            assert!(!config.image_validation_reject_non_rgb_images);
+            assert!(!config.image_validation_reject_single_channel_images);
         });
+    }
+
+    #[test]
+    fn test_image_validation_env_vars_override_defaults() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "plain-model"),
+                ("TOKEN", "tok"),
+                ("VLLM_PROXY_IMAGE_VALIDATION_DISABLED", "1"),
+                ("VLLM_PROXY_IMAGE_VALIDATION_TIMEOUT_SECS", "7"),
+                ("VLLM_PROXY_IMAGE_VALIDATION_MAX_BYTES", "1234"),
+                ("VLLM_PROXY_IMAGE_VALIDATION_MAX_CONCURRENCY", "3"),
+                ("VLLM_PROXY_IMAGE_VALIDATION_ALLOW_PRIVATE_HOSTS", "true"),
+                ("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB", "1"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+
+                assert!(!config.image_validation_enabled);
+                assert_eq!(config.image_validation_timeout_secs, 7);
+                assert_eq!(config.image_validation_max_bytes, 1234);
+                assert_eq!(config.image_validation_max_concurrency, 3);
+                assert!(config.image_validation_allow_private_hosts);
+                assert!(config.image_validation_reject_non_rgb_images);
+                assert!(config.image_validation_reject_single_channel_images);
+
+                let image_validation = config.image_validation();
+                assert!(!image_validation.enabled);
+                assert_eq!(image_validation.timeout, std::time::Duration::from_secs(7));
+                assert_eq!(image_validation.max_bytes, 1234);
+                assert_eq!(image_validation.max_concurrency, 3);
+                assert!(image_validation.allow_private_hosts);
+                assert!(image_validation.reject_non_rgb_images);
+                assert!(image_validation.reject_single_channel_images);
+            },
+        );
+    }
+
+    #[test]
+    fn test_gemma4_enables_single_channel_guard_by_default_with_env_override() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "RedHatAI/gemma-4-31B-it-FP8-Dynamic"),
+                ("TOKEN", "tok"),
+                ("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB", "0"),
+            ],
+            || {
+                env::remove_var("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB");
+                let config = Config::from_env().unwrap();
+                assert!(config.image_validation_reject_single_channel_images);
+                assert!(!config.image_validation_reject_non_rgb_images);
+
+                env::set_var("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB", "1");
+                let config = Config::from_env().unwrap();
+                assert!(config.image_validation_reject_single_channel_images);
+                assert!(config.image_validation_reject_non_rgb_images);
+
+                env::set_var("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB", "0");
+                let config = Config::from_env().unwrap();
+                assert!(!config.image_validation_reject_single_channel_images);
+                assert!(!config.image_validation_reject_non_rgb_images);
+            },
+        );
+    }
+
+    #[test]
+    fn test_gemma4_guard_does_not_match_gemma_4b() {
+        with_env_vars(
+            &[("MODEL_NAME", "google/gemma-4b-it"), ("TOKEN", "tok")],
+            || {
+                env::remove_var("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB");
+
+                let config = Config::from_env().unwrap();
+
+                assert!(!config.image_validation_reject_single_channel_images);
+                assert!(!config.image_validation_reject_non_rgb_images);
+            },
+        );
     }
 
     #[test]

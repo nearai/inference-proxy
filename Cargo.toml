@@ -60,7 +60,7 @@ metrics-exporter-prometheus = "0.18"
 
 [dependencies.nv-attestation-sdk]
 git = "https://github.com/NVIDIA/attestation-sdk.git"
-tag = "2026.04.29"
+tag = "2026.06.09"
 optional = true
 
 [features]

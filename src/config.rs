@@ -26,7 +26,15 @@ fn env_bool_optional(name: &str) -> Option<bool> {
 
 fn is_gemma4_model_name(model_name: &str) -> bool {
     let name = model_name.to_ascii_lowercase();
-    name.contains("gemma-4") || name.contains("gemma4")
+    ["gemma-4", "gemma4"].iter().any(|needle| {
+        name.match_indices(needle).any(|(idx, _)| {
+            name[idx + needle.len()..]
+                .chars()
+                .next()
+                .map(|c| !c.is_ascii_alphanumeric())
+                .unwrap_or(true)
+        })
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -608,6 +616,21 @@ mod tests {
 
                 env::set_var("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB", "0");
                 let config = Config::from_env().unwrap();
+                assert!(!config.image_validation_reject_single_channel_images);
+                assert!(!config.image_validation_reject_non_rgb_images);
+            },
+        );
+    }
+
+    #[test]
+    fn test_gemma4_guard_does_not_match_gemma_4b() {
+        with_env_vars(
+            &[("MODEL_NAME", "google/gemma-4b-it"), ("TOKEN", "tok")],
+            || {
+                env::remove_var("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB");
+
+                let config = Config::from_env().unwrap();
+
                 assert!(!config.image_validation_reject_single_channel_images);
                 assert!(!config.image_validation_reject_non_rgb_images);
             },

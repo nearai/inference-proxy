@@ -36,6 +36,7 @@
 //! SGLang already fetches these URLs today, so this is a net security
 //! improvement, not a new exposure.
 
+use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -149,9 +150,10 @@ pub async fn reject_invalid_images(
         // Validate ALL images with bounded concurrency; short-circuit on the
         // first bad one. Each URL is moved into its own future (owning the
         // String) so the buffered stream stays `Send` for the axum handler.
+        let per_request_concurrency = cfg.max_concurrency.saturating_sub(1).max(1);
         let mut results = stream::iter(urls)
             .map(|url| async move { validate_one(&url, cfg).await })
-            .buffer_unordered(cfg.max_concurrency.max(1));
+            .buffer_unordered(per_request_concurrency);
         while let Some(verdict) = results.next().await {
             if verdict == Verdict::Reject {
                 return Err(AppError::BadRequest(REJECT_MSG.to_string()));
@@ -222,9 +224,10 @@ fn is_remote_scheme(url: &str) -> bool {
 
 async fn validate_one(url: &str, cfg: &ImageValidationConfig) -> Verdict {
     // URL schemes are case-insensitive (RFC 3986), and common URL parsers
-    // ignore leading ASCII whitespace/control characters. Normalize before
-    // matching so `HTTP://`, ` DATA:`, and ` FILE:///` can't bypass validation
-    // or the dangerous-scheme refusal.
+    // ignore leading ASCII whitespace/control characters plus embedded
+    // tab/newline characters. Normalize before matching so `HTTP://`, ` DATA:`,
+    // `h\tttp://`, and `fi\nle:///` can't bypass validation or the
+    // dangerous-scheme refusal.
     let url = normalize_image_url_input(url);
     let (scheme, rest) = match url.split_once(':') {
         Some((s, r)) => (s.to_ascii_lowercase(), r),
@@ -236,18 +239,32 @@ async fn validate_one(url: &str, cfg: &ImageValidationConfig) -> Verdict {
             cfg.reject_non_rgb_images,
             cfg.reject_single_channel_images,
         ),
-        "http" | "https" => validate_http_url(url, cfg).await,
+        "http" | "https" => validate_http_url(url.as_ref(), cfg).await,
         "file" | "ftp" | "gopher" => {
             // Dangerous / never a valid web image — refuse outright.
-            tracing::debug!(reason = "dangerous_scheme", "image validation rejected");
+            tracing::info!(reason = "dangerous_scheme", "image validation rejected");
             Verdict::Reject
         }
         _ => Verdict::Pass, // unknown scheme: don't assume (fail-open)
     }
 }
 
-fn normalize_image_url_input(url: &str) -> &str {
-    url.trim_start_matches(|c: char| c.is_ascii_whitespace() || c.is_ascii_control())
+fn normalize_image_url_input(url: &str) -> Cow<'_, str> {
+    let trimmed = url.trim_start_matches(|c: char| c.is_ascii_whitespace() || c.is_ascii_control());
+    if trimmed
+        .as_bytes()
+        .iter()
+        .any(|b| matches!(b, b'\t' | b'\n' | b'\r'))
+    {
+        Cow::Owned(
+            trimmed
+                .chars()
+                .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(trimmed)
+    }
 }
 
 /// `rest` is the part after `data:` — e.g. `image/png;base64,iVBOR...`.
@@ -268,14 +285,20 @@ fn validate_data_url_with_policy(
         match decode_b64_prefix(data) {
             // The declared media type is client-controlled and is exactly what
             // lies in the mislabeled cases — classify the bytes, not the label.
-            Some(bytes) => classify_bytes_with_policy(
-                &bytes,
-                None,
-                reject_non_rgb_images,
-                reject_single_channel_images,
-            ),
+            Some(bytes) => {
+                let verdict = classify_bytes_with_policy(
+                    &bytes,
+                    None,
+                    reject_non_rgb_images,
+                    reject_single_channel_images,
+                );
+                if verdict == Verdict::Reject {
+                    tracing::info!(reason = "data_url_non_image", "image validation rejected");
+                }
+                verdict
+            }
             None => {
-                tracing::debug!(reason = "data_url_bad_base64", "image validation rejected");
+                tracing::info!(reason = "data_url_bad_base64", "image validation rejected");
                 Verdict::Reject // not decodable base64 under any alphabet
             }
         }
@@ -324,11 +347,11 @@ async fn validate_http_url(url: &str, cfg: &ImageValidationConfig) -> Verdict {
     match parsed.host() {
         None => return Verdict::Reject,
         Some(Host::Ipv4(ip)) if !cfg.allow_private_hosts && is_disallowed_ip(IpAddr::V4(ip)) => {
-            tracing::debug!(reason = "ssrf_ip_literal", "image validation rejected");
+            tracing::info!(reason = "ssrf_ip_literal", "image validation rejected");
             return Verdict::Reject;
         }
         Some(Host::Ipv6(ip)) if !cfg.allow_private_hosts && is_disallowed_ip(IpAddr::V6(ip)) => {
-            tracing::debug!(reason = "ssrf_ip_literal", "image validation rejected");
+            tracing::info!(reason = "ssrf_ip_literal", "image validation rejected");
             return Verdict::Reject;
         }
         _ => {}
@@ -350,7 +373,7 @@ async fn validate_http_url(url: &str, cfg: &ImageValidationConfig) -> Verdict {
     {
         Ok(Ok(permit)) => permit,
         _ => {
-            tracing::debug!(
+            tracing::warn!(
                 reason = "validator_saturated",
                 "image validation passthrough"
             );
@@ -377,7 +400,7 @@ async fn validate_http_url(url: &str, cfg: &ImageValidationConfig) -> Verdict {
             return Verdict::Pass;
         }
         Err(_) => {
-            tracing::debug!(reason = "fetch_error", "image validation rejected");
+            tracing::info!(reason = "fetch_error", "image validation rejected");
             return Verdict::Reject;
         }
     };
@@ -385,7 +408,7 @@ async fn validate_http_url(url: &str, cfg: &ImageValidationConfig) -> Verdict {
     let status = resp.status();
     if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
         // Definitively gone.
-        tracing::debug!(status = %status.as_u16(), reason = "http_gone", "image validation rejected");
+        tracing::info!(status = %status.as_u16(), reason = "http_gone", "image validation rejected");
         return Verdict::Reject;
     }
     if !status.is_success() {
@@ -438,7 +461,7 @@ async fn validate_http_url(url: &str, cfg: &ImageValidationConfig) -> Verdict {
         cfg.reject_single_channel_images,
     );
     if verdict == Verdict::Reject {
-        tracing::debug!(reason = "non_image_body", "image validation rejected");
+        tracing::info!(reason = "non_image_body", "image validation rejected");
     }
     verdict
 }
@@ -793,6 +816,10 @@ fn is_disallowed_ip(ip: IpAddr) -> bool {
             let seg = v6.segments();
             v6.is_loopback()
                 || v6.is_unspecified()
+                || (seg[0] == 0 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0)
+                // ::/96 IPv4-compatible addresses.
+                || (seg[0] == 0x2001 && seg[1] == 0) // 2001::/32 Teredo
+                || seg[0] == 0x2002 // 2002::/16 6to4
                 || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
                 || (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
                 || (
@@ -1084,17 +1111,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uppercase_and_leading_space_schemes_are_not_bypassed() {
+    async fn uppercase_leading_space_and_embedded_control_schemes_are_not_bypassed() {
         // Case-insensitive and parser-like leading-space handling: dangerous,
-        // data, and remote schemes must still hit their validation paths.
+        // embedded-control, data, and remote schemes must still hit their
+        // validation paths.
         let html = base64::engine::general_purpose::STANDARD.encode("<!doctype html><html></html>");
         for url in [
             "FILE:///etc/passwd".to_string(),
             "File:///etc/passwd".to_string(),
             " FILE:///etc/passwd".to_string(),
+            "fi\tle:///etc/passwd".to_string(),
+            "f\rile:///etc/passwd".to_string(),
             format!("DATA:image/png;base64,{html}"),
             format!("\tdata:image/png;base64,{html}"),
+            format!("data\t:image/png;base64,{html}"),
+            format!("da\nta:image/png;base64,{html}"),
             " http://127.0.0.1:1/x.png".to_string(),
+            "h\tttp://127.0.0.1:1/x.png".to_string(),
+            "htt\rps://127.0.0.1:1/x.png".to_string(),
         ] {
             let v = serde_json::json!({"messages":[{"role":"user","content":[
                 {"type":"image_url","image_url":{"url": url}}
@@ -1186,6 +1220,9 @@ mod tests {
             "fc00::1",
             "64:ff9b::0808:0808",
             "64:ff9b:1::1",
+            "::0808:0808",
+            "2002:0a00:0001::1",
+            "2001:0000:4136:e378:8000:63bf:3fff:fdd2",
         ] {
             assert!(
                 is_disallowed_ip(ip.parse().unwrap()),

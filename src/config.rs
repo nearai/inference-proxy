@@ -596,6 +596,42 @@ mod tests {
     }
 
     #[test]
+    fn test_image_validation_env_vars_override_defaults() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "plain-model"),
+                ("TOKEN", "tok"),
+                ("VLLM_PROXY_IMAGE_VALIDATION_DISABLED", "1"),
+                ("VLLM_PROXY_IMAGE_VALIDATION_TIMEOUT_SECS", "7"),
+                ("VLLM_PROXY_IMAGE_VALIDATION_MAX_BYTES", "1234"),
+                ("VLLM_PROXY_IMAGE_VALIDATION_MAX_CONCURRENCY", "3"),
+                ("VLLM_PROXY_IMAGE_VALIDATION_ALLOW_PRIVATE_HOSTS", "true"),
+                ("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB", "1"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+
+                assert!(!config.image_validation_enabled);
+                assert_eq!(config.image_validation_timeout_secs, 7);
+                assert_eq!(config.image_validation_max_bytes, 1234);
+                assert_eq!(config.image_validation_max_concurrency, 3);
+                assert!(config.image_validation_allow_private_hosts);
+                assert!(config.image_validation_reject_non_rgb_images);
+                assert!(config.image_validation_reject_single_channel_images);
+
+                let image_validation = config.image_validation();
+                assert!(!image_validation.enabled);
+                assert_eq!(image_validation.timeout, std::time::Duration::from_secs(7));
+                assert_eq!(image_validation.max_bytes, 1234);
+                assert_eq!(image_validation.max_concurrency, 3);
+                assert!(image_validation.allow_private_hosts);
+                assert!(image_validation.reject_non_rgb_images);
+                assert!(image_validation.reject_single_channel_images);
+            },
+        );
+    }
+
+    #[test]
     fn test_gemma4_enables_single_channel_guard_by_default_with_env_override() {
         with_env_vars(
             &[

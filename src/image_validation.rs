@@ -433,9 +433,7 @@ async fn validate_http_url(url: &str, cfg: &ImageValidationConfig) -> Verdict {
     while let Some(chunk) = body.next().await {
         match chunk {
             Ok(b) => {
-                head.extend_from_slice(&b);
-                if head.len() >= cap {
-                    head.truncate(cap);
+                if append_capped_head_bytes(&mut head, &b, cap) {
                     break;
                 }
             }
@@ -464,6 +462,16 @@ async fn validate_http_url(url: &str, cfg: &ImageValidationConfig) -> Verdict {
         tracing::info!(reason = "non_image_body", "image validation rejected");
     }
     verdict
+}
+
+fn append_capped_head_bytes(head: &mut Vec<u8>, chunk: &[u8], cap: usize) -> bool {
+    let remaining = cap.saturating_sub(head.len());
+    if remaining == 0 {
+        return true;
+    }
+    let take = remaining.min(chunk.len());
+    head.extend_from_slice(&chunk[..take]);
+    head.len() >= cap
 }
 
 /// Global cap on concurrent outbound image-validation fetches, shared across
@@ -945,6 +953,17 @@ mod tests {
         assert!(is_image_magic(b"RIFF\0\0\0\0WEBPVP8 "));
         assert!(!is_image_magic(b"<!doctype html>"));
         assert!(!is_image_magic(b"not an image"));
+    }
+
+    #[test]
+    fn append_capped_head_bytes_never_exceeds_cap() {
+        let mut head = vec![1, 2];
+
+        assert!(append_capped_head_bytes(&mut head, &[3, 4, 5, 6, 7], 4));
+        assert_eq!(head, vec![1, 2, 3, 4]);
+
+        assert!(append_capped_head_bytes(&mut head, &[8, 9], 4));
+        assert_eq!(head, vec![1, 2, 3, 4]);
     }
 
     #[test]

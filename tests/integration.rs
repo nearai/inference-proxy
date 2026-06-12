@@ -4583,6 +4583,74 @@ async fn test_encrypted_chat_non_streaming_ed25519() {
 }
 
 #[tokio::test]
+async fn test_encrypted_chat_image_validation_rejects_decrypted_bad_image() {
+    use vllm_proxy_rs::encryption;
+
+    let mock_server = MockServer::start().await;
+    let client_pair = test_client_signing_pair();
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"x"})))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app_with_image_validation(&mock_server.uri());
+
+    let server_pub_hex = test_ed25519_pub_key_hex();
+    let server_pub_bytes = hex::decode(&server_pub_hex).unwrap();
+    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
+
+    let enc_for_request = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: server_pub_bytes,
+        version: 1,
+        encrypt_all_fields: false,
+    };
+
+    let content = serde_json::json!([
+        {"type": "text", "text": "what is this"},
+        {"type": "image_url", "image_url": {"url": "file:///etc/passwd"}}
+    ]);
+    let encrypted_content = encryption::encrypt_string(
+        &serde_json::to_string(&content).unwrap(),
+        &enc_for_request,
+        &client_pair,
+    )
+    .unwrap();
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": encrypted_content}],
+        "stream": false
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header("x-signing-algo", "ed25519")
+                .header("x-client-pub-key", &client_pub_hex)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(response).await;
+    assert!(body["error"]["message"].is_string());
+    assert!(!body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("/etc/passwd"));
+}
+
+#[tokio::test]
 async fn test_encrypted_chat_streaming_ed25519() {
     use vllm_proxy_rs::encryption;
 

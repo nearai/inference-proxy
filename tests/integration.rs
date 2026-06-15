@@ -2460,6 +2460,63 @@ async fn test_audio_transcriptions_multipart() {
     assert_eq!(sig_response.status(), StatusCode::OK);
 }
 
+// Regression: a multipart audio body larger than axum's 2 MiB DefaultBodyLimit
+// must still be accepted (the route disables the default limit so the handler's
+// own `max_audio_request_size` is the only ceiling). Before the fix this failed
+// with a 413/connection reset that surfaced as a 502 from the fronting nginx.
+#[tokio::test]
+async fn test_audio_transcriptions_large_body_not_rejected() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "trans-large",
+            "text": "ok"
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    // 3 MiB of audio payload — comfortably above axum's 2 MiB default limit and
+    // below the 100 MiB max_audio_request_size default.
+    let audio_payload = "a".repeat(3 * 1024 * 1024);
+    let boundary = "----TestBoundaryLarge";
+    let body = format!(
+        "--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"model\"\r\n\r\n\
+         whisper-1\r\n\
+         --{boundary}\r\n\
+         Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n\
+         Content-Type: audio/wav\r\n\r\n\
+         {audio_payload}\r\n\
+         --{boundary}--\r\n"
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Without the DefaultBodyLimit override this is a 413; the request must now
+    // reach the backend and return its 200 response.
+    assert_eq!(response.status(), StatusCode::OK);
+    let resp_body = body_to_json(response).await;
+    assert_eq!(resp_body["id"], "trans-large");
+}
+
 // ---- Catch-all passthrough ----
 
 #[tokio::test]

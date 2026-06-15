@@ -9,6 +9,7 @@ pub mod ohttp;
 pub mod passthrough;
 pub mod signature;
 
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use axum::Router;
 
@@ -44,10 +45,20 @@ pub fn build_router() -> Router<AppState> {
             "/v1/images/generations",
             post(passthrough::images_generations),
         )
-        .route("/v1/images/edits", post(passthrough::images_edits))
+        // Multipart upload routes: axum's `Multipart` extractor enforces the
+        // global 2 MiB `DefaultBodyLimit`, which rejects the body before the
+        // handler's own size guard (`max_audio_request_size` / `max_image_request_size`)
+        // can run. Disabling the default limit here makes those per-type limits —
+        // enforced incrementally in `read_field_chunks` / `read_field_data` — the
+        // single source of truth. Without this, audio/images > ~2 MiB fail upstream
+        // with a 502 (connection reset before the body is consumed).
+        .route(
+            "/v1/images/edits",
+            post(passthrough::images_edits).layer(DefaultBodyLimit::disable()),
+        )
         .route(
             "/v1/audio/transcriptions",
-            post(passthrough::audio_transcriptions),
+            post(passthrough::audio_transcriptions).layer(DefaultBodyLimit::disable()),
         )
         .route("/v1/signature/{chat_id}", get(signature::signature))
         // Internal — sibling proxies on the same host call this when

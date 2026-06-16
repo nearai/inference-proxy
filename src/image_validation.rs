@@ -804,27 +804,58 @@ fn is_video_magic(b: &[u8]) -> bool {
     // ISO-BMFF/QuickTime: "....ftyp" then a major brand. Image brands are
     // accepted by `is_image_magic` before this function is called.
     if b.len() >= 12 && &b[4..8] == b"ftyp" {
-        let brand = &b[8..12];
-        if matches!(
-            brand,
-            b"isom"
-                | b"iso2"
-                | b"mp41"
-                | b"mp42"
-                | b"avc1"
-                | b"dash"
-                | b"mmp4"
-                | b"3gp4"
-                | b"3gp5"
-                | b"qt  "
-                | b"M4V "
-                | b"M4A "
-        ) {
+        if is_video_bmff_brand(&b[8..12]) {
             return true;
+        }
+
+        let box_size = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize;
+        let brand_end = if box_size >= 16 {
+            b.len().min(box_size)
+        } else {
+            b.len()
+        };
+        if brand_end > 16 {
+            for brand in b[16..brand_end].chunks_exact(4) {
+                if is_video_bmff_brand(brand) {
+                    return true;
+                }
+            }
         }
     }
 
     false
+}
+
+fn is_video_bmff_brand(brand: &[u8]) -> bool {
+    matches!(
+        brand,
+        b"isom"
+            | b"iso2"
+            | b"iso3"
+            | b"iso4"
+            | b"iso5"
+            | b"iso6"
+            | b"mp41"
+            | b"mp42"
+            | b"mp4a"
+            | b"mp4v"
+            | b"avc1"
+            | b"dash"
+            | b"mmp4"
+            | b"3gp4"
+            | b"3gp5"
+            | b"3gp6"
+            | b"3g2a"
+            | b"3g2b"
+            | b"qt  "
+            | b"M4V "
+            | b"m4v "
+            | b"M4A "
+            | b"m4a "
+            | b"F4V "
+            | b"F4A "
+            | b"F4B "
+    )
 }
 
 /// Whether the head looks like HTML / XML / JSON / plain text rather than an
@@ -1008,6 +1039,10 @@ mod tests {
     #[test]
     fn video_magic_detected_without_rejecting_image_bmff() {
         assert!(is_video_magic(b"\0\0\0 ftypisom\0\0\x02\0isomiso2avc1mp41"));
+        assert!(is_video_magic(b"\0\0\0\x18ftypzzzz\0\0\0\0mp42isom"));
+        assert!(is_video_magic(b"\0\0\0\x14ftypiso6\0\0\0\0"));
+        assert!(is_video_magic(b"\0\0\0\x14ftypmp4v\0\0\0\0"));
+        assert!(is_video_magic(b"\0\0\0\x14ftypm4v \0\0\0\0"));
         assert!(is_video_magic(b"\x1A\x45\xDF\xA3webm"));
         assert!(!is_video_magic(b"\0\0\0 ftypavif\0\0\0\0"));
         assert!(!is_video_magic(&[
@@ -1182,6 +1217,20 @@ mod tests {
             classify_bytes(&[0xFF, 0xD8, 0xFF, 0xE0], Some("video/mp4")),
             Verdict::Pass
         );
+    }
+
+    #[test]
+    fn video_application_content_types_are_rejected() {
+        for content_type in [
+            "application/mp4",
+            "application/webm",
+            "application/x-matroska",
+        ] {
+            assert_eq!(
+                classify_bytes(b"\0\x01\x02\x03", Some(content_type)),
+                Verdict::Reject
+            );
+        }
     }
 
     #[tokio::test]

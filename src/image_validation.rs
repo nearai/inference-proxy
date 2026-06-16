@@ -589,6 +589,9 @@ fn classify_bytes_with_policy(
     if is_image_magic(bytes) {
         return Verdict::Pass;
     }
+    if is_video_magic(bytes) {
+        return Verdict::Reject;
+    }
     // No image magic and the head is essentially printable text (e.g. a plain
     // "Not Found" body or a base64-encoded text blob): not a decodable raster
     // image. Real images are binary, so this won't false-reject one.
@@ -601,7 +604,10 @@ fn classify_bytes_with_policy(
         if is_textual_content_type(ct) {
             return Verdict::Reject;
         }
-        if ct.starts_with("image/") || ct.starts_with("video/") {
+        if is_video_content_type(ct) {
+            return Verdict::Reject;
+        }
+        if ct.starts_with("image/") {
             return Verdict::Pass;
         }
     }
@@ -736,6 +742,14 @@ fn is_textual_content_type(ct: &str) -> bool {
         )
 }
 
+fn is_video_content_type(ct: &str) -> bool {
+    ct.starts_with("video/")
+        || matches!(
+            ct,
+            "application/mp4" | "application/x-matroska" | "application/webm"
+        )
+}
+
 /// Magic-byte detection for the common raster formats SGLang/PIL decode.
 fn is_image_magic(b: &[u8]) -> bool {
     if b.len() < 4 {
@@ -775,6 +789,41 @@ fn is_image_magic(b: &[u8]) -> bool {
             return true;
         }
     }
+    false
+}
+
+/// Magic-byte detection for common video containers mistakenly sent as
+/// `image_url`. Keep this separate from [`is_image_magic`] because ISO-BMFF is
+/// also used by real image formats such as AVIF/HEIC, which are handled there.
+fn is_video_magic(b: &[u8]) -> bool {
+    // Matroska/WebM EBML header.
+    if b.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        return true;
+    }
+
+    // ISO-BMFF/QuickTime: "....ftyp" then a major brand. Image brands are
+    // accepted by `is_image_magic` before this function is called.
+    if b.len() >= 12 && &b[4..8] == b"ftyp" {
+        let brand = &b[8..12];
+        if matches!(
+            brand,
+            b"isom"
+                | b"iso2"
+                | b"mp41"
+                | b"mp42"
+                | b"avc1"
+                | b"dash"
+                | b"mmp4"
+                | b"3gp4"
+                | b"3gp5"
+                | b"qt  "
+                | b"M4V "
+                | b"M4A "
+        ) {
+            return true;
+        }
+    }
+
     false
 }
 
@@ -951,8 +1000,19 @@ mod tests {
         assert!(is_image_magic(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 0]));
         assert!(is_image_magic(b"GIF89a...."));
         assert!(is_image_magic(b"RIFF\0\0\0\0WEBPVP8 "));
+        assert!(is_image_magic(b"\0\0\0 ftypavif\0\0\0\0"));
         assert!(!is_image_magic(b"<!doctype html>"));
         assert!(!is_image_magic(b"not an image"));
+    }
+
+    #[test]
+    fn video_magic_detected_without_rejecting_image_bmff() {
+        assert!(is_video_magic(b"\0\0\0 ftypisom\0\0\x02\0isomiso2avc1mp41"));
+        assert!(is_video_magic(b"\x1A\x45\xDF\xA3webm"));
+        assert!(!is_video_magic(b"\0\0\0 ftypavif\0\0\0\0"));
+        assert!(!is_video_magic(&[
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A
+        ]));
     }
 
     #[test]
@@ -1098,6 +1158,28 @@ mod tests {
         // A genuine image is still accepted whatever the declared type.
         assert_eq!(
             classify_bytes(&[0xFF, 0xD8, 0xFF, 0xE0], Some("application/octet-stream")),
+            Verdict::Pass
+        );
+    }
+
+    #[test]
+    fn video_supplied_as_image_url_is_rejected() {
+        // Production incident shape: MP4 bytes delivered through image_url.
+        let mp4 = b"\0\0\0 ftypisom\0\0\x02\0isomiso2avc1mp41";
+        assert_eq!(classify_bytes(mp4, Some("video/mp4")), Verdict::Reject);
+        assert_eq!(
+            classify_bytes(mp4, Some("application/octet-stream")),
+            Verdict::Reject
+        );
+        assert_eq!(
+            classify_bytes(b"\0\x01\x02\x03", Some("video/mp4")),
+            Verdict::Reject
+        );
+
+        // True image bytes still pass even if the upstream content-type is bad;
+        // bytes win over server-controlled metadata.
+        assert_eq!(
+            classify_bytes(&[0xFF, 0xD8, 0xFF, 0xE0], Some("video/mp4")),
             Verdict::Pass
         );
     }

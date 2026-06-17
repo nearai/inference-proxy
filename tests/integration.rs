@@ -476,6 +476,58 @@ async fn test_chat_completions_image_validation_rejects_bad_image() {
 }
 
 #[tokio::test]
+async fn test_chat_completions_image_validation_rejects_remote_video_image_url() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"x"})))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/remote-video.mp4"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"\0\0\0 ftypisom\0\0\x02\0isomiso2avc1mp41".to_vec())
+                .insert_header("content-type", "video/mp4"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app_with_image_validation(&mock_server.uri());
+    let image_url = format!("{}/remote-video.mp4", mock_server.uri());
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {"url": image_url}}
+        ]}],
+        "stream": false
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(response).await;
+    assert!(
+        body["error"]["message"].is_string(),
+        "expected OpenAI error shape, got: {body}"
+    );
+}
+
+#[tokio::test]
 async fn test_catch_all_chat_alias_runs_image_validation() {
     // A trailing-slash chat-completions alias lands in catch_all. It must still
     // run image validation so backend-accepted aliases cannot bypass the guard.

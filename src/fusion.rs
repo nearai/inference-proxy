@@ -734,7 +734,7 @@ async fn call_local_chat_json(
     remove_streaming_for_internal_call(&mut body);
     let body = serde_json::to_vec(&body).map_err(|e| AppError::Internal(e.into()))?;
     let (url, _guard) = state.backend_pool.select_url("/v1/chat/completions");
-    post_chat_json(state, &url, None, tracing_ids, body, "local_synthesis").await
+    post_chat_json(state, &url, None, tracing_ids, body, "local_synthesis", 1).await
 }
 
 async fn call_direct_chat_json(
@@ -756,7 +756,16 @@ async fn call_direct_chat_json(
         endpoint.base_url.trim_end_matches('/')
     );
     let body = serde_json::to_vec(&body).map_err(|e| AppError::Internal(e.into()))?;
-    post_chat_json(state, &url, Some(token), tracing_ids, body, "fusion_direct").await
+    post_chat_json(
+        state,
+        &url,
+        Some(token),
+        tracing_ids,
+        body,
+        "fusion_direct",
+        state.config.fusion_internal_max_attempts,
+    )
+    .await
 }
 
 async fn call_direct_chat_with_web_tools(
@@ -895,44 +904,89 @@ async fn post_chat_json(
     tracing_ids: &TracingIds,
     body: Vec<u8>,
     label: &'static str,
+    max_attempts: usize,
 ) -> Result<Value, AppError> {
     let started = Instant::now();
-    let mut req = state
-        .http_client
-        .post(url)
-        .timeout(Duration::from_secs(state.config.fusion_panel_timeout_secs))
-        .header("content-type", "application/json")
-        .header("accept", "application/json")
-        .header("x-openrouter-fusion-depth", "1")
-        .header("x-nearai-fusion-depth", "1");
-    if let Some(token) = bearer {
-        req = req.bearer_auth(token);
-    }
-    for (k, v) in tracing_ids.upstream_headers() {
-        req = req.header(k, v);
-    }
-    let response = req.body(body).send().await.map_err(|e| {
-        if e.is_timeout() {
-            AppError::UpstreamParsed {
-                status: StatusCode::GATEWAY_TIMEOUT,
-                message: "fusion_panel_timeout".to_string(),
-                error_type: "fusion_error".to_string(),
-            }
-        } else {
-            AppError::Internal(e.into())
+    let attempts = max_attempts.max(1);
+    for attempt in 1..=attempts {
+        let mut req = state
+            .http_client
+            .post(url)
+            .timeout(Duration::from_secs(state.config.fusion_panel_timeout_secs))
+            .header("content-type", "application/json")
+            .header("accept", "application/json")
+            .header("x-openrouter-fusion-depth", "1")
+            .header("x-nearai-fusion-depth", "1");
+        if let Some(token) = bearer {
+            req = req.bearer_auth(token);
         }
-    })?;
-    metrics::histogram!("upstream_request_duration_seconds", "endpoint" => label)
-        .record(started.elapsed().as_secs_f64());
-    let status = response.status();
-    let bytes = read_response_limited(response, state.config.fusion_max_response_bytes).await?;
-    if !status.is_success() {
-        return Err(AppError::Upstream {
-            status,
-            body: bytes,
-        });
+        for (k, v) in tracing_ids.upstream_headers() {
+            req = req.header(k, v);
+        }
+
+        let response = match req.body(body.clone()).send().await {
+            Ok(response) => response,
+            Err(e) => {
+                let retry = attempt < attempts && is_retryable_transport_error(&e);
+                if retry {
+                    sleep_before_fusion_retry(state, attempt).await;
+                    continue;
+                }
+                metrics::histogram!("upstream_request_duration_seconds", "endpoint" => label)
+                    .record(started.elapsed().as_secs_f64());
+                return Err(map_fusion_transport_error(e));
+            }
+        };
+
+        let status = response.status();
+        let bytes = read_response_limited(response, state.config.fusion_max_response_bytes).await?;
+        if !status.is_success() {
+            if attempt < attempts && status.is_server_error() {
+                sleep_before_fusion_retry(state, attempt).await;
+                continue;
+            }
+            metrics::histogram!("upstream_request_duration_seconds", "endpoint" => label)
+                .record(started.elapsed().as_secs_f64());
+            return Err(AppError::Upstream {
+                status,
+                body: bytes,
+            });
+        }
+        metrics::histogram!("upstream_request_duration_seconds", "endpoint" => label)
+            .record(started.elapsed().as_secs_f64());
+        return serde_json::from_slice(&bytes).map_err(|e| AppError::Internal(e.into()));
     }
-    serde_json::from_slice(&bytes).map_err(|e| AppError::Internal(e.into()))
+
+    Err(AppError::Internal(anyhow::anyhow!(
+        "Fusion retry loop exhausted unexpectedly"
+    )))
+}
+
+fn is_retryable_transport_error(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect() || error.is_request()
+}
+
+fn map_fusion_transport_error(error: reqwest::Error) -> AppError {
+    if error.is_timeout() {
+        AppError::UpstreamParsed {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            message: "fusion_panel_timeout".to_string(),
+            error_type: "fusion_error".to_string(),
+        }
+    } else {
+        AppError::Internal(error.into())
+    }
+}
+
+async fn sleep_before_fusion_retry(state: &AppState, attempt: usize) {
+    let shift = u32::try_from(attempt.saturating_sub(1)).unwrap_or(u32::MAX);
+    let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+    let delay_ms = state
+        .config
+        .fusion_internal_retry_initial_backoff_ms
+        .saturating_mul(multiplier)
+        .min(5_000);
+    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 }
 
 async fn read_response_limited(

@@ -243,6 +243,12 @@ pub struct Config {
     pub fusion_panel_timeout_secs: u64,
     /// Maximum bytes buffered from Fusion endpoint discovery and model responses.
     pub fusion_max_response_bytes: usize,
+    /// Total attempts for transient Fusion direct model HTTP calls. 1 disables
+    /// retry; retries are only for transport errors, timeouts, and 5xx.
+    pub fusion_internal_max_attempts: usize,
+    /// Initial backoff before retrying Fusion direct model calls. Backoff
+    /// doubles per attempt.
+    pub fusion_internal_retry_initial_backoff_ms: u64,
 }
 
 impl Config {
@@ -460,6 +466,11 @@ impl Config {
                 .map_err(|_| anyhow::anyhow!("FUSION_MAX_DEPTH exceeds the u32 range"))?,
             fusion_panel_timeout_secs: env_int("FUSION_PANEL_TIMEOUT_SECS", 120) as u64,
             fusion_max_response_bytes: env_int("FUSION_MAX_RESPONSE_BYTES", 10 * 1024 * 1024),
+            fusion_internal_max_attempts: env_int("FUSION_INTERNAL_MAX_ATTEMPTS", 2),
+            fusion_internal_retry_initial_backoff_ms: env_int(
+                "FUSION_INTERNAL_RETRY_INITIAL_BACKOFF_MS",
+                250,
+            ) as u64,
         };
 
         // Validate attestation cache TTL (TTL/2 is used as refresh interval, so TTL < 2 would cause a busy loop)
@@ -512,6 +523,16 @@ impl Config {
             }
             if config.fusion_max_response_bytes == 0 {
                 anyhow::bail!("FUSION_MAX_RESPONSE_BYTES must be greater than 0");
+            }
+            if config.fusion_internal_max_attempts == 0 {
+                anyhow::bail!("FUSION_INTERNAL_MAX_ATTEMPTS must be at least 1");
+            }
+            if config.fusion_internal_max_attempts > 1
+                && config.fusion_internal_retry_initial_backoff_ms == 0
+            {
+                anyhow::bail!(
+                    "FUSION_INTERNAL_RETRY_INITIAL_BACKOFF_MS must be greater than 0 when FUSION_INTERNAL_MAX_ATTEMPTS > 1"
+                );
             }
             if config.fusion_default_analysis_models.is_empty() {
                 warn!(
@@ -657,6 +678,8 @@ mod tests {
             env::remove_var("FUSION_MAX_DEPTH");
             env::remove_var("FUSION_PANEL_TIMEOUT_SECS");
             env::remove_var("FUSION_MAX_RESPONSE_BYTES");
+            env::remove_var("FUSION_INTERNAL_MAX_ATTEMPTS");
+            env::remove_var("FUSION_INTERNAL_RETRY_INITIAL_BACKOFF_MS");
             env::remove_var("BRAVE_LLM_CONTEXT_API_KEY");
 
             let config = Config::from_env().unwrap();
@@ -698,6 +721,8 @@ mod tests {
             assert_eq!(config.fusion_max_depth, 1);
             assert_eq!(config.fusion_panel_timeout_secs, 120);
             assert_eq!(config.fusion_max_response_bytes, 10 * 1024 * 1024);
+            assert_eq!(config.fusion_internal_max_attempts, 2);
+            assert_eq!(config.fusion_internal_retry_initial_backoff_ms, 250);
         });
     }
 
@@ -815,6 +840,14 @@ mod tests {
                 "FUSION_MAX_RESPONSE_BYTES",
                 "FUSION_MAX_RESPONSE_BYTES must be greater than 0",
             ),
+            (
+                "FUSION_INTERNAL_MAX_ATTEMPTS",
+                "FUSION_INTERNAL_MAX_ATTEMPTS must be at least 1",
+            ),
+            (
+                "FUSION_INTERNAL_RETRY_INITIAL_BACKOFF_MS",
+                "FUSION_INTERNAL_RETRY_INITIAL_BACKOFF_MS must be greater than 0",
+            ),
         ] {
             with_env_vars(
                 &[
@@ -863,6 +896,8 @@ mod tests {
                 ("FUSION_MAX_DEPTH", "2"),
                 ("FUSION_PANEL_TIMEOUT_SECS", "9"),
                 ("FUSION_MAX_RESPONSE_BYTES", "4096"),
+                ("FUSION_INTERNAL_MAX_ATTEMPTS", "4"),
+                ("FUSION_INTERNAL_RETRY_INITIAL_BACKOFF_MS", "17"),
             ],
             || {
                 let config = Config::from_env().unwrap();
@@ -881,6 +916,8 @@ mod tests {
                 assert_eq!(config.fusion_max_depth, 2);
                 assert_eq!(config.fusion_panel_timeout_secs, 9);
                 assert_eq!(config.fusion_max_response_bytes, 4096);
+                assert_eq!(config.fusion_internal_max_attempts, 4);
+                assert_eq!(config.fusion_internal_retry_initial_backoff_ms, 17);
             },
         );
     }

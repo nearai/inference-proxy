@@ -22,6 +22,8 @@ struct TestAppOptions {
     web_context_search_url: Option<String>,
     fusion_panel_timeout_secs: u64,
     fusion_max_response_bytes: usize,
+    fusion_internal_max_attempts: usize,
+    fusion_internal_retry_initial_backoff_ms: u64,
 }
 
 impl Default for TestAppOptions {
@@ -36,6 +38,8 @@ impl Default for TestAppOptions {
             web_context_search_url: None,
             fusion_panel_timeout_secs: 120,
             fusion_max_response_bytes: 10 * 1024 * 1024,
+            fusion_internal_max_attempts: 2,
+            fusion_internal_retry_initial_backoff_ms: 1,
         }
     }
 }
@@ -197,6 +201,8 @@ fn build_test_app_inner_with_fusion(mock_url: &str, options: TestAppOptions) -> 
         fusion_max_depth: 1,
         fusion_panel_timeout_secs: options.fusion_panel_timeout_secs,
         fusion_max_response_bytes: options.fusion_max_response_bytes,
+        fusion_internal_max_attempts: options.fusion_internal_max_attempts,
+        fusion_internal_retry_initial_backoff_ms: options.fusion_internal_retry_initial_backoff_ms,
     };
 
     // Use fixed keys for deterministic tests
@@ -1225,6 +1231,143 @@ async fn test_forced_fusion_runs_panel_judge_and_synthesis() {
     assert_eq!(body["nearai_fusion"]["status"], "invoked");
     assert_eq!(body["nearai_fusion"]["panel"][0]["model"], "panel-a");
     assert_eq!(body["nearai_fusion"]["judge"]["status"], "ok");
+}
+
+#[tokio::test]
+async fn test_forced_fusion_retries_transient_panel_5xx() {
+    use wiremock::matchers::body_string_contains;
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/endpoints"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "endpoints": [{
+                "domain": mock_server.uri(),
+                "models": ["panel-a"]
+            }]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/attestation/report"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", "Bearer fusion-token"))
+        .and(body_string_contains(
+            "one member of a private multi-model panel",
+        ))
+        .respond_with(ResponseTemplate::new(503).set_body_string("loading"))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", "Bearer fusion-token"))
+        .and(body_string_contains(
+            "one member of a private multi-model panel",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-panel",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Panel retry succeeded."},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", "Bearer fusion-token"))
+        .and(body_string_contains("strict JSON only"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-judge",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "{\"consensus\":\"retry ok\",\"disagreements\":[],\"strengths\":[],\"risks\":[],\"synthesis_guidance\":\"answer retry ok\"}"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("\"model\":\"test-model\""))
+        .and(body_string_contains("final synthesis model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-final",
+            "object": "chat.completion",
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Retry ok."},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11}
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app_with_fusion(
+        &mock_server.uri(),
+        format!("{}/endpoints", mock_server.uri()),
+    );
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Retry the panel if needed"}],
+        "tools": [{
+            "type": "nearai:fusion",
+            "analysis_models": ["panel-a"],
+            "model": "panel-a",
+            "max_completion_tokens": 16
+        }],
+        "tool_choice": "required",
+        "stream": false
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response).await;
+    assert_eq!(body["choices"][0]["message"]["content"], "Retry ok.");
+    assert_eq!(body["usage"]["prompt_tokens"], 9);
+    assert_eq!(body["usage"]["completion_tokens"], 12);
+    assert_eq!(body["usage"]["total_tokens"], 21);
+    assert_eq!(body["nearai_fusion"]["panel"][0]["status"], "ok");
+    assert_eq!(
+        body["nearai_fusion"]["panel"][0]["error"],
+        serde_json::Value::Null
+    );
 }
 
 #[tokio::test]
@@ -5184,6 +5327,8 @@ fn build_test_app_with_cloud_api_retries(
         fusion_max_depth: 1,
         fusion_panel_timeout_secs: 120,
         fusion_max_response_bytes: 10 * 1024 * 1024,
+        fusion_internal_max_attempts: 2,
+        fusion_internal_retry_initial_backoff_ms: 1,
     };
 
     let ecdsa_key: [u8; 32] = [
@@ -7587,6 +7732,8 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         fusion_max_depth: 1,
         fusion_panel_timeout_secs: 120,
         fusion_max_response_bytes: 10 * 1024 * 1024,
+        fusion_internal_max_attempts: 2,
+        fusion_internal_retry_initial_backoff_ms: 1,
     };
 
     let ecdsa_key: [u8; 32] = [
@@ -8001,6 +8148,8 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         fusion_max_depth: 1,
         fusion_panel_timeout_secs: 120,
         fusion_max_response_bytes: 10 * 1024 * 1024,
+        fusion_internal_max_attempts: 2,
+        fusion_internal_retry_initial_backoff_ms: 1,
     };
 
     let ecdsa = signing::EcdsaContext::from_key_bytes(&ecdsa_key).unwrap();

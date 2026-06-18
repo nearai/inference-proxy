@@ -107,6 +107,8 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         fusion_max_depth: 1,
         fusion_panel_timeout_secs: 120,
         fusion_max_response_bytes: 10 * 1024 * 1024,
+        fusion_internal_max_attempts: 2,
+        fusion_internal_retry_initial_backoff_ms: 250,
     };
 
     let ecdsa = signing::EcdsaContext::from_key_bytes(&ECDSA_KEY).unwrap();

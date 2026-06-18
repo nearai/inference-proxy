@@ -218,6 +218,31 @@ pub struct Config {
     pub agent_loop_max_iterations: u32,
     /// Per-tool-call timeout for the Brave HTTP request.
     pub web_context_search_timeout_secs: u64,
+
+    // Fusion (server-side multi-model deliberation)
+    /// Feature flag for server-side Fusion orchestration. When false, Fusion
+    /// tool entries pass through unchanged.
+    pub fusion_enabled: bool,
+    /// Endpoint discovery URL returning `{ "endpoints": [{ "domain": "...", "models": [...] }] }`.
+    /// This URL is a Fusion trust anchor: returned domains receive the shared
+    /// internal bearer token, so operators must keep it under trusted control.
+    pub fusion_endpoints_url: String,
+    /// TTL for the endpoint discovery cache.
+    pub fusion_endpoints_ttl_secs: u64,
+    /// Internal bearer token used for direct completions calls to every
+    /// discovered panel and judge backend. V1 uses one shared secret; keep
+    /// `FUSION_ENDPOINTS_URL` trusted and do not expose per-request overrides.
+    pub fusion_internal_bearer_token: Option<String>,
+    /// Default panel models when the tool configuration omits `analysis_models`.
+    pub fusion_default_analysis_models: Vec<String>,
+    /// Hard cap on panel size.
+    pub fusion_max_panel_models: usize,
+    /// Maximum accepted Fusion recursion depth.
+    pub fusion_max_depth: u32,
+    /// Per-request timeout for Fusion panel, judge, and synthesis chat calls.
+    pub fusion_panel_timeout_secs: u64,
+    /// Maximum bytes buffered from Fusion endpoint discovery and model responses.
+    pub fusion_max_response_bytes: usize,
 }
 
 impl Config {
@@ -320,6 +345,14 @@ impl Config {
         let image_validation_reject_non_rgb_images =
             image_validation_reject_non_rgb_override.unwrap_or(false);
 
+        let fusion_default_analysis_models = env::var("FUSION_DEFAULT_ANALYSIS_MODELS")
+            .ok()
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().trim_start_matches('~').to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
         let config = Config {
             model_name,
             tokens,
@@ -400,13 +433,33 @@ impl Config {
                 .filter(|s| !s.is_empty()),
             web_context_search_api_key: env::var("WEB_CONTEXT_SEARCH_API_KEY")
                 .ok()
-                .filter(|s| !s.is_empty()),
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    env::var("BRAVE_LLM_CONTEXT_API_KEY")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                }),
             // `env_int` returns `usize`; on 64-bit hosts a user-supplied value
             // > u32::MAX would silently wrap. `try_from` surfaces it as a
             // config error instead so a typo can't become a tiny iteration cap.
             agent_loop_max_iterations: u32::try_from(env_int("AGENT_LOOP_MAX_ITERATIONS", 5))
                 .map_err(|_| anyhow::anyhow!("AGENT_LOOP_MAX_ITERATIONS exceeds the u32 range"))?,
             web_context_search_timeout_secs: env_int("WEB_CONTEXT_SEARCH_TIMEOUT_SECS", 30) as u64,
+            fusion_enabled: env_bool("FUSION_ENABLED"),
+            fusion_endpoints_url: env_or(
+                "FUSION_ENDPOINTS_URL",
+                "https://completions.near.ai/endpoints",
+            ),
+            fusion_endpoints_ttl_secs: env_int("FUSION_ENDPOINTS_TTL_SECS", 300) as u64,
+            fusion_internal_bearer_token: env::var("FUSION_INTERNAL_BEARER_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            fusion_default_analysis_models,
+            fusion_max_panel_models: env_int("FUSION_MAX_PANEL_MODELS", 8),
+            fusion_max_depth: u32::try_from(env_int("FUSION_MAX_DEPTH", 1))
+                .map_err(|_| anyhow::anyhow!("FUSION_MAX_DEPTH exceeds the u32 range"))?,
+            fusion_panel_timeout_secs: env_int("FUSION_PANEL_TIMEOUT_SECS", 120) as u64,
+            fusion_max_response_bytes: env_int("FUSION_MAX_RESPONSE_BYTES", 10 * 1024 * 1024),
         };
 
         // Validate attestation cache TTL (TTL/2 is used as refresh interval, so TTL < 2 would cause a busy loop)
@@ -428,7 +481,7 @@ impl Config {
         // Agent loop: URL and key must both be set or both unset; iteration cap must be positive.
         if config.web_context_search_url.is_some() != config.web_context_search_api_key.is_some() {
             anyhow::bail!(
-                "WEB_CONTEXT_SEARCH_URL and WEB_CONTEXT_SEARCH_API_KEY must both be set or both unset"
+                "WEB_CONTEXT_SEARCH_URL and WEB_CONTEXT_SEARCH_API_KEY or BRAVE_LLM_CONTEXT_API_KEY must both be set or both unset"
             );
         }
         if config.agent_loop_max_iterations == 0 {
@@ -436,6 +489,35 @@ impl Config {
         }
         if config.web_context_search_timeout_secs == 0 {
             anyhow::bail!("WEB_CONTEXT_SEARCH_TIMEOUT_SECS must be greater than 0");
+        }
+
+        if config.fusion_enabled {
+            if config.fusion_internal_bearer_token.is_none() {
+                anyhow::bail!("FUSION_INTERNAL_BEARER_TOKEN must be set when FUSION_ENABLED=true");
+            }
+            if config.fusion_endpoints_url.is_empty() {
+                anyhow::bail!("FUSION_ENDPOINTS_URL must not be empty");
+            }
+            if config.fusion_endpoints_ttl_secs == 0 {
+                anyhow::bail!("FUSION_ENDPOINTS_TTL_SECS must be greater than 0");
+            }
+            if config.fusion_max_panel_models == 0 {
+                anyhow::bail!("FUSION_MAX_PANEL_MODELS must be at least 1");
+            }
+            if config.fusion_max_depth == 0 {
+                anyhow::bail!("FUSION_MAX_DEPTH must be at least 1");
+            }
+            if config.fusion_panel_timeout_secs == 0 {
+                anyhow::bail!("FUSION_PANEL_TIMEOUT_SECS must be greater than 0");
+            }
+            if config.fusion_max_response_bytes == 0 {
+                anyhow::bail!("FUSION_MAX_RESPONSE_BYTES must be greater than 0");
+            }
+            if config.fusion_default_analysis_models.is_empty() {
+                warn!(
+                    "FUSION_ENABLED=true with no FUSION_DEFAULT_ANALYSIS_MODELS; clients must provide analysis_models per request"
+                );
+            }
         }
 
         Ok(config)
@@ -564,6 +646,18 @@ mod tests {
             env::remove_var("GPU_NO_HW_MODE");
             env::remove_var("CHAT_CACHE_EXPIRATION");
             env::remove_var("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB");
+            env::remove_var("WEB_CONTEXT_SEARCH_URL");
+            env::remove_var("WEB_CONTEXT_SEARCH_API_KEY");
+            env::remove_var("FUSION_ENABLED");
+            env::remove_var("FUSION_ENDPOINTS_URL");
+            env::remove_var("FUSION_ENDPOINTS_TTL_SECS");
+            env::remove_var("FUSION_INTERNAL_BEARER_TOKEN");
+            env::remove_var("FUSION_DEFAULT_ANALYSIS_MODELS");
+            env::remove_var("FUSION_MAX_PANEL_MODELS");
+            env::remove_var("FUSION_MAX_DEPTH");
+            env::remove_var("FUSION_PANEL_TIMEOUT_SECS");
+            env::remove_var("FUSION_MAX_RESPONSE_BYTES");
+            env::remove_var("BRAVE_LLM_CONTEXT_API_KEY");
 
             let config = Config::from_env().unwrap();
 
@@ -592,6 +686,18 @@ mod tests {
             assert!(config.rerank_url_override.is_none());
             assert!(!config.image_validation_reject_non_rgb_images);
             assert!(!config.image_validation_reject_single_channel_images);
+            assert!(!config.fusion_enabled);
+            assert_eq!(
+                config.fusion_endpoints_url,
+                "https://completions.near.ai/endpoints"
+            );
+            assert_eq!(config.fusion_endpoints_ttl_secs, 300);
+            assert!(config.fusion_internal_bearer_token.is_none());
+            assert!(config.fusion_default_analysis_models.is_empty());
+            assert_eq!(config.fusion_max_panel_models, 8);
+            assert_eq!(config.fusion_max_depth, 1);
+            assert_eq!(config.fusion_panel_timeout_secs, 120);
+            assert_eq!(config.fusion_max_response_bytes, 10 * 1024 * 1024);
         });
     }
 
@@ -632,6 +738,26 @@ mod tests {
     }
 
     #[test]
+    fn test_config_accepts_brave_llm_context_api_key_alias() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "model"),
+                ("TOKEN", "tok"),
+                ("WEB_CONTEXT_SEARCH_URL", "https://brave.test/context"),
+                ("WEB_CONTEXT_SEARCH_API_KEY", ""),
+                ("BRAVE_LLM_CONTEXT_API_KEY", "brave-alias-key"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(
+                    config.web_context_search_api_key.as_deref(),
+                    Some("brave-alias-key")
+                );
+            },
+        );
+    }
+
+    #[test]
     fn test_gemma4_enables_single_channel_guard_by_default_with_env_override() {
         with_env_vars(
             &[
@@ -659,6 +785,55 @@ mod tests {
     }
 
     #[test]
+    fn test_config_requires_fusion_token_when_enabled() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "model"),
+                ("TOKEN", "tok"),
+                ("FUSION_ENABLED", "true"),
+                ("FUSION_INTERNAL_BEARER_TOKEN", ""),
+            ],
+            || {
+                let result = Config::from_env();
+                assert!(result.is_err());
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("FUSION_INTERNAL_BEARER_TOKEN"));
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_rejects_zero_fusion_limits_when_enabled() {
+        for (name, expected) in [
+            (
+                "FUSION_PANEL_TIMEOUT_SECS",
+                "FUSION_PANEL_TIMEOUT_SECS must be greater than 0",
+            ),
+            (
+                "FUSION_MAX_RESPONSE_BYTES",
+                "FUSION_MAX_RESPONSE_BYTES must be greater than 0",
+            ),
+        ] {
+            with_env_vars(
+                &[
+                    ("MODEL_NAME", "model"),
+                    ("TOKEN", "tok"),
+                    ("FUSION_ENABLED", "true"),
+                    ("FUSION_INTERNAL_BEARER_TOKEN", "internal"),
+                    (name, "0"),
+                ],
+                || {
+                    let result = Config::from_env();
+                    assert!(result.is_err());
+                    assert!(result.unwrap_err().to_string().contains(expected));
+                },
+            );
+        }
+    }
+
+    #[test]
     fn test_gemma4_guard_does_not_match_gemma_4b() {
         with_env_vars(
             &[("MODEL_NAME", "google/gemma-4b-it"), ("TOKEN", "tok")],
@@ -669,6 +844,43 @@ mod tests {
 
                 assert!(!config.image_validation_reject_single_channel_images);
                 assert!(!config.image_validation_reject_non_rgb_images);
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_parses_fusion_settings() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "model"),
+                ("TOKEN", "tok"),
+                ("FUSION_ENABLED", "true"),
+                ("FUSION_INTERNAL_BEARER_TOKEN", "internal"),
+                ("FUSION_ENDPOINTS_URL", "http://endpoints.test/list"),
+                ("FUSION_ENDPOINTS_TTL_SECS", "42"),
+                ("FUSION_DEFAULT_ANALYSIS_MODELS", "~model-a, model-b"),
+                ("FUSION_MAX_PANEL_MODELS", "3"),
+                ("FUSION_MAX_DEPTH", "2"),
+                ("FUSION_PANEL_TIMEOUT_SECS", "9"),
+                ("FUSION_MAX_RESPONSE_BYTES", "4096"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert!(config.fusion_enabled);
+                assert_eq!(
+                    config.fusion_internal_bearer_token.as_deref(),
+                    Some("internal")
+                );
+                assert_eq!(config.fusion_endpoints_url, "http://endpoints.test/list");
+                assert_eq!(config.fusion_endpoints_ttl_secs, 42);
+                assert_eq!(
+                    config.fusion_default_analysis_models,
+                    vec!["model-a".to_string(), "model-b".to_string()]
+                );
+                assert_eq!(config.fusion_max_panel_models, 3);
+                assert_eq!(config.fusion_max_depth, 2);
+                assert_eq!(config.fusion_panel_timeout_secs, 9);
+                assert_eq!(config.fusion_max_response_bytes, 4096);
             },
         );
     }

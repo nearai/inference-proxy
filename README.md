@@ -11,6 +11,7 @@ Rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-proxy) (Python).
 - **Backend-agnostic** — works with any OpenAI-compatible backend (vLLM, sglang, etc.).
 - **Streaming support** — SSE streams are hashed incrementally and signed on completion.
 - **In-memory cache** — moka-based TTL cache for signatures (no Redis dependency).
+- **Fusion orchestration** — optional server-side multi-model deliberation for `/v1/chat/completions`, gated by `FUSION_ENABLED`.
 
 ## Endpoints
 
@@ -114,6 +115,60 @@ All configuration is via environment variables:
 | `VLLM_RERANK_URL` | No | `{base}/v1/rerank` | Override rerank endpoint |
 | `VLLM_SCORE_URL` | No | `{base}/v1/score` | Override score endpoint |
 
+### Fusion
+
+Fusion is disabled by default. When enabled, `/v1/chat/completions` intercepts
+tool entries of type `openrouter:fusion` or `nearai:fusion`; all other routes
+and non-Fusion chat requests keep the normal proxy behavior. Cloud API remains
+a pass-through: billing observes the single final response, whose `usage`
+contains the aggregate token usage from panel, judge, and synthesis calls.
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `FUSION_ENABLED` | No | `false` | Enables server-side Fusion orchestration |
+| `FUSION_INTERNAL_BEARER_TOKEN` | Yes, when enabled | — | Bearer token used for internal direct completions calls |
+| `FUSION_ENDPOINTS_URL` | No | `https://completions.near.ai/endpoints` | Endpoint discovery source |
+| `FUSION_ENDPOINTS_TTL_SECS` | No | `300` | Discovery cache TTL |
+| `FUSION_DEFAULT_ANALYSIS_MODELS` | No | — | Comma-separated fallback panel models |
+| `FUSION_MAX_PANEL_MODELS` | No | `8` | Hard cap on panel fan-out |
+| `FUSION_MAX_DEPTH` | No | `1` | Recursion guard for Fusion-to-Fusion calls |
+| `FUSION_PANEL_TIMEOUT_SECS` | No | `120` | Timeout for Fusion panel, judge, and synthesis chat calls |
+| `FUSION_MAX_RESPONSE_BYTES` | No | `10485760` | Max bytes buffered from Fusion endpoint discovery and internal model responses |
+| `AGENT_LOOP_MAX_ITERATIONS` | No | `5` | Also caps Fusion `web_context_search` tool calls |
+| `WEB_CONTEXT_SEARCH_URL` | If Fusion web search is used | — | Brave LLM Context endpoint |
+| `WEB_CONTEXT_SEARCH_API_KEY` | If Fusion web search is used | — | Brave LLM Context API key |
+| `BRAVE_LLM_CONTEXT_API_KEY` | No | — | Alias for `WEB_CONTEXT_SEARCH_API_KEY` |
+
+Production launch checklist:
+
+- Keep `FUSION_ENABLED=false` until the direct completions token and Brave key
+  are provisioned in the deployment secret store.
+- Set `FUSION_INTERNAL_BEARER_TOKEN` to a token accepted by the direct model
+  proxies listed by `FUSION_ENDPOINTS_URL`.
+- Treat `FUSION_ENDPOINTS_URL` as a trust anchor. Every returned panel or judge
+  domain receives `FUSION_INTERNAL_BEARER_TOKEN`; do not point it at
+  user-controlled endpoint lists or allow per-request endpoint overrides.
+- V1 does not SSRF-filter discovered panel domains beyond trusting
+  `FUSION_ENDPOINTS_URL`. Keep the endpoint list operator-controlled and use
+  network policy if a deployment needs additional egress restrictions.
+- V1 attestation covers the synthesis proxy response. Panel attestation is an
+  informational `/attestation/report` liveness check and is not
+  cryptographically bound into the final response signature.
+- For Fusion requests that include `{"type":"web_context_search"}`, set
+  `WEB_CONTEXT_SEARCH_URL=https://api.search.brave.com/res/v1/llm/context`
+  and either `WEB_CONTEXT_SEARCH_API_KEY` or `BRAVE_LLM_CONTEXT_API_KEY`.
+- Run the local/live smoke test before flipping the feature flag:
+
+```bash
+FUSION_INTERNAL_BEARER_TOKEN=... \
+WEB_CONTEXT_SEARCH_API_KEY=... \
+scripts/fusion_e2e.py --real-brave
+```
+
+The smoke test starts only local helper processes, calls live direct model
+proxies, verifies non-streaming and streaming Fusion, checks aggregate usage,
+and retrieves the final response signature. It does not deploy production.
+
 ## Running
 
 ```bash
@@ -138,7 +193,10 @@ cargo build --release
 cargo test
 ```
 
-89 tests: 50 unit tests (signing, cache, config, error, attestation helpers, SSE parser) and 39 integration tests (full app with wiremock mock backend, including cryptographic signature verification, multipart endpoints, streaming completions).
+The suite includes unit tests for signing, cache, config, errors,
+attestation helpers, SSE parsing, Fusion orchestration, and integration tests
+with wiremock mock backends for cryptographic signature verification,
+multipart endpoints, streaming completions, E2EE, web tools, and Fusion.
 
 ## Project Structure
 

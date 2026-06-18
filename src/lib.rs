@@ -14,6 +14,7 @@ pub mod cache;
 pub mod config;
 pub mod encryption;
 pub mod error;
+pub mod fusion;
 pub mod gpu_evidence_delegate;
 pub mod image_validation;
 pub mod metrics_middleware;
@@ -43,6 +44,7 @@ pub struct AppState {
     pub backend_pool: Arc<backend_pool::BackendPool>,
     pub ohttp_gateway: Option<Arc<ohttp_gateway::OhttpGateway>>,
     pub ohttp_attestation_ed25519: Option<types::OhttpAttestation>,
+    pub fusion_caches: Arc<fusion::FusionCaches>,
 }
 
 /// Tracing correlation IDs for a request, parsed once by `request_id_middleware`

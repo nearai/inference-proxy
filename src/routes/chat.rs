@@ -6,11 +6,11 @@ use axum::Extension;
 
 use sha2::Digest;
 
-use crate::agent_loop;
 use crate::auth::RequireAuth;
 use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
 use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageType};
+use crate::{agent_loop, fusion};
 use crate::{AppState, TracingIds};
 
 /// POST /v1/chat/completions
@@ -60,6 +60,45 @@ pub async fn chat_completions(
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+
+    if state.config.fusion_enabled && fusion::has_fusion_tool(&request_json) {
+        let depth = fusion::trusted_request_depth(&headers, &state);
+        if depth >= state.config.fusion_max_depth {
+            return Err(AppError::BadRequest("fusion_depth_exceeded".to_string()));
+        }
+
+        let (response_transform, chunk_transform) = if let Some(ctx) = enc_ctx.clone() {
+            let signing = state.signing.clone();
+            (
+                Some(encryption::make_response_transform(
+                    Endpoint::ChatCompletions,
+                    ctx.clone(),
+                    signing.clone(),
+                )),
+                Some(encryption::make_chunk_transform(
+                    Endpoint::ChatCompletions,
+                    ctx,
+                    signing,
+                )),
+            )
+        } else {
+            (None, None)
+        };
+
+        return fusion::run_chat_completion(
+            fusion::ChatCompletionContext {
+                state,
+                auth,
+                tracing_ids,
+                request_hash,
+                is_stream,
+                response_transform,
+                chunk_transform,
+            },
+            request_json,
+        )
+        .await;
+    }
 
     // Server-side agent loop opt-in: the request advertises exactly
     // `{"type":"web_context_search"}` and nothing else. Requires streaming

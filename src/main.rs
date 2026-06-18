@@ -6,7 +6,7 @@ use tokio::net::TcpListener;
 use tracing::info;
 use vllm_proxy_rs::ohttp_gateway::OhttpGateway;
 use vllm_proxy_rs::{
-    attestation, backend_pool, cache, config, metrics_middleware, rate_limit,
+    attestation, backend_pool, cache, config, fusion, metrics_middleware, rate_limit,
     request_id_middleware, routes, signing, startup_checks, AppState,
 };
 
@@ -154,6 +154,7 @@ async fn main() -> anyhow::Result<()> {
         backend_pool: backend_pool.clone(),
         ohttp_gateway: ohttp_gw,
         ohttp_attestation_ed25519: ohttp_attestation_ed25519.clone(),
+        fusion_caches: Arc::new(fusion::FusionCaches::default()),
     };
 
     // Spawn background attestation cache refresh task.

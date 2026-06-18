@@ -95,6 +95,15 @@ fn build_agent_loop_app_with_cloud(
         web_context_search_api_key: brave_url.map(|_| "brave-test-key".to_string()),
         agent_loop_max_iterations: 3,
         web_context_search_timeout_secs: 5,
+        fusion_enabled: false,
+        fusion_endpoints_url: "https://completions.near.ai/endpoints".to_string(),
+        fusion_endpoints_ttl_secs: 300,
+        fusion_internal_bearer_token: None,
+        fusion_default_analysis_models: Vec::new(),
+        fusion_max_panel_models: 8,
+        fusion_max_depth: 1,
+        fusion_panel_timeout_secs: 120,
+        fusion_max_response_bytes: 10 * 1024 * 1024,
     };
 
     let ecdsa_key: [u8; 32] = [
@@ -132,6 +141,7 @@ fn build_agent_loop_app_with_cloud(
         backend_pool,
         ohttp_gateway: None,
         ohttp_attestation_ed25519: None,
+        fusion_caches: Arc::new(fusion::FusionCaches::default()),
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(1000, 2000);

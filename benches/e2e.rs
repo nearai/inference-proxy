@@ -98,6 +98,15 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         web_context_search_api_key: None,
         agent_loop_max_iterations: 5,
         web_context_search_timeout_secs: 30,
+        fusion_enabled: false,
+        fusion_endpoints_url: "https://completions.near.ai/endpoints".to_string(),
+        fusion_endpoints_ttl_secs: 300,
+        fusion_internal_bearer_token: None,
+        fusion_default_analysis_models: Vec::new(),
+        fusion_max_panel_models: 8,
+        fusion_max_depth: 1,
+        fusion_panel_timeout_secs: 120,
+        fusion_max_response_bytes: 10 * 1024 * 1024,
     };
 
     let ecdsa = signing::EcdsaContext::from_key_bytes(&ECDSA_KEY).unwrap();
@@ -126,6 +135,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         backend_pool,
         ohttp_gateway: None,
         ohttp_attestation_ed25519: None,
+        fusion_caches: Arc::new(fusion::FusionCaches::default()),
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(10000, 20000);

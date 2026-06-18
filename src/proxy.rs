@@ -392,7 +392,7 @@ fn input_only_usage_body(
 }
 
 /// Extract usage from a parsed JSON response and fire-and-forget a report to the cloud API.
-fn try_report_usage(response_data: &serde_json::Value, id: &str, opts: &ProxyOpts) {
+pub(crate) fn try_report_usage(response_data: &serde_json::Value, id: &str, opts: &ProxyOpts) {
     let Some(reporter) = &opts.usage_reporter else {
         return;
     };

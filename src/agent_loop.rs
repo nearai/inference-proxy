@@ -261,7 +261,7 @@ pub async fn run_chat_completion(
 /// Also forces `parallel_tool_calls: false`. Phase 1 caps execution at one
 /// tool call per iteration; instructing the model not to emit more than one
 /// keeps the upstream from producing tool calls we'd then drop.
-fn rewrite_tool_for_upstream(request_json: &mut Value) {
+pub(crate) fn rewrite_tool_for_upstream(request_json: &mut Value) {
     request_json["tools"] = json!([{
         "type": "function",
         "function": {
@@ -1206,6 +1206,22 @@ async fn brave_llm_context_search(
         .map_err(|e| BraveError::Other(format!("brave JSON parse failed: {e}")))?;
 
     Ok(format_context_response(&parsed))
+}
+
+pub(crate) async fn brave_llm_context_search_text(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    query: &str,
+    timeout: Duration,
+    tracing_ids: &TracingIds,
+) -> Result<String, String> {
+    brave_llm_context_search(client, url, api_key, query, timeout, tracing_ids)
+        .await
+        .map_err(|err| match err {
+            BraveError::Timeout => "timeout".to_string(),
+            BraveError::Other(msg) => msg,
+        })
 }
 
 fn error_category(e: &reqwest::Error) -> &'static str {

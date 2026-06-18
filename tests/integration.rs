@@ -1263,8 +1263,10 @@ async fn test_forced_fusion_retries_transient_panel_5xx() {
         .and(body_string_contains(
             "one member of a private multi-model panel",
         ))
-        .respond_with(ResponseTemplate::new(503).set_body_string("loading"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("loading".repeat(512)))
+        .expect(1)
         .up_to_n_times(1)
+        .with_priority(1)
         .mount(&mock_server)
         .await;
 
@@ -1285,6 +1287,7 @@ async fn test_forced_fusion_retries_transient_panel_5xx() {
             "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
         })))
         .expect(1)
+        .with_priority(2)
         .mount(&mock_server)
         .await;
 
@@ -1326,9 +1329,14 @@ async fn test_forced_fusion_retries_transient_panel_5xx() {
         .mount(&mock_server)
         .await;
 
-    let app = build_test_app_with_fusion(
+    let app = build_test_app_inner(
         &mock_server.uri(),
-        format!("{}/endpoints", mock_server.uri()),
+        TestAppOptions {
+            fusion_enabled: true,
+            fusion_endpoints_url: Some(format!("{}/endpoints", mock_server.uri())),
+            fusion_max_response_bytes: 512,
+            ..Default::default()
+        },
     );
 
     let request_body = serde_json::json!({

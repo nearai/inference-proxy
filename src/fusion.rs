@@ -906,9 +906,10 @@ async fn post_chat_json(
     label: &'static str,
     max_attempts: usize,
 ) -> Result<Value, AppError> {
-    let started = Instant::now();
+    let body = Bytes::from(body);
     let attempts = max_attempts.max(1);
     for attempt in 1..=attempts {
+        let attempt_started = Instant::now();
         let mut req = state
             .http_client
             .post(url)
@@ -927,33 +928,43 @@ async fn post_chat_json(
         let response = match req.body(body.clone()).send().await {
             Ok(response) => response,
             Err(e) => {
+                record_upstream_attempt(label, attempt_started);
                 let retry = attempt < attempts && is_retryable_transport_error(&e);
                 if retry {
                     sleep_before_fusion_retry(state, attempt).await;
                     continue;
                 }
-                metrics::histogram!("upstream_request_duration_seconds", "endpoint" => label)
-                    .record(started.elapsed().as_secs_f64());
                 return Err(map_fusion_transport_error(e));
             }
         };
 
         let status = response.status();
-        let bytes = read_response_limited(response, state.config.fusion_max_response_bytes).await?;
+        if !status.is_success() && attempt < attempts && status.is_server_error() {
+            record_upstream_attempt(label, attempt_started);
+            sleep_before_fusion_retry(state, attempt).await;
+            continue;
+        }
+
+        let bytes =
+            match read_response_limited(response, state.config.fusion_max_response_bytes).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    record_upstream_attempt(label, attempt_started);
+                    if attempt < attempts && e.is_retryable() {
+                        sleep_before_fusion_retry(state, attempt).await;
+                        continue;
+                    }
+                    return Err(e.into_app_error());
+                }
+            };
+
+        record_upstream_attempt(label, attempt_started);
         if !status.is_success() {
-            if attempt < attempts && status.is_server_error() {
-                sleep_before_fusion_retry(state, attempt).await;
-                continue;
-            }
-            metrics::histogram!("upstream_request_duration_seconds", "endpoint" => label)
-                .record(started.elapsed().as_secs_f64());
             return Err(AppError::Upstream {
                 status,
                 body: bytes,
             });
         }
-        metrics::histogram!("upstream_request_duration_seconds", "endpoint" => label)
-            .record(started.elapsed().as_secs_f64());
         return serde_json::from_slice(&bytes).map_err(|e| AppError::Internal(e.into()));
     }
 
@@ -962,8 +973,13 @@ async fn post_chat_json(
     )))
 }
 
+fn record_upstream_attempt(label: &'static str, started: Instant) {
+    metrics::histogram!("upstream_request_duration_seconds", "endpoint" => label)
+        .record(started.elapsed().as_secs_f64());
+}
+
 fn is_retryable_transport_error(error: &reqwest::Error) -> bool {
-    error.is_timeout() || error.is_connect() || error.is_request()
+    error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
 }
 
 fn map_fusion_transport_error(error: reqwest::Error) -> AppError {
@@ -981,35 +997,57 @@ fn map_fusion_transport_error(error: reqwest::Error) -> AppError {
 async fn sleep_before_fusion_retry(state: &AppState, attempt: usize) {
     let shift = u32::try_from(attempt.saturating_sub(1)).unwrap_or(u32::MAX);
     let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
-    let delay_ms = state
+    let upper_ms = state
         .config
         .fusion_internal_retry_initial_backoff_ms
         .saturating_mul(multiplier)
         .min(5_000);
+    let delay_ms = rand::random_range(0..=upper_ms);
     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 }
 
 async fn read_response_limited(
     response: reqwest::Response,
     max_bytes: usize,
-) -> Result<Bytes, AppError> {
+) -> Result<Bytes, FusionBodyReadError> {
     if response
         .content_length()
         .is_some_and(|len| len > max_bytes as u64)
     {
-        return Err(fusion_response_too_large());
+        return Err(FusionBodyReadError::TooLarge);
     }
 
     let mut body = BytesMut::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| AppError::Internal(e.into()))?;
+        let chunk = chunk.map_err(FusionBodyReadError::Transport)?;
         if body.len().saturating_add(chunk.len()) > max_bytes {
-            return Err(fusion_response_too_large());
+            return Err(FusionBodyReadError::TooLarge);
         }
         body.extend_from_slice(&chunk);
     }
     Ok(body.freeze())
+}
+
+enum FusionBodyReadError {
+    TooLarge,
+    Transport(reqwest::Error),
+}
+
+impl FusionBodyReadError {
+    fn is_retryable(&self) -> bool {
+        match self {
+            FusionBodyReadError::TooLarge => false,
+            FusionBodyReadError::Transport(error) => is_retryable_transport_error(error),
+        }
+    }
+
+    fn into_app_error(self) -> AppError {
+        match self {
+            FusionBodyReadError::TooLarge => fusion_response_too_large(),
+            FusionBodyReadError::Transport(error) => map_fusion_transport_error(error),
+        }
+    }
 }
 
 fn fusion_response_too_large() -> AppError {
@@ -1175,7 +1213,9 @@ async fn endpoint_snapshot(state: &AppState) -> Result<EndpointSnapshot, AppErro
             }
         })?;
     let status = response.status();
-    let bytes = read_response_limited(response, state.config.fusion_max_response_bytes).await?;
+    let bytes = read_response_limited(response, state.config.fusion_max_response_bytes)
+        .await
+        .map_err(FusionBodyReadError::into_app_error)?;
     if !status.is_success() {
         return Err(AppError::Upstream {
             status,

@@ -1,6 +1,8 @@
 use std::env;
 use tracing::warn;
 
+const FUSION_INTERNAL_MAX_ATTEMPTS_LIMIT: usize = 5;
+
 fn env_or(name: &str, default: &str) -> String {
     env::var(name).unwrap_or_else(|_| default.to_string())
 }
@@ -244,7 +246,7 @@ pub struct Config {
     /// Maximum bytes buffered from Fusion endpoint discovery and model responses.
     pub fusion_max_response_bytes: usize,
     /// Total attempts for transient Fusion direct model HTTP calls. 1 disables
-    /// retry; retries are only for transport errors, timeouts, and 5xx.
+    /// retry; retries are only for connect errors, timeouts, and 5xx.
     pub fusion_internal_max_attempts: usize,
     /// Initial backoff before retrying Fusion direct model calls. Backoff
     /// doubles per attempt.
@@ -526,6 +528,12 @@ impl Config {
             }
             if config.fusion_internal_max_attempts == 0 {
                 anyhow::bail!("FUSION_INTERNAL_MAX_ATTEMPTS must be at least 1");
+            }
+            if config.fusion_internal_max_attempts > FUSION_INTERNAL_MAX_ATTEMPTS_LIMIT {
+                anyhow::bail!(
+                    "FUSION_INTERNAL_MAX_ATTEMPTS must be at most {}",
+                    FUSION_INTERNAL_MAX_ATTEMPTS_LIMIT
+                );
             }
             if config.fusion_internal_max_attempts > 1
                 && config.fusion_internal_retry_initial_backoff_ms == 0
@@ -864,6 +872,27 @@ mod tests {
                 },
             );
         }
+    }
+
+    #[test]
+    fn test_config_rejects_excessive_fusion_internal_attempts_when_enabled() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "model"),
+                ("TOKEN", "tok"),
+                ("FUSION_ENABLED", "true"),
+                ("FUSION_INTERNAL_BEARER_TOKEN", "internal"),
+                ("FUSION_INTERNAL_MAX_ATTEMPTS", "6"),
+            ],
+            || {
+                let result = Config::from_env();
+                assert!(result.is_err());
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("FUSION_INTERNAL_MAX_ATTEMPTS must be at most 5"));
+            },
+        );
     }
 
     #[test]

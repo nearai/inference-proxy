@@ -968,9 +968,7 @@ async fn post_chat_json(
         return serde_json::from_slice(&bytes).map_err(|e| AppError::Internal(e.into()));
     }
 
-    Err(AppError::Internal(anyhow::anyhow!(
-        "Fusion retry loop exhausted unexpectedly"
-    )))
+    unreachable!("fusion retry loop always returns early on the last attempt");
 }
 
 fn record_upstream_attempt(label: &'static str, started: Instant) {
@@ -979,7 +977,7 @@ fn record_upstream_attempt(label: &'static str, started: Instant) {
 }
 
 fn is_retryable_transport_error(error: &reqwest::Error) -> bool {
-    error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
+    error.is_timeout() || error.is_connect()
 }
 
 fn map_fusion_transport_error(error: reqwest::Error) -> AppError {

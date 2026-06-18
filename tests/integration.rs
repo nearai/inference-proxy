@@ -1379,6 +1379,167 @@ async fn test_forced_fusion_retries_transient_panel_5xx() {
 }
 
 #[tokio::test]
+async fn test_forced_fusion_exhausts_transient_panel_5xx_retries() {
+    use wiremock::matchers::body_string_contains;
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/endpoints"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "endpoints": [{
+                "domain": mock_server.uri(),
+                "models": ["panel-a"]
+            }]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/attestation/report"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", "Bearer fusion-token"))
+        .and(body_string_contains(
+            "one member of a private multi-model panel",
+        ))
+        .respond_with(ResponseTemplate::new(503).set_body_string("still loading"))
+        .expect(3)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("strict JSON only"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "nope"})))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app_inner(
+        &mock_server.uri(),
+        TestAppOptions {
+            fusion_enabled: true,
+            fusion_endpoints_url: Some(format!("{}/endpoints", mock_server.uri())),
+            fusion_internal_max_attempts: 3,
+            ..Default::default()
+        },
+    );
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Retry exhaustion"}],
+        "tools": [{
+            "type": "nearai:fusion",
+            "analysis_models": ["panel-a"],
+            "model": "panel-a"
+        }],
+        "tool_choice": "required",
+        "stream": false
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = body_to_json(response).await;
+    assert_eq!(body["error"]["message"], "all_panels_failed");
+    assert_eq!(body["error"]["type"], "fusion_error");
+}
+
+#[tokio::test]
+async fn test_forced_fusion_does_not_retry_when_attempts_one() {
+    use wiremock::matchers::body_string_contains;
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/endpoints"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "endpoints": [{
+                "domain": mock_server.uri(),
+                "models": ["panel-a"]
+            }]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/attestation/report"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", "Bearer fusion-token"))
+        .and(body_string_contains(
+            "one member of a private multi-model panel",
+        ))
+        .respond_with(ResponseTemplate::new(503).set_body_string("loading"))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app_inner(
+        &mock_server.uri(),
+        TestAppOptions {
+            fusion_enabled: true,
+            fusion_endpoints_url: Some(format!("{}/endpoints", mock_server.uri())),
+            fusion_internal_max_attempts: 1,
+            fusion_internal_retry_initial_backoff_ms: 0,
+            ..Default::default()
+        },
+    );
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "No retry"}],
+        "tools": [{
+            "type": "nearai:fusion",
+            "analysis_models": ["panel-a"],
+            "model": "panel-a"
+        }],
+        "tool_choice": "required",
+        "stream": false
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = body_to_json(response).await;
+    assert_eq!(body["error"]["message"], "all_panels_failed");
+    assert_eq!(body["error"]["type"], "fusion_error");
+}
+
+#[tokio::test]
 async fn test_forced_fusion_runs_panel_web_context_search() {
     use wiremock::matchers::{body_string_contains, query_param};
 

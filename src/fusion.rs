@@ -1522,6 +1522,7 @@ async fn stream_final_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn detects_and_removes_fusion_tool() {
@@ -1568,6 +1569,62 @@ mod tests {
         assert_eq!(usage.to_json()["prompt_tokens"], 7);
         assert_eq!(usage.to_json()["completion_tokens"], 10);
         assert_eq!(usage.to_json()["total_tokens"], 17);
+    }
+
+    #[tokio::test]
+    async fn retryable_transport_error_accepts_only_timeout_and_connect() {
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let unused_addr = reserved.local_addr().unwrap();
+        drop(reserved);
+
+        let connect_error = reqwest::Client::new()
+            .get(format!("http://{unused_addr}/"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(connect_error.is_connect());
+        assert!(is_retryable_transport_error(&connect_error));
+
+        let timeout_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let timeout_addr = timeout_listener.local_addr().unwrap();
+        let timeout_server = tokio::spawn(async move {
+            let (_stream, _) = timeout_listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        });
+        let timeout_error = reqwest::Client::builder()
+            .timeout(Duration::from_millis(20))
+            .build()
+            .unwrap()
+            .get(format!("http://{timeout_addr}/"))
+            .send()
+            .await
+            .unwrap_err();
+        timeout_server.abort();
+        assert!(timeout_error.is_timeout());
+        assert!(is_retryable_transport_error(&timeout_error));
+
+        let decode_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let decode_addr = decode_listener.local_addr().unwrap();
+        let decode_server = tokio::spawn(async move {
+            let (mut stream, _) = decode_listener.accept().await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 8\r\ncontent-type: application/json\r\n\r\nnot-json",
+                )
+                .await
+                .unwrap();
+        });
+        let decode_error = reqwest::Client::new()
+            .get(format!("http://{decode_addr}/"))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap_err();
+        decode_server.await.unwrap();
+        assert!(decode_error.is_decode());
+        assert!(!is_retryable_transport_error(&decode_error));
     }
 
     #[test]

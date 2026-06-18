@@ -1409,7 +1409,7 @@ async fn test_forced_fusion_exhausts_transient_panel_5xx_retries() {
             "one member of a private multi-model panel",
         ))
         .respond_with(ResponseTemplate::new(503).set_body_string("still loading"))
-        .expect(3)
+        .expect(2)
         .mount(&mock_server)
         .await;
 
@@ -1426,7 +1426,7 @@ async fn test_forced_fusion_exhausts_transient_panel_5xx_retries() {
         TestAppOptions {
             fusion_enabled: true,
             fusion_endpoints_url: Some(format!("{}/endpoints", mock_server.uri())),
-            fusion_internal_max_attempts: 3,
+            fusion_internal_max_attempts: 2,
             ..Default::default()
         },
     );

@@ -1200,9 +1200,11 @@ async fn test_forced_fusion_runs_panel_judge_and_synthesis() {
         "messages": [{"role": "user", "content": "Pick a color"}],
         "tools": [{
             "type": "openrouter:fusion",
-            "analysis_models": ["~panel-a"],
-            "model": "panel-a",
-            "max_completion_tokens": 16
+            "parameters": {
+                "analysis_models": ["~panel-a"],
+                "model": "panel-a",
+                "max_completion_tokens": 16
+            }
         }],
         "tool_choice": "required",
         "stream": false
@@ -2152,6 +2154,63 @@ async fn test_forced_fusion_all_panels_failed_returns_taxonomy_error() {
         "tools": [{
             "type": "openrouter:fusion",
             "analysis_models": ["missing-panel"]
+        }],
+        "tool_choice": "required",
+        "stream": false
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = body_to_json(response).await;
+    assert_eq!(body["error"]["message"], "all_panels_failed");
+    assert_eq!(body["error"]["type"], "fusion_error");
+}
+
+#[tokio::test]
+async fn test_forced_fusion_accepts_openrouter_plugin_config() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/endpoints"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "endpoints": []
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "nope"})))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app_with_fusion(
+        &mock_server.uri(),
+        format!("{}/endpoints", mock_server.uri()),
+    );
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Plugin Fusion"}],
+        "plugins": [{
+            "id": "fusion",
+            "analysis_models": ["missing-panel"],
+            "model": "missing-panel",
+            "max_completion_tokens": 16,
+            "max_tool_calls": 0
         }],
         "tool_choice": "required",
         "stream": false

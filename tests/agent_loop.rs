@@ -104,6 +104,8 @@ fn build_agent_loop_app_with_cloud(
         fusion_max_depth: 1,
         fusion_panel_timeout_secs: 120,
         fusion_max_response_bytes: 10 * 1024 * 1024,
+        fusion_internal_max_attempts: 2,
+        fusion_internal_retry_initial_backoff_ms: 250,
     };
 
     let ecdsa_key: [u8; 32] = [

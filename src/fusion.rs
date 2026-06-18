@@ -734,7 +734,7 @@ async fn call_local_chat_json(
     remove_streaming_for_internal_call(&mut body);
     let body = serde_json::to_vec(&body).map_err(|e| AppError::Internal(e.into()))?;
     let (url, _guard) = state.backend_pool.select_url("/v1/chat/completions");
-    post_chat_json(state, &url, None, tracing_ids, body, "local_synthesis").await
+    post_chat_json(state, &url, None, tracing_ids, body, "local_synthesis", 1).await
 }
 
 async fn call_direct_chat_json(
@@ -756,7 +756,16 @@ async fn call_direct_chat_json(
         endpoint.base_url.trim_end_matches('/')
     );
     let body = serde_json::to_vec(&body).map_err(|e| AppError::Internal(e.into()))?;
-    post_chat_json(state, &url, Some(token), tracing_ids, body, "fusion_direct").await
+    post_chat_json(
+        state,
+        &url,
+        Some(token),
+        tracing_ids,
+        body,
+        "fusion_direct",
+        state.config.fusion_internal_max_attempts,
+    )
+    .await
 }
 
 async fn call_direct_chat_with_web_tools(
@@ -895,67 +904,148 @@ async fn post_chat_json(
     tracing_ids: &TracingIds,
     body: Vec<u8>,
     label: &'static str,
+    max_attempts: usize,
 ) -> Result<Value, AppError> {
-    let started = Instant::now();
-    let mut req = state
-        .http_client
-        .post(url)
-        .timeout(Duration::from_secs(state.config.fusion_panel_timeout_secs))
-        .header("content-type", "application/json")
-        .header("accept", "application/json")
-        .header("x-openrouter-fusion-depth", "1")
-        .header("x-nearai-fusion-depth", "1");
-    if let Some(token) = bearer {
-        req = req.bearer_auth(token);
-    }
-    for (k, v) in tracing_ids.upstream_headers() {
-        req = req.header(k, v);
-    }
-    let response = req.body(body).send().await.map_err(|e| {
-        if e.is_timeout() {
-            AppError::UpstreamParsed {
-                status: StatusCode::GATEWAY_TIMEOUT,
-                message: "fusion_panel_timeout".to_string(),
-                error_type: "fusion_error".to_string(),
-            }
-        } else {
-            AppError::Internal(e.into())
+    let body = Bytes::from(body);
+    let attempts = max_attempts.max(1);
+    for attempt in 1..=attempts {
+        let attempt_started = Instant::now();
+        let mut req = state
+            .http_client
+            .post(url)
+            .timeout(Duration::from_secs(state.config.fusion_panel_timeout_secs))
+            .header("content-type", "application/json")
+            .header("accept", "application/json")
+            .header("x-openrouter-fusion-depth", "1")
+            .header("x-nearai-fusion-depth", "1");
+        if let Some(token) = bearer {
+            req = req.bearer_auth(token);
         }
-    })?;
+        for (k, v) in tracing_ids.upstream_headers() {
+            req = req.header(k, v);
+        }
+
+        let response = match req.body(body.clone()).send().await {
+            Ok(response) => response,
+            Err(e) => {
+                record_upstream_attempt(label, attempt_started);
+                let retry = attempt < attempts && is_retryable_transport_error(&e);
+                if retry {
+                    sleep_before_fusion_retry(state, attempt).await;
+                    continue;
+                }
+                return Err(map_fusion_transport_error(e));
+            }
+        };
+
+        let status = response.status();
+        if !status.is_success() && attempt < attempts && status.is_server_error() {
+            record_upstream_attempt(label, attempt_started);
+            sleep_before_fusion_retry(state, attempt).await;
+            continue;
+        }
+
+        let bytes =
+            match read_response_limited(response, state.config.fusion_max_response_bytes).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    record_upstream_attempt(label, attempt_started);
+                    if attempt < attempts && e.is_retryable() {
+                        sleep_before_fusion_retry(state, attempt).await;
+                        continue;
+                    }
+                    return Err(e.into_app_error());
+                }
+            };
+
+        record_upstream_attempt(label, attempt_started);
+        if !status.is_success() {
+            return Err(AppError::Upstream {
+                status,
+                body: bytes,
+            });
+        }
+        return serde_json::from_slice(&bytes).map_err(|e| AppError::Internal(e.into()));
+    }
+
+    unreachable!("fusion retry loop always returns early on the last attempt");
+}
+
+fn record_upstream_attempt(label: &'static str, started: Instant) {
     metrics::histogram!("upstream_request_duration_seconds", "endpoint" => label)
         .record(started.elapsed().as_secs_f64());
-    let status = response.status();
-    let bytes = read_response_limited(response, state.config.fusion_max_response_bytes).await?;
-    if !status.is_success() {
-        return Err(AppError::Upstream {
-            status,
-            body: bytes,
-        });
+}
+
+fn is_retryable_transport_error(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect()
+}
+
+fn map_fusion_transport_error(error: reqwest::Error) -> AppError {
+    if error.is_timeout() {
+        AppError::UpstreamParsed {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            message: "fusion_panel_timeout".to_string(),
+            error_type: "fusion_error".to_string(),
+        }
+    } else {
+        AppError::Internal(error.into())
     }
-    serde_json::from_slice(&bytes).map_err(|e| AppError::Internal(e.into()))
+}
+
+async fn sleep_before_fusion_retry(state: &AppState, attempt: usize) {
+    let shift = u32::try_from(attempt.saturating_sub(1)).unwrap_or(u32::MAX);
+    let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+    let upper_ms = state
+        .config
+        .fusion_internal_retry_initial_backoff_ms
+        .saturating_mul(multiplier)
+        .min(5_000);
+    let delay_ms = rand::random_range(0..=upper_ms);
+    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 }
 
 async fn read_response_limited(
     response: reqwest::Response,
     max_bytes: usize,
-) -> Result<Bytes, AppError> {
+) -> Result<Bytes, FusionBodyReadError> {
     if response
         .content_length()
         .is_some_and(|len| len > max_bytes as u64)
     {
-        return Err(fusion_response_too_large());
+        return Err(FusionBodyReadError::TooLarge);
     }
 
     let mut body = BytesMut::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| AppError::Internal(e.into()))?;
+        let chunk = chunk.map_err(FusionBodyReadError::Transport)?;
         if body.len().saturating_add(chunk.len()) > max_bytes {
-            return Err(fusion_response_too_large());
+            return Err(FusionBodyReadError::TooLarge);
         }
         body.extend_from_slice(&chunk);
     }
     Ok(body.freeze())
+}
+
+enum FusionBodyReadError {
+    TooLarge,
+    Transport(reqwest::Error),
+}
+
+impl FusionBodyReadError {
+    fn is_retryable(&self) -> bool {
+        match self {
+            FusionBodyReadError::TooLarge => false,
+            FusionBodyReadError::Transport(error) => is_retryable_transport_error(error),
+        }
+    }
+
+    fn into_app_error(self) -> AppError {
+        match self {
+            FusionBodyReadError::TooLarge => fusion_response_too_large(),
+            FusionBodyReadError::Transport(error) => map_fusion_transport_error(error),
+        }
+    }
 }
 
 fn fusion_response_too_large() -> AppError {
@@ -1121,7 +1211,9 @@ async fn endpoint_snapshot(state: &AppState) -> Result<EndpointSnapshot, AppErro
             }
         })?;
     let status = response.status();
-    let bytes = read_response_limited(response, state.config.fusion_max_response_bytes).await?;
+    let bytes = read_response_limited(response, state.config.fusion_max_response_bytes)
+        .await
+        .map_err(FusionBodyReadError::into_app_error)?;
     if !status.is_success() {
         return Err(AppError::Upstream {
             status,
@@ -1430,6 +1522,7 @@ async fn stream_final_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn detects_and_removes_fusion_tool() {
@@ -1476,6 +1569,62 @@ mod tests {
         assert_eq!(usage.to_json()["prompt_tokens"], 7);
         assert_eq!(usage.to_json()["completion_tokens"], 10);
         assert_eq!(usage.to_json()["total_tokens"], 17);
+    }
+
+    #[tokio::test]
+    async fn retryable_transport_error_accepts_only_timeout_and_connect() {
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let unused_addr = reserved.local_addr().unwrap();
+        drop(reserved);
+
+        let connect_error = reqwest::Client::new()
+            .get(format!("http://{unused_addr}/"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(connect_error.is_connect());
+        assert!(is_retryable_transport_error(&connect_error));
+
+        let timeout_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let timeout_addr = timeout_listener.local_addr().unwrap();
+        let timeout_server = tokio::spawn(async move {
+            let (_stream, _) = timeout_listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        });
+        let timeout_error = reqwest::Client::builder()
+            .timeout(Duration::from_millis(20))
+            .build()
+            .unwrap()
+            .get(format!("http://{timeout_addr}/"))
+            .send()
+            .await
+            .unwrap_err();
+        timeout_server.abort();
+        assert!(timeout_error.is_timeout());
+        assert!(is_retryable_transport_error(&timeout_error));
+
+        let decode_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let decode_addr = decode_listener.local_addr().unwrap();
+        let decode_server = tokio::spawn(async move {
+            let (mut stream, _) = decode_listener.accept().await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 8\r\ncontent-type: application/json\r\n\r\nnot-json",
+                )
+                .await
+                .unwrap();
+        });
+        let decode_error = reqwest::Client::new()
+            .get(format!("http://{decode_addr}/"))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap_err();
+        decode_server.await.unwrap();
+        assert!(decode_error.is_decode());
+        assert!(!is_retryable_transport_error(&decode_error));
     }
 
     #[test]

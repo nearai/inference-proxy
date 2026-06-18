@@ -134,6 +134,8 @@ contains the aggregate token usage from panel, judge, and synthesis calls.
 | `FUSION_MAX_DEPTH` | No | `1` | Recursion guard for Fusion-to-Fusion calls |
 | `FUSION_PANEL_TIMEOUT_SECS` | No | `120` | Timeout for Fusion panel, judge, and synthesis chat calls |
 | `FUSION_MAX_RESPONSE_BYTES` | No | `10485760` | Max bytes buffered from Fusion endpoint discovery and internal model responses |
+| `FUSION_INTERNAL_MAX_ATTEMPTS` | No | `2` | Attempts for transient Fusion direct model HTTP calls; `1` disables retries; max `5` |
+| `FUSION_INTERNAL_RETRY_INITIAL_BACKOFF_MS` | No | `250` | Initial backoff for Fusion direct model retries; doubles per attempt with full jitter |
 | `AGENT_LOOP_MAX_ITERATIONS` | No | `5` | Also caps Fusion `web_context_search` tool calls |
 | `WEB_CONTEXT_SEARCH_URL` | If Fusion web search is used | — | Brave LLM Context endpoint |
 | `WEB_CONTEXT_SEARCH_API_KEY` | If Fusion web search is used | — | Brave LLM Context API key |

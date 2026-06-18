@@ -3,6 +3,7 @@ use std::sync::Arc;
 use axum::middleware;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use tokio::net::TcpListener;
+use tower_http::compression::CompressionLayer;
 use tracing::info;
 use vllm_proxy_rs::ohttp_gateway::OhttpGateway;
 use vllm_proxy_rs::{
@@ -237,6 +238,10 @@ async fn main() -> anyhow::Result<()> {
         .layer(axum::Extension(rate_limit_state))
         .layer(middleware::from_fn(request_id_middleware))
         .layer(middleware::from_fn(metrics_middleware::metrics_middleware))
+        // Compress responses when the client sends Accept-Encoding: gzip.
+        // The attestation report (118 KB) shrinks to ~44 KB (2.6x), reducing
+        // body-transfer time by ~60%. SSE streams are skipped automatically.
+        .layer(CompressionLayer::new())
         .with_state(state);
 
     // Bind and serve

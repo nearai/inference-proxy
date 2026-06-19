@@ -2,6 +2,7 @@ use std::env;
 use tracing::warn;
 
 const FUSION_INTERNAL_MAX_ATTEMPTS_LIMIT: usize = 5;
+const DEFAULT_GEMMA4_ALLOWED_MEDIA_DOMAIN: &str = "prod-files-secure.s3.us-west-2.amazonaws.com";
 
 fn env_or(name: &str, default: &str) -> String {
     env::var(name).unwrap_or_else(|_| default.to_string())
@@ -37,6 +38,28 @@ fn is_gemma4_model_name(model_name: &str) -> bool {
                 .unwrap_or(true)
         })
     })
+}
+
+fn parse_allowed_media_domains(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .filter_map(normalize_allowed_media_domain)
+        .collect()
+}
+
+fn normalize_allowed_media_domain(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('.');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(url) = reqwest::Url::parse(trimmed) {
+        return url.host_str().map(normalize_host);
+    }
+    Some(normalize_host(trimmed))
+}
+
+fn normalize_host(host: &str) -> String {
+    host.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +105,11 @@ pub struct Config {
     //   VLLM_PROXY_IMAGE_VALIDATION_MAX_CONCURRENCY=8   global concurrent fetches
     //   VLLM_PROXY_IMAGE_VALIDATION_ALLOW_PRIVATE_HOSTS=1  permit private/loopback
     //       image hosts (tests / trusted internal deployments; default: off)
+    //   VLLM_PROXY_IMAGE_VALIDATION_ALLOWED_DOMAINS=example.com,cdn.example.com
+    //       exact remote image_url host allowlist. If unset, falls back to
+    //       VLLM_ALLOWED_MEDIA_DOMAINS when present so deployments can mirror
+    //       vLLM's --allowed-media-domains policy. Gemma-4 defaults to the
+    //       current vLLM default domain because its backend already enforces it.
     //   VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB=0|1  force broad non-RGB
     //       rejection. By default Gemma-4 model names reject only observed
     //       one-channel crash inputs; broader RGBA/CMYK/palette rejection is
@@ -96,6 +124,7 @@ pub struct Config {
     pub image_validation_max_bytes: usize,
     pub image_validation_max_concurrency: usize,
     pub image_validation_allow_private_hosts: bool,
+    pub image_validation_allowed_domains: Vec<String>,
     pub image_validation_reject_non_rgb_images: bool,
     pub image_validation_reject_single_channel_images: bool,
 
@@ -352,6 +381,23 @@ impl Config {
                 .unwrap_or_else(|| is_gemma4_model_name(&model_name));
         let image_validation_reject_non_rgb_images =
             image_validation_reject_non_rgb_override.unwrap_or(false);
+        let image_validation_allowed_domains =
+            env::var("VLLM_PROXY_IMAGE_VALIDATION_ALLOWED_DOMAINS")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| {
+                    env::var("VLLM_ALLOWED_MEDIA_DOMAINS")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty())
+                })
+                .map(|s| parse_allowed_media_domains(&s))
+                .unwrap_or_else(|| {
+                    if is_gemma4_model_name(&model_name) {
+                        vec![DEFAULT_GEMMA4_ALLOWED_MEDIA_DOMAIN.to_string()]
+                    } else {
+                        Vec::new()
+                    }
+                });
 
         let fusion_default_analysis_models = env::var("FUSION_DEFAULT_ANALYSIS_MODELS")
             .ok()
@@ -408,6 +454,7 @@ impl Config {
             image_validation_allow_private_hosts: env_bool(
                 "VLLM_PROXY_IMAGE_VALIDATION_ALLOW_PRIVATE_HOSTS",
             ),
+            image_validation_allowed_domains,
             image_validation_reject_non_rgb_images,
             image_validation_reject_single_channel_images,
             chat_cache_expiration_secs: env_int("CHAT_CACHE_EXPIRATION", 1200) as u64,
@@ -560,6 +607,7 @@ impl Config {
             max_bytes: self.image_validation_max_bytes,
             max_concurrency: self.image_validation_max_concurrency,
             allow_private_hosts: self.image_validation_allow_private_hosts,
+            allowed_domains: self.image_validation_allowed_domains.clone(),
             reject_non_rgb_images: self.image_validation_reject_non_rgb_images,
             reject_single_channel_images: self.image_validation_reject_single_channel_images,
         }
@@ -674,6 +722,8 @@ mod tests {
             env::remove_var("DEV");
             env::remove_var("GPU_NO_HW_MODE");
             env::remove_var("CHAT_CACHE_EXPIRATION");
+            env::remove_var("VLLM_ALLOWED_MEDIA_DOMAINS");
+            env::remove_var("VLLM_PROXY_IMAGE_VALIDATION_ALLOWED_DOMAINS");
             env::remove_var("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB");
             env::remove_var("WEB_CONTEXT_SEARCH_URL");
             env::remove_var("WEB_CONTEXT_SEARCH_API_KEY");
@@ -715,6 +765,7 @@ mod tests {
             assert_eq!(config.backend_urls, vec!["http://localhost:8000"]);
             assert!(config.images_url_override.is_none());
             assert!(config.rerank_url_override.is_none());
+            assert!(config.image_validation_allowed_domains.is_empty());
             assert!(!config.image_validation_reject_non_rgb_images);
             assert!(!config.image_validation_reject_single_channel_images);
             assert!(!config.fusion_enabled);
@@ -745,6 +796,10 @@ mod tests {
                 ("VLLM_PROXY_IMAGE_VALIDATION_MAX_BYTES", "1234"),
                 ("VLLM_PROXY_IMAGE_VALIDATION_MAX_CONCURRENCY", "3"),
                 ("VLLM_PROXY_IMAGE_VALIDATION_ALLOW_PRIVATE_HOSTS", "true"),
+                (
+                    "VLLM_PROXY_IMAGE_VALIDATION_ALLOWED_DOMAINS",
+                    " https://CDN.Example.COM, images.example.com. ",
+                ),
                 ("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB", "1"),
             ],
             || {
@@ -755,6 +810,10 @@ mod tests {
                 assert_eq!(config.image_validation_max_bytes, 1234);
                 assert_eq!(config.image_validation_max_concurrency, 3);
                 assert!(config.image_validation_allow_private_hosts);
+                assert_eq!(
+                    config.image_validation_allowed_domains,
+                    vec!["cdn.example.com", "images.example.com"]
+                );
                 assert!(config.image_validation_reject_non_rgb_images);
                 assert!(config.image_validation_reject_single_channel_images);
 
@@ -764,8 +823,50 @@ mod tests {
                 assert_eq!(image_validation.max_bytes, 1234);
                 assert_eq!(image_validation.max_concurrency, 3);
                 assert!(image_validation.allow_private_hosts);
+                assert_eq!(
+                    image_validation.allowed_domains,
+                    vec!["cdn.example.com", "images.example.com"]
+                );
                 assert!(image_validation.reject_non_rgb_images);
                 assert!(image_validation.reject_single_channel_images);
+            },
+        );
+    }
+
+    #[test]
+    fn test_image_validation_allowed_domains_fallback_and_gemma_default() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "plain-model"),
+                ("TOKEN", "tok"),
+                (
+                    "VLLM_ALLOWED_MEDIA_DOMAINS",
+                    "prod-files-secure.s3.us-west-2.amazonaws.com, CDN.GeneralContext.COM",
+                ),
+            ],
+            || {
+                env::remove_var("VLLM_PROXY_IMAGE_VALIDATION_ALLOWED_DOMAINS");
+                let config = Config::from_env().unwrap();
+                assert_eq!(
+                    config.image_validation_allowed_domains,
+                    vec![
+                        "prod-files-secure.s3.us-west-2.amazonaws.com",
+                        "cdn.generalcontext.com"
+                    ]
+                );
+            },
+        );
+
+        with_env_vars(
+            &[("MODEL_NAME", "google/gemma-4-31B-it"), ("TOKEN", "tok")],
+            || {
+                env::remove_var("VLLM_ALLOWED_MEDIA_DOMAINS");
+                env::remove_var("VLLM_PROXY_IMAGE_VALIDATION_ALLOWED_DOMAINS");
+                let config = Config::from_env().unwrap();
+                assert_eq!(
+                    config.image_validation_allowed_domains,
+                    vec![DEFAULT_GEMMA4_ALLOWED_MEDIA_DOMAIN]
+                );
             },
         );
     }

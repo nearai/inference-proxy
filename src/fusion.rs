@@ -470,7 +470,8 @@ async fn run_panels(
     request_json: &Value,
     config: &FusionConfig,
 ) -> Vec<PanelOutcome> {
-    let futures = config.analysis_models.iter().cloned().map(|model| {
+    let futures = config.analysis_models.iter().map(|model| {
+        let model = model.clone();
         let state = state.clone();
         let tracing_ids = tracing_ids.clone();
         let request_json = request_json.clone();

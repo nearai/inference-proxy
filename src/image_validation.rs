@@ -79,6 +79,9 @@ pub struct ImageValidationConfig {
     /// to private IP *literals* are always refused regardless, since redirect
     /// targets are server-controlled and must never be trusted to point inward.
     pub allow_private_hosts: bool,
+    /// Exact remote image host allowlist mirroring vLLM's
+    /// `--allowed-media-domains` policy. Empty means no domain restriction.
+    pub allowed_domains: Vec<String>,
     /// Reject decisively non-RGB raster images. This is strict opt-in because
     /// RGBA, CMYK, and palette handling still need real-engine verification.
     pub reject_non_rgb_images: bool,
@@ -340,6 +343,14 @@ async fn validate_http_url(url: &str, cfg: &ImageValidationConfig) -> Verdict {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return Verdict::Reject;
     };
+    if !remote_host_matches_allowed_domains(&parsed, &cfg.allowed_domains) {
+        tracing::info!(
+            reason = "disallowed_media_domain",
+            host = parsed.host_str().unwrap_or("<missing>"),
+            "image validation rejected"
+        );
+        return Verdict::Reject;
+    }
 
     // SSRF guard for the *initial* URL when it's an IP literal: the client's
     // resolver isn't consulted for literals. Domains (initial + redirect hops)
@@ -750,6 +761,21 @@ fn is_video_content_type(ct: &str) -> bool {
         )
 }
 
+fn remote_host_matches_allowed_domains(parsed: &reqwest::Url, allowed_domains: &[String]) -> bool {
+    if allowed_domains.is_empty() {
+        return true;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let host = normalize_host_for_domain_match(host);
+    allowed_domains.iter().any(|allowed| allowed == &host)
+}
+
+fn normalize_host_for_domain_match(host: &str) -> String {
+    host.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
 /// Magic-byte detection for the common raster formats SGLang/PIL decode.
 fn is_image_magic(b: &[u8]) -> bool {
     if b.len() < 4 {
@@ -934,6 +960,7 @@ mod tests {
             max_bytes: 2048,
             max_concurrency: 4,
             allow_private_hosts: true,
+            allowed_domains: Vec::new(),
             reject_non_rgb_images: false,
             reject_single_channel_images: false,
         }
@@ -1231,6 +1258,35 @@ mod tests {
                 Verdict::Reject
             );
         }
+    }
+
+    #[test]
+    fn allowed_media_domains_match_exact_normalized_hosts() {
+        let allowed = vec!["prod-files-secure.s3.us-west-2.amazonaws.com".to_string()];
+        let good =
+            reqwest::Url::parse("https://PROD-FILES-SECURE.S3.US-WEST-2.AMAZONAWS.COM./image.png")
+                .unwrap();
+        let bad = reqwest::Url::parse(
+            "https://cdn.generalcontext.com/prod-files-secure.s3.us-west-2.amazonaws.com/image.png",
+        )
+        .unwrap();
+
+        assert!(remote_host_matches_allowed_domains(&good, &allowed));
+        assert!(!remote_host_matches_allowed_domains(&bad, &allowed));
+    }
+
+    #[tokio::test]
+    async fn disallowed_remote_domain_is_rejected_before_fetch() {
+        let mut c = cfg();
+        c.allowed_domains = vec!["prod-files-secure.s3.us-west-2.amazonaws.com".to_string()];
+        let v = serde_json::json!({"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":"https://cdn.generalcontext.com/image.png"}}
+        ]}]});
+
+        assert!(matches!(
+            reject_invalid_images(&v, &c).await,
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[tokio::test]

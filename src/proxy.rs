@@ -187,7 +187,12 @@ pub(crate) fn effective_error_status(
         return passthrough;
     }
     match info {
-        Some(info) if message_is_client_fetch_4xx(&info.message) => StatusCode::BAD_REQUEST,
+        Some(info)
+            if message_is_client_fetch_4xx(&info.message)
+                || message_is_allowed_media_domain_error(&info.message) =>
+        {
+            StatusCode::BAD_REQUEST
+        }
         _ => passthrough,
     }
 }
@@ -211,6 +216,12 @@ fn message_is_client_fetch_4xx(message: &str) -> bool {
             .expect("static regex compiles")
     });
     FETCH_4XX.is_match(&lower)
+}
+
+fn message_is_allowed_media_domain_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("url must be from one of the allowed domains")
+        && lower.contains("input url domain")
 }
 
 /// Reports usage to the cloud API for billing.
@@ -2438,6 +2449,12 @@ mod tests {
                 String::from_utf8_lossy(body)
             );
         }
+    }
+
+    #[test]
+    fn test_effective_status_downgrades_allowed_media_domain_errors_to_400() {
+        let body = br#"{"message":"The URL must be from one of the allowed domains: ['prod-files-secure.s3.us-west-2.amazonaws.com']. Input URL domain: cdn.generalcontext.com","type":"InternalServerError"}"#;
+        assert_eq!(eff(500, body), StatusCode::BAD_REQUEST);
     }
 
     #[test]

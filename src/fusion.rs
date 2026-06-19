@@ -552,11 +552,12 @@ async fn run_panels(
     request_json: &Value,
     config: &FusionConfig,
 ) -> Vec<PanelOutcome> {
-    let futures = config.analysis_models.iter().cloned().map(|model| {
+    let futures = config.analysis_models.iter().map(|model| {
         let state = state.clone();
         let tracing_ids = tracing_ids.clone();
         let request_json = request_json.clone();
         let config = config.clone();
+        let model = model.clone();
         async move { call_panel(&state, &tracing_ids, &request_json, &config, model).await }
     });
     join_all(futures).await

@@ -106,6 +106,8 @@ All configuration is via environment variables:
 | `VLLM_PROXY_IMAGE_VALIDATION_MAX_BYTES` | No | `8192` | Max fetched/decode-head bytes used for image sniffing |
 | `VLLM_PROXY_IMAGE_VALIDATION_MAX_CONCURRENCY` | No | `8` | Global concurrent outbound image-validation fetches |
 | `VLLM_PROXY_IMAGE_VALIDATION_ALLOW_PRIVATE_HOSTS` | No | `false` | Permit private/loopback image hosts for trusted deployments/tests |
+| `VLLM_PROXY_IMAGE_VALIDATION_ALLOWED_DOMAINS` | No | empty; Gemma-4 defaults to `prod-files-secure.s3.us-west-2.amazonaws.com` | Exact remote `image_url` host allowlist enforced before fetch and on every redirect hop. When unset, falls back to `VLLM_ALLOWED_MEDIA_DOMAINS`; set explicitly to an empty string to disable the proxy-side domain restriction |
+| `VLLM_ALLOWED_MEDIA_DOMAINS` | No | empty | vLLM-compatible media-domain allowlist used by the proxy only when `VLLM_PROXY_IMAGE_VALIDATION_ALLOWED_DOMAINS` is unset |
 | `VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB` | No | `false` (`1` forces strict mode) | Gemma-4 defaults to rejecting observed one-channel PNG/JPEG crash inputs; set `1` to reject broader non-RGB PNG/JPEG classes |
 | `VLLM_PROXY_MAX_KEEPALIVE` | No | `100` | Connection pool max idle per host |
 | `LISTEN_PORT` | No | `8000` | Server listen port |

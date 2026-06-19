@@ -208,7 +208,8 @@ pub async fn run_chat_completion(
     let fusion_tool = remove_fusion_tool(&mut request_json).ok_or_else(|| {
         AppError::BadRequest("Fusion was enabled but no Fusion tool was found".to_string())
     })?;
-    let config = parse_config(&fusion_tool, &ctx.state)?;
+    let outer_model = read_string(&request_json, "model");
+    let config = parse_config(&fusion_tool, &ctx.state, outer_model.as_deref())?;
     let forced = is_required_tool_choice(&request_json);
 
     let mut aggregate_usage = Usage::default();
@@ -301,19 +302,27 @@ fn remove_fusion_tool(request: &mut Value) -> Option<Value> {
         if let Some(index) = tools.iter().position(is_fusion_tool) {
             let tool = tools.remove(index);
             if tools.is_empty() {
-                request.as_object_mut()?.remove("tools");
+                if let Some(obj) = request.as_object_mut() {
+                    obj.remove("tools");
+                }
             }
             remove_fusion_plugins_if_any(request);
             return Some(tool);
         }
     }
 
-    let plugins = request.get_mut("plugins")?.as_array_mut()?;
-    let index = plugins.iter().position(is_enabled_fusion_plugin)?;
-    let plugin = plugins.remove(index);
-    if plugins.is_empty() {
-        request.as_object_mut()?.remove("plugins");
+    let (plugin, plugins_empty) = {
+        let plugins = request.get_mut("plugins")?.as_array_mut()?;
+        let index = plugins.iter().position(is_enabled_fusion_plugin)?;
+        let plugin = plugins.remove(index);
+        (plugin, plugins.is_empty())
+    };
+    if plugins_empty {
+        if let Some(obj) = request.as_object_mut() {
+            obj.remove("plugins");
+        }
     }
+    remove_fusion_plugins_if_any(request);
     let mut tool = plugin;
     if let Some(obj) = tool.as_object_mut() {
         obj.insert(
@@ -324,10 +333,12 @@ fn remove_fusion_tool(request: &mut Value) -> Option<Value> {
     Some(tool)
 }
 
-fn parse_config(tool: &Value, state: &AppState) -> Result<FusionConfig, AppError> {
-    let nested = fusion_nested_config(tool);
-    let mut analysis_models = read_string_array(tool, "analysis_models")
-        .or_else(|| nested.and_then(|v| read_string_array(v, "analysis_models")))
+fn parse_config(
+    tool: &Value,
+    state: &AppState,
+    outer_model: Option<&str>,
+) -> Result<FusionConfig, AppError> {
+    let mut analysis_models = read_fusion_string_array(tool, "analysis_models")
         .unwrap_or_else(|| state.config.fusion_default_analysis_models.clone());
     analysis_models = normalize_unique_models(analysis_models);
 
@@ -343,29 +354,67 @@ fn parse_config(tool: &Value, state: &AppState) -> Result<FusionConfig, AppError
         )));
     }
 
+    let openrouter_fusion = tool.get("type").and_then(|v| v.as_str()) == Some("openrouter:fusion");
+
     Ok(FusionConfig {
         analysis_models,
-        judge_model: read_string(tool, "model")
-            .or_else(|| nested.and_then(|v| read_string(v, "model")))
+        judge_model: read_fusion_string(tool, "model")
+            .or_else(|| {
+                if openrouter_fusion {
+                    outer_model.map(ToOwned::to_owned)
+                } else {
+                    None
+                }
+            })
             .map(|m| normalize_model_name(&m)),
         max_tool_calls: bounded_max_tool_calls(
-            read_u32(tool, "max_tool_calls")
-                .or_else(|| nested.and_then(|v| read_u32(v, "max_tool_calls"))),
+            read_fusion_u32(tool, "max_tool_calls"),
             state.config.agent_loop_max_iterations,
         ),
-        max_completion_tokens: read_u64(tool, "max_completion_tokens")
-            .or_else(|| nested.and_then(|v| read_u64(v, "max_completion_tokens"))),
-        temperature: read_f64(tool, "temperature")
-            .or_else(|| nested.and_then(|v| read_f64(v, "temperature"))),
-        reasoning: tool
-            .get("reasoning")
-            .cloned()
-            .or_else(|| nested.and_then(|v| v.get("reasoning").cloned())),
+        max_completion_tokens: read_fusion_u64(tool, "max_completion_tokens"),
+        temperature: read_fusion_f64(tool, "temperature"),
+        reasoning: read_fusion_value(tool, "reasoning"),
     })
 }
 
-fn fusion_nested_config(tool: &Value) -> Option<&Value> {
-    tool.get("parameters").or_else(|| tool.get("config"))
+fn read_fusion_string_array(tool: &Value, key: &str) -> Option<Vec<String>> {
+    read_string_array(tool, key)
+        .or_else(|| {
+            tool.get("parameters")
+                .and_then(|v| read_string_array(v, key))
+        })
+        .or_else(|| tool.get("config").and_then(|v| read_string_array(v, key)))
+}
+
+fn read_fusion_string(tool: &Value, key: &str) -> Option<String> {
+    read_string(tool, key)
+        .or_else(|| tool.get("parameters").and_then(|v| read_string(v, key)))
+        .or_else(|| tool.get("config").and_then(|v| read_string(v, key)))
+}
+
+fn read_fusion_u32(tool: &Value, key: &str) -> Option<u32> {
+    read_u32(tool, key)
+        .or_else(|| tool.get("parameters").and_then(|v| read_u32(v, key)))
+        .or_else(|| tool.get("config").and_then(|v| read_u32(v, key)))
+}
+
+fn read_fusion_u64(tool: &Value, key: &str) -> Option<u64> {
+    read_u64(tool, key)
+        .or_else(|| tool.get("parameters").and_then(|v| read_u64(v, key)))
+        .or_else(|| tool.get("config").and_then(|v| read_u64(v, key)))
+}
+
+fn read_fusion_f64(tool: &Value, key: &str) -> Option<f64> {
+    read_f64(tool, key)
+        .or_else(|| tool.get("parameters").and_then(|v| read_f64(v, key)))
+        .or_else(|| tool.get("config").and_then(|v| read_f64(v, key)))
+}
+
+fn read_fusion_value(tool: &Value, key: &str) -> Option<Value> {
+    tool.get(key)
+        .cloned()
+        .or_else(|| tool.get("parameters").and_then(|v| v.get(key).cloned()))
+        .or_else(|| tool.get("config").and_then(|v| v.get(key).cloned()))
 }
 
 fn read_string_array(value: &Value, key: &str) -> Option<Vec<String>> {
@@ -1114,14 +1163,14 @@ fn is_enabled_fusion_plugin(plugin: &Value) -> bool {
 }
 
 fn remove_fusion_plugins_if_any(request: &mut Value) {
-    if let Some(plugins) = request.get_mut("plugins").and_then(|v| v.as_array_mut()) {
-        plugins.retain(|plugin| !is_enabled_fusion_plugin(plugin));
-    }
-    if request
-        .get("plugins")
-        .and_then(|v| v.as_array())
-        .is_some_and(|plugins| plugins.is_empty())
-    {
+    let plugins_empty =
+        if let Some(plugins) = request.get_mut("plugins").and_then(|v| v.as_array_mut()) {
+            plugins.retain(|plugin| !is_enabled_fusion_plugin(plugin));
+            plugins.is_empty()
+        } else {
+            false
+        };
+    if plugins_empty {
         if let Some(obj) = request.as_object_mut() {
             obj.remove("plugins");
         }

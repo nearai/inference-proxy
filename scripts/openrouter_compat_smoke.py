@@ -64,7 +64,7 @@ class MockDirectEndpoint(BaseHTTPRequestHandler):
                     "endpoints": [
                         {
                             "domain": f"http://127.0.0.1:{self.endpoint_port}",
-                            "models": [PANEL_MODEL, JUDGE_MODEL],
+                            "models": [PANEL_MODEL, JUDGE_MODEL, MODEL],
                         }
                     ]
                 },
@@ -112,7 +112,7 @@ class MockDirectEndpoint(BaseHTTPRequestHandler):
             return
 
         if "strict JSON only" in serialized:
-            self.calls.append("judge")
+            self.calls.append(f"judge:{payload.get('model')}")
             self.write_json(
                 200,
                 {
@@ -254,11 +254,12 @@ def post_json(port: int, body: dict[str, Any]) -> dict[str, Any]:
 
 def assert_fusion_response(name: str, response: dict[str, Any]) -> None:
     assert response["choices"][0]["message"]["content"] == "OpenRouter Fusion compatibility works."
-    assert response["usage"] == {
+    expected_usage = {
         "prompt_tokens": 9,
         "completion_tokens": 12,
         "total_tokens": 21,
     }
+    assert response["usage"] == expected_usage, response
     metadata = response["nearai_fusion"]
     assert metadata["status"] == "invoked"
     assert metadata["judge"]["status"] == "ok"
@@ -316,7 +317,6 @@ def main() -> int:
                     {
                         "id": "fusion",
                         "analysis_models": [PANEL_MODEL],
-                        "model": JUDGE_MODEL,
                         "max_completion_tokens": 32,
                         "temperature": 0,
                     }
@@ -326,7 +326,14 @@ def main() -> int:
         )
         assert_fusion_response("plugin", plugin_response)
 
-    expected_calls = ["panel", "judge", "synthesis", "panel", "judge", "synthesis"]
+    expected_calls = [
+        "panel",
+        f"judge:{JUDGE_MODEL}",
+        "synthesis",
+        "panel",
+        f"judge:{MODEL}",
+        "synthesis",
+    ]
     assert MockDirectEndpoint.calls == expected_calls, MockDirectEndpoint.calls
     return 0
 

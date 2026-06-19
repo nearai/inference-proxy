@@ -1149,6 +1149,7 @@ async fn test_forced_fusion_runs_panel_judge_and_synthesis() {
             }],
             "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
         })))
+        .expect(1)
         .mount(&mock_server)
         .await;
 

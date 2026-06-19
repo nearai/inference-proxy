@@ -1270,9 +1270,14 @@ mod tests {
             "https://cdn.generalcontext.com/prod-files-secure.s3.us-west-2.amazonaws.com/image.png",
         )
         .unwrap();
+        let subdomain = reqwest::Url::parse(
+            "https://sub.prod-files-secure.s3.us-west-2.amazonaws.com/image.png",
+        )
+        .unwrap();
 
         assert!(remote_host_matches_allowed_domains(&good, &allowed));
         assert!(!remote_host_matches_allowed_domains(&bad, &allowed));
+        assert!(!remote_host_matches_allowed_domains(&subdomain, &allowed));
     }
 
     #[tokio::test]

@@ -218,10 +218,13 @@ fn message_is_client_fetch_4xx(message: &str) -> bool {
     FETCH_4XX.is_match(&lower)
 }
 
+/// True when an upstream error `message` describes a media URL rejected because
+/// its domain is not on the allowlist. vLLM wraps this client-side validation
+/// failure as a generic 500, so without this check cloud-api would retry the
+/// identical request and surface a misleading 502 "model unavailable".
 fn message_is_allowed_media_domain_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("url must be from one of the allowed domains")
-        && lower.contains("input url domain")
 }
 
 /// Reports usage to the cloud API for billing.

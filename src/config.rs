@@ -384,13 +384,12 @@ impl Config {
         let image_validation_allowed_domains =
             env::var("VLLM_PROXY_IMAGE_VALIDATION_ALLOWED_DOMAINS")
                 .ok()
-                .filter(|s| !s.trim().is_empty())
+                .map(|s| parse_allowed_media_domains(&s))
                 .or_else(|| {
                     env::var("VLLM_ALLOWED_MEDIA_DOMAINS")
                         .ok()
-                        .filter(|s| !s.trim().is_empty())
+                        .map(|s| parse_allowed_media_domains(&s))
                 })
-                .map(|s| parse_allowed_media_domains(&s))
                 .unwrap_or_else(|| {
                     if is_gemma4_model_name(&model_name) {
                         vec![DEFAULT_GEMMA4_ALLOWED_MEDIA_DOMAIN.to_string()]
@@ -867,6 +866,22 @@ mod tests {
                     config.image_validation_allowed_domains,
                     vec![DEFAULT_GEMMA4_ALLOWED_MEDIA_DOMAIN]
                 );
+            },
+        );
+
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "google/gemma-4-31B-it"),
+                ("TOKEN", "tok"),
+                ("VLLM_PROXY_IMAGE_VALIDATION_ALLOWED_DOMAINS", ""),
+                (
+                    "VLLM_ALLOWED_MEDIA_DOMAINS",
+                    "prod-files-secure.s3.us-west-2.amazonaws.com",
+                ),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert!(config.image_validation_allowed_domains.is_empty());
             },
         );
     }

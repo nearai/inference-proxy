@@ -24,13 +24,11 @@
 //! ## SSRF
 //! This introduces an outbound fetch of client-controlled URLs, so the
 //! validation client is hardened against reaching internal addresses:
-//!   * a dedicated [`reqwest::Client`] whose DNS resolver ([`SsrfResolver`])
-//!     refuses any **domain** that resolves to a private/loopback/link-local/
-//!     metadata range — this covers the initial request *and every redirect
-//!     hop* (redirects are still followed, so legitimately-redirecting image
-//!     URLs keep working);
-//!   * a redirect policy that additionally refuses hops to a disallowed **IP
-//!     literal** (the resolver isn't consulted for literals);
+//!   * a dedicated no-redirect [`reqwest::Client`] whose DNS resolver
+//!     ([`SsrfResolver`]) refuses any **domain** that resolves to a private/
+//!     loopback/link-local/metadata range;
+//!   * explicit redirect handling that checks every `Location` against the same
+//!     SSRF and media-domain policies before that hop is fetched;
 //!   * an explicit check on the initial URL's host when it is an IP literal.
 //!
 //! SGLang already fetches these URLs today, so this is a net security
@@ -79,6 +77,9 @@ pub struct ImageValidationConfig {
     /// to private IP *literals* are always refused regardless, since redirect
     /// targets are server-controlled and must never be trusted to point inward.
     pub allow_private_hosts: bool,
+    /// Exact remote image host allowlist mirroring vLLM's
+    /// `--allowed-media-domains` policy. Empty means no domain restriction.
+    pub allowed_domains: Vec<String>,
     /// Reject decisively non-RGB raster images. This is strict opt-in because
     /// RGBA, CMYK, and palette handling still need real-engine verification.
     pub reject_non_rgb_images: bool,
@@ -337,24 +338,11 @@ fn decode_b64_prefix(data: &str) -> Option<Vec<u8>> {
 }
 
 async fn validate_http_url(url: &str, cfg: &ImageValidationConfig) -> Verdict {
-    let Ok(parsed) = reqwest::Url::parse(url) else {
+    let Ok(mut current) = reqwest::Url::parse(url) else {
         return Verdict::Reject;
     };
-
-    // SSRF guard for the *initial* URL when it's an IP literal: the client's
-    // resolver isn't consulted for literals. Domains (initial + redirect hops)
-    // are guarded by SsrfResolver; literal redirect hops by the redirect policy.
-    match parsed.host() {
-        None => return Verdict::Reject,
-        Some(Host::Ipv4(ip)) if !cfg.allow_private_hosts && is_disallowed_ip(IpAddr::V4(ip)) => {
-            tracing::info!(reason = "ssrf_ip_literal", "image validation rejected");
-            return Verdict::Reject;
-        }
-        Some(Host::Ipv6(ip)) if !cfg.allow_private_hosts && is_disallowed_ip(IpAddr::V6(ip)) => {
-            tracing::info!(reason = "ssrf_ip_literal", "image validation rejected");
-            return Verdict::Reject;
-        }
-        _ => {}
+    if let Some(verdict) = preflight_http_url(&current, cfg, false) {
+        return verdict;
     }
 
     // Global cap on concurrent outbound fetches across ALL requests, so a flood
@@ -381,30 +369,106 @@ async fn validate_http_url(url: &str, cfg: &ImageValidationConfig) -> Verdict {
         }
     };
 
-    // Present like a normal client: many image CDNs gate on User-Agent/Accept
-    // (see catch_all.rs / cloud-api#606). A UA-less request would 403 here while
-    // the engine's fetcher succeeds, producing false rejects.
-    let resp = match validation_client(cfg.allow_private_hosts)
-        .get(url)
-        .timeout(cfg.timeout)
-        .header(reqwest::header::USER_AGENT, IMAGE_VALIDATION_USER_AGENT)
-        .header(reqwest::header::ACCEPT, "image/*,*/*;q=0.8")
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        // DNS/connect failure or blocked by SsrfResolver → a definitive failure
-        // the engine would also hit. Timeouts are ambiguous and fail open.
-        Err(err) if err.is_timeout() => {
-            tracing::debug!(reason = "fetch_timeout", "image validation passthrough");
+    let mut redirects_followed = 0;
+    loop {
+        if let Some(verdict) = preflight_http_url(&current, cfg, redirects_followed > 0) {
+            return verdict;
+        }
+
+        // Present like a normal client: many image CDNs gate on User-Agent/Accept
+        // (see catch_all.rs / cloud-api#606). A UA-less request would 403 here while
+        // the engine's fetcher succeeds, producing false rejects.
+        let resp = match validation_client(cfg.allow_private_hosts)
+            .get(current.clone())
+            .timeout(cfg.timeout)
+            .header(reqwest::header::USER_AGENT, IMAGE_VALIDATION_USER_AGENT)
+            .header(reqwest::header::ACCEPT, "image/*,*/*;q=0.8")
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            // DNS/connect failure or blocked by SsrfResolver → a definitive failure
+            // the engine would also hit. Timeouts are ambiguous and fail open.
+            Err(err) if err.is_timeout() => {
+                tracing::debug!(reason = "fetch_timeout", "image validation passthrough");
+                return Verdict::Pass;
+            }
+            Err(_) => {
+                tracing::info!(reason = "fetch_error", "image validation rejected");
+                return Verdict::Reject;
+            }
+        };
+
+        if !resp.status().is_redirection() {
+            return classify_http_response(resp, cfg).await;
+        }
+        if redirects_followed >= MAX_REDIRECTS {
+            tracing::debug!(
+                reason = "redirect_chain_exhausted",
+                "image validation passthrough"
+            );
             return Verdict::Pass;
         }
-        Err(_) => {
-            tracing::info!(reason = "fetch_error", "image validation rejected");
-            return Verdict::Reject;
-        }
-    };
 
+        let Some(location) = resp.headers().get(reqwest::header::LOCATION) else {
+            tracing::debug!(
+                reason = "redirect_without_location",
+                "image validation passthrough"
+            );
+            return Verdict::Pass;
+        };
+        let Ok(location) = location.to_str() else {
+            tracing::info!(
+                reason = "bad_redirect_location",
+                "image validation rejected"
+            );
+            return Verdict::Reject;
+        };
+        let Ok(next) = current.join(location) else {
+            tracing::info!(
+                reason = "bad_redirect_location",
+                "image validation rejected"
+            );
+            return Verdict::Reject;
+        };
+        current = next;
+        redirects_followed += 1;
+    }
+}
+
+fn preflight_http_url(
+    parsed: &reqwest::Url,
+    cfg: &ImageValidationConfig,
+    is_redirect_hop: bool,
+) -> Option<Verdict> {
+    if !remote_host_matches_allowed_domains(parsed, &cfg.allowed_domains) {
+        tracing::info!(
+            reason = "disallowed_media_domain",
+            host = parsed.host_str().unwrap_or("<missing>"),
+            "image validation rejected"
+        );
+        return Some(Verdict::Reject);
+    }
+
+    // The client's resolver is not consulted for IP literals. Initial literals
+    // honor allow_private_hosts for tests/trusted deployments; redirect literals
+    // are server-controlled and always blocked when they point inward.
+    let block_private_literal = is_redirect_hop || !cfg.allow_private_hosts;
+    match parsed.host() {
+        None => Some(Verdict::Reject),
+        Some(Host::Ipv4(ip)) if block_private_literal && is_disallowed_ip(IpAddr::V4(ip)) => {
+            tracing::info!(reason = "ssrf_ip_literal", "image validation rejected");
+            Some(Verdict::Reject)
+        }
+        Some(Host::Ipv6(ip)) if block_private_literal && is_disallowed_ip(IpAddr::V6(ip)) => {
+            tracing::info!(reason = "ssrf_ip_literal", "image validation rejected");
+            Some(Verdict::Reject)
+        }
+        _ => None,
+    }
+}
+
+async fn classify_http_response(resp: reqwest::Response, cfg: &ImageValidationConfig) -> Verdict {
     let status = resp.status();
     if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
         // Definitively gone.
@@ -485,8 +549,8 @@ fn global_fetch_semaphore(permits: usize) -> &'static tokio::sync::Semaphore {
 ///
 /// Differs from the shared client in two security-relevant ways: it resolves
 /// through [`SsrfResolver`] (rejects domains pointing at non-public ranges) and
-/// uses a redirect policy that refuses hops to disallowed IP literals while
-/// still following ordinary redirects (so valid redirecting image URLs work).
+/// disables automatic redirects so each hop can be checked against the same
+/// SSRF and media-domain policies before it is fetched.
 fn validation_client(allow_private_hosts: bool) -> &'static reqwest::Client {
     static PUBLIC_ONLY_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     static PRIVATE_ALLOWED_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -496,32 +560,9 @@ fn validation_client(allow_private_hosts: bool) -> &'static reqwest::Client {
         &PUBLIC_ONLY_CLIENT
     };
     client.get_or_init(|| {
-        let redirect = reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= MAX_REDIRECTS {
-                return attempt.stop();
-            }
-            // Refuse redirects to a disallowed IP literal (regardless of
-            // allow_private_hosts — redirect targets are server-controlled and
-            // must never be trusted to point inward). Domain hops are guarded
-            // by SsrfResolver during connection.
-            let blocked = match attempt.url().host() {
-                Some(Host::Ipv4(ip)) => is_disallowed_ip(IpAddr::V4(ip)),
-                Some(Host::Ipv6(ip)) => is_disallowed_ip(IpAddr::V6(ip)),
-                _ => false,
-            };
-            if blocked {
-                // IMPORTANT: `error()`, not `stop()`. `stop()` returns the 3xx
-                // response, which downstream treats as an ambiguous non-2xx and
-                // passes through (fail-open) — defeating the SSRF guard. An
-                // error surfaces as a transport failure → Reject.
-                attempt.error("redirect to a non-public address refused")
-            } else {
-                attempt.follow()
-            }
-        });
         reqwest::Client::builder()
             .no_proxy()
-            .redirect(redirect)
+            .redirect(reqwest::redirect::Policy::none())
             .dns_resolver(Arc::new(SsrfResolver {
                 allow_private_hosts,
             }))
@@ -750,6 +791,21 @@ fn is_video_content_type(ct: &str) -> bool {
         )
 }
 
+fn remote_host_matches_allowed_domains(parsed: &reqwest::Url, allowed_domains: &[String]) -> bool {
+    if allowed_domains.is_empty() {
+        return true;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let host = normalize_host_for_domain_match(host);
+    allowed_domains.iter().any(|allowed| allowed == &host)
+}
+
+fn normalize_host_for_domain_match(host: &str) -> String {
+    host.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
 /// Magic-byte detection for the common raster formats SGLang/PIL decode.
 fn is_image_magic(b: &[u8]) -> bool {
     if b.len() < 4 {
@@ -934,6 +990,7 @@ mod tests {
             max_bytes: 2048,
             max_concurrency: 4,
             allow_private_hosts: true,
+            allowed_domains: Vec::new(),
             reject_non_rgb_images: false,
             reject_single_channel_images: false,
         }
@@ -1231,6 +1288,40 @@ mod tests {
                 Verdict::Reject
             );
         }
+    }
+
+    #[test]
+    fn allowed_media_domains_match_exact_normalized_hosts() {
+        let allowed = vec!["prod-files-secure.s3.us-west-2.amazonaws.com".to_string()];
+        let good =
+            reqwest::Url::parse("https://PROD-FILES-SECURE.S3.US-WEST-2.AMAZONAWS.COM./image.png")
+                .unwrap();
+        let bad = reqwest::Url::parse(
+            "https://cdn.generalcontext.com/prod-files-secure.s3.us-west-2.amazonaws.com/image.png",
+        )
+        .unwrap();
+        let subdomain = reqwest::Url::parse(
+            "https://sub.prod-files-secure.s3.us-west-2.amazonaws.com/image.png",
+        )
+        .unwrap();
+
+        assert!(remote_host_matches_allowed_domains(&good, &allowed));
+        assert!(!remote_host_matches_allowed_domains(&bad, &allowed));
+        assert!(!remote_host_matches_allowed_domains(&subdomain, &allowed));
+    }
+
+    #[tokio::test]
+    async fn disallowed_remote_domain_is_rejected_before_fetch() {
+        let mut c = cfg();
+        c.allowed_domains = vec!["prod-files-secure.s3.us-west-2.amazonaws.com".to_string()];
+        let v = serde_json::json!({"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":"https://cdn.generalcontext.com/image.png"}}
+        ]}]});
+
+        assert!(matches!(
+            reject_invalid_images(&v, &c).await,
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[tokio::test]
@@ -1534,6 +1625,44 @@ mod tests {
         let c = cfg();
         let req = serde_json::json!({"messages":[{"role":"user","content":[
             {"type":"image_url","image_url":{"url": format!("{}/redirect.png", server.uri())}}
+        ]}]});
+        assert!(matches!(
+            reject_invalid_images(&req, &c).await,
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn redirect_to_disallowed_media_domain_is_rejected_before_fetch() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let origin = MockServer::start().await;
+        let redirected = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redirect.png"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/image.png", redirected.uri())),
+            )
+            .mount(&origin)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/image.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
+            )
+            .expect(0)
+            .mount(&redirected)
+            .await;
+
+        let origin_uri = origin.uri().replace("127.0.0.1", "localhost");
+        let mut c = cfg();
+        c.allowed_domains = vec!["localhost".to_string()];
+        let req = serde_json::json!({"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url": format!("{origin_uri}/redirect.png")}}
         ]}]});
         assert!(matches!(
             reject_invalid_images(&req, &c).await,

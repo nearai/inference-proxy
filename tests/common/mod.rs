@@ -37,6 +37,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         image_validation_max_bytes: 8192,
         image_validation_max_concurrency: 8,
         image_validation_allow_private_hosts: false,
+        image_validation_allowed_domains: Vec::new(),
         image_validation_reject_non_rgb_images: false,
         image_validation_reject_single_channel_images: false,
         chat_cache_expiration_secs: 1200,

@@ -125,6 +125,12 @@ fn test_effective_status_downgrades_client_fetch_4xx_to_400() {
 }
 
 #[test]
+fn test_effective_status_downgrades_allowed_media_domain_errors_to_400() {
+    let body = br#"{"message":"The URL must be from one of the allowed domains: ['prod-files-secure.s3.us-west-2.amazonaws.com']. Input URL domain: cdn.generalcontext.com","type":"InternalServerError"}"#;
+    assert_eq!(eff(500, body), StatusCode::BAD_REQUEST);
+}
+
+#[test]
 fn test_effective_status_keeps_5xx_when_not_a_client_4xx() {
     let f503 = br#"{"message":"503, message='Service Unavailable', url='https://host/x.jpg'"}"#;
     assert_eq!(eff(500, f503), StatusCode::INTERNAL_SERVER_ERROR);

@@ -15,6 +15,7 @@ pub async fn metrics(State(state): State<AppState>) -> Result<Response, AppError
         None,
         "text/plain; charset=utf-8",
         None,
+        None,
     )
     .await
 }
@@ -28,6 +29,7 @@ pub async fn models(State(state): State<AppState>) -> Result<Response, AppError>
         reqwest::Method::GET,
         None,
         "application/json",
+        None,
         None,
     )
     .await

@@ -15,34 +15,56 @@ use axum::Router;
 
 use crate::AppState;
 
+pub const ROUTE_ROOT: &str = "/";
+pub const ROUTE_VERSION: &str = "/version";
+pub const ROUTE_HEALTHZ: &str = "/healthz";
+pub const ROUTE_METRICS: &str = "/metrics";
+pub const ROUTE_V1_METRICS: &str = "/v1/metrics";
+pub const ROUTE_V1_MODELS: &str = "/v1/models";
+pub const ROUTE_ATTESTATION_REPORT: &str = "/v1/attestation/report";
+pub const ROUTE_CHAT_COMPLETIONS: &str = "/v1/chat/completions";
+pub const ROUTE_COMPLETIONS: &str = "/v1/completions";
+pub const ROUTE_TOKENIZE: &str = "/v1/tokenize";
+pub const ROUTE_EMBEDDINGS: &str = "/v1/embeddings";
+pub const ROUTE_RERANK: &str = "/v1/rerank";
+pub const ROUTE_SCORE: &str = "/v1/score";
+pub const ROUTE_IMAGES_GENERATIONS: &str = "/v1/images/generations";
+pub const ROUTE_IMAGES_EDITS: &str = "/v1/images/edits";
+pub const ROUTE_AUDIO_TRANSCRIPTIONS: &str = "/v1/audio/transcriptions";
+pub const ROUTE_SIGNATURE: &str = "/v1/signature/{chat_id}";
+pub const ROUTE_INTERNAL_GPU_EVIDENCE: &str = "/internal/gpu_evidence";
+pub const ROUTE_OHTTP_WELL_KNOWN: &str = "/.well-known/ohttp-gateway";
+pub const ROUTE_OHTTP_CONFIG: &str = "/v1/ohttp/config";
+pub const ROUTE_OHTTP_RELAY: &str = "/ohttp";
+
 pub fn build_router() -> Router<AppState> {
     Router::new()
         // Unauthenticated health endpoints
-        .route("/", get(health::root))
-        .route("/version", get(health::version))
-        .route("/healthz", get(health::healthz))
+        .route(ROUTE_ROOT, get(health::root))
+        .route(ROUTE_VERSION, get(health::version))
+        .route(ROUTE_HEALTHZ, get(health::healthz))
         // Unauthenticated Prometheus metrics
         .route(
-            "/metrics",
+            ROUTE_METRICS,
             get(crate::metrics_middleware::prometheus_metrics_handler),
         )
         // Unauthenticated backend metrics/models
-        .route("/v1/metrics", get(metrics::metrics))
-        .route("/v1/models", get(metrics::models))
+        .route(ROUTE_V1_METRICS, get(metrics::metrics))
+        .route(ROUTE_V1_MODELS, get(metrics::models))
         // Unauthenticated attestation report
         .route(
-            "/v1/attestation/report",
+            ROUTE_ATTESTATION_REPORT,
             get(attestation::attestation_report),
         )
         // Authenticated endpoints
-        .route("/v1/chat/completions", post(chat::chat_completions))
-        .route("/v1/completions", post(completions::completions))
-        .route("/v1/tokenize", post(passthrough::tokenize))
-        .route("/v1/embeddings", post(passthrough::embeddings))
-        .route("/v1/rerank", post(passthrough::rerank))
-        .route("/v1/score", post(passthrough::score))
+        .route(ROUTE_CHAT_COMPLETIONS, post(chat::chat_completions))
+        .route(ROUTE_COMPLETIONS, post(completions::completions))
+        .route(ROUTE_TOKENIZE, post(passthrough::tokenize))
+        .route(ROUTE_EMBEDDINGS, post(passthrough::embeddings))
+        .route(ROUTE_RERANK, post(passthrough::rerank))
+        .route(ROUTE_SCORE, post(passthrough::score))
         .route(
-            "/v1/images/generations",
+            ROUTE_IMAGES_GENERATIONS,
             post(passthrough::images_generations),
         )
         // Multipart upload routes: axum's `Multipart` extractor enforces the
@@ -53,22 +75,22 @@ pub fn build_router() -> Router<AppState> {
         // single source of truth. Without this, audio/images > ~2 MiB fail upstream
         // with a 502 (connection reset before the body is consumed).
         .route(
-            "/v1/images/edits",
+            ROUTE_IMAGES_EDITS,
             post(passthrough::images_edits).layer(DefaultBodyLimit::disable()),
         )
         .route(
-            "/v1/audio/transcriptions",
+            ROUTE_AUDIO_TRANSCRIPTIONS,
             post(passthrough::audio_transcriptions).layer(DefaultBodyLimit::disable()),
         )
-        .route("/v1/signature/{chat_id}", get(signature::signature))
+        .route(ROUTE_SIGNATURE, get(signature::signature))
         // Internal — sibling proxies on the same host call this when
         // configured with GPU_EVIDENCE_DELEGATE_URL pointed at us.
-        .route("/internal/gpu_evidence", post(internal::gpu_evidence))
+        .route(ROUTE_INTERNAL_GPU_EVIDENCE, post(internal::gpu_evidence))
         // OHTTP Gateway (RFC 9458) — POST /ohttp is unauthenticated; auth may be
         // inside the encrypted Binary HTTP message or on the outer HTTP request
         // (relay-injected Authorization). See `ohttp_relay` docs.
-        .route("/.well-known/ohttp-gateway", get(ohttp::ohttp_config))
-        .route("/v1/ohttp/config", get(ohttp::ohttp_config))
-        .route("/ohttp", post(ohttp::ohttp_relay))
+        .route(ROUTE_OHTTP_WELL_KNOWN, get(ohttp::ohttp_config))
+        .route(ROUTE_OHTTP_CONFIG, get(ohttp::ohttp_config))
+        .route(ROUTE_OHTTP_RELAY, post(ohttp::ohttp_relay))
         .fallback(catch_all::catch_all)
 }

@@ -3556,12 +3556,13 @@ async fn test_request_id_generated() {
 #[tokio::test]
 async fn test_request_id_passthrough() {
     let app = build_test_app("http://unused");
+    let valid_request_id = "950e8400-e29b-41d4-a716-446655440004";
 
     let response = app
         .oneshot(
             Request::builder()
                 .uri("/")
-                .header("x-request-id", "my-custom-id")
+                .header("x-request-id", valid_request_id)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3570,7 +3571,7 @@ async fn test_request_id_passthrough() {
 
     assert_eq!(
         response.headers().get("x-request-id").unwrap(),
-        "my-custom-id"
+        valid_request_id
     );
 }
 
@@ -9944,7 +9945,10 @@ async fn test_tracing_headers_propagated_to_upstream() {
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .and(header("x-request-id", "test-req-id-123"))
+        .and(header(
+            "x-request-id",
+            "750e8400-e29b-41d4-a716-446655440002",
+        ))
         .and(header("x-org-id", "org-abc"))
         .and(header("x-workspace-id", "ws-xyz"))
         .respond_with(
@@ -9964,7 +9968,7 @@ async fn test_tracing_headers_propagated_to_upstream() {
                 .uri("/v1/chat/completions")
                 .header("authorization", "Bearer test-token")
                 .header("content-type", "application/json")
-                .header("x-request-id", "test-req-id-123")
+                .header("x-request-id", "750e8400-e29b-41d4-a716-446655440002")
                 .header("x-org-id", "org-abc")
                 .header("x-workspace-id", "ws-xyz")
                 .body(Body::from(
@@ -10050,7 +10054,10 @@ async fn test_tracing_headers_propagated_non_streaming() {
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .and(header("x-request-id", "ns-req-id-999"))
+        .and(header(
+            "x-request-id",
+            "850e8400-e29b-41d4-a716-446655440003",
+        ))
         .and(header("x-org-id", "org-ns"))
         .and(header("x-workspace-id", "ws-ns"))
         .respond_with(
@@ -10070,7 +10077,7 @@ async fn test_tracing_headers_propagated_non_streaming() {
                 .uri("/v1/chat/completions")
                 .header("authorization", "Bearer test-token")
                 .header("content-type", "application/json")
-                .header("x-request-id", "ns-req-id-999")
+                .header("x-request-id", "850e8400-e29b-41d4-a716-446655440003")
                 .header("x-org-id", "org-ns")
                 .header("x-workspace-id", "ws-ns")
                 .body(Body::from(

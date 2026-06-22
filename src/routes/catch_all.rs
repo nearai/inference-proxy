@@ -28,6 +28,10 @@ const EXCLUDED_REQUEST_HEADERS: &[&str] = &[
     "proxy-authorization",
     // Don't leak the proxy's auth token to backend
     "authorization",
+    // Re-attach tracing headers from the middleware-selected/trusted values.
+    "x-request-id",
+    "x-org-id",
+    "x-workspace-id",
 ];
 
 /// Headers to exclude when forwarding response headers from the backend.
@@ -151,8 +155,11 @@ pub async fn catch_all(
         None => path.to_string(),
     };
     let (backend_url, backend_guard) = state.backend_pool.select_url(&path_with_query);
+    let tracing_ids =
+        tracing_ids.with_trusted_tenant_headers(&headers, auth.cloud_api_key.is_none());
 
-    debug!(method = %method, backend_url = %backend_url, "Catch-all passthrough");
+    let logged_backend_url = proxy::sanitized_upstream_url_for_logs(&backend_url);
+    debug!(method = %method, backend_url = %logged_backend_url, "Catch-all passthrough");
 
     // Build backend request
     let mut builder = state.http_client.request(
@@ -166,6 +173,9 @@ pub async fn catch_all(
         if !EXCLUDED_REQUEST_HEADERS.contains(&name_lower.as_str()) {
             builder = builder.header(name.as_str(), value);
         }
+    }
+    for (name, value) in tracing_ids.upstream_headers() {
+        builder = builder.header(name, value);
     }
 
     // Attach body if non-empty

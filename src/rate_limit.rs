@@ -85,7 +85,7 @@ pub async fn rate_limit_middleware(request: Request<axum::body::Body>, next: Nex
     match state.limiter.check_key(&ip) {
         Ok(_) => next.run(request).await,
         Err(_not_until) => {
-            warn!(client_ip = %ip, "Rate limit exceeded");
+            warn!(client_ip_present = true, "Rate limit exceeded");
             AppError::RateLimited.into_response()
         }
     }

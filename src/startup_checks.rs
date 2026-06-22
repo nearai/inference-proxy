@@ -4,12 +4,16 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 
+#[cfg(test)]
+#[path = "startup_checks_tests.rs"]
+mod startup_checks_tests;
+
 #[derive(Debug, thiserror::Error)]
 pub enum StartupCheckError {
     #[error("Backend not reachable at {url}: {source}")]
     ConnectionFailed { url: String, source: reqwest::Error },
 
-    #[error("Backend returned HTTP {status} for {url}: {body}")]
+    #[error("Backend returned HTTP {status} for {url} (response body omitted from logs)")]
     UnexpectedStatus {
         url: String,
         status: u16,
@@ -230,7 +234,8 @@ async fn check_models(
         error!(
             url = %models_url,
             status = status.as_u16(),
-            response_body = %body,
+            body_len = body.len(),
+            has_body = !body.is_empty(),
             "Backend /v1/models returned non-success status"
         );
         return Err(StartupCheckError::UnexpectedStatus {
@@ -256,7 +261,8 @@ async fn check_models(
             error!(
                 url = %models_url,
                 status = status.as_u16(),
-                response_body = %body_text,
+                body_len = body_text.len(),
+                has_body = !body_text.is_empty(),
                 error = %parse_error,
                 "Backend /v1/models returned invalid JSON"
             );
@@ -341,7 +347,15 @@ async fn check_chat_completions_with_tools(
         url = %chat_completions_url,
         mode,
         model = %model_name,
-        request = %serde_json::to_string(&request_body).unwrap_or_default(),
+        request_message_count = request_body
+            .get("messages")
+            .and_then(|messages| messages.as_array())
+            .map_or(0, |messages| messages.len()),
+        tool_count = request_body
+            .get("tools")
+            .and_then(|tools| tools.as_array())
+            .map_or(0, |tools| tools.len()),
+        stream,
         "Sending chat completions check with tools..."
     );
 
@@ -382,7 +396,8 @@ async fn check_chat_completions_with_tools(
             mode,
             status = status.as_u16(),
             elapsed_ms = start.elapsed().as_millis() as u64,
-            response_body = %body,
+            body_len = body.len(),
+            has_body = !body.is_empty(),
             "Backend chat completions returned non-success status"
         );
         return Err(StartupCheckError::UnexpectedStatus {
@@ -427,20 +442,20 @@ async fn validate_non_streaming_response(
                 reason: format!("Failed to parse response as JSON: {e}"),
             })?;
 
-    debug!(
-        response = %serde_json::to_string_pretty(&body).unwrap_or_default(),
-        "Non-streaming response body"
-    );
+    let body_len = serde_json::to_string(&body).map_or(0, |body| body.len());
 
     let choices = body
         .get("choices")
         .and_then(|c| c.as_array())
         .ok_or_else(|| StartupCheckError::ChatCompletionFailed {
-            reason: format!(
-                "Response missing choices array. Response: {}",
-                serde_json::to_string_pretty(&body).unwrap_or_default()
-            ),
+            reason: format!("Response missing choices array; body_len={body_len}"),
         })?;
+
+    debug!(
+        body_len,
+        choice_count = choices.len(),
+        "Non-streaming response metadata"
+    );
 
     if choices.is_empty() {
         return Err(StartupCheckError::ChatCompletionFailed {
@@ -476,15 +491,15 @@ async fn validate_non_streaming_response(
                     "Model returned tool call(s)"
                 );
             } else {
-                let content = msg
+                let content_len = msg
                     .get("content")
                     .and_then(|c| c.as_str())
-                    .unwrap_or("<no content>");
-                let preview: String = content.chars().take(100).collect();
+                    .map_or(0, |content| content.len());
                 info!(
                     choice_index = i,
                     finish_reason,
-                    content_preview = %preview,
+                    content_len,
+                    has_content = content_len > 0,
                     "Model returned text response"
                 );
             }
@@ -542,7 +557,12 @@ async fn validate_streaming_response(response: reqwest::Response) -> Result<(), 
                 Ok(parsed) => {
                     got_any_data = true;
                     chunk_count += 1;
-                    debug!(chunk = chunk_count, data = %data, "Received SSE chunk");
+                    debug!(
+                        chunk = chunk_count,
+                        data_len = data.len(),
+                        has_data = !data.is_empty(),
+                        "Received SSE chunk metadata"
+                    );
 
                     // Accumulate tool call argument deltas
                     if let Some(choices) = parsed.get("choices").and_then(|c| c.as_array()) {
@@ -580,12 +600,14 @@ async fn validate_streaming_response(response: reqwest::Response) -> Result<(), 
                 Err(e) => {
                     error!(
                         error = %e,
-                        data = %data,
+                        data_len = data.len(),
+                        has_data = !data.is_empty(),
                         "Failed to parse SSE data line as JSON during startup check"
                     );
                     return Err(StartupCheckError::ChatCompletionFailed {
                         reason: format!(
-                            "Failed to parse streaming SSE data as JSON: {e}; data: {data}"
+                            "Failed to parse streaming SSE data as JSON: {e}; data_len={}",
+                            data.len()
                         ),
                     });
                 }
@@ -618,24 +640,25 @@ async fn validate_streaming_response(response: reqwest::Response) -> Result<(), 
         if !args.is_empty() {
             debug!(
                 tool_call_index = %key,
-                accumulated_arguments = %args,
+                argument_len = args.len(),
                 "Validating tool call arguments JSON"
             );
             if serde_json::from_str::<serde_json::Value>(args).is_err() {
                 error!(
                     tool_call_index = %key,
-                    arguments = %args,
+                    argument_len = args.len(),
                     "Streaming tool call produced malformed JSON arguments"
                 );
                 return Err(StartupCheckError::ChatCompletionFailed {
                     reason: format!(
-                        "Streaming tool call (index {key}) has malformed JSON arguments: {args}"
+                        "Streaming tool call (index {key}) has malformed JSON arguments; argument_len={}",
+                        args.len()
                     ),
                 });
             }
             info!(
                 tool_call_index = %key,
-                arguments = %args,
+                argument_len = args.len(),
                 "Tool call arguments validated as valid JSON"
             );
         }
@@ -660,7 +683,10 @@ fn validate_tool_calls_json(choices: &[serde_json::Value]) -> Result<(), Startup
                 {
                     if serde_json::from_str::<serde_json::Value>(args_str).is_err() {
                         return Err(StartupCheckError::ChatCompletionFailed {
-                            reason: format!("Tool call has malformed JSON arguments: {args_str}"),
+                            reason: format!(
+                                "Tool call has malformed JSON arguments; argument_len={}",
+                                args_str.len()
+                            ),
                         });
                     }
                 }

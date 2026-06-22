@@ -26,6 +26,8 @@ pub async fn completions(
 
     // Extract encryption context from headers
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
+    let tracing_ids =
+        tracing_ids.with_trusted_tenant_headers(&headers, auth.cloud_api_key.is_none());
 
     let original_request_hash = Some(resolve_request_hash_for_signing(
         &headers,

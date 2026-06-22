@@ -16,10 +16,14 @@ use crate::{AppState, TracingIds};
 /// POST /v1/tokenize — simple proxy, no signing.
 pub async fn tokenize(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    auth: RequireAuth,
+    Extension(tracing_ids): Extension<TracingIds>,
+    headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
     let request_body = read_body_with_limit(body, state.config.max_request_size).await?;
+    let tracing_ids =
+        tracing_ids.with_trusted_tenant_headers(&headers, auth.cloud_api_key.is_none());
 
     let (url, _guard) = state.backend_pool.select_url("/tokenize");
     proxy::proxy_simple(
@@ -31,6 +35,7 @@ pub async fn tokenize(
         Some(std::time::Duration::from_secs(
             state.config.timeout_tokenize_secs,
         )),
+        Some(&tracing_ids),
     )
     .await
 }
@@ -44,6 +49,8 @@ pub async fn embeddings(
     body: Body,
 ) -> Result<Response, AppError> {
     let reporter = make_usage_reporter(&auth, &state);
+    let tracing_ids =
+        tracing_ids.with_trusted_tenant_headers(&headers, auth.cloud_api_key.is_none());
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
 
     json_passthrough_encrypted(
@@ -71,6 +78,8 @@ pub async fn rerank(
     body: Body,
 ) -> Result<Response, AppError> {
     let reporter = make_usage_reporter(&auth, &state);
+    let tracing_ids =
+        tracing_ids.with_trusted_tenant_headers(&headers, auth.cloud_api_key.is_none());
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
     let url_override = state.config.rerank_url_override.clone();
 
@@ -99,6 +108,8 @@ pub async fn score(
     body: Body,
 ) -> Result<Response, AppError> {
     let reporter = make_usage_reporter(&auth, &state);
+    let tracing_ids =
+        tracing_ids.with_trusted_tenant_headers(&headers, auth.cloud_api_key.is_none());
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
     let url_override = state.config.score_url_override.clone();
 
@@ -127,6 +138,8 @@ pub async fn images_generations(
     body: Body,
 ) -> Result<Response, AppError> {
     let reporter = make_usage_reporter(&auth, &state);
+    let tracing_ids =
+        tracing_ids.with_trusted_tenant_headers(&headers, auth.cloud_api_key.is_none());
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
     let url_override = state.config.images_url_override.clone();
 
@@ -154,6 +167,8 @@ pub async fn images_edits(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Response, AppError> {
+    let tracing_ids =
+        tracing_ids.with_trusted_tenant_headers(&headers, auth.cloud_api_key.is_none());
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
     let max_size = state.config.max_image_request_size;
     let mut form = reqwest::multipart::Form::new();
@@ -234,6 +249,8 @@ pub async fn audio_transcriptions(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Response, AppError> {
+    let tracing_ids =
+        tracing_ids.with_trusted_tenant_headers(&headers, auth.cloud_api_key.is_none());
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
     let max_size = state.config.max_audio_request_size;
     let mut form = reqwest::multipart::Form::new();

@@ -120,10 +120,26 @@ All configuration is via environment variables:
 ### Fusion
 
 Fusion is disabled by default. When enabled, `/v1/chat/completions` intercepts
-tool entries of type `openrouter:fusion` or `nearai:fusion`; all other routes
-and non-Fusion chat requests keep the normal proxy behavior. Cloud API remains
-a pass-through: billing observes the single final response, whose `usage`
-contains the aggregate token usage from panel, judge, and synthesis calls.
+OpenRouter-compatible `openrouter:fusion` server tools, NEAR `nearai:fusion`
+tools, and OpenRouter plugin entries with `{"id":"fusion"}`; all other routes
+and non-Fusion chat requests keep the normal proxy behavior. Cloud API remains a
+pass-through: billing observes the single final response, whose `usage` contains
+the aggregate token usage from panel, judge, and synthesis calls.
+
+Supported request shapes:
+
+```json
+{"tools":[{"type":"openrouter:fusion","parameters":{"analysis_models":["model-a"],"model":"judge-model"}}]}
+```
+
+```json
+{"plugins":[{"id":"fusion","analysis_models":["model-a"],"model":"judge-model"}]}
+```
+
+Legacy flat tool fields continue to work for `nearai:fusion` and existing
+clients. `plugins[].enabled=false` is not treated as a Fusion invocation. The
+`openrouter/fusion` model alias is not resolved in inference-proxy because
+cloud-api routes by model name before pass-through.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|

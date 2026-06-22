@@ -12,6 +12,13 @@ use crate::error::AppError;
 use crate::signing::SigningPair;
 use crate::{AppState, TracingIds};
 
+#[cfg(test)]
+#[path = "proxy_upstream_error_tests.rs"]
+mod proxy_upstream_error_tests;
+#[cfg(test)]
+#[path = "proxy_validation_error_tests.rs"]
+mod proxy_validation_error_tests;
+
 /// Parsed upstream error info for logging and re-wrapping.
 pub struct UpstreamErrorInfo {
     pub message: String,
@@ -143,18 +150,49 @@ pub fn sanitize_validation_errors(message: &str) -> String {
         .join("\n")
 }
 
+/// Render an upstream URL for logs without caller-controlled credential/query data.
+pub(crate) fn sanitized_upstream_url_for_logs(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(mut parsed) => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            parsed.to_string()
+        }
+        Err(_) => url
+            .split(['?', '#'])
+            .next()
+            .unwrap_or("<invalid upstream url>")
+            .to_string(),
+    }
+}
+
 /// Parse an upstream error body, log it, and return the parsed info.
 pub(crate) fn log_upstream_error(
     status: reqwest::StatusCode,
     url: &str,
     body: &[u8],
+    tracing_ids: Option<&TracingIds>,
 ) -> Option<UpstreamErrorInfo> {
     let info = parse_upstream_error(body);
+    let upstream_url = sanitized_upstream_url_for_logs(url);
+    let (request_id, org_id, workspace_id) = match tracing_ids {
+        Some(ids) => (
+            ids.request_id.as_str(),
+            ids.org_id_or_empty(),
+            ids.workspace_id_or_empty(),
+        ),
+        None => ("", "", ""),
+    };
     warn!(
+        request_id = %request_id,
+        org_id = %org_id,
+        workspace_id = %workspace_id,
         upstream_status = %status,
-        upstream_url = %url,
-        error_message = info.as_ref().map(|e| e.message.as_str()).unwrap_or("unparseable"),
-        error_type = info.as_ref().map(|e| e.error_type.as_str()).unwrap_or("unknown"),
+        upstream_url = %upstream_url,
+        upstream_error_parseable = info.is_some(),
+        upstream_error_body_bytes = body.len(),
         "Backend returned non-success status"
     );
     info
@@ -575,14 +613,14 @@ pub struct ProxyOpts {
     /// Tracing correlation IDs (request_id / org_id / workspace_id) parsed by
     /// `request_id_middleware`. When `Some`, the corresponding headers are
     /// forwarded to the upstream engine and emitted on the per-request log
-    /// line. Routes that don't carry org context (completions, passthrough)
-    /// leave this `None`.
+    /// line. Direct completion and authenticated passthrough routes pass the selected
+    /// request ID; tenant IDs appear only on trusted config-token paths.
     pub tracing_ids: Option<TracingIds>,
 }
 
 /// Apply upstream tracing headers to a `reqwest::RequestBuilder`. No-op when
 /// `tracing_ids` is `None`.
-fn apply_tracing_headers(
+pub(crate) fn apply_tracing_headers(
     mut req: reqwest::RequestBuilder,
     tracing_ids: Option<&TracingIds>,
 ) -> reqwest::RequestBuilder {
@@ -658,7 +696,7 @@ pub async fn proxy_json_request(
     let status = response.status();
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
-        let info = log_upstream_error(status, url, &body);
+        let info = log_upstream_error(status, url, &body, opts.tracing_ids.as_ref());
         return Err(AppError::Upstream {
             status: effective_error_status(status.as_u16(), info.as_ref()),
             body,
@@ -704,7 +742,8 @@ pub async fn proxy_json_request(
             );
             let reqwest_status = reqwest::StatusCode::from_u16(status_code.as_u16())
                 .unwrap_or(reqwest::StatusCode::BAD_GATEWAY);
-            let info = log_upstream_error(reqwest_status, url, &body_bytes);
+            let info =
+                log_upstream_error(reqwest_status, url, &body_bytes, opts.tracing_ids.as_ref());
             return Err(AppError::Upstream {
                 // A client media-fetch failure can arrive as an SSE error chunk
                 // with code:500 + `403, message='…', url='…'` — downgrade to 400
@@ -1254,7 +1293,7 @@ pub async fn proxy_streaming_request(
     let status = response.status();
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
-        let info = log_upstream_error(status, url, &body);
+        let info = log_upstream_error(status, url, &body, opts.tracing_ids.as_ref());
         return Err(AppError::Upstream {
             status: effective_error_status(status.as_u16(), info.as_ref()),
             body,
@@ -1573,7 +1612,7 @@ pub async fn proxy_multipart_request(
     let status = response.status();
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
-        let info = log_upstream_error(status, url, &body);
+        let info = log_upstream_error(status, url, &body, opts.tracing_ids.as_ref());
         return Err(AppError::Upstream {
             status: effective_error_status(status.as_u16(), info.as_ref()),
             body,
@@ -1642,6 +1681,7 @@ pub async fn proxy_simple(
     body: Option<&[u8]>,
     content_type: &str,
     timeout: Option<std::time::Duration>,
+    tracing_ids: Option<&TracingIds>,
 ) -> Result<Response, AppError> {
     let mut builder = client.request(method, url);
 
@@ -1654,6 +1694,7 @@ pub async fn proxy_simple(
     if let Some(timeout) = timeout {
         builder = builder.timeout(timeout);
     }
+    builder = apply_tracing_headers(builder, tracing_ids);
 
     let upstream_start = std::time::Instant::now();
     let response = builder
@@ -1666,7 +1707,7 @@ pub async fn proxy_simple(
     let status = response.status();
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
-        let info = log_upstream_error(status, url, &body);
+        let info = log_upstream_error(status, url, &body, tracing_ids);
         return Err(AppError::Upstream {
             status: effective_error_status(status.as_u16(), info.as_ref()),
             body,
@@ -2417,115 +2458,6 @@ mod tests {
         assert!(parser.seen_done);
     }
 
-    #[test]
-    fn test_parse_upstream_error_vllm_flat_format() {
-        let body = br#"{"object":"error","message":"This model's maximum context length is 2048 tokens","type":"BadRequestError","param":null,"code":400}"#;
-        let info = parse_upstream_error(body).unwrap();
-        assert_eq!(
-            info.message,
-            "This model's maximum context length is 2048 tokens"
-        );
-        assert_eq!(info.error_type, "BadRequestError");
-    }
-
-    /// Parse `body` the way the proxy does (via `log_upstream_error`) and apply
-    /// `effective_error_status` — mirrors the real call sites.
-    fn eff(status: u16, body: &[u8]) -> StatusCode {
-        effective_error_status(status, parse_upstream_error(body).as_ref())
-    }
-
-    #[test]
-    fn test_effective_status_downgrades_client_fetch_4xx_to_400() {
-        // The real nearai/cloud-api#606 case: vLLM wraps a client image-URL
-        // fetch that the remote host 4xx'd as a generic 500. We must surface 400.
-        for body in [
-            br#"{"message":"403, message='Forbidden', url='https://upload.wikimedia.org/x.jpg'","type":"InternalServerError"}"#.as_slice(),
-            br#"{"message":"400, message='Bad Request', url='https://host/x.jpg'"}"#.as_slice(),
-            br#"{"message":"404, message='Not Found', url='https://host/x.jpg'"}"#.as_slice(),
-            br#"{"message":"403 Client Error: Forbidden for url: https://host/x.png"}"#.as_slice(),
-            br#"{"error":{"message":"ClientResponseError, status=403, message='Forbidden', url='https://host/x'"}}"#.as_slice(),
-        ] {
-            assert_eq!(
-                eff(500, body),
-                StatusCode::BAD_REQUEST,
-                "expected 5xx->400 for client-fetch 4xx body: {}",
-                String::from_utf8_lossy(body)
-            );
-        }
-    }
-
-    #[test]
-    fn test_effective_status_downgrades_allowed_media_domain_errors_to_400() {
-        let body = br#"{"message":"The URL must be from one of the allowed domains: ['prod-files-secure.s3.us-west-2.amazonaws.com']. Input URL domain: cdn.generalcontext.com","type":"InternalServerError"}"#;
-        assert_eq!(eff(500, body), StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn test_effective_status_keeps_5xx_when_not_a_client_4xx() {
-        // Remote host answered 5xx → transient, must stay retryable (5xx).
-        let f503 = br#"{"message":"503, message='Service Unavailable', url='https://host/x.jpg'"}"#;
-        assert_eq!(eff(500, f503), StatusCode::INTERNAL_SERVER_ERROR);
-        // Genuine backend error unrelated to a fetch → unchanged.
-        let oom = br#"{"message":"CUDA out of memory","type":"InternalServerError"}"#;
-        assert_eq!(eff(500, oom), StatusCode::INTERNAL_SERVER_ERROR);
-        // A 4-something with no url anchor must NOT be mistaken for a fetch 4xx.
-        let noturl = br#"{"message":"requested 450 message tokens exceed the limit"}"#;
-        assert_eq!(eff(500, noturl), StatusCode::INTERNAL_SERVER_ERROR);
-        // Unparseable body (None info) → unchanged.
-        assert_eq!(
-            effective_error_status(500, None),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-    }
-
-    #[test]
-    fn test_effective_status_passes_through_non_5xx() {
-        // A genuine upstream 4xx is already correct — never rewrite it.
-        let body = br#"{"message":"400, message='Bad Request', url='https://host/x'"}"#;
-        assert_eq!(eff(400, body), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            eff(404, br#"{"message":"not found"}"#),
-            StatusCode::NOT_FOUND
-        );
-    }
-
-    #[test]
-    fn test_parse_upstream_error_nested_format() {
-        let body = br#"{"error":{"message":"model not found","type":"not_found"}}"#;
-        let info = parse_upstream_error(body).unwrap();
-        assert_eq!(info.message, "model not found");
-        assert_eq!(info.error_type, "not_found");
-    }
-
-    #[test]
-    fn test_parse_upstream_error_nested_missing_type() {
-        let body = br#"{"error":{"message":"something went wrong"}}"#;
-        let info = parse_upstream_error(body).unwrap();
-        assert_eq!(info.message, "something went wrong");
-        assert_eq!(info.error_type, "unknown");
-    }
-
-    #[test]
-    fn test_parse_upstream_error_non_json() {
-        assert!(parse_upstream_error(b"internal secret error details").is_none());
-    }
-
-    #[test]
-    fn test_parse_upstream_error_missing_message() {
-        let body = br#"{"type":"BadRequestError","code":400}"#;
-        assert!(parse_upstream_error(body).is_none());
-    }
-
-    #[test]
-    fn test_parse_upstream_error_empty_body() {
-        assert!(parse_upstream_error(b"").is_none());
-    }
-
-    #[test]
-    fn test_parse_upstream_error_empty_json() {
-        assert!(parse_upstream_error(b"{}").is_none());
-    }
-
     // ── Fix 1: SseTransformer line buffering and fail-closed tests ──
 
     #[test]
@@ -2788,172 +2720,6 @@ mod tests {
             msg["reasoning_content"],
             serde_json::Value::String("Step 1 Step 2".into())
         );
-    }
-
-    // --- sanitize_validation_errors tests ---
-
-    #[test]
-    fn test_sanitize_strips_input_from_validation_errors() {
-        let message = concat!(
-            "2 validation errors:\n",
-            "  {'type': 'value_error', 'loc': ('body', 'messages', 1), 'msg': \"Value error, invalid role\", 'input': 'user', 'ctx': {'error': ValueError(\"bad\")}}\n",
-            "  {'type': 'string_type', 'loc': ('body', 'messages', 1, 'content'), 'msg': 'Input should be a valid string', 'input': [{'text': 'secret user conversation content', 'type': 'custom'}]}"
-        );
-        let result = sanitize_validation_errors(message);
-        assert!(!result.contains("secret user conversation"));
-        assert!(!result.contains("'input':"));
-        assert!(result.contains("2 validation errors:"));
-        assert!(result.contains("value_error: Value error, invalid role"));
-        assert!(result.contains("string_type: Input should be a valid string"));
-    }
-
-    #[test]
-    fn test_sanitize_strips_ctx_only_lines() {
-        let message = concat!(
-            "1 validation errors:\n",
-            "  {'type': 'value_error', 'msg': 'bad', 'ctx': {'error': ValueError('secret data')}}"
-        );
-        let result = sanitize_validation_errors(message);
-        assert!(!result.contains("secret data"));
-        assert!(result.contains("value_error: bad"));
-    }
-
-    #[test]
-    fn test_sanitize_strips_stack_traces() {
-        let message = concat!(
-            "1 validation errors:\n",
-            "  {'type': 'value_error', 'msg': 'bad', 'input': 'x'}\n",
-            "  File \"/sgl-workspace/sglang/python/sglang/srt/entrypoints/http_server.py\", line 1324\n",
-            "    POST /v1/chat/completions some data"
-        );
-        let result = sanitize_validation_errors(message);
-        assert!(!result.contains("sgl-workspace"));
-        assert!(!result.contains("POST /v1/chat"));
-    }
-
-    #[test]
-    fn test_sanitize_preserves_non_validation_errors() {
-        let message = "Context length exceeded: 32768 tokens requested, 16384 max";
-        assert_eq!(sanitize_validation_errors(message), message);
-    }
-
-    #[test]
-    fn test_sanitize_handles_non_dict_lines_with_input() {
-        let message = concat!(
-            "1 validation errors:\n",
-            "  - {'type': 'value_error', 'msg': 'bad', 'input': 'secret user message'}"
-        );
-        let result = sanitize_validation_errors(message);
-        assert!(!result.contains("secret user message"));
-        assert!(result.contains("value_error: bad"));
-    }
-
-    #[test]
-    fn test_parse_upstream_error_sanitizes_sglang_validation() {
-        let body = serde_json::json!({
-            "object": "error",
-            "message": "1 validation errors:\n  {'type': 'value_error', 'msg': 'bad request', 'input': 'sensitive user data', 'ctx': {'error': ValueError('details')}}"
-        });
-        let body_bytes = serde_json::to_vec(&body).unwrap();
-        let info = parse_upstream_error(&body_bytes).unwrap();
-        assert!(!info.message.contains("sensitive user data"));
-        assert!(info.message.contains("value_error: bad request"));
-    }
-
-    #[test]
-    fn test_parse_upstream_error_sanitizes_nested_format() {
-        let body = serde_json::json!({
-            "error": {
-                "message": "1 validation errors:\n  {'type': 'string_type', 'msg': 'bad input', 'input': [{'text': 'secret conversation'}]}",
-                "type": "invalid_request_error"
-            }
-        });
-        let body_bytes = serde_json::to_vec(&body).unwrap();
-        let info = parse_upstream_error(&body_bytes).unwrap();
-        assert!(!info.message.contains("secret conversation"));
-        assert!(info.message.contains("string_type: bad input"));
-        assert_eq!(info.error_type, "invalid_request_error");
-    }
-
-    // --- pydantic v2 format tests ---
-
-    #[test]
-    fn test_sanitize_strips_pydantic_v2_input_value() {
-        // Real vLLM pydantic v2 error format
-        let message = concat!(
-            "7 validation errors for ValidatorIterator\n",
-            "0.ChatCompletionContentPartTextParam.text\n",
-            "  Field required [type=missing, input_value={'content': 'secret user message', 'type': 'custom'}, input_type=dict]\n",
-            "    For further information visit https://errors.pydantic.dev/2.10/v/missing\n",
-            "0.ChatCompletionContentPartTextParam.type\n",
-            "  Input should be 'text' [type=literal_error, input_value='custom', input_type=str]\n",
-            "    For further information visit https://errors.pydantic.dev/2.10/v/literal_error"
-        );
-        let result = sanitize_validation_errors(message);
-        assert!(
-            !result.contains("secret user message"),
-            "leaked user content: {result}"
-        );
-        assert!(
-            !result.contains("input_value="),
-            "leaked input_value: {result}"
-        );
-        assert!(
-            !result.contains("input_type="),
-            "leaked input_type: {result}"
-        );
-        assert!(!result.contains("pydantic.dev"), "leaked URL: {result}");
-        assert!(
-            result.contains("Field required [type=missing]"),
-            "missing error desc: {result}"
-        );
-        assert!(
-            result.contains("Input should be 'text' [type=literal_error]"),
-            "missing error desc: {result}"
-        );
-        assert!(
-            result.contains("0.ChatCompletionContentPartTextParam.text"),
-            "missing field path: {result}"
-        );
-    }
-
-    #[test]
-    fn test_sanitize_strips_pydantic_v2_nested_dict() {
-        // input_value with deeply nested user content
-        let message = "  Field required [type=missing, input_value={'messages': [{'role': 'user', 'content': 'tell me your secrets'}]}, input_type=dict]";
-        let result = sanitize_validation_errors(message);
-        assert!(
-            !result.contains("tell me your secrets"),
-            "leaked user content: {result}"
-        );
-        assert!(result.contains("Field required [type=missing]"));
-    }
-
-    #[test]
-    fn test_parse_upstream_error_sanitizes_pydantic_v2() {
-        // Full vLLM error response with pydantic v2 format
-        let body = serde_json::json!({
-            "message": "7 validation errors for ValidatorIterator\n0.ChatCompletionContentPartTextParam.text\n  Field required [type=missing, input_value={'file_id': 'file-abc', 'type': 'file'}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.10/v/missing",
-            "type": "invalid_request_error"
-        });
-        let body_bytes = serde_json::to_vec(&body).unwrap();
-        let info = parse_upstream_error(&body_bytes).unwrap();
-        assert!(
-            !info.message.contains("input_value"),
-            "leaked input_value: {}",
-            info.message
-        );
-        assert!(
-            !info.message.contains("file-abc"),
-            "leaked file id: {}",
-            info.message
-        );
-        assert!(
-            !info.message.contains("pydantic.dev"),
-            "leaked URL: {}",
-            info.message
-        );
-        assert!(info.message.contains("Field required [type=missing]"));
     }
 
     #[test]

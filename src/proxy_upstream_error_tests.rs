@@ -68,18 +68,28 @@ fn test_upstream_error_log_excludes_parsed_body_content() {
         .with_writer(move || writer_logs.writer())
         .finish();
     let body = br#"{"message":"403, message='Forbidden', url='https://private.example/media.jpg?token=SECRET_TOKEN_SENTINEL&email=alice@example.com'","type":"InternalServerError"}"#;
+    let tracing_ids = TracingIds {
+        request_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+        request_id_inbound: true,
+        org_id: Some("org-test".to_string()),
+        workspace_id: Some("workspace-test".to_string()),
+    };
 
     let _subscriber_guard = tracing::subscriber::set_default(subscriber);
     let info = log_upstream_error(
         reqwest::StatusCode::INTERNAL_SERVER_ERROR,
         "http://backend.invalid/v1/chat/completions",
         body,
+        Some(&tracing_ids),
     )
     .expect("upstream error body should parse");
 
     assert!(info.message.contains("SECRET_TOKEN_SENTINEL"));
     let captured = logs.contents();
     assert!(captured.contains("upstream_status=500"));
+    assert!(captured.contains("request_id=550e8400-e29b-41d4-a716-446655440000"));
+    assert!(captured.contains("org_id=org-test"));
+    assert!(captured.contains("workspace_id=workspace-test"));
     assert!(captured.contains("upstream_error_parseable=true"));
     assert!(captured.contains("upstream_error_body_bytes="));
     assert_missing(

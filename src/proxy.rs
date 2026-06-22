@@ -173,10 +173,22 @@ pub(crate) fn log_upstream_error(
     status: reqwest::StatusCode,
     url: &str,
     body: &[u8],
+    tracing_ids: Option<&TracingIds>,
 ) -> Option<UpstreamErrorInfo> {
     let info = parse_upstream_error(body);
     let upstream_url = sanitized_upstream_url_for_logs(url);
+    let (request_id, org_id, workspace_id) = match tracing_ids {
+        Some(ids) => (
+            ids.request_id.as_str(),
+            ids.org_id_or_empty(),
+            ids.workspace_id_or_empty(),
+        ),
+        None => ("", "", ""),
+    };
     warn!(
+        request_id = %request_id,
+        org_id = %org_id,
+        workspace_id = %workspace_id,
         upstream_status = %status,
         upstream_url = %upstream_url,
         upstream_error_parseable = info.is_some(),
@@ -594,7 +606,7 @@ pub struct ProxyOpts {
 
 /// Apply upstream tracing headers to a `reqwest::RequestBuilder`. No-op when
 /// `tracing_ids` is `None`.
-fn apply_tracing_headers(
+pub(crate) fn apply_tracing_headers(
     mut req: reqwest::RequestBuilder,
     tracing_ids: Option<&TracingIds>,
 ) -> reqwest::RequestBuilder {
@@ -670,7 +682,7 @@ pub async fn proxy_json_request(
     let status = response.status();
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
-        let info = log_upstream_error(status, url, &body);
+        let info = log_upstream_error(status, url, &body, opts.tracing_ids.as_ref());
         return Err(AppError::Upstream {
             status: effective_error_status(status.as_u16(), info.as_ref()),
             body,
@@ -716,7 +728,8 @@ pub async fn proxy_json_request(
             );
             let reqwest_status = reqwest::StatusCode::from_u16(status_code.as_u16())
                 .unwrap_or(reqwest::StatusCode::BAD_GATEWAY);
-            let info = log_upstream_error(reqwest_status, url, &body_bytes);
+            let info =
+                log_upstream_error(reqwest_status, url, &body_bytes, opts.tracing_ids.as_ref());
             return Err(AppError::Upstream {
                 // A client media-fetch failure can arrive as an SSE error chunk
                 // with code:500 + `403, message='…', url='…'` — downgrade to 400
@@ -1266,7 +1279,7 @@ pub async fn proxy_streaming_request(
     let status = response.status();
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
-        let info = log_upstream_error(status, url, &body);
+        let info = log_upstream_error(status, url, &body, opts.tracing_ids.as_ref());
         return Err(AppError::Upstream {
             status: effective_error_status(status.as_u16(), info.as_ref()),
             body,
@@ -1585,7 +1598,7 @@ pub async fn proxy_multipart_request(
     let status = response.status();
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
-        let info = log_upstream_error(status, url, &body);
+        let info = log_upstream_error(status, url, &body, opts.tracing_ids.as_ref());
         return Err(AppError::Upstream {
             status: effective_error_status(status.as_u16(), info.as_ref()),
             body,
@@ -1680,7 +1693,7 @@ pub async fn proxy_simple(
     let status = response.status();
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
-        let info = log_upstream_error(status, url, &body);
+        let info = log_upstream_error(status, url, &body, tracing_ids);
         return Err(AppError::Upstream {
             status: effective_error_status(status.as_u16(), info.as_ref()),
             body,

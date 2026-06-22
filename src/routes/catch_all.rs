@@ -174,9 +174,7 @@ pub async fn catch_all(
             builder = builder.header(name.as_str(), value);
         }
     }
-    for (name, value) in tracing_ids.upstream_headers() {
-        builder = builder.header(name, value);
-    }
+    builder = proxy::apply_tracing_headers(builder, Some(&tracing_ids));
 
     // Attach body if non-empty
     if !body_bytes.is_empty() {
@@ -197,8 +195,12 @@ pub async fn catch_all(
             .bytes()
             .await
             .unwrap_or_else(|_| bytes::Bytes::from("{}"));
-        let error_info =
-            crate::proxy::log_upstream_error(upstream_status, &backend_url, &error_body);
+        let error_info = crate::proxy::log_upstream_error(
+            upstream_status,
+            &backend_url,
+            &error_body,
+            Some(&tracing_ids),
+        );
         // Downgrade a backend 5xx to 400 when it's really a client media-fetch
         // 4xx (e.g. a UA-gated image URL), so it isn't retried/masked as a 502
         // (nearai/cloud-api#606). See proxy::effective_error_status.

@@ -16,11 +16,14 @@ use crate::{AppState, TracingIds};
 /// POST /v1/tokenize — simple proxy, no signing.
 pub async fn tokenize(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    auth: RequireAuth,
     Extension(tracing_ids): Extension<TracingIds>,
+    headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
     let request_body = read_body_with_limit(body, state.config.max_request_size).await?;
+    let tracing_ids =
+        tracing_ids.with_trusted_tenant_headers(&headers, auth.cloud_api_key.is_none());
 
     let (url, _guard) = state.backend_pool.select_url("/tokenize");
     proxy::proxy_simple(

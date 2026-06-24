@@ -50,6 +50,14 @@ const BRAVE_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 /// the output is truncated with a marker.
 const MAX_FORMATTED_OUTPUT_BYTES: usize = 32 * 1024;
 
+/// Upper bound on how many `web_context_search` calls we execute in a single
+/// iteration. We force `parallel_tool_calls: false`, but some engines (e.g.
+/// SGLang serving GLM-5.1) ignore the flag and emit several calls anyway. We
+/// run them all rather than dropping them back to the client (which can't
+/// fulfil a server-side namespaced tool), but cap the count so a misbehaving
+/// model can't fan out an unbounded number of Brave requests per iteration.
+const MAX_TOOL_CALLS_PER_ITERATION: usize = 8;
+
 /// True iff the request's `tools` field is exactly one entry of type
 /// `web_context_search`. Mixed tool types or multiple entries return false
 /// and let the request flow through the existing pass-through path.
@@ -458,13 +466,19 @@ async fn drive_loop(
             break;
         }
 
-        // Phase 1: cap at exactly one tool call per iteration. We force
-        // `parallel_tool_calls: false` upstream; if a model still emits
-        // multiple (some engines ignore the flag), fall through to the
-        // non-loop path so we never silently drop a tool call.
+        // Execute every `web_context_search` call the iteration produced. We
+        // force `parallel_tool_calls: false` upstream, but some engines (e.g.
+        // SGLang serving GLM-5.1) ignore the flag and emit multiple parallel
+        // calls. Dropping them to the client breaks the loop — the client
+        // can't fulfil a server-side namespaced tool and reports the search as
+        // failed — so we run all of them (bounded by MAX_TOOL_CALLS_PER_ITERATION),
+        // as long as every call is the namespaced search tool. A mixed/foreign
+        // tool, or more calls than the cap, falls through to the non-loop path
+        // so we never silently drop or unexpectedly fan out a tool call.
         let is_tool_call_iteration = iter_outcome.saw_done
             && iter_outcome.finish_reason.as_deref() == Some("tool_calls")
-            && iter_outcome.tool_calls.len() == 1
+            && !iter_outcome.tool_calls.is_empty()
+            && iter_outcome.tool_calls.len() <= MAX_TOOL_CALLS_PER_ITERATION
             && all_calls_are_web_context_search(&iter_outcome.tool_calls);
 
         if !is_tool_call_iteration {

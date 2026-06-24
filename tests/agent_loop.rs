@@ -643,31 +643,130 @@ async fn upstream_5xx_on_first_call_propagates_status() {
 /// The model's tool_call chunks are still forwarded as-is so the client can
 /// see what the model wanted; but no synthetic `nearai_tool_result` chunk
 /// is emitted and Brave is never called.
+/// SSE that emits `n` parallel `web_context_search` tool calls (ids
+/// `call_0..call_{n-1}`, indices `0..n`) in one assistant turn and finishes
+/// with `tool_calls`. Some engines (e.g. SGLang serving GLM-5.1) emit these
+/// even though we force `parallel_tool_calls: false`.
+fn upstream_parallel_tool_calls_sse(chat_id: &str, n: usize) -> String {
+    let calls: Vec<String> = (0..n)
+        .map(|i| {
+            format!(
+                "{{\"index\":{i},\"id\":\"call_{i}\",\"type\":\"function\",\"function\":{{\"name\":\"web_context_search\",\"arguments\":\"{{\\\"query\\\":\\\"q{i}\\\"}}\"}}}}"
+            )
+        })
+        .collect();
+    format!(
+        "data: {{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"tool_calls\":[{calls}]}}}}]}}\n\n\
+         data: {{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}],\"usage\":{{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}}}\n\n\
+         data: [DONE]\n\n",
+        id = chat_id,
+        calls = calls.join(","),
+    )
+}
+
+/// When an iteration emits multiple parallel `web_context_search` calls
+/// (despite `parallel_tool_calls: false`), the loop must execute *all* of
+/// them — emitting one `nearai_tool_result` per call — and continue, rather
+/// than dropping them to the client. Dropping them is what made Brave/Leo
+/// report "my search tools aren't cooperating" with GLM-5.1 (Slack thread
+/// 2026-06-24): the client can't fulfil a server-side namespaced tool.
 #[tokio::test]
-async fn multiple_tool_calls_in_one_iteration_skips_loop() {
+async fn multiple_tool_calls_in_one_iteration_all_execute() {
     let upstream = MockServer::start().await;
     let brave = MockServer::start().await;
 
-    // SSE that emits TWO tool_calls (indices 0 and 1) and finishes with
-    // `tool_calls`. Phase 1 caps execution at one — neither should run.
-    let two_tool_calls_sse = "data: {\"id\":\"chatcmpl-MULTI\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[\
-        {\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"web_context_search\",\"arguments\":\"{\\\"query\\\":\\\"a\\\"}\"}},\
-        {\"index\":1,\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"web_context_search\",\"arguments\":\"{\\\"query\\\":\\\"b\\\"}\"}}\
-    ]}}]}\n\n\
-    data: {\"id\":\"chatcmpl-MULTI\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
-    data: [DONE]\n\n";
+    // First upstream call: two parallel tool calls. Second: final answer.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    upstream_parallel_tool_calls_sse("chatcmpl-MULTI", 2),
+                    "text/event-stream",
+                ),
+        )
+        .up_to_n_times(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    upstream_final_answer_sse("chatcmpl-MULTI"),
+                    "text/event-stream",
+                ),
+        )
+        .mount(&upstream)
+        .await;
+
+    // Brave must be called exactly twice — once per parallel query.
+    Mock::given(method("GET"))
+        .and(path("/res/v1/llm/context"))
+        .and(header("X-Subscription-Token", "brave-test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(brave_context_json()))
+        .expect(2)
+        .mount(&brave)
+        .await;
+
+    let brave_url = format!("{}/res/v1/llm/context", brave.uri());
+    let app = build_agent_loop_app(&upstream.uri(), Some(&brave_url));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json")
+                .body(Body::from(agent_loop_request_body(true).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_string(response).await;
+    // Both calls executed: one tool-result chunk per tool_call_id.
+    assert_eq!(
+        body.matches("nearai_tool_result").count(),
+        2,
+        "expected two tool-result chunks, got body: {body}"
+    );
+    assert!(body.contains("\"tool_call_id\":\"call_0\""));
+    assert!(body.contains("\"tool_call_id\":\"call_1\""));
+    // Loop continued into the final answer and closed cleanly.
+    assert!(body.contains("Hello."));
+    assert!(body.ends_with("data: [DONE]\n\n"));
+    assert_eq!(body.matches("data: [DONE]").count(), 1);
+    // Brave called exactly twice (wiremock asserts on drop via `.expect(2)`).
+    drop(brave);
+}
+
+/// More parallel calls than `MAX_TOOL_CALLS_PER_ITERATION` (8) is treated as a
+/// misbehaving model: the loop refuses to fan out unbounded Brave requests and
+/// falls through to the client-side pass-through path (no search executed).
+#[tokio::test]
+async fn over_cap_parallel_tool_calls_skip_loop() {
+    let upstream = MockServer::start().await;
+    let brave = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
-                .set_body_raw(two_tool_calls_sse, "text/event-stream"),
+                .set_body_raw(
+                    upstream_parallel_tool_calls_sse("chatcmpl-OVER", 9),
+                    "text/event-stream",
+                ),
         )
         .mount(&upstream)
         .await;
 
-    // Brave mock: track that it's never called by failing loudly.
+    // Brave must never be called.
     Mock::given(method("GET"))
         .and(path("/res/v1/llm/context"))
         .respond_with(ResponseTemplate::new(500).set_body_string("brave should not be called"))
@@ -693,8 +792,7 @@ async fn multiple_tool_calls_in_one_iteration_skips_loop() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_to_string(response).await;
-    assert!(body.contains("call_a"));
-    assert!(body.contains("call_b"));
+    assert!(body.contains("call_0"));
     assert!(!body.contains("nearai_tool_result"));
     assert!(body.ends_with("data: [DONE]\n\n"));
     // Verify Brave was never called (wiremock asserts on drop via `.expect(0)`).

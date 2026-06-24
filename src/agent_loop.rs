@@ -475,9 +475,10 @@ async fn drive_loop(
         // as long as every call is the namespaced search tool. A mixed/foreign
         // tool, or more calls than the cap, falls through to the non-loop path
         // so we never silently drop or unexpectedly fan out a tool call.
+        // (`all_calls_are_web_context_search` already returns false on an empty
+        // slice, so no separate non-empty check is needed.)
         let is_tool_call_iteration = iter_outcome.saw_done
             && iter_outcome.finish_reason.as_deref() == Some("tool_calls")
-            && !iter_outcome.tool_calls.is_empty()
             && iter_outcome.tool_calls.len() <= MAX_TOOL_CALLS_PER_ITERATION
             && all_calls_are_web_context_search(&iter_outcome.tool_calls);
 

@@ -904,6 +904,101 @@ fn merge_extra(target: &mut serde_json::Value, extra: serde_json::Map<String, se
     }
 }
 
+fn is_spurious_empty_string_suffix(previous: &str, delta: &str) -> bool {
+    delta == "\"\""
+        && serde_json::from_str::<serde_json::Value>(previous).is_ok_and(|value| value.is_object())
+}
+
+const MAX_TRACKED_TOOL_ARGUMENT_BYTES: usize = 64 * 1024;
+const MAX_TRACKED_TOOL_CALLS: usize = 256;
+
+#[derive(Default)]
+pub(crate) struct ToolArgumentFilter {
+    arguments: std::collections::HashMap<(usize, usize), String>,
+    tracked_bytes: usize,
+    disabled: bool,
+}
+
+impl ToolArgumentFilter {
+    pub(crate) fn filter_chunk(&mut self, val: &mut serde_json::Value) {
+        let Some(choices) = val
+            .get_mut("choices")
+            .and_then(|value| value.as_array_mut())
+        else {
+            return;
+        };
+
+        for choice in choices {
+            let choice_index = choice
+                .get("index")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0) as usize;
+            let Some(delta) = choice
+                .get_mut("delta")
+                .and_then(|value| value.as_object_mut())
+            else {
+                continue;
+            };
+            let remove_tool_calls = if let Some(tool_calls) = delta
+                .get_mut("tool_calls")
+                .and_then(|value| value.as_array_mut())
+            {
+                tool_calls.retain(|tool_call| self.retain_tool_call(choice_index, tool_call));
+                tool_calls.is_empty()
+            } else {
+                false
+            };
+            if remove_tool_calls {
+                delta.remove("tool_calls");
+            }
+        }
+    }
+
+    fn retain_tool_call(&mut self, choice_index: usize, tool_call: &serde_json::Value) -> bool {
+        let tool_index = tool_call
+            .get("index")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as usize;
+        let Some(arguments) = tool_call
+            .get("function")
+            .and_then(|value| value.get("arguments"))
+            .and_then(|value| value.as_str())
+        else {
+            return true;
+        };
+
+        if self.disabled {
+            return true;
+        }
+
+        let key = (choice_index, tool_index);
+        if self
+            .arguments
+            .get(&key)
+            .is_some_and(|previous| is_spurious_empty_string_suffix(previous, arguments))
+        {
+            metrics::counter!("spurious_tool_argument_suffixes_total").increment(1);
+            return false;
+        }
+
+        if (!self.arguments.contains_key(&key) && self.arguments.len() >= MAX_TRACKED_TOOL_CALLS)
+            || self
+                .tracked_bytes
+                .checked_add(arguments.len())
+                .is_none_or(|size| size > MAX_TRACKED_TOOL_ARGUMENT_BYTES)
+        {
+            self.arguments.clear();
+            self.tracked_bytes = 0;
+            self.disabled = true;
+            return true;
+        }
+
+        self.arguments.entry(key).or_default().push_str(arguments);
+        self.tracked_bytes += arguments.len();
+        true
+    }
+}
+
 impl StreamingResponseAssembler {
     fn new(shape: ResponseShape) -> Self {
         Self {
@@ -1207,6 +1302,14 @@ impl ChoiceAssembler {
                 }
                 if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
                     let prev = existing["function"]["arguments"].as_str().unwrap_or("");
+                    // SGLang's DeepSeek v3.2/v4 parser used to emit a final `""`
+                    // delta after it had already streamed a complete JSON object
+                    // (sglang#29883). Dropping only that impossible continuation
+                    // avoids corrupting legitimate `""` fragments inside an object.
+                    if is_spurious_empty_string_suffix(prev, args) {
+                        metrics::counter!("spurious_tool_argument_suffixes_total").increment(1);
+                        continue;
+                    }
                     let mut combined = prev.to_string();
                     combined.push_str(args);
                     existing["function"]["arguments"] = combined.into();
@@ -1497,6 +1600,7 @@ pub(crate) fn normalize_chat_chunk(val: &mut serde_json::Value) {
 struct SseTransformer {
     line_buffer: String,
     extra_transform: Option<crate::encryption::ChunkTransform>,
+    tool_argument_filter: ToolArgumentFilter,
 }
 
 impl SseTransformer {
@@ -1504,6 +1608,7 @@ impl SseTransformer {
         Self {
             line_buffer: String::new(),
             extra_transform,
+            tool_argument_filter: ToolArgumentFilter::default(),
         }
     }
 
@@ -1537,6 +1642,7 @@ impl SseTransformer {
                                 "Failed to parse SSE data line: {e}"
                             ))
                         })?;
+                    self.tool_argument_filter.filter_chunk(&mut parsed);
                     normalize_chat_chunk(&mut parsed);
                     if let Some(ref extra) = self.extra_transform {
                         (extra)(&mut parsed)?;
@@ -1579,6 +1685,7 @@ impl SseTransformer {
                 let mut parsed: serde_json::Value = serde_json::from_str(data).map_err(|e| {
                     AppError::Internal(anyhow::anyhow!("Failed to parse SSE data line: {e}"))
                 })?;
+                self.tool_argument_filter.filter_chunk(&mut parsed);
                 normalize_chat_chunk(&mut parsed);
                 if let Some(ref extra) = self.extra_transform {
                     (extra)(&mut parsed)?;
@@ -2673,6 +2780,95 @@ mod tests {
     }
 
     #[test]
+    fn test_sse_transformer_ignores_spurious_empty_string_after_complete_tool_arguments() {
+        let mut transformer = SseTransformer::new(None);
+        let first = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}}]}}]}\n";
+        transformer.process_chunk(first).unwrap();
+
+        let suffix = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"\\\"\"}}]}}]}\n";
+        let output = transformer.process_chunk(suffix).unwrap();
+        let data = std::str::from_utf8(&output)
+            .unwrap()
+            .strip_prefix("data: ")
+            .unwrap()
+            .trim();
+        let event: serde_json::Value = serde_json::from_str(data).unwrap();
+
+        assert!(event["choices"][0]["delta"].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn test_sse_transformer_preserves_empty_string_inside_incomplete_tool_arguments() {
+        let mut transformer = SseTransformer::new(None);
+        let first = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"value\\\":\"}}]}}]}\n";
+        transformer.process_chunk(first).unwrap();
+
+        let empty_string = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"\\\"\"}}]}}]}\n";
+        let output = transformer.process_chunk(empty_string).unwrap();
+        let data = std::str::from_utf8(&output)
+            .unwrap()
+            .strip_prefix("data: ")
+            .unwrap()
+            .trim();
+        let event: serde_json::Value = serde_json::from_str(data).unwrap();
+
+        assert_eq!(
+            event["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+            "\"\""
+        );
+    }
+
+    #[test]
+    fn test_tool_argument_filter_isolates_choices_and_tool_indices() {
+        let mut filter = ToolArgumentFilter::default();
+        let mut first = serde_json::json!({
+            "choices": [
+                {"index": 0, "delta": {"tool_calls": [
+                    {"index": 0, "function": {"arguments": "{}"}}
+                ]}},
+                {"index": 1, "delta": {"tool_calls": [
+                    {"index": 2, "function": {"arguments": "{\"value\":"}}
+                ]}}
+            ]
+        });
+        filter.filter_chunk(&mut first);
+
+        let mut suffixes = serde_json::json!({
+            "choices": [
+                {"index": 0, "delta": {"tool_calls": [
+                    {"index": 0, "function": {"arguments": "\"\""}}
+                ]}},
+                {"index": 1, "delta": {"tool_calls": [
+                    {"index": 2, "function": {"arguments": "\"\""}}
+                ]}}
+            ]
+        });
+        filter.filter_chunk(&mut suffixes);
+
+        assert!(suffixes["choices"][0]["delta"].get("tool_calls").is_none());
+        assert_eq!(
+            suffixes["choices"][1]["delta"]["tool_calls"][0]["function"]["arguments"],
+            "\"\""
+        );
+    }
+
+    #[test]
+    fn test_tool_argument_filter_stops_buffering_at_byte_limit() {
+        let mut filter = ToolArgumentFilter::default();
+        let mut event = serde_json::json!({
+            "choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0,
+                "function": {"arguments": "x".repeat(MAX_TRACKED_TOOL_ARGUMENT_BYTES + 1)}
+            }]}}]
+        });
+        filter.filter_chunk(&mut event);
+
+        assert!(filter.disabled);
+        assert!(filter.arguments.is_empty());
+        assert_eq!(filter.tracked_bytes, 0);
+    }
+
+    #[test]
     fn test_sse_transformer_normalize_then_extra_transform() {
         // Extra transform runs after normalization — it should see reasoning_content.
         let extra: ChunkTransform = Arc::new(|v| {
@@ -2848,6 +3044,44 @@ mod tests {
         assert_eq!(tc["id"], "call_1");
         assert_eq!(tc["function"]["name"], "get_weather");
         assert_eq!(tc["function"]["arguments"], "{\"city\": \"NYC\"}");
+    }
+
+    #[test]
+    fn test_assembler_ignores_spurious_empty_string_after_complete_tool_arguments() {
+        let mut asm = StreamingResponseAssembler::new(ResponseShape::ChatCompletion);
+        asm.process_chunk(
+            br#"data: {"id":"t1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"list_channels","arguments":"{}"}}]}}]}"#,
+        );
+        asm.process_chunk(b"\n\n");
+        asm.process_chunk(
+            br#"data: {"id":"t1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"\""}}]},"finish_reason":"tool_calls"}]}"#,
+        );
+        asm.process_chunk(b"\n\ndata: [DONE]\n\n");
+
+        let resp = asm.into_response("chatcmpl");
+        let arguments = &resp["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"];
+        assert_eq!(arguments, "{}");
+    }
+
+    #[test]
+    fn test_assembler_preserves_empty_string_inside_incomplete_tool_arguments() {
+        let mut asm = StreamingResponseAssembler::new(ResponseShape::ChatCompletion);
+        asm.process_chunk(
+            br#"data: {"id":"t1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"set_value","arguments":"{\"value\":"}}]}}]}"#,
+        );
+        asm.process_chunk(b"\n\n");
+        asm.process_chunk(
+            br#"data: {"id":"t1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"\""}}]}}]}"#,
+        );
+        asm.process_chunk(b"\n\n");
+        asm.process_chunk(
+            br#"data: {"id":"t1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]},"finish_reason":"tool_calls"}]}"#,
+        );
+        asm.process_chunk(b"\n\ndata: [DONE]\n\n");
+
+        let resp = asm.into_response("chatcmpl");
+        let arguments = &resp["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"];
+        assert_eq!(arguments, "{\"value\":\"\"}");
     }
 
     #[test]

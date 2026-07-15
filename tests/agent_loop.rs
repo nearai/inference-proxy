@@ -177,6 +177,18 @@ fn upstream_tool_call_sse(chat_id: &str, query: &str) -> String {
     )
 }
 
+fn upstream_tool_call_sse_with_spurious_suffix(chat_id: &str, query: &str) -> String {
+    let args = serde_json::to_string(&serde_json::json!({"query": query})).unwrap();
+    format!(
+        "data: {{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"tool_calls\":[{{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{{\"name\":\"web_context_search\",\"arguments\":{args_json}}}}}]}}}}]}}\n\n\
+         data: {{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"function\":{{\"arguments\":\"\\\"\\\"\"}}}}]}}}}]}}\n\n\
+         data: {{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}],\"usage\":{{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}}}\n\n\
+         data: [DONE]\n\n",
+        id = chat_id,
+        args_json = serde_json::to_string(&args).unwrap(),
+    )
+}
+
 /// vLLM-shaped SSE for an assistant turn that emits a plain answer
 /// (`Hello.`) and finishes with `stop`.
 fn upstream_final_answer_sse(chat_id: &str) -> String {
@@ -369,6 +381,66 @@ async fn happy_path_executes_search_and_continues() {
     // [DONE] should only appear once in the final stream — intermediate
     // [DONE]s from upstream are swallowed by the loop.
     assert_eq!(body.matches("data: [DONE]").count(), 1);
+}
+
+#[tokio::test]
+async fn spurious_tool_argument_suffix_executes_search_and_continues() {
+    let upstream = MockServer::start().await;
+    let brave = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    upstream_tool_call_sse_with_spurious_suffix("chatcmpl-SUFFIX", "rust"),
+                    "text/event-stream",
+                ),
+        )
+        .up_to_n_times(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(
+                    upstream_final_answer_sse("chatcmpl-SUFFIX"),
+                    "text/event-stream",
+                ),
+        )
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/res/v1/llm/context"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(brave_context_json()))
+        .expect(1)
+        .mount(&brave)
+        .await;
+
+    let brave_url = format!("{}/res/v1/llm/context", brave.uri());
+    let app = build_agent_loop_app(&upstream.uri(), Some(&brave_url));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json")
+                .body(Body::from(agent_loop_request_body(true).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_string(response).await;
+    assert!(body.contains("nearai_tool_result"));
+    assert!(body.contains("\"status\":\"ok\""));
+    assert!(body.contains("Hello."));
+    drop(brave);
 }
 
 #[tokio::test]

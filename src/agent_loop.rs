@@ -30,7 +30,10 @@ use tracing::{debug, error, info, warn};
 use crate::auth::RequireAuth;
 use crate::encryption::ChunkTransform;
 use crate::error::AppError;
-use crate::proxy::{make_usage_reporter, normalize_chat_chunk, spawn_usage_report, StreamingGuard};
+use crate::proxy::{
+    make_usage_reporter, normalize_chat_chunk, spawn_usage_report, StreamingGuard,
+    ToolArgumentFilter,
+};
 use crate::{AppState, TracingIds};
 
 pub const WEB_CONTEXT_SEARCH_TOOL_NAME: &str = "web_context_search";
@@ -739,6 +742,7 @@ async fn run_iteration(
         client_disconnected: false,
         upstream_error: None,
     };
+    let mut tool_argument_filter = ToolArgumentFilter::default();
 
     // SSE line loop. We hold off forwarding `[DONE]` until the caller decides
     // whether to continue looping; everything else is forwarded as it arrives.
@@ -781,6 +785,7 @@ async fn run_iteration(
                                         continue;
                                     }
                                 };
+                                tool_argument_filter.filter_chunk(&mut parsed);
                                 ingest_chunk_metadata(&parsed, &mut outcome);
 
                                 // SGLang and friends emit top-level

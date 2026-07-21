@@ -28,6 +28,15 @@ fn build_agent_loop_app_with_cloud(
     brave_url: Option<&str>,
     cloud_api_url: Option<&str>,
 ) -> axum::Router {
+    build_agent_loop_app_with_cloud_and_idle(upstream_mock_url, brave_url, cloud_api_url, 0)
+}
+
+fn build_agent_loop_app_with_cloud_and_idle(
+    upstream_mock_url: &str,
+    brave_url: Option<&str>,
+    cloud_api_url: Option<&str>,
+    stream_idle_timeout_secs: u64,
+) -> axum::Router {
     let base = upstream_mock_url.trim_end_matches('/');
     let config = config::Config {
         model_name: "test-model".to_string(),
@@ -73,7 +82,7 @@ fn build_agent_loop_app_with_cloud(
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,
-        stream_idle_timeout_secs: 0,
+        stream_idle_timeout_secs,
         timeout_tokenize_secs: 5,
         openai_chat_compatibility_check_enabled: false,
         startup_check_retries: 1,
@@ -223,6 +232,26 @@ async fn body_to_string(response: axum::response::Response) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+async fn stalled_sse_upstream_url() -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = socket.read(&mut request).await;
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    });
+    format!("http://{address}")
+}
+
 fn agent_loop_request_body(stream: bool) -> serde_json::Value {
     serde_json::json!({
         "model": "test-model",
@@ -233,6 +262,72 @@ fn agent_loop_request_body(stream: bool) -> serde_json::Value {
 }
 
 // ── tests ───────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn upstream_idle_watchdog_covers_agent_loop_iterations() {
+    let upstream_url = stalled_sse_upstream_url().await;
+    let brave = MockServer::start().await;
+    let app = build_agent_loop_app_with_cloud_and_idle(&upstream_url, Some(&brave.uri()), None, 1);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json")
+                .body(Body::from(agent_loop_request_body(true).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        response.into_body().collect(),
+    )
+    .await
+    .expect("agent-loop idle watchdog should fire before the test timeout");
+    assert!(result.is_err(), "stalled agent-loop body must fail");
+}
+
+#[tokio::test]
+async fn agent_loop_accepts_done_without_trailing_newline() {
+    let upstream = MockServer::start().await;
+    let brave = MockServer::start().await;
+    let final_answer = upstream_final_answer_sse("chatcmpl-NO-NL")
+        .trim_end_matches('\n')
+        .to_string();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(final_answer, "text/event-stream"),
+        )
+        .mount(&upstream)
+        .await;
+
+    let app =
+        build_agent_loop_app_with_cloud_and_idle(&upstream.uri(), Some(&brave.uri()), None, 1);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json")
+                .body(Body::from(agent_loop_request_body(true).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let body = body_to_string(response).await;
+    assert!(body.contains("Hello."));
+    assert!(body.ends_with("data: [DONE]\n\n"));
+}
 
 #[tokio::test]
 async fn rejects_when_search_unconfigured() {

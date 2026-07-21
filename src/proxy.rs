@@ -768,6 +768,7 @@ pub async fn proxy_json_request(
                 assembler.process_chunk(&chunk);
             }
         }
+        stream_parser.finish();
         if opts.stream_idle_timeout_secs > 0 && !stream_parser.seen_done {
             metrics::counter!(
                 "upstream_stream_incomplete_total",
@@ -1440,15 +1441,9 @@ pub async fn proxy_streaming_request(
                     downstream_closed = true;
                     break;
                 }
-                _ = async {
-                    if stream_idle_timeout_secs == 0 {
-                        std::future::pending::<()>().await;
-                    } else {
-                        tokio::time::sleep(std::time::Duration::from_secs(
-                            stream_idle_timeout_secs,
-                        )).await;
-                    }
-                } => {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(
+                    stream_idle_timeout_secs,
+                )), if stream_idle_timeout_secs > 0 => {
                     warn!(
                         request_id = %log_request_id,
                         org_id = %log_org_id,
@@ -1467,6 +1462,8 @@ pub async fn proxy_streaming_request(
                 }
             }
         }
+
+        parser.finish();
 
         // Flush any remaining buffered content in the transformer
         if !upstream_error && !downstream_closed {
@@ -1993,15 +1990,9 @@ pub async fn proxy_streaming_response(
                     downstream_closed = true;
                     break;
                 }
-                _ = async {
-                    if stream_idle_timeout_secs == 0 {
-                        std::future::pending::<()>().await;
-                    } else {
-                        tokio::time::sleep(std::time::Duration::from_secs(
-                            stream_idle_timeout_secs,
-                        )).await;
-                    }
-                } => {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(
+                    stream_idle_timeout_secs,
+                )), if stream_idle_timeout_secs > 0 => {
                     warn!(
                         request_id = %log_request_id,
                         org_id = %log_org_id,
@@ -2020,6 +2011,8 @@ pub async fn proxy_streaming_response(
                 }
             }
         }
+
+        parser.finish();
 
         // Flush any remaining buffered content in the transformer
         if !upstream_error && !downstream_closed {
@@ -2253,6 +2246,14 @@ impl SseParser {
 
             // Remove the processed line in-place (no allocation, just memmove)
             self.line_buffer.drain(..newline_pos + 1);
+        }
+    }
+
+    /// Dispatch a final unterminated SSE line at end-of-stream. SSE permits
+    /// the last event line to omit its newline, including `data: [DONE]`.
+    pub fn finish(&mut self) {
+        if !self.line_buffer.is_empty() {
+            self.process_chunk(b"\n");
         }
     }
 }
@@ -2637,6 +2638,25 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_done_without_trailing_newline_completes_cleanly() {
+        let upstream = raw_sse_response(
+            Some("data: {\"id\":\"chat-1\",\"choices\":[]}\n\ndata: [DONE]"),
+            false,
+        )
+        .await;
+        let mut opts = test_proxy_opts();
+        opts.stream_idle_timeout_secs = 1;
+        let response = proxy_streaming_response(upstream, "request-sha256", opts, StatusCode::OK)
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("valid final [DONE] line must not fail the response body");
+        assert!(body.ends_with(b"data: [DONE]"));
+    }
+
     #[test]
     fn test_sse_parser_normal_sse() {
         let mut parser = SseParser::new();
@@ -2688,6 +2708,16 @@ mod tests {
         parser.process_chunk(b"data: {\"id\":\"chat-6\"}\n\n");
         assert_eq!(parser.chat_id.as_deref(), Some("chat-6"));
         assert!(!parser.seen_done);
+    }
+
+    #[test]
+    fn test_sse_parser_done_without_trailing_newline() {
+        let mut parser = SseParser::new();
+        parser.process_chunk(b"data: [DONE]");
+        assert!(!parser.seen_done);
+
+        parser.finish();
+        assert!(parser.seen_done);
     }
 
     #[test]

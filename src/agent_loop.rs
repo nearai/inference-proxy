@@ -146,6 +146,7 @@ pub async fn run_chat_completion(
         .clone()
         .expect("caller verified web_context_search_api_key is set");
     let tool_timeout = Duration::from_secs(state.config.web_context_search_timeout_secs);
+    let stream_idle_timeout_secs = state.config.stream_idle_timeout_secs;
     let usage_reporter = make_usage_reporter(&auth, &state);
 
     tokio::spawn(async move {
@@ -164,6 +165,7 @@ pub async fn run_chat_completion(
                 brave_url: &brave_url,
                 brave_key: &brave_key,
                 tool_timeout,
+                stream_idle_timeout_secs,
                 tracing_ids: &tracing_ids,
             },
             first_response,
@@ -302,6 +304,7 @@ struct LoopCtx<'a> {
     brave_url: &'a str,
     brave_key: &'a str,
     tool_timeout: Duration,
+    stream_idle_timeout_secs: u64,
     tracing_ids: &'a TracingIds,
 }
 
@@ -425,6 +428,8 @@ async fn drive_loop(
                 } else {
                     None
                 },
+                stream_idle_timeout_secs: ctx.stream_idle_timeout_secs,
+                tracing_ids: ctx.tracing_ids,
             },
             response,
         )
@@ -689,6 +694,8 @@ struct IterCtx<'a> {
     /// When set, rewrite each forwarded chunk's `id` to this value so the
     /// client sees one logical completion across loop iterations.
     rewrite_id_to: Option<&'a str>,
+    stream_idle_timeout_secs: u64,
+    tracing_ids: &'a TracingIds,
 }
 
 struct IterOutcome {
@@ -852,7 +859,20 @@ async fn run_iteration(
                         }
                     }
                     Some(Err(e)) => return Err(AppError::Internal(e.into())),
-                    None => break, // upstream closed before [DONE]
+                    None => {
+                        // SSE dispatches a final data line at EOF even when it
+                        // has no trailing newline. Recognize the protocol
+                        // terminator before classifying this as incomplete.
+                        let final_line = String::from_utf8_lossy(&byte_buf);
+                        let trimmed = final_line.trim_end_matches(['\n', '\r']);
+                        let data = trimmed
+                            .strip_prefix("data: ")
+                            .or_else(|| trimmed.strip_prefix("data:"));
+                        if data.is_some_and(|value| value.trim() == "[DONE]") {
+                            outcome.saw_done = true;
+                        }
+                        break;
+                    }
                 }
             }
             _ = ctx.tx.closed() => {
@@ -861,6 +881,27 @@ async fn run_iteration(
                 // and don't fire another Brave call.
                 outcome.client_disconnected = true;
                 break 'outer;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(ctx.stream_idle_timeout_secs)),
+                if ctx.stream_idle_timeout_secs > 0 => {
+                metrics::counter!(
+                    "upstream_stream_incomplete_total",
+                    "reason" => "idle_timeout",
+                    "mode" => "agent_loop"
+                )
+                .increment(1);
+                warn!(
+                    request_id = %ctx.tracing_ids.request_id,
+                    org_id = %ctx.tracing_ids.org_id_or_empty(),
+                    workspace_id = %ctx.tracing_ids.workspace_id_or_empty(),
+                    timeout_secs = ctx.stream_idle_timeout_secs,
+                    "Agent-loop upstream SSE stream exceeded the idle timeout"
+                );
+                return Err(AppError::UpstreamParsed {
+                    status: StatusCode::GATEWAY_TIMEOUT,
+                    message: "Upstream response stream timed out".to_string(),
+                    error_type: "upstream_stream_idle_timeout".to_string(),
+                });
             }
         }
     }

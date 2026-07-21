@@ -606,6 +606,10 @@ pub struct ProxyOpts {
     /// this is moved into the spawned task so active_conns stays incremented
     /// for the full duration of the stream (not just until the handler returns).
     pub backend_guard: Option<crate::backend_pool::BackendGuard>,
+    /// Maximum idle time between upstream SSE chunks. Zero disables the
+    /// watchdog. Kept per-request so routes can apply the configured value to
+    /// both native streaming and internally reassembled JSON requests.
+    pub stream_idle_timeout_secs: u64,
     /// Shape of the reassembled response when forwarding an SSE stream as
     /// a non-streaming JSON body. Defaults to `ChatCompletion`; the
     /// `/v1/completions` route sets this to `TextCompletion`.
@@ -658,10 +662,9 @@ fn log_ids_or_empty(tracing_ids: &Option<TracingIds>) -> (String, String, String
 ///    backend. The backend (SGLang/vLLM) detects the closed connection and
 ///    aborts generation, preventing zombie requests from consuming GPU.
 ///
-/// 2. **No idle timeout**: Tokens flow continuously (~every 80ms), so neither
-///    SLIRP idle timeouts nor intermediate proxy read timeouts fire. The
-///    reqwest client timeout becomes a "total stream time" bound rather than
-///    a "time to first byte" bound.
+/// 2. **Idle watchdog**: When configured, an upstream stream that stops
+///    producing chunks fails as a typed 504 before any downstream response is
+///    sent. The ordinary reqwest timeout remains a total-request bound.
 pub async fn proxy_json_request(
     client: &reqwest::Client,
     url: &str,
@@ -717,13 +720,75 @@ pub async fn proxy_json_request(
     let mut response_data = if is_sse {
         // Consume the SSE stream and reassemble into a non-streaming response.
         let mut assembler = StreamingResponseAssembler::new(opts.response_shape);
+        let mut stream_parser = SseParser::new();
         {
             use futures_util::StreamExt;
             let mut byte_stream = std::pin::pin!(response.bytes_stream());
-            while let Some(chunk) = byte_stream.next().await {
+            loop {
+                let next_chunk = if opts.stream_idle_timeout_secs == 0 {
+                    byte_stream.next().await
+                } else {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(opts.stream_idle_timeout_secs),
+                        byte_stream.next(),
+                    )
+                    .await
+                    {
+                        Ok(chunk) => chunk,
+                        Err(_) => {
+                            metrics::counter!(
+                                "upstream_stream_incomplete_total",
+                                "reason" => "idle_timeout",
+                                "mode" => "json_via_stream"
+                            )
+                            .increment(1);
+                            let (request_id, org_id, workspace_id) =
+                                log_ids_or_empty(&opts.tracing_ids);
+                            warn!(
+                                request_id = %request_id,
+                                org_id = %org_id,
+                                workspace_id = %workspace_id,
+                                model = %opts.model_name.to_lowercase(),
+                                timeout_secs = opts.stream_idle_timeout_secs,
+                                "Upstream SSE stream exceeded the idle timeout"
+                            );
+                            return Err(AppError::UpstreamParsed {
+                                status: StatusCode::GATEWAY_TIMEOUT,
+                                message: "Upstream response stream timed out".to_string(),
+                                error_type: "upstream_stream_idle_timeout".to_string(),
+                            });
+                        }
+                    }
+                };
+                let Some(chunk) = next_chunk else {
+                    break;
+                };
                 let chunk = chunk.map_err(|e| AppError::Internal(e.into()))?;
+                stream_parser.process_chunk(&chunk);
                 assembler.process_chunk(&chunk);
             }
+        }
+        stream_parser.finish();
+        if opts.stream_idle_timeout_secs > 0 && !stream_parser.seen_done {
+            metrics::counter!(
+                "upstream_stream_incomplete_total",
+                "reason" => "missing_done",
+                "mode" => "json_via_stream"
+            )
+            .increment(1);
+            let (request_id, org_id, workspace_id) = log_ids_or_empty(&opts.tracing_ids);
+            warn!(
+                request_id = %request_id,
+                org_id = %org_id,
+                workspace_id = %workspace_id,
+                model = %opts.model_name.to_lowercase(),
+                "Upstream SSE stream ended without [DONE]"
+            );
+            return Err(AppError::UpstreamParsed {
+                status: StatusCode::BAD_GATEWAY,
+                message: "Upstream response stream ended before completion".to_string(),
+                error_type: "upstream_stream_incomplete".to_string(),
+            });
         }
         // If the stream surfaced an upstream error chunk (e.g. SGLang queue-full
         // abort), propagate it as a real upstream error. Otherwise the empty
@@ -1309,6 +1374,7 @@ pub async fn proxy_streaming_request(
     let model_name = opts.model_name.clone();
     let chunk_transform = opts.chunk_transform;
     let backend_guard = opts.backend_guard;
+    let stream_idle_timeout_secs = opts.stream_idle_timeout_secs;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
@@ -1329,6 +1395,7 @@ pub async fn proxy_streaming_request(
         let mut parser = SseParser::new();
         let mut upstream_error = false;
         let mut downstream_closed = false;
+        let mut incomplete_reason = None;
         let mut transformer = SseTransformer::new(chunk_transform);
 
         loop {
@@ -1348,6 +1415,7 @@ pub async fn proxy_streaming_request(
                                         "Stream transform failed",
                                     ))).await;
                                     upstream_error = true;
+                                    incomplete_reason = Some("transform_error");
                                     break;
                                 }
                             };
@@ -1361,6 +1429,7 @@ pub async fn proxy_streaming_request(
                         Some(Err(e)) => {
                             error!(error = %e, "Error reading upstream stream");
                             upstream_error = true;
+                            incomplete_reason = Some("upstream_read_error");
                             let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
                             break;
                         }
@@ -1372,8 +1441,29 @@ pub async fn proxy_streaming_request(
                     downstream_closed = true;
                     break;
                 }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(
+                    stream_idle_timeout_secs,
+                )), if stream_idle_timeout_secs > 0 => {
+                    warn!(
+                        request_id = %log_request_id,
+                        org_id = %log_org_id,
+                        workspace_id = %log_workspace_id,
+                        model = %model_name.to_lowercase(),
+                        timeout_secs = stream_idle_timeout_secs,
+                        "Upstream SSE stream exceeded the idle timeout"
+                    );
+                    upstream_error = true;
+                    incomplete_reason = Some("idle_timeout");
+                    let _ = tx.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Upstream response stream timed out",
+                    ))).await;
+                    break;
+                }
             }
         }
+
+        parser.finish();
 
         // Flush any remaining buffered content in the transformer
         if !upstream_error && !downstream_closed {
@@ -1390,12 +1480,39 @@ pub async fn proxy_streaming_request(
                         .send(Err(std::io::Error::other("Stream transform failed")))
                         .await;
                     upstream_error = true;
+                    incomplete_reason = Some("transform_error");
                 }
                 _ => {}
             }
         }
 
+        // Once the watchdog is enabled, an upstream EOF without the protocol
+        // terminator is an explicit downstream body error rather than a
+        // successful-looking truncated HTTP 200.
+        if stream_idle_timeout_secs > 0
+            && !upstream_error
+            && !downstream_closed
+            && !parser.seen_done
+        {
+            incomplete_reason = Some("missing_done");
+            let _ = tx
+                .send(Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Upstream response stream ended before [DONE]",
+                )))
+                .await;
+        }
+
         let completed_cleanly = !upstream_error && !downstream_closed && parser.seen_done;
+        if !completed_cleanly && !downstream_closed {
+            let reason = incomplete_reason.unwrap_or("missing_done");
+            metrics::counter!(
+                "upstream_stream_incomplete_total",
+                "reason" => reason,
+                "mode" => "streaming_request"
+            )
+            .increment(1);
+        }
 
         // Bill for the tokens the backend already produced, even when the stream
         // did NOT finish cleanly (nearai/infra#98). With continuous_usage_stats
@@ -1809,6 +1926,7 @@ pub async fn proxy_streaming_response(
     let model_name = opts.model_name.clone();
     let chunk_transform = opts.chunk_transform;
     let backend_guard = opts.backend_guard;
+    let stream_idle_timeout_secs = opts.stream_idle_timeout_secs;
     let request_sha256 = request_sha256.to_string();
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
@@ -1825,6 +1943,7 @@ pub async fn proxy_streaming_response(
         let mut parser = SseParser::new();
         let mut upstream_error = false;
         let mut downstream_closed = false;
+        let mut incomplete_reason = None;
         let mut transformer = SseTransformer::new(chunk_transform);
 
         loop {
@@ -1844,6 +1963,7 @@ pub async fn proxy_streaming_response(
                                         "Stream transform failed",
                                     ))).await;
                                     upstream_error = true;
+                                    incomplete_reason = Some("transform_error");
                                     break;
                                 }
                             };
@@ -1858,6 +1978,7 @@ pub async fn proxy_streaming_response(
                         Some(Err(e)) => {
                             error!(error = %e, "Error reading upstream stream");
                             upstream_error = true;
+                            incomplete_reason = Some("upstream_read_error");
                             let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
                             break;
                         }
@@ -1869,8 +1990,29 @@ pub async fn proxy_streaming_response(
                     downstream_closed = true;
                     break;
                 }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(
+                    stream_idle_timeout_secs,
+                )), if stream_idle_timeout_secs > 0 => {
+                    warn!(
+                        request_id = %log_request_id,
+                        org_id = %log_org_id,
+                        workspace_id = %log_workspace_id,
+                        model = %model_name.to_lowercase(),
+                        timeout_secs = stream_idle_timeout_secs,
+                        "Upstream SSE stream exceeded the idle timeout"
+                    );
+                    upstream_error = true;
+                    incomplete_reason = Some("idle_timeout");
+                    let _ = tx.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Upstream response stream timed out",
+                    ))).await;
+                    break;
+                }
             }
         }
+
+        parser.finish();
 
         // Flush any remaining buffered content in the transformer
         if !upstream_error && !downstream_closed {
@@ -1887,12 +2029,36 @@ pub async fn proxy_streaming_response(
                         .send(Err(std::io::Error::other("Stream transform failed")))
                         .await;
                     upstream_error = true;
+                    incomplete_reason = Some("transform_error");
                 }
                 _ => {}
             }
         }
 
+        if stream_idle_timeout_secs > 0
+            && !upstream_error
+            && !downstream_closed
+            && !parser.seen_done
+        {
+            incomplete_reason = Some("missing_done");
+            let _ = tx
+                .send(Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Upstream response stream ended before [DONE]",
+                )))
+                .await;
+        }
+
         let completed_cleanly = !upstream_error && !downstream_closed && parser.seen_done;
+        if !completed_cleanly && !downstream_closed {
+            let reason = incomplete_reason.unwrap_or("missing_done");
+            metrics::counter!(
+                "upstream_stream_incomplete_total",
+                "reason" => reason,
+                "mode" => "streaming_response"
+            )
+            .increment(1);
+        }
 
         // Bill for tokens already produced even on an interrupted stream
         // (nearai/infra#98). Shared with proxy_streaming_request so both
@@ -2082,6 +2248,14 @@ impl SseParser {
             self.line_buffer.drain(..newline_pos + 1);
         }
     }
+
+    /// Dispatch a final unterminated SSE line at end-of-stream. SSE permits
+    /// the last event line to omit its newline, including `data: [DONE]`.
+    pub fn finish(&mut self) {
+        if !self.line_buffer.is_empty() {
+            self.process_chunk(b"\n");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2233,6 +2407,7 @@ mod tests {
             response_transform: None,
             chunk_transform: None,
             backend_guard: None,
+            stream_idle_timeout_secs: 0,
             response_shape: ResponseShape::default(),
             tracing_ids: None,
         }
@@ -2394,6 +2569,94 @@ mod tests {
         );
     }
 
+    async fn raw_sse_response(body: Option<&'static str>, hold_open: bool) -> reqwest::Response {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            if let Some(body) = body {
+                let encoded = format!("{:X}\r\n{}\r\n0\r\n\r\n", body.len(), body);
+                socket.write_all(encoded.as_bytes()).await.unwrap();
+            }
+            if hold_open {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        });
+
+        reqwest::Client::new()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_stream_idle_watchdog_fails_downstream_body() {
+        let upstream = raw_sse_response(None, true).await;
+        let mut opts = test_proxy_opts();
+        opts.stream_idle_timeout_secs = 1;
+        let response = proxy_streaming_response(upstream, "request-sha256", opts, StatusCode::OK)
+            .await
+            .unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            axum::body::to_bytes(response.into_body(), 1024 * 1024),
+        )
+        .await
+        .expect("idle watchdog should fire before the test timeout");
+        assert!(
+            result.is_err(),
+            "stalled stream must fail the response body"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_missing_done_fails_downstream_body_when_watchdog_enabled() {
+        let upstream =
+            raw_sse_response(Some("data: {\"id\":\"chat-1\",\"choices\":[]}\n\n"), false).await;
+        let mut opts = test_proxy_opts();
+        opts.stream_idle_timeout_secs = 1;
+        let response = proxy_streaming_response(upstream, "request-sha256", opts, StatusCode::OK)
+            .await
+            .unwrap();
+
+        let result = axum::body::to_bytes(response.into_body(), 1024 * 1024).await;
+        assert!(
+            result.is_err(),
+            "stream without [DONE] must fail the response body"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_done_without_trailing_newline_completes_cleanly() {
+        let upstream = raw_sse_response(
+            Some("data: {\"id\":\"chat-1\",\"choices\":[]}\n\ndata: [DONE]"),
+            false,
+        )
+        .await;
+        let mut opts = test_proxy_opts();
+        opts.stream_idle_timeout_secs = 1;
+        let response = proxy_streaming_response(upstream, "request-sha256", opts, StatusCode::OK)
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("valid final [DONE] line must not fail the response body");
+        assert!(body.ends_with(b"data: [DONE]"));
+    }
+
     #[test]
     fn test_sse_parser_normal_sse() {
         let mut parser = SseParser::new();
@@ -2445,6 +2708,16 @@ mod tests {
         parser.process_chunk(b"data: {\"id\":\"chat-6\"}\n\n");
         assert_eq!(parser.chat_id.as_deref(), Some("chat-6"));
         assert!(!parser.seen_done);
+    }
+
+    #[test]
+    fn test_sse_parser_done_without_trailing_newline() {
+        let mut parser = SseParser::new();
+        parser.process_chunk(b"data: [DONE]");
+        assert!(!parser.seen_done);
+
+        parser.finish();
+        assert!(parser.seen_done);
     }
 
     #[test]

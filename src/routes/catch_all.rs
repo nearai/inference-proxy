@@ -246,6 +246,7 @@ pub async fn catch_all(
             response_transform: None,
             chunk_transform: None,
             backend_guard: Some(backend_guard),
+            stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
             response_shape: ResponseShape::ChatCompletion,
             tracing_ids: Some(tracing_ids.clone()),
         };
@@ -274,6 +275,7 @@ pub async fn catch_all(
             response_transform: None,
             chunk_transform: None,
             backend_guard: None,
+            stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
             response_shape: ResponseShape::ChatCompletion,
             tracing_ids: Some(tracing_ids),
         };

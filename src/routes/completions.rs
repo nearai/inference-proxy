@@ -102,6 +102,7 @@ pub async fn completions(
         response_transform,
         chunk_transform,
         backend_guard: Some(guard),
+        stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
         response_shape: ResponseShape::TextCompletion,
         tracing_ids: Some(tracing_ids),
     };

@@ -202,6 +202,7 @@ pub async fn chat_completions(
         response_transform,
         chunk_transform,
         backend_guard: Some(guard),
+        stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
         response_shape: ResponseShape::ChatCompletion,
         tracing_ids: Some(tracing_ids),
     };

@@ -1498,6 +1498,7 @@ async fn finish_response(
         response_transform: ctx.response_transform,
         chunk_transform: ctx.chunk_transform,
         backend_guard: None,
+        stream_idle_timeout_secs: ctx.state.config.stream_idle_timeout_secs,
         response_shape: ResponseShape::ChatCompletion,
         tracing_ids: Some(ctx.tracing_ids),
     };

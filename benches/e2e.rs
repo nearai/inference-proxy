@@ -76,6 +76,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,
+        stream_idle_timeout_secs: 0,
         timeout_tokenize_secs: 5,
         openai_chat_compatibility_check_enabled: false,
         startup_check_retries: 0,

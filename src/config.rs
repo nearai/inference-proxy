@@ -153,6 +153,10 @@ pub struct Config {
 
     // Timeouts
     pub timeout_secs: u64,
+    /// Maximum idle time between upstream SSE chunks. Zero disables the
+    /// watchdog. This is separate from `timeout_secs`, which bounds the total
+    /// reqwest request lifetime rather than token cadence.
+    pub stream_idle_timeout_secs: u64,
     pub timeout_tokenize_secs: u64,
 
     // Cloud API for sk- key validation
@@ -465,6 +469,7 @@ impl Config {
             rate_limit_burst_size: env_int("RATE_LIMIT_BURST_SIZE", 200) as u32,
             rate_limit_trust_proxy_headers: !env_bool("RATE_LIMIT_NO_TRUST_PROXY"),
             timeout_secs: env_int("VLLM_PROXY_TIMEOUT_SECS", 3600) as u64,
+            stream_idle_timeout_secs: env_int("VLLM_PROXY_STREAM_IDLE_TIMEOUT_SECS", 0) as u64,
             timeout_tokenize_secs: 10,
             openai_chat_compatibility_check_enabled: env_bool("OPENAI_CHAT_COMPATIBILITY_CHECK"),
             startup_check_retries: env_int("STARTUP_CHECK_RETRIES", 3),
@@ -724,6 +729,7 @@ mod tests {
             env::remove_var("VLLM_ALLOWED_MEDIA_DOMAINS");
             env::remove_var("VLLM_PROXY_IMAGE_VALIDATION_ALLOWED_DOMAINS");
             env::remove_var("VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB");
+            env::remove_var("VLLM_PROXY_STREAM_IDLE_TIMEOUT_SECS");
             env::remove_var("WEB_CONTEXT_SEARCH_URL");
             env::remove_var("WEB_CONTEXT_SEARCH_API_KEY");
             env::remove_var("FUSION_ENABLED");
@@ -767,6 +773,7 @@ mod tests {
             assert!(config.image_validation_allowed_domains.is_empty());
             assert!(!config.image_validation_reject_non_rgb_images);
             assert!(!config.image_validation_reject_single_channel_images);
+            assert_eq!(config.stream_idle_timeout_secs, 0);
             assert!(!config.fusion_enabled);
             assert_eq!(
                 config.fusion_endpoints_url,
@@ -782,6 +789,21 @@ mod tests {
             assert_eq!(config.fusion_internal_max_attempts, 2);
             assert_eq!(config.fusion_internal_retry_initial_backoff_ms, 250);
         });
+    }
+
+    #[test]
+    fn test_stream_idle_timeout_env_override() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "test-model"),
+                ("TOKEN", "tok"),
+                ("VLLM_PROXY_STREAM_IDLE_TIMEOUT_SECS", "20"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.stream_idle_timeout_secs, 20);
+            },
+        );
     }
 
     #[test]

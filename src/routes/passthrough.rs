@@ -226,6 +226,7 @@ pub async fn images_edits(
         response_transform,
         chunk_transform: None,
         backend_guard: None,
+        stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
         response_shape: ResponseShape::ChatCompletion,
         tracing_ids: Some(tracing_ids),
     };
@@ -311,6 +312,7 @@ pub async fn audio_transcriptions(
         response_transform,
         chunk_transform: None,
         backend_guard: None,
+        stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
         response_shape: ResponseShape::ChatCompletion,
         tracing_ids: Some(tracing_ids),
     };
@@ -377,6 +379,7 @@ async fn json_passthrough_encrypted(
                 response_transform,
                 chunk_transform: None,
                 backend_guard: None,
+                stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
                 response_shape: ResponseShape::ChatCompletion,
                 tracing_ids: Some(tracing_ids.clone()),
             };
@@ -395,6 +398,7 @@ async fn json_passthrough_encrypted(
                 response_transform,
                 chunk_transform: None,
                 backend_guard: Some(guard),
+                stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
                 response_shape: ResponseShape::ChatCompletion,
                 tracing_ids: Some(tracing_ids),
             };

@@ -73,6 +73,7 @@ fn build_agent_loop_app_with_cloud(
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,
+        stream_idle_timeout_secs: 0,
         timeout_tokenize_secs: 5,
         openai_chat_compatibility_check_enabled: false,
         startup_check_retries: 1,

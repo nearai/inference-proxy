@@ -73,6 +73,8 @@ fn test_upstream_error_log_excludes_parsed_body_content() {
         request_id_inbound: true,
         org_id: Some("org-test".to_string()),
         workspace_id: Some("workspace-test".to_string()),
+        request_source: None,
+        forward_tenant_headers: false,
     };
 
     let _subscriber_guard = tracing::subscriber::set_default(subscriber);

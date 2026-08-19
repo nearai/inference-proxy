@@ -31,8 +31,7 @@ pub async fn chat_completions(
 
     // Extract encryption context from headers
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
-    let tracing_ids =
-        tracing_ids.with_trusted_tenant_headers(&headers, auth.cloud_api_key.is_none());
+    let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
 
     // Request hash for signing: SHA256(wire body) by default. X-Request-Hash is only
     // honored when authenticated with config.token (trusted gateway); sk- clients

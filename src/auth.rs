@@ -6,7 +6,88 @@ use tracing::warn;
 
 use crate::config::Config;
 use crate::error::AppError;
+use crate::request_tracing::TracingIds;
 use crate::AppState;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthPath {
+    TrustedConfigToken,
+    CloudApiKey,
+}
+
+impl AuthPath {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::TrustedConfigToken => "trusted_config_token",
+            Self::CloudApiKey => "cloud_api_key",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngressRouteKind {
+    Canonical,
+    Indexed,
+    Long,
+    LongIndexed,
+    Other,
+    Missing,
+}
+
+impl IngressRouteKind {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Canonical => "canonical",
+            Self::Indexed => "indexed",
+            Self::Long => "long",
+            Self::LongIndexed => "long_indexed",
+            Self::Other => "other",
+            Self::Missing => "missing",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestSource {
+    pub auth_path: AuthPath,
+    pub ingress_route: IngressRouteKind,
+}
+
+fn classify_ingress_host(host: Option<&str>) -> IngressRouteKind {
+    let Some(host) = host else {
+        return IngressRouteKind::Missing;
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if !(host.ends_with(".completions.near.ai") || host.ends_with(".completions-stg.near.ai")) {
+        return IngressRouteKind::Other;
+    }
+
+    let Some(label) = host.split('.').next() else {
+        return IngressRouteKind::Other;
+    };
+    let (base_label, indexed) = label
+        .rsplit_once("-i")
+        .filter(|(_, index)| !index.is_empty() && index.chars().all(|c| c.is_ascii_digit()))
+        .map_or((label, false), |(base, _)| (base, true));
+    let long = base_label.ends_with("-long");
+
+    match (long, indexed) {
+        (false, false) => IngressRouteKind::Canonical,
+        (false, true) => IngressRouteKind::Indexed,
+        (true, false) => IngressRouteKind::Long,
+        (true, true) => IngressRouteKind::LongIndexed,
+    }
+}
+
+fn classify_ingress_route(parts: &Parts) -> IngressRouteKind {
+    let authority_host = parts.uri.authority().map(|authority| authority.host());
+    let header_host = parts
+        .headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(':').next());
+    classify_ingress_host(authority_host.or(header_host))
+}
 
 /// Extractor that validates Bearer token authentication.
 /// Use as a handler parameter to require auth on a route.
@@ -22,6 +103,11 @@ pub struct RequireAuth {
     pub org_id: Option<String>,
     pub workspace_id: Option<String>,
     pub api_key_id: Option<String>,
+    /// Correlation ID selected by request middleware. Direct-key usage
+    /// reporting forwards this to Cloud API so auth, completion, and billing
+    /// handoff logs can be joined without using the raw API key.
+    pub request_id: Option<String>,
+    pub request_source: RequestSource,
 }
 
 /// Subject identity extracted from a successful `/v1/check_api_key` response.
@@ -99,6 +185,7 @@ async fn check_cloud_api_key(
     config: &Config,
     cloud_api_url: &str,
     token: &str,
+    request_id: Option<&str>,
 ) -> Result<AuthSubject, AppError> {
     let url = format!("{cloud_api_url}/v1/check_api_key");
     let max_attempts = config.cloud_api_auth_max_attempts.max(1);
@@ -106,12 +193,14 @@ async fn check_cloud_api_key(
     let initial_backoff_ms = config.cloud_api_auth_initial_backoff_ms;
 
     for attempt in 1..=max_attempts {
-        let result = http_client
+        let mut request = http_client
             .post(&url)
             .header("authorization", format!("Bearer {token}"))
-            .timeout(per_attempt_timeout)
-            .send()
-            .await;
+            .timeout(per_attempt_timeout);
+        if let Some(request_id) = request_id {
+            request = request.header("x-request-id", request_id);
+        }
+        let result = request.send().await;
 
         let (status, body_bytes) = match result {
             Ok(response) => {
@@ -251,6 +340,14 @@ impl FromRequestParts<AppState> for RequireAuth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        let ingress_route = classify_ingress_route(parts);
+        // request_id_middleware has already normalized this to a UUID. Reuse it
+        // for the Cloud API auth check so direct traffic is joinable across the
+        // check-api-key and completion logs.
+        let request_id = parts
+            .extensions
+            .get::<TracingIds>()
+            .map(|ids| ids.request_id.clone());
         let auth_header = parts
             .headers
             .get("authorization")
@@ -267,6 +364,11 @@ impl FromRequestParts<AppState> for RequireAuth {
                         org_id: None,
                         workspace_id: None,
                         api_key_id: None,
+                        request_id,
+                        request_source: RequestSource {
+                            auth_path: AuthPath::TrustedConfigToken,
+                            ingress_route,
+                        },
                     });
                 }
 
@@ -278,6 +380,7 @@ impl FromRequestParts<AppState> for RequireAuth {
                             &state.config,
                             cloud_api_url,
                             token,
+                            request_id.as_deref(),
                         )
                         .await?;
                         return Ok(RequireAuth {
@@ -285,6 +388,11 @@ impl FromRequestParts<AppState> for RequireAuth {
                             org_id: subject.org_id,
                             workspace_id: subject.workspace_id,
                             api_key_id: subject.api_key_id,
+                            request_id,
+                            request_source: RequestSource {
+                                auth_path: AuthPath::CloudApiKey,
+                                ingress_route,
+                            },
                         });
                     }
                 }
@@ -301,6 +409,31 @@ mod tests {
     use super::*;
     use std::hint::black_box;
     use std::time::Instant;
+
+    #[test]
+    fn classifies_bounded_ingress_route_kinds() {
+        assert_eq!(
+            classify_ingress_host(Some("glm-5-2.completions.near.ai")),
+            IngressRouteKind::Canonical
+        );
+        assert_eq!(
+            classify_ingress_host(Some("glm-5-2-i7.completions.near.ai")),
+            IngressRouteKind::Indexed
+        );
+        assert_eq!(
+            classify_ingress_host(Some("glm-5-2-long.completions.near.ai")),
+            IngressRouteKind::Long
+        );
+        assert_eq!(
+            classify_ingress_host(Some("glm-5-2-long-i2.completions-stg.near.ai")),
+            IngressRouteKind::LongIndexed
+        );
+        assert_eq!(
+            classify_ingress_host(Some("127.0.0.1")),
+            IngressRouteKind::Other
+        );
+        assert_eq!(classify_ingress_host(None), IngressRouteKind::Missing);
+    }
 
     /// Measure the median duration (in nanoseconds) of `iterations` calls to `compare_fn(a, b)`.
     fn median_nanos(

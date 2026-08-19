@@ -155,8 +155,7 @@ pub async fn catch_all(
         None => path.to_string(),
     };
     let (backend_url, backend_guard) = state.backend_pool.select_url(&path_with_query);
-    let tracing_ids =
-        tracing_ids.with_trusted_tenant_headers(&headers, auth.cloud_api_key.is_none());
+    let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
 
     let logged_backend_url = proxy::sanitized_upstream_url_for_logs(&backend_url);
     debug!(method = %method, backend_url = %logged_backend_url, "Catch-all passthrough");

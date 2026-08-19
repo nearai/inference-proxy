@@ -30,7 +30,9 @@ use tracing::{debug, error, info, warn};
 use crate::auth::RequireAuth;
 use crate::encryption::ChunkTransform;
 use crate::error::AppError;
-use crate::proxy::{make_usage_reporter, normalize_chat_chunk, spawn_usage_report, StreamingGuard};
+use crate::proxy::{
+    make_usage_reporter, normalize_chat_chunk, report_chat_usage_if_present, StreamingGuard,
+};
 use crate::{AppState, TracingIds};
 
 pub const WEB_CONTEXT_SEARCH_TOOL_NAME: &str = "web_context_search";
@@ -196,29 +198,23 @@ pub async fn run_chat_completion(
                 // sk- requests (RequireAuth.cloud_api_key); cloud-api's own
                 // InterceptStream is not in that path, so this is the sole biller —
                 // no double-billing. Reported at most once per loop (one chat id).
-                if let (Some(reporter), Some(chat_id)) =
-                    (usage_reporter.as_ref(), result.chat_id.as_deref())
-                {
-                    if result.input_tokens > 0 || result.output_tokens > 0 {
-                        let body = json!({
-                            "type": "chat_completion",
-                            "model": reporter.model_name,
-                            "input_tokens": result.input_tokens,
-                            "output_tokens": result.output_tokens,
-                            "id": chat_id,
-                        });
-                        spawn_usage_report(reporter, body);
-                        if !result.completed_cleanly {
-                            info!(
-                                request_id = %tracing_ids.request_id,
-                                org_id = %tracing_ids.org_id_or_empty(),
-                                workspace_id = %tracing_ids.workspace_id_or_empty(),
-                                chat_id = %chat_id,
-                                input_tokens = result.input_tokens,
-                                output_tokens = result.output_tokens,
-                                "Reported usage for interrupted agent loop"
-                            );
-                        }
+                if let Some(reporter) = usage_reporter.as_ref() {
+                    let usage = (result.input_tokens > 0 || result.output_tokens > 0).then_some((
+                        i64::try_from(result.input_tokens).unwrap_or(i64::MAX),
+                        i64::try_from(result.output_tokens).unwrap_or(i64::MAX),
+                    ));
+                    let reported =
+                        report_chat_usage_if_present(reporter, usage, result.chat_id.as_deref());
+                    if reported && !result.completed_cleanly {
+                        info!(
+                            request_id = %tracing_ids.request_id,
+                            org_id = %tracing_ids.org_id_or_empty(),
+                            workspace_id = %tracing_ids.workspace_id_or_empty(),
+                            chat_id = %result.chat_id.as_deref().unwrap_or(""),
+                            input_tokens = result.input_tokens,
+                            output_tokens = result.output_tokens,
+                            "Reported usage for interrupted agent loop"
+                        );
                     }
                 }
 

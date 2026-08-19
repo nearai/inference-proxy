@@ -172,8 +172,24 @@ async fn public_cloud_api_key_tenant_headers_are_not_forwarded() {
     );
     assert!(!received[0].headers.contains_key("x-org-id"));
     assert!(!received[0].headers.contains_key("x-workspace-id"));
+
+    let auth_checks: Vec<_> = cloud_api
+        .received_requests()
+        .await
+        .expect("cloud api records auth checks")
+        .into_iter()
+        .filter(|request| request.url.path() == "/v1/check_api_key")
+        .collect();
+    assert_eq!(auth_checks.len(), 1);
+    assert_eq!(
+        auth_checks[0]
+            .headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(VALID_REQUEST_ID)
+    );
     eprintln!(
-        "manual-qa: public tenant strip wiremock x-request-id={} x-org-id_present={} x-workspace-id_present={}",
+        "manual-qa: public tenant strip wiremock x-request-id={} auth_check_correlated=true x-org-id_present={} x-workspace-id_present={}",
         VALID_REQUEST_ID,
         received[0].headers.contains_key("x-org-id"),
         received[0].headers.contains_key("x-workspace-id")

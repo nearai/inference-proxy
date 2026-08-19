@@ -3,11 +3,14 @@ use axum::middleware::Next;
 use axum::response::Response;
 use tracing::Instrument;
 
+use crate::auth::{AuthPath, RequestSource, RequireAuth};
+
 /// Tracing correlation IDs for a request, parsed once by `request_id_middleware`
 /// from `X-Request-Id` and inserted into the request extensions. Handlers that
 /// have authenticated a trusted config token may opt in to tenant propagation
-/// from `X-Org-Id` / `X-Workspace-Id`; public Cloud API key requests cannot
-/// inject those tenant log/forwarding fields.
+/// from `X-Org-Id` / `X-Workspace-Id`. Public Cloud API key requests cannot
+/// inject those fields; their log identity comes only from the server-side
+/// `/v1/check_api_key` response and is not forwarded to the model backend.
 #[derive(Clone, Debug)]
 pub struct TracingIds {
     /// The request ID used in spans, logs, and the response header. Either the
@@ -20,6 +23,13 @@ pub struct TracingIds {
     pub org_id: Option<String>,
     /// Trusted `X-Workspace-Id`, if present and ASCII-valid.
     pub workspace_id: Option<String>,
+    /// Bounded authentication and ingress-route classification attached only
+    /// after the request has passed authentication.
+    pub request_source: Option<RequestSource>,
+    /// Whether tenant IDs may be forwarded to the model backend. This is true
+    /// only for the trusted config-token/gateway path. Verified direct-key IDs
+    /// are retained for logs but do not change the upstream wire contract.
+    pub(crate) forward_tenant_headers: bool,
 }
 
 impl TracingIds {
@@ -40,6 +50,8 @@ impl TracingIds {
             request_id_inbound,
             org_id: None,
             workspace_id: None,
+            request_source: None,
+            forward_tenant_headers: false,
         }
     }
 
@@ -66,7 +78,43 @@ impl TracingIds {
             request_id_inbound: self.request_id_inbound,
             org_id,
             workspace_id,
+            request_source: self.request_source,
+            forward_tenant_headers: true,
         }
+    }
+
+    /// Return a copy with tenant identity obtained from the authenticated
+    /// Cloud API response. These values are authoritative for observability,
+    /// but remain log-only so direct traffic cannot alter backend headers.
+    fn with_verified_tenant(&self, org_id: Option<&str>, workspace_id: Option<&str>) -> Self {
+        Self {
+            request_id: self.request_id.clone(),
+            request_id_inbound: self.request_id_inbound,
+            org_id: org_id.map(str::to_string),
+            workspace_id: workspace_id.map(str::to_string),
+            request_source: self.request_source,
+            forward_tenant_headers: false,
+        }
+    }
+
+    /// Attach the only tenant context authorized for the authentication path:
+    /// trusted gateway headers for the config token, or server-verified IDs
+    /// returned by Cloud API for a direct `sk-` key. Caller-supplied tenant
+    /// headers are therefore ignored on the public direct-key path.
+    pub fn with_authenticated_context(&self, headers: &HeaderMap, auth: &RequireAuth) -> Self {
+        let ids = match auth.request_source.auth_path {
+            AuthPath::CloudApiKey => {
+                self.with_verified_tenant(auth.org_id.as_deref(), auth.workspace_id.as_deref())
+            }
+            AuthPath::TrustedConfigToken => self.with_trusted_tenant_headers(headers, true),
+        };
+        ids.with_request_source(auth.request_source)
+    }
+
+    pub fn with_request_source(&self, request_source: RequestSource) -> Self {
+        let mut ids = self.clone();
+        ids.request_source = Some(request_source);
+        ids
     }
 
     /// `(name, value)` pairs to forward to the upstream backend. Always forwards
@@ -74,8 +122,16 @@ impl TracingIds {
     /// handler explicitly attached trusted tenant metadata.
     pub fn upstream_headers(&self) -> impl Iterator<Item = (&'static str, &str)> + '_ {
         let req = Some(("x-request-id", self.request_id.as_str()));
-        let org = self.org_id.as_deref().map(|v| ("x-org-id", v));
-        let ws = self.workspace_id.as_deref().map(|v| ("x-workspace-id", v));
+        let org = self
+            .forward_tenant_headers
+            .then_some(self.org_id.as_deref())
+            .flatten()
+            .map(|v| ("x-org-id", v));
+        let ws = self
+            .forward_tenant_headers
+            .then_some(self.workspace_id.as_deref())
+            .flatten()
+            .map(|v| ("x-workspace-id", v));
         req.into_iter().chain(org).chain(ws)
     }
 
@@ -210,6 +266,63 @@ mod tests {
         );
         assert!(trusted_forwarded.contains(&("x-org-id", "org-uuid-123")));
         assert!(trusted_forwarded.contains(&("x-workspace-id", "ws-uuid-456")));
+
+        let classified = trusted_ids.with_request_source(RequestSource {
+            auth_path: crate::auth::AuthPath::TrustedConfigToken,
+            ingress_route: crate::auth::IngressRouteKind::LongIndexed,
+        });
+        assert_eq!(
+            classified.request_source,
+            Some(RequestSource {
+                auth_path: crate::auth::AuthPath::TrustedConfigToken,
+                ingress_route: crate::auth::IngressRouteKind::LongIndexed,
+            })
+        );
+
+        let direct_auth = RequireAuth {
+            cloud_api_key: Some("sk-test-redacted".to_string()),
+            org_id: Some("org-authenticated".to_string()),
+            workspace_id: Some("ws-authenticated".to_string()),
+            api_key_id: Some("key-authenticated".to_string()),
+            request_id: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            request_source: RequestSource {
+                auth_path: crate::auth::AuthPath::CloudApiKey,
+                ingress_route: crate::auth::IngressRouteKind::Canonical,
+            },
+        };
+        let verified_ids = ids.with_authenticated_context(&h, &direct_auth);
+        assert_eq!(verified_ids.org_id.as_deref(), Some("org-authenticated"));
+        assert_eq!(
+            verified_ids.workspace_id.as_deref(),
+            Some("ws-authenticated")
+        );
+        assert_eq!(
+            verified_ids.request_source,
+            Some(direct_auth.request_source)
+        );
+        assert_eq!(
+            verified_ids.upstream_headers().collect::<Vec<_>>(),
+            vec![("x-request-id", "550e8400-e29b-41d4-a716-446655440000")],
+            "verified direct-key identity is log-only; spoofed public tenant headers stay off wire"
+        );
+
+        // The explicit auth-path classification is the authorization boundary;
+        // incidental population of cloud_api_key must not override it.
+        let trusted_auth = RequireAuth {
+            cloud_api_key: Some("implementation-detail-only".to_string()),
+            org_id: None,
+            workspace_id: None,
+            api_key_id: None,
+            request_id: None,
+            request_source: RequestSource {
+                auth_path: crate::auth::AuthPath::TrustedConfigToken,
+                ingress_route: crate::auth::IngressRouteKind::Canonical,
+            },
+        };
+        let trusted_ids = ids.with_authenticated_context(&h, &trusted_auth);
+        let trusted_headers = trusted_ids.upstream_headers().collect::<Vec<_>>();
+        assert!(trusted_headers.contains(&("x-org-id", "org-uuid-123")));
+        assert!(trusted_headers.contains(&("x-workspace-id", "ws-uuid-456")));
     }
 
     #[test]

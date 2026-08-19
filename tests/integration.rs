@@ -6293,6 +6293,7 @@ async fn get_usage_requests(cloud_api: &MockServer) -> Vec<serde_json::Value> {
 async fn test_usage_reported_for_cloud_api_key_non_streaming() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    let request_id = "550e8400-e29b-41d4-a716-446655440000";
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -6336,6 +6337,7 @@ async fn test_usage_reported_for_cloud_api_key_non_streaming() {
                 .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
                 .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .header("x-request-id", request_id)
                 .body(Body::from(serde_json::to_string(&request_body).unwrap()))
                 .unwrap(),
         )
@@ -6353,6 +6355,25 @@ async fn test_usage_reported_for_cloud_api_key_non_streaming() {
     assert_eq!(usage_reqs[0]["input_tokens"], 10);
     assert_eq!(usage_reqs[0]["output_tokens"], 5);
     assert!(usage_reqs[0]["id"].as_str().is_some());
+
+    // The same safe correlation ID must cover both Cloud API calls: key
+    // verification and the later async usage handoff. This makes direct
+    // requests joinable without forwarding or logging the raw API key.
+    let cloud_api_reqs = cloud_api.received_requests().await.unwrap_or_default();
+    for path in ["/v1/check_api_key", "/v1/internal/usage"] {
+        let request = cloud_api_reqs
+            .iter()
+            .find(|request| request.url.path() == path)
+            .unwrap_or_else(|| panic!("expected Cloud API request to {path}"));
+        assert_eq!(
+            request
+                .headers
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some(request_id),
+            "{path} should carry the completion request ID"
+        );
+    }
 }
 
 #[tokio::test]

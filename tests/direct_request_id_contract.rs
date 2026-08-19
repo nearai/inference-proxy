@@ -131,8 +131,31 @@ async fn direct_privacy_classify_observable_request_id_contract() {
     assert!(!invalid_upstream.headers.contains_key("x-org-id"));
     assert!(!invalid_upstream.headers.contains_key("x-workspace-id"));
 
+    let auth_checks: Vec<_> = cloud_api
+        .received_requests()
+        .await
+        .expect("cloud api records auth checks")
+        .into_iter()
+        .filter(|request| request.url.path() == "/v1/check_api_key")
+        .collect();
+    assert_eq!(auth_checks.len(), 2, "expected one auth check per request");
+    assert_eq!(
+        auth_checks[0]
+            .headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(VALID_REQUEST_ID)
+    );
+    assert_eq!(
+        auth_checks[1]
+            .headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(replacement_id.as_str())
+    );
+
     eprintln!(
-        "manual-qa: POST /v1/privacy/classify forwarded status=200 valid_x_request_id={} invalid_replacement_x_request_id={} upstream_valid_query={} tenant_headers_present=false",
+        "manual-qa: POST /v1/privacy/classify forwarded status=200 valid_x_request_id={} invalid_replacement_x_request_id={} upstream_valid_query={} auth_checks_correlated=true tenant_headers_present=false",
         VALID_REQUEST_ID,
         replacement_id,
         valid_upstream.url.query().unwrap_or("<missing>")

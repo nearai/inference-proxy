@@ -633,20 +633,24 @@ fn report_stream_usage_on_finalize(
     let Some(reporter) = usage_reporter else {
         return;
     };
-    let reported = report_chat_usage_if_present(reporter, usage, chat_id);
-
-    if reported && !completed_cleanly {
-        let (input, output) = usage.expect("reported usage requires token counts");
-        let id = chat_id.expect("reported usage requires a response id");
-        info!(
-            request_id = %log_request_id,
-            org_id = %log_org_id,
-            workspace_id = %log_workspace_id,
-            chat_id = %id,
-            input_tokens = input,
-            output_tokens = output,
-            "Reported usage for interrupted stream"
-        );
+    match (usage, chat_id) {
+        (Some((input, output)), Some(id)) => {
+            let reported = report_chat_usage_if_present(reporter, Some((input, output)), Some(id));
+            if reported && !completed_cleanly {
+                info!(
+                    request_id = %log_request_id,
+                    org_id = %log_org_id,
+                    workspace_id = %log_workspace_id,
+                    chat_id = %id,
+                    input_tokens = input,
+                    output_tokens = output,
+                    "Reported usage for interrupted stream"
+                );
+            }
+        }
+        _ => {
+            report_chat_usage_if_present(reporter, usage, chat_id);
+        }
     }
 }
 
@@ -746,7 +750,8 @@ pub(crate) fn spawn_usage_report(reporter: &UsageReporter, mut body: serde_json:
             Ok(resp) => {
                 let status = resp.status();
                 let outcome = classify_usage_http_status(status);
-                record_usage_report_outcome(&reporter, outcome, Some(started_at.elapsed()));
+                let elapsed = started_at.elapsed();
+                record_usage_report_outcome(&reporter, outcome, Some(elapsed));
                 if outcome == UsageReportOutcome::Accepted {
                     info!(
                         request_id = %reporter.request_id.as_deref().unwrap_or(""),
@@ -755,7 +760,7 @@ pub(crate) fn spawn_usage_report(reporter: &UsageReporter, mut body: serde_json:
                         api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
                         model = %reporter.model_name,
                         status = %status,
-                        duration_ms = started_at.elapsed().as_millis() as u64,
+                        duration_ms = elapsed.as_millis() as u64,
                         auth_path = reporter.request_source.auth_path.as_label(),
                         ingress_route = reporter.request_source.ingress_route.as_label(),
                         "Direct-key usage report accepted by Cloud API"
@@ -768,7 +773,7 @@ pub(crate) fn spawn_usage_report(reporter: &UsageReporter, mut body: serde_json:
                         api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
                         model = %reporter.model_name,
                         status = %status,
-                        duration_ms = started_at.elapsed().as_millis() as u64,
+                        duration_ms = elapsed.as_millis() as u64,
                         auth_path = reporter.request_source.auth_path.as_label(),
                         ingress_route = reporter.request_source.ingress_route.as_label(),
                         outcome = outcome.as_label(),
@@ -778,7 +783,8 @@ pub(crate) fn spawn_usage_report(reporter: &UsageReporter, mut body: serde_json:
             }
             Err(error) => {
                 let outcome = classify_usage_request_error(&error);
-                record_usage_report_outcome(&reporter, outcome, Some(started_at.elapsed()));
+                let elapsed = started_at.elapsed();
+                record_usage_report_outcome(&reporter, outcome, Some(elapsed));
                 warn!(
                     request_id = %reporter.request_id.as_deref().unwrap_or(""),
                     org_id = %reporter.org_id.as_deref().unwrap_or(""),
@@ -786,7 +792,7 @@ pub(crate) fn spawn_usage_report(reporter: &UsageReporter, mut body: serde_json:
                     api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
                     model = %reporter.model_name,
                     error = %error,
-                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    duration_ms = elapsed.as_millis() as u64,
                     auth_path = reporter.request_source.auth_path.as_label(),
                     ingress_route = reporter.request_source.ingress_route.as_label(),
                     outcome = outcome.as_label(),
@@ -876,7 +882,7 @@ struct RequestMetricLabels {
     request_id_origin: &'static str,
 }
 
-fn request_metric_labels(tracing_ids: &Option<TracingIds>) -> RequestMetricLabels {
+fn request_metric_labels(tracing_ids: Option<&TracingIds>) -> RequestMetricLabels {
     match tracing_ids {
         Some(ids) => {
             let tenant_context = match (
@@ -889,6 +895,9 @@ fn request_metric_labels(tracing_ids: &Option<TracingIds>) -> RequestMetricLabel
                 | (Some(crate::auth::AuthPath::CloudApiKey), false, true) => "verified_partial",
                 (Some(crate::auth::AuthPath::TrustedConfigToken), true, _)
                 | (Some(crate::auth::AuthPath::TrustedConfigToken), _, true) => "trusted_headers",
+                (Some(crate::auth::AuthPath::TrustedConfigToken), false, false) => {
+                    "trusted_no_tenant"
+                }
                 (_, false, false) => "absent",
                 _ => "present_unknown",
             };
@@ -938,6 +947,47 @@ fn record_completed_request_metrics(
         .record(input_tokens.max(0) as f64);
     metrics::histogram!("inference_proxy_request_duration_seconds", &common_labels)
         .record(total_duration_ms as f64 / 1_000.0);
+}
+
+/// Record one successfully finalized inference response using only bounded
+/// metric dimensions. Verified tenant IDs remain structured-log fields and
+/// are never copied into metric labels.
+pub(crate) fn record_completed_request(
+    tracing_ids: Option<&TracingIds>,
+    model_name: &str,
+    response_id: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+    total_duration: std::time::Duration,
+    mode: &'static str,
+) {
+    let source_labels = request_metric_labels(tracing_ids);
+    let total_ms = total_duration.as_millis();
+    let (request_id, org_id, workspace_id) = match tracing_ids {
+        Some(ids) => (
+            ids.request_id.as_str(),
+            ids.org_id_or_empty(),
+            ids.workspace_id_or_empty(),
+        ),
+        None => ("", "", ""),
+    };
+    record_completed_request_metrics(source_labels, input_tokens, total_ms, mode);
+    info!(
+        request_id = %request_id,
+        org_id = %org_id,
+        workspace_id = %workspace_id,
+        model = %model_name.to_lowercase(),
+        chat_id = %response_id,
+        input_tokens,
+        output_tokens,
+        total_duration_ms = total_ms,
+        auth_path = source_labels.auth_path,
+        ingress_route = source_labels.ingress_route,
+        tenant_context = source_labels.tenant_context,
+        request_id_origin = source_labels.request_id_origin,
+        mode,
+        "request completed"
+    );
 }
 
 /// Proxy a non-streaming JSON request to the backend using internal streaming.
@@ -1133,38 +1183,16 @@ pub async fn proxy_json_request(
     let chat_id = response_data["id"].as_str().unwrap_or("").to_string();
     try_report_usage(&response_data, &chat_id, &opts);
 
-    // Structured completion log — one line per successful non-streaming request.
-    // Mirrors the log emitted by proxy_streaming_request so both paths are
-    // queryable in Datadog by request_id / org_id.
-    {
-        let input_tokens = response_data
-            .pointer("/usage/prompt_tokens")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        let output_tokens = response_data
-            .pointer("/usage/completion_tokens")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        let total_ms = upstream_start.elapsed().as_millis();
-        let (log_request_id, log_org_id, log_workspace_id) = log_ids_or_empty(&opts.tracing_ids);
-        let source_labels = request_metric_labels(&opts.tracing_ids);
-        record_completed_request_metrics(source_labels, input_tokens, total_ms, "json_via_stream");
-        info!(
-            request_id = %log_request_id,
-            org_id = %log_org_id,
-            workspace_id = %log_workspace_id,
-            model = %opts.model_name.to_lowercase(),
-            chat_id = %chat_id,
-            input_tokens,
-            output_tokens,
-            total_duration_ms = total_ms,
-            auth_path = source_labels.auth_path,
-            ingress_route = source_labels.ingress_route,
-            tenant_context = source_labels.tenant_context,
-            request_id_origin = source_labels.request_id_origin,
-            "request completed"
-        );
-    }
+    // Keep plaintext usage values for bounded completion metrics after every
+    // fallible transform, serialization, and signing step has succeeded.
+    let input_tokens = response_data
+        .pointer("/usage/prompt_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let output_tokens = response_data
+        .pointer("/usage/completion_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
 
     // Apply response transform (e.g., encryption) before hashing/signing.
     if let Some(transform) = opts.response_transform.take() {
@@ -1184,6 +1212,16 @@ pub async fn proxy_json_request(
     })?;
     let signed_json = serde_json::to_string(&signed).map_err(|e| AppError::Internal(e.into()))?;
     opts.cache.set_chat(&chat_id, &signed_json);
+
+    record_completed_request(
+        opts.tracing_ids.as_ref(),
+        &opts.model_name,
+        &chat_id,
+        input_tokens,
+        output_tokens,
+        upstream_start.elapsed(),
+        "json_via_stream",
+    );
 
     Ok((
         StatusCode::OK,
@@ -1662,7 +1700,7 @@ pub async fn proxy_streaming_request(
 
     // Capture log fields before any partial moves from opts.
     let (log_request_id, log_org_id, log_workspace_id) = log_ids_or_empty(&opts.tracing_ids);
-    let source_labels = request_metric_labels(&opts.tracing_ids);
+    let completion_tracing_ids = opts.tracing_ids.clone();
 
     let signing = opts.signing.clone();
     let cache = opts.cache.clone();
@@ -1831,43 +1869,35 @@ pub async fn proxy_streaming_request(
             let response_sha256 = hex::encode(hasher.finalize());
             if let Some(ref id) = parser.chat_id {
                 let text = format!("{model_name}:{request_sha256}:{response_sha256}");
-                match signing.sign_chat(&text) {
-                    Ok(signed) => {
-                        if let Ok(signed_json) = serde_json::to_string(&signed) {
+                let signature_cached = match signing.sign_chat(&text) {
+                    Ok(signed) => match serde_json::to_string(&signed) {
+                        Ok(signed_json) => {
                             cache.set_chat(id, &signed_json);
+                            true
                         }
-                    }
+                        Err(e) => {
+                            error!(error = %e, "Failed to serialize streaming signature");
+                            false
+                        }
+                    },
                     Err(e) => {
                         error!(error = %e, "Signing failed for streaming response");
+                        false
                     }
-                }
+                };
 
-                // Structured completion log — one line per successful streaming request.
-                // Carries org_id/request_id propagated from cloud-api so this line is
-                // joinable with cloud-api and nginx logs in Datadog.
-                let (input_tokens, output_tokens) = parser.usage.unwrap_or((0, 0));
-                let total_ms = upstream_start.elapsed().as_millis();
-                record_completed_request_metrics(
-                    source_labels,
-                    input_tokens,
-                    total_ms,
-                    "streaming_request",
-                );
-                info!(
-                    request_id = %log_request_id,
-                    org_id = %log_org_id,
-                    workspace_id = %log_workspace_id,
-                    model = %model_name.to_lowercase(),
-                    chat_id = %id,
-                    input_tokens,
-                    output_tokens,
-                    total_duration_ms = total_ms,
-                    auth_path = source_labels.auth_path,
-                    ingress_route = source_labels.ingress_route,
-                    tenant_context = source_labels.tenant_context,
-                    request_id_origin = source_labels.request_id_origin,
-                    "request completed"
-                );
+                if signature_cached {
+                    let (input_tokens, output_tokens) = parser.usage.unwrap_or((0, 0));
+                    record_completed_request(
+                        completion_tracing_ids.as_ref(),
+                        &model_name,
+                        id,
+                        input_tokens,
+                        output_tokens,
+                        upstream_start.elapsed(),
+                        "streaming_request",
+                    );
+                }
             } else {
                 error!("Chat id could not be extracted from the completed streaming response");
             }
@@ -2067,6 +2097,14 @@ pub async fn proxy_multipart_request(
 
     // Report usage for cloud API key requests (before encryption, needs plaintext fields)
     try_report_usage(&response_data, &response_id, &opts);
+    let input_tokens = response_data
+        .pointer("/usage/prompt_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let output_tokens = response_data
+        .pointer("/usage/completion_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
 
     // Apply response transform (e.g., encryption) before hashing/signing.
     // The signature covers the response bytes the client actually receives.
@@ -2087,6 +2125,16 @@ pub async fn proxy_multipart_request(
     })?;
     let signed_json = serde_json::to_string(&signed).map_err(|e| AppError::Internal(e.into()))?;
     opts.cache.set_chat(&response_id, &signed_json);
+
+    record_completed_request(
+        opts.tracing_ids.as_ref(),
+        &opts.model_name,
+        &response_id,
+        input_tokens,
+        output_tokens,
+        upstream_start.elapsed(),
+        "multipart",
+    );
 
     Ok((
         StatusCode::OK,
@@ -2149,13 +2197,20 @@ pub async fn proxy_simple(
         .unwrap())
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct CompletionContext {
+    pub(crate) started_at: std::time::Instant,
+    pub(crate) mode: &'static str,
+}
+
 /// Sign already-fetched JSON response bytes, cache the signature, and return a JSON response.
-/// Used by catch-all when content-type is already known to be JSON.
-pub async fn sign_and_cache_json_response(
+/// Used by catch-all and Fusion when content-type is already known to be JSON.
+pub(crate) async fn sign_and_cache_json_response(
     response_bytes: &[u8],
     request_sha256: &str,
     mut opts: ProxyOpts,
     status: StatusCode,
+    completion: Option<CompletionContext>,
 ) -> Result<Response, AppError> {
     // Parse JSON; if the backend sent content-type: application/json but the body
     // is empty or not valid JSON, wrap it in an empty object so we can still
@@ -2186,6 +2241,14 @@ pub async fn sign_and_cache_json_response(
 
     // Report usage for cloud API key requests (before encryption, needs plaintext fields)
     try_report_usage(&response_data, &chat_id, &opts);
+    let input_tokens = response_data
+        .pointer("/usage/prompt_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let output_tokens = response_data
+        .pointer("/usage/completion_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
 
     // Apply response transform (e.g., encryption) before hashing/signing.
     // The signature covers the response bytes the client actually receives.
@@ -2207,6 +2270,18 @@ pub async fn sign_and_cache_json_response(
     let signed_json = serde_json::to_string(&signed).map_err(|e| AppError::Internal(e.into()))?;
     opts.cache.set_chat(&chat_id, &signed_json);
 
+    if let Some(completion) = completion {
+        record_completed_request(
+            opts.tracing_ids.as_ref(),
+            &opts.model_name,
+            &chat_id,
+            input_tokens,
+            output_tokens,
+            completion.started_at.elapsed(),
+            completion.mode,
+        );
+    }
+
     Ok(Response::builder()
         .status(status)
         .header("content-type", "application/json")
@@ -2221,11 +2296,11 @@ pub async fn proxy_streaming_response(
     request_sha256: &str,
     opts: ProxyOpts,
     status: StatusCode,
+    request_started_at: std::time::Instant,
 ) -> Result<Response, AppError> {
     // Capture log fields before any partial moves from opts.
     let (log_request_id, log_org_id, log_workspace_id) = log_ids_or_empty(&opts.tracing_ids);
-    let source_labels = request_metric_labels(&opts.tracing_ids);
-    let stream_start = std::time::Instant::now();
+    let completion_tracing_ids = opts.tracing_ids.clone();
 
     let signing = opts.signing.clone();
     let cache = opts.cache.clone();
@@ -2386,41 +2461,35 @@ pub async fn proxy_streaming_response(
             let response_sha256 = hex::encode(hasher.finalize());
             if let Some(ref id) = parser.chat_id {
                 let text = format!("{model_name}:{request_sha256}:{response_sha256}");
-                match signing.sign_chat(&text) {
-                    Ok(signed) => {
-                        if let Ok(signed_json) = serde_json::to_string(&signed) {
+                let signature_cached = match signing.sign_chat(&text) {
+                    Ok(signed) => match serde_json::to_string(&signed) {
+                        Ok(signed_json) => {
                             cache.set_chat(id, &signed_json);
+                            true
                         }
-                    }
+                        Err(e) => {
+                            error!(error = %e, "Failed to serialize streaming signature");
+                            false
+                        }
+                    },
                     Err(e) => {
                         error!(error = %e, "Signing failed for streaming response");
+                        false
                     }
-                }
+                };
 
-                // Structured completion log — one line per successful streaming response.
-                let (input_tokens, output_tokens) = parser.usage.unwrap_or((0, 0));
-                let total_ms = stream_start.elapsed().as_millis();
-                record_completed_request_metrics(
-                    source_labels,
-                    input_tokens,
-                    total_ms,
-                    "streaming_response",
-                );
-                info!(
-                    request_id = %log_request_id,
-                    org_id = %log_org_id,
-                    workspace_id = %log_workspace_id,
-                    model = %model_name.to_lowercase(),
-                    chat_id = %id,
-                    input_tokens,
-                    output_tokens,
-                    total_duration_ms = total_ms,
-                    auth_path = source_labels.auth_path,
-                    ingress_route = source_labels.ingress_route,
-                    tenant_context = source_labels.tenant_context,
-                    request_id_origin = source_labels.request_id_origin,
-                    "request completed"
-                );
+                if signature_cached {
+                    let (input_tokens, output_tokens) = parser.usage.unwrap_or((0, 0));
+                    record_completed_request(
+                        completion_tracing_ids.as_ref(),
+                        &model_name,
+                        id,
+                        input_tokens,
+                        output_tokens,
+                        request_started_at.elapsed(),
+                        "streaming_response",
+                    );
+                }
             } else {
                 error!("Chat id could not be extracted from the completed streaming response");
             }
@@ -2597,7 +2666,7 @@ mod tests {
             forward_tenant_headers: true,
         });
 
-        let labels = request_metric_labels(&tracing_ids);
+        let labels = request_metric_labels(tracing_ids.as_ref());
         assert_eq!(labels.auth_path, "trusted_config_token");
         assert_eq!(labels.ingress_route, "long_indexed");
         assert_eq!(labels.tenant_context, "trusted_headers");
@@ -2614,11 +2683,27 @@ mod tests {
             }),
             forward_tenant_headers: false,
         });
-        let direct_labels = request_metric_labels(&direct_ids);
+        let direct_labels = request_metric_labels(direct_ids.as_ref());
         assert_eq!(direct_labels.auth_path, "cloud_api_key");
         assert_eq!(direct_labels.ingress_route, "canonical");
         assert_eq!(direct_labels.tenant_context, "verified");
         assert_eq!(direct_labels.request_id_origin, "generated");
+
+        let trusted_without_tenant = Some(TracingIds {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            request_id_inbound: false,
+            org_id: None,
+            workspace_id: None,
+            request_source: Some(RequestSource {
+                auth_path: AuthPath::TrustedConfigToken,
+                ingress_route: IngressRouteKind::Canonical,
+            }),
+            forward_tenant_headers: true,
+        });
+        assert_eq!(
+            request_metric_labels(trusted_without_tenant.as_ref()).tenant_context,
+            "trusted_no_tenant"
+        );
     }
 
     fn reporter_with(
@@ -2817,7 +2902,8 @@ mod tests {
         let opts = test_proxy_opts();
         let request_sha256 = hex::encode(Sha256::digest(b"test-request"));
 
-        let result = sign_and_cache_json_response(b"", &request_sha256, opts, StatusCode::OK).await;
+        let result =
+            sign_and_cache_json_response(b"", &request_sha256, opts, StatusCode::OK, None).await;
 
         let resp = result.expect("empty body should not return error");
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2841,6 +2927,7 @@ mod tests {
             &request_sha256,
             opts,
             StatusCode::OK,
+            None,
         )
         .await;
 
@@ -2863,7 +2950,7 @@ mod tests {
         let body = br#"{"id":"existing-id","text":"hello"}"#;
 
         let result =
-            sign_and_cache_json_response(body, &request_sha256, opts, StatusCode::OK).await;
+            sign_and_cache_json_response(body, &request_sha256, opts, StatusCode::OK, None).await;
 
         let resp = result.expect("valid JSON should succeed");
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2886,7 +2973,7 @@ mod tests {
         let body = br#"{"text":"hello"}"#;
 
         let result =
-            sign_and_cache_json_response(body, &request_sha256, opts, StatusCode::OK).await;
+            sign_and_cache_json_response(body, &request_sha256, opts, StatusCode::OK, None).await;
 
         let resp = result.expect("valid JSON without id should succeed");
         let resp_body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
@@ -2906,9 +2993,10 @@ mod tests {
         let request_sha256 = hex::encode(Sha256::digest(b"test"));
         let body = br#"{"id":"s1"}"#;
 
-        let resp = sign_and_cache_json_response(body, &request_sha256, opts, StatusCode::CREATED)
-            .await
-            .unwrap();
+        let resp =
+            sign_and_cache_json_response(body, &request_sha256, opts, StatusCode::CREATED, None)
+                .await
+                .unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
     }
 
@@ -3004,9 +3092,15 @@ mod tests {
         let upstream = raw_sse_response(None, true).await;
         let mut opts = test_proxy_opts();
         opts.stream_idle_timeout_secs = 1;
-        let response = proxy_streaming_response(upstream, "request-sha256", opts, StatusCode::OK)
-            .await
-            .unwrap();
+        let response = proxy_streaming_response(
+            upstream,
+            "request-sha256",
+            opts,
+            StatusCode::OK,
+            std::time::Instant::now(),
+        )
+        .await
+        .unwrap();
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -3026,9 +3120,15 @@ mod tests {
             raw_sse_response(Some("data: {\"id\":\"chat-1\",\"choices\":[]}\n\n"), false).await;
         let mut opts = test_proxy_opts();
         opts.stream_idle_timeout_secs = 1;
-        let response = proxy_streaming_response(upstream, "request-sha256", opts, StatusCode::OK)
-            .await
-            .unwrap();
+        let response = proxy_streaming_response(
+            upstream,
+            "request-sha256",
+            opts,
+            StatusCode::OK,
+            std::time::Instant::now(),
+        )
+        .await
+        .unwrap();
 
         let result = axum::body::to_bytes(response.into_body(), 1024 * 1024).await;
         assert!(
@@ -3046,9 +3146,15 @@ mod tests {
         .await;
         let mut opts = test_proxy_opts();
         opts.stream_idle_timeout_secs = 1;
-        let response = proxy_streaming_response(upstream, "request-sha256", opts, StatusCode::OK)
-            .await
-            .unwrap();
+        let response = proxy_streaming_response(
+            upstream,
+            "request-sha256",
+            opts,
+            StatusCode::OK,
+            std::time::Instant::now(),
+        )
+        .await
+        .unwrap();
 
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await

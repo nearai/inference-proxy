@@ -31,7 +31,8 @@ use crate::auth::RequireAuth;
 use crate::encryption::ChunkTransform;
 use crate::error::AppError;
 use crate::proxy::{
-    make_usage_reporter, normalize_chat_chunk, report_chat_usage_if_present, StreamingGuard,
+    make_usage_reporter, normalize_chat_chunk, record_completed_request,
+    report_chat_usage_if_present, StreamingGuard,
 };
 use crate::{AppState, TracingIds};
 
@@ -89,6 +90,7 @@ pub async fn run_chat_completion(
     mut request_json: Value,
     chunk_transform: Option<ChunkTransform>,
 ) -> Result<Response, AppError> {
+    let request_started_at = Instant::now();
     // Rewrite our namespaced tool into a standard OpenAI `function` so the
     // upstream engine (vLLM/SGLang) emits tool_calls in its usual shape.
     rewrite_tool_for_upstream(&mut request_json);
@@ -230,11 +232,23 @@ pub async fn run_chat_completion(
                 let response_sha256 = hex::encode(result.hasher.finalize());
                 let text = format!("{model_name}:{request_hash}:{response_sha256}");
                 match signing.sign_chat(&text) {
-                    Ok(signed) => {
-                        if let Ok(signed_json) = serde_json::to_string(&signed) {
+                    Ok(signed) => match serde_json::to_string(&signed) {
+                        Ok(signed_json) => {
                             cache.set_chat(chat_id, &signed_json);
+                            record_completed_request(
+                                Some(&tracing_ids),
+                                &model_name,
+                                chat_id,
+                                i64::try_from(result.input_tokens).unwrap_or(i64::MAX),
+                                i64::try_from(result.output_tokens).unwrap_or(i64::MAX),
+                                request_started_at.elapsed(),
+                                "agent_loop",
+                            );
                         }
-                    }
+                        Err(e) => {
+                            error!(error = %e, "Failed to serialize agent-loop signature")
+                        }
+                    },
                     Err(e) => error!(error = %e, "Signing failed for agent loop response"),
                 }
             }

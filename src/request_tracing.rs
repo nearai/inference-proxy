@@ -3,7 +3,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use tracing::Instrument;
 
-use crate::auth::{RequestSource, RequireAuth};
+use crate::auth::{AuthPath, RequestSource, RequireAuth};
 
 /// Tracing correlation IDs for a request, parsed once by `request_id_middleware`
 /// from `X-Request-Id` and inserted into the request extensions. Handlers that
@@ -102,10 +102,11 @@ impl TracingIds {
     /// returned by Cloud API for a direct `sk-` key. Caller-supplied tenant
     /// headers are therefore ignored on the public direct-key path.
     pub fn with_authenticated_context(&self, headers: &HeaderMap, auth: &RequireAuth) -> Self {
-        let ids = if auth.cloud_api_key.is_some() {
-            self.with_verified_tenant(auth.org_id.as_deref(), auth.workspace_id.as_deref())
-        } else {
-            self.with_trusted_tenant_headers(headers, true)
+        let ids = match auth.request_source.auth_path {
+            AuthPath::CloudApiKey => {
+                self.with_verified_tenant(auth.org_id.as_deref(), auth.workspace_id.as_deref())
+            }
+            AuthPath::TrustedConfigToken => self.with_trusted_tenant_headers(headers, true),
         };
         ids.with_request_source(auth.request_source)
     }
@@ -304,6 +305,24 @@ mod tests {
             vec![("x-request-id", "550e8400-e29b-41d4-a716-446655440000")],
             "verified direct-key identity is log-only; spoofed public tenant headers stay off wire"
         );
+
+        // The explicit auth-path classification is the authorization boundary;
+        // incidental population of cloud_api_key must not override it.
+        let trusted_auth = RequireAuth {
+            cloud_api_key: Some("implementation-detail-only".to_string()),
+            org_id: None,
+            workspace_id: None,
+            api_key_id: None,
+            request_id: None,
+            request_source: RequestSource {
+                auth_path: crate::auth::AuthPath::TrustedConfigToken,
+                ingress_route: crate::auth::IngressRouteKind::Canonical,
+            },
+        };
+        let trusted_ids = ids.with_authenticated_context(&h, &trusted_auth);
+        let trusted_headers = trusted_ids.upstream_headers().collect::<Vec<_>>();
+        assert!(trusted_headers.contains(&("x-org-id", "org-uuid-123")));
+        assert!(trusted_headers.contains(&("x-workspace-id", "ws-uuid-456")));
     }
 
     #[test]

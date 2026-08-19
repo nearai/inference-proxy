@@ -249,7 +249,14 @@ pub async fn catch_all(
             response_shape: ResponseShape::ChatCompletion,
             tracing_ids: Some(tracing_ids.clone()),
         };
-        proxy::proxy_streaming_response(response, &request_sha256, opts, axum_status).await
+        proxy::proxy_streaming_response(
+            response,
+            &request_sha256,
+            opts,
+            axum_status,
+            upstream_start,
+        )
+        .await
     } else if content_type.contains("application/json") {
         // Buffer JSON response with size guard
         let response_bytes = response
@@ -278,8 +285,17 @@ pub async fn catch_all(
             response_shape: ResponseShape::ChatCompletion,
             tracing_ids: Some(tracing_ids),
         };
-        proxy::sign_and_cache_json_response(&response_bytes, &request_sha256, opts, axum_status)
-            .await
+        proxy::sign_and_cache_json_response(
+            &response_bytes,
+            &request_sha256,
+            opts,
+            axum_status,
+            Some(proxy::CompletionContext {
+                started_at: upstream_start,
+                mode: "catch_all_json",
+            }),
+        )
+        .await
     } else {
         // Raw passthrough — stream without signing, preserve upstream headers
         let mut builder = Response::builder().status(axum_status);

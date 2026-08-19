@@ -233,7 +233,7 @@ pub async fn run_chat_completion(
                 "preflight_status": preflight_status,
                 "aggregate_usage": aggregate_usage.to_json(),
             });
-            return finish_response(ctx, response).await;
+            return finish_response(ctx, response, started).await;
         }
         preflight_status = "invoked".to_string();
     }
@@ -288,7 +288,7 @@ pub async fn run_chat_completion(
         max_tool_calls: config.max_tool_calls,
     });
 
-    finish_response(ctx, synthesis).await
+    finish_response(ctx, synthesis, started).await
 }
 
 fn is_fusion_tool(tool: &Value) -> bool {
@@ -1486,6 +1486,7 @@ fn metadata_json(input: MetadataJson<'_>) -> Value {
 async fn finish_response(
     ctx: ChatCompletionContext,
     response_json: Value,
+    started_at: Instant,
 ) -> Result<Response, AppError> {
     let opts = ProxyOpts {
         signing: ctx.state.signing.clone(),
@@ -1504,10 +1505,20 @@ async fn finish_response(
     };
 
     if ctx.is_stream {
-        stream_final_response(response_json, ctx.request_hash, opts).await
+        stream_final_response(response_json, ctx.request_hash, opts, started_at).await
     } else {
         let body = serde_json::to_vec(&response_json).map_err(|e| AppError::Internal(e.into()))?;
-        proxy::sign_and_cache_json_response(&body, &ctx.request_hash, opts, StatusCode::OK).await
+        proxy::sign_and_cache_json_response(
+            &body,
+            &ctx.request_hash,
+            opts,
+            StatusCode::OK,
+            Some(proxy::CompletionContext {
+                started_at,
+                mode: "fusion_json",
+            }),
+        )
+        .await
     }
 }
 
@@ -1515,6 +1526,7 @@ async fn stream_final_response(
     response_json: Value,
     request_sha256: String,
     opts: ProxyOpts,
+    started_at: Instant,
 ) -> Result<Response, AppError> {
     let id = response_json
         .get("id")
@@ -1545,6 +1557,14 @@ async fn stream_final_response(
         .get("usage")
         .cloned()
         .unwrap_or_else(|| Usage::default().to_json());
+    let input_tokens = usage
+        .get("prompt_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("completion_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
     let metadata = response_json.get("nearai_fusion").cloned();
     let finish_reason = response_json
         .pointer("/choices/0/finish_reason")
@@ -1611,6 +1631,16 @@ async fn stream_final_response(
     let signed_json = serde_json::to_string(&signed).map_err(|e| AppError::Internal(e.into()))?;
     opts.cache.set_chat(&id, &signed_json);
     proxy::try_report_usage(&response_json, &id, &opts);
+
+    proxy::record_completed_request(
+        opts.tracing_ids.as_ref(),
+        &opts.model_name,
+        &id,
+        input_tokens,
+        output_tokens,
+        started_at.elapsed(),
+        "fusion_streaming",
+    );
 
     info!(
         chat_id = %id,

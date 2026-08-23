@@ -214,6 +214,10 @@ pub struct Config {
     // Multi-backend support
     /// All backend base URLs (derived from VLLM_BACKEND_URLS or VLLM_BASE_URL).
     pub backend_urls: Vec<String>,
+    /// Number of independent vLLM data-parallel engines behind this proxy.
+    /// When set, append-only chat conversations are pinned to one rank so
+    /// their turns reuse that engine's local prefix cache.
+    pub vllm_data_parallel_size: Option<usize>,
     /// Health check interval in seconds (only used when multiple backends).
     pub health_check_interval_secs: u64,
     /// Consecutive failures before marking a backend unhealthy.
@@ -318,6 +322,22 @@ impl Config {
         if backend_urls.is_empty() {
             anyhow::bail!("VLLM_BACKEND_URLS is set but contains no valid URLs");
         }
+
+        let vllm_data_parallel_size = match env::var("VLLM_DATA_PARALLEL_SIZE") {
+            Ok(raw) => {
+                let value = raw.trim().parse::<usize>().map_err(|_| {
+                    anyhow::anyhow!("VLLM_DATA_PARALLEL_SIZE must be a positive integer")
+                })?;
+                if value == 0 {
+                    anyhow::bail!("VLLM_DATA_PARALLEL_SIZE must be a positive integer");
+                }
+                Some(value)
+            }
+            Err(env::VarError::NotPresent) => None,
+            Err(env::VarError::NotUnicode(_)) => {
+                anyhow::bail!("VLLM_DATA_PARALLEL_SIZE must be valid UTF-8")
+            }
+        };
 
         // Track which endpoint URLs are explicitly overridden (should bypass pool)
         let images_url_override = env::var("VLLM_IMAGES_URL").ok().filter(|s| !s.is_empty());
@@ -476,6 +496,7 @@ impl Config {
             startup_check_retry_delay_secs: env_int("STARTUP_CHECK_RETRY_DELAY_SECS", 5) as u64,
             startup_check_timeout_secs: env_int("STARTUP_CHECK_TIMEOUT_SECS", 30) as u64,
             backend_urls,
+            vllm_data_parallel_size,
             health_check_interval_secs: env_int("HEALTH_CHECK_INTERVAL_SECS", 5) as u64,
             health_check_max_failures: env_int("HEALTH_CHECK_MAX_FAILURES", 3) as u32,
             health_check_timeout_secs: env_int("HEALTH_CHECK_TIMEOUT_SECS", 3) as u64,
@@ -718,6 +739,7 @@ mod tests {
             // Remove optional vars to test defaults
             env::remove_var("VLLM_BASE_URL");
             env::remove_var("VLLM_BACKEND_URLS");
+            env::remove_var("VLLM_DATA_PARALLEL_SIZE");
             env::remove_var("VLLM_IMAGES_URL");
             env::remove_var("VLLM_IMAGES_EDITS_URL");
             env::remove_var("VLLM_TRANSCRIPTIONS_URL");
@@ -768,6 +790,7 @@ mod tests {
             assert!(!config.dev_mode);
             assert!(!config.gpu_no_hw_mode);
             assert_eq!(config.backend_urls, vec!["http://localhost:8000"]);
+            assert_eq!(config.vllm_data_parallel_size, None);
             assert!(config.images_url_override.is_none());
             assert!(config.rerank_url_override.is_none());
             assert!(config.image_validation_allowed_domains.is_empty());
@@ -1126,6 +1149,38 @@ mod tests {
                 assert_eq!(config.backend_urls, vec!["http://myhost:9000"]);
             },
         );
+    }
+
+    #[test]
+    fn test_config_parses_vllm_data_parallel_size() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "model"),
+                ("TOKEN", "tok"),
+                ("VLLM_DATA_PARALLEL_SIZE", "4"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.vllm_data_parallel_size, Some(4));
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_rejects_invalid_vllm_data_parallel_size() {
+        for invalid in ["0", "not-a-number", ""] {
+            with_env_vars(
+                &[
+                    ("MODEL_NAME", "model"),
+                    ("TOKEN", "tok"),
+                    ("VLLM_DATA_PARALLEL_SIZE", invalid),
+                ],
+                || {
+                    let error = Config::from_env().unwrap_err().to_string();
+                    assert!(error.contains("VLLM_DATA_PARALLEL_SIZE"));
+                },
+            );
+        }
     }
 
     #[test]

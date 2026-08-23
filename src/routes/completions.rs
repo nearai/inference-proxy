@@ -104,6 +104,7 @@ pub async fn completions(
         stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
         response_shape: ResponseShape::TextCompletion,
         tracing_ids: Some(tracing_ids),
+        upstream_data_parallel_rank: None,
     };
 
     if is_stream {

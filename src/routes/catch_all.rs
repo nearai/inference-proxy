@@ -32,6 +32,9 @@ const EXCLUDED_REQUEST_HEADERS: &[&str] = &[
     "x-request-id",
     "x-org-id",
     "x-workspace-id",
+    // The proxy derives vLLM DP affinity for chat routes. Never allow an
+    // untrusted client to select an engine through the catch-all path.
+    crate::vllm_dp_affinity::DATA_PARALLEL_RANK_HEADER,
 ];
 
 /// Headers to exclude when forwarding response headers from the backend.
@@ -130,12 +133,19 @@ pub async fn catch_all(
             max_size: state.config.max_request_size,
         });
     }
-    if is_chat_completions_alias {
+    let upstream_data_parallel_rank = if is_chat_completions_alias {
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
             crate::image_validation::reject_invalid_images(&json, &state.config.image_validation())
                 .await?;
+            state
+                .vllm_dp_affinity
+                .rank_for_chat_request(&json, &state.config.model_name)
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
 
     // Compute request hash
     let request_sha256 = if body_bytes.is_empty() {
@@ -174,6 +184,7 @@ pub async fn catch_all(
         }
     }
     builder = proxy::apply_tracing_headers(builder, Some(&tracing_ids));
+    builder = proxy::apply_data_parallel_rank_header(builder, upstream_data_parallel_rank);
 
     // Attach body if non-empty
     if !body_bytes.is_empty() {
@@ -248,6 +259,7 @@ pub async fn catch_all(
             stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
             response_shape: ResponseShape::ChatCompletion,
             tracing_ids: Some(tracing_ids.clone()),
+            upstream_data_parallel_rank: None,
         };
         proxy::proxy_streaming_response(
             response,
@@ -284,6 +296,7 @@ pub async fn catch_all(
             stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
             response_shape: ResponseShape::ChatCompletion,
             tracing_ids: Some(tracing_ids),
+            upstream_data_parallel_rank: None,
         };
         proxy::sign_and_cache_json_response(
             &response_bytes,

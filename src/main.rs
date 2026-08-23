@@ -7,7 +7,7 @@ use tracing::info;
 use vllm_proxy_rs::ohttp_gateway::OhttpGateway;
 use vllm_proxy_rs::{
     attestation, backend_pool, cache, config, fusion, metrics_middleware, rate_limit,
-    request_id_middleware, routes, signing, startup_checks, AppState,
+    request_id_middleware, routes, signing, startup_checks, vllm_dp_affinity, AppState,
 };
 
 /// DNS resolver that returns only IPv4 addresses.
@@ -113,6 +113,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize caches
     let chat_cache = cache::ChatCache::new(&config.model_name, config.chat_cache_expiration_secs);
+    let vllm_dp_affinity = Arc::new(vllm_dp_affinity::VllmDpAffinity::new(
+        config.vllm_data_parallel_size,
+        config.chat_cache_expiration_secs,
+    ));
     let attestation_cache = Arc::new(attestation::AttestationCache::new(
         config.attestation_cache_ttl_secs,
     ));
@@ -155,6 +159,7 @@ async fn main() -> anyhow::Result<()> {
         ohttp_gateway: ohttp_gw,
         ohttp_attestation_ed25519: ohttp_attestation_ed25519.clone(),
         fusion_caches: Arc::new(fusion::FusionCaches::default()),
+        vllm_dp_affinity,
     };
 
     // Spawn background attestation cache refresh task.

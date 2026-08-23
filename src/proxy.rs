@@ -843,6 +843,9 @@ pub struct ProxyOpts {
     /// line. Direct completion and authenticated passthrough routes pass the selected
     /// request ID; tenant IDs appear only on trusted config-token paths.
     pub tracing_ids: Option<TracingIds>,
+    /// Optional vLLM data-parallel engine rank. Chat routes derive this from a
+    /// stable conversation prefix when `VLLM_DATA_PARALLEL_SIZE` is configured.
+    pub upstream_data_parallel_rank: Option<usize>,
 }
 
 /// Apply upstream tracing headers to a `reqwest::RequestBuilder`. No-op when
@@ -858,6 +861,26 @@ pub(crate) fn apply_tracing_headers(
         req = req.header(k, v);
     }
     req
+}
+
+/// Apply vLLM's request-scoped data-parallel rank override. The proxy derives
+/// this value itself; it is never copied from an untrusted client header.
+pub(crate) fn apply_data_parallel_rank_header(
+    req: reqwest::RequestBuilder,
+    rank: Option<usize>,
+) -> reqwest::RequestBuilder {
+    let Some(rank) = rank else {
+        return req;
+    };
+    metrics::counter!(
+        "vllm_dp_affinity_requests_total",
+        "rank" => rank.to_string()
+    )
+    .increment(1);
+    req.header(
+        crate::vllm_dp_affinity::DATA_PARALLEL_RANK_HEADER,
+        rank.to_string(),
+    )
 }
 
 /// Owned `(request_id, org_id, workspace_id)` strings for emission on the
@@ -1027,6 +1050,7 @@ pub async fn proxy_json_request(
             .header("accept", "text/event-stream"),
         opts.tracing_ids.as_ref(),
     );
+    let req = apply_data_parallel_rank_header(req, opts.upstream_data_parallel_rank);
     let response = req
         .body(streaming_body)
         .send()
@@ -1680,6 +1704,7 @@ pub async fn proxy_streaming_request(
             .header("accept", "text/event-stream"),
         opts.tracing_ids.as_ref(),
     );
+    let req = apply_data_parallel_rank_header(req, opts.upstream_data_parallel_rank);
     let response = req
         .body(request_body)
         .send()
@@ -2894,7 +2919,37 @@ mod tests {
             stream_idle_timeout_secs: 0,
             response_shape: ResponseShape::default(),
             tracing_ids: None,
+            upstream_data_parallel_rank: None,
         }
+    }
+
+    #[test]
+    fn test_apply_data_parallel_rank_header() {
+        let client = reqwest::Client::new();
+        let request = apply_data_parallel_rank_header(
+            client.post("http://example.invalid/v1/chat/completions"),
+            Some(3),
+        )
+        .build()
+        .unwrap();
+        assert_eq!(
+            request
+                .headers()
+                .get(crate::vllm_dp_affinity::DATA_PARALLEL_RANK_HEADER)
+                .unwrap(),
+            "3"
+        );
+
+        let request = apply_data_parallel_rank_header(
+            client.post("http://example.invalid/v1/chat/completions"),
+            None,
+        )
+        .build()
+        .unwrap();
+        assert!(request
+            .headers()
+            .get(crate::vllm_dp_affinity::DATA_PARALLEL_RANK_HEADER)
+            .is_none());
     }
 
     #[tokio::test]

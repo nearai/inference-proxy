@@ -89,6 +89,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
         startup_check_retry_delay_secs: 0,
         startup_check_timeout_secs: 5,
         backend_urls: vec![upstream_mock_url.to_string()],
+        vllm_data_parallel_size: None,
         health_check_interval_secs: 5,
         health_check_max_failures: 3,
         health_check_timeout_secs: 3,
@@ -155,6 +156,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
         ohttp_gateway: None,
         ohttp_attestation_ed25519: None,
         fusion_caches: Arc::new(fusion::FusionCaches::default()),
+        vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(None, 1_200)),
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(1000, 2000);

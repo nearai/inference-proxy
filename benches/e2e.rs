@@ -111,6 +111,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         fusion_max_response_bytes: 10 * 1024 * 1024,
         fusion_internal_max_attempts: 2,
         fusion_internal_retry_initial_backoff_ms: 250,
+        vllm_data_parallel_size: None,
     };
 
     let ecdsa = signing::EcdsaContext::from_key_bytes(&ECDSA_KEY).unwrap();
@@ -137,6 +138,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
             attestation::TlsCertTracker::new(None).expect("tracker for None path"),
         ),
         backend_pool,
+        vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(None, 1_200)),
         ohttp_gateway: None,
         ohttp_attestation_ed25519: None,
         fusion_caches: Arc::new(fusion::FusionCaches::default()),

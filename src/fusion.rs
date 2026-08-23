@@ -1502,6 +1502,7 @@ async fn finish_response(
         stream_idle_timeout_secs: ctx.state.config.stream_idle_timeout_secs,
         response_shape: ResponseShape::ChatCompletion,
         tracing_ids: Some(ctx.tracing_ids),
+        upstream_data_parallel_rank: None,
     };
 
     if ctx.is_stream {

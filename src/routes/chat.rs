@@ -166,6 +166,10 @@ pub async fn chat_completions(
         request_json["stream_options"] = serde_json::Value::Object(stream_opts);
     }
 
+    let upstream_data_parallel_rank = state
+        .vllm_dp_affinity
+        .rank_for_chat_request(&request_json, &state.config.model_name);
+
     let modified_body =
         serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?;
 
@@ -204,6 +208,7 @@ pub async fn chat_completions(
         stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
         response_shape: ResponseShape::ChatCompletion,
         tracing_ids: Some(tracing_ids),
+        upstream_data_parallel_rank,
     };
 
     if is_stream {

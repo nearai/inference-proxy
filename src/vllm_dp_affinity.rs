@@ -102,9 +102,11 @@ fn conversation_key(
     // These fields can affect the rendered prompt before the first user turn.
     // Include them when present so unrelated prompt templates do not share an
     // affinity bucket merely because their initial message text matches.
+    // `tool_choice` is deliberately excluded: it selects how the model may
+    // answer but does not change the reusable messages/tools prefix, and agent
+    // loops commonly change it between otherwise append-only turns.
     for field in [
         "tools",
-        "tool_choice",
         "chat_template",
         "chat_template_kwargs",
         "documents",
@@ -170,6 +172,25 @@ mod tests {
             conversation_key(&base, "model", &[0; 32]),
             conversation_key(&changed, "model", &[0; 32])
         );
+    }
+
+    #[test]
+    fn tool_choice_changes_keep_the_same_affinity_key() {
+        let base = serde_json::json!({
+            "messages": [{"role": "user", "content": "use a tool"}],
+            "tools": [{"type": "function", "function": {"name": "lookup"}}]
+        });
+        let mut automatic = base.clone();
+        automatic["tool_choice"] = serde_json::json!("auto");
+        let mut forced = base.clone();
+        forced["tool_choice"] = serde_json::json!({
+            "type": "function",
+            "function": {"name": "lookup"}
+        });
+
+        let base_key = conversation_key(&base, "model", &[0; 32]);
+        assert_eq!(base_key, conversation_key(&automatic, "model", &[0; 32]));
+        assert_eq!(base_key, conversation_key(&forced, "model", &[0; 32]));
     }
 
     #[test]

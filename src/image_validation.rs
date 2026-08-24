@@ -871,7 +871,7 @@ fn is_video_magic(b: &[u8]) -> bool {
             b.len()
         };
         if brand_end > 16 {
-            for brand in b[16..brand_end].chunks_exact(4) {
+            for brand in b[16..brand_end].as_chunks::<4>().0 {
                 if is_video_bmff_brand(brand) {
                     return true;
                 }

@@ -21,6 +21,7 @@ pub mod routes;
 pub mod signing;
 pub mod startup_checks;
 pub mod types;
+pub mod vllm_dp_affinity;
 
 pub use request_tracing::{request_id_middleware, TracingIds};
 
@@ -43,4 +44,5 @@ pub struct AppState {
     pub ohttp_gateway: Option<Arc<ohttp_gateway::OhttpGateway>>,
     pub ohttp_attestation_ed25519: Option<types::OhttpAttestation>,
     pub fusion_caches: Arc<fusion::FusionCaches>,
+    pub vllm_dp_affinity: Arc<vllm_dp_affinity::VllmDpAffinity>,
 }

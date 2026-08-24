@@ -24,6 +24,7 @@ struct TestAppOptions {
     fusion_max_response_bytes: usize,
     fusion_internal_max_attempts: usize,
     fusion_internal_retry_initial_backoff_ms: u64,
+    vllm_data_parallel_size: Option<usize>,
 }
 
 impl Default for TestAppOptions {
@@ -40,6 +41,7 @@ impl Default for TestAppOptions {
             fusion_max_response_bytes: 10 * 1024 * 1024,
             fusion_internal_max_attempts: 2,
             fusion_internal_retry_initial_backoff_ms: 1,
+            vllm_data_parallel_size: None,
         }
     }
 }
@@ -67,6 +69,16 @@ fn build_test_app_with_image_validation(mock_url: &str) -> axum::Router {
         mock_url,
         TestAppOptions {
             image_validation: true,
+            ..Default::default()
+        },
+    )
+}
+
+fn build_test_app_with_vllm_dp_affinity(mock_url: &str, data_parallel_size: usize) -> axum::Router {
+    build_test_app_inner(
+        mock_url,
+        TestAppOptions {
+            vllm_data_parallel_size: Some(data_parallel_size),
             ..Default::default()
         },
     )
@@ -172,6 +184,7 @@ fn build_test_app_inner_with_fusion(mock_url: &str, options: TestAppOptions) -> 
         startup_check_retry_delay_secs: 0,
         startup_check_timeout_secs: 5,
         backend_urls: vec![mock_url.to_string()],
+        vllm_data_parallel_size: options.vllm_data_parallel_size,
         health_check_interval_secs: 5,
         health_check_max_failures: 3,
         health_check_timeout_secs: 3,
@@ -249,6 +262,10 @@ fn build_test_app_inner_with_fusion(mock_url: &str, options: TestAppOptions) -> 
         ohttp_gateway: None,
         ohttp_attestation_ed25519: None,
         fusion_caches: Arc::new(fusion::FusionCaches::default()),
+        vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(
+            options.vllm_data_parallel_size,
+            1_200,
+        )),
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(options.rate_per_second, options.rate_burst);
@@ -509,6 +526,107 @@ async fn test_chat_completions_non_streaming() {
     let body = body_to_json(response).await;
     assert_eq!(body["id"], "chatcmpl-test123");
     assert_eq!(body["choices"][0]["message"]["content"], "Hello!");
+}
+
+#[tokio::test]
+async fn test_chat_completions_forwards_derived_vllm_data_parallel_rank() {
+    let mock_server = MockServer::start().await;
+    let request_body = serde_json::json!({
+        "model": "client-alias",
+        "messages": [
+            {"role": "system", "content": "Be concise"},
+            {"role": "user", "content": "Hi"}
+        ],
+        "stream": false
+    });
+    // A fresh proxy assigns its first unique conversation to rank 0, then
+    // advances round-robin for subsequent unique conversation prefixes.
+    let expected_rank = "0";
+
+    let backend_response = serde_json::json!({
+        "id": "chatcmpl-affinity",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "Hello!"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header(
+            vllm_dp_affinity::DATA_PARALLEL_RANK_HEADER,
+            expected_rank,
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&backend_response))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app_with_vllm_dp_affinity(&mock_server.uri(), 4);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                // This untrusted client value must not be forwarded. The
+                // proxy computes and injects its own rank instead.
+                .header(vllm_dp_affinity::DATA_PARALLEL_RANK_HEADER, "99")
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_catch_all_chat_alias_forwards_derived_vllm_data_parallel_rank() {
+    let mock_server = MockServer::start().await;
+    let request_body = serde_json::json!({
+        "model": "client-alias",
+        "messages": [{"role": "user", "content": "Hi from an alias"}],
+        "stream": false
+    });
+
+    let backend_response = serde_json::json!({
+        "id": "chatcmpl-affinity-alias",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "Hello!"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions/"))
+        .and(header(vllm_dp_affinity::DATA_PARALLEL_RANK_HEADER, "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&backend_response))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app_with_vllm_dp_affinity(&mock_server.uri(), 4);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions/")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header(vllm_dp_affinity::DATA_PARALLEL_RANK_HEADER, "99")
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -5848,6 +5966,7 @@ fn build_test_app_with_cloud_api_retries(
         startup_check_retry_delay_secs: 0,
         startup_check_timeout_secs: 5,
         backend_urls: vec![mock_url.to_string()],
+        vllm_data_parallel_size: None,
         health_check_interval_secs: 5,
         health_check_max_failures: 3,
         health_check_timeout_secs: 3,
@@ -5917,6 +6036,7 @@ fn build_test_app_with_cloud_api_retries(
         ohttp_gateway: None,
         ohttp_attestation_ed25519: None,
         fusion_caches: Arc::new(fusion::FusionCaches::default()),
+        vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(None, 1_200)),
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(100, 200);
@@ -8276,6 +8396,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         startup_check_retry_delay_secs: 0,
         startup_check_timeout_secs: 5,
         backend_urls: vec![mock_url.to_string()],
+        vllm_data_parallel_size: None,
         health_check_interval_secs: 5,
         health_check_max_failures: 3,
         health_check_timeout_secs: 3,
@@ -8342,6 +8463,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         ohttp_gateway: Some(Arc::new(ohttp_gw)),
         ohttp_attestation_ed25519: Some(ohttp_attestation_ed25519),
         fusion_caches: Arc::new(fusion::FusionCaches::default()),
+        vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(None, 1_200)),
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(100, 200);
@@ -8694,6 +8816,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         startup_check_retry_delay_secs: 0,
         startup_check_timeout_secs: 5,
         backend_urls: vec![mock_url.to_string()],
+        vllm_data_parallel_size: None,
         health_check_interval_secs: 5,
         health_check_max_failures: 3,
         health_check_timeout_secs: 3,
@@ -8751,6 +8874,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         ohttp_gateway: Some(Arc::new(ohttp_gw)),
         ohttp_attestation_ed25519: Some(ohttp_attestation_ed25519),
         fusion_caches: Arc::new(fusion::FusionCaches::default()),
+        vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(None, 1_200)),
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(100, 200);

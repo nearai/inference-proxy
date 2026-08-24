@@ -223,6 +223,7 @@ pub async fn images_edits(
         stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
         response_shape: ResponseShape::ChatCompletion,
         tracing_ids: Some(tracing_ids),
+        upstream_data_parallel_rank: None,
     };
 
     let (url, _guard) = match &state.config.images_edits_url_override {
@@ -308,6 +309,7 @@ pub async fn audio_transcriptions(
         stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
         response_shape: ResponseShape::ChatCompletion,
         tracing_ids: Some(tracing_ids),
+        upstream_data_parallel_rank: None,
     };
 
     let (url, _guard) = match &state.config.transcriptions_url_override {
@@ -375,6 +377,7 @@ async fn json_passthrough_encrypted(
                 stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
                 response_shape: ResponseShape::ChatCompletion,
                 tracing_ids: Some(tracing_ids.clone()),
+                upstream_data_parallel_rank: None,
             };
             proxy::proxy_json_request(&state.http_client, u, forward_body, opts).await
         }
@@ -394,6 +397,7 @@ async fn json_passthrough_encrypted(
                 stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
                 response_shape: ResponseShape::ChatCompletion,
                 tracing_ids: Some(tracing_ids),
+                upstream_data_parallel_rank: None,
             };
             proxy::proxy_json_request(&state.http_client, &url, forward_body, opts).await
         }

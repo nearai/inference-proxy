@@ -95,6 +95,7 @@ All configuration is via environment variables:
 | `MODEL_NAME` | Yes | — | Model name for cache key namespacing |
 | `TOKEN` | Yes | — | Bearer token for API authentication |
 | `VLLM_BASE_URL` | No | `http://localhost:8000` | Backend base URL |
+| `VLLM_DATA_PARALLEL_SIZE` | No | unset | Number of independent vLLM DP engines in one backend. When set, assigns new chat conversations round-robin and keeps append-only turns on the same rank via `X-data-parallel-rank`, improving local prefix-cache reuse without trusting a client-supplied rank. Requires exactly one backend URL. |
 | `DEV` | No | `false` | Dev mode (random signing keys instead of KMS) |
 | `GPU_NO_HW_MODE` | No | `false` | Use canned GPU evidence |
 | `CHAT_CACHE_EXPIRATION` | No | `1200` | Signature cache TTL in seconds |

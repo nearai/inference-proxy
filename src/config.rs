@@ -338,6 +338,11 @@ impl Config {
                 anyhow::bail!("VLLM_DATA_PARALLEL_SIZE must be valid UTF-8")
             }
         };
+        if vllm_data_parallel_size.is_some() && backend_urls.len() != 1 {
+            anyhow::bail!(
+                "VLLM_DATA_PARALLEL_SIZE requires exactly one vLLM backend; multiple VLLM_BACKEND_URLS have independent prefix caches"
+            );
+        }
 
         // Track which endpoint URLs are explicitly overridden (should bypass pool)
         let images_url_override = env::var("VLLM_IMAGES_URL").ok().filter(|s| !s.is_empty());
@@ -1181,6 +1186,22 @@ mod tests {
                 },
             );
         }
+    }
+
+    #[test]
+    fn test_config_rejects_dp_affinity_with_multiple_backends() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "model"),
+                ("TOKEN", "tok"),
+                ("VLLM_DATA_PARALLEL_SIZE", "4"),
+                ("VLLM_BACKEND_URLS", "http://backend-a,http://backend-b"),
+            ],
+            || {
+                let error = Config::from_env().unwrap_err().to_string();
+                assert!(error.contains("requires exactly one vLLM backend"));
+            },
+        );
     }
 
     #[test]

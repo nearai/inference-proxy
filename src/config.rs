@@ -153,9 +153,10 @@ pub struct Config {
 
     // Timeouts
     pub timeout_secs: u64,
-    /// Maximum idle time between upstream SSE chunks. Zero disables the
-    /// watchdog. This is separate from `timeout_secs`, which bounds the total
-    /// reqwest request lifetime rather than token cadence.
+    /// Maximum idle time between upstream SSE chunks after the first chunk.
+    /// Zero disables the watchdog. This deliberately does not bound time to
+    /// first chunk, which includes model queueing and prefill; `timeout_secs`
+    /// remains the total reqwest request bound.
     pub stream_idle_timeout_secs: u64,
     pub timeout_tokenize_secs: u64,
 

@@ -756,6 +756,7 @@ async fn run_iteration(
         client_disconnected: false,
         upstream_error: None,
     };
+    let mut received_upstream_chunk = false;
 
     // SSE line loop. We hold off forwarding `[DONE]` until the caller decides
     // whether to continue looping; everything else is forwarded as it arrives.
@@ -766,6 +767,7 @@ async fn run_iteration(
             chunk = byte_stream.next() => {
                 match chunk {
                     Some(Ok(chunk)) => {
+                        received_upstream_chunk = true;
                         byte_buf.extend_from_slice(&chunk);
 
                         while let Some(nl) = byte_buf.iter().position(|b| *b == b'\n') {
@@ -893,7 +895,7 @@ async fn run_iteration(
                 break 'outer;
             }
             _ = tokio::time::sleep(Duration::from_secs(ctx.stream_idle_timeout_secs)),
-                if ctx.stream_idle_timeout_secs > 0 => {
+                if ctx.stream_idle_timeout_secs > 0 && received_upstream_chunk => {
                 metrics::counter!(
                     "upstream_stream_incomplete_total",
                     "reason" => "idle_timeout",

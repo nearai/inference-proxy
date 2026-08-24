@@ -1024,9 +1024,10 @@ pub(crate) fn record_completed_request(
 ///    backend. The backend (SGLang/vLLM) detects the closed connection and
 ///    aborts generation, preventing zombie requests from consuming GPU.
 ///
-/// 2. **Idle watchdog**: When configured, an upstream stream that stops
-///    producing chunks fails as a typed 504 before any downstream response is
-///    sent. The ordinary reqwest timeout remains a total-request bound.
+/// 2. **Idle watchdog**: After the first upstream chunk arrives, a stream that
+///    stops producing further chunks fails as a typed 504 before any downstream
+///    response is sent. Queueing and prefill time to first chunk remain bounded
+///    only by the ordinary total reqwest timeout.
 pub async fn proxy_json_request(
     client: &reqwest::Client,
     url: &str,
@@ -1087,8 +1088,9 @@ pub async fn proxy_json_request(
         {
             use futures_util::StreamExt;
             let mut byte_stream = std::pin::pin!(response.bytes_stream());
+            let mut received_upstream_chunk = false;
             loop {
-                let next_chunk = if opts.stream_idle_timeout_secs == 0 {
+                let next_chunk = if opts.stream_idle_timeout_secs == 0 || !received_upstream_chunk {
                     byte_stream.next().await
                 } else {
                     match tokio::time::timeout(
@@ -1126,7 +1128,18 @@ pub async fn proxy_json_request(
                 let Some(chunk) = next_chunk else {
                     break;
                 };
-                let chunk = chunk.map_err(|e| AppError::Internal(e.into()))?;
+                let chunk = chunk.map_err(|e| {
+                    if e.is_timeout() {
+                        AppError::UpstreamParsed {
+                            status: StatusCode::GATEWAY_TIMEOUT,
+                            message: "Upstream response stream timed out".to_string(),
+                            error_type: "upstream_request_timeout".to_string(),
+                        }
+                    } else {
+                        AppError::Internal(e.into())
+                    }
+                })?;
+                received_upstream_chunk = true;
                 stream_parser.process_chunk(&chunk);
                 assembler.process_chunk(&chunk);
             }
@@ -1755,6 +1768,7 @@ pub async fn proxy_streaming_request(
         let mut upstream_error = false;
         let mut downstream_closed = false;
         let mut incomplete_reason = None;
+        let mut received_upstream_chunk = false;
         let mut transformer = SseTransformer::new(chunk_transform);
 
         loop {
@@ -1762,6 +1776,7 @@ pub async fn proxy_streaming_request(
                 chunk = byte_stream.next() => {
                     match chunk {
                         Some(Ok(chunk)) => {
+                            received_upstream_chunk = true;
                             parser.process_chunk(&chunk);
 
                             // Normalize (and encrypt, if active) the chunk, then hash
@@ -1802,7 +1817,7 @@ pub async fn proxy_streaming_request(
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_secs(
                     stream_idle_timeout_secs,
-                )), if stream_idle_timeout_secs > 0 => {
+                )), if stream_idle_timeout_secs > 0 && received_upstream_chunk => {
                     warn!(
                         request_id = %log_request_id,
                         org_id = %log_org_id,
@@ -2351,6 +2366,7 @@ pub async fn proxy_streaming_response(
         let mut upstream_error = false;
         let mut downstream_closed = false;
         let mut incomplete_reason = None;
+        let mut received_upstream_chunk = false;
         let mut transformer = SseTransformer::new(chunk_transform);
 
         loop {
@@ -2358,6 +2374,7 @@ pub async fn proxy_streaming_response(
                 chunk = byte_stream.next() => {
                     match chunk {
                         Some(Ok(chunk)) => {
+                            received_upstream_chunk = true;
                             parser.process_chunk(&chunk);
 
                             // Normalize (and encrypt, if active) the chunk, then hash
@@ -2399,7 +2416,7 @@ pub async fn proxy_streaming_response(
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_secs(
                     stream_idle_timeout_secs,
-                )), if stream_idle_timeout_secs > 0 => {
+                )), if stream_idle_timeout_secs > 0 && received_upstream_chunk => {
                     warn!(
                         request_id = %log_request_id,
                         org_id = %log_org_id,
@@ -3142,9 +3159,194 @@ mod tests {
             .unwrap()
     }
 
+    async fn delayed_sse_server_url(
+        body: &'static str,
+        initial_delay: std::time::Duration,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(initial_delay).await;
+            let encoded = format!("{:X}\r\n{}\r\n0\r\n\r\n", body.len(), body);
+            socket.write_all(encoded.as_bytes()).await.unwrap();
+        });
+
+        format!("http://{address}")
+    }
+
+    async fn delayed_sse_response(
+        body: &'static str,
+        initial_delay: std::time::Duration,
+    ) -> reqwest::Response {
+        reqwest::Client::new()
+            .get(delayed_sse_server_url(body, initial_delay).await)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn sse_response_then_stall(
+        body: &'static str,
+        stall_duration: std::time::Duration,
+    ) -> reqwest::Response {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let encoded = format!("{:X}\r\n{}\r\n", body.len(), body);
+            socket.write_all(encoded.as_bytes()).await.unwrap();
+            tokio::time::sleep(stall_duration).await;
+        });
+
+        reqwest::Client::new()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
-    async fn test_stream_idle_watchdog_fails_downstream_body() {
-        let upstream = raw_sse_response(None, true).await;
+    async fn test_stream_idle_watchdog_does_not_limit_time_to_first_chunk() {
+        let upstream = delayed_sse_response(
+            "data: {\"id\":\"chat-slow-prefill\",\"choices\":[]}\n\ndata: [DONE]\n\n",
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        let mut opts = test_proxy_opts();
+        opts.stream_idle_timeout_secs = 1;
+        let response = proxy_streaming_response(
+            upstream,
+            "request-sha256",
+            opts,
+            StatusCode::OK,
+            std::time::Instant::now(),
+        )
+        .await
+        .unwrap();
+
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            axum::body::to_bytes(response.into_body(), 1024 * 1024),
+        )
+        .await
+        .expect("valid slow-prefill response should finish")
+        .expect("idle watchdog must not reject time to first chunk");
+        assert!(body.ends_with(b"data: [DONE]\n\n"));
+    }
+
+    const VALID_CHAT_SSE: &str = concat!(
+        "data: {\"id\":\"chat-slow-prefill\",\"model\":\"test-model\",",
+        "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",",
+        "\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chat-slow-prefill\",\"model\":\"test-model\",",
+        "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],",
+        "\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    #[tokio::test]
+    async fn test_native_streaming_watchdog_allows_slow_first_chunk() {
+        let url = delayed_sse_server_url(VALID_CHAT_SSE, std::time::Duration::from_secs(2)).await;
+        let mut opts = test_proxy_opts();
+        opts.stream_idle_timeout_secs = 1;
+        let response = proxy_streaming_request(
+            &reqwest::Client::new(),
+            &url,
+            br#"{"model":"test-model","stream":true}"#.to_vec(),
+            opts,
+        )
+        .await
+        .unwrap();
+
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            axum::body::to_bytes(response.into_body(), 1024 * 1024),
+        )
+        .await
+        .expect("valid slow-prefill stream should finish")
+        .expect("native stream watchdog must not reject time to first chunk");
+        assert!(body.ends_with(b"data: [DONE]\n\n"));
+    }
+
+    #[tokio::test]
+    async fn test_json_via_stream_watchdog_allows_slow_first_chunk() {
+        let url = delayed_sse_server_url(VALID_CHAT_SSE, std::time::Duration::from_secs(2)).await;
+        let mut opts = test_proxy_opts();
+        opts.stream_idle_timeout_secs = 1;
+        let response = proxy_json_request(
+            &reqwest::Client::new(),
+            &url,
+            br#"{"model":"test-model","messages":[]}"#.to_vec(),
+            opts,
+        )
+        .await
+        .expect("JSON-via-stream watchdog must not reject time to first chunk");
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response["id"], "chat-slow-prefill");
+        assert_eq!(response["choices"][0]["message"]["content"], "ok");
+        assert_eq!(response["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[tokio::test]
+    async fn test_json_via_stream_first_chunk_total_timeout_is_504() {
+        let url = delayed_sse_server_url(VALID_CHAT_SSE, std::time::Duration::from_secs(2)).await;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let mut opts = test_proxy_opts();
+        opts.stream_idle_timeout_secs = 1;
+
+        let result = proxy_json_request(
+            &client,
+            &url,
+            br#"{"model":"test-model","messages":[]}"#.to_vec(),
+            opts,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(AppError::UpstreamParsed {
+                status: StatusCode::GATEWAY_TIMEOUT,
+                error_type,
+                ..
+            }) if error_type == "upstream_request_timeout"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_stream_idle_watchdog_fails_after_first_chunk() {
+        let upstream = sse_response_then_stall(
+            "data: {\"id\":\"chat-stalled\",\"choices\":[]}\n\n",
+            std::time::Duration::from_secs(3),
+        )
+        .await;
         let mut opts = test_proxy_opts();
         opts.stream_idle_timeout_secs = 1;
         let response = proxy_streaming_response(

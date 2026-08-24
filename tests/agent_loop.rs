@@ -249,7 +249,38 @@ async fn stalled_sse_upstream_url() -> String {
             )
             .await
             .unwrap();
+        let first_chunk = concat!(
+            "data: {\"id\":\"chatcmpl-STALL\",\"object\":\"chat.completion.chunk\",",
+            "\"created\":1,\"model\":\"test-model\",\"choices\":[{\"index\":0,",
+            "\"delta\":{\"role\":\"assistant\",\"content\":\"\"},",
+            "\"finish_reason\":null}]}\n\n"
+        );
+        let encoded = format!("{:X}\r\n{}\r\n", first_chunk.len(), first_chunk);
+        socket.write_all(encoded.as_bytes()).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    });
+    format!("http://{address}")
+}
+
+async fn delayed_valid_sse_upstream_url(initial_delay: std::time::Duration) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let body = upstream_final_answer_sse("chatcmpl-SLOW-PREFILL");
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = socket.read(&mut request).await;
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(initial_delay).await;
+        let encoded = format!("{:X}\r\n{}\r\n0\r\n\r\n", body.len(), body);
+        socket.write_all(encoded.as_bytes()).await.unwrap();
     });
     format!("http://{address}")
 }
@@ -292,6 +323,39 @@ async fn upstream_idle_watchdog_covers_agent_loop_iterations() {
     .await
     .expect("agent-loop idle watchdog should fire before the test timeout");
     assert!(result.is_err(), "stalled agent-loop body must fail");
+}
+
+#[tokio::test]
+async fn agent_loop_idle_watchdog_allows_slow_first_chunk() {
+    let upstream_url = delayed_valid_sse_upstream_url(std::time::Duration::from_secs(2)).await;
+    let brave = MockServer::start().await;
+    let app = build_agent_loop_app_with_cloud_and_idle(&upstream_url, Some(&brave.uri()), None, 1);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json")
+                .body(Body::from(agent_loop_request_body(true).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        response.into_body().collect(),
+    )
+    .await
+    .expect("valid slow-prefill agent loop should finish")
+    .expect("agent-loop watchdog must not reject time to first chunk")
+    .to_bytes();
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("Hello."));
+    assert!(body.contains("data: [DONE]"));
 }
 
 #[tokio::test]

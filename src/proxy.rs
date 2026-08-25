@@ -1024,10 +1024,12 @@ pub(crate) fn record_completed_request(
 ///    backend. The backend (SGLang/vLLM) detects the closed connection and
 ///    aborts generation, preventing zombie requests from consuming GPU.
 ///
-/// 2. **Idle watchdog**: After the first upstream chunk arrives, a stream that
-///    stops producing further chunks fails as a typed 504 before any downstream
-///    response is sent. Queueing and prefill time to first chunk remain bounded
-///    only by the ordinary total reqwest timeout.
+/// 2. **Idle watchdog**: After the first upstream generation-progress event
+///    arrives, a stream that stops producing further chunks fails as a typed
+///    504 before any downstream response is sent. Queueing, prefill, and
+///    metadata-only role events remain bounded only by the ordinary total
+///    reqwest timeout. vLLM can emit the assistant role and then legitimately
+///    stay byte-silent while hidden reasoning is generated.
 pub async fn proxy_json_request(
     client: &reqwest::Client,
     url: &str,
@@ -1088,43 +1090,44 @@ pub async fn proxy_json_request(
         {
             use futures_util::StreamExt;
             let mut byte_stream = std::pin::pin!(response.bytes_stream());
-            let mut received_upstream_chunk = false;
+            let mut received_upstream_progress = false;
             loop {
-                let next_chunk = if opts.stream_idle_timeout_secs == 0 || !received_upstream_chunk {
-                    byte_stream.next().await
-                } else {
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(opts.stream_idle_timeout_secs),
-                        byte_stream.next(),
-                    )
-                    .await
-                    {
-                        Ok(chunk) => chunk,
-                        Err(_) => {
-                            metrics::counter!(
-                                "upstream_stream_incomplete_total",
-                                "reason" => "idle_timeout",
-                                "mode" => "json_via_stream"
-                            )
-                            .increment(1);
-                            let (request_id, org_id, workspace_id) =
-                                log_ids_or_empty(&opts.tracing_ids);
-                            warn!(
-                                request_id = %request_id,
-                                org_id = %org_id,
-                                workspace_id = %workspace_id,
-                                model = %opts.model_name.to_lowercase(),
-                                timeout_secs = opts.stream_idle_timeout_secs,
-                                "Upstream SSE stream exceeded the idle timeout"
-                            );
-                            return Err(AppError::UpstreamParsed {
-                                status: StatusCode::GATEWAY_TIMEOUT,
-                                message: "Upstream response stream timed out".to_string(),
-                                error_type: "upstream_stream_idle_timeout".to_string(),
-                            });
+                let next_chunk =
+                    if opts.stream_idle_timeout_secs == 0 || !received_upstream_progress {
+                        byte_stream.next().await
+                    } else {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(opts.stream_idle_timeout_secs),
+                            byte_stream.next(),
+                        )
+                        .await
+                        {
+                            Ok(chunk) => chunk,
+                            Err(_) => {
+                                metrics::counter!(
+                                    "upstream_stream_incomplete_total",
+                                    "reason" => "idle_timeout",
+                                    "mode" => "json_via_stream"
+                                )
+                                .increment(1);
+                                let (request_id, org_id, workspace_id) =
+                                    log_ids_or_empty(&opts.tracing_ids);
+                                warn!(
+                                    request_id = %request_id,
+                                    org_id = %org_id,
+                                    workspace_id = %workspace_id,
+                                    model = %opts.model_name.to_lowercase(),
+                                    timeout_secs = opts.stream_idle_timeout_secs,
+                                    "Upstream SSE stream exceeded the idle timeout"
+                                );
+                                return Err(AppError::UpstreamParsed {
+                                    status: StatusCode::GATEWAY_TIMEOUT,
+                                    message: "Upstream response stream timed out".to_string(),
+                                    error_type: "upstream_stream_idle_timeout".to_string(),
+                                });
+                            }
                         }
-                    }
-                };
+                    };
                 let Some(chunk) = next_chunk else {
                     break;
                 };
@@ -1139,8 +1142,7 @@ pub async fn proxy_json_request(
                         AppError::Internal(e.into())
                     }
                 })?;
-                received_upstream_chunk = true;
-                stream_parser.process_chunk(&chunk);
+                received_upstream_progress |= stream_parser.process_chunk(&chunk);
                 assembler.process_chunk(&chunk);
             }
         }
@@ -1768,7 +1770,7 @@ pub async fn proxy_streaming_request(
         let mut upstream_error = false;
         let mut downstream_closed = false;
         let mut incomplete_reason = None;
-        let mut received_upstream_chunk = false;
+        let mut received_upstream_progress = false;
         let mut transformer = SseTransformer::new(chunk_transform);
 
         loop {
@@ -1776,8 +1778,7 @@ pub async fn proxy_streaming_request(
                 chunk = byte_stream.next() => {
                     match chunk {
                         Some(Ok(chunk)) => {
-                            received_upstream_chunk = true;
-                            parser.process_chunk(&chunk);
+                            received_upstream_progress |= parser.process_chunk(&chunk);
 
                             // Normalize (and encrypt, if active) the chunk, then hash
                             // what the client actually receives for signatures.
@@ -1817,7 +1818,7 @@ pub async fn proxy_streaming_request(
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_secs(
                     stream_idle_timeout_secs,
-                )), if stream_idle_timeout_secs > 0 && received_upstream_chunk => {
+                )), if stream_idle_timeout_secs > 0 && received_upstream_progress => {
                     warn!(
                         request_id = %log_request_id,
                         org_id = %log_org_id,
@@ -2366,7 +2367,7 @@ pub async fn proxy_streaming_response(
         let mut upstream_error = false;
         let mut downstream_closed = false;
         let mut incomplete_reason = None;
-        let mut received_upstream_chunk = false;
+        let mut received_upstream_progress = false;
         let mut transformer = SseTransformer::new(chunk_transform);
 
         loop {
@@ -2374,8 +2375,7 @@ pub async fn proxy_streaming_response(
                 chunk = byte_stream.next() => {
                     match chunk {
                         Some(Ok(chunk)) => {
-                            received_upstream_chunk = true;
-                            parser.process_chunk(&chunk);
+                            received_upstream_progress |= parser.process_chunk(&chunk);
 
                             // Normalize (and encrypt, if active) the chunk, then hash
                             // what the client actually receives for signatures.
@@ -2416,7 +2416,7 @@ pub async fn proxy_streaming_response(
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_secs(
                     stream_idle_timeout_secs,
-                )), if stream_idle_timeout_secs > 0 && received_upstream_chunk => {
+                )), if stream_idle_timeout_secs > 0 && received_upstream_progress => {
                     warn!(
                         request_id = %log_request_id,
                         org_id = %log_org_id,
@@ -2579,6 +2579,10 @@ pub struct SseParser {
     line_buffer: String,
     pub chat_id: Option<String>,
     pub seen_done: bool,
+    /// Whether the stream has emitted client-visible generation progress.
+    /// A role-only chat chunk is metadata, not progress: vLLM emits it before
+    /// hidden reasoning and may then remain byte-silent for an unbounded time.
+    pub seen_generation_progress: bool,
     /// Token usage extracted from the final SSE chunk (prompt_tokens, completion_tokens).
     pub usage: Option<(i64, i64)>,
 }
@@ -2595,15 +2599,18 @@ impl SseParser {
             line_buffer: String::new(),
             chat_id: None,
             seen_done: false,
+            seen_generation_progress: false,
             usage: None,
         }
     }
 
-    pub fn process_chunk(&mut self, chunk: &[u8]) {
+    pub fn process_chunk(&mut self, chunk: &[u8]) -> bool {
         match std::str::from_utf8(chunk) {
             Ok(s) => self.line_buffer.push_str(s),
             Err(_) => self.line_buffer.push_str(&String::from_utf8_lossy(chunk)),
         }
+
+        let mut chunk_has_generation_progress = false;
 
         // Process all complete lines in the buffer.
         // We extract state changes from borrowed data first, then mutate,
@@ -2617,7 +2624,7 @@ impl SseParser {
                 };
 
             // Borrow the line from the buffer, extract what we need, then release the borrow
-            let (is_done, extracted_id, extracted_usage) = {
+            let (is_done, extracted_id, extracted_usage, has_generation_progress) = {
                 let line = &self.line_buffer[..line_end];
                 let data = line
                     .strip_prefix("data: ")
@@ -2626,9 +2633,9 @@ impl SseParser {
                     .trim();
 
                 if data.is_empty() {
-                    (false, None, None)
+                    (false, None, None, false)
                 } else if data == "[DONE]" {
-                    (true, None, None)
+                    (true, None, None, true)
                 } else if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
                     let id = if self.chat_id.is_none() {
                         parsed
@@ -2656,9 +2663,10 @@ impl SseParser {
                                 None
                             }
                         });
-                    (false, id, usage)
+                    let progress = sse_value_has_generation_progress(&parsed);
+                    (false, id, usage, progress)
                 } else {
-                    (false, None, None)
+                    (false, None, None, false)
                 }
             };
 
@@ -2671,18 +2679,71 @@ impl SseParser {
             if let Some(usage) = extracted_usage {
                 self.usage = Some(usage);
             }
+            if has_generation_progress {
+                self.seen_generation_progress = true;
+                chunk_has_generation_progress = true;
+            }
 
             // Remove the processed line in-place (no allocation, just memmove)
             self.line_buffer.drain(..newline_pos + 1);
         }
+
+        chunk_has_generation_progress
     }
 
     /// Dispatch a final unterminated SSE line at end-of-stream. SSE permits
     /// the last event line to omit its newline, including `data: [DONE]`.
     pub fn finish(&mut self) {
         if !self.line_buffer.is_empty() {
-            self.process_chunk(b"\n");
+            let _ = self.process_chunk(b"\n");
         }
+    }
+}
+
+fn sse_value_has_generation_progress(value: &serde_json::Value) -> bool {
+    if value.get("error").is_some_and(|error| !error.is_null())
+        || value.get("usage").is_some_and(|usage| !usage.is_null())
+    {
+        return true;
+    }
+
+    let Some(choices) = value.get("choices").and_then(serde_json::Value::as_array) else {
+        // Non-chat streaming protocols (for example Responses API events) do
+        // not use `choices`. Conservatively treat every parsed data event as
+        // progress so unknown-but-forwarded schemas retain the historical
+        // watchdog behavior. Known chat metadata is classified below.
+        return true;
+    };
+
+    choices.iter().any(|choice| {
+        if choice
+            .get("finish_reason")
+            .is_some_and(|reason| !reason.is_null())
+        {
+            return true;
+        }
+        if choice.get("text").is_some_and(json_value_has_payload) {
+            return true;
+        }
+        choice
+            .get("delta")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|delta| {
+                delta
+                    .iter()
+                    .any(|(key, value)| key != "role" && json_value_has_payload(value))
+            })
+    })
+}
+
+fn json_value_has_payload(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(value) => *value,
+        serde_json::Value::Number(_) => true,
+        serde_json::Value::String(value) => !value.is_empty(),
+        serde_json::Value::Array(value) => !value.is_empty(),
+        serde_json::Value::Object(value) => !value.is_empty(),
     }
 }
 
@@ -3226,6 +3287,35 @@ mod tests {
             .unwrap()
     }
 
+    async fn sse_server_url_with_delayed_tail(
+        first_event: &'static str,
+        tail: &'static str,
+        delay: std::time::Duration,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let first = format!("{:X}\r\n{}\r\n", first_event.len(), first_event);
+            socket.write_all(first.as_bytes()).await.unwrap();
+            tokio::time::sleep(delay).await;
+            let tail = format!("{:X}\r\n{}\r\n0\r\n\r\n", tail.len(), tail);
+            socket.write_all(tail.as_bytes()).await.unwrap();
+        });
+
+        format!("http://{address}")
+    }
+
     #[tokio::test]
     async fn test_stream_idle_watchdog_does_not_limit_time_to_first_chunk() {
         let upstream = delayed_sse_response(
@@ -3262,6 +3352,20 @@ mod tests {
         "data: {\"id\":\"chat-slow-prefill\",\"model\":\"test-model\",",
         "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],",
         "\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    const ROLE_ONLY_CHAT_SSE: &str = concat!(
+        "data: {\"id\":\"chat-hidden-reasoning\",\"model\":\"test-model\",",
+        "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",",
+        "\"content\":\"\"},\"finish_reason\":null}]}\n\n"
+    );
+
+    const FINISH_CHAT_SSE: &str = concat!(
+        "data: {\"id\":\"chat-hidden-reasoning\",\"model\":\"test-model\",",
+        "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}],",
+        "\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":4096,",
+        "\"total_tokens\":4097}}\n\n",
         "data: [DONE]\n\n"
     );
 
@@ -3313,6 +3417,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_streaming_response_watchdog_ignores_role_only_hidden_reasoning_gap() {
+        let url = sse_server_url_with_delayed_tail(
+            ROLE_ONLY_CHAT_SSE,
+            FINISH_CHAT_SSE,
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        let upstream = reqwest::Client::new().get(url).send().await.unwrap();
+        let mut opts = test_proxy_opts();
+        opts.stream_idle_timeout_secs = 1;
+        let response = proxy_streaming_response(
+            upstream,
+            "request-sha256",
+            opts,
+            StatusCode::OK,
+            std::time::Instant::now(),
+        )
+        .await
+        .unwrap();
+
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            axum::body::to_bytes(response.into_body(), 1024 * 1024),
+        )
+        .await
+        .expect("hidden reasoning should finish after the idle threshold")
+        .expect("role-only metadata must not arm the idle watchdog");
+        assert!(body.ends_with(b"data: [DONE]\n\n"));
+    }
+
+    #[tokio::test]
+    async fn test_native_streaming_watchdog_ignores_role_only_hidden_reasoning_gap() {
+        let url = sse_server_url_with_delayed_tail(
+            ROLE_ONLY_CHAT_SSE,
+            FINISH_CHAT_SSE,
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        let mut opts = test_proxy_opts();
+        opts.stream_idle_timeout_secs = 1;
+        let response = proxy_streaming_request(
+            &reqwest::Client::new(),
+            &url,
+            br#"{"model":"test-model","stream":true}"#.to_vec(),
+            opts,
+        )
+        .await
+        .unwrap();
+
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            axum::body::to_bytes(response.into_body(), 1024 * 1024),
+        )
+        .await
+        .expect("hidden reasoning should finish after the idle threshold")
+        .expect("native stream role metadata must not arm the idle watchdog");
+        assert!(body.ends_with(b"data: [DONE]\n\n"));
+    }
+
+    #[tokio::test]
+    async fn test_json_via_stream_watchdog_ignores_role_only_hidden_reasoning_gap() {
+        let url = sse_server_url_with_delayed_tail(
+            ROLE_ONLY_CHAT_SSE,
+            FINISH_CHAT_SSE,
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        let mut opts = test_proxy_opts();
+        opts.stream_idle_timeout_secs = 1;
+        let response = proxy_json_request(
+            &reqwest::Client::new(),
+            &url,
+            br#"{"model":"test-model","messages":[]}"#.to_vec(),
+            opts,
+        )
+        .await
+        .expect("JSON-via-stream role metadata must not arm the idle watchdog");
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response["id"], "chat-hidden-reasoning");
+        assert_eq!(response["choices"][0]["finish_reason"], "length");
+    }
+
+    #[tokio::test]
     async fn test_json_via_stream_first_chunk_total_timeout_is_504() {
         let url = delayed_sse_server_url(VALID_CHAT_SSE, std::time::Duration::from_secs(2)).await;
         let client = reqwest::Client::builder()
@@ -3343,7 +3534,7 @@ mod tests {
     #[tokio::test]
     async fn test_stream_idle_watchdog_fails_after_first_chunk() {
         let upstream = sse_response_then_stall(
-            "data: {\"id\":\"chat-stalled\",\"choices\":[]}\n\n",
+            "data: {\"id\":\"chat-stalled\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
             std::time::Duration::from_secs(3),
         )
         .await;
@@ -3425,6 +3616,42 @@ mod tests {
         parser.process_chunk(b"data: {\"id\":\"chat-1\",\"content\":\"hi\"}\n\ndata: [DONE]\n\n");
         assert_eq!(parser.chat_id.as_deref(), Some("chat-1"));
         assert!(parser.seen_done);
+    }
+
+    #[test]
+    fn test_sse_parser_role_only_chunk_is_not_generation_progress() {
+        let mut parser = SseParser::new();
+        let progress = parser.process_chunk(ROLE_ONLY_CHAT_SSE.as_bytes());
+        assert!(!progress);
+        assert!(!parser.seen_generation_progress);
+    }
+
+    #[test]
+    fn test_sse_parser_role_only_null_usage_is_not_generation_progress() {
+        let mut parser = SseParser::new();
+        let progress = parser.process_chunk(
+            b"data: {\"id\":\"chat-1\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}],\"usage\":null}\n\n",
+        );
+        assert!(!progress);
+        assert!(!parser.seen_generation_progress);
+    }
+
+    #[test]
+    fn test_sse_parser_unknown_schema_is_generation_progress() {
+        let mut parser = SseParser::new();
+        let progress = parser.process_chunk(b"data: {\"token\":\"visible\"}\n\n");
+        assert!(progress);
+        assert!(parser.seen_generation_progress);
+    }
+
+    #[test]
+    fn test_sse_parser_visible_content_is_generation_progress() {
+        let mut parser = SseParser::new();
+        let progress = parser.process_chunk(
+            b"data: {\"id\":\"chat-1\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"visible\"},\"finish_reason\":null}]}\n\n",
+        );
+        assert!(progress);
+        assert!(parser.seen_generation_progress);
     }
 
     #[test]

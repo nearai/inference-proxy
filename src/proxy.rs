@@ -2709,8 +2709,10 @@ fn sse_value_has_generation_progress(value: &serde_json::Value) -> bool {
 
     let Some(choices) = value.get("choices").and_then(serde_json::Value::as_array) else {
         // Non-chat streaming protocols (for example Responses API events) do
-        // not use `choices`; retain the historical watchdog behavior for them.
-        return value.get("type").is_some();
+        // not use `choices`. Conservatively treat every parsed data event as
+        // progress so unknown-but-forwarded schemas retain the historical
+        // watchdog behavior. Known chat metadata is classified below.
+        return true;
     };
 
     choices.iter().any(|choice| {
@@ -3632,6 +3634,14 @@ mod tests {
         );
         assert!(!progress);
         assert!(!parser.seen_generation_progress);
+    }
+
+    #[test]
+    fn test_sse_parser_unknown_schema_is_generation_progress() {
+        let mut parser = SseParser::new();
+        let progress = parser.process_chunk(b"data: {\"token\":\"visible\"}\n\n");
+        assert!(progress);
+        assert!(parser.seen_generation_progress);
     }
 
     #[test]

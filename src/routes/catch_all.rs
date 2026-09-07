@@ -133,18 +133,23 @@ pub async fn catch_all(
             max_size: state.config.max_request_size,
         });
     }
-    let upstream_data_parallel_rank = if is_chat_completions_alias {
+    let (upstream_data_parallel_rank, backend_affinity_key) = if is_chat_completions_alias {
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
             crate::image_validation::reject_invalid_images(&json, &state.config.image_validation())
                 .await?;
-            state
-                .vllm_dp_affinity
-                .rank_for_chat_request(&json, &state.config.model_name)
+            (
+                state
+                    .vllm_dp_affinity
+                    .rank_for_chat_request(&json, &state.config.model_name),
+                state
+                    .backend_affinity
+                    .key_for_chat_request(&json, &state.config.model_name),
+            )
         } else {
-            None
+            (None, None)
         }
     } else {
-        None
+        (None, None)
     };
 
     // Compute request hash
@@ -164,7 +169,11 @@ pub async fn catch_all(
         Some(q) => format!("{path}?{q}"),
         None => path.to_string(),
     };
-    let (backend_url, backend_guard) = state.backend_pool.select_url(&path_with_query);
+    let (backend_url, backend_guard) = state.backend_affinity.select_url(
+        &state.backend_pool,
+        backend_affinity_key,
+        &path_with_query,
+    );
     let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
 
     let logged_backend_url = proxy::sanitized_upstream_url_for_logs(&backend_url);

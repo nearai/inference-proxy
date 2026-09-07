@@ -4,6 +4,7 @@ pub mod agent_loop;
 pub mod attestation;
 pub mod attestation_sdk;
 pub mod auth;
+pub mod backend_affinity;
 pub mod backend_pool;
 pub mod cache;
 pub mod config;
@@ -45,4 +46,7 @@ pub struct AppState {
     pub ohttp_attestation_ed25519: Option<types::OhttpAttestation>,
     pub fusion_caches: Arc<fusion::FusionCaches>,
     pub vllm_dp_affinity: Arc<vllm_dp_affinity::VllmDpAffinity>,
+    /// Conversation → backend pinning across `backend_pool` (see
+    /// `VLLM_BACKEND_CONVERSATION_AFFINITY`). Inactive with one backend.
+    pub backend_affinity: Arc<backend_affinity::BackendConversationAffinity>,
 }

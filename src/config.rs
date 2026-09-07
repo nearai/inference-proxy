@@ -219,6 +219,15 @@ pub struct Config {
     /// When set, append-only chat conversations are pinned to one rank so
     /// their turns reuse that engine's local prefix cache.
     pub vllm_data_parallel_size: Option<usize>,
+    /// Pin append-only chat conversations to one backend of `backend_urls`
+    /// so their turns reuse that engine's prefix cache instead of being
+    /// re-prefilled on whichever backend has the fewest connections. Bounded
+    /// by `backend_affinity_max_imbalance`; no effect with a single backend.
+    pub backend_conversation_affinity: bool,
+    /// Max extra in-flight requests the pinned backend may carry over the
+    /// least-loaded healthy backend before a turn is rebalanced (and the
+    /// conversation re-pinned) to the least-loaded backend.
+    pub backend_affinity_max_imbalance: u32,
     /// Health check interval in seconds (only used when multiple backends).
     pub health_check_interval_secs: u64,
     /// Consecutive failures before marking a backend unhealthy.
@@ -344,6 +353,17 @@ impl Config {
                 "VLLM_DATA_PARALLEL_SIZE requires exactly one vLLM backend; multiple VLLM_BACKEND_URLS have independent prefix caches"
             );
         }
+
+        let backend_conversation_affinity = env_bool("VLLM_BACKEND_CONVERSATION_AFFINITY");
+        if backend_conversation_affinity && vllm_data_parallel_size.is_some() {
+            anyhow::bail!(
+                "VLLM_BACKEND_CONVERSATION_AFFINITY and VLLM_DATA_PARALLEL_SIZE are mutually exclusive; data-parallel affinity already pins conversations inside the single backend"
+            );
+        }
+        let backend_affinity_max_imbalance =
+            u32::try_from(env_int("VLLM_BACKEND_AFFINITY_MAX_IMBALANCE", 8)).map_err(|_| {
+                anyhow::anyhow!("VLLM_BACKEND_AFFINITY_MAX_IMBALANCE exceeds the u32 range")
+            })?;
 
         // Track which endpoint URLs are explicitly overridden (should bypass pool)
         let images_url_override = env::var("VLLM_IMAGES_URL").ok().filter(|s| !s.is_empty());
@@ -503,6 +523,8 @@ impl Config {
             startup_check_timeout_secs: env_int("STARTUP_CHECK_TIMEOUT_SECS", 30) as u64,
             backend_urls,
             vllm_data_parallel_size,
+            backend_conversation_affinity,
+            backend_affinity_max_imbalance,
             health_check_interval_secs: env_int("HEALTH_CHECK_INTERVAL_SECS", 5) as u64,
             health_check_max_failures: env_int("HEALTH_CHECK_MAX_FAILURES", 3) as u32,
             health_check_timeout_secs: env_int("HEALTH_CHECK_TIMEOUT_SECS", 3) as u64,
@@ -1201,6 +1223,56 @@ mod tests {
             || {
                 let error = Config::from_env().unwrap_err().to_string();
                 assert!(error.contains("requires exactly one vLLM backend"));
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_backend_conversation_affinity_defaults_off() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "model"),
+                ("TOKEN", "tok"),
+                ("VLLM_BACKEND_URLS", "http://backend-a,http://backend-b"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert!(!config.backend_conversation_affinity);
+                assert_eq!(config.backend_affinity_max_imbalance, 8);
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_parses_backend_conversation_affinity() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "model"),
+                ("TOKEN", "tok"),
+                ("VLLM_BACKEND_URLS", "http://backend-a,http://backend-b"),
+                ("VLLM_BACKEND_CONVERSATION_AFFINITY", "true"),
+                ("VLLM_BACKEND_AFFINITY_MAX_IMBALANCE", "3"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert!(config.backend_conversation_affinity);
+                assert_eq!(config.backend_affinity_max_imbalance, 3);
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_rejects_backend_affinity_combined_with_dp_affinity() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "model"),
+                ("TOKEN", "tok"),
+                ("VLLM_DATA_PARALLEL_SIZE", "4"),
+                ("VLLM_BACKEND_CONVERSATION_AFFINITY", "1"),
+            ],
+            || {
+                let error = Config::from_env().unwrap_err().to_string();
+                assert!(error.contains("mutually exclusive"));
             },
         );
     }

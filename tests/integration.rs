@@ -25,6 +25,10 @@ struct TestAppOptions {
     fusion_internal_max_attempts: usize,
     fusion_internal_retry_initial_backoff_ms: u64,
     vllm_data_parallel_size: Option<usize>,
+    /// Backend URLs for the pool; empty means "just the mock URL".
+    backend_urls: Vec<String>,
+    backend_conversation_affinity: bool,
+    backend_affinity_max_imbalance: u32,
 }
 
 impl Default for TestAppOptions {
@@ -42,6 +46,9 @@ impl Default for TestAppOptions {
             fusion_internal_max_attempts: 2,
             fusion_internal_retry_initial_backoff_ms: 1,
             vllm_data_parallel_size: None,
+            backend_urls: Vec::new(),
+            backend_conversation_affinity: false,
+            backend_affinity_max_imbalance: 8,
         }
     }
 }
@@ -125,7 +132,38 @@ fn build_test_app_with_fusion_and_web(
 }
 
 fn build_test_app_inner_with_fusion(mock_url: &str, options: TestAppOptions) -> axum::Router {
+    build_test_app_inner_with_pool(mock_url, options).0
+}
+
+/// Multi-backend test app. Returns the pool so tests can shape `active_conns`
+/// and `healthy` to steer least-connections without real concurrency.
+fn build_test_app_with_backends(
+    backend_urls: Vec<String>,
+    conversation_affinity: bool,
+    max_imbalance: u32,
+) -> (axum::Router, Arc<vllm_proxy_rs::backend_pool::BackendPool>) {
+    let mock_url = backend_urls[0].clone();
+    build_test_app_inner_with_pool(
+        &mock_url,
+        TestAppOptions {
+            backend_urls,
+            backend_conversation_affinity: conversation_affinity,
+            backend_affinity_max_imbalance: max_imbalance,
+            ..Default::default()
+        },
+    )
+}
+
+fn build_test_app_inner_with_pool(
+    mock_url: &str,
+    options: TestAppOptions,
+) -> (axum::Router, Arc<vllm_proxy_rs::backend_pool::BackendPool>) {
     let base = mock_url.trim_end_matches('/');
+    let backend_urls: Vec<String> = if options.backend_urls.is_empty() {
+        vec![mock_url.to_string()]
+    } else {
+        options.backend_urls.clone()
+    };
 
     let config = config::Config {
         model_name: "test-model".to_string(),
@@ -183,8 +221,10 @@ fn build_test_app_inner_with_fusion(mock_url: &str, options: TestAppOptions) -> 
         startup_check_retries: 1,
         startup_check_retry_delay_secs: 0,
         startup_check_timeout_secs: 5,
-        backend_urls: vec![mock_url.to_string()],
+        backend_urls: backend_urls.clone(),
         vllm_data_parallel_size: options.vllm_data_parallel_size,
+        backend_conversation_affinity: options.backend_conversation_affinity,
+        backend_affinity_max_imbalance: options.backend_affinity_max_imbalance,
         health_check_interval_secs: 5,
         health_check_max_failures: 3,
         health_check_timeout_secs: 3,
@@ -244,9 +284,15 @@ fn build_test_app_inner_with_fusion(mock_url: &str, options: TestAppOptions) -> 
         .build_recorder()
         .handle();
 
-    let backend_pool = Arc::new(vllm_proxy_rs::backend_pool::BackendPool::new(vec![
-        mock_url.to_string(),
-    ]));
+    let backend_pool = Arc::new(vllm_proxy_rs::backend_pool::BackendPool::new(backend_urls));
+    let backend_affinity = Arc::new(
+        vllm_proxy_rs::backend_affinity::BackendConversationAffinity::new(
+            options.backend_conversation_affinity,
+            backend_pool.len(),
+            options.backend_affinity_max_imbalance,
+            1_200,
+        ),
+    );
 
     let state = AppState {
         config: Arc::new(config),
@@ -258,7 +304,7 @@ fn build_test_app_inner_with_fusion(mock_url: &str, options: TestAppOptions) -> 
         tls_cert_fingerprint: Arc::new(
             vllm_proxy_rs::attestation::TlsCertTracker::new(None).expect("tracker for None path"),
         ),
-        backend_pool,
+        backend_pool: backend_pool.clone(),
         ohttp_gateway: None,
         ohttp_attestation_ed25519: None,
         fusion_caches: Arc::new(fusion::FusionCaches::default()),
@@ -266,6 +312,7 @@ fn build_test_app_inner_with_fusion(mock_url: &str, options: TestAppOptions) -> 
             options.vllm_data_parallel_size,
             1_200,
         )),
+        backend_affinity,
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(options.rate_per_second, options.rate_burst);
@@ -274,11 +321,12 @@ fn build_test_app_inner_with_fusion(mock_url: &str, options: TestAppOptions) -> 
         trust_proxy_headers: true,
     };
 
-    routes::build_router()
+    let router = routes::build_router()
         .layer(middleware::from_fn(rate_limit::rate_limit_middleware))
         .layer(axum::Extension(rate_limit_state))
         .layer(middleware::from_fn(request_id_middleware))
-        .with_state(state)
+        .with_state(state);
+    (router, backend_pool)
 }
 
 fn auth_header() -> (&'static str, &'static str) {
@@ -627,6 +675,221 @@ async fn test_catch_all_chat_alias_forwards_derived_vllm_data_parallel_rank() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+// ---- Backend conversation affinity (multi-backend pools) ----
+
+/// Chat body with `turns` extra assistant/user exchanges appended to the same
+/// system + first-user prefix, i.e. later turns of one conversation.
+fn affinity_chat_body(turns: usize) -> serde_json::Value {
+    let mut messages = vec![
+        serde_json::json!({"role": "system", "content": "Be concise"}),
+        serde_json::json!({"role": "user", "content": "Plan my trip"}),
+    ];
+    for i in 0..turns {
+        messages.push(serde_json::json!({"role": "assistant", "content": format!("Step {i}")}));
+        messages.push(serde_json::json!({"role": "user", "content": format!("Then what, {i}?")}));
+    }
+    serde_json::json!({"model": "client-alias", "messages": messages, "stream": false})
+}
+
+async fn mount_chat_ok(server: &MockServer, path_str: &str, expected: u64) {
+    Mock::given(method("POST"))
+        .and(path(path_str))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-affinity",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11}
+        })))
+        .expect(expected)
+        .mount(server)
+        .await;
+}
+
+async fn post_chat(app: axum::Router, uri: &str, body: &serde_json::Value) -> StatusCode {
+    app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header(auth_header().0, auth_header().1)
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+    .status()
+}
+
+async fn requests_seen(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .map(|requests| requests.len())
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn test_backend_affinity_keeps_conversation_on_first_backend() {
+    let backend_a = MockServer::start().await;
+    let backend_b = MockServer::start().await;
+    mount_chat_ok(&backend_a, "/v1/chat/completions", 2).await;
+    mount_chat_ok(&backend_b, "/v1/chat/completions", 1).await;
+    let (app, pool) = build_test_app_with_backends(vec![backend_a.uri(), backend_b.uri()], true, 8);
+
+    // Turn 1: both backends idle; least-connections resolves the tie to A.
+    assert_eq!(
+        post_chat(app.clone(), "/v1/chat/completions", &affinity_chat_body(0)).await,
+        StatusCode::OK
+    );
+    assert_eq!(requests_seen(&backend_a).await, 1);
+
+    // A is now busier than B. Least-connections alone would move the
+    // conversation to B; affinity keeps turn 2 on A, where the prefix is cached.
+    pool.backends()[0]
+        .active_conns
+        .store(3, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        post_chat(app.clone(), "/v1/chat/completions", &affinity_chat_body(1)).await,
+        StatusCode::OK
+    );
+    assert_eq!(requests_seen(&backend_a).await, 2);
+    assert_eq!(requests_seen(&backend_b).await, 0);
+
+    // An unrelated conversation is still balanced onto the less-loaded backend.
+    let unrelated = serde_json::json!({
+        "model": "client-alias",
+        "messages": [{"role": "user", "content": "Something else entirely"}],
+        "stream": false
+    });
+    assert_eq!(
+        post_chat(app, "/v1/chat/completions", &unrelated).await,
+        StatusCode::OK
+    );
+    assert_eq!(requests_seen(&backend_b).await, 1);
+}
+
+#[tokio::test]
+async fn test_backend_affinity_rebalances_when_pinned_backend_is_overloaded() {
+    let backend_a = MockServer::start().await;
+    let backend_b = MockServer::start().await;
+    mount_chat_ok(&backend_a, "/v1/chat/completions", 1).await;
+    mount_chat_ok(&backend_b, "/v1/chat/completions", 2).await;
+    let (app, pool) = build_test_app_with_backends(vec![backend_a.uri(), backend_b.uri()], true, 2);
+
+    assert_eq!(
+        post_chat(app.clone(), "/v1/chat/completions", &affinity_chat_body(0)).await,
+        StatusCode::OK
+    );
+    assert_eq!(requests_seen(&backend_a).await, 1);
+
+    // A carries five more in-flight requests than B, beyond the bound of two:
+    // the turn is rebalanced to B and the conversation re-pinned there.
+    pool.backends()[0]
+        .active_conns
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        post_chat(app.clone(), "/v1/chat/completions", &affinity_chat_body(1)).await,
+        StatusCode::OK
+    );
+    assert_eq!(requests_seen(&backend_b).await, 1);
+
+    // Once A is idle again the conversation follows its new home on B (whose
+    // cache now holds the prefix) instead of flapping back.
+    pool.backends()[0]
+        .active_conns
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    pool.backends()[1]
+        .active_conns
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        post_chat(app, "/v1/chat/completions", &affinity_chat_body(2)).await,
+        StatusCode::OK
+    );
+    assert_eq!(requests_seen(&backend_b).await, 2);
+    assert_eq!(requests_seen(&backend_a).await, 1);
+}
+
+#[tokio::test]
+async fn test_backend_affinity_skips_unhealthy_pinned_backend() {
+    let backend_a = MockServer::start().await;
+    let backend_b = MockServer::start().await;
+    mount_chat_ok(&backend_a, "/v1/chat/completions", 1).await;
+    mount_chat_ok(&backend_b, "/v1/chat/completions", 1).await;
+    let (app, pool) = build_test_app_with_backends(vec![backend_a.uri(), backend_b.uri()], true, 8);
+
+    assert_eq!(
+        post_chat(app.clone(), "/v1/chat/completions", &affinity_chat_body(0)).await,
+        StatusCode::OK
+    );
+    assert_eq!(requests_seen(&backend_a).await, 1);
+
+    pool.backends()[0]
+        .healthy
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        post_chat(app, "/v1/chat/completions", &affinity_chat_body(1)).await,
+        StatusCode::OK
+    );
+    assert_eq!(requests_seen(&backend_b).await, 1);
+    assert_eq!(requests_seen(&backend_a).await, 1);
+}
+
+#[tokio::test]
+async fn test_catch_all_chat_alias_honors_backend_affinity() {
+    let backend_a = MockServer::start().await;
+    let backend_b = MockServer::start().await;
+    mount_chat_ok(&backend_a, "/v1/chat/completions", 1).await;
+    mount_chat_ok(&backend_a, "/v1/chat/completions/", 1).await;
+    mount_chat_ok(&backend_b, "/v1/chat/completions", 0).await;
+    mount_chat_ok(&backend_b, "/v1/chat/completions/", 0).await;
+    let (app, pool) = build_test_app_with_backends(vec![backend_a.uri(), backend_b.uri()], true, 8);
+
+    assert_eq!(
+        post_chat(app.clone(), "/v1/chat/completions", &affinity_chat_body(0)).await,
+        StatusCode::OK
+    );
+    pool.backends()[0]
+        .active_conns
+        .store(3, std::sync::atomic::Ordering::Relaxed);
+    // The trailing-slash alias goes through the catch-all handler, which must
+    // derive the same conversation key and land on the pinned backend.
+    assert_eq!(
+        post_chat(app, "/v1/chat/completions/", &affinity_chat_body(1)).await,
+        StatusCode::OK
+    );
+    assert_eq!(requests_seen(&backend_a).await, 2);
+    assert_eq!(requests_seen(&backend_b).await, 0);
+}
+
+#[tokio::test]
+async fn test_multiple_backends_without_affinity_stay_least_connections() {
+    let backend_a = MockServer::start().await;
+    let backend_b = MockServer::start().await;
+    mount_chat_ok(&backend_a, "/v1/chat/completions", 1).await;
+    mount_chat_ok(&backend_b, "/v1/chat/completions", 1).await;
+    let (app, pool) =
+        build_test_app_with_backends(vec![backend_a.uri(), backend_b.uri()], false, 8);
+
+    assert_eq!(
+        post_chat(app.clone(), "/v1/chat/completions", &affinity_chat_body(0)).await,
+        StatusCode::OK
+    );
+    pool.backends()[0]
+        .active_conns
+        .store(3, std::sync::atomic::Ordering::Relaxed);
+    // Flag off: the second turn simply follows least-connections to B.
+    assert_eq!(
+        post_chat(app, "/v1/chat/completions", &affinity_chat_body(1)).await,
+        StatusCode::OK
+    );
+    assert_eq!(requests_seen(&backend_a).await, 1);
+    assert_eq!(requests_seen(&backend_b).await, 1);
 }
 
 #[tokio::test]
@@ -5967,6 +6230,8 @@ fn build_test_app_with_cloud_api_retries(
         startup_check_timeout_secs: 5,
         backend_urls: vec![mock_url.to_string()],
         vllm_data_parallel_size: None,
+        backend_conversation_affinity: false,
+        backend_affinity_max_imbalance: 8,
         health_check_interval_secs: 5,
         health_check_max_failures: 3,
         health_check_timeout_secs: 3,
@@ -6037,6 +6302,9 @@ fn build_test_app_with_cloud_api_retries(
         ohttp_attestation_ed25519: None,
         fusion_caches: Arc::new(fusion::FusionCaches::default()),
         vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(None, 1_200)),
+        backend_affinity: Arc::new(
+            vllm_proxy_rs::backend_affinity::BackendConversationAffinity::new(false, 1, 8, 1_200),
+        ),
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(100, 200);
@@ -8397,6 +8665,8 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         startup_check_timeout_secs: 5,
         backend_urls: vec![mock_url.to_string()],
         vllm_data_parallel_size: None,
+        backend_conversation_affinity: false,
+        backend_affinity_max_imbalance: 8,
         health_check_interval_secs: 5,
         health_check_max_failures: 3,
         health_check_timeout_secs: 3,
@@ -8464,6 +8734,9 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         ohttp_attestation_ed25519: Some(ohttp_attestation_ed25519),
         fusion_caches: Arc::new(fusion::FusionCaches::default()),
         vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(None, 1_200)),
+        backend_affinity: Arc::new(
+            vllm_proxy_rs::backend_affinity::BackendConversationAffinity::new(false, 1, 8, 1_200),
+        ),
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(100, 200);
@@ -8817,6 +9090,8 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         startup_check_timeout_secs: 5,
         backend_urls: vec![mock_url.to_string()],
         vllm_data_parallel_size: None,
+        backend_conversation_affinity: false,
+        backend_affinity_max_imbalance: 8,
         health_check_interval_secs: 5,
         health_check_max_failures: 3,
         health_check_timeout_secs: 3,
@@ -8875,6 +9150,9 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         ohttp_attestation_ed25519: Some(ohttp_attestation_ed25519),
         fusion_caches: Arc::new(fusion::FusionCaches::default()),
         vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(None, 1_200)),
+        backend_affinity: Arc::new(
+            vllm_proxy_rs::backend_affinity::BackendConversationAffinity::new(false, 1, 8, 1_200),
+        ),
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(100, 200);

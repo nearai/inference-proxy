@@ -76,7 +76,10 @@ impl VllmDpAffinity {
 /// messages through the first user message, and optional tool/template inputs.
 /// Later assistant and user turns are deliberately excluded. The digest uses a
 /// process-random salt, stays in memory only, and is never logged or persisted.
-fn conversation_key(
+///
+/// Shared with `backend_affinity`, which pins conversations to one backend of
+/// a multi-backend pool with the same key.
+pub(crate) fn conversation_key(
     request: &Value,
     deployed_model_name: &str,
     affinity_salt: &[u8; 32],

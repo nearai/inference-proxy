@@ -112,6 +112,8 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         fusion_internal_max_attempts: 2,
         fusion_internal_retry_initial_backoff_ms: 250,
         vllm_data_parallel_size: None,
+        backend_conversation_affinity: false,
+        backend_affinity_max_imbalance: 8,
     };
 
     let ecdsa = signing::EcdsaContext::from_key_bytes(&ECDSA_KEY).unwrap();
@@ -139,6 +141,9 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         ),
         backend_pool,
         vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(None, 1_200)),
+        backend_affinity: Arc::new(
+            vllm_proxy_rs::backend_affinity::BackendConversationAffinity::new(false, 1, 8, 1_200),
+        ),
         ohttp_gateway: None,
         ohttp_attestation_ed25519: None,
         fusion_caches: Arc::new(fusion::FusionCaches::default()),

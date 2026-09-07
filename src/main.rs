@@ -6,8 +6,8 @@ use tokio::net::TcpListener;
 use tracing::info;
 use vllm_proxy_rs::ohttp_gateway::OhttpGateway;
 use vllm_proxy_rs::{
-    attestation, backend_pool, cache, config, fusion, metrics_middleware, rate_limit,
-    request_id_middleware, routes, signing, startup_checks, vllm_dp_affinity, AppState,
+    attestation, backend_affinity, backend_pool, cache, config, fusion, metrics_middleware,
+    rate_limit, request_id_middleware, routes, signing, startup_checks, vllm_dp_affinity, AppState,
 };
 
 /// DNS resolver that returns only IPv4 addresses.
@@ -117,6 +117,21 @@ async fn main() -> anyhow::Result<()> {
         config.vllm_data_parallel_size,
         config.chat_cache_expiration_secs,
     ));
+    let backend_affinity = Arc::new(backend_affinity::BackendConversationAffinity::new(
+        config.backend_conversation_affinity,
+        config.backend_urls.len(),
+        config.backend_affinity_max_imbalance,
+        config.chat_cache_expiration_secs,
+    ));
+    if backend_affinity.is_active() {
+        info!(
+            backends = config.backend_urls.len(),
+            max_imbalance = config.backend_affinity_max_imbalance,
+            "Backend conversation affinity enabled"
+        );
+    } else if config.backend_conversation_affinity {
+        info!("VLLM_BACKEND_CONVERSATION_AFFINITY set but only one backend is configured; nothing to pin");
+    }
     let attestation_cache = Arc::new(attestation::AttestationCache::new(
         config.attestation_cache_ttl_secs,
     ));
@@ -160,6 +175,7 @@ async fn main() -> anyhow::Result<()> {
         ohttp_attestation_ed25519: ohttp_attestation_ed25519.clone(),
         fusion_caches: Arc::new(fusion::FusionCaches::default()),
         vllm_dp_affinity,
+        backend_affinity,
     };
 
     // Spawn background attestation cache refresh task.

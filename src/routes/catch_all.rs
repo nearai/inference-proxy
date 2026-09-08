@@ -98,6 +98,17 @@ fn validate_path(path: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// True when a decoded request path targets the Responses API — `/v1/responses`
+/// itself or any sub-path (`/v1/responses/{id}`, `.../cancel`, ...).
+///
+/// The caller must pass the percent-DECODED path so an encoded alias
+/// (`/v1/%72esponses`) is matched too. `validate_path` has already rejected
+/// encoded slashes, so a decoded path cannot gain extra segments here.
+fn is_responses_path(decoded_path: &str) -> bool {
+    let path = decoded_path.trim_end_matches('/');
+    path == "/v1/responses" || path.starts_with("/v1/responses/")
+}
+
 /// Catch-all handler for undefined API paths. Forwards any request to the
 /// backend inference engine, signing and caching the response when it's
 /// JSON or SSE streaming.
@@ -115,6 +126,33 @@ pub async fn catch_all(
 
     validate_path(path)?;
 
+    // Billing-integrity guard for the Responses API (`/v1/responses`).
+    //
+    // `/v1/responses` has no dedicated route, so it lands here in the catch-all,
+    // which accounts usage as a ChatCompletion. But `build_usage_body` reads only
+    // `usage.prompt_tokens` / `usage.completion_tokens`, while Responses reports
+    // `usage.input_tokens` / `usage.output_tokens`. On a direct `sk-` request —
+    // where this proxy is the sole biller — the parser therefore sees zero
+    // billable tokens, logs "no billable usage", and reports nothing: the request
+    // generates tokens without reducing the key's balance or appearing in usage
+    // accounting. The streaming path has the same gap (`SseParser` reads the same
+    // two field names).
+    //
+    // The Responses product surface is served through cloud-api, which translates
+    // it into `/v1/chat/completions` calls against the backend and never forwards
+    // `/v1/responses` to this proxy. Refusing it here closes the direct-host
+    // accounting bypass without affecting the supported path. Remove this guard
+    // only once a dedicated Responses usage parser (the input/output token field
+    // names plus the Responses SSE event shape) is wired into the catch-all.
+    let decoded_path = percent_encoding::percent_decode_str(path).decode_utf8_lossy();
+    if is_responses_path(&decoded_path) {
+        return Err(AppError::NotFound(
+            "The /v1/responses endpoint is not available on this host; \
+             use the NEAR AI Cloud API for the Responses API."
+                .to_string(),
+        ));
+    }
+
     // Read body (use max_audio_request_size = 100MB since content type is unknown)
     let body_bytes = read_body_with_limit(body, state.config.max_audio_request_size).await?;
 
@@ -126,7 +164,6 @@ pub async fn catch_all(
     // regardless of the header — but keep the parse under the normal JSON
     // request cap so a huge body can't pressure the proxy via `serde_json`
     // (catch-all otherwise accepts up to 100 MB since content type is unknown).
-    let decoded_path = percent_encoding::percent_decode_str(path).decode_utf8_lossy();
     let is_chat_completions_alias = decoded_path.trim_end_matches('/') == "/v1/chat/completions";
     if is_chat_completions_alias && body_bytes.len() > state.config.max_request_size {
         return Err(AppError::PayloadTooLarge {
@@ -402,5 +439,29 @@ mod tests {
         assert!(validate_path("/v1%2f..%2fsecret").is_err());
         // Double-encoded slash
         assert!(validate_path("/v1/%252f../secret").is_err());
+    }
+
+    #[test]
+    fn test_responses_paths_detected() {
+        // The generation endpoint and every sub-path are refused: forwarded
+        // through the catch-all they bill as ChatCompletion, whose parser
+        // cannot read the Responses `input_tokens`/`output_tokens` usage.
+        assert!(is_responses_path("/v1/responses"));
+        assert!(is_responses_path("/v1/responses/"));
+        assert!(is_responses_path("/v1/responses/resp_abc123"));
+        assert!(is_responses_path("/v1/responses/resp_abc123/cancel"));
+        assert!(is_responses_path("/v1/responses/resp_abc123/input_items"));
+    }
+
+    #[test]
+    fn test_non_responses_paths_not_blocked() {
+        // Only the exact segment matches — a longer segment sharing the prefix
+        // is a different endpoint and must still pass through.
+        assert!(!is_responses_path("/v1/responsesx"));
+        assert!(!is_responses_path("/v1/responses_foo"));
+        assert!(!is_responses_path("/v1/chat/completions"));
+        assert!(!is_responses_path("/v1/models"));
+        assert!(!is_responses_path("/v1/custom/endpoint"));
+        assert!(!is_responses_path("/"));
     }
 }

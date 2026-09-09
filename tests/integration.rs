@@ -6765,6 +6765,170 @@ async fn test_usage_reported_for_cloud_api_key_non_streaming() {
 }
 
 #[tokio::test]
+async fn test_responses_endpoint_refused_instead_of_billing_silently() {
+    // Regression: `/v1/responses` has no dedicated route, so it fell through to
+    // the catch-all, which accounts usage as a ChatCompletion. Responses reports
+    // `usage.input_tokens`/`output_tokens`, which that parser does not read, so a
+    // direct `sk-` request generated billable tokens while usage reporting was
+    // skipped ("response contained no billable usage") — tokens served for free
+    // and absent from accounting. The proxy must refuse the endpoint outright
+    // until a dedicated Responses usage parser exists.
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-test",
+            "workspace_id": "ws-test",
+            "api_key_id": "key-test"
+        })))
+        .mount(&cloud_api)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/internal/usage"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_api)
+        .await;
+
+    // The backend would happily serve this — the guard must stop the request
+    // before it is forwarded, so these tokens are never generated unbilled.
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "resp_regression",
+            "object": "response",
+            "status": "completed",
+            "model": "test-model",
+            "output": [],
+            "usage": {"input_tokens": 17, "output_tokens": 30, "total_tokens": 47}
+        })))
+        .mount(&backend)
+        .await;
+
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .body(Body::from(
+                    r#"{"model":"test-model","input":"hello","max_output_tokens":32}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "/v1/responses must be refused, not proxied and silently unbilled"
+    );
+    let body = body_to_json(response).await;
+    assert_eq!(body["error"]["type"], "not_found");
+
+    // The request never reached the backend, so no tokens were generated.
+    let backend_hits = backend
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == "/v1/responses")
+        .count();
+    assert_eq!(
+        backend_hits, 0,
+        "blocked request must not be forwarded to the inference backend"
+    );
+
+    // And nothing was reported to billing (there is nothing to report).
+    wait_for_usage_request(&cloud_api, 1).await;
+    assert!(
+        get_usage_requests(&cloud_api).await.is_empty(),
+        "no usage should be reported for a refused request"
+    );
+}
+
+#[tokio::test]
+async fn test_responses_subpaths_refused() {
+    // Sub-paths (`/v1/responses/{id}`, `.../cancel`) share the same accounting
+    // gap and are not a supported direct-host surface either.
+    let backend = MockServer::start().await;
+    let app = build_test_app(&backend.uri());
+
+    for uri in [
+        "/v1/responses/",
+        "/v1/responses/resp_abc123",
+        "/v1/responses/resp_abc123/cancel",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .header(auth_header().0, auth_header().1)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{uri} must be refused by the catch-all"
+        );
+    }
+
+    assert_eq!(
+        backend.received_requests().await.unwrap_or_default().len(),
+        0,
+        "no Responses sub-path may reach the backend"
+    );
+}
+
+#[tokio::test]
+async fn test_catch_all_still_proxies_other_unknown_paths() {
+    // The guard must be narrow: a path that merely shares the prefix is a
+    // different endpoint and keeps its passthrough behaviour.
+    let backend = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/responsesx"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"id": "pt-not-responses", "ok": true})),
+        )
+        .mount(&backend)
+        .await;
+
+    let app = build_test_app(&backend.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responsesx")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response).await;
+    assert_eq!(body["ok"], true);
+}
+
+#[tokio::test]
 async fn test_usage_reported_for_streaming_chat_with_cloud_api_key() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;

@@ -244,7 +244,7 @@ async fn main() -> anyhow::Result<()> {
             http_client: state.http_client.clone(),
         }
     });
-    if state.config.healthz_skip_dstack {
+    if state.config.non_tee_deployment {
         // Non-TEE deployment (gateway mode): no dstack guest agent, so there is
         // nothing to attest and the periodic refresh would only log failures.
         info!("dstack not available on this deployment; attestation cache refresh disabled");

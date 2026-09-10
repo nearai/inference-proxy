@@ -91,7 +91,7 @@ const DSTACK_SKIPPED: &str = "skipped";
 /// server-side rather than returned to the unauthenticated caller.
 pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     let dstack_path = state.config.dstack_socket_path.clone();
-    let skip_dstack = state.config.healthz_skip_dstack;
+    let skip_dstack = state.config.non_tee_deployment;
     // Hold the BackendGuard for the full probe so the backend's
     // `active_connections` count reflects the in-flight check; otherwise the
     // probe slot is "free" the moment we read the URL and least-connections

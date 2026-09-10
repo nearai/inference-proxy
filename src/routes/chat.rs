@@ -222,6 +222,8 @@ pub async fn chat_completions(
         backend_guard: Some(guard),
         stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
         sse_keepalive_secs: state.config.sse_keepalive_secs,
+        map_queue_full_to_429: state.config.map_queue_full_to_429,
+        stream_error_peek_ms: state.config.stream_error_peek_ms,
         response_shape: ResponseShape::ChatCompletion,
         tracing_ids: Some(tracing_ids),
         upstream_data_parallel_rank,

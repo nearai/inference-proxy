@@ -89,8 +89,9 @@ the pool is dynamic (`BackendPool::set_backends`; affinity pins are keyed by
 backend URL), backend requests carry `VLLM_BACKEND_TOKEN` via the dedicated
 `AppState.backend_client` (never `http_client`, which talks to cloud-api), and
 `VLLM_PROXY_REJECTED_CONTENT_PART_TYPES`, `VLLM_PROXY_CATCH_ALL_DISABLED`,
-`VLLM_PROXY_SSE_KEEPALIVE_SECS`, `HEALTHZ_SKIP_DSTACK`, `LISTEN_ADDR` are the
-opt-in policies. All default to the in-CVM behavior. `BackendPool::select_url`
+`VLLM_PROXY_SSE_KEEPALIVE_SECS`, `VLLM_PROXY_MAP_QUEUE_FULL_TO_429`,
+`VLLM_PROXY_STREAM_ERROR_PEEK_MS`, `NON_TEE_DEPLOYMENT` (404s the attestation,
+signature and GPU-evidence routes), `LISTEN_ADDR` are the opt-in policies. All default to the in-CVM behavior. `BackendPool::select_url`
 returns `Err(AppError::NoBackendsAvailable)` (503) when the pool is empty.
 
 ### Cloud API integration

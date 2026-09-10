@@ -25,7 +25,9 @@ struct GatewayOptions {
     backend_urls: Option<Vec<String>>,
     backend_token: Option<String>,
     backend_health_path: Option<String>,
-    healthz_skip_dstack: bool,
+    non_tee_deployment: bool,
+    map_queue_full_to_429: bool,
+    stream_error_peek_ms: u64,
     rejected_content_part_types: Vec<String>,
     catch_all_disabled: bool,
     sse_keepalive_secs: u64,
@@ -105,7 +107,9 @@ fn build_gateway(mock_url: &str, options: GatewayOptions) -> (axum::Router, Arc<
         backend_health_path: options
             .backend_health_path
             .unwrap_or_else(|| "/health".to_string()),
-        healthz_skip_dstack: options.healthz_skip_dstack,
+        non_tee_deployment: options.non_tee_deployment,
+        map_queue_full_to_429: options.map_queue_full_to_429,
+        stream_error_peek_ms: options.stream_error_peek_ms,
         backend_discovery: None,
         rejected_content_part_types: options.rejected_content_part_types,
         catch_all_disabled: options.catch_all_disabled,
@@ -459,7 +463,7 @@ async fn healthz_can_skip_dstack_and_probe_a_custom_backend_path() {
     let (app, _) = build_gateway(
         &mock.uri(),
         GatewayOptions {
-            healthz_skip_dstack: true,
+            non_tee_deployment: true,
             backend_health_path: Some("/healthz".to_string()),
             ..Default::default()
         },
@@ -511,7 +515,7 @@ async fn empty_pool_is_503_on_inference_and_unhealthy_on_healthz() {
         &mock.uri(),
         GatewayOptions {
             backend_urls: Some(Vec::new()),
-            healthz_skip_dstack: true,
+            non_tee_deployment: true,
             ..Default::default()
         },
     );
@@ -815,6 +819,359 @@ async fn sse_keepalive_is_off_by_default() {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let text = String::from_utf8_lossy(&bytes);
     assert!(!text.contains(": keep-alive"), "{text}");
+    assert!(text.contains("data: [DONE]"), "{text}");
+    handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// NON_TEE_DEPLOYMENT: attestation surface is not advertised
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn non_tee_deployment_hides_attestation_signature_and_gpu_evidence() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+        .mount(&mock)
+        .await;
+    let (app, _) = build_gateway(
+        &mock.uri(),
+        GatewayOptions {
+            non_tee_deployment: true,
+            ..Default::default()
+        },
+    );
+
+    // A completion still works and is (dev-)signed internally...
+    let response = app
+        .clone()
+        .oneshot(chat_request(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // ...but nothing unverifiable is offered.
+    let cases = [
+        ("GET", "/v1/attestation/report", false, ""),
+        (
+            "GET",
+            "/v1/attestation/report?signing_algo=ed25519",
+            false,
+            "",
+        ),
+        ("GET", "/v1/signature/chatcmpl-gw-1", true, ""),
+        (
+            "POST",
+            "/internal/gpu_evidence",
+            true,
+            r#"{"nonce":"0000000000000000000000000000000000000000000000000000000000000000"}"#,
+        ),
+    ];
+    for (m, uri, auth, body) in cases {
+        let mut req = Request::builder()
+            .method(m)
+            .uri(uri)
+            .header("content-type", "application/json");
+        if auth {
+            req = req.header("authorization", "Bearer test-token");
+        }
+        let response = app
+            .clone()
+            .oneshot(req.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{m} {uri}");
+        let json = json_body(response).await;
+        assert_eq!(json["error"]["type"], "not_found", "{m} {uri}");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("does not run inside a TEE"),
+            "{m} {uri}: {json}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tee_deployment_keeps_signature_route() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+        .mount(&mock)
+        .await;
+    let (app, _) = build_gateway(&mock.uri(), GatewayOptions::default());
+    let response = app
+        .clone()
+        .oneshot(chat_request(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let id = body["id"].as_str().unwrap().to_string();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/signature/{id}"))
+                .header("authorization", "Bearer test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// Queue-full → 429 and the bounded first-event peek
+// ---------------------------------------------------------------------------
+
+const QUEUE_FULL_BODY: &str =
+    r#"{"object":"error","message":"The request queue is full.","type":"abort","code":503}"#;
+
+#[tokio::test]
+async fn queue_full_503_becomes_429_only_when_enabled() {
+    for (enabled, expected) in [
+        (true, StatusCode::TOO_MANY_REQUESTS),
+        (false, StatusCode::SERVICE_UNAVAILABLE),
+    ] {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(503).set_body_raw(QUEUE_FULL_BODY, "application/json"),
+            )
+            .mount(&mock)
+            .await;
+        let (app, _) = build_gateway(
+            &mock.uri(),
+            GatewayOptions {
+                map_queue_full_to_429: enabled,
+                ..Default::default()
+            },
+        );
+        let response = app
+            .oneshot(chat_request(serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}]
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "enabled={enabled}");
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["message"], "The request queue is full.");
+    }
+}
+
+#[tokio::test]
+async fn other_503s_are_not_rewritten() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(503).set_body_raw(
+            r#"{"object":"error","message":"Model is loading","type":"ServiceUnavailable","code":503}"#,
+            "application/json",
+        ))
+        .mount(&mock)
+        .await;
+    let (app, _) = build_gateway(
+        &mock.uri(),
+        GatewayOptions {
+            map_queue_full_to_429: true,
+            ..Default::default()
+        },
+    );
+    let response = app
+        .oneshot(chat_request(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// SGLang rejects at admission on an HTTP 200 SSE stream: the first event is
+/// `data: {"error": …}` followed by a clean `[DONE]`.
+fn queue_full_sse_stream() -> String {
+    format!("data: {{\"error\":{QUEUE_FULL_BODY}}}\n\ndata: [DONE]\n\n")
+}
+
+#[tokio::test]
+async fn streaming_queue_full_first_event_becomes_429_with_peek() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(queue_full_sse_stream()),
+        )
+        .mount(&mock)
+        .await;
+    let (app, _) = build_gateway(
+        &mock.uri(),
+        GatewayOptions {
+            map_queue_full_to_429: true,
+            stream_error_peek_ms: 1000,
+            ..Default::default()
+        },
+    );
+    let response = app
+        .oneshot(chat_request(serde_json::json!({
+            "model": "test-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["message"], "The request queue is full.");
+}
+
+#[tokio::test]
+async fn streaming_first_event_error_keeps_engine_status_without_mapping() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(queue_full_sse_stream()),
+        )
+        .mount(&mock)
+        .await;
+    let (app, _) = build_gateway(
+        &mock.uri(),
+        GatewayOptions {
+            stream_error_peek_ms: 1000,
+            ..Default::default()
+        },
+    );
+    let response = app
+        .oneshot(chat_request(serde_json::json!({
+            "model": "test-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn streaming_without_peek_forwards_the_error_event_on_200() {
+    // Existing behavior, preserved for CVM deployments (peek off).
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(queue_full_sse_stream()),
+        )
+        .mount(&mock)
+        .await;
+    let (app, _) = build_gateway(
+        &mock.uri(),
+        GatewayOptions {
+            map_queue_full_to_429: true,
+            ..Default::default()
+        },
+    );
+    let response = app
+        .oneshot(chat_request(serde_json::json!({
+            "model": "test-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("The request queue is full."), "{text}");
+    assert!(text.contains("data: [DONE]"), "{text}");
+}
+
+#[tokio::test]
+async fn stream_peek_timeout_leaves_a_slow_stream_intact() {
+    let (backend, handle) = spawn_silent_then_stream_backend(
+        Duration::from_millis(700),
+        vec![
+            "data: {\"id\":\"chatcmpl-pk\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"slow\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-pk\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" hello\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ],
+    )
+    .await;
+    let (app, _) = build_gateway(
+        &backend,
+        GatewayOptions {
+            stream_error_peek_ms: 200,
+            map_queue_full_to_429: true,
+            ..Default::default()
+        },
+    );
+    let response = app
+        .oneshot(chat_request(serde_json::json!({
+            "model": "test-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("\"content\":\"slow\""), "{text}");
+    assert!(text.contains("\"content\":\" hello\""), "{text}");
+    assert!(text.contains("data: [DONE]"), "{text}");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn stream_peek_keeps_a_fast_first_chunk() {
+    // The peeked chunk must be re-attached: nothing is lost when the first
+    // event is ordinary content that arrives inside the peek window.
+    let (backend, handle) = spawn_silent_then_stream_backend(
+        Duration::from_millis(50),
+        vec![
+            "data: {\"id\":\"chatcmpl-fast\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"first\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-fast\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" second\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ],
+    )
+    .await;
+    let (app, _) = build_gateway(
+        &backend,
+        GatewayOptions {
+            stream_error_peek_ms: 2000,
+            ..Default::default()
+        },
+    );
+    let response = app
+        .oneshot(chat_request(serde_json::json!({
+            "model": "test-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("\"content\":\"first\""), "{text}");
+    assert!(text.contains("\"content\":\" second\""), "{text}");
     assert!(text.contains("data: [DONE]"), "{text}");
     handle.abort();
 }

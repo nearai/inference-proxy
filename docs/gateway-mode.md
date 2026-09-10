@@ -65,7 +65,9 @@ to the current in-CVM behavior.
 | `VLLM_PROXY_REJECTED_CONTENT_PART_TYPES` | `video_url,input_audio,file` | Modalities this deployment does not serve → deterministic `400`. |
 | `VLLM_PROXY_CATCH_ALL_DISABLED` | `1` | Only the declared inference routes exist; `/v1/responses`, `/v1/conversations`, and anything undeclared is `404`. Stateless by construction. |
 | `VLLM_PROXY_SSE_KEEPALIVE_SECS` | `15` | `: keep-alive` SSE comments while the upstream is silent (long prefill/queueing), so intermediaries with read timeouts do not cancel. Off in CVMs: comments are not part of the signed bytes. |
-| `HEALTHZ_SKIP_DSTACK` | `1` | No dstack socket outside a CVM; `/healthz` reports `"dstack":"skipped"`. |
+| `NON_TEE_DEPLOYMENT` | `1` | No dstack socket outside a CVM: `/healthz` reports `"dstack":"skipped"`, no attestation refresh, and the attestation, signature and GPU-evidence routes answer 404 so nothing unverifiable is advertised. |
+| `VLLM_PROXY_MAP_QUEUE_FULL_TO_429` | `1` | The engine's admission rejection ("The request queue is full.", 503) becomes 429: back-pressure, not an outage. |
+| `VLLM_PROXY_STREAM_ERROR_PEEK_MS` | `1000` | Streams wait up to 1 s for the first upstream event; an admission-time `data: {"error":…}` becomes a real 429/5xx instead of a 200 that fails mid-stream. Normal streams are unaffected (a slow first token just times the peek out). |
 | `DEV` / `GPU_NO_HW_MODE` | `1` / `1` | Non-TEE: random signing keys, no hardware evidence. The gateway offers no attestation. |
 | `LISTEN_ADDR` / `LISTEN_PORT` | `127.0.0.1` / `31700` | Bind behind the local TLS terminator. |
 | `RATE_LIMIT_PER_SECOND` / `RATE_LIMIT_BURST_SIZE` | raise for aggregator traffic | Per-IP limiter; an aggregator arrives from a handful of IPs. |
@@ -84,6 +86,12 @@ and `VLLM_DATA_PARALLEL_SIZE` (single-engine DP affinity).
 - If the registry is unreachable the gateway serves from the last known set;
   if it has never answered, inference returns `503 service_unavailable` and
   `/healthz` reports `"backend":"no_backends"`.
+- Overload: the engine caps its waiting queue (`--max-queued-requests`) and
+  rejects at admission with "The request queue is full." — HTTP 503 for JSON
+  requests, and for streams a first SSE event `data: {"error": …, "code": 503}`
+  on an HTTP 200. With `VLLM_PROXY_STREAM_ERROR_PEEK_MS` the gateway holds the
+  stream's status line for up to that long, so the rejection surfaces as a
+  status; with `VLLM_PROXY_MAP_QUEUE_FULL_TO_429` that status is 429.
 - `/metrics` exposes `backend_pool_size`, `backend_pool_healthy`,
   `backend_discovery_polls_total{outcome}`,
   `backend_discovery_consecutive_failures`, `backend_affinity_*`,
@@ -92,7 +100,9 @@ and `VLLM_DATA_PARALLEL_SIZE` (single-engine DP affinity).
 
 ## What is deliberately not offered here
 
-Attestation (`/v1/attestation/report`) and response signatures are meaningful
-only inside the CVM; a non-TEE gateway runs with dev keys and should not be
-advertised as verifiable. Customers who need TEE guarantees keep using the
-per-model `*.completions.near.ai` domains or the Cloud API.
+Attestation (`/v1/attestation/report`), response signatures
+(`/v1/signature/{id}`) and GPU-evidence delegation (`/internal/gpu_evidence`)
+are meaningful only inside the CVM; with `NON_TEE_DEPLOYMENT=1` they answer
+404, so a non-TEE gateway never advertises something a verifier cannot check.
+Customers who need TEE guarantees keep using the per-model
+`*.completions.near.ai` domains or the Cloud API.

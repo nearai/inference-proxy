@@ -38,7 +38,7 @@ impl CapturedLogs {
 }
 
 fn eff(status: u16, body: &[u8]) -> StatusCode {
-    effective_error_status(status, parse_upstream_error(body).as_ref())
+    effective_error_status(status, parse_upstream_error(body).as_ref(), false)
 }
 
 fn assert_missing(value: &str, needles: &[&str]) {
@@ -141,7 +141,7 @@ fn test_effective_status_keeps_5xx_when_not_a_client_4xx() {
     let noturl = br#"{"message":"requested 450 message tokens exceed the limit"}"#;
     assert_eq!(eff(500, noturl), StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(
-        effective_error_status(500, None),
+        effective_error_status(500, None, false),
         StatusCode::INTERNAL_SERVER_ERROR
     );
 }
@@ -179,4 +179,51 @@ fn test_parse_upstream_error_unparseable_inputs() {
     ] {
         assert!(parse_upstream_error(body).is_none());
     }
+}
+
+#[test]
+fn test_queue_full_maps_to_429_only_when_enabled() {
+    let body =
+        br#"{"object":"error","message":"The request queue is full.","type":"abort","code":503}"#;
+    let info = parse_upstream_error(body);
+    assert_eq!(
+        effective_error_status(503, info.as_ref(), true),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        effective_error_status(503, info.as_ref(), false),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    // Only the admission rejection is back-pressure; other 503s stay.
+    let other = parse_upstream_error(br#"{"message":"Model is loading","type":"x","code":503}"#);
+    assert_eq!(
+        effective_error_status(503, other.as_ref(), true),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    // And a queue-full message on a non-503 status is never reinterpreted.
+    assert_eq!(
+        effective_error_status(500, info.as_ref(), true),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+}
+
+#[test]
+fn test_first_sse_error_event_detection() {
+    let queue_full = b"data: {\"error\":{\"object\":\"error\",\"message\":\"The request queue is full.\",\"type\":\"abort\",\"code\":503}}\n\ndata: [DONE]\n\n";
+    let err = first_sse_error_event(queue_full).expect("error event");
+    assert_eq!(err["code"], 503);
+    assert_eq!(err["message"], "The request queue is full.");
+
+    // Leading keep-alive comments and blank lines are skipped.
+    let with_comment = b": keep-alive\n\ndata: {\"error\":{\"message\":\"nope\",\"code\":429}}\n\n";
+    assert_eq!(first_sse_error_event(with_comment).unwrap()["code"], 429);
+
+    // Ordinary first events are not errors.
+    let role =
+        b"data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n";
+    assert!(first_sse_error_event(role).is_none());
+    assert!(first_sse_error_event(b"data: [DONE]\n\n").is_none());
+    assert!(first_sse_error_event(b"data: {\"error\":null}\n\n").is_none());
+    assert!(first_sse_error_event(b"garbage").is_none());
+    assert!(first_sse_error_event(&[0xff, 0xfe]).is_none());
 }

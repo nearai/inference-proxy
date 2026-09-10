@@ -272,8 +272,11 @@ pub async fn catch_all(
         // Downgrade a backend 5xx to 400 when it's really a client media-fetch
         // 4xx (e.g. a UA-gated image URL), so it isn't retried/masked as a 502
         // (nearai/cloud-api#606). See proxy::effective_error_status.
-        let axum_status =
-            crate::proxy::effective_error_status(upstream_status.as_u16(), error_info.as_ref());
+        let axum_status = crate::proxy::effective_error_status(
+            upstream_status.as_u16(),
+            error_info.as_ref(),
+            state.config.map_queue_full_to_429,
+        );
         return Err(AppError::UpstreamParsed {
             status: axum_status,
             message: error_info
@@ -316,6 +319,8 @@ pub async fn catch_all(
             backend_guard: Some(backend_guard),
             stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
             sse_keepalive_secs: state.config.sse_keepalive_secs,
+            map_queue_full_to_429: state.config.map_queue_full_to_429,
+            stream_error_peek_ms: state.config.stream_error_peek_ms,
             response_shape: ResponseShape::ChatCompletion,
             tracing_ids: Some(tracing_ids.clone()),
             upstream_data_parallel_rank: None,
@@ -354,6 +359,8 @@ pub async fn catch_all(
             backend_guard: None,
             stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
             sse_keepalive_secs: state.config.sse_keepalive_secs,
+            map_queue_full_to_429: state.config.map_queue_full_to_429,
+            stream_error_peek_ms: state.config.stream_error_peek_ms,
             response_shape: ResponseShape::ChatCompletion,
             tracing_ids: Some(tracing_ids),
             upstream_data_parallel_rank: None,

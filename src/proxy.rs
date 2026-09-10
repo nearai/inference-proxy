@@ -223,11 +223,23 @@ pub(crate) fn log_upstream_error(
 pub(crate) fn effective_error_status(
     upstream_status: u16,
     info: Option<&UpstreamErrorInfo>,
+    map_queue_full_to_429: bool,
 ) -> StatusCode {
     let passthrough = StatusCode::from_u16(upstream_status).unwrap_or(StatusCode::BAD_GATEWAY);
     // Only reinterpret server errors; a genuine 4xx is already correct.
     if !(500..600).contains(&upstream_status) {
         return passthrough;
+    }
+    // The engine's admission rejection is back-pressure, not an outage:
+    // SGLang answers `--max-queued-requests` overflow with 503 and the
+    // message "The request queue is full." (HTTP body, or an SSE error event
+    // carrying `code: 503`). Aggregators score 5xx against uptime and treat
+    // 429 as "retry elsewhere", which is the intended semantics.
+    if map_queue_full_to_429
+        && upstream_status == 503
+        && info.is_some_and(|info| message_is_queue_full(&info.message))
+    {
+        return StatusCode::TOO_MANY_REQUESTS;
     }
     match info {
         Some(info)
@@ -238,6 +250,27 @@ pub(crate) fn effective_error_status(
         }
         _ => passthrough,
     }
+}
+
+/// SGLang scheduler admission rejection (`_abort_on_queued_limit`).
+fn message_is_queue_full(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("queue is full")
+}
+
+/// If `chunk` begins with an SSE `data:` event whose payload carries an
+/// `error` object, return that object. Used by the bounded first-event peek
+/// in `proxy_streaming_request`: an engine that rejects a request at
+/// admission emits `data: {"error": {..., "code": 503}}` as the very first
+/// event of an otherwise well-formed HTTP 200 SSE stream.
+pub(crate) fn first_sse_error_event(chunk: &[u8]) -> Option<serde_json::Value> {
+    let text = std::str::from_utf8(chunk).ok()?;
+    let first_data = text
+        .lines()
+        .map(str::trim_end)
+        .find(|line| !line.is_empty() && !line.starts_with(':'))?;
+    let payload = first_data.strip_prefix("data:")?.trim();
+    let event: serde_json::Value = serde_json::from_str(payload).ok()?;
+    event.get("error").filter(|e| e.is_object()).cloned()
 }
 
 /// True when an upstream error `message` describes a client media-URL fetch that
@@ -842,6 +875,10 @@ pub struct ProxyOpts {
     /// stream has been silent for this many seconds (0 = off). Comments are
     /// not part of the signed/hashed response bytes.
     pub sse_keepalive_secs: u64,
+    /// See `Config::map_queue_full_to_429`.
+    pub map_queue_full_to_429: bool,
+    /// See `Config::stream_error_peek_ms` (streaming requests only).
+    pub stream_error_peek_ms: u64,
     /// Shape of the reassembled response when forwarding an SSE stream as
     /// a non-streaming JSON body. Defaults to `ChatCompletion`; the
     /// `/v1/completions` route sets this to `TextCompletion`.
@@ -1076,7 +1113,11 @@ pub async fn proxy_json_request(
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
         let info = log_upstream_error(status, url, &body, opts.tracing_ids.as_ref());
         return Err(AppError::Upstream {
-            status: effective_error_status(status.as_u16(), info.as_ref()),
+            status: effective_error_status(
+                status.as_u16(),
+                info.as_ref(),
+                opts.map_queue_full_to_429,
+            ),
             body,
         });
     }
@@ -1200,7 +1241,11 @@ pub async fn proxy_json_request(
                 // A client media-fetch failure can arrive as an SSE error chunk
                 // with code:500 + `403, message='…', url='…'` — downgrade to 400
                 // here too so it isn't retried/masked as a 502 (cloud-api#606).
-                status: effective_error_status(status_code.as_u16(), info.as_ref()),
+                status: effective_error_status(
+                    status_code.as_u16(),
+                    info.as_ref(),
+                    opts.map_queue_full_to_429,
+                ),
                 body: body_bytes,
             });
         }
@@ -1742,7 +1787,11 @@ pub async fn proxy_streaming_request(
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
         let info = log_upstream_error(status, url, &body, opts.tracing_ids.as_ref());
         return Err(AppError::Upstream {
-            status: effective_error_status(status.as_u16(), info.as_ref()),
+            status: effective_error_status(
+                status.as_u16(),
+                info.as_ref(),
+                opts.map_queue_full_to_429,
+            ),
             body,
         });
     }
@@ -1762,10 +1811,81 @@ pub async fn proxy_streaming_request(
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
+    // Bounded peek at the first upstream chunk (opt-in). An engine that
+    // rejects at admission (queue full, priority abort) still answers HTTP 200
+    // and puts `data: {"error": …}` first; surfacing that as a real error
+    // status lets clients retry elsewhere instead of consuming a 200 that
+    // fails mid-stream. A slow first token simply times the peek out and the
+    // stream proceeds unchanged. Client disconnect during the peek drops this
+    // future, and with it the upstream connection.
+    let mut byte_stream = response.bytes_stream();
+    let mut first_chunk: Option<Bytes> = None;
+    if opts.stream_error_peek_ms > 0 {
+        use futures_util::StreamExt;
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(opts.stream_error_peek_ms),
+            byte_stream.next(),
+        )
+        .await
+        {
+            Ok(Some(Ok(chunk))) => {
+                if let Some(err) = first_sse_error_event(&chunk) {
+                    let code = err
+                        .get("code")
+                        .and_then(|v| v.as_u64())
+                        .and_then(|c| u16::try_from(c).ok())
+                        .filter(|c| (400..600).contains(c))
+                        .unwrap_or(502);
+                    let body = Bytes::from(
+                        serde_json::to_vec(&serde_json::json!({ "error": err }))
+                            .map_err(|e| AppError::Internal(e.into()))?,
+                    );
+                    let info = log_upstream_error(
+                        reqwest::StatusCode::from_u16(code)
+                            .unwrap_or(reqwest::StatusCode::BAD_GATEWAY),
+                        url,
+                        &body,
+                        opts.tracing_ids.as_ref(),
+                    );
+                    metrics::counter!("upstream_stream_first_event_errors_total").increment(1);
+                    return Err(AppError::Upstream {
+                        status: effective_error_status(
+                            code,
+                            info.as_ref(),
+                            opts.map_queue_full_to_429,
+                        ),
+                        body,
+                    });
+                }
+                first_chunk = Some(chunk);
+            }
+            Ok(Some(Err(e))) => {
+                warn!(error = %e, "Upstream stream failed before its first event");
+                return Err(AppError::UpstreamParsed {
+                    status: StatusCode::BAD_GATEWAY,
+                    message: "Upstream response stream failed before completion".to_string(),
+                    error_type: "upstream_stream_incomplete".to_string(),
+                });
+            }
+            Ok(None) => {
+                return Err(AppError::UpstreamParsed {
+                    status: StatusCode::BAD_GATEWAY,
+                    message: "Upstream response stream ended before completion".to_string(),
+                    error_type: "upstream_stream_incomplete".to_string(),
+                });
+            }
+            Err(_elapsed) => {}
+        }
+    }
+    // Re-attach the peeked chunk so the pump below sees the complete stream.
+    let byte_stream = futures_util::stream::StreamExt::chain(
+        futures_util::stream::iter(first_chunk.map(Ok)),
+        byte_stream,
+    );
+
     // Spawn a task to consume upstream and forward chunks.
     // Uses select! on tx.closed() to detect client disconnect while waiting
     // for upstream data, preventing resource leaks from abandoned connections.
-    let byte_stream = response.bytes_stream();
     tokio::spawn(async move {
         use futures_util::StreamExt;
 
@@ -2138,7 +2258,11 @@ pub async fn proxy_multipart_request(
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
         let info = log_upstream_error(status, url, &body, opts.tracing_ids.as_ref());
         return Err(AppError::Upstream {
-            status: effective_error_status(status.as_u16(), info.as_ref()),
+            status: effective_error_status(
+                status.as_u16(),
+                info.as_ref(),
+                opts.map_queue_full_to_429,
+            ),
             body,
         });
     }
@@ -2251,7 +2375,7 @@ pub async fn proxy_simple(
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
         let info = log_upstream_error(status, url, &body, tracing_ids);
         return Err(AppError::Upstream {
-            status: effective_error_status(status.as_u16(), info.as_ref()),
+            status: effective_error_status(status.as_u16(), info.as_ref(), false),
             body,
         });
     }
@@ -3026,6 +3150,8 @@ mod tests {
             backend_guard: None,
             stream_idle_timeout_secs: 0,
             sse_keepalive_secs: 0,
+            map_queue_full_to_429: false,
+            stream_error_peek_ms: 0,
             response_shape: ResponseShape::default(),
             tracing_ids: None,
             upstream_data_parallel_rank: None,

@@ -39,6 +39,12 @@ pub async fn gpu_evidence(
     _auth: RequireAuth,
     Json(req): Json<DelegateRequest>,
 ) -> Result<Json<DelegateResponse>, AppError> {
+    if state.config.non_tee_deployment {
+        return Err(AppError::NotFound(
+            "GPU evidence is not available on this endpoint: it does not run inside a TEE."
+                .to_string(),
+        ));
+    }
     // Decode + length-check the nonce up front so a malformed request
     // surfaces a clean 400 instead of a generic 500 from the SDK /
     // Python paths deep in the call stack. We need the bytes anyway

@@ -253,10 +253,25 @@ pub struct Config {
     /// lightweight route). Gateway mode points it at the inference-proxy's
     /// unauthenticated `/healthz`.
     pub backend_health_path: String,
-    /// Skip the dstack guest-agent probe in `/healthz` (`HEALTHZ_SKIP_DSTACK`).
-    /// Only for deployments outside a CVM, where there is no dstack socket and
-    /// attestation is not offered.
-    pub healthz_skip_dstack: bool,
+    /// This proxy does not run inside a TEE (`NON_TEE_DEPLOYMENT=1`): no
+    /// dstack guest agent, no hardware evidence, dev signing keys. Effects:
+    /// `/healthz` skips the dstack probe, the attestation cache refresh is not
+    /// started, and `/v1/attestation/report`, `/v1/signature/{id}` and
+    /// `/internal/gpu_evidence` answer 404 so nothing unverifiable is
+    /// advertised. Inference routes are unaffected.
+    pub non_tee_deployment: bool,
+    /// Rewrite the engine's queue-full rejection (HTTP 503 / SSE error event
+    /// `"The request queue is full."`) to 429 (`VLLM_PROXY_MAP_QUEUE_FULL_TO_429`).
+    /// Aggregators treat 429 as back-pressure and 5xx as an outage; off by
+    /// default because cloud-api's peer fallback keys on the 503.
+    pub map_queue_full_to_429: bool,
+    /// For streaming requests, wait up to this many milliseconds for the
+    /// first upstream SSE chunk before committing a 200 to the client
+    /// (`VLLM_PROXY_STREAM_ERROR_PEEK_MS`, 0 = off). An engine that rejects
+    /// at admission (queue full, aborted) emits `data: {"error": …}` as its
+    /// first event on an HTTP 200 stream; peeking turns that into a real
+    /// error status instead of a 200 that fails mid-stream.
+    pub stream_error_peek_ms: u64,
     /// Dynamic backend membership from the model-proxy registry
     /// (`VLLM_BACKEND_DISCOVERY_URL`, `_TOKEN`, `_URL_TEMPLATE`,
     /// `_INTERVAL_SECS`, `_TIMEOUT_SECS`). Mutually exclusive with
@@ -637,7 +652,9 @@ impl Config {
             listen_addr,
             backend_token,
             backend_health_path,
-            healthz_skip_dstack: env_bool("HEALTHZ_SKIP_DSTACK"),
+            non_tee_deployment: env_bool("NON_TEE_DEPLOYMENT"),
+            map_queue_full_to_429: env_bool("VLLM_PROXY_MAP_QUEUE_FULL_TO_429"),
+            stream_error_peek_ms: env_int("VLLM_PROXY_STREAM_ERROR_PEEK_MS", 0) as u64,
             backend_discovery,
             rejected_content_part_types,
             catch_all_disabled: env_bool("VLLM_PROXY_CATCH_ALL_DISABLED"),
@@ -876,7 +893,9 @@ mod tests {
             "VLLM_DATA_PARALLEL_SIZE",
             "VLLM_BACKEND_TOKEN",
             "VLLM_BACKEND_HEALTH_PATH",
-            "HEALTHZ_SKIP_DSTACK",
+            "NON_TEE_DEPLOYMENT",
+            "VLLM_PROXY_MAP_QUEUE_FULL_TO_429",
+            "VLLM_PROXY_STREAM_ERROR_PEEK_MS",
             "VLLM_PROXY_REJECTED_CONTENT_PART_TYPES",
             "VLLM_PROXY_CATCH_ALL_DISABLED",
             "VLLM_PROXY_SSE_KEEPALIVE_SECS",
@@ -894,7 +913,9 @@ mod tests {
             assert_eq!(config.listen_addr, "0.0.0.0");
             assert!(config.backend_token.is_none());
             assert_eq!(config.backend_health_path, "/health");
-            assert!(!config.healthz_skip_dstack);
+            assert!(!config.non_tee_deployment);
+            assert!(!config.map_queue_full_to_429);
+            assert_eq!(config.stream_error_peek_ms, 0);
             assert!(config.backend_discovery.is_none());
             assert!(config.rejected_content_part_types.is_empty());
             assert!(!config.catch_all_disabled);
@@ -921,7 +942,9 @@ mod tests {
                 ("VLLM_BACKEND_DISCOVERY_INTERVAL_SECS", "0"),
                 ("VLLM_BACKEND_TOKEN", " backend-secret "),
                 ("VLLM_BACKEND_HEALTH_PATH", "/healthz"),
-                ("HEALTHZ_SKIP_DSTACK", "1"),
+                ("NON_TEE_DEPLOYMENT", "1"),
+                ("VLLM_PROXY_MAP_QUEUE_FULL_TO_429", "1"),
+                ("VLLM_PROXY_STREAM_ERROR_PEEK_MS", "750"),
                 (
                     "VLLM_PROXY_REJECTED_CONTENT_PART_TYPES",
                     "video_url, input_audio",
@@ -949,7 +972,9 @@ mod tests {
                 );
                 assert_eq!(config.backend_token.as_deref(), Some("backend-secret"));
                 assert_eq!(config.backend_health_path, "/healthz");
-                assert!(config.healthz_skip_dstack);
+                assert!(config.non_tee_deployment);
+                assert!(config.map_queue_full_to_429);
+                assert_eq!(config.stream_error_peek_ms, 750);
                 assert_eq!(
                     config.rejected_content_part_types,
                     vec!["video_url", "input_audio"]

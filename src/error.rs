@@ -35,6 +35,12 @@ pub enum AppError {
     #[error("rate limit exceeded")]
     RateLimited,
 
+    /// The backend pool has no members (e.g. discovery has not yet produced a
+    /// listing, or every backend was withdrawn). Distinct from an unreachable
+    /// backend so operators can tell "nothing to route to" from "routed and failed".
+    #[error("no inference backend available")]
+    NoBackendsAvailable,
+
     #[error("{0}")]
     Internal(#[from] anyhow::Error),
 }
@@ -102,6 +108,12 @@ impl IntoResponse for AppError {
                 StatusCode::TOO_MANY_REQUESTS,
                 "Rate limit exceeded. Please try again later.".to_string(),
                 "rate_limited",
+            ),
+            AppError::NoBackendsAvailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No inference backend is available for this model right now. Please retry."
+                    .to_string(),
+                "service_unavailable",
             ),
             AppError::Internal(ref e) => {
                 error!(error = %e, "Internal server error");

@@ -76,6 +76,14 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         score_url_override: None,
         ohttp_enabled: false,
         listen_port: 8000,
+        listen_addr: "127.0.0.1".to_string(),
+        backend_token: None,
+        backend_health_path: "/health".to_string(),
+        healthz_skip_dstack: false,
+        backend_discovery: None,
+        rejected_content_part_types: Vec::new(),
+        catch_all_disabled: false,
+        sse_keepalive_secs: 0,
         dstack_socket_path: options
             .dstack_socket_path
             .unwrap_or_else(|| "/var/run/dstack.sock".to_string()),
@@ -125,6 +133,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         cache: Arc::new(chat_cache),
         attestation_cache: Arc::new(vllm_proxy_rs::attestation::AttestationCache::new(300)),
         http_client: reqwest::Client::new(),
+        backend_client: reqwest::Client::new(),
         metrics_handle,
         tls_cert_fingerprint: Arc::new(
             vllm_proxy_rs::attestation::TlsCertTracker::new(None).expect("tracker for None path"),
@@ -135,7 +144,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         fusion_caches: Arc::new(fusion::FusionCaches::default()),
         vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(None, 1_200)),
         backend_affinity: Arc::new(
-            vllm_proxy_rs::backend_affinity::BackendConversationAffinity::new(false, 1, 8, 1_200),
+            vllm_proxy_rs::backend_affinity::BackendConversationAffinity::new(false, 8, 1_200),
         ),
     };
     let rate_limiter = rate_limit::build_rate_limiter(100, 200);

@@ -816,7 +816,7 @@ async fn call_local_chat_json(
     strip_fusion_tools_if_any(&mut body);
     remove_streaming_for_internal_call(&mut body);
     let body = serde_json::to_vec(&body).map_err(|e| AppError::Internal(e.into()))?;
-    let (url, _guard) = state.backend_pool.select_url("/v1/chat/completions");
+    let (url, _guard) = state.backend_pool.select_url("/v1/chat/completions")?;
     post_chat_json(state, &url, None, tracing_ids, body, "local_synthesis", 1).await
 }
 
@@ -993,8 +993,14 @@ async fn post_chat_json(
     let attempts = max_attempts.max(1);
     for attempt in 1..=attempts {
         let attempt_started = Instant::now();
-        let mut req = state
-            .http_client
+        // Local (pool) calls carry the backend credential; direct panel/judge
+        // calls to other endpoints use their own bearer on the plain client.
+        let client = if bearer.is_some() {
+            &state.http_client
+        } else {
+            &state.backend_client
+        };
+        let mut req = client
             .post(url)
             .timeout(Duration::from_secs(state.config.fusion_panel_timeout_secs))
             .header("content-type", "application/json")
@@ -1500,6 +1506,7 @@ async fn finish_response(
         chunk_transform: ctx.chunk_transform,
         backend_guard: None,
         stream_idle_timeout_secs: ctx.state.config.stream_idle_timeout_secs,
+        sse_keepalive_secs: ctx.state.config.sse_keepalive_secs,
         response_shape: ResponseShape::ChatCompletion,
         tracing_ids: Some(ctx.tracing_ids),
         upstream_data_parallel_rank: None,

@@ -80,6 +80,19 @@ This is a Rust rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-pro
 - `ATTESTATION_CACHE_TTL` (default 300s) — TTL for cached nonce-less attestation reports; background refresh runs at half-TTL
 - `DSTACK_SOCKET_PATH` (default `/var/run/dstack.sock`) — probed by `GET /healthz` so upstream load balancers (e.g. model-proxy) can detach this instance when the dstack guest-agent socket is unreachable. `/v1/models` alone won't catch this failure mode — sglang/vLLM keep serving while `/v1/attestation/report` silently 500s. The backend leg of `/healthz` probes `/health` (not `/v1/models`) since `/v1/models` serializes against the OpenAI request loop and can stall for >1s during prefill, producing spurious 503s on otherwise-healthy hosts.
 
+### Gateway mode (fleet-wide, non-TEE)
+
+The proxy can also run outside a CVM in front of a whole model fleet — see
+[docs/gateway-mode.md](docs/gateway-mode.md). Membership comes from model-proxy
+(`VLLM_BACKEND_DISCOVERY_URL` + `_TOKEN` + `_URL_TEMPLATE`, `backend_discovery.rs`),
+the pool is dynamic (`BackendPool::set_backends`; affinity pins are keyed by
+backend URL), backend requests carry `VLLM_BACKEND_TOKEN` via the dedicated
+`AppState.backend_client` (never `http_client`, which talks to cloud-api), and
+`VLLM_PROXY_REJECTED_CONTENT_PART_TYPES`, `VLLM_PROXY_CATCH_ALL_DISABLED`,
+`VLLM_PROXY_SSE_KEEPALIVE_SECS`, `HEALTHZ_SKIP_DSTACK`, `LISTEN_ADDR` are the
+opt-in policies. All default to the in-CVM behavior. `BackendPool::select_url`
+returns `Err(AppError::NoBackendsAvailable)` (503) when the pool is empty.
+
 ### Cloud API integration
 
 - `CLOUD_API_URL` enables two features: (1) `sk-live-`/`sk-test-` API key validation via `POST /v1/check_api_key`, (2) fire-and-forget usage reporting via `POST /v1/internal/usage`

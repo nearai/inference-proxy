@@ -24,9 +24,9 @@ pub async fn tokenize(
     let request_body = read_body_with_limit(body, state.config.max_request_size).await?;
     let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
 
-    let (url, _guard) = state.backend_pool.select_url("/tokenize");
+    let (url, _guard) = state.backend_pool.select_url("/tokenize")?;
     proxy::proxy_simple(
-        &state.http_client,
+        &state.backend_client,
         &url,
         reqwest::Method::POST,
         Some(&request_body),
@@ -221,6 +221,7 @@ pub async fn images_edits(
         chunk_transform: None,
         backend_guard: None,
         stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
+        sse_keepalive_secs: 0,
         response_shape: ResponseShape::ChatCompletion,
         tracing_ids: Some(tracing_ids),
         upstream_data_parallel_rank: None,
@@ -229,12 +230,12 @@ pub async fn images_edits(
     let (url, _guard) = match &state.config.images_edits_url_override {
         Some(override_url) => (override_url.clone(), None),
         None => {
-            let (u, g) = state.backend_pool.select_url("/v1/images/edits");
+            let (u, g) = state.backend_pool.select_url("/v1/images/edits")?;
             (u, Some(g))
         }
     };
 
-    proxy::proxy_multipart_request(&state.http_client, &url, form, &request_sha256, opts).await
+    proxy::proxy_multipart_request(&state.backend_client, &url, form, &request_sha256, opts).await
 }
 
 /// POST /v1/audio/transcriptions — multipart proxy with signing.
@@ -307,6 +308,7 @@ pub async fn audio_transcriptions(
         chunk_transform: None,
         backend_guard: None,
         stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
+        sse_keepalive_secs: 0,
         response_shape: ResponseShape::ChatCompletion,
         tracing_ids: Some(tracing_ids),
         upstream_data_parallel_rank: None,
@@ -315,12 +317,12 @@ pub async fn audio_transcriptions(
     let (url, _guard) = match &state.config.transcriptions_url_override {
         Some(override_url) => (override_url.clone(), None),
         None => {
-            let (u, g) = state.backend_pool.select_url("/v1/audio/transcriptions");
+            let (u, g) = state.backend_pool.select_url("/v1/audio/transcriptions")?;
             (u, Some(g))
         }
     };
 
-    proxy::proxy_multipart_request(&state.http_client, &url, form, &request_sha256, opts).await
+    proxy::proxy_multipart_request(&state.backend_client, &url, form, &request_sha256, opts).await
 }
 
 /// Generic JSON passthrough with signing and optional encryption support.
@@ -375,14 +377,15 @@ async fn json_passthrough_encrypted(
                 chunk_transform: None,
                 backend_guard: None,
                 stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
+                sse_keepalive_secs: 0,
                 response_shape: ResponseShape::ChatCompletion,
                 tracing_ids: Some(tracing_ids.clone()),
                 upstream_data_parallel_rank: None,
             };
-            proxy::proxy_json_request(&state.http_client, u, forward_body, opts).await
+            proxy::proxy_json_request(&state.backend_client, u, forward_body, opts).await
         }
         None => {
-            let (url, guard) = state.backend_pool.select_url(pool_path);
+            let (url, guard) = state.backend_pool.select_url(pool_path)?;
             let opts = ProxyOpts {
                 signing: state.signing.clone(),
                 cache: state.cache.clone(),
@@ -395,11 +398,12 @@ async fn json_passthrough_encrypted(
                 chunk_transform: None,
                 backend_guard: Some(guard),
                 stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
+                sse_keepalive_secs: 0,
                 response_shape: ResponseShape::ChatCompletion,
                 tracing_ids: Some(tracing_ids),
                 upstream_data_parallel_rank: None,
             };
-            proxy::proxy_json_request(&state.http_client, &url, forward_body, opts).await
+            proxy::proxy_json_request(&state.backend_client, &url, forward_body, opts).await
         }
     }
 }

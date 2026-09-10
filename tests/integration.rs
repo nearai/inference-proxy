@@ -235,6 +235,14 @@ fn build_test_app_inner_with_pool(
         score_url_override: None,
         ohttp_enabled: false,
         listen_port: 8000,
+        listen_addr: "127.0.0.1".to_string(),
+        backend_token: None,
+        backend_health_path: "/health".to_string(),
+        healthz_skip_dstack: false,
+        backend_discovery: None,
+        rejected_content_part_types: Vec::new(),
+        catch_all_disabled: false,
+        sse_keepalive_secs: 0,
         dstack_socket_path: options.dstack_socket_path,
         gpu_evidence_delegate_url: None,
         gpu_evidence_delegate_timeout_secs: 30,
@@ -288,7 +296,6 @@ fn build_test_app_inner_with_pool(
     let backend_affinity = Arc::new(
         vllm_proxy_rs::backend_affinity::BackendConversationAffinity::new(
             options.backend_conversation_affinity,
-            backend_pool.len(),
             options.backend_affinity_max_imbalance,
             1_200,
         ),
@@ -299,7 +306,8 @@ fn build_test_app_inner_with_pool(
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),
         attestation_cache: Arc::new(vllm_proxy_rs::attestation::AttestationCache::new(300)),
-        http_client,
+        http_client: http_client.clone(),
+        backend_client: http_client,
         metrics_handle,
         tls_cert_fingerprint: Arc::new(
             vllm_proxy_rs::attestation::TlsCertTracker::new(None).expect("tracker for None path"),
@@ -6242,6 +6250,14 @@ fn build_test_app_with_cloud_api_retries(
         score_url_override: None,
         ohttp_enabled: false,
         listen_port: 8000,
+        listen_addr: "127.0.0.1".to_string(),
+        backend_token: None,
+        backend_health_path: "/health".to_string(),
+        healthz_skip_dstack: false,
+        backend_discovery: None,
+        rejected_content_part_types: Vec::new(),
+        catch_all_disabled: false,
+        sse_keepalive_secs: 0,
         dstack_socket_path: "/var/run/dstack.sock".to_string(),
         gpu_evidence_delegate_url: None,
         gpu_evidence_delegate_timeout_secs: 30,
@@ -6292,7 +6308,8 @@ fn build_test_app_with_cloud_api_retries(
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),
         attestation_cache: Arc::new(vllm_proxy_rs::attestation::AttestationCache::new(300)),
-        http_client,
+        http_client: http_client.clone(),
+        backend_client: http_client,
         metrics_handle,
         tls_cert_fingerprint: Arc::new(
             vllm_proxy_rs::attestation::TlsCertTracker::new(None).expect("tracker for None path"),
@@ -6303,7 +6320,7 @@ fn build_test_app_with_cloud_api_retries(
         fusion_caches: Arc::new(fusion::FusionCaches::default()),
         vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(None, 1_200)),
         backend_affinity: Arc::new(
-            vllm_proxy_rs::backend_affinity::BackendConversationAffinity::new(false, 1, 8, 1_200),
+            vllm_proxy_rs::backend_affinity::BackendConversationAffinity::new(false, 8, 1_200),
         ),
     };
 
@@ -8841,6 +8858,14 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         score_url_override: None,
         ohttp_enabled: true,
         listen_port: 0, // not used in oneshot tests
+        listen_addr: "127.0.0.1".to_string(),
+        backend_token: None,
+        backend_health_path: "/health".to_string(),
+        healthz_skip_dstack: false,
+        backend_discovery: None,
+        rejected_content_part_types: Vec::new(),
+        catch_all_disabled: false,
+        sse_keepalive_secs: 0,
         dstack_socket_path: "/var/run/dstack.sock".to_string(),
         gpu_evidence_delegate_url: None,
         gpu_evidence_delegate_timeout_secs: 30,
@@ -8888,7 +8913,8 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),
         attestation_cache: Arc::new(attestation::AttestationCache::new(300)),
-        http_client,
+        http_client: http_client.clone(),
+        backend_client: http_client,
         metrics_handle,
         tls_cert_fingerprint: Arc::new(
             vllm_proxy_rs::attestation::TlsCertTracker::new(None).expect("tracker for None path"),
@@ -8899,7 +8925,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         fusion_caches: Arc::new(fusion::FusionCaches::default()),
         vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(None, 1_200)),
         backend_affinity: Arc::new(
-            vllm_proxy_rs::backend_affinity::BackendConversationAffinity::new(false, 1, 8, 1_200),
+            vllm_proxy_rs::backend_affinity::BackendConversationAffinity::new(false, 8, 1_200),
         ),
     };
 
@@ -9266,6 +9292,14 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         score_url_override: None,
         ohttp_enabled: true,
         listen_port: port,
+        listen_addr: "127.0.0.1".to_string(),
+        backend_token: None,
+        backend_health_path: "/health".to_string(),
+        healthz_skip_dstack: false,
+        backend_discovery: None,
+        rejected_content_part_types: Vec::new(),
+        catch_all_disabled: false,
+        sse_keepalive_secs: 0,
         dstack_socket_path: "/var/run/dstack.sock".to_string(),
         gpu_evidence_delegate_url: None,
         gpu_evidence_delegate_timeout_secs: 30,
@@ -9305,6 +9339,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         cache: Arc::new(cache::ChatCache::new("test-model", 1200)),
         attestation_cache: Arc::new(attestation::AttestationCache::new(300)),
         http_client: reqwest::Client::new(),
+        backend_client: reqwest::Client::new(),
         metrics_handle,
         tls_cert_fingerprint: Arc::new(
             vllm_proxy_rs::attestation::TlsCertTracker::new(None).expect("tracker for None path"),
@@ -9315,7 +9350,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         fusion_caches: Arc::new(fusion::FusionCaches::default()),
         vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(None, 1_200)),
         backend_affinity: Arc::new(
-            vllm_proxy_rs::backend_affinity::BackendConversationAffinity::new(false, 1, 8, 1_200),
+            vllm_proxy_rs::backend_affinity::BackendConversationAffinity::new(false, 8, 1_200),
         ),
     };
 

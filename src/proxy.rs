@@ -12,6 +12,11 @@ use crate::error::AppError;
 use crate::signing::SigningPair;
 use crate::{AppState, TracingIds};
 
+/// SSE comment line emitted by the optional stream keep-alive
+/// (`VLLM_PROXY_SSE_KEEPALIVE_SECS`). Per the SSE spec, lines starting with
+/// `:` are ignored by consumers.
+pub const SSE_KEEPALIVE_COMMENT: &[u8] = b": keep-alive\n\n";
+
 #[cfg(test)]
 #[path = "proxy_upstream_error_tests.rs"]
 mod proxy_upstream_error_tests;
@@ -833,6 +838,10 @@ pub struct ProxyOpts {
     /// watchdog. Kept per-request so routes can apply the configured value to
     /// both native streaming and internally reassembled JSON requests.
     pub stream_idle_timeout_secs: u64,
+    /// Emit `: keep-alive` SSE comments to the client whenever the upstream
+    /// stream has been silent for this many seconds (0 = off). Comments are
+    /// not part of the signed/hashed response bytes.
+    pub sse_keepalive_secs: u64,
     /// Shape of the reassembled response when forwarding an SSE stream as
     /// a non-streaming JSON body. Defaults to `ChatCompletion`; the
     /// `/v1/completions` route sets this to `TextCompletion`.
@@ -1749,6 +1758,7 @@ pub async fn proxy_streaming_request(
     let chunk_transform = opts.chunk_transform;
     let backend_guard = opts.backend_guard;
     let stream_idle_timeout_secs = opts.stream_idle_timeout_secs;
+    let sse_keepalive_secs = opts.sse_keepalive_secs;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
@@ -1773,11 +1783,22 @@ pub async fn proxy_streaming_request(
         let mut received_upstream_progress = false;
         let mut transformer = SseTransformer::new(chunk_transform);
 
+        // Keep-alive comments while the upstream is silent (queueing, long
+        // prefill, grammar compilation): SSE consumers ignore comment lines,
+        // but intermediaries with a read timeout would otherwise cancel the
+        // request. Reset on every upstream chunk; the first tick is immediate
+        // and consumed here so the first comment waits a full period.
+        let mut keepalive =
+            tokio::time::interval(std::time::Duration::from_secs(sse_keepalive_secs.max(1)));
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        keepalive.tick().await;
+
         loop {
             tokio::select! {
                 chunk = byte_stream.next() => {
                     match chunk {
                         Some(Ok(chunk)) => {
+                            keepalive.reset();
                             received_upstream_progress |= parser.process_chunk(&chunk);
 
                             // Normalize (and encrypt, if active) the chunk, then hash
@@ -1813,8 +1834,17 @@ pub async fn proxy_streaming_request(
                 }
                 _ = tx.closed() => {
                     info!("Client disconnected, aborting upstream stream processing");
+                    metrics::counter!("stream_client_disconnects_total").increment(1);
                     downstream_closed = true;
                     break;
+                }
+                _ = keepalive.tick(), if sse_keepalive_secs > 0 => {
+                    // Not hashed: comments are transport padding, not response content.
+                    if tx.send(Ok(Bytes::from_static(SSE_KEEPALIVE_COMMENT))).await.is_err() {
+                        downstream_closed = true;
+                        break;
+                    }
+                    metrics::counter!("sse_keepalive_comments_total").increment(1);
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_secs(
                     stream_idle_timeout_secs,
@@ -2995,6 +3025,7 @@ mod tests {
             chunk_transform: None,
             backend_guard: None,
             stream_idle_timeout_secs: 0,
+            sse_keepalive_secs: 0,
             response_shape: ResponseShape::default(),
             tracing_ids: None,
             upstream_data_parallel_rank: None,

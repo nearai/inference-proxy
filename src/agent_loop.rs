@@ -34,6 +34,7 @@ use crate::proxy::{
     make_usage_reporter, normalize_chat_chunk, record_completed_request,
     report_chat_usage_if_present, StreamingGuard,
 };
+use crate::usage::{CachedTokens, ChatUsage};
 use crate::{AppState, TracingIds};
 
 pub const WEB_CONTEXT_SEARCH_TOOL_NAME: &str = "web_context_search";
@@ -201,10 +202,13 @@ pub async fn run_chat_completion(
                 // InterceptStream is not in that path, so this is the sole biller —
                 // no double-billing. Reported at most once per loop (one chat id).
                 if let Some(reporter) = usage_reporter.as_ref() {
-                    let usage = (result.input_tokens > 0 || result.output_tokens > 0).then_some((
-                        i64::try_from(result.input_tokens).unwrap_or(i64::MAX),
-                        i64::try_from(result.output_tokens).unwrap_or(i64::MAX),
-                    ));
+                    let usage = (result.input_tokens > 0 || result.output_tokens > 0).then_some(
+                        ChatUsage {
+                            input_tokens: i64::try_from(result.input_tokens).unwrap_or(i64::MAX),
+                            output_tokens: i64::try_from(result.output_tokens).unwrap_or(i64::MAX),
+                            cache_read_tokens: result.cache_read_tokens,
+                        },
+                    );
                     let reported =
                         report_chat_usage_if_present(reporter, usage, result.chat_id.as_deref());
                     if reported && !result.completed_cleanly {
@@ -324,6 +328,7 @@ struct LoopResult {
     iterations: u32,
     input_tokens: u64,
     output_tokens: u64,
+    cache_read_tokens: i64,
     terminated_by: &'static str,
     /// True only if the loop closed cleanly (model stop / max_iterations
     /// terminator) and the final `[DONE]` was sent downstream. False on
@@ -341,6 +346,7 @@ async fn drive_loop(
     let mut created: Option<i64> = None;
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
+    let mut total_cache_read_tokens: i64 = 0;
     let mut iterations: u32 = 0;
     let terminated_by;
     let mut completed_cleanly = false;
@@ -456,6 +462,8 @@ async fn drive_loop(
         }
         total_input_tokens = total_input_tokens.saturating_add(iter_outcome.input_tokens);
         total_output_tokens = total_output_tokens.saturating_add(iter_outcome.output_tokens);
+        total_cache_read_tokens = total_cache_read_tokens
+            .saturating_add(iter_outcome.cached_tokens.observed().unwrap_or(0));
 
         debug!(
             iteration = iterations,
@@ -662,6 +670,7 @@ async fn drive_loop(
         iterations,
         input_tokens: total_input_tokens,
         output_tokens: total_output_tokens,
+        cache_read_tokens: total_cache_read_tokens,
         terminated_by,
         completed_cleanly,
     })
@@ -716,6 +725,7 @@ struct IterOutcome {
     tool_calls: Vec<Value>,
     input_tokens: u64,
     output_tokens: u64,
+    cached_tokens: CachedTokens,
     /// True iff the upstream stream terminated with a `data: [DONE]` line.
     /// Drive_loop only forwards a downstream `[DONE]` and signs the response
     /// when this is true; an abrupt EOF or a transport error must NOT be
@@ -752,6 +762,7 @@ async fn run_iteration(
         tool_calls: Vec::new(),
         input_tokens: 0,
         output_tokens: 0,
+        cached_tokens: CachedTokens::default(),
         saw_done: false,
         client_disconnected: false,
         upstream_error: None,
@@ -959,6 +970,10 @@ fn ingest_chunk_metadata(event: &Value, outcome: &mut IterOutcome) {
         if let Some(c) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
             outcome.output_tokens = c;
         }
+        outcome.cached_tokens.update(
+            usage,
+            i64::try_from(outcome.input_tokens).unwrap_or(i64::MAX),
+        );
     }
 
     if let Some(choices) = event.get("choices").and_then(|v| v.as_array()) {

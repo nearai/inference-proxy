@@ -12,6 +12,12 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 // Import from the crate
 use vllm_proxy_rs::*;
 
+#[path = "direct_cache/mod.rs"]
+mod direct_cache;
+
+#[path = "fusion_cache/mod.rs"]
+mod fusion_cache;
+
 struct TestAppOptions {
     rate_per_second: u64,
     rate_burst: u32,
@@ -19,6 +25,7 @@ struct TestAppOptions {
     image_validation: bool,
     fusion_enabled: bool,
     fusion_endpoints_url: Option<String>,
+    cloud_api_url: Option<String>,
     web_context_search_url: Option<String>,
     fusion_panel_timeout_secs: u64,
     fusion_max_response_bytes: usize,
@@ -40,6 +47,7 @@ impl Default for TestAppOptions {
             image_validation: false,
             fusion_enabled: false,
             fusion_endpoints_url: None,
+            cloud_api_url: None,
             web_context_search_url: None,
             fusion_panel_timeout_secs: 120,
             fusion_max_response_bytes: 10 * 1024 * 1024,
@@ -207,11 +215,14 @@ fn build_test_app_inner_with_pool(
         rate_limit_per_second: options.rate_per_second,
         rate_limit_burst_size: options.rate_burst,
         rate_limit_trust_proxy_headers: true,
-        cloud_api_url: None,
+        cloud_api_url: options.cloud_api_url.clone(),
         cloud_api_auth_max_attempts: 1,
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
-        cloud_api_usage_token: None,
+        cloud_api_usage_token: options
+            .cloud_api_url
+            .as_ref()
+            .map(|_| "test-usage-token".to_string()),
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,

@@ -17,6 +17,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use vllm_proxy_rs::*;
 
+#[path = "agent_cache/reporting.rs"]
+mod agent_cache;
+
 // ── test app builder ────────────────────────────────────────────────
 
 fn build_agent_loop_app(upstream_mock_url: &str, brave_url: Option<&str>) -> axum::Router {
@@ -211,9 +214,9 @@ fn upstream_final_answer_sse(chat_id: &str) -> String {
 /// a correct biller keeps the latest (3), a buggy one that sums would report 6.
 fn upstream_final_answer_sse_no_done(chat_id: &str) -> String {
     format!(
-        "data: {{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"Hel\"}}}}],\"usage\":{{\"prompt_tokens\":15,\"completion_tokens\":1,\"total_tokens\":16}}}}\n\n\
+        "data: {{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"Hel\"}}}}],\"usage\":{{\"prompt_tokens\":15,\"completion_tokens\":1,\"total_tokens\":16,\"prompt_tokens_details\":{{\"cached_tokens\":12}}}}}}\n\n\
          data: {{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"lo.\"}}}}],\"usage\":{{\"prompt_tokens\":15,\"completion_tokens\":2,\"total_tokens\":17}}}}\n\n\
-         data: {{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":15,\"completion_tokens\":3,\"total_tokens\":18}}}}\n\n",
+         data: {{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":15,\"completion_tokens\":3,\"total_tokens\":18,\"prompt_tokens_details\":{{\"cached_tokens\":null}}}}}}\n\n",
         id = chat_id,
     )
 }
@@ -1606,24 +1609,7 @@ async fn brave_formatted_output_is_truncated() {
 #[tokio::test]
 async fn interrupted_agent_loop_reports_usage_without_signature() {
     let upstream = MockServer::start().await;
-    let cloud_api = MockServer::start().await;
-
-    // sk- key validation succeeds → usage reporter is active for this request.
-    // Identity fields enable the service-token /v1/internal/usage reporting path.
-    Mock::given(method("POST"))
-        .and(path("/v1/check_api_key"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "organization_id": "org-test",
-            "workspace_id": "ws-test",
-            "api_key_id": "key-test"
-        })))
-        .mount(&cloud_api)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/internal/usage"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&cloud_api)
-        .await;
+    let (cloud_api, usage_received) = agent_cache::usage_server().await;
 
     // Single turn: a final answer carrying cumulative usage on every chunk
     // (1→2→3 completion tokens) but no [DONE]. The mock only matches if the loop
@@ -1671,21 +1657,13 @@ async fn interrupted_agent_loop_reports_usage_without_signature() {
     let _ = response.into_body().collect().await;
 
     // Usage is reported (fire-and-forget) even though the stream never saw [DONE].
-    let mut usage_body = None;
-    for _ in 0..50 {
-        let reqs = cloud_api.received_requests().await.unwrap();
-        if let Some(req) = reqs.iter().find(|r| r.url.path() == "/v1/internal/usage") {
-            usage_body = Some(serde_json::from_slice::<serde_json::Value>(&req.body).unwrap());
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    let usage = usage_body.expect("interrupted agent loop must still report usage");
+    let usage = agent_cache::reported_usage(&cloud_api, &usage_received).await;
     assert_eq!(usage["type"], "chat_completion");
     // Latest cumulative usage, NOT the sum of the per-chunk cumulative values
     // (summing the 3 chunks would overbill to 45 in / 6 out).
     assert_eq!(usage["input_tokens"], 15);
     assert_eq!(usage["output_tokens"], 3);
+    assert_eq!(usage["cache_read_tokens"], 12);
     assert_eq!(usage["id"], "chatcmpl-INT");
 
     // ...but no signature is cached over the incomplete response.
@@ -1701,4 +1679,6 @@ async fn interrupted_agent_loop_reports_usage_without_signature() {
         .await
         .unwrap();
     assert_eq!(sig_response.status(), StatusCode::NOT_FOUND);
+    upstream.verify().await;
+    cloud_api.verify().await;
 }

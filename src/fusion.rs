@@ -18,6 +18,7 @@ use crate::auth::RequireAuth;
 use crate::encryption::{ChunkTransform, ResponseTransform};
 use crate::error::AppError;
 use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageType};
+use crate::usage::ChatUsage;
 use crate::{AppState, TracingIds};
 
 const FUSION_TYPES: [&str; 2] = ["openrouter:fusion", "nearai:fusion"];
@@ -73,12 +74,14 @@ struct EndpointInfo {
 pub struct Usage {
     prompt_tokens: i64,
     completion_tokens: i64,
+    cache_read_tokens: i64,
 }
 
 impl Usage {
     fn add(&mut self, other: &Usage) {
         self.prompt_tokens += other.prompt_tokens;
         self.completion_tokens += other.completion_tokens;
+        self.cache_read_tokens += other.cache_read_tokens;
     }
 
     fn total_tokens(&self) -> i64 {
@@ -90,20 +93,16 @@ impl Usage {
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "total_tokens": self.total_tokens(),
+            "prompt_tokens_details": {"cached_tokens": self.cache_read_tokens},
         })
     }
 
     fn from_response(value: &Value) -> Usage {
-        let usage = value.get("usage").unwrap_or(&Value::Null);
+        let usage = ChatUsage::from_usage(value.get("usage").unwrap_or(&Value::Null));
         Usage {
-            prompt_tokens: usage
-                .get("prompt_tokens")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0),
-            completion_tokens: usage
-                .get("completion_tokens")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0),
+            prompt_tokens: usage.input_tokens,
+            completion_tokens: usage.output_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
         }
     }
 }
@@ -1659,6 +1658,9 @@ async fn stream_final_response(
 }
 
 #[cfg(test)]
+mod cache_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
@@ -1731,10 +1733,12 @@ mod tests {
         let mut usage = Usage {
             prompt_tokens: 2,
             completion_tokens: 3,
+            ..Usage::default()
         };
         usage.add(&Usage {
             prompt_tokens: 5,
             completion_tokens: 7,
+            ..Usage::default()
         });
         assert_eq!(usage.to_json()["prompt_tokens"], 7);
         assert_eq!(usage.to_json()["completion_tokens"], 10);

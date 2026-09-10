@@ -22,6 +22,7 @@ pub mod routes;
 pub mod signing;
 pub mod startup_checks;
 pub mod types;
+pub mod usage;
 pub mod vllm_dp_affinity;
 
 pub use request_tracing::{request_id_middleware, TracingIds};

@@ -666,6 +666,10 @@ fn report_stream_usage_on_finalize(
                 );
             }
         }
+        // This arm is reached only when usage or chat_id is missing, so
+        // report_chat_usage_if_present records the appropriate missing-data outcome and
+        // returns without sending a usage report; discarding the cached component cannot
+        // lose billed data.
         (usage, chat_id) => {
             report_chat_usage_if_present(reporter, usage.map(|(usage, _)| usage), chat_id);
         }

@@ -1,9 +1,5 @@
 use std::sync::Arc;
 
-#[cfg(test)]
-#[path = "proxy/cache_tests.rs"]
-mod cache_tests;
-
 use axum::body::Body;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -14,7 +10,6 @@ use tracing::{debug, error, info, warn};
 use crate::cache::ChatCache;
 use crate::error::AppError;
 use crate::signing::SigningPair;
-use crate::usage::{cached_tokens, CachedTokens, ChatUsage};
 use crate::{AppState, TracingIds};
 
 #[cfg(test)]
@@ -463,6 +458,15 @@ pub fn make_usage_reporter(
     })
 }
 
+/// Read the provider's cached-prompt counter, bounded to the non-negative prompt total.
+fn cached_tokens(usage: &serde_json::Value, prompt_tokens: i64) -> Option<i64> {
+    usage
+        .get("prompt_tokens_details")?
+        .get("cached_tokens")?
+        .as_i64()
+        .map(|tokens| tokens.clamp(0, prompt_tokens.max(0)))
+}
+
 /// Build the `/v1/internal/usage` request body for a parsed response, or
 /// `None` when there is nothing billable to report. Pure (no I/O) so it can
 /// be unit-tested directly; `try_report_usage` wraps it with the
@@ -475,16 +479,24 @@ fn build_usage_body(
 ) -> Option<serde_json::Value> {
     match usage_type {
         UsageType::ChatCompletion => {
-            let usage = ChatUsage::from_usage(response_data.get("usage")?);
-            if usage.input_tokens == 0 && usage.output_tokens == 0 {
+            let usage = response_data.get("usage")?;
+            let input = usage
+                .get("prompt_tokens")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let output = usage
+                .get("completion_tokens")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            if input == 0 && output == 0 {
                 return None;
             }
             Some(serde_json::json!({
                 "type": "chat_completion",
                 "model": model_name,
-                "input_tokens": usage.input_tokens,
-                "output_tokens": usage.output_tokens,
-                "cache_read_tokens": usage.cache_read_tokens,
+                "input_tokens": input,
+                "output_tokens": output,
+                "cache_read_tokens": cached_tokens(usage, input).unwrap_or(0),
                 "id": id,
             }))
         }
@@ -564,10 +576,10 @@ pub(crate) fn try_report_usage(response_data: &serde_json::Value, id: &str, opts
 /// outcomes instead of silent gaps in the direct-key reporting funnel.
 pub(crate) fn report_chat_usage_if_present(
     reporter: &UsageReporter,
-    usage: Option<ChatUsage>,
+    usage: Option<(i64, i64)>,
     response_id: Option<&str>,
 ) -> bool {
-    let Some(usage) = usage else {
+    let Some((input, output)) = usage else {
         record_usage_report_outcome(reporter, UsageReportOutcome::MissingBillableUsage, None);
         warn!(
             request_id = %reporter.request_id.as_deref().unwrap_or(""),
@@ -589,8 +601,8 @@ pub(crate) fn report_chat_usage_if_present(
             workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
             api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
             model = %reporter.model_name,
-            input_tokens = usage.input_tokens,
-            output_tokens = usage.output_tokens,
+            input_tokens = input,
+            output_tokens = output,
             auth_path = reporter.request_source.auth_path.as_label(),
             ingress_route = reporter.request_source.ingress_route.as_label(),
             "Skipping direct-key usage report: provider response ID was not observed"
@@ -601,9 +613,8 @@ pub(crate) fn report_chat_usage_if_present(
     let body = serde_json::json!({
         "type": "chat_completion",
         "model": reporter.model_name,
-        "input_tokens": usage.input_tokens,
-        "output_tokens": usage.output_tokens,
-        "cache_read_tokens": usage.cache_read_tokens,
+        "input_tokens": input,
+        "output_tokens": output,
         "id": id,
     });
     spawn_usage_report(reporter, body);
@@ -622,7 +633,7 @@ pub(crate) fn report_chat_usage_if_present(
 /// not in that path, so this is the sole biller and there is no double-billing.
 fn report_stream_usage_on_finalize(
     usage_reporter: &Option<UsageReporter>,
-    usage: Option<ChatUsage>,
+    usage: Option<((i64, i64), Option<i64>)>,
     chat_id: Option<&str>,
     completed_cleanly: bool,
     log_request_id: &str,
@@ -633,22 +644,30 @@ fn report_stream_usage_on_finalize(
         return;
     };
     match (usage, chat_id) {
-        (Some(usage), Some(id)) => {
-            let reported = report_chat_usage_if_present(reporter, Some(usage), Some(id));
-            if reported && !completed_cleanly {
+        (Some(((input, output), cache_read_tokens)), Some(id)) => {
+            let body = serde_json::json!({
+                "type": "chat_completion",
+                "model": reporter.model_name,
+                "input_tokens": input,
+                "output_tokens": output,
+                "cache_read_tokens": cache_read_tokens.unwrap_or(0),
+                "id": id,
+            });
+            spawn_usage_report(reporter, body);
+            if !completed_cleanly {
                 info!(
                     request_id = %log_request_id,
                     org_id = %log_org_id,
                     workspace_id = %log_workspace_id,
                     chat_id = %id,
-                    input_tokens = usage.input_tokens,
-                    output_tokens = usage.output_tokens,
+                    input_tokens = input,
+                    output_tokens = output,
                     "Reported usage for interrupted stream"
                 );
             }
         }
-        _ => {
-            report_chat_usage_if_present(reporter, usage, chat_id);
+        (usage, chat_id) => {
+            report_chat_usage_if_present(reporter, usage.map(|(usage, _)| usage), chat_id);
         }
     }
 }
@@ -1296,7 +1315,6 @@ struct StreamingResponseAssembler {
     /// Per-choice state, keyed by choice index.
     choices: Vec<ChoiceAssembler>,
     usage: Option<serde_json::Value>,
-    cached_tokens: CachedTokens,
     metadata: Option<serde_json::Value>,
     shape: ResponseShape,
     /// First `event["error"]` object seen in the stream. SGLang aborts (e.g.
@@ -1350,7 +1368,6 @@ impl StreamingResponseAssembler {
             created: None,
             choices: Vec::new(),
             usage: None,
-            cached_tokens: CachedTokens::default(),
             metadata: None,
             shape,
             error: None,
@@ -1427,12 +1444,21 @@ impl StreamingResponseAssembler {
         // Capture usage (typically in the final chunk with empty choices).
         if let Some(u) = event.get("usage").filter(|v| v.is_object()) {
             let mut usage = u.clone();
-            let counts = ChatUsage::from_cumulative_usage(u, &mut self.cached_tokens);
-            if cached_tokens(u).is_none() && self.cached_tokens.observed().is_some() {
-                if !usage["prompt_tokens_details"].is_object() {
-                    usage["prompt_tokens_details"] = serde_json::json!({});
+            let prompt_tokens = usage
+                .get("prompt_tokens")
+                .and_then(|value| value.as_i64())
+                .unwrap_or(0);
+            if cached_tokens(&usage, prompt_tokens).is_none() {
+                if let Some(retained_cached_tokens) = self
+                    .usage
+                    .as_ref()
+                    .and_then(|previous| cached_tokens(previous, prompt_tokens))
+                {
+                    if !usage["prompt_tokens_details"].is_object() {
+                        usage["prompt_tokens_details"] = serde_json::json!({});
+                    }
+                    usage["prompt_tokens_details"]["cached_tokens"] = retained_cached_tokens.into();
                 }
-                usage["prompt_tokens_details"]["cached_tokens"] = counts.cache_read_tokens.into();
             }
             self.usage = Some(usage);
         }
@@ -1906,7 +1932,7 @@ pub async fn proxy_streaming_request(
         // stays gated on a clean [DONE] below.
         report_stream_usage_on_finalize(
             &usage_reporter,
-            parser.usage,
+            parser.usage.map(|usage| (usage, parser.cached_tokens)),
             parser.chat_id.as_deref(),
             completed_cleanly,
             &log_request_id,
@@ -1937,13 +1963,13 @@ pub async fn proxy_streaming_request(
                 };
 
                 if signature_cached {
-                    let usage = parser.usage.unwrap_or_default();
+                    let (input_tokens, output_tokens) = parser.usage.unwrap_or((0, 0));
                     record_completed_request(
                         completion_tracing_ids.as_ref(),
                         &model_name,
                         id,
-                        usage.input_tokens,
-                        usage.output_tokens,
+                        input_tokens,
+                        output_tokens,
                         upstream_start.elapsed(),
                         "streaming_request",
                     );
@@ -2500,7 +2526,7 @@ pub async fn proxy_streaming_response(
         // stays gated on a clean [DONE] below.
         report_stream_usage_on_finalize(
             &usage_reporter,
-            parser.usage,
+            parser.usage.map(|usage| (usage, parser.cached_tokens)),
             parser.chat_id.as_deref(),
             completed_cleanly,
             &log_request_id,
@@ -2530,13 +2556,13 @@ pub async fn proxy_streaming_response(
                 };
 
                 if signature_cached {
-                    let usage = parser.usage.unwrap_or_default();
+                    let (input_tokens, output_tokens) = parser.usage.unwrap_or((0, 0));
                     record_completed_request(
                         completion_tracing_ids.as_ref(),
                         &model_name,
                         id,
-                        usage.input_tokens,
-                        usage.output_tokens,
+                        input_tokens,
+                        output_tokens,
                         request_started_at.elapsed(),
                         "streaming_response",
                     );
@@ -2592,9 +2618,9 @@ pub struct SseParser {
     /// A role-only chat chunk is metadata, not progress: vLLM emits it before
     /// hidden reasoning and may then remain byte-silent for an unbounded time.
     pub seen_generation_progress: bool,
-    /// Latest billable cumulative counters, including previously observed cached input.
-    pub usage: Option<ChatUsage>,
-    cached_tokens: CachedTokens,
+    /// Token usage extracted from the final SSE chunk (prompt_tokens, completion_tokens).
+    pub usage: Option<(i64, i64)>,
+    cached_tokens: Option<i64>,
 }
 
 impl Default for SseParser {
@@ -2611,7 +2637,7 @@ impl SseParser {
             seen_done: false,
             seen_generation_progress: false,
             usage: None,
-            cached_tokens: CachedTokens::default(),
+            cached_tokens: None,
         }
     }
 
@@ -2660,15 +2686,19 @@ impl SseParser {
                         .get("usage")
                         .filter(|u| u.is_object())
                         .and_then(|usage| {
-                            let counts = ChatUsage::from_usage(usage);
-                            let accepted = counts.input_tokens > 0 || counts.output_tokens > 0;
-                            let input_tokens = if accepted {
-                                counts.input_tokens
+                            let input = usage
+                                .get("prompt_tokens")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0);
+                            let output = usage
+                                .get("completion_tokens")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0);
+                            if input > 0 || output > 0 {
+                                Some(((input, output), cached_tokens(usage, input)))
                             } else {
-                                self.usage.map_or(0, |previous| previous.input_tokens)
-                            };
-                            self.cached_tokens.update(usage, input_tokens);
-                            accepted.then_some(counts)
+                                None
+                            }
                         });
                     let progress = sse_value_has_generation_progress(&parsed);
                     (false, id, usage, progress)
@@ -2683,11 +2713,10 @@ impl SseParser {
             if let Some(id) = extracted_id {
                 self.chat_id = Some(id);
             }
-            if let Some(usage) = extracted_usage {
+            if let Some((usage, cached_tokens)) = extracted_usage {
                 self.usage = Some(usage);
-            }
-            if let Some(usage) = self.usage.as_mut() {
-                usage.cache_read_tokens = self.cached_tokens.observed().unwrap_or(0);
+                self.cached_tokens = cached_tokens
+                    .or_else(|| self.cached_tokens.map(|tokens| tokens.min(usage.0.max(0))));
             }
             if has_generation_progress {
                 self.seen_generation_progress = true;
@@ -2915,13 +2944,18 @@ mod tests {
     #[test]
     fn test_build_usage_body_chat_completion() {
         let resp = serde_json::json!({
-            "usage": {"prompt_tokens": 12, "completion_tokens": 7}
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 7,
+                "prompt_tokens_details": {"cached_tokens": 9}
+            }
         });
         let body = build_usage_body(&UsageType::ChatCompletion, &resp, "m", "id-1").unwrap();
         assert_eq!(body["type"], "chat_completion");
         assert_eq!(body["model"], "m");
         assert_eq!(body["input_tokens"], 12);
         assert_eq!(body["output_tokens"], 7);
+        assert_eq!(body["cache_read_tokens"], 9);
         assert_eq!(body["id"], "id-1");
     }
 

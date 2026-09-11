@@ -12,12 +12,6 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 // Import from the crate
 use vllm_proxy_rs::*;
 
-#[path = "direct_cache/mod.rs"]
-mod direct_cache;
-
-#[path = "fusion_cache/mod.rs"]
-mod fusion_cache;
-
 struct TestAppOptions {
     rate_per_second: u64,
     rate_burst: u32,
@@ -25,7 +19,6 @@ struct TestAppOptions {
     image_validation: bool,
     fusion_enabled: bool,
     fusion_endpoints_url: Option<String>,
-    cloud_api_url: Option<String>,
     web_context_search_url: Option<String>,
     fusion_panel_timeout_secs: u64,
     fusion_max_response_bytes: usize,
@@ -47,7 +40,6 @@ impl Default for TestAppOptions {
             image_validation: false,
             fusion_enabled: false,
             fusion_endpoints_url: None,
-            cloud_api_url: None,
             web_context_search_url: None,
             fusion_panel_timeout_secs: 120,
             fusion_max_response_bytes: 10 * 1024 * 1024,
@@ -215,14 +207,11 @@ fn build_test_app_inner_with_pool(
         rate_limit_per_second: options.rate_per_second,
         rate_limit_burst_size: options.rate_burst,
         rate_limit_trust_proxy_headers: true,
-        cloud_api_url: options.cloud_api_url.clone(),
+        cloud_api_url: None,
         cloud_api_auth_max_attempts: 1,
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
-        cloud_api_usage_token: options
-            .cloud_api_url
-            .as_ref()
-            .map(|_| "test-usage-token".to_string()),
+        cloud_api_usage_token: None,
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,
@@ -6710,15 +6699,16 @@ async fn test_usage_reported_for_cloud_api_key_non_streaming() {
         .mount(&cloud_api)
         .await;
 
+    let sse_body = "\
+data: {\"id\":\"chatcmpl-usage1\",\"object\":\"chat.completion.chunk\",\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":8}}}\n\n\
+data: {\"id\":\"chatcmpl-usage1\",\"object\":\"chat.completion.chunk\",\"model\":\"test-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n\
+data: [DONE]\n\n";
+
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-usage1",
-            "object": "chat.completion",
-            "model": "test-model",
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
-        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(sse_body.as_bytes(), "text/event-stream"),
+        )
         .mount(&backend)
         .await;
 
@@ -6753,6 +6743,7 @@ async fn test_usage_reported_for_cloud_api_key_non_streaming() {
     assert_eq!(usage_reqs[0]["model"], "test-model");
     assert_eq!(usage_reqs[0]["input_tokens"], 10);
     assert_eq!(usage_reqs[0]["output_tokens"], 5);
+    assert_eq!(usage_reqs[0]["cache_read_tokens"], 8);
     assert!(usage_reqs[0]["id"].as_str().is_some());
 
     // The same safe correlation ID must cover both Cloud API calls: key
@@ -6963,7 +6954,7 @@ async fn test_usage_reported_for_streaming_chat_with_cloud_api_key() {
     // SSE streaming response with usage in final chunk
     let sse_body = "\
 data: {\"id\":\"chatcmpl-stream-u1\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"index\":0}]}\n\n\
-data: {\"id\":\"chatcmpl-stream-u1\",\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":3,\"total_tokens\":11}}\n\n\
+data: {\"id\":\"chatcmpl-stream-u1\",\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":3,\"total_tokens\":11,\"prompt_tokens_details\":{\"cached_tokens\":6}}}\n\n\
 data: [DONE]\n\n";
 
     Mock::given(method("POST"))
@@ -7009,6 +7000,7 @@ data: [DONE]\n\n";
     assert_eq!(usage_reqs[0]["type"], "chat_completion");
     assert_eq!(usage_reqs[0]["input_tokens"], 8);
     assert_eq!(usage_reqs[0]["output_tokens"], 3);
+    assert_eq!(usage_reqs[0]["cache_read_tokens"], 6);
     // Reported via the service-token /v1/internal/usage path: cloud-api attributes
     // the usage from these identity fields in the body (not from an sk- bearer).
     assert_eq!(usage_reqs[0]["organization_id"], "org-test");
@@ -7046,8 +7038,8 @@ async fn test_usage_reported_for_interrupted_stream_without_done() {
     // Running cumulative usage on each chunk (continuous_usage_stats), then the
     // stream is cut off mid-flight — no final empty-choices chunk and no [DONE].
     let sse_body = "\
-data: {\"id\":\"chatcmpl-interrupted\",\"choices\":[{\"delta\":{\"content\":\"hel\"},\"index\":0}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":1,\"total_tokens\":9}}\n\n\
-data: {\"id\":\"chatcmpl-interrupted\",\"choices\":[{\"delta\":{\"content\":\"lo\"},\"index\":0}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10}}\n\n";
+data: {\"id\":\"chatcmpl-interrupted\",\"choices\":[{\"delta\":{\"content\":\"hel\"},\"index\":0}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":1,\"total_tokens\":9,\"prompt_tokens_details\":{\"cached_tokens\":4}}}\n\n\
+data: {\"id\":\"chatcmpl-interrupted\",\"choices\":[{\"delta\":{\"content\":\"lo\"},\"index\":0}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10,\"prompt_tokens_details\":{\"cached_tokens\":6}}}\n\n";
 
     // The mock only matches if the proxy forwards continuous_usage_stats:true —
     // this is what makes the running per-chunk usage above a reachable production
@@ -7101,6 +7093,7 @@ data: {\"id\":\"chatcmpl-interrupted\",\"choices\":[{\"delta\":{\"content\":\"lo
     assert_eq!(usage_reqs[0]["type"], "chat_completion");
     assert_eq!(usage_reqs[0]["input_tokens"], 8);
     assert_eq!(usage_reqs[0]["output_tokens"], 2);
+    assert_eq!(usage_reqs[0]["cache_read_tokens"], 6);
 
     // ...but the signature is still withheld: a partial stream cannot be verified.
     let sig_response = app

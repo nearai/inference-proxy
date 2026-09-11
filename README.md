@@ -130,9 +130,6 @@ and non-Fusion chat requests keep the normal proxy behavior. Cloud API remains a
 pass-through: billing observes the single final response, whose `usage` contains
 the aggregate token usage from panel, judge, and synthesis calls.
 
-See [direct usage reporting](docs/direct-usage-reporting.md) for cached-input
-normalization, cumulative stream retention, and aggregation semantics.
-
 Supported request shapes:
 
 ```json

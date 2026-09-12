@@ -6,8 +6,9 @@ use tokio::net::TcpListener;
 use tracing::info;
 use vllm_proxy_rs::ohttp_gateway::OhttpGateway;
 use vllm_proxy_rs::{
-    attestation, backend_affinity, backend_pool, cache, config, fusion, metrics_middleware,
-    rate_limit, request_id_middleware, routes, signing, startup_checks, vllm_dp_affinity, AppState,
+    attestation, backend_affinity, backend_discovery, backend_pool, cache, config, fusion,
+    metrics_middleware, rate_limit, request_id_middleware, routes, signing, startup_checks,
+    vllm_dp_affinity, AppState,
 };
 
 /// DNS resolver that returns only IPv4 addresses.
@@ -56,6 +57,7 @@ async fn main() -> anyhow::Result<()> {
     let config = config::Config::from_env()?;
 
     let listen_port = config.listen_port;
+    let listen_addr = config.listen_addr.clone();
 
     // Warn if any backend URL points to the proxy's own listen address
     let self_local = format!("://localhost:{listen_port}");
@@ -119,18 +121,16 @@ async fn main() -> anyhow::Result<()> {
     ));
     let backend_affinity = Arc::new(backend_affinity::BackendConversationAffinity::new(
         config.backend_conversation_affinity,
-        config.backend_urls.len(),
         config.backend_affinity_max_imbalance,
         config.chat_cache_expiration_secs,
     ));
     if backend_affinity.is_active() {
         info!(
             backends = config.backend_urls.len(),
+            discovery = config.backend_discovery.is_some(),
             max_imbalance = config.backend_affinity_max_imbalance,
-            "Backend conversation affinity enabled"
+            "Backend conversation affinity enabled (pins apply whenever the pool has more than one backend)"
         );
-    } else if config.backend_conversation_affinity {
-        info!("VLLM_BACKEND_CONVERSATION_AFFINITY set but only one backend is configured; nothing to pin");
     }
     let attestation_cache = Arc::new(attestation::AttestationCache::new(
         config.attestation_cache_ttl_secs,
@@ -143,22 +143,70 @@ async fn main() -> anyhow::Result<()> {
     // closed. A reused-but-closed connection surfaces as
     // `error sending request for url ...` and produced ~12 spurious 401s/h
     // on `/v1/check_api_key` before we capped this. (See auth.rs retry path.)
-    let mut http_builder = reqwest::Client::builder()
-        .dns_resolver(Arc::new(Ipv4OnlyResolver))
-        .pool_max_idle_per_host(config.max_keepalive)
-        .timeout(std::time::Duration::from_secs(config.timeout_secs));
-    if config.pool_idle_timeout_secs > 0 {
-        http_builder = http_builder.pool_idle_timeout(std::time::Duration::from_secs(
-            config.pool_idle_timeout_secs,
-        ));
-    }
-    let http_client = http_builder.build()?;
+    let build_http_client = |default_headers: Option<reqwest::header::HeaderMap>| {
+        let mut http_builder = reqwest::Client::builder()
+            .dns_resolver(Arc::new(Ipv4OnlyResolver))
+            .pool_max_idle_per_host(config.max_keepalive)
+            .timeout(std::time::Duration::from_secs(config.timeout_secs));
+        if config.pool_idle_timeout_secs > 0 {
+            http_builder = http_builder.pool_idle_timeout(std::time::Duration::from_secs(
+                config.pool_idle_timeout_secs,
+            ));
+        }
+        if let Some(headers) = default_headers {
+            http_builder = http_builder.default_headers(headers);
+        }
+        http_builder.build()
+    };
+    let http_client = build_http_client(None)?;
+    // Backend-only client: carries the backend bearer (if any) as a default
+    // header so it can never be attached to a cloud-api or registry request.
+    let backend_client = match &config.backend_token {
+        Some(token) => {
+            let mut headers = reqwest::header::HeaderMap::new();
+            let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|_| anyhow::anyhow!("VLLM_BACKEND_TOKEN is not a valid header value"))?;
+            value.set_sensitive(true);
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+            info!("Backend requests will carry the configured VLLM_BACKEND_TOKEN");
+            build_http_client(Some(headers))?
+        }
+        None => http_client.clone(),
+    };
 
     // Initialize metrics
     let metrics_handle = metrics_middleware::setup_metrics_recorder();
 
-    // Initialize backend pool
+    // Initialize backend pool. With discovery enabled it starts from the
+    // registry listing (one synchronous poll) and is kept current by a
+    // background task; a failed initial poll serves 503 until the registry
+    // answers rather than failing startup.
     let backend_pool = Arc::new(backend_pool::BackendPool::new(config.backend_urls.clone()));
+    if let Some(discovery) = &config.backend_discovery {
+        info!(
+            url = %discovery.url,
+            interval_secs = discovery.interval_secs,
+            "Backend discovery enabled"
+        );
+        // The registry call carries the discovery token explicitly; use the
+        // plain client so the backend bearer is never sent to the registry.
+        match backend_discovery::poll_once(&http_client, discovery, &backend_pool).await {
+            Ok(change) => info!(
+                added = ?change.added,
+                backends = backend_pool.len(),
+                "Initial backend discovery complete"
+            ),
+            Err(reason) => tracing::warn!(
+                reason = %reason,
+                "Initial backend discovery failed; serving 503 until the registry responds"
+            ),
+        }
+        backend_discovery::spawn_discovery(
+            backend_pool.clone(),
+            http_client.clone(),
+            discovery.clone(),
+        );
+    }
 
     // Build app state
     let model_name = config.model_name.clone();
@@ -168,6 +216,7 @@ async fn main() -> anyhow::Result<()> {
         cache: Arc::new(chat_cache),
         attestation_cache: attestation_cache.clone(),
         http_client,
+        backend_client,
         metrics_handle,
         tls_cert_fingerprint: tls_cert_fingerprint.clone(),
         backend_pool: backend_pool.clone(),
@@ -195,22 +244,29 @@ async fn main() -> anyhow::Result<()> {
             http_client: state.http_client.clone(),
         }
     });
-    attestation::spawn_cache_refresh_task(
-        attestation_cache,
-        model_name,
-        state.signing.clone(),
-        state.config.gpu_no_hw_mode,
-        tls_cert_fingerprint,
-        state.config.attestation_cache_ttl_secs / 2,
-        compose_manager,
-        ohttp_attestation_ed25519,
-        delegate_refresh,
-    );
+    if state.config.non_tee_deployment {
+        // Non-TEE deployment (gateway mode): no dstack guest agent, so there is
+        // nothing to attest and the periodic refresh would only log failures.
+        info!("dstack not available on this deployment; attestation cache refresh disabled");
+    } else {
+        attestation::spawn_cache_refresh_task(
+            attestation_cache,
+            model_name,
+            state.signing.clone(),
+            state.config.gpu_no_hw_mode,
+            tls_cert_fingerprint,
+            state.config.attestation_cache_ttl_secs / 2,
+            compose_manager,
+            ohttp_attestation_ed25519,
+            delegate_refresh,
+        );
+    }
 
     // Run OpenAI chat compatibility checks if enabled
     if state.config.openai_chat_compatibility_check_enabled {
         info!("OpenAI chat compatibility check enabled, verifying backend...");
-        if let Err(e) = startup_checks::run_startup_checks(&state.http_client, &state.config).await
+        if let Err(e) =
+            startup_checks::run_startup_checks(&state.backend_client, &state.config).await
         {
             tracing::error!(error = %e, "OpenAI chat compatibility check failed — exiting");
             return Err(e.into());
@@ -219,21 +275,23 @@ async fn main() -> anyhow::Result<()> {
         info!("OpenAI chat compatibility check disabled (set OPENAI_CHAT_COMPATIBILITY_CHECK=true to enable)");
     }
 
-    // Spawn backend health checks if multiple backends
-    if backend_pool.len() > 1 {
+    // Spawn backend health checks if multiple backends (or membership is
+    // dynamic and may grow).
+    if backend_pool.len() > 1 || state.config.backend_discovery.is_some() {
         info!(
             backends = backend_pool.len(),
             interval_secs = state.config.health_check_interval_secs,
             max_failures = state.config.health_check_max_failures,
+            health_path = %state.config.backend_health_path,
             "Spawning backend health checker"
         );
         backend_pool::spawn_health_check(
             backend_pool,
-            state.http_client.clone(),
+            state.backend_client.clone(),
             std::time::Duration::from_secs(state.config.health_check_interval_secs),
             std::time::Duration::from_secs(state.config.health_check_timeout_secs),
             state.config.health_check_max_failures,
-            routes::health::BACKEND_HEALTH_PATH,
+            &state.config.backend_health_path,
         );
     }
 
@@ -262,7 +320,7 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
 
     // Bind and serve
-    let addr = format!("0.0.0.0:{listen_port}");
+    let addr = format!("{}:{listen_port}", listen_addr);
     let listener = TcpListener::bind(&addr).await?;
     info!("Listening on {addr}");
 

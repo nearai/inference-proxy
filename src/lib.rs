@@ -5,9 +5,11 @@ pub mod attestation;
 pub mod attestation_sdk;
 pub mod auth;
 pub mod backend_affinity;
+pub mod backend_discovery;
 pub mod backend_pool;
 pub mod cache;
 pub mod config;
+pub mod content_policy;
 pub mod encryption;
 pub mod error;
 pub mod fusion;
@@ -34,6 +36,11 @@ pub struct AppState {
     pub cache: Arc<cache::ChatCache>,
     pub attestation_cache: Arc<attestation::AttestationCache>,
     pub http_client: reqwest::Client,
+    /// Client for requests to the inference backends. Identical to
+    /// `http_client` unless `VLLM_BACKEND_TOKEN` is set, in which case it
+    /// carries `Authorization: Bearer <token>` by default so the credential is
+    /// only ever sent to backends — never to cloud-api or other services.
+    pub backend_client: reqwest::Client,
     pub metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
     /// Live SHA-256 hash of the TLS certificate's SPKI (Subject Public Key
     /// Info). The tracker re-stats the cert on every attestation-cache

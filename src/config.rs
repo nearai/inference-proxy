@@ -239,6 +239,57 @@ pub struct Config {
     pub ohttp_enabled: bool,
     /// Listen port for the proxy (used by OHTTP handler for loopback requests).
     pub listen_port: u16,
+    /// Interface to bind (`LISTEN_ADDR`, default `0.0.0.0`). Gateway
+    /// deployments behind a local TLS terminator bind `127.0.0.1`.
+    pub listen_addr: String,
+    /// Bearer token attached to every request sent to the inference backends
+    /// (`VLLM_BACKEND_TOKEN`). Used when the backends are themselves
+    /// inference-proxies (gateway mode): they accept it as a trusted config
+    /// token, so they neither re-validate the customer key nor double-report
+    /// usage. Never sent to cloud-api or any other service.
+    pub backend_token: Option<String>,
+    /// Path probed on each backend by the pool health checker and by
+    /// `/healthz` (`VLLM_BACKEND_HEALTH_PATH`, default `/health`, the engine's
+    /// lightweight route). Gateway mode points it at the inference-proxy's
+    /// unauthenticated `/healthz`.
+    pub backend_health_path: String,
+    /// This proxy does not run inside a TEE (`NON_TEE_DEPLOYMENT=1`): no
+    /// dstack guest agent, no hardware evidence, dev signing keys. Effects:
+    /// `/healthz` skips the dstack probe, the attestation cache refresh is not
+    /// started, and `/v1/attestation/report`, `/v1/signature/{id}` and
+    /// `/internal/gpu_evidence` answer 404 so nothing unverifiable is
+    /// advertised. Inference routes are unaffected.
+    pub non_tee_deployment: bool,
+    /// Rewrite the engine's queue-full rejection (HTTP 503 / SSE error event
+    /// `"The request queue is full."`) to 429 (`VLLM_PROXY_MAP_QUEUE_FULL_TO_429`).
+    /// Aggregators treat 429 as back-pressure and 5xx as an outage; off by
+    /// default because cloud-api's peer fallback keys on the 503.
+    pub map_queue_full_to_429: bool,
+    /// For streaming requests, wait up to this many milliseconds for the
+    /// first upstream SSE chunk before committing a 200 to the client
+    /// (`VLLM_PROXY_STREAM_ERROR_PEEK_MS`, 0 = off). An engine that rejects
+    /// at admission (queue full, aborted) emits `data: {"error": …}` as its
+    /// first event on an HTTP 200 stream; peeking turns that into a real
+    /// error status instead of a 200 that fails mid-stream.
+    pub stream_error_peek_ms: u64,
+    /// Dynamic backend membership from the model-proxy registry
+    /// (`VLLM_BACKEND_DISCOVERY_URL`, `_TOKEN`, `_URL_TEMPLATE`,
+    /// `_INTERVAL_SECS`, `_TIMEOUT_SECS`). Mutually exclusive with
+    /// `VLLM_BACKEND_URLS` and `VLLM_DATA_PARALLEL_SIZE`.
+    pub backend_discovery: Option<crate::backend_discovery::BackendDiscoveryConfig>,
+    /// Chat content part `type`s refused with 400 before dispatch
+    /// (`VLLM_PROXY_REJECTED_CONTENT_PART_TYPES`, e.g. `video_url,input_audio,file`).
+    pub rejected_content_part_types: Vec<String>,
+    /// Refuse any path without a dedicated route instead of forwarding it to
+    /// the backend (`VLLM_PROXY_CATCH_ALL_DISABLED`). Keeps a gateway strictly
+    /// stateless: only the explicitly routed inference endpoints exist.
+    pub catch_all_disabled: bool,
+    /// Emit an SSE comment (`: keep-alive`) on client streams whenever the
+    /// upstream has been silent for this many seconds
+    /// (`VLLM_PROXY_SSE_KEEPALIVE_SECS`, 0 = off). Comments are not hashed into
+    /// the response signature, so leave this off where clients verify
+    /// signatures over the raw stream bytes.
+    pub sse_keepalive_secs: u64,
 
     // Endpoint URL overrides (Some = explicitly set, bypasses backend pool)
     pub images_url_override: Option<String>,
@@ -318,18 +369,66 @@ impl Config {
         let vllm_base_url = env_or("VLLM_BASE_URL", "http://localhost:8000");
         let base = vllm_base_url.trim_end_matches('/');
 
-        // Multi-backend: VLLM_BACKEND_URLS takes precedence over VLLM_BASE_URL
-        let backend_urls: Vec<String> = env::var("VLLM_BACKEND_URLS")
+        // Dynamic membership from the model-proxy registry (gateway mode).
+        let backend_discovery = match env::var("VLLM_BACKEND_DISCOVERY_URL")
             .ok()
+            .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
-            .map(|s| {
-                s.split(',')
-                    .map(|u| u.trim().trim_end_matches('/').to_string())
-                    .filter(|u| !u.is_empty())
-                    .collect()
-            })
-            .unwrap_or_else(|| vec![vllm_base_url.clone()]);
-        if backend_urls.is_empty() {
+        {
+            Some(url) => {
+                if env::var("VLLM_BACKEND_URLS")
+                    .ok()
+                    .is_some_and(|s| !s.trim().is_empty())
+                {
+                    anyhow::bail!(
+                        "VLLM_BACKEND_DISCOVERY_URL and VLLM_BACKEND_URLS are mutually exclusive"
+                    );
+                }
+                let url_template = env::var("VLLM_BACKEND_DISCOVERY_URL_TEMPLATE")
+                    .ok()
+                    .map(|s| s.trim().trim_end_matches('/').to_string())
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "VLLM_BACKEND_DISCOVERY_URL_TEMPLATE is required with VLLM_BACKEND_DISCOVERY_URL"
+                        )
+                    })?;
+                if !url_template.contains(crate::backend_discovery::HANDLE_PLACEHOLDER) {
+                    anyhow::bail!(
+                        "VLLM_BACKEND_DISCOVERY_URL_TEMPLATE must contain {}",
+                        crate::backend_discovery::HANDLE_PLACEHOLDER
+                    );
+                }
+                Some(crate::backend_discovery::BackendDiscoveryConfig {
+                    url,
+                    token: env::var("VLLM_BACKEND_DISCOVERY_TOKEN")
+                        .ok()
+                        .filter(|s| !s.is_empty()),
+                    url_template,
+                    interval_secs: env_int("VLLM_BACKEND_DISCOVERY_INTERVAL_SECS", 5).max(1) as u64,
+                    timeout_secs: env_int("VLLM_BACKEND_DISCOVERY_TIMEOUT_SECS", 3).max(1) as u64,
+                })
+            }
+            None => None,
+        };
+
+        // Multi-backend: VLLM_BACKEND_URLS takes precedence over VLLM_BASE_URL.
+        // With discovery the pool starts empty and is filled by the registry.
+        let backend_urls: Vec<String> = if backend_discovery.is_some() {
+            Vec::new()
+        } else {
+            env::var("VLLM_BACKEND_URLS")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    s.split(',')
+                        .map(|u| u.trim().trim_end_matches('/').to_string())
+                        .filter(|u| !u.is_empty())
+                        .collect()
+                })
+                .unwrap_or_else(|| vec![vllm_base_url.clone()])
+        };
+        if backend_urls.is_empty() && backend_discovery.is_none() {
             anyhow::bail!("VLLM_BACKEND_URLS is set but contains no valid URLs");
         }
 
@@ -348,6 +447,11 @@ impl Config {
                 anyhow::bail!("VLLM_DATA_PARALLEL_SIZE must be valid UTF-8")
             }
         };
+        if vllm_data_parallel_size.is_some() && backend_discovery.is_some() {
+            anyhow::bail!(
+                "VLLM_DATA_PARALLEL_SIZE and VLLM_BACKEND_DISCOVERY_URL are mutually exclusive; discovered backends are independent engines"
+            );
+        }
         if vllm_data_parallel_size.is_some() && backend_urls.len() != 1 {
             anyhow::bail!(
                 "VLLM_DATA_PARALLEL_SIZE requires exactly one vLLM backend; multiple VLLM_BACKEND_URLS have independent prefix caches"
@@ -396,6 +500,21 @@ impl Config {
             .unwrap_or_else(|_| "8000".to_string())
             .parse()
             .map_err(|_| anyhow::anyhow!("LISTEN_PORT must be a valid port number"))?;
+        let listen_addr = env_or("LISTEN_ADDR", "0.0.0.0");
+        if listen_addr.parse::<std::net::IpAddr>().is_err() {
+            anyhow::bail!("LISTEN_ADDR must be an IP address");
+        }
+        let backend_token = env::var("VLLM_BACKEND_TOKEN")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let backend_health_path = env_or("VLLM_BACKEND_HEALTH_PATH", "/health");
+        if !backend_health_path.starts_with('/') {
+            anyhow::bail!("VLLM_BACKEND_HEALTH_PATH must start with '/'");
+        }
+        let rejected_content_part_types = crate::content_policy::parse_rejected_types(
+            &env::var("VLLM_PROXY_REJECTED_CONTENT_PART_TYPES").unwrap_or_default(),
+        );
 
         let git_rev = std::fs::read_to_string("/etc/.GIT_REV")
             .map(|s| s.trim().to_string())
@@ -530,6 +649,16 @@ impl Config {
             health_check_timeout_secs: env_int("HEALTH_CHECK_TIMEOUT_SECS", 3) as u64,
             ohttp_enabled: env_bool("OHTTP_ENABLED"),
             listen_port,
+            listen_addr,
+            backend_token,
+            backend_health_path,
+            non_tee_deployment: env_bool("NON_TEE_DEPLOYMENT"),
+            map_queue_full_to_429: env_bool("VLLM_PROXY_MAP_QUEUE_FULL_TO_429"),
+            stream_error_peek_ms: env_int("VLLM_PROXY_STREAM_ERROR_PEEK_MS", 0) as u64,
+            backend_discovery,
+            rejected_content_part_types,
+            catch_all_disabled: env_bool("VLLM_PROXY_CATCH_ALL_DISABLED"),
+            sse_keepalive_secs: env_int("VLLM_PROXY_SSE_KEEPALIVE_SECS", 0) as u64,
             images_url_override,
             images_edits_url_override,
             transcriptions_url_override,
@@ -749,6 +878,171 @@ mod tests {
             || {
                 let config = Config::from_env().unwrap();
                 assert_eq!(config.tokens, vec!["tok-a", "tok-b", "tok-c"]);
+            },
+        );
+    }
+
+    fn gateway_env_cleanup() {
+        for key in [
+            "VLLM_BACKEND_URLS",
+            "VLLM_BACKEND_DISCOVERY_URL",
+            "VLLM_BACKEND_DISCOVERY_TOKEN",
+            "VLLM_BACKEND_DISCOVERY_URL_TEMPLATE",
+            "VLLM_BACKEND_DISCOVERY_INTERVAL_SECS",
+            "VLLM_BACKEND_DISCOVERY_TIMEOUT_SECS",
+            "VLLM_DATA_PARALLEL_SIZE",
+            "VLLM_BACKEND_TOKEN",
+            "VLLM_BACKEND_HEALTH_PATH",
+            "NON_TEE_DEPLOYMENT",
+            "VLLM_PROXY_MAP_QUEUE_FULL_TO_429",
+            "VLLM_PROXY_STREAM_ERROR_PEEK_MS",
+            "VLLM_PROXY_REJECTED_CONTENT_PART_TYPES",
+            "VLLM_PROXY_CATCH_ALL_DISABLED",
+            "VLLM_PROXY_SSE_KEEPALIVE_SECS",
+            "LISTEN_ADDR",
+        ] {
+            env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn test_gateway_defaults_leave_existing_deployments_unchanged() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            gateway_env_cleanup();
+            let config = Config::from_env().unwrap();
+            assert_eq!(config.listen_addr, "0.0.0.0");
+            assert!(config.backend_token.is_none());
+            assert_eq!(config.backend_health_path, "/health");
+            assert!(!config.non_tee_deployment);
+            assert!(!config.map_queue_full_to_429);
+            assert_eq!(config.stream_error_peek_ms, 0);
+            assert!(config.backend_discovery.is_none());
+            assert!(config.rejected_content_part_types.is_empty());
+            assert!(!config.catch_all_disabled);
+            assert_eq!(config.sse_keepalive_secs, 0);
+            assert_eq!(config.backend_urls, vec!["http://localhost:8000"]);
+        });
+    }
+
+    #[test]
+    fn test_gateway_discovery_config_parses_and_empties_static_pool() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                (
+                    "VLLM_BACKEND_DISCOVERY_URL",
+                    " https://registry.test/backends/list?domain=glm.test ",
+                ),
+                ("VLLM_BACKEND_DISCOVERY_TOKEN", "reg-token"),
+                (
+                    "VLLM_BACKEND_DISCOVERY_URL_TEMPLATE",
+                    "https://glm-b{handle}.test/",
+                ),
+                ("VLLM_BACKEND_DISCOVERY_INTERVAL_SECS", "0"),
+                ("VLLM_BACKEND_TOKEN", " backend-secret "),
+                ("VLLM_BACKEND_HEALTH_PATH", "/healthz"),
+                ("NON_TEE_DEPLOYMENT", "1"),
+                ("VLLM_PROXY_MAP_QUEUE_FULL_TO_429", "1"),
+                ("VLLM_PROXY_STREAM_ERROR_PEEK_MS", "750"),
+                (
+                    "VLLM_PROXY_REJECTED_CONTENT_PART_TYPES",
+                    "video_url, input_audio",
+                ),
+                ("VLLM_PROXY_CATCH_ALL_DISABLED", "true"),
+                ("VLLM_PROXY_SSE_KEEPALIVE_SECS", "15"),
+                ("LISTEN_ADDR", "127.0.0.1"),
+            ],
+            || {
+                env::remove_var("VLLM_BACKEND_URLS");
+                env::remove_var("VLLM_DATA_PARALLEL_SIZE");
+                let config = Config::from_env().unwrap();
+                let discovery = config.backend_discovery.as_ref().expect("discovery");
+                assert_eq!(
+                    discovery.url,
+                    "https://registry.test/backends/list?domain=glm.test"
+                );
+                assert_eq!(discovery.token.as_deref(), Some("reg-token"));
+                assert_eq!(discovery.url_template, "https://glm-b{handle}.test");
+                assert_eq!(discovery.interval_secs, 1, "interval is clamped to >= 1");
+                assert_eq!(discovery.timeout_secs, 3);
+                assert!(
+                    config.backend_urls.is_empty(),
+                    "pool starts empty with discovery"
+                );
+                assert_eq!(config.backend_token.as_deref(), Some("backend-secret"));
+                assert_eq!(config.backend_health_path, "/healthz");
+                assert!(config.non_tee_deployment);
+                assert!(config.map_queue_full_to_429);
+                assert_eq!(config.stream_error_peek_ms, 750);
+                assert_eq!(
+                    config.rejected_content_part_types,
+                    vec!["video_url", "input_audio"]
+                );
+                assert!(config.catch_all_disabled);
+                assert_eq!(config.sse_keepalive_secs, 15);
+                assert_eq!(config.listen_addr, "127.0.0.1");
+                gateway_env_cleanup();
+            },
+        );
+    }
+
+    #[test]
+    fn test_gateway_discovery_rejects_conflicting_or_incomplete_settings() {
+        // Template is required and must carry the placeholder.
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                (
+                    "VLLM_BACKEND_DISCOVERY_URL",
+                    "https://registry.test/backends/list",
+                ),
+            ],
+            || {
+                env::remove_var("VLLM_BACKEND_DISCOVERY_URL_TEMPLATE");
+                env::remove_var("VLLM_BACKEND_URLS");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("VLLM_BACKEND_DISCOVERY_URL_TEMPLATE"), "{err}");
+                env::set_var("VLLM_BACKEND_DISCOVERY_URL_TEMPLATE", "https://fixed.test");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("{handle}"), "{err}");
+                // Static and dynamic membership are mutually exclusive.
+                env::set_var(
+                    "VLLM_BACKEND_DISCOVERY_URL_TEMPLATE",
+                    "https://b{handle}.test",
+                );
+                env::set_var("VLLM_BACKEND_URLS", "http://a:8000");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("mutually exclusive"), "{err}");
+                env::remove_var("VLLM_BACKEND_URLS");
+                // So are discovery and data-parallel affinity.
+                env::set_var("VLLM_DATA_PARALLEL_SIZE", "2");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("VLLM_DATA_PARALLEL_SIZE"), "{err}");
+                gateway_env_cleanup();
+            },
+        );
+    }
+
+    #[test]
+    fn test_gateway_listen_addr_and_health_path_are_validated() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                ("LISTEN_ADDR", "not-an-ip"),
+            ],
+            || {
+                gateway_env_cleanup();
+                env::set_var("LISTEN_ADDR", "not-an-ip");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("LISTEN_ADDR"), "{err}");
+                env::remove_var("LISTEN_ADDR");
+                env::set_var("VLLM_BACKEND_HEALTH_PATH", "healthz");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("VLLM_BACKEND_HEALTH_PATH"), "{err}");
+                gateway_env_cleanup();
             },
         );
     }

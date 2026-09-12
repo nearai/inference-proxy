@@ -88,7 +88,7 @@ pub async fn completions(
         (None, None)
     };
 
-    let (url, guard) = state.backend_pool.select_url("/v1/completions");
+    let (url, guard) = state.backend_pool.select_url("/v1/completions")?;
 
     let opts = ProxyOpts {
         signing: state.signing.clone(),
@@ -102,14 +102,17 @@ pub async fn completions(
         chunk_transform,
         backend_guard: Some(guard),
         stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
+        sse_keepalive_secs: state.config.sse_keepalive_secs,
+        map_queue_full_to_429: state.config.map_queue_full_to_429,
+        stream_error_peek_ms: state.config.stream_error_peek_ms,
         response_shape: ResponseShape::TextCompletion,
         tracing_ids: Some(tracing_ids),
         upstream_data_parallel_rank: None,
     };
 
     if is_stream {
-        proxy::proxy_streaming_request(&state.http_client, &url, modified_body, opts).await
+        proxy::proxy_streaming_request(&state.backend_client, &url, modified_body, opts).await
     } else {
-        proxy::proxy_json_request(&state.http_client, &url, modified_body, opts).await
+        proxy::proxy_json_request(&state.backend_client, &url, modified_body, opts).await
     }
 }

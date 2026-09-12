@@ -115,7 +115,7 @@ pub async fn run_chat_completion(
     // Pick one backend; reuse it across every iteration so the engine can
     // prefix-cache across rounds (each iteration's prompt = prior iteration +
     // a few new messages, so the cache hit rate should be very high).
-    let (upstream_url, backend_guard) = state.backend_pool.select_url("/v1/chat/completions");
+    let (upstream_url, backend_guard) = state.backend_pool.select_url("/v1/chat/completions")?;
 
     // Send the first upstream request synchronously so its HTTP status
     // propagates to the caller. Without this, a 400/429/503 from upstream
@@ -125,7 +125,7 @@ pub async fn run_chat_completion(
     let first_request_body =
         serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?;
     let first_response = send_upstream(
-        &state.http_client,
+        &state.backend_client,
         &upstream_url,
         first_request_body,
         &tracing_ids,
@@ -135,6 +135,7 @@ pub async fn run_chat_completion(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
     let http_client = state.http_client.clone();
+    let backend_client = state.backend_client.clone();
     let signing = state.signing.clone();
     let cache = state.cache.clone();
     let model_name = state.config.model_name.clone();
@@ -161,6 +162,7 @@ pub async fn run_chat_completion(
         let outcome = drive_loop(
             LoopCtx {
                 client: &http_client,
+                backend_client: &backend_client,
                 upstream_url: &upstream_url,
                 request_json: &mut request_json,
                 tx: &tx,
@@ -306,6 +308,8 @@ pub(crate) fn rewrite_tool_for_upstream(request_json: &mut Value) {
 
 struct LoopCtx<'a> {
     client: &'a reqwest::Client,
+    /// Client for the inference backend (carries the backend bearer, if any).
+    backend_client: &'a reqwest::Client,
     upstream_url: &'a str,
     request_json: &'a mut Value,
     tx: &'a tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
@@ -382,7 +386,7 @@ async fn drive_loop(
                 let body = serde_json::to_vec(ctx.request_json)
                     .map_err(|e| AppError::Internal(e.into()))?;
                 let send_outcome = tokio::select! {
-                    r = send_upstream(ctx.client, ctx.upstream_url, body, ctx.tracing_ids) => Some(r),
+                    r = send_upstream(ctx.backend_client, ctx.upstream_url, body, ctx.tracing_ids) => Some(r),
                     _ = ctx.tx.closed() => None,
                 };
                 let Some(send_outcome) = send_outcome else {

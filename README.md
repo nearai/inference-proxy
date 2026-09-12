@@ -115,6 +115,20 @@ All configuration is via environment variables:
 | `VLLM_PROXY_MAX_KEEPALIVE` | No | `100` | Connection pool max idle per host |
 | `VLLM_PROXY_STREAM_IDLE_TIMEOUT_SECS` | No | `0` (disabled) | Maximum idle time between upstream SSE chunks after the first client-visible generation-progress event. It does not cap queueing, prefill, or a metadata-only assistant-role event (vLLM may emit that before hidden reasoning). When enabled, internally reassembled JSON fails with 504; native streams terminate with a body error. EOF without `[DONE]` is also treated as incomplete |
 | `LISTEN_PORT` | No | `8000` | Server listen port |
+| `LISTEN_ADDR` | No | `0.0.0.0` | Interface to bind |
+| `VLLM_BACKEND_DISCOVERY_URL` | No | unset | Gateway mode: model-proxy `GET /backends/list?domain=…` listing that defines the backend pool dynamically. Mutually exclusive with `VLLM_BACKEND_URLS` / `VLLM_DATA_PARALLEL_SIZE`. See [docs/gateway-mode.md](docs/gateway-mode.md) |
+| `VLLM_BACKEND_DISCOVERY_TOKEN` | No | unset | Bearer for the discovery listing |
+| `VLLM_BACKEND_DISCOVERY_URL_TEMPLATE` | With discovery | — | Backend base URL with `{handle}`, e.g. `https://glm-5-3-flash-b{handle}.completions.near.ai` |
+| `VLLM_BACKEND_DISCOVERY_INTERVAL_SECS` | No | `5` | Discovery poll interval (errors keep the last membership) |
+| `VLLM_BACKEND_DISCOVERY_TIMEOUT_SECS` | No | `3` | Discovery request timeout |
+| `VLLM_BACKEND_TOKEN` | No | unset | Bearer attached to backend requests only (when backends are inference-proxies). Never sent to cloud-api |
+| `VLLM_BACKEND_HEALTH_PATH` | No | `/health` | Path probed by the pool health checker and `/healthz` |
+| `NON_TEE_DEPLOYMENT` | No | `false` | This proxy runs outside a TEE: `/healthz` skips the dstack probe, the attestation cache refresh is not started, and `/v1/attestation/report`, `/v1/signature/{id}`, `/internal/gpu_evidence` return 404 |
+| `VLLM_PROXY_MAP_QUEUE_FULL_TO_429` | No | `false` | Rewrite the engine's queue-full rejection (503 "The request queue is full.") to 429. Off in CVMs: cloud-api's peer fallback keys on the 503 |
+| `VLLM_PROXY_STREAM_ERROR_PEEK_MS` | No | `0` (off) | Streaming: wait up to this long for the first upstream SSE chunk before committing a 200; an admission-time `data: {"error":…}` first event becomes a real error status instead of a 200 that fails mid-stream |
+| `VLLM_PROXY_REJECTED_CONTENT_PART_TYPES` | No | empty | Chat content part `type`s refused with 400 before dispatch, e.g. `video_url,input_audio,file` |
+| `VLLM_PROXY_CATCH_ALL_DISABLED` | No | `false` | Return 404 for any path without a dedicated route instead of forwarding it |
+| `VLLM_PROXY_SSE_KEEPALIVE_SECS` | No | `0` (off) | Emit `: keep-alive` SSE comments to the client whenever the upstream stream is silent this long. Not hashed into signatures — keep off where clients verify raw stream bytes |
 | `VLLM_IMAGES_URL` | No | `{base}/v1/images/generations` | Override images endpoint |
 | `VLLM_IMAGES_EDITS_URL` | No | `{base}/v1/images/edits` | Override image edits endpoint |
 | `VLLM_TRANSCRIPTIONS_URL` | No | `{base}/v1/audio/transcriptions` | Override transcriptions endpoint |

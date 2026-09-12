@@ -126,6 +126,14 @@ pub async fn catch_all(
 
     validate_path(path)?;
 
+    // A strictly stateless gateway exposes only the dedicated inference
+    // routes; nothing else is forwarded to the fleet.
+    if state.config.catch_all_disabled {
+        return Err(AppError::NotFound(
+            "This endpoint is not available on this host.".to_string(),
+        ));
+    }
+
     // Billing-integrity guard for the Responses API (`/v1/responses`).
     //
     // `/v1/responses` has no dedicated route, so it lands here in the catch-all,
@@ -172,6 +180,10 @@ pub async fn catch_all(
     }
     let (upstream_data_parallel_rank, backend_affinity_key) = if is_chat_completions_alias {
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+            crate::content_policy::reject_unsupported_content_parts(
+                &json,
+                &state.config.rejected_content_part_types,
+            )?;
             crate::image_validation::reject_invalid_images(&json, &state.config.image_validation())
                 .await?;
             (
@@ -210,14 +222,14 @@ pub async fn catch_all(
         &state.backend_pool,
         backend_affinity_key,
         &path_with_query,
-    );
+    )?;
     let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
 
     let logged_backend_url = proxy::sanitized_upstream_url_for_logs(&backend_url);
     debug!(method = %method, backend_url = %logged_backend_url, "Catch-all passthrough");
 
     // Build backend request
-    let mut builder = state.http_client.request(
+    let mut builder = state.backend_client.request(
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap(),
         &backend_url,
     );
@@ -260,8 +272,11 @@ pub async fn catch_all(
         // Downgrade a backend 5xx to 400 when it's really a client media-fetch
         // 4xx (e.g. a UA-gated image URL), so it isn't retried/masked as a 502
         // (nearai/cloud-api#606). See proxy::effective_error_status.
-        let axum_status =
-            crate::proxy::effective_error_status(upstream_status.as_u16(), error_info.as_ref());
+        let axum_status = crate::proxy::effective_error_status(
+            upstream_status.as_u16(),
+            error_info.as_ref(),
+            state.config.map_queue_full_to_429,
+        );
         return Err(AppError::UpstreamParsed {
             status: axum_status,
             message: error_info
@@ -303,6 +318,9 @@ pub async fn catch_all(
             chunk_transform: None,
             backend_guard: Some(backend_guard),
             stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
+            sse_keepalive_secs: state.config.sse_keepalive_secs,
+            map_queue_full_to_429: state.config.map_queue_full_to_429,
+            stream_error_peek_ms: state.config.stream_error_peek_ms,
             response_shape: ResponseShape::ChatCompletion,
             tracing_ids: Some(tracing_ids.clone()),
             upstream_data_parallel_rank: None,
@@ -340,6 +358,9 @@ pub async fn catch_all(
             chunk_transform: None,
             backend_guard: None,
             stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
+            sse_keepalive_secs: state.config.sse_keepalive_secs,
+            map_queue_full_to_429: state.config.map_queue_full_to_429,
+            stream_error_peek_ms: state.config.stream_error_peek_ms,
             response_shape: ResponseShape::ChatCompletion,
             tracing_ids: Some(tracing_ids),
             upstream_data_parallel_rank: None,

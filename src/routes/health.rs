@@ -63,6 +63,8 @@ const DSTACK_UNREACHABLE: &str = "unreachable";
 const DSTACK_TIMEOUT: &str = "timeout";
 const BACKEND_TIMEOUT: &str = "timeout";
 const BACKEND_UNREACHABLE: &str = "unreachable";
+const BACKEND_NONE: &str = "no_backends";
+const DSTACK_SKIPPED: &str = "skipped";
 
 /// GET /healthz — readiness probe for upstream load balancers.
 ///
@@ -89,23 +91,40 @@ const BACKEND_UNREACHABLE: &str = "unreachable";
 /// server-side rather than returned to the unauthenticated caller.
 pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     let dstack_path = state.config.dstack_socket_path.clone();
+    let skip_dstack = state.config.non_tee_deployment;
     // Hold the BackendGuard for the full probe so the backend's
     // `active_connections` count reflects the in-flight check; otherwise the
     // probe slot is "free" the moment we read the URL and least-connections
-    // accounting under-counts the load.
-    let (backend_url, _guard) = state.backend_pool.select_url(BACKEND_HEALTH_PATH);
-    let client = state.http_client.clone();
+    // accounting under-counts the load. An empty pool (discovery has not
+    // produced a listing yet) is reported as its own token.
+    let selection = state
+        .backend_pool
+        .select_url(&state.config.backend_health_path);
+    let client = state.backend_client.clone();
 
-    let (dstack_result, backend_result) = tokio::join!(
-        check_dstack(&dstack_path),
-        check_backend(&client, &backend_url, &_guard),
-    );
+    let dstack_check = async {
+        if skip_dstack {
+            Ok(())
+        } else {
+            check_dstack(&dstack_path).await
+        }
+    };
+    let backend_check = async {
+        match &selection {
+            Ok((backend_url, guard)) => check_backend(&client, backend_url, guard).await,
+            Err(_) => {
+                warn!(check = "backend", "no backend in pool");
+                Err(BACKEND_NONE)
+            }
+        }
+    };
+    let (dstack_result, backend_result) = tokio::join!(dstack_check, backend_check);
 
     let healthy = dstack_result.is_ok() && backend_result.is_ok();
     let body = serde_json::json!({
         "status": if healthy { STATUS_OK } else { "unhealthy" },
         "checks": {
-            "dstack": status_token(&dstack_result),
+            "dstack": if skip_dstack { DSTACK_SKIPPED } else { status_token(&dstack_result) },
             "backend": status_token(&backend_result),
         },
     });

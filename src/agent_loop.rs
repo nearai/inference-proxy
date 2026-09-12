@@ -32,7 +32,7 @@ use crate::encryption::ChunkTransform;
 use crate::error::AppError;
 use crate::proxy::{
     make_usage_reporter, normalize_chat_chunk, record_completed_request,
-    report_chat_usage_if_present, StreamingGuard,
+    report_chat_usage_if_present, tenant_context_label, StreamingGuard,
 };
 use crate::{AppState, TracingIds};
 
@@ -899,7 +899,8 @@ async fn run_iteration(
                 metrics::counter!(
                     "upstream_stream_incomplete_total",
                     "reason" => "idle_timeout",
-                    "mode" => "agent_loop"
+                    "mode" => "agent_loop",
+                    "tenant_context" => tenant_context_label(Some(ctx.tracing_ids))
                 )
                 .increment(1);
                 warn!(

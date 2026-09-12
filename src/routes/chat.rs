@@ -169,6 +169,11 @@ pub async fn chat_completions(
     let upstream_data_parallel_rank = state
         .vllm_dp_affinity
         .rank_for_chat_request(&request_json, &state.config.model_name);
+    // Same conversation digest, applied across independent backends: later
+    // turns follow the backend that already holds this conversation's prefix.
+    let backend_affinity_key = state
+        .backend_affinity
+        .key_for_chat_request(&request_json, &state.config.model_name);
 
     let modified_body =
         serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?;
@@ -192,7 +197,11 @@ pub async fn chat_completions(
         (None, None)
     };
 
-    let (url, guard) = state.backend_pool.select_url("/v1/chat/completions");
+    let (url, guard) = state.backend_affinity.select_url(
+        &state.backend_pool,
+        backend_affinity_key,
+        "/v1/chat/completions",
+    );
 
     let opts = ProxyOpts {
         signing: state.signing.clone(),

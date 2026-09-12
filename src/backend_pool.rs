@@ -62,6 +62,41 @@ impl Drop for BackendGuard {
     }
 }
 
+/// Why `BackendPool::select_with_preference` chose the backend it did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionOutcome {
+    /// Only one backend in the pool.
+    Single,
+    /// No preference given: plain least-connections.
+    New,
+    /// The preferred backend was healthy and within the imbalance bound.
+    Pinned,
+    /// The preferred backend was healthy but too far above the least-loaded one.
+    Rebalanced,
+    /// The preferred backend was unhealthy.
+    Unhealthy,
+}
+
+impl SelectionOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SelectionOutcome::Single => "single",
+            SelectionOutcome::New => "new",
+            SelectionOutcome::Pinned => "pinned",
+            SelectionOutcome::Rebalanced => "rebalanced",
+            SelectionOutcome::Unhealthy => "unhealthy",
+        }
+    }
+}
+
+/// Result of `BackendPool::select_with_preference`.
+pub struct Selection {
+    pub backend: Arc<Backend>,
+    /// Position of `backend` in the pool (stable for the process lifetime).
+    pub index: usize,
+    pub outcome: SelectionOutcome,
+}
+
 /// Pool of backends for the same model, with least-connections selection.
 pub struct BackendPool {
     backends: Vec<Arc<Backend>>,
@@ -93,24 +128,83 @@ impl BackendPool {
         if self.backends.len() == 1 {
             return self.backends[0].clone();
         }
+        self.backends[self.least_connections_index()].clone()
+    }
 
-        // Try healthy backends first
+    /// Least-connections selection with an optional preferred backend.
+    ///
+    /// The preferred backend wins when it is healthy and carries at most
+    /// `max_imbalance` more in-flight requests than the least-loaded healthy
+    /// backend; otherwise selection falls back to plain least-connections. An
+    /// index outside the pool is treated as no preference.
+    pub fn select_with_preference(
+        &self,
+        preferred: Option<usize>,
+        max_imbalance: u32,
+    ) -> Selection {
+        if self.backends.len() == 1 {
+            return Selection {
+                backend: self.backends[0].clone(),
+                index: 0,
+                outcome: SelectionOutcome::Single,
+            };
+        }
+
+        let least_index = self.least_connections_index();
+        let least = &self.backends[least_index];
+        let Some(preferred_index) = preferred.filter(|index| *index < self.backends.len()) else {
+            return Selection {
+                backend: least.clone(),
+                index: least_index,
+                outcome: SelectionOutcome::New,
+            };
+        };
+
+        let candidate = &self.backends[preferred_index];
+        if !candidate.healthy.load(Ordering::Relaxed) {
+            return Selection {
+                backend: least.clone(),
+                index: least_index,
+                outcome: SelectionOutcome::Unhealthy,
+            };
+        }
+
+        let candidate_conns = candidate.active_conns.load(Ordering::Relaxed);
+        let least_conns = least.active_conns.load(Ordering::Relaxed);
+        if candidate_conns <= least_conns.saturating_add(max_imbalance) {
+            Selection {
+                backend: candidate.clone(),
+                index: preferred_index,
+                outcome: SelectionOutcome::Pinned,
+            }
+        } else {
+            Selection {
+                backend: least.clone(),
+                index: least_index,
+                outcome: SelectionOutcome::Rebalanced,
+            }
+        }
+    }
+
+    /// Index of the least-loaded healthy backend, or of the least-loaded
+    /// backend overall when none is healthy.
+    fn least_connections_index(&self) -> usize {
         let healthy = self
             .backends
             .iter()
-            .filter(|b| b.healthy.load(Ordering::Relaxed))
-            .min_by_key(|b| b.active_conns.load(Ordering::Relaxed));
+            .enumerate()
+            .filter(|(_, b)| b.healthy.load(Ordering::Relaxed))
+            .min_by_key(|(_, b)| b.active_conns.load(Ordering::Relaxed))
+            .map(|(index, _)| index);
 
-        if let Some(b) = healthy {
-            return b.clone();
-        }
-
-        // All unhealthy — pick least-loaded anyway
-        self.backends
-            .iter()
-            .min_by_key(|b| b.active_conns.load(Ordering::Relaxed))
-            .expect("backends is non-empty")
-            .clone()
+        healthy.unwrap_or_else(|| {
+            self.backends
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, b)| b.active_conns.load(Ordering::Relaxed))
+                .map(|(index, _)| index)
+                .expect("backends is non-empty")
+        })
     }
 
     /// Select a backend and return (full_url, guard).
@@ -258,6 +352,70 @@ mod tests {
 
         let selected = pool.select();
         assert_eq!(selected.base_url, "http://b2:8000");
+    }
+
+    fn two_backends() -> BackendPool {
+        BackendPool::new(vec![
+            "http://b1:8000".to_string(),
+            "http://b2:8000".to_string(),
+        ])
+    }
+
+    #[test]
+    fn test_preference_pins_within_imbalance_bound() {
+        let pool = two_backends();
+        pool.backends[0].active_conns.store(4, Ordering::Relaxed);
+        pool.backends[1].active_conns.store(1, Ordering::Relaxed);
+
+        // 4 <= 1 + 8: the preferred backend keeps the request.
+        let selection = pool.select_with_preference(Some(0), 8);
+        assert_eq!(selection.index, 0);
+        assert_eq!(selection.outcome, SelectionOutcome::Pinned);
+        assert_eq!(selection.backend.base_url, "http://b1:8000");
+    }
+
+    #[test]
+    fn test_preference_rebalances_beyond_imbalance_bound() {
+        let pool = two_backends();
+        pool.backends[0].active_conns.store(4, Ordering::Relaxed);
+        pool.backends[1].active_conns.store(1, Ordering::Relaxed);
+
+        // 4 > 1 + 2: fall back to least-connections.
+        let selection = pool.select_with_preference(Some(0), 2);
+        assert_eq!(selection.index, 1);
+        assert_eq!(selection.outcome, SelectionOutcome::Rebalanced);
+    }
+
+    #[test]
+    fn test_preference_skips_unhealthy_backend() {
+        let pool = two_backends();
+        pool.backends[0].healthy.store(false, Ordering::Relaxed);
+
+        let selection = pool.select_with_preference(Some(0), 8);
+        assert_eq!(selection.index, 1);
+        assert_eq!(selection.outcome, SelectionOutcome::Unhealthy);
+    }
+
+    #[test]
+    fn test_no_or_invalid_preference_is_least_connections() {
+        let pool = two_backends();
+        pool.backends[0].active_conns.store(2, Ordering::Relaxed);
+
+        let selection = pool.select_with_preference(None, 8);
+        assert_eq!(selection.index, 1);
+        assert_eq!(selection.outcome, SelectionOutcome::New);
+
+        let selection = pool.select_with_preference(Some(7), 8);
+        assert_eq!(selection.index, 1);
+        assert_eq!(selection.outcome, SelectionOutcome::New);
+    }
+
+    #[test]
+    fn test_single_backend_ignores_preference() {
+        let pool = BackendPool::new(vec!["http://b1:8000".to_string()]);
+        let selection = pool.select_with_preference(Some(3), 0);
+        assert_eq!(selection.index, 0);
+        assert_eq!(selection.outcome, SelectionOutcome::Single);
     }
 
     #[test]

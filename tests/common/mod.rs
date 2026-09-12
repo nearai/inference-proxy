@@ -64,6 +64,8 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         startup_check_timeout_secs: 5,
         backend_urls: vec![mock_url.to_string()],
         vllm_data_parallel_size: None,
+        backend_conversation_affinity: false,
+        backend_affinity_max_imbalance: 8,
         health_check_interval_secs: 5,
         health_check_max_failures: 3,
         health_check_timeout_secs: 3,
@@ -132,6 +134,9 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         ohttp_attestation_ed25519: None,
         fusion_caches: Arc::new(fusion::FusionCaches::default()),
         vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(None, 1_200)),
+        backend_affinity: Arc::new(
+            vllm_proxy_rs::backend_affinity::BackendConversationAffinity::new(false, 1, 8, 1_200),
+        ),
     };
     let rate_limiter = rate_limit::build_rate_limiter(100, 200);
     let rate_limit_state = rate_limit::RateLimitState {

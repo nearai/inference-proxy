@@ -50,6 +50,7 @@ async fn direct_privacy_classify_reports_nested_input_usage() {
         },
     );
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")

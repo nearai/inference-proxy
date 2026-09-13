@@ -121,11 +121,6 @@ async fn operational_public_routes_echo_uuid_request_id_headers() {
 #[tokio::test]
 async fn route_matrix_responses_include_uuid_request_id_headers() {
     let mock_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1/not-a-real-route"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("fallback ok"))
-        .mount(&mock_server)
-        .await;
     Mock::given(method("POST"))
         .and(path("/v1/images/edits"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -191,7 +186,7 @@ async fn route_matrix_responses_include_uuid_request_id_headers() {
         auth_failure.status()
     );
 
-    let fallback = app
+    let unknown_route = app
         .clone()
         .oneshot(
             Request::builder()
@@ -203,12 +198,12 @@ async fn route_matrix_responses_include_uuid_request_id_headers() {
         )
         .await
         .unwrap();
-    assert_eq!(fallback.status(), StatusCode::OK);
-    let fallback_request_id = request_id_from_response(&fallback);
-    assert_uuid(&fallback_request_id);
+    assert_eq!(unknown_route.status(), StatusCode::NOT_FOUND);
+    let unknown_route_request_id = request_id_from_response(&unknown_route);
+    assert_uuid(&unknown_route_request_id);
     eprintln!(
-        "manual-qa: fallback status={} generated x-request-id={fallback_request_id}",
-        fallback.status()
+        "manual-qa: unknown route status={} generated x-request-id={unknown_route_request_id}",
+        unknown_route.status()
     );
 
     let boundary = "----RequestIdContractBoundary";

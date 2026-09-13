@@ -27,11 +27,16 @@ Rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-proxy) (Python).
 | POST | `/v1/tokenize` | Yes | Tokenization (no signing) |
 | POST | `/v1/rerank` | Yes | Reranking |
 | POST | `/v1/score` | Yes | Scoring |
+| POST | `/v1/privacy/classify` | Yes | Privacy classification |
 | POST | `/v1/images/generations` | Yes | Image generation |
 | POST | `/v1/images/edits` | Yes | Image editing (multipart) |
 | POST | `/v1/audio/transcriptions` | Yes | Audio transcription (multipart) |
 | GET | `/v1/signature/{chat_id}` | Yes | Retrieve cached signature |
-| GET | `/v1/attestation/report` | Yes | TEE attestation report |
+| GET | `/v1/attestation/report` | No | TEE attestation report |
+| POST | `/internal/gpu_evidence` | Trusted token | Sibling-proxy GPU evidence |
+
+All other paths return `404` locally. They are never forwarded to the backend
+inference engine.
 
 ## Error Handling
 
@@ -54,7 +59,7 @@ All error responses use the OpenAI-compatible JSON format:
 
 ### Upstream errors (vLLM/sglang)
 
-Named routes (`/v1/chat/completions`, `/v1/completions`, etc.) pass through the backend error body verbatim, preserving the original status code. The catch-all route (arbitrary paths) parses the backend error and re-wraps it in the OpenAI format above.
+Named routes (`/v1/chat/completions`, `/v1/completions`, etc.) pass through the backend error body verbatim, preserving the original status code.
 
 Common upstream errors:
 

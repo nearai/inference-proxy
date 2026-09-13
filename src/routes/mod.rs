@@ -1,5 +1,4 @@
 pub mod attestation;
-pub mod catch_all;
 pub mod chat;
 pub mod completions;
 pub mod health;
@@ -7,12 +6,14 @@ pub mod internal;
 pub mod metrics;
 pub mod ohttp;
 pub mod passthrough;
+pub mod privacy;
 pub mod signature;
 
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use axum::Router;
 
+use crate::error::AppError;
 use crate::AppState;
 
 pub const ROUTE_ROOT: &str = "/";
@@ -28,6 +29,7 @@ pub const ROUTE_TOKENIZE: &str = "/v1/tokenize";
 pub const ROUTE_EMBEDDINGS: &str = "/v1/embeddings";
 pub const ROUTE_RERANK: &str = "/v1/rerank";
 pub const ROUTE_SCORE: &str = "/v1/score";
+pub const ROUTE_PRIVACY_CLASSIFY: &str = "/v1/privacy/classify";
 pub const ROUTE_IMAGES_GENERATIONS: &str = "/v1/images/generations";
 pub const ROUTE_IMAGES_EDITS: &str = "/v1/images/edits";
 pub const ROUTE_AUDIO_TRANSCRIPTIONS: &str = "/v1/audio/transcriptions";
@@ -36,6 +38,15 @@ pub const ROUTE_INTERNAL_GPU_EVIDENCE: &str = "/internal/gpu_evidence";
 pub const ROUTE_OHTTP_WELL_KNOWN: &str = "/.well-known/ohttp-gateway";
 pub const ROUTE_OHTTP_CONFIG: &str = "/v1/ohttp/config";
 pub const ROUTE_OHTTP_RELAY: &str = "/ohttp";
+
+/// Fail closed for every route that is not explicitly registered below.
+///
+/// This handler intentionally has no request extractors: unknown requests are
+/// rejected without authenticating, buffering their body, or contacting an
+/// inference backend.
+async fn unknown_route() -> AppError {
+    AppError::NotFound("Endpoint not found".to_string())
+}
 
 pub fn build_router() -> Router<AppState> {
     Router::new()
@@ -63,6 +74,7 @@ pub fn build_router() -> Router<AppState> {
         .route(ROUTE_EMBEDDINGS, post(passthrough::embeddings))
         .route(ROUTE_RERANK, post(passthrough::rerank))
         .route(ROUTE_SCORE, post(passthrough::score))
+        .route(ROUTE_PRIVACY_CLASSIFY, post(privacy::classify))
         .route(
             ROUTE_IMAGES_GENERATIONS,
             post(passthrough::images_generations),
@@ -92,5 +104,5 @@ pub fn build_router() -> Router<AppState> {
         .route(ROUTE_OHTTP_WELL_KNOWN, get(ohttp::ohttp_config))
         .route(ROUTE_OHTTP_CONFIG, get(ohttp::ohttp_config))
         .route(ROUTE_OHTTP_RELAY, post(ohttp::ohttp_relay))
-        .fallback(catch_all::catch_all)
+        .fallback(unknown_route)
 }

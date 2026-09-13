@@ -413,6 +413,9 @@ pub enum UsageType {
     Embedding,
     Rerank,
     Score,
+    /// Privacy-filter responses report input usage per classified item under
+    /// `data[].usage.input_tokens` rather than in a top-level usage object.
+    PrivacyClassify,
 }
 
 /// Shape of the reassembled non-streaming response when `proxy_json_request`
@@ -519,6 +522,24 @@ fn build_usage_body(
         UsageType::Embedding => input_only_usage_body("embedding", response_data, model_name, id),
         UsageType::Rerank => input_only_usage_body("rerank", response_data, model_name, id),
         UsageType::Score => input_only_usage_body("score", response_data, model_name, id),
+        UsageType::PrivacyClassify => {
+            let input = response_data
+                .get("data")?
+                .as_array()?
+                .iter()
+                .filter_map(|item| item.pointer("/usage/input_tokens")?.as_i64())
+                .filter(|tokens| *tokens > 0)
+                .fold(0_i64, i64::saturating_add);
+            if input == 0 {
+                return None;
+            }
+            Some(serde_json::json!({
+                "type": "privacy_classify",
+                "model": model_name,
+                "input_tokens": input,
+                "id": id,
+            }))
+        }
     }
 }
 
@@ -2999,6 +3020,22 @@ mod tests {
     }
 
     #[test]
+    fn test_build_usage_body_privacy_classify_sums_nested_input_tokens() {
+        let resp = serde_json::json!({
+            "data": [
+                {"index": 0, "usage": {"input_tokens": 12}},
+                {"index": 1, "usage": {"input_tokens": 30}}
+            ]
+        });
+        let body =
+            build_usage_body(&UsageType::PrivacyClassify, &resp, "privacy-model", "id-4").unwrap();
+        assert_eq!(body["type"], "privacy_classify");
+        assert_eq!(body["model"], "privacy-model");
+        assert_eq!(body["input_tokens"], 42);
+        assert_eq!(body["id"], "id-4");
+    }
+
+    #[test]
     fn test_build_usage_body_returns_none_when_nothing_billable() {
         // No usage object at all.
         assert!(
@@ -3013,6 +3050,10 @@ mod tests {
         // Empty image data array.
         let no_images = serde_json::json!({"data": []});
         assert!(build_usage_body(&UsageType::ImageGeneration, &no_images, "m", "x").is_none());
+        let no_privacy_usage = serde_json::json!({"data": [{"spans": []}]});
+        assert!(
+            build_usage_body(&UsageType::PrivacyClassify, &no_privacy_usage, "m", "x").is_none()
+        );
     }
 
     /// Build a ProxyOpts with fixed signing keys for deterministic tests.

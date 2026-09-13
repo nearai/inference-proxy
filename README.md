@@ -119,12 +119,27 @@ All configuration is via environment variables:
 | `VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB` | No | `false` (`1` forces strict mode) | Gemma-4 defaults to rejecting observed one-channel PNG/JPEG crash inputs; set `1` to reject broader non-RGB PNG/JPEG classes |
 | `VLLM_PROXY_MAX_KEEPALIVE` | No | `100` | Connection pool max idle per host |
 | `VLLM_PROXY_STREAM_IDLE_TIMEOUT_SECS` | No | `0` (disabled) | Maximum idle time between upstream SSE chunks after the first client-visible generation-progress event. It does not cap queueing, prefill, or a metadata-only assistant-role event (vLLM may emit that before hidden reasoning). When enabled, internally reassembled JSON fails with 504; native streams terminate with a body error. EOF without `[DONE]` is also treated as incomplete |
+| `CLOUD_API_URL` | No | unset | Enables direct Cloud API-key authentication. When set, `CLOUD_API_USAGE_TOKEN` is required and startup fails without it. |
+| `CLOUD_API_USAGE_TOKEN` | With `CLOUD_API_URL` | — | Service credential used only by the durable usage-delivery worker. It is never written to the outbox. |
+| `CLOUD_API_USAGE_OUTBOX_DIR` | With `CLOUD_API_URL` | `/var/lib/inference-proxy/usage-outbox` | Durable spool for direct-key usage events. Mount this path on a persistent volume owned by one proxy instance. Startup fails if it cannot be opened. |
+| `CLOUD_API_USAGE_REPORT_TIMEOUT_SECS` | No | `5` | Per-attempt Cloud API usage-delivery timeout. |
+| `CLOUD_API_USAGE_RETRY_INITIAL_BACKOFF_MS` | No | `500` | Initial full-jitter retry ceiling for retained usage events. |
+| `CLOUD_API_USAGE_RETRY_MAX_BACKOFF_SECS` | No | `60` | Maximum full-jitter retry ceiling. Pending events are replayed after restart and removed only after a 2xx response. |
 | `LISTEN_PORT` | No | `8000` | Server listen port |
 | `VLLM_IMAGES_URL` | No | `{base}/v1/images/generations` | Override images endpoint |
 | `VLLM_IMAGES_EDITS_URL` | No | `{base}/v1/images/edits` | Override image edits endpoint |
 | `VLLM_TRANSCRIPTIONS_URL` | No | `{base}/v1/audio/transcriptions` | Override transcriptions endpoint |
 | `VLLM_RERANK_URL` | No | `{base}/v1/rerank` | Override rerank endpoint |
 | `VLLM_SCORE_URL` | No | `{base}/v1/score` | Override score endpoint |
+
+Direct-key billing uses one fsynced JSON event per provider response ID. Cloud
+API already treats `(organization_id, inference_id)` as idempotent, so a crash
+after Cloud API commits but before the proxy unlinks its event is safe to
+replay. Transport failures, timeouts, authorization failures, 404s, rate limits,
+and server errors retain the event. A Cloud API 400 is an immutable-payload
+failure and is renamed to `*.rejected-*` so it remains inspectable without
+blocking later valid usage. Monitor `inference_proxy_usage_outbox_pending` and
+the bounded `inference_proxy_usage_outbox_quarantined_total{reason=...}` metric.
 
 ### Fusion
 

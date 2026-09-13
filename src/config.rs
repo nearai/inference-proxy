@@ -173,10 +173,18 @@ pub struct Config {
     /// path. Required for usage reporting: when set AND the auth response carried
     /// `organization_id + workspace_id + api_key_id`, the reporter posts to
     /// `/v1/internal/usage` with this token as `Bearer` and the subject identity
-    /// in the body. When unset (or the auth response is missing identity fields),
-    /// usage reporting is skipped — cloud-api removed the legacy `Bearer sk-…`
-    /// `/v1/usage` endpoint, so there is no fallback.
+    /// in the body. Startup fails when this is unset while `cloud_api_url` is
+    /// configured — cloud-api removed the legacy `Bearer sk-…` `/v1/usage`
+    /// endpoint, so there is no safe fallback.
     pub cloud_api_usage_token: Option<String>,
+    /// Persistent directory for direct-key usage events awaiting delivery.
+    pub cloud_api_usage_outbox_dir: std::path::PathBuf,
+    /// Per-attempt timeout for usage delivery to Cloud API.
+    pub cloud_api_usage_report_timeout_secs: u64,
+    /// Initial full-jitter retry ceiling after a failed usage delivery.
+    pub cloud_api_usage_retry_initial_backoff_ms: u64,
+    /// Maximum full-jitter retry ceiling after repeated delivery failures.
+    pub cloud_api_usage_retry_max_backoff_secs: u64,
 
     // Compose-manager attestation (deployment actions attestation)
     pub compose_manager_url: Option<String>,
@@ -479,6 +487,20 @@ impl Config {
             cloud_api_usage_token: env::var("CLOUD_API_USAGE_TOKEN")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            cloud_api_usage_outbox_dir: std::path::PathBuf::from(env_or(
+                "CLOUD_API_USAGE_OUTBOX_DIR",
+                "/var/lib/inference-proxy/usage-outbox",
+            )),
+            cloud_api_usage_report_timeout_secs: env_int("CLOUD_API_USAGE_REPORT_TIMEOUT_SECS", 5)
+                as u64,
+            cloud_api_usage_retry_initial_backoff_ms: env_int(
+                "CLOUD_API_USAGE_RETRY_INITIAL_BACKOFF_MS",
+                500,
+            ) as u64,
+            cloud_api_usage_retry_max_backoff_secs: env_int(
+                "CLOUD_API_USAGE_RETRY_MAX_BACKOFF_SECS",
+                60,
+            ) as u64,
             compose_manager_url,
             gpu_evidence_delegate_url: env::var("GPU_EVIDENCE_DELEGATE_URL")
                 .ok()

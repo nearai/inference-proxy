@@ -22,6 +22,7 @@ pub mod routes;
 pub mod signing;
 pub mod startup_checks;
 pub mod types;
+pub mod usage_outbox;
 pub mod vllm_dp_affinity;
 
 pub use request_tracing::{request_id_middleware, TracingIds};
@@ -34,6 +35,9 @@ pub struct AppState {
     pub cache: Arc<cache::ChatCache>,
     pub attestation_cache: Arc<attestation::AttestationCache>,
     pub http_client: reqwest::Client,
+    /// Durable spool used for direct-key billing handoff. Events are written
+    /// before delivery and replayed after process/container restarts.
+    pub usage_outbox: Option<Arc<usage_outbox::UsageOutbox>>,
     pub metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
     /// Live SHA-256 hash of the TLS certificate's SPKI (Subject Public Key
     /// Info). The tracker re-stats the cert on every attestation-cache

@@ -89,6 +89,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
         startup_check_retry_delay_secs: 0,
         startup_check_timeout_secs: 5,
         backend_urls: vec![upstream_mock_url.to_string()],
+        backend_api_key: None,
         vllm_data_parallel_size: None,
         backend_conversation_affinity: false,
         backend_affinity_max_imbalance: 8,

@@ -231,6 +231,7 @@ pub async fn catch_all(
     }
     builder = proxy::apply_tracing_headers(builder, Some(&tracing_ids));
     builder = proxy::apply_data_parallel_rank_header(builder, upstream_data_parallel_rank);
+    builder = proxy::apply_backend_auth(builder, state.config.backend_api_key.as_deref());
 
     // Attach body if non-empty
     if !body_bytes.is_empty() {
@@ -306,6 +307,7 @@ pub async fn catch_all(
             response_shape: ResponseShape::ChatCompletion,
             tracing_ids: Some(tracing_ids.clone()),
             upstream_data_parallel_rank: None,
+            backend_api_key: state.config.backend_api_key.clone(),
         };
         proxy::proxy_streaming_response(
             response,
@@ -343,6 +345,7 @@ pub async fn catch_all(
             response_shape: ResponseShape::ChatCompletion,
             tracing_ids: Some(tracing_ids),
             upstream_data_parallel_rank: None,
+            backend_api_key: state.config.backend_api_key.clone(),
         };
         proxy::sign_and_cache_json_response(
             &response_bytes,

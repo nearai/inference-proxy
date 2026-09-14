@@ -27,6 +27,7 @@ struct TestAppOptions {
     vllm_data_parallel_size: Option<usize>,
     /// Backend URLs for the pool; empty means "just the mock URL".
     backend_urls: Vec<String>,
+    backend_api_key: Option<String>,
     backend_conversation_affinity: bool,
     backend_affinity_max_imbalance: u32,
 }
@@ -47,6 +48,7 @@ impl Default for TestAppOptions {
             fusion_internal_retry_initial_backoff_ms: 1,
             vllm_data_parallel_size: None,
             backend_urls: Vec::new(),
+            backend_api_key: None,
             backend_conversation_affinity: false,
             backend_affinity_max_imbalance: 8,
         }
@@ -222,6 +224,7 @@ fn build_test_app_inner_with_pool(
         startup_check_retry_delay_secs: 0,
         startup_check_timeout_secs: 5,
         backend_urls: backend_urls.clone(),
+        backend_api_key: options.backend_api_key.clone(),
         vllm_data_parallel_size: options.vllm_data_parallel_size,
         backend_conversation_affinity: options.backend_conversation_affinity,
         backend_affinity_max_imbalance: options.backend_affinity_max_imbalance,
@@ -3663,6 +3666,94 @@ async fn test_models_no_auth_required() {
     assert_eq!(body["data"][0]["id"], "test-model");
 }
 
+#[tokio::test]
+async fn test_backend_api_key_is_used_for_models_without_forwarding_client_auth() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .and(header("authorization", "Bearer engine-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "test-model"}]
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app_inner(
+        &mock_server.uri(),
+        TestAppOptions {
+            backend_api_key: Some("engine-secret".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .header(
+                    "authorization",
+                    "Bearer client-secret-must-not-pass-through",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_backend_api_key_is_used_for_authenticated_chat() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", "Bearer engine-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-backend-auth",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app_inner(
+        &mock_server.uri(),
+        TestAppOptions {
+            backend_api_key: Some("engine-secret".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test-token")
+                .body(Body::from(
+                    r#"{"model":"test-model","messages":[{"role":"user","content":"say ok"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response).await;
+    assert_eq!(body["choices"][0]["message"]["content"], "ok");
+}
+
 // ---- Completions ----
 
 #[tokio::test]
@@ -6229,6 +6320,7 @@ fn build_test_app_with_cloud_api_retries(
         startup_check_retry_delay_secs: 0,
         startup_check_timeout_secs: 5,
         backend_urls: vec![mock_url.to_string()],
+        backend_api_key: None,
         vllm_data_parallel_size: None,
         backend_conversation_affinity: false,
         backend_affinity_max_imbalance: 8,
@@ -8832,6 +8924,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         startup_check_retry_delay_secs: 0,
         startup_check_timeout_secs: 5,
         backend_urls: vec![mock_url.to_string()],
+        backend_api_key: None,
         vllm_data_parallel_size: None,
         backend_conversation_affinity: false,
         backend_affinity_max_imbalance: 8,
@@ -9257,6 +9350,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         startup_check_retry_delay_secs: 0,
         startup_check_timeout_secs: 5,
         backend_urls: vec![mock_url.to_string()],
+        backend_api_key: None,
         vllm_data_parallel_size: None,
         backend_conversation_affinity: false,
         backend_affinity_max_imbalance: 8,

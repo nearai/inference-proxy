@@ -129,6 +129,7 @@ pub async fn run_chat_completion(
         &upstream_url,
         first_request_body,
         &tracing_ids,
+        state.config.backend_api_key.as_deref(),
     )
     .await?;
 
@@ -151,6 +152,7 @@ pub async fn run_chat_completion(
         .expect("caller verified web_context_search_api_key is set");
     let tool_timeout = Duration::from_secs(state.config.web_context_search_timeout_secs);
     let stream_idle_timeout_secs = state.config.stream_idle_timeout_secs;
+    let backend_api_key = state.config.backend_api_key.clone();
     let usage_reporter = make_usage_reporter(&auth, &state);
 
     tokio::spawn(async move {
@@ -171,6 +173,7 @@ pub async fn run_chat_completion(
                 tool_timeout,
                 stream_idle_timeout_secs,
                 tracing_ids: &tracing_ids,
+                backend_api_key: backend_api_key.as_deref(),
             },
             first_response,
         )
@@ -316,6 +319,7 @@ struct LoopCtx<'a> {
     tool_timeout: Duration,
     stream_idle_timeout_secs: u64,
     tracing_ids: &'a TracingIds,
+    backend_api_key: Option<&'a str>,
 }
 
 struct LoopResult {
@@ -382,7 +386,13 @@ async fn drive_loop(
                 let body = serde_json::to_vec(ctx.request_json)
                     .map_err(|e| AppError::Internal(e.into()))?;
                 let send_outcome = tokio::select! {
-                    r = send_upstream(ctx.client, ctx.upstream_url, body, ctx.tracing_ids) => Some(r),
+                    r = send_upstream(
+                        ctx.client,
+                        ctx.upstream_url,
+                        body,
+                        ctx.tracing_ids,
+                        ctx.backend_api_key,
+                    ) => Some(r),
                     _ = ctx.tx.closed() => None,
                 };
                 let Some(send_outcome) = send_outcome else {
@@ -1023,6 +1033,7 @@ async fn send_upstream(
     upstream_url: &str,
     body: Vec<u8>,
     tracing_ids: &TracingIds,
+    backend_api_key: Option<&str>,
 ) -> Result<reqwest::Response, AppError> {
     let mut req = client
         .post(upstream_url)
@@ -1031,6 +1042,7 @@ async fn send_upstream(
     for (k, v) in tracing_ids.upstream_headers() {
         req = req.header(k, v);
     }
+    req = crate::proxy::apply_backend_auth(req, backend_api_key);
     let response = req
         .body(body)
         .send()

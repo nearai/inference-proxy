@@ -75,6 +75,9 @@ This is a Rust rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-pro
 - Docker image: `nearaidev/vllm-proxy-rs` (published with digest-pinned refs in cvm-conf)
 - Deployed via compose files in [nearai/cvm-compose-files](https://github.com/nearai/cvm-compose-files)
 - Each proxy instance needs: `MODEL_NAME`, `TOKEN`, `VLLM_BASE_URL`, `TLS_CERT_PATH`
+- `VLLM_BACKEND_API_KEY` optionally sets a distinct bearer token for the
+  inference engine. It is attached only to backend-bound requests; the client
+  `Authorization` header remains stripped and is never forwarded.
 - Optional: `CLOUD_API_URL` (enables usage reporting + `sk-` API key auth via cloud-api), `LOG_FORMAT=json` (structured JSON logs)
 - Pre-dispatch image validation is enabled by default for chat-completions image inputs. `VLLM_PROXY_IMAGE_VALIDATION_DISABLED=1` disables it. Tunables: `VLLM_PROXY_IMAGE_VALIDATION_TIMEOUT_SECS` (default 5), `VLLM_PROXY_IMAGE_VALIDATION_MAX_BYTES` (8192), `VLLM_PROXY_IMAGE_VALIDATION_MAX_CONCURRENCY` (8), `VLLM_PROXY_IMAGE_VALIDATION_ALLOW_PRIVATE_HOSTS` (default off), `VLLM_PROXY_IMAGE_VALIDATION_ALLOWED_DOMAINS` (exact remote `image_url` host allowlist checked before fetch and on every redirect; falls back to `VLLM_ALLOWED_MEDIA_DOMAINS` when unset; Gemma-4 defaults to `prod-files-secure.s3.us-west-2.amazonaws.com`; explicitly set empty to disable the proxy-side domain restriction), `VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB` (default off; `1` forces strict non-RGB PNG/JPEG rejection. Gemma-4 model names still auto-reject observed one-channel PNG/JPEG crash inputs).
 - `ATTESTATION_CACHE_TTL` (default 300s) — TTL for cached nonce-less attestation reports; background refresh runs at half-TTL

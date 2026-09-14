@@ -817,7 +817,16 @@ async fn call_local_chat_json(
     remove_streaming_for_internal_call(&mut body);
     let body = serde_json::to_vec(&body).map_err(|e| AppError::Internal(e.into()))?;
     let (url, _guard) = state.backend_pool.select_url("/v1/chat/completions");
-    post_chat_json(state, &url, None, tracing_ids, body, "local_synthesis", 1).await
+    post_chat_json(
+        state,
+        &url,
+        state.config.backend_api_key.as_deref(),
+        tracing_ids,
+        body,
+        "local_synthesis",
+        1,
+    )
+    .await
 }
 
 async fn call_direct_chat_json(
@@ -1503,6 +1512,7 @@ async fn finish_response(
         response_shape: ResponseShape::ChatCompletion,
         tracing_ids: Some(ctx.tracing_ids),
         upstream_data_parallel_rank: None,
+        backend_api_key: ctx.state.config.backend_api_key.clone(),
     };
 
     if ctx.is_stream {

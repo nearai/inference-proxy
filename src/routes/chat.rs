@@ -218,6 +218,7 @@ pub async fn chat_completions(
         response_shape: ResponseShape::ChatCompletion,
         tracing_ids: Some(tracing_ids),
         upstream_data_parallel_rank,
+        backend_api_key: state.config.backend_api_key.clone(),
     };
 
     if is_stream {

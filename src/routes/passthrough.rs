@@ -30,11 +30,14 @@ pub async fn tokenize(
         &url,
         reqwest::Method::POST,
         Some(&request_body),
-        "application/json",
-        Some(std::time::Duration::from_secs(
-            state.config.timeout_tokenize_secs,
-        )),
-        Some(&tracing_ids),
+        proxy::SimpleProxyOpts {
+            content_type: "application/json",
+            timeout: Some(std::time::Duration::from_secs(
+                state.config.timeout_tokenize_secs,
+            )),
+            tracing_ids: Some(&tracing_ids),
+            backend_api_key: state.config.backend_api_key.as_deref(),
+        },
     )
     .await
 }
@@ -224,6 +227,7 @@ pub async fn images_edits(
         response_shape: ResponseShape::ChatCompletion,
         tracing_ids: Some(tracing_ids),
         upstream_data_parallel_rank: None,
+        backend_api_key: state.config.backend_api_key.clone(),
     };
 
     let (url, _guard) = match &state.config.images_edits_url_override {
@@ -310,6 +314,7 @@ pub async fn audio_transcriptions(
         response_shape: ResponseShape::ChatCompletion,
         tracing_ids: Some(tracing_ids),
         upstream_data_parallel_rank: None,
+        backend_api_key: state.config.backend_api_key.clone(),
     };
 
     let (url, _guard) = match &state.config.transcriptions_url_override {
@@ -378,6 +383,7 @@ async fn json_passthrough_encrypted(
                 response_shape: ResponseShape::ChatCompletion,
                 tracing_ids: Some(tracing_ids.clone()),
                 upstream_data_parallel_rank: None,
+                backend_api_key: state.config.backend_api_key.clone(),
             };
             proxy::proxy_json_request(&state.http_client, u, forward_body, opts).await
         }
@@ -398,6 +404,7 @@ async fn json_passthrough_encrypted(
                 response_shape: ResponseShape::ChatCompletion,
                 tracing_ids: Some(tracing_ids),
                 upstream_data_parallel_rank: None,
+                backend_api_key: state.config.backend_api_key.clone(),
             };
             proxy::proxy_json_request(&state.http_client, &url, forward_body, opts).await
         }

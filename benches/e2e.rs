@@ -83,6 +83,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         startup_check_retry_delay_secs: 0,
         startup_check_timeout_secs: 1,
         backend_urls: vec![mock_url.to_string()],
+        backend_api_key: None,
         health_check_interval_secs: 5,
         health_check_max_failures: 3,
         health_check_timeout_secs: 3,

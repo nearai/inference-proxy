@@ -105,6 +105,7 @@ pub async fn completions(
         response_shape: ResponseShape::TextCompletion,
         tracing_ids: Some(tracing_ids),
         upstream_data_parallel_rank: None,
+        backend_api_key: state.config.backend_api_key.clone(),
     };
 
     if is_stream {

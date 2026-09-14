@@ -4,7 +4,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 
 use tracing::Level;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[derive(Clone, Default)]
@@ -39,6 +39,33 @@ impl CapturedLogs {
             .expect("captured logs mutex should not poison");
         String::from_utf8_lossy(&logs).into_owned()
     }
+}
+
+#[tokio::test]
+async fn startup_check_uses_backend_api_key() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .and(header("authorization", "Bearer engine-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "test-model"}]
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = reqwest::Client::new();
+    let models_url = format!("{}/v1/models", mock_server.uri());
+    let result = check_models_with_auth(
+        &client,
+        &models_url,
+        "test-model",
+        Duration::from_secs(5),
+        Some("engine-secret"),
+    )
+    .await;
+
+    assert!(result.is_ok());
 }
 
 #[tokio::test]

@@ -215,6 +215,10 @@ pub struct Config {
     // Multi-backend support
     /// All backend base URLs (derived from VLLM_BACKEND_URLS or VLLM_BASE_URL).
     pub backend_urls: Vec<String>,
+    /// Optional bearer token attached only to requests sent to inference
+    /// backends. This is intentionally separate from `TOKEN`, which
+    /// authenticates clients at the proxy boundary and is never forwarded.
+    pub backend_api_key: Option<String>,
     /// Number of independent vLLM data-parallel engines behind this proxy.
     /// When set, append-only chat conversations are pinned to one rank so
     /// their turns reuse that engine's local prefix cache.
@@ -522,6 +526,9 @@ impl Config {
             startup_check_retry_delay_secs: env_int("STARTUP_CHECK_RETRY_DELAY_SECS", 5) as u64,
             startup_check_timeout_secs: env_int("STARTUP_CHECK_TIMEOUT_SECS", 30) as u64,
             backend_urls,
+            backend_api_key: env::var("VLLM_BACKEND_API_KEY")
+                .ok()
+                .filter(|s| !s.is_empty()),
             vllm_data_parallel_size,
             backend_conversation_affinity,
             backend_affinity_max_imbalance,
@@ -762,11 +769,28 @@ mod tests {
     }
 
     #[test]
+    fn test_config_parses_backend_api_key_separately_from_client_token() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "test"),
+                ("TOKEN", "client-token"),
+                ("VLLM_BACKEND_API_KEY", "engine-token"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.tokens, vec!["client-token"]);
+                assert_eq!(config.backend_api_key.as_deref(), Some("engine-token"));
+            },
+        );
+    }
+
+    #[test]
     fn test_config_default_values() {
         with_env_vars(&[("MODEL_NAME", "my-model"), ("TOKEN", "secret")], || {
             // Remove optional vars to test defaults
             env::remove_var("VLLM_BASE_URL");
             env::remove_var("VLLM_BACKEND_URLS");
+            env::remove_var("VLLM_BACKEND_API_KEY");
             env::remove_var("VLLM_DATA_PARALLEL_SIZE");
             env::remove_var("VLLM_IMAGES_URL");
             env::remove_var("VLLM_IMAGES_EDITS_URL");

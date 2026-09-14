@@ -868,6 +868,10 @@ pub struct ProxyOpts {
     /// Optional vLLM data-parallel engine rank. Chat routes derive this from a
     /// stable conversation prefix when `VLLM_DATA_PARALLEL_SIZE` is configured.
     pub upstream_data_parallel_rank: Option<usize>,
+    /// Optional bearer credential for the selected inference backend. This is
+    /// distinct from, and never populated from, the client's Authorization
+    /// header.
+    pub backend_api_key: Option<String>,
 }
 
 /// Apply upstream tracing headers to a `reqwest::RequestBuilder`. No-op when
@@ -883,6 +887,19 @@ pub(crate) fn apply_tracing_headers(
         req = req.header(k, v);
     }
     req
+}
+
+/// Attach the operator-configured engine credential to an inference-backend
+/// request. The client-facing bearer is deliberately stripped at ingress; the
+/// two trust boundaries must not share request headers implicitly.
+pub(crate) fn apply_backend_auth(
+    req: reqwest::RequestBuilder,
+    backend_api_key: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match backend_api_key {
+        Some(token) => req.bearer_auth(token),
+        None => req,
+    }
 }
 
 /// Apply vLLM's request-scoped data-parallel rank override. The proxy derives
@@ -1075,6 +1092,7 @@ pub async fn proxy_json_request(
             .header("accept", "text/event-stream"),
         opts.tracing_ids.as_ref(),
     );
+    let req = apply_backend_auth(req, opts.backend_api_key.as_deref());
     let req = apply_data_parallel_rank_header(req, opts.upstream_data_parallel_rank);
     let response = req
         .body(streaming_body)
@@ -1758,6 +1776,7 @@ pub async fn proxy_streaming_request(
             .header("accept", "text/event-stream"),
         opts.tracing_ids.as_ref(),
     );
+    let req = apply_backend_auth(req, opts.backend_api_key.as_deref());
     let req = apply_data_parallel_rank_header(req, opts.upstream_data_parallel_rank);
     let response = req
         .body(request_body)
@@ -2138,6 +2157,7 @@ pub async fn proxy_multipart_request(
 ) -> Result<Response, AppError> {
     let upstream_start = std::time::Instant::now();
     let req = apply_tracing_headers(client.post(url).multipart(form), opts.tracing_ids.as_ref());
+    let req = apply_backend_auth(req, opts.backend_api_key.as_deref());
     let response = req.send().await.map_err(|e| AppError::Internal(e.into()))?;
     metrics::histogram!("upstream_request_duration_seconds", "endpoint" => "multipart")
         .record(upstream_start.elapsed().as_secs_f64());
@@ -2225,14 +2245,19 @@ pub async fn proxy_multipart_request(
 }
 
 /// Simple proxy without signing (for tokenize, metrics, models).
+pub struct SimpleProxyOpts<'a> {
+    pub content_type: &'a str,
+    pub timeout: Option<std::time::Duration>,
+    pub tracing_ids: Option<&'a TracingIds>,
+    pub backend_api_key: Option<&'a str>,
+}
+
 pub async fn proxy_simple(
     client: &reqwest::Client,
     url: &str,
     method: reqwest::Method,
     body: Option<&[u8]>,
-    content_type: &str,
-    timeout: Option<std::time::Duration>,
-    tracing_ids: Option<&TracingIds>,
+    opts: SimpleProxyOpts<'_>,
 ) -> Result<Response, AppError> {
     let mut builder = client.request(method, url);
 
@@ -2242,10 +2267,11 @@ pub async fn proxy_simple(
             .body(body.to_vec());
     }
 
-    if let Some(timeout) = timeout {
+    if let Some(timeout) = opts.timeout {
         builder = builder.timeout(timeout);
     }
-    builder = apply_tracing_headers(builder, tracing_ids);
+    builder = apply_tracing_headers(builder, opts.tracing_ids);
+    builder = apply_backend_auth(builder, opts.backend_api_key);
 
     let upstream_start = std::time::Instant::now();
     let response = builder
@@ -2258,7 +2284,7 @@ pub async fn proxy_simple(
     let status = response.status();
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
-        let info = log_upstream_error(status, url, &body, tracing_ids);
+        let info = log_upstream_error(status, url, &body, opts.tracing_ids);
         return Err(AppError::Upstream {
             status: effective_error_status(status.as_u16(), info.as_ref()),
             body,
@@ -2272,7 +2298,7 @@ pub async fn proxy_simple(
 
     Ok(Response::builder()
         .status(StatusCode::OK)
-        .header("content-type", content_type)
+        .header("content-type", opts.content_type)
         .body(Body::from(response_bytes))
         .unwrap())
 }
@@ -3046,6 +3072,7 @@ mod tests {
             response_shape: ResponseShape::default(),
             tracing_ids: None,
             upstream_data_parallel_rank: None,
+            backend_api_key: None,
         }
     }
 

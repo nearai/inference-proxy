@@ -90,7 +90,13 @@ pub async fn run_startup_checks(
 
         // Check 1: /v1/models — backend reachable, model loaded
         if let Err(e) = run_with_retries("models", retries, delay, || {
-            check_models(client, &models_url, &config.model_name, timeout)
+            check_models_with_auth(
+                client,
+                &models_url,
+                &config.model_name,
+                timeout,
+                config.backend_api_key.as_deref(),
+            )
         })
         .await
         {
@@ -101,7 +107,14 @@ pub async fn run_startup_checks(
 
         // Check 2: non-streaming chat completions with tools
         if let Err(e) = run_with_retries("chat_completions_tools", retries, delay, || {
-            check_chat_completions_with_tools(client, &chat_url, &config.model_name, false, timeout)
+            check_chat_completions_with_tools_and_auth(
+                client,
+                &chat_url,
+                &config.model_name,
+                false,
+                timeout,
+                config.backend_api_key.as_deref(),
+            )
         })
         .await
         {
@@ -112,7 +125,14 @@ pub async fn run_startup_checks(
 
         // Check 3: streaming chat completions with tools
         if let Err(e) = run_with_retries("chat_completions_tools_streaming", retries, delay, || {
-            check_chat_completions_with_tools(client, &chat_url, &config.model_name, true, timeout)
+            check_chat_completions_with_tools_and_auth(
+                client,
+                &chat_url,
+                &config.model_name,
+                true,
+                timeout,
+                config.backend_api_key.as_deref(),
+            )
         })
         .await
         {
@@ -194,32 +214,39 @@ where
     })
 }
 
+#[cfg(test)]
 async fn check_models(
     client: &reqwest::Client,
     models_url: &str,
     expected_model: &str,
     timeout: Duration,
 ) -> Result<(), StartupCheckError> {
+    check_models_with_auth(client, models_url, expected_model, timeout, None).await
+}
+
+async fn check_models_with_auth(
+    client: &reqwest::Client,
+    models_url: &str,
+    expected_model: &str,
+    timeout: Duration,
+    backend_api_key: Option<&str>,
+) -> Result<(), StartupCheckError> {
     info!(url = %models_url, "Checking /v1/models endpoint...");
 
     let start = std::time::Instant::now();
-    let response = client
-        .get(models_url)
-        .timeout(timeout)
-        .send()
-        .await
-        .map_err(|e| {
-            error!(
-                url = %models_url,
-                elapsed_ms = start.elapsed().as_millis() as u64,
-                error = %e,
-                "Failed to connect to backend /v1/models"
-            );
-            StartupCheckError::ConnectionFailed {
-                url: models_url.to_string(),
-                source: e,
-            }
-        })?;
+    let request = crate::proxy::apply_backend_auth(client.get(models_url), backend_api_key);
+    let response = request.timeout(timeout).send().await.map_err(|e| {
+        error!(
+            url = %models_url,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            error = %e,
+            "Failed to connect to backend /v1/models"
+        );
+        StartupCheckError::ConnectionFailed {
+            url: models_url.to_string(),
+            source: e,
+        }
+    })?;
 
     let status = response.status();
     debug!(
@@ -333,12 +360,32 @@ fn build_tools_request(model_name: &str, stream: bool) -> serde_json::Value {
     })
 }
 
+#[cfg(test)]
 async fn check_chat_completions_with_tools(
     client: &reqwest::Client,
     chat_completions_url: &str,
     model_name: &str,
     stream: bool,
     timeout: Duration,
+) -> Result<(), StartupCheckError> {
+    check_chat_completions_with_tools_and_auth(
+        client,
+        chat_completions_url,
+        model_name,
+        stream,
+        timeout,
+        None,
+    )
+    .await
+}
+
+async fn check_chat_completions_with_tools_and_auth(
+    client: &reqwest::Client,
+    chat_completions_url: &str,
+    model_name: &str,
+    stream: bool,
+    timeout: Duration,
+    backend_api_key: Option<&str>,
 ) -> Result<(), StartupCheckError> {
     let mode = if stream { "streaming" } else { "non-streaming" };
     let request_body = build_tools_request(model_name, stream);
@@ -360,8 +407,9 @@ async fn check_chat_completions_with_tools(
     );
 
     let start = std::time::Instant::now();
-    let response = client
-        .post(chat_completions_url)
+    let request =
+        crate::proxy::apply_backend_auth(client.post(chat_completions_url), backend_api_key);
+    let response = request
         .timeout(timeout)
         .json(&request_body)
         .send()

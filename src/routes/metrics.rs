@@ -17,9 +17,12 @@ pub async fn metrics(
         &url,
         reqwest::Method::GET,
         None,
-        "text/plain; charset=utf-8",
-        None,
-        Some(&tracing_ids),
+        proxy::SimpleProxyOpts {
+            content_type: "text/plain; charset=utf-8",
+            timeout: None,
+            tracing_ids: Some(&tracing_ids),
+            backend_api_key: state.config.backend_api_key.as_deref(),
+        },
     )
     .await
 }
@@ -35,9 +38,12 @@ pub async fn models(
         &url,
         reqwest::Method::GET,
         None,
-        "application/json",
-        None,
-        Some(&tracing_ids),
+        proxy::SimpleProxyOpts {
+            content_type: "application/json",
+            timeout: None,
+            tracing_ids: Some(&tracing_ids),
+            backend_api_key: state.config.backend_api_key.as_deref(),
+        },
     )
     .await
 }

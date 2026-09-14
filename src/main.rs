@@ -234,6 +234,7 @@ async fn main() -> anyhow::Result<()> {
             std::time::Duration::from_secs(state.config.health_check_timeout_secs),
             state.config.health_check_max_failures,
             routes::health::BACKEND_HEALTH_PATH,
+            state.config.backend_api_key.clone(),
         );
     }
 

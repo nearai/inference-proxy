@@ -230,6 +230,7 @@ pub fn spawn_health_check(
     timeout: Duration,
     max_failures: u32,
     health_path: &str,
+    backend_api_key: Option<String>,
 ) {
     let health_path = health_path.to_string();
     tokio::spawn(async move {
@@ -239,7 +240,9 @@ pub fn spawn_health_check(
             tick.tick().await;
             for backend in pool.backends() {
                 let url = backend.url(&health_path);
-                let result = client.get(&url).timeout(timeout).send().await;
+                let request =
+                    crate::proxy::apply_backend_auth(client.get(&url), backend_api_key.as_deref());
+                let result = request.timeout(timeout).send().await;
 
                 match result {
                     Ok(resp) if resp.status().is_success() => {
@@ -305,6 +308,8 @@ pub fn spawn_health_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn test_single_backend_always_selected() {
@@ -442,5 +447,36 @@ mod tests {
         let b = Backend::new("http://b1:8000/".to_string());
         assert_eq!(b.url("/v1/models"), "http://b1:8000/v1/models");
         assert_eq!(b.url(""), "http://b1:8000");
+    }
+
+    #[tokio::test]
+    async fn background_health_check_uses_dedicated_engine_auth() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/health"))
+            .and(header("authorization", "Bearer engine-secret"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let pool = Arc::new(BackendPool::new(vec![server.uri()]));
+        spawn_health_check(
+            pool.clone(),
+            reqwest::Client::new(),
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+            1,
+            "/health",
+            Some("engine-secret".to_string()),
+        );
+        tokio::time::sleep(Duration::from_millis(35)).await;
+
+        assert!(pool.backends()[0].healthy.load(Ordering::Relaxed));
+        assert_eq!(
+            pool.backends()[0]
+                .consecutive_failures
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 }

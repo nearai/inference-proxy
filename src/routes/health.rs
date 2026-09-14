@@ -95,10 +95,11 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     // accounting under-counts the load.
     let (backend_url, _guard) = state.backend_pool.select_url(BACKEND_HEALTH_PATH);
     let client = state.http_client.clone();
+    let backend_api_key = state.config.backend_api_key.clone();
 
     let (dstack_result, backend_result) = tokio::join!(
         check_dstack(&dstack_path),
-        check_backend(&client, &backend_url, &_guard),
+        check_backend(&client, &backend_url, &_guard, backend_api_key.as_deref()),
     );
 
     let healthy = dstack_result.is_ok() && backend_result.is_ok();
@@ -153,8 +154,10 @@ async fn check_backend(
     client: &reqwest::Client,
     url: &str,
     _guard: &BackendGuard,
+    backend_api_key: Option<&str>,
 ) -> Result<(), &'static str> {
-    let send = client.get(url).timeout(BACKEND_PROBE_TIMEOUT).send();
+    let request = crate::proxy::apply_backend_auth(client.get(url), backend_api_key);
+    let send = request.timeout(BACKEND_PROBE_TIMEOUT).send();
     match send.await {
         Ok(resp) if resp.status().is_success() => {
             // Drain the body so reqwest can return the connection to the
@@ -205,6 +208,8 @@ fn http_status_token(status: StatusCode) -> &'static str {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
     async fn dstack_check_passes_when_socket_listens() {
@@ -237,6 +242,24 @@ mod tests {
 
         let result = check_dstack(path.to_str().unwrap()).await;
         assert_eq!(result, Err(DSTACK_UNREACHABLE));
+    }
+
+    #[tokio::test]
+    async fn backend_check_uses_dedicated_engine_auth() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(BACKEND_HEALTH_PATH))
+            .and(header("authorization", "Bearer engine-secret"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let pool = crate::backend_pool::BackendPool::new(vec![server.uri()]);
+        let (url, guard) = pool.select_url(BACKEND_HEALTH_PATH);
+        let result =
+            check_backend(&reqwest::Client::new(), &url, &guard, Some("engine-secret")).await;
+        assert!(result.is_ok(), "expected authenticated health check");
     }
 
     #[test]

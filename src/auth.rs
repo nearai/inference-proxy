@@ -398,7 +398,9 @@ impl FromRequestParts<AppState> for RequireAuth {
                                 state.config.allowed_org_ids.iter().any(|a| a == org)
                             })
                         {
-                            metrics::counter!("cloud_api_auth_attempts_total", "outcome" => "org_not_allowed")
+                            // Separate from cloud_api_auth_attempts_total: the attempt
+                            // itself succeeded (cloud-api said 200), this is policy.
+                            metrics::counter!("cloud_api_org_allowlist_rejections_total")
                                 .increment(1);
                             tracing::warn!(
                                 request_id = request_id.as_deref().unwrap_or("-"),

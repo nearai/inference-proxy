@@ -83,6 +83,10 @@ to the current in-CVM behavior.
 | `VLLM_PROXY_SSE_KEEPALIVE_SECS` | `15` | `: keep-alive` SSE comments while the upstream is silent (long prefill/queueing), so intermediaries with read timeouts do not cancel. Off in CVMs: comments are not part of the signed bytes. |
 | `VLLM_PROXY_MAP_QUEUE_FULL_TO_429` | `1` | The engine's admission rejection (queue full, or a queued request displaced by a higher-priority one) becomes 429: back-pressure, not an outage. Off in CVMs: cloud-api's peer fallback keys on the 503. |
 | `VLLM_PROXY_STREAM_ERROR_PEEK_MS` | `1000` | Streams wait up to 1 s for the first upstream event; an admission-time `data: {"error":…}` becomes a real 429/5xx instead of a 200 that fails mid-stream. A slow first token just times the peek out. |
+| `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` / `_START_INFLIGHT` | `48` / `32` | The lane's in-flight budget: refuse with 429 + `Retry-After` before dispatch instead of queueing (see below). Starts at 32 and ramps by 8 every 30 min while the lane stays healthy. |
+| `VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS` | `30000` | Refuse new work while, over the last minute, at least 20 lane requests reached the engine and 5 % of them (at least two) waited longer than this for their first generation event. |
+| `VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS` | `10` | A backend that rejected at engine admission within this window is steered around; when every healthy backend did, new work is refused. |
+| `VLLM_BACKEND_CONNECT_FAILOVER` | `1` | A backend that refuses the connection (host down, proxy restarting) costs the request nothing: it is re-sent once to another healthy backend, the dead one leaves the rotation until a probe succeeds, and a pinned conversation follows. Never on an HTTP error. |
 | `NON_TEE_DEPLOYMENT` | `1` | No dstack socket outside a CVM: `/healthz` reports `"dstack":"skipped"`, no attestation refresh, and `/v1/attestation/report`, `/v1/signature/{id}`, `/internal/gpu_evidence` answer 404 so nothing unverifiable is advertised. |
 | `DEV` / `GPU_NO_HW_MODE` | `1` / `1` | Non-TEE: random signing keys, no hardware evidence. |
 | `LISTEN_ADDR` / `LISTEN_PORT` | `127.0.0.1` / `31700` | Bind behind the local TLS terminator. |
@@ -119,11 +123,57 @@ on an HTTP 200. With `VLLM_PROXY_STREAM_ERROR_PEEK_MS` the gateway holds the
 stream's status line for up to that long, so the rejection surfaces as a
 status; with `VLLM_PROXY_MAP_QUEUE_FULL_TO_429` that status is 429.
 
+## Admission budget
+
+Mapping the engine's rejection to 429 only helps once the engine's queue is
+full; by then the lane's earlier requests are already waiting behind large
+prefills and their time to first token is minutes. The gateway therefore
+bounds the lane itself (`admission.rs`), in this order, before anything is sent
+upstream:
+
+1. **Observed overload.** Two signals the gateway measures on its own traffic.
+   Time to first generation: over the last minute, at least 20 lane requests
+   reached the engine and 5 % of them (at least two) waited longer than
+   `VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS` for their first generation event — a
+   request that ends (client gone, idle timeout) before generating counts with
+   the time it waited, so slow requests clients give up on are not lost; the
+   verdict is re-evaluated at most once a second. Engine back-pressure: a
+   backend that answered an admission rejection within
+   `VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS` is steered around while other
+   hosts have room, and once every healthy backend did, new work is refused.
+   Either refusal lasts until the signal ages out (reasons `ttft` and
+   `backend_queue`).
+2. **Global in-flight budget.** At most `budget` lane requests in flight across
+   the fleet (reason `budget`). The budget starts at
+   `VLLM_PROXY_ADMISSION_START_INFLIGHT` and grows by
+   `VLLM_PROXY_ADMISSION_RAMP_STEP` every `VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS`
+   up to `VLLM_PROXY_ADMISSION_MAX_INFLIGHT`, but only after an interval
+   without any overload signal; a restart goes back to the start value.
+3. **Per-host share.** `ceil(budget / healthy backends)` in flight per backend,
+   reserved atomically at selection so concurrent requests cannot overshoot it,
+   so a conversation-affinity pin cannot pile the whole budget onto one host: a
+   pinned conversation whose host is at its share (or steered around) moves to
+   the least-loaded host with room, and only when no host has room is the
+   request refused (reason `host_share`).
+
+A refusal is `429` with `Retry-After: VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS`
+and an error of type `overloaded`; the slot is released when the response —
+the whole stream, for SSE — is complete. Nothing is retried on the engine's
+behalf: one upstream attempt per request, with the single exception of a
+connection that cannot be established at all (`VLLM_BACKEND_CONNECT_FAILOVER`),
+where nothing reached the engine yet. An engine rejection that arrives after
+the peek window is already on a committed 200 stream; it still counts as
+back-pressure for the next admission decision
+(`upstream_stream_error_events_total{phase="after_headers"}`).
+
 `/metrics` exposes `backend_pool_size`, `backend_pool_healthy`,
 `backend_affinity_*`, `rejected_content_parts_total{part_type}`,
 `sse_keepalive_comments_total`, `upstream_stream_first_event_errors_total`,
-`stream_client_disconnects_total`, plus the existing usage-report and upstream
-metrics.
+`stream_client_disconnects_total`, `admission_inflight`, `admission_budget`,
+`admission_rejections_total{reason}`, `admission_ttft_seconds`,
+`admission_backpressure_total{backend}`, `backend_failover_total{outcome}`,
+`upstream_stream_error_events_total{phase}`, plus the existing usage-report and
+upstream metrics.
 
 ## What is deliberately not offered here
 

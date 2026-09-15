@@ -4,10 +4,13 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use axum::Extension;
 
+use crate::admission::RejectReason;
 use crate::auth::RequireAuth;
 use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
-use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageType};
+use crate::proxy::{
+    self, make_usage_reporter, ConnectFailover, ProxyOpts, ResponseShape, UsageType,
+};
 use crate::routes::chat::{read_body_with_limit, resolve_request_hash_for_signing};
 use crate::{AppState, TracingIds};
 
@@ -92,7 +95,35 @@ pub async fn completions(
         (None, None)
     };
 
-    let (url, guard) = state.backend_pool.select_url("/v1/completions");
+    // Lane admission (gateway mode), see the chat route.
+    let permit = state.admission.try_admit(&state.backend_pool)?;
+    let host_share = state
+        .admission
+        .host_share(state.backend_pool.healthy_count());
+    let placement = state
+        .backend_affinity
+        .place(
+            &state.backend_pool,
+            None,
+            "/v1/completions",
+            host_share,
+            &|index| state.admission.backend_saturated(index),
+        )
+        .ok_or_else(|| AppError::from(state.admission.reject(RejectReason::HostShare)))?;
+    if let Some(permit) = permit.as_ref() {
+        permit.attach_backend(placement.index);
+    }
+    let connect_failover = state
+        .config
+        .backend_connect_failover
+        .then(|| ConnectFailover {
+            pool: state.backend_pool.clone(),
+            path: "/v1/completions",
+            index: placement.index,
+            max_conns: host_share,
+            affinity: None,
+        });
+    let url = placement.url;
 
     let opts = ProxyOpts {
         signing: state.signing.clone(),
@@ -104,7 +135,7 @@ pub async fn completions(
         request_hash: original_request_hash,
         response_transform,
         chunk_transform,
-        backend_guard: Some(guard),
+        backend_guard: Some(placement.guard),
         stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
         sse_keepalive_secs: state.config.sse_keepalive_secs,
         map_queue_full_to_429: state.config.map_queue_full_to_429,
@@ -112,6 +143,8 @@ pub async fn completions(
         response_shape: ResponseShape::TextCompletion,
         tracing_ids: Some(tracing_ids),
         upstream_data_parallel_rank: None,
+        admission: permit,
+        connect_failover,
     };
 
     if is_stream {

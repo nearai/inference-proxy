@@ -40,6 +40,14 @@ pub enum AppError {
     #[error("rate limit exceeded")]
     RateLimited,
 
+    /// Refused at lane admission (`admission.rs`): 429 with `Retry-After`,
+    /// before anything was sent upstream.
+    #[error("overloaded ({reason})")]
+    Overloaded {
+        reason: &'static str,
+        retry_after_secs: u64,
+    },
+
     #[error("{0}")]
     Internal(#[from] anyhow::Error),
 }
@@ -113,6 +121,11 @@ impl IntoResponse for AppError {
                 "Rate limit exceeded. Please try again later.".to_string(),
                 "rate_limited",
             ),
+            AppError::Overloaded { .. } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "The endpoint is at capacity. Please retry later.".to_string(),
+                "overloaded",
+            ),
             AppError::Internal(ref e) => {
                 error!(error = %e, "Internal server error");
                 (
@@ -134,7 +147,27 @@ impl IntoResponse for AppError {
             }
         });
 
-        (status, axum::Json(body)).into_response()
+        let mut response = (status, axum::Json(body)).into_response();
+        if let AppError::Overloaded {
+            retry_after_secs, ..
+        } = self
+        {
+            if let Ok(value) = axum::http::HeaderValue::from_str(&retry_after_secs.to_string()) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, value);
+            }
+        }
+        response
+    }
+}
+
+impl From<crate::admission::Rejected> for AppError {
+    fn from(rejected: crate::admission::Rejected) -> Self {
+        AppError::Overloaded {
+            reason: rejected.reason.as_str(),
+            retry_after_secs: rejected.retry_after.as_secs().max(1),
+        }
     }
 }
 
@@ -163,6 +196,25 @@ mod tests {
         assert_eq!(json["error"]["type"], "bad_request");
         assert!(json["error"]["param"].is_null());
         assert!(json["error"]["code"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_overloaded_error_carries_retry_after() {
+        let err = AppError::Overloaded {
+            reason: "budget",
+            retry_after_secs: 2,
+        };
+        let response = err.into_response();
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("2")
+        );
+        let (status, json) = response_to_json(response).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(json["error"]["type"], "overloaded");
     }
 
     #[tokio::test]

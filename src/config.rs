@@ -15,6 +15,22 @@ fn env_int(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Parse an optional numeric variable, failing loudly on garbage (unlike
+/// `env_int`, which silently falls back to the default).
+fn env_parse<T>(name: &str, default: T) -> anyhow::Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    match env::var(name) {
+        Ok(raw) if !raw.trim().is_empty() => raw
+            .trim()
+            .parse::<T>()
+            .map_err(|e| anyhow::anyhow!("{name}: {e}")),
+        _ => Ok(default),
+    }
+}
+
 fn parse_bool(v: &str) -> bool {
     matches!(v.to_lowercase().as_str(), "1" | "true" | "yes")
 }
@@ -291,6 +307,33 @@ pub struct Config {
     /// the response signature, so leave this off where clients verify
     /// signatures over the raw stream bytes.
     pub sse_keepalive_secs: u64,
+    /// Lane admission (gateway mode, see `admission.rs`): hard ceiling on
+    /// chat/completions requests in flight across the fleet
+    /// (`VLLM_PROXY_ADMISSION_MAX_INFLIGHT`, 0 = off, the default).
+    pub admission_max_inflight: u32,
+    /// Budget at start-up (`VLLM_PROXY_ADMISSION_START_INFLIGHT`, default =
+    /// the maximum, i.e. no ramp).
+    pub admission_start_inflight: u32,
+    /// Budget increase per clean ramp interval
+    /// (`VLLM_PROXY_ADMISSION_RAMP_STEP`, default 8).
+    pub admission_ramp_step: u32,
+    /// Ramp interval (`VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS`, default 1800).
+    pub admission_ramp_interval_secs: u64,
+    /// Refuse new work while the lane's time-to-first-chunk p95 over the last
+    /// minute is above this (`VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS`, default
+    /// 30000, 0 = no TTFT check).
+    pub admission_ttft_p95_max_ms: u64,
+    /// How long an engine admission rejection counts against its backend
+    /// (`VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS`, default 10).
+    pub admission_backpressure_secs: u64,
+    /// `Retry-After` on refusals (`VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS`,
+    /// default 2).
+    pub admission_retry_after_secs: u64,
+    /// Retry a chat/completions request once on another healthy backend when
+    /// the connection to the chosen one fails before anything was sent
+    /// (`VLLM_BACKEND_CONNECT_FAILOVER`). HTTP errors, queue-full included,
+    /// are never retried.
+    pub backend_connect_failover: bool,
 
     // Endpoint URL overrides (Some = explicitly set, bypasses backend pool)
     pub images_url_override: Option<String>,
@@ -557,6 +600,43 @@ impl Config {
             .filter(|s| !s.is_empty())
             .collect();
 
+        let admission_max_inflight: u32 = env_parse("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", 0)?;
+        let admission_start_inflight: u32 = env_parse(
+            "VLLM_PROXY_ADMISSION_START_INFLIGHT",
+            admission_max_inflight,
+        )?;
+        let admission_ramp_step: u32 = env_parse("VLLM_PROXY_ADMISSION_RAMP_STEP", 8)?;
+        let admission_ramp_interval_secs: u64 =
+            env_parse("VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS", 1800)?;
+        let admission_ttft_p95_max_ms: u64 =
+            env_parse("VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS", 30_000)?;
+        let admission_backpressure_secs: u64 =
+            env_parse("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS", 10)?;
+        let admission_retry_after_secs: u64 =
+            env_parse("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS", 2)?;
+        if admission_max_inflight > 0 {
+            if admission_start_inflight == 0 || admission_start_inflight > admission_max_inflight {
+                anyhow::bail!(
+                    "VLLM_PROXY_ADMISSION_START_INFLIGHT must be between 1 and VLLM_PROXY_ADMISSION_MAX_INFLIGHT"
+                );
+            }
+            if admission_start_inflight < admission_max_inflight && admission_ramp_step == 0 {
+                anyhow::bail!(
+                    "VLLM_PROXY_ADMISSION_RAMP_STEP must be at least 1 when the budget ramps"
+                );
+            }
+            if admission_ramp_interval_secs == 0 {
+                anyhow::bail!("VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS must be at least 1");
+            }
+            if admission_backpressure_secs == 0 {
+                anyhow::bail!("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS must be at least 1");
+            }
+            if admission_retry_after_secs == 0 {
+                anyhow::bail!("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS must be at least 1");
+            }
+        }
+        let backend_connect_failover = env_bool("VLLM_BACKEND_CONNECT_FAILOVER");
+
         let config = Config {
             model_name,
             tokens,
@@ -641,6 +721,14 @@ impl Config {
             rejected_content_part_types,
             allowed_org_ids,
             sse_keepalive_secs: env_int("VLLM_PROXY_SSE_KEEPALIVE_SECS", 0) as u64,
+            admission_max_inflight,
+            admission_start_inflight,
+            admission_ramp_step,
+            admission_ramp_interval_secs,
+            admission_ttft_p95_max_ms,
+            admission_backpressure_secs,
+            admission_retry_after_secs,
+            backend_connect_failover,
             images_url_override,
             images_edits_url_override,
             transcriptions_url_override,
@@ -760,10 +848,34 @@ impl Config {
             }
         }
 
+        if config.admission_max_inflight > 0
+            && (config.fusion_enabled || config.web_context_search_url.is_some())
+        {
+            anyhow::bail!(
+                "VLLM_PROXY_ADMISSION_MAX_INFLIGHT cannot be combined with FUSION_ENABLED or WEB_CONTEXT_SEARCH_URL: those execution modes run outside the lane budget"
+            );
+        }
         Ok(config)
     }
 
     /// Build the runtime config for pre-dispatch image validation.
+    /// Lane admission settings, `None` unless `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` is set.
+    pub fn admission(&self) -> Option<crate::admission::AdmissionConfig> {
+        if self.admission_max_inflight == 0 {
+            return None;
+        }
+        Some(crate::admission::AdmissionConfig {
+            max_inflight: self.admission_max_inflight,
+            start_inflight: self.admission_start_inflight,
+            ramp_step: self.admission_ramp_step,
+            ramp_interval: std::time::Duration::from_secs(self.admission_ramp_interval_secs),
+            ttft_p95_max: (self.admission_ttft_p95_max_ms > 0)
+                .then(|| std::time::Duration::from_millis(self.admission_ttft_p95_max_ms)),
+            backpressure_ttl: std::time::Duration::from_secs(self.admission_backpressure_secs),
+            retry_after: std::time::Duration::from_secs(self.admission_retry_after_secs),
+        })
+    }
+
     pub fn image_validation(&self) -> crate::image_validation::ImageValidationConfig {
         crate::image_validation::ImageValidationConfig {
             enabled: self.image_validation_enabled,
@@ -877,6 +989,14 @@ mod tests {
             "VLLM_PROXY_REJECTED_CONTENT_PART_TYPES",
             "VLLM_PROXY_ALLOWED_ORG_IDS",
             "VLLM_PROXY_SSE_KEEPALIVE_SECS",
+            "VLLM_PROXY_ADMISSION_MAX_INFLIGHT",
+            "VLLM_PROXY_ADMISSION_START_INFLIGHT",
+            "VLLM_PROXY_ADMISSION_RAMP_STEP",
+            "VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS",
+            "VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS",
+            "VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS",
+            "VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS",
+            "VLLM_BACKEND_CONNECT_FAILOVER",
             "LISTEN_ADDR",
         ] {
             env::remove_var(key);
@@ -898,6 +1018,9 @@ mod tests {
             assert!(config.rejected_content_part_types.is_empty());
             assert!(config.allowed_org_ids.is_empty());
             assert_eq!(config.sse_keepalive_secs, 0);
+            assert_eq!(config.admission_max_inflight, 0);
+            assert!(config.admission().is_none());
+            assert!(!config.backend_connect_failover);
             assert_eq!(config.backend_urls, vec!["http://localhost:8000"]);
         });
     }
@@ -1655,5 +1778,85 @@ mod tests {
         with_env_vars(&[("_TEST_INT_VALID", "99")], || {
             assert_eq!(env_int("_TEST_INT_VALID", 42), 99);
         });
+    }
+
+    #[test]
+    fn test_admission_config_parses_and_validates() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                ("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", "48"),
+                ("VLLM_PROXY_ADMISSION_START_INFLIGHT", "32"),
+                ("VLLM_PROXY_ADMISSION_RAMP_STEP", "8"),
+                ("VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS", "1800"),
+                ("VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS", "30000"),
+                ("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS", "10"),
+                ("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS", "2"),
+                ("VLLM_BACKEND_CONNECT_FAILOVER", "1"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(
+                    config.admission(),
+                    Some(crate::admission::AdmissionConfig {
+                        max_inflight: 48,
+                        start_inflight: 32,
+                        ramp_step: 8,
+                        ramp_interval: std::time::Duration::from_secs(1800),
+                        ttft_p95_max: Some(std::time::Duration::from_secs(30)),
+                        backpressure_ttl: std::time::Duration::from_secs(10),
+                        retry_after: std::time::Duration::from_secs(2),
+                    })
+                );
+                assert!(config.backend_connect_failover);
+
+                // No TTFT check when the bound is 0; no ramp when start is omitted.
+                env::set_var("VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS", "0");
+                env::remove_var("VLLM_PROXY_ADMISSION_START_INFLIGHT");
+                let config = Config::from_env().unwrap();
+                let admission = config.admission().unwrap();
+                assert_eq!(admission.ttft_p95_max, None);
+                assert_eq!(admission.start_inflight, 48);
+
+                // Validation.
+                env::set_var("VLLM_PROXY_ADMISSION_START_INFLIGHT", "64");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("VLLM_PROXY_ADMISSION_START_INFLIGHT"), "{err}");
+                env::set_var("VLLM_PROXY_ADMISSION_START_INFLIGHT", "32");
+                env::set_var("VLLM_PROXY_ADMISSION_RAMP_STEP", "0");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("VLLM_PROXY_ADMISSION_RAMP_STEP"), "{err}");
+                env::set_var("VLLM_PROXY_ADMISSION_RAMP_STEP", "8");
+                env::set_var("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", "lots");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("VLLM_PROXY_ADMISSION_MAX_INFLIGHT"), "{err}");
+                env::set_var("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", "48");
+                env::set_var("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS", "0");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS"),
+                    "{err}"
+                );
+                env::remove_var("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS");
+                env::set_var("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS", "0");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS"),
+                    "{err}"
+                );
+                env::set_var("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS", "2");
+                // Unbudgeted execution modes cannot coexist with admission.
+                env::set_var("FUSION_ENABLED", "1");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("FUSION_ENABLED"), "{err}");
+                env::remove_var("FUSION_ENABLED");
+                env::set_var("WEB_CONTEXT_SEARCH_URL", "https://search.example");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("WEB_CONTEXT_SEARCH_URL"), "{err}");
+                env::remove_var("WEB_CONTEXT_SEARCH_URL");
+                env::remove_var("VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS");
+            },
+        );
     }
 }

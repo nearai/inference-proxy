@@ -68,6 +68,43 @@ pub async fn chat_completions(
         &request_json,
         &state.config.rejected_content_part_types,
     )?;
+    // Lane admission (gateway mode): budget and overload checks, then a
+    // placement bounded by the per-host share that steers around backends
+    // that just rejected at engine admission. Both refuse with 429 before
+    // anything is fetched or sent upstream; disabled deployments get `None`s.
+    // Same conversation digest, applied across independent backends: later
+    // turns follow the backend that already holds this conversation's prefix.
+    let backend_affinity_key = state
+        .backend_affinity
+        .key_for_chat_request(&request_json, &state.config.model_name);
+    let permit = state.admission.try_admit(&state.backend_pool)?;
+    let host_share = state
+        .admission
+        .host_share(state.backend_pool.healthy_count());
+    let placement = state
+        .backend_affinity
+        .place(
+            &state.backend_pool,
+            backend_affinity_key,
+            "/v1/chat/completions",
+            host_share,
+            &|index| state.admission.backend_saturated(index),
+        )
+        .ok_or_else(|| AppError::from(state.admission.reject(RejectReason::HostShare)))?;
+    if let Some(permit) = permit.as_ref() {
+        permit.attach_backend(placement.index);
+    }
+    let connect_failover = state
+        .config
+        .backend_connect_failover
+        .then(|| ConnectFailover {
+            pool: state.backend_pool.clone(),
+            path: "/v1/chat/completions",
+            index: placement.index,
+            max_conns: host_share,
+            affinity: backend_affinity_key.map(|key| (state.backend_affinity.clone(), key)),
+        });
+
     crate::image_validation::reject_invalid_images(&request_json, &state.config.image_validation())
         .await?;
 
@@ -183,12 +220,6 @@ pub async fn chat_completions(
     let upstream_data_parallel_rank = state
         .vllm_dp_affinity
         .rank_for_chat_request(&request_json, &state.config.model_name);
-    // Same conversation digest, applied across independent backends: later
-    // turns follow the backend that already holds this conversation's prefix.
-    let backend_affinity_key = state
-        .backend_affinity
-        .key_for_chat_request(&request_json, &state.config.model_name);
-
     let modified_body =
         serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?;
 
@@ -211,34 +242,7 @@ pub async fn chat_completions(
         (None, None)
     };
 
-    // Lane admission (gateway mode): budget and overload checks first, then a
-    // placement bounded by the per-host share. Both refuse with 429 before
-    // anything is sent upstream; disabled deployments get `None`s.
-    let permit = state.admission.try_admit(&state.backend_pool)?;
-    let placement = state
-        .backend_affinity
-        .place(
-            &state.backend_pool,
-            backend_affinity_key,
-            "/v1/chat/completions",
-            state
-                .admission
-                .host_share(state.backend_pool.healthy_count()),
-        )
-        .ok_or_else(|| AppError::from(state.admission.reject(RejectReason::HostShare)))?;
-    if let Some(permit) = permit.as_ref() {
-        permit.attach_backend(placement.index);
-    }
-    let connect_failover = state
-        .config
-        .backend_connect_failover
-        .then(|| ConnectFailover {
-            pool: state.backend_pool.clone(),
-            path: "/v1/chat/completions",
-            index: placement.index,
-        });
     let url = placement.url;
-
     let opts = ProxyOpts {
         signing: state.signing.clone(),
         cache: state.cache.clone(),

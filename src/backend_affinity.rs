@@ -41,7 +41,7 @@ impl Placement {
         Self {
             url: selection.backend.url(path),
             index: selection.index,
-            guard: BackendGuard::new(selection.backend),
+            guard: selection.guard,
         }
     }
 }
@@ -91,24 +91,26 @@ impl BackendConversationAffinity {
 
     /// Pick a backend for `key` — plain least-connections without one — and
     /// return where the request goes. `max_conns` bounds the in-flight
-    /// requests per backend (the admission per-host share): a pinned
-    /// conversation whose backend is at the bound is moved to the least-loaded
-    /// backend under it, and `None` means no backend has room.
+    /// requests per backend (the admission per-host share) and `avoid` marks
+    /// backends to steer around (recent engine back-pressure): a pinned
+    /// conversation whose backend is at the bound or avoided is moved to the
+    /// least-loaded eligible backend, and `None` means no backend has room.
     pub fn place(
         &self,
         pool: &BackendPool,
         key: Option<ConversationKey>,
         path: &str,
         max_conns: Option<u32>,
+        avoid: &dyn Fn(usize) -> bool,
     ) -> Option<Placement> {
         let Some(key) = key else {
-            let selection = pool.select_with_preference_bounded(None, 0, max_conns)?;
+            let selection = pool.select_with_preference_bounded(None, 0, max_conns, avoid)?;
             return Some(Placement::new(selection, path));
         };
 
         let existing = self.assignments.get(&key);
         let selection =
-            pool.select_with_preference_bounded(existing, self.max_imbalance, max_conns)?;
+            pool.select_with_preference_bounded(existing, self.max_imbalance, max_conns, avoid)?;
         if existing != Some(selection.index) {
             // New conversation, or the pinned backend was unhealthy/overloaded:
             // remember where this turn actually went so the next turn follows
@@ -130,6 +132,13 @@ impl BackendConversationAffinity {
         metrics::gauge!("backend_affinity_assignments").set(self.assignments.entry_count() as f64);
 
         Some(Placement::new(selection, path))
+    }
+
+    /// Move a conversation to `index` (connection fail-over placed it there).
+    pub fn repin(&self, key: ConversationKey, index: usize) {
+        if self.enabled {
+            self.assignments.insert(key, index);
+        }
     }
 
     /// Current pinned backend index for a key (tests and diagnostics).
@@ -185,7 +194,7 @@ mod tests {
         // Turn 1: both idle → least-connections picks b1.
         let key = affinity.key_for_chat_request(&turn(0), "model");
         let Placement { url, guard, .. } = affinity
-            .place(&pool, key, "/v1/chat/completions", None)
+            .place(&pool, key, "/v1/chat/completions", None, &|_| false)
             .unwrap();
         assert_eq!(url, "http://b1:8000/v1/chat/completions");
         drop(guard);
@@ -198,7 +207,7 @@ mod tests {
         let Placement {
             url, guard: _guard, ..
         } = affinity
-            .place(&pool, key, "/v1/chat/completions", None)
+            .place(&pool, key, "/v1/chat/completions", None, &|_| false)
             .unwrap();
         assert_eq!(url, "http://b1:8000/v1/chat/completions");
         assert_eq!(affinity.assignment(&key.unwrap()), Some(0));
@@ -217,7 +226,7 @@ mod tests {
         let Placement {
             url, guard: _guard, ..
         } = affinity
-            .place(&pool, key, "/v1/chat/completions", None)
+            .place(&pool, key, "/v1/chat/completions", None, &|_| false)
             .unwrap();
         assert_eq!(url, "http://b2:8000/v1/chat/completions");
         assert_eq!(affinity.assignment(&key.unwrap()), Some(1));
@@ -230,7 +239,7 @@ mod tests {
 
         let key = affinity.key_for_chat_request(&turn(0), "model").unwrap();
         let Placement { url, guard, .. } = affinity
-            .place(&pool, Some(key), "/v1/chat/completions", None)
+            .place(&pool, Some(key), "/v1/chat/completions", None, &|_| false)
             .unwrap();
         assert_eq!(url, "http://b1:8000/v1/chat/completions");
         drop(guard);
@@ -238,7 +247,7 @@ mod tests {
         // b1 has 5 more in-flight requests than b2 (> max_imbalance 4).
         pool.backends()[0].active_conns.store(5, Ordering::Relaxed);
         let Placement { url, guard, .. } = affinity
-            .place(&pool, Some(key), "/v1/chat/completions", None)
+            .place(&pool, Some(key), "/v1/chat/completions", None, &|_| false)
             .unwrap();
         assert_eq!(url, "http://b2:8000/v1/chat/completions");
         assert_eq!(affinity.assignment(&key), Some(1));
@@ -251,7 +260,7 @@ mod tests {
         let Placement {
             url, guard: _guard, ..
         } = affinity
-            .place(&pool, Some(key), "/v1/chat/completions", None)
+            .place(&pool, Some(key), "/v1/chat/completions", None, &|_| false)
             .unwrap();
         assert_eq!(url, "http://b2:8000/v1/chat/completions");
     }
@@ -263,7 +272,7 @@ mod tests {
 
         let key = affinity.key_for_chat_request(&turn(0), "model").unwrap();
         let Placement { url, guard, .. } = affinity
-            .place(&pool, Some(key), "/v1/chat/completions", None)
+            .place(&pool, Some(key), "/v1/chat/completions", None, &|_| false)
             .unwrap();
         assert_eq!(url, "http://b1:8000/v1/chat/completions");
         drop(guard);
@@ -272,7 +281,7 @@ mod tests {
         let Placement {
             url, guard: _guard, ..
         } = affinity
-            .place(&pool, Some(key), "/v1/chat/completions", None)
+            .place(&pool, Some(key), "/v1/chat/completions", None, &|_| false)
             .unwrap();
         assert_eq!(url, "http://b2:8000/v1/chat/completions");
         assert_eq!(affinity.assignment(&key), Some(1));
@@ -285,7 +294,9 @@ mod tests {
 
         let key = affinity.key_for_chat_request(&turn(0), "model").unwrap();
         let Placement { url, guard, .. } = affinity
-            .place(&pool, Some(key), "/v1/chat/completions", Some(2))
+            .place(&pool, Some(key), "/v1/chat/completions", Some(2), &|_| {
+                false
+            })
             .unwrap();
         assert_eq!(url, "http://b1:8000/v1/chat/completions");
         drop(guard);
@@ -294,7 +305,9 @@ mod tests {
         // even though the imbalance (2) is within the bound (8).
         pool.backends()[0].active_conns.store(2, Ordering::Relaxed);
         let placement = affinity
-            .place(&pool, Some(key), "/v1/chat/completions", Some(2))
+            .place(&pool, Some(key), "/v1/chat/completions", Some(2), &|_| {
+                false
+            })
             .unwrap();
         assert_eq!(placement.index, 1);
         assert_eq!(affinity.assignment(&key), Some(1));
@@ -303,11 +316,39 @@ mod tests {
         // Both at the share: nothing to place, with or without a key.
         pool.backends()[1].active_conns.store(2, Ordering::Relaxed);
         assert!(affinity
-            .place(&pool, Some(key), "/v1/chat/completions", Some(2))
+            .place(&pool, Some(key), "/v1/chat/completions", Some(2), &|_| {
+                false
+            })
             .is_none());
         assert!(affinity
-            .place(&pool, None, "/v1/completions", Some(2))
+            .place(&pool, None, "/v1/completions", Some(2), &|_| false)
             .is_none());
+    }
+
+    #[test]
+    fn pinned_conversation_moves_off_an_avoided_host_and_repins() {
+        let pool = two_backend_pool();
+        let affinity = BackendConversationAffinity::new(true, 2, 8, 1_200);
+        let key = affinity.key_for_chat_request(&turn(0), "model").unwrap();
+        let placement = affinity
+            .place(&pool, Some(key), "/v1/chat/completions", None, &|_| false)
+            .unwrap();
+        assert_eq!(placement.index, 0);
+        drop(placement);
+
+        // b1 just rejected at engine admission: steer the next turn to b2.
+        let placement = affinity
+            .place(&pool, Some(key), "/v1/chat/completions", None, &|index| {
+                index == 0
+            })
+            .unwrap();
+        assert_eq!(placement.index, 1);
+        assert_eq!(affinity.assignment(&key), Some(1));
+        drop(placement);
+
+        // Fail-over re-pins explicitly.
+        affinity.repin(key, 0);
+        assert_eq!(affinity.assignment(&key), Some(0));
     }
 
     #[test]
@@ -318,7 +359,7 @@ mod tests {
         let Placement {
             url, guard: _guard, ..
         } = affinity
-            .place(&pool, None, "/v1/completions", None)
+            .place(&pool, None, "/v1/completions", None, &|_| false)
             .unwrap();
         assert_eq!(url, "http://b2:8000/v1/completions");
     }

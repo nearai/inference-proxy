@@ -955,6 +955,13 @@ pub struct ConnectFailover {
     pub path: &'static str,
     /// Index of the backend the request is currently placed on.
     pub index: usize,
+    /// Per-host in-flight bound for the replacement (the admission share).
+    pub max_conns: Option<u32>,
+    /// Conversation to re-pin onto the replacement backend.
+    pub affinity: Option<(
+        Arc<crate::backend_affinity::BackendConversationAffinity>,
+        crate::backend_affinity::ConversationKey,
+    )>,
 }
 
 fn build_upstream_request(
@@ -1000,11 +1007,35 @@ async fn send_upstream(
     let response = match first {
         Ok(response) => response,
         Err(error) if error.is_connect() && opts.connect_failover.is_some() => {
-            let (pool, path, failed) = {
+            let (pool, path, failed, max_conns, affinity) = {
                 let failover = opts.connect_failover.as_ref().expect("checked above");
-                (failover.pool.clone(), failover.path, failover.index)
+                (
+                    failover.pool.clone(),
+                    failover.path,
+                    failover.index,
+                    failover.max_conns,
+                    failover.affinity.clone(),
+                )
             };
-            let Some(next) = pool.select_excluding(failed) else {
+            // Nothing listens there right now: take it out of rotation until
+            // the health checker sees it answer again.
+            if let Some(backend) = pool.backends().get(failed) {
+                if backend
+                    .healthy
+                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
+                    warn!(
+                        backend = %sanitized_upstream_url_for_logs(&backend.base_url),
+                        "Backend marked unhealthy after a connection failure"
+                    );
+                }
+            }
+            let avoid = |index: usize| {
+                opts.admission
+                    .as_ref()
+                    .is_some_and(|permit| permit.backend_saturated(index))
+            };
+            let Some(next) = pool.select_excluding(failed, max_conns, &avoid) else {
                 metrics::counter!("backend_failover_total", "outcome" => "exhausted").increment(1);
                 warn!(
                     backend = %sanitized_upstream_url_for_logs(url),
@@ -1027,7 +1058,11 @@ async fn send_upstream(
             if let Some(permit) = opts.admission.as_ref() {
                 permit.attach_backend(next.index);
             }
-            opts.backend_guard = Some(crate::backend_pool::BackendGuard::new(next.backend));
+            if let Some((affinity, key)) = affinity {
+                // Later turns follow the request, not the dead host.
+                affinity.repin(key, next.index);
+            }
+            opts.backend_guard = Some(next.guard);
             match build_upstream_request(client, url, body, opts).send().await {
                 Ok(response) => response,
                 Err(error) if error.is_connect() => {
@@ -1047,19 +1082,24 @@ async fn send_upstream(
     };
     metrics::histogram!("upstream_request_duration_seconds", "endpoint" => endpoint)
         .record(upstream_start.elapsed().as_secs_f64());
+    if response.status().is_success() {
+        if let Some(permit) = opts.admission.as_ref() {
+            permit.mark_dispatched();
+        }
+    }
     Ok(response)
 }
 
-/// An engine admission rejection (queue full, priority abort) on a lane
-/// request: tell the admission controller which backend is saturated.
-fn note_engine_backpressure(
-    permit: Option<&crate::admission::Permit>,
-    info: Option<&UpstreamErrorInfo>,
-) {
-    if let (Some(permit), Some(info)) = (permit, info) {
-        if message_is_queue_full(&info.message) {
-            permit.observe_backpressure();
-        }
+/// The engine answered a lane request with an error instead of generating:
+/// no TTFT observation for it, and an admission rejection (queue full,
+/// priority abort) tells the admission controller which backend is saturated.
+fn note_engine_error(permit: Option<&crate::admission::Permit>, message: Option<&str>) {
+    let Some(permit) = permit else {
+        return;
+    };
+    permit.abandon();
+    if message.is_some_and(message_is_queue_full) {
+        permit.observe_backpressure();
     }
 }
 
@@ -1275,7 +1315,10 @@ pub async fn proxy_json_request(
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
         let info = log_upstream_error(status, &url, &body, opts.tracing_ids.as_ref());
-        note_engine_backpressure(opts.admission.as_ref(), info.as_ref());
+        note_engine_error(
+            opts.admission.as_ref(),
+            info.as_ref().map(|i| i.message.as_str()),
+        );
         return Err(AppError::Upstream {
             status: effective_error_status(
                 status.as_u16(),
@@ -1356,10 +1399,12 @@ pub async fn proxy_json_request(
                         AppError::Internal(e.into())
                     }
                 })?;
-                if let Some(permit) = opts.admission.as_ref() {
-                    permit.observe_first_chunk();
-                }
                 received_upstream_progress |= stream_parser.process_chunk(&chunk);
+                if received_upstream_progress {
+                    if let Some(permit) = opts.admission.as_ref() {
+                        permit.observe_generation_started();
+                    }
+                }
                 assembler.process_chunk(&chunk);
             }
         }
@@ -1404,7 +1449,10 @@ pub async fn proxy_json_request(
                 .unwrap_or(reqwest::StatusCode::BAD_GATEWAY);
             let info =
                 log_upstream_error(reqwest_status, &url, &body_bytes, opts.tracing_ids.as_ref());
-            note_engine_backpressure(opts.admission.as_ref(), info.as_ref());
+            note_engine_error(
+                opts.admission.as_ref(),
+                info.as_ref().map(|i| i.message.as_str()),
+            );
             return Err(AppError::Upstream {
                 // A client media-fetch failure can arrive as an SSE error chunk
                 // with code:500 + `403, message='…', url='…'` — downgrade to 400
@@ -1424,6 +1472,10 @@ pub async fn proxy_json_request(
             .bytes()
             .await
             .map_err(|e| AppError::Internal(e.into()))?;
+        if let Some(permit) = opts.admission.as_ref() {
+            // The whole completion arrived at once: that is its generation start.
+            permit.observe_generation_started();
+        }
         let mut data: serde_json::Value =
             serde_json::from_slice(&response_bytes).map_err(|e| AppError::Internal(e.into()))?;
         // Generate an ID if not present.
@@ -1965,7 +2017,10 @@ pub async fn proxy_streaming_request(
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
         let info = log_upstream_error(status, &url, &body, opts.tracing_ids.as_ref());
-        note_engine_backpressure(opts.admission.as_ref(), info.as_ref());
+        note_engine_error(
+            opts.admission.as_ref(),
+            info.as_ref().map(|i| i.message.as_str()),
+        );
         return Err(AppError::Upstream {
             status: effective_error_status(
                 status.as_u16(),
@@ -2028,7 +2083,10 @@ pub async fn proxy_streaming_request(
                         &body,
                         opts.tracing_ids.as_ref(),
                     );
-                    note_engine_backpressure(admission.as_ref(), info.as_ref());
+                    note_engine_error(
+                        admission.as_ref(),
+                        info.as_ref().map(|i| i.message.as_str()),
+                    );
                     metrics::counter!("upstream_stream_first_event_errors_total").increment(1);
                     return Err(AppError::Upstream {
                         status: effective_error_status(
@@ -2038,9 +2096,6 @@ pub async fn proxy_streaming_request(
                         ),
                         body,
                     });
-                }
-                if let Some(permit) = admission.as_ref() {
-                    permit.observe_first_chunk();
                 }
                 first_chunk = Some(chunk);
             }
@@ -2112,10 +2167,26 @@ pub async fn proxy_streaming_request(
                         Some(Ok(chunk)) => {
                             keepalive.reset();
                             last_upstream_chunk = tokio::time::Instant::now();
-                            if let Some(permit) = admission.as_ref() {
-                                permit.observe_first_chunk();
-                            }
                             received_upstream_progress |= parser.process_chunk(&chunk);
+                            if received_upstream_progress {
+                                if let Some(permit) = admission.as_ref() {
+                                    permit.observe_generation_started();
+                                }
+                            }
+                            // An engine rejection that arrived after the peek
+                            // window (or split across chunks) is already on a
+                            // committed 200; admission still learns about it.
+                            if let Some(error) = parser.take_error_event() {
+                                metrics::counter!(
+                                    "upstream_stream_error_events_total",
+                                    "phase" => "after_headers"
+                                )
+                                .increment(1);
+                                note_engine_error(
+                                    admission.as_ref(),
+                                    error.get("message").and_then(|m| m.as_str()),
+                                );
+                            }
 
                             // Normalize (and encrypt, if active) the chunk, then hash
                             // what the client actually receives for signatures.
@@ -2935,6 +3006,8 @@ pub struct SseParser {
     /// Token usage extracted from the final SSE chunk (prompt_tokens, completion_tokens).
     pub usage: Option<(i64, i64)>,
     cached_tokens: Option<i64>,
+    /// The first `data: {"error": …}` event seen, until taken.
+    error_event: Option<serde_json::Value>,
 }
 
 impl Default for SseParser {
@@ -2952,7 +3025,13 @@ impl SseParser {
             seen_generation_progress: false,
             usage: None,
             cached_tokens: None,
+            error_event: None,
         }
+    }
+
+    /// The engine's error event, if one arrived (taken once).
+    pub fn take_error_event(&mut self) -> Option<serde_json::Value> {
+        self.error_event.take()
     }
 
     pub fn process_chunk(&mut self, chunk: &[u8]) -> bool {
@@ -2975,7 +3054,7 @@ impl SseParser {
                 };
 
             // Borrow the line from the buffer, extract what we need, then release the borrow
-            let (is_done, extracted_id, extracted_usage, has_generation_progress) = {
+            let (is_done, extracted_id, extracted_usage, has_generation_progress, error_event) = {
                 let line = &self.line_buffer[..line_end];
                 let data = line
                     .strip_prefix("data: ")
@@ -2984,9 +3063,9 @@ impl SseParser {
                     .trim();
 
                 if data.is_empty() {
-                    (false, None, None, false)
+                    (false, None, None, false, None)
                 } else if data == "[DONE]" {
-                    (true, None, None, true)
+                    (true, None, None, true, None)
                 } else if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
                     let id = if self.chat_id.is_none() {
                         parsed
@@ -3015,11 +3094,19 @@ impl SseParser {
                             }
                         });
                     let progress = sse_value_has_generation_progress(&parsed);
-                    (false, id, usage, progress)
+                    let error_event = if self.error_event.is_none() {
+                        parsed.get("error").filter(|e| e.is_object()).cloned()
+                    } else {
+                        None
+                    };
+                    (false, id, usage, progress, error_event)
                 } else {
-                    (false, None, None, false)
+                    (false, None, None, false, None)
                 }
             };
+            if let Some(error_event) = error_event {
+                self.error_event = Some(error_event);
+            }
 
             if is_done {
                 self.seen_done = true;

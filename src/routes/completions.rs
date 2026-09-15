@@ -97,15 +97,17 @@ pub async fn completions(
 
     // Lane admission (gateway mode), see the chat route.
     let permit = state.admission.try_admit(&state.backend_pool)?;
+    let host_share = state
+        .admission
+        .host_share(state.backend_pool.healthy_count());
     let placement = state
         .backend_affinity
         .place(
             &state.backend_pool,
             None,
             "/v1/completions",
-            state
-                .admission
-                .host_share(state.backend_pool.healthy_count()),
+            host_share,
+            &|index| state.admission.backend_saturated(index),
         )
         .ok_or_else(|| AppError::from(state.admission.reject(RejectReason::HostShare)))?;
     if let Some(permit) = permit.as_ref() {
@@ -118,6 +120,8 @@ pub async fn completions(
             pool: state.backend_pool.clone(),
             path: "/v1/completions",
             index: placement.index,
+            max_conns: host_share,
+            affinity: None,
         });
     let url = placement.url;
 

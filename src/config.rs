@@ -631,6 +631,9 @@ impl Config {
             if admission_backpressure_secs == 0 {
                 anyhow::bail!("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS must be at least 1");
             }
+            if admission_retry_after_secs == 0 {
+                anyhow::bail!("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS must be at least 1");
+            }
         }
         let backend_connect_failover = env_bool("VLLM_BACKEND_CONNECT_FAILOVER");
 
@@ -845,6 +848,13 @@ impl Config {
             }
         }
 
+        if config.admission_max_inflight > 0
+            && (config.fusion_enabled || config.web_context_search_url.is_some())
+        {
+            anyhow::bail!(
+                "VLLM_PROXY_ADMISSION_MAX_INFLIGHT cannot be combined with FUSION_ENABLED or WEB_CONTEXT_SEARCH_URL: those execution modes run outside the lane budget"
+            );
+        }
         Ok(config)
     }
 
@@ -1829,6 +1839,22 @@ mod tests {
                     "{err}"
                 );
                 env::remove_var("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS");
+                env::set_var("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS", "0");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS"),
+                    "{err}"
+                );
+                env::set_var("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS", "2");
+                // Unbudgeted execution modes cannot coexist with admission.
+                env::set_var("FUSION_ENABLED", "1");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("FUSION_ENABLED"), "{err}");
+                env::remove_var("FUSION_ENABLED");
+                env::set_var("WEB_CONTEXT_SEARCH_URL", "https://search.example");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("WEB_CONTEXT_SEARCH_URL"), "{err}");
+                env::remove_var("WEB_CONTEXT_SEARCH_URL");
                 env::remove_var("VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS");
             },
         );

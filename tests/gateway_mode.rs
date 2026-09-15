@@ -1588,3 +1588,52 @@ async fn streaming_request_holds_its_budget_slot_until_the_stream_ends() {
     assert_eq!(third.status(), StatusCode::OK);
     handle.abort();
 }
+
+#[tokio::test]
+async fn engine_rejection_after_the_peek_window_still_reaches_admission() {
+    // The engine takes longer than the peek window to answer, then rejects
+    // with an error event on the committed 200 stream.
+    let (backend, handle) = spawn_silent_then_stream_backend(
+        Duration::from_millis(1300),
+        vec!["data: {\"error\":{\"object\":\"error\",\"message\":\"The request queue is full.\",\"type\":\"abort\",\"code\":503}}\n\n"],
+    )
+    .await;
+    let app = build_gateway(
+        &backend,
+        GatewayOptions {
+            admission_max_inflight: 8,
+            map_queue_full_to_429: true,
+            stream_error_peek_ms: 1000,
+            ..Default::default()
+        },
+    );
+    let stream_body = serde_json::json!({
+        "model": "test-model",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+    let first = app
+        .clone()
+        .oneshot(chat_request(stream_body.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        first.status(),
+        StatusCode::OK,
+        "peek timed out: status is committed"
+    );
+    let mut body = first.into_body();
+    let mut seen = String::new();
+    while let Some(frame) = body.frame().await {
+        if let Ok(data) = frame.unwrap().into_data() {
+            seen.push_str(&String::from_utf8_lossy(&data));
+        }
+    }
+    assert!(seen.contains("queue is full"), "{seen}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // The only backend is now known to be saturated: refused before dispatch.
+    let second = app.oneshot(chat_request(stream_body)).await.unwrap();
+    assert_overloaded(second).await;
+    handle.abort();
+}

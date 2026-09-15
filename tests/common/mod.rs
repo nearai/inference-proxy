@@ -78,6 +78,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         listen_port: 8000,
         listen_addr: "127.0.0.1".to_string(),
         backend_token: None,
+        backend_priority: None,
         backend_health_path: "/health".to_string(),
         non_tee_deployment: false,
         map_queue_full_to_429: false,

@@ -16,6 +16,7 @@ pub mod gpu_evidence_delegate;
 pub mod image_validation;
 pub mod metrics_middleware;
 pub mod ohttp_gateway;
+pub mod priority;
 pub mod proxy;
 pub mod rate_limit;
 pub mod request_tracing;
@@ -36,9 +37,10 @@ pub struct AppState {
     pub attestation_cache: Arc<attestation::AttestationCache>,
     pub http_client: reqwest::Client,
     /// Client for requests to the inference backends. Identical to
-    /// `http_client` unless `VLLM_BACKEND_TOKEN` is set, in which case it
-    /// carries `Authorization: Bearer <token>` by default so the credential is
-    /// only ever sent to backends — never to cloud-api or other services.
+    /// `http_client` unless `VLLM_BACKEND_TOKEN` or `VLLM_BACKEND_PRIORITY`
+    /// is set, in which case it carries `Authorization: Bearer <token>` and/or
+    /// `X-NearAI-Priority: <n>` by default so those only ever reach backends —
+    /// never cloud-api or other services.
     pub backend_client: reqwest::Client,
     pub metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
     /// Live SHA-256 hash of the TLS certificate's SPKI (Subject Public Key

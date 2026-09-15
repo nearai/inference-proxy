@@ -91,7 +91,10 @@ redeploys), backend requests carry `VLLM_BACKEND_TOKEN` via the dedicated
 `VLLM_PROXY_MAP_QUEUE_FULL_TO_429`, `VLLM_PROXY_STREAM_ERROR_PEEK_MS`,
 `NON_TEE_DEPLOYMENT` (404s the attestation, signature and GPU-evidence routes),
 `VLLM_BACKEND_HEALTH_PATH` and `LISTEN_ADDR` are the opt-in policies. All default
-to the in-CVM behavior.
+to the in-CVM behavior. Request priority (`priority.rs`, no CVM config): every
+chat/completions body gets `priority` set by the proxy — the `X-NearAI-Priority`
+header value for callers using the config `TOKEN` (a gateway sets it from
+`VLLM_BACKEND_PRIORITY`), 0 for everyone else; client values are discarded.
 
 ### Cloud API integration
 

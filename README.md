@@ -122,6 +122,7 @@ All configuration is via environment variables:
 | `LISTEN_PORT` | No | `8000` | Server listen port |
 | `LISTEN_ADDR` | No | `0.0.0.0` | Interface to bind |
 | `VLLM_BACKEND_TOKEN` | No | unset | Bearer attached to backend requests only (gateway mode: the backends are CVM inference-proxies and accept it as a trusted config token). Never sent to cloud-api |
+| `VLLM_BACKEND_PRIORITY` | No | unset | Gateway mode: engine priority for this proxy's traffic, sent as `X-NearAI-Priority` on every backend request (e.g. `-1` for the OpenRouter lane). The CVM proxy honors the header only from callers using its `TOKEN`; it sets `priority` on every chat/completions body itself (header value or 0), discarding client values |
 | `VLLM_BACKEND_HEALTH_PATH` | No | `/health` | Path probed by the pool health checker and `/healthz` |
 | `NON_TEE_DEPLOYMENT` | No | `false` | This proxy runs outside a TEE: `/healthz` skips the dstack probe, the attestation cache refresh is not started, and `/v1/attestation/report`, `/v1/signature/{id}`, `/internal/gpu_evidence` return 404 |
 | `VLLM_PROXY_MAP_QUEUE_FULL_TO_429` | No | `false` | Rewrite the engine's admission rejection (503 "The request queue is full." / "aborted by a higher priority request") to 429. Off in CVMs: cloud-api's peer fallback keys on the 503 |

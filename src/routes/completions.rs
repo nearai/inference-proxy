@@ -24,6 +24,10 @@ pub async fn completions(
     let mut request_json: serde_json::Value = serde_json::from_slice(&request_body)
         .map_err(|e| AppError::BadRequest(format!("Invalid JSON: {e}")))?;
 
+    // Engine `priority`: the proxy decides it (trusted callers may set it via
+    // header; any client value is discarded).
+    crate::priority::apply_priority(&mut request_json, &headers, auth.cloud_api_key.is_none());
+
     // Extract encryption context from headers
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
     let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);

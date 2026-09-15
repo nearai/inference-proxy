@@ -237,6 +237,7 @@ fn build_test_app_inner_with_pool(
         listen_port: 8000,
         listen_addr: "127.0.0.1".to_string(),
         backend_token: None,
+        backend_priority: None,
         backend_health_path: "/health".to_string(),
         non_tee_deployment: false,
         map_queue_full_to_429: false,
@@ -3952,14 +3953,16 @@ async fn test_strip_empty_tool_calls() {
     let mock_server = MockServer::start().await;
 
     // Expect the backend receives the request WITHOUT empty tool_calls.
-    // The proxy injects stream: true internally, so include those fields.
+    // The proxy injects stream: true and the engine priority internally, so
+    // include those fields.
     let expected_backend_body = serde_json::json!({
         "messages": [
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": "hello"}
         ],
         "stream": true,
-        "stream_options": {"include_usage": true}
+        "stream_options": {"include_usage": true},
+        "priority": 0
     });
 
     Mock::given(method("POST"))
@@ -5242,6 +5245,7 @@ fn build_test_app_with_cloud_api_retries(
         listen_port: 8000,
         listen_addr: "127.0.0.1".to_string(),
         backend_token: None,
+        backend_priority: None,
         backend_health_path: "/health".to_string(),
         non_tee_deployment: false,
         map_queue_full_to_429: false,
@@ -7851,6 +7855,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         listen_port: 0, // not used in oneshot tests
         listen_addr: "127.0.0.1".to_string(),
         backend_token: None,
+        backend_priority: None,
         backend_health_path: "/health".to_string(),
         non_tee_deployment: false,
         map_queue_full_to_429: false,
@@ -8285,6 +8290,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         listen_port: port,
         listen_addr: "127.0.0.1".to_string(),
         backend_token: None,
+        backend_priority: None,
         backend_health_path: "/health".to_string(),
         non_tee_deployment: false,
         map_queue_full_to_429: false,
@@ -8575,6 +8581,113 @@ async fn test_ohttp_outer_authorization_relay_injected() {
         "Relay auth OK"
     );
     assert_eq!(resp_body["id"], "chatcmpl-relay");
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_ohttp_outer_bearer_scrubs_inner_x_nearai_priority() {
+    // Behind a relay the loopback request authenticates with the relay's outer
+    // bearer (trusted), while the inner headers come from the end customer:
+    // an inner X-NearAI-Priority must be dropped so the body gets the default.
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"priority": 0}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-ohttp-scrubbed-priority",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock.uri()).await;
+
+    let body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "priority": 999,
+        "stream": false
+    });
+    let mut inner_req = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/chat/completions".to_vec(),
+    );
+    inner_req.put_header("content-type", "application/json");
+    inner_req.put_header("x-nearai-priority", "1000");
+    inner_req.write_content(serde_json::to_vec(&body).unwrap());
+
+    let (enc_request, client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{base_url}/ohttp"))
+        .header("content-type", "message/ohttp-req")
+        .header("authorization", "Bearer test-token")
+        .body(enc_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let enc_response = response.bytes().await.unwrap();
+    let inner_resp = ohttp_decrypt_response(client_response, &enc_response);
+    assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+    mock.verify().await;
+    mock.reset().await;
+
+    // Without a relay bearer the inner request authenticates itself; a trusted
+    // client (config token) may set its own priority through OHTTP.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"priority": -1}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-ohttp-trusted-priority",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let mut inner_req = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/chat/completions".to_vec(),
+    );
+    inner_req.put_header("content-type", "application/json");
+    inner_req.put_header("authorization", "Bearer test-token");
+    inner_req.put_header("x-nearai-priority", "-1");
+    inner_req.write_content(serde_json::to_vec(&body).unwrap());
+    let (enc_request, client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+    let response = client
+        .post(format!("{base_url}/ohttp"))
+        .header("content-type", "message/ohttp-req")
+        .body(enc_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let enc_response = response.bytes().await.unwrap();
+    let inner_resp = ohttp_decrypt_response(client_response, &enc_response);
+    assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+    mock.verify().await;
 
     server_handle.abort();
 }

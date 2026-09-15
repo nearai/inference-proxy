@@ -72,6 +72,7 @@ to the current in-CVM behavior.
 | `CLOUD_API_URL` / `CLOUD_API_USAGE_TOKEN` | prod values | Key validation and usage reporting. |
 | `VLLM_BACKEND_URLS` | the `-b<handle>` URLs | Fleet membership (see above). |
 | `VLLM_BACKEND_TOKEN` | a token from the CVM proxies' `TOKEN` list | Outbound bearer for backend requests only (dedicated HTTP client; never sent to cloud-api). Mint one for the gateway so it can be revoked on its own. |
+| `VLLM_BACKEND_PRIORITY` | `-1` | Sent as `X-NearAI-Priority` on every backend request; the CVM proxies put it in the engine's `priority` (see below). |
 | `VLLM_BACKEND_HEALTH_PATH` | `/healthz` | The CVM proxy's unauthenticated readiness route (dstack + engine). |
 | `VLLM_BACKEND_CONVERSATION_AFFINITY` | `1` | Fleet-level conversation affinity (the CVM proxy still does its own across its replicas). |
 | `HEALTH_CHECK_INTERVAL_SECS` / `_TIMEOUT_SECS` / `_MAX_FAILURES` | `5` / `4` / `3` | The timeout must exceed the CVM proxy's own 3 s backend probe. |
@@ -88,6 +89,22 @@ The router fails closed: only declared routes exist. The TLS terminator in
 front of the gateway should additionally expose only `/v1/chat/completions`,
 `/v1/completions`, `/v1/models` and `/healthz`; `/metrics` and `/v1/metrics`
 are operator-only.
+
+## Priority
+
+The CVM proxy sets `priority` on every chat/completions body it forwards and
+discards whatever the client sent: the `X-NearAI-Priority` value when the
+caller authenticated with the proxy's own `TOKEN` (cloud-api, or this gateway),
+0 otherwise. No CVM configuration is involved. cloud-api never forwards
+customer headers and sends none of its own, so its requests are 0; this gateway
+sends `-1`; a direct customer's header is ignored because they use an `sk-`
+key. With SGLang's `--enable-priority-scheduling --disable-priority-preemption`
+a cloud-api or direct request then skips ahead of queued OpenRouter requests,
+and when the waiting queue is full it displaces the newest queued OpenRouter
+request, which the engine aborts with "The request is aborted by a higher
+priority request." (a 429 here, see below). The engine ignores `priority` until
+its flag is on, and 0 is vLLM's default for the field, so the proxies roll
+first, everywhere.
 
 ## Overload
 

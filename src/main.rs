@@ -259,7 +259,7 @@ async fn main() -> anyhow::Result<()> {
         );
         backend_pool::spawn_health_check(
             backend_pool,
-            state.backend_client.clone(),
+            state.http_client.clone(),
             std::time::Duration::from_secs(state.config.health_check_interval_secs),
             std::time::Duration::from_secs(state.config.health_check_timeout_secs),
             state.config.health_check_max_failures,

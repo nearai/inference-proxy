@@ -98,7 +98,7 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     let (backend_url, guard) = state
         .backend_pool
         .select_url(&state.config.backend_health_path);
-    let client = state.backend_client.clone();
+    let client = state.http_client.clone();
 
     let dstack_check = async {
         if skip_dstack {

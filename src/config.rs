@@ -446,6 +446,17 @@ impl Config {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        // A backend bearer means the backends treat this proxy as trusted and
+        // do not bill its requests, so this proxy must be able to: fail closed
+        // at startup instead of serving unbilled inference.
+        if backend_token.is_some() {
+            let set = |name: &str| env::var(name).is_ok_and(|v| !v.trim().is_empty());
+            if !set("CLOUD_API_URL") || !set("CLOUD_API_USAGE_TOKEN") {
+                anyhow::bail!(
+                    "VLLM_BACKEND_TOKEN requires CLOUD_API_URL and CLOUD_API_USAGE_TOKEN: backends do not bill trusted-token requests"
+                );
+            }
+        }
         let backend_health_path = env_or("VLLM_BACKEND_HEALTH_PATH", "/health");
         if !backend_health_path.starts_with('/') {
             anyhow::bail!("VLLM_BACKEND_HEALTH_PATH must start with '/'");
@@ -859,6 +870,8 @@ mod tests {
                 ("MODEL_NAME", "m"),
                 ("TOKEN", "t"),
                 ("VLLM_BACKEND_TOKEN", " backend-secret "),
+                ("CLOUD_API_URL", "https://cloud-api.test"),
+                ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
                 ("VLLM_BACKEND_HEALTH_PATH", "/healthz"),
                 ("NON_TEE_DEPLOYMENT", "1"),
                 ("VLLM_PROXY_MAP_QUEUE_FULL_TO_429", "1"),
@@ -885,6 +898,28 @@ mod tests {
                 );
                 assert_eq!(config.sse_keepalive_secs, 15);
                 assert_eq!(config.listen_addr, "127.0.0.1");
+                gateway_env_cleanup();
+            },
+        );
+    }
+
+    #[test]
+    fn test_backend_token_requires_cloud_api_billing() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                ("VLLM_BACKEND_TOKEN", "backend-secret"),
+                ("CLOUD_API_URL", "https://cloud-api.test"),
+                ("CLOUD_API_USAGE_TOKEN", ""),
+            ],
+            || {
+                gateway_env_cleanup();
+                env::set_var("VLLM_BACKEND_TOKEN", "backend-secret");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("CLOUD_API_USAGE_TOKEN"), "{err}");
+                env::set_var("CLOUD_API_USAGE_TOKEN", "usage-secret");
+                assert!(Config::from_env().is_ok());
                 gateway_env_cleanup();
             },
         );

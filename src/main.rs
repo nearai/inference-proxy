@@ -7,7 +7,8 @@ use tracing::info;
 use vllm_proxy_rs::ohttp_gateway::OhttpGateway;
 use vllm_proxy_rs::{
     attestation, backend_affinity, backend_pool, cache, config, fusion, metrics_middleware,
-    rate_limit, request_id_middleware, routes, signing, startup_checks, vllm_dp_affinity, AppState,
+    rate_limit, request_id_middleware, routes, signing, startup_checks, usage_outbox,
+    vllm_dp_affinity, AppState,
 };
 
 /// DNS resolver that returns only IPv4 addresses.
@@ -154,8 +155,58 @@ async fn main() -> anyhow::Result<()> {
     }
     let http_client = http_builder.build()?;
 
-    // Initialize metrics
+    // Initialize metrics before the outbox worker can emit replay outcomes.
     let metrics_handle = metrics_middleware::setup_metrics_recorder();
+
+    // Open the durable billing spool before accepting traffic. If Cloud API
+    // usage delivery is configured but its persistent directory is unusable,
+    // fail startup instead of silently reverting to fire-and-forget billing.
+    let usage_outbox = match (
+        config.cloud_api_url.as_ref(),
+        config.cloud_api_usage_token.as_ref(),
+    ) {
+        (Some(cloud_api_url), Some(cloud_api_usage_token)) => {
+            let outbox = usage_outbox::UsageOutbox::open(
+                usage_outbox::UsageOutboxConfig {
+                    directory: config.cloud_api_usage_outbox_dir.clone(),
+                    cloud_api_url: cloud_api_url.clone(),
+                    cloud_api_usage_token: cloud_api_usage_token.clone(),
+                    request_timeout: std::time::Duration::from_secs(
+                        config.cloud_api_usage_report_timeout_secs,
+                    ),
+                    initial_backoff: std::time::Duration::from_millis(
+                        config.cloud_api_usage_retry_initial_backoff_ms,
+                    ),
+                    max_backoff: std::time::Duration::from_secs(
+                        config.cloud_api_usage_retry_max_backoff_secs,
+                    ),
+                    delete_on_drop: false,
+                },
+                http_client.clone(),
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to open durable usage outbox at {}: {error}",
+                    config.cloud_api_usage_outbox_dir.display()
+                )
+            })?;
+            info!(
+                directory = %config.cloud_api_usage_outbox_dir.display(),
+                pending = outbox.pending_count(),
+                "Durable usage outbox ready"
+            );
+            Some(outbox)
+        }
+        (Some(_), None) => {
+            anyhow::bail!(
+                "CLOUD_API_USAGE_TOKEN is required when CLOUD_API_URL enables direct API-key authentication"
+            );
+        }
+        (None, Some(_)) => {
+            anyhow::bail!("CLOUD_API_URL is required when CLOUD_API_USAGE_TOKEN is configured");
+        }
+        (None, None) => None,
+    };
 
     // Initialize backend pool
     let backend_pool = Arc::new(backend_pool::BackendPool::new(config.backend_urls.clone()));
@@ -168,6 +219,7 @@ async fn main() -> anyhow::Result<()> {
         cache: Arc::new(chat_cache),
         attestation_cache: attestation_cache.clone(),
         http_client,
+        usage_outbox,
         metrics_handle,
         tls_cert_fingerprint: tls_cert_fingerprint.clone(),
         backend_pool: backend_pool.clone(),

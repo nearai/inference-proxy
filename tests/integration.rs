@@ -212,6 +212,10 @@ fn build_test_app_inner_with_pool(
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
         cloud_api_usage_token: None,
+        cloud_api_usage_outbox_dir: std::path::PathBuf::from("/tmp/unused-usage-outbox"),
+        cloud_api_usage_report_timeout_secs: 5,
+        cloud_api_usage_retry_initial_backoff_ms: 10,
+        cloud_api_usage_retry_max_backoff_secs: 1,
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,
@@ -300,6 +304,7 @@ fn build_test_app_inner_with_pool(
         cache: Arc::new(chat_cache),
         attestation_cache: Arc::new(vllm_proxy_rs::attestation::AttestationCache::new(300)),
         http_client,
+        usage_outbox: None,
         metrics_handle,
         tls_cert_fingerprint: Arc::new(
             vllm_proxy_rs::attestation::TlsCertTracker::new(None).expect("tracker for None path"),
@@ -5162,6 +5167,8 @@ fn build_test_app_with_cloud_api_retries(
     initial_backoff_ms: u64,
 ) -> axum::Router {
     let base = mock_url.trim_end_matches('/');
+    let usage_outbox_dir =
+        std::env::temp_dir().join(format!("vllm-proxy-usage-test-{}", uuid::Uuid::new_v4()));
 
     let config = config::Config {
         model_name: "test-model".to_string(),
@@ -5202,6 +5209,10 @@ fn build_test_app_with_cloud_api_retries(
         // Usage is reported via the service-token /v1/internal/usage path only;
         // configure the token so usage-reporting tests exercise the real path.
         cloud_api_usage_token: Some("test-usage-token".to_string()),
+        cloud_api_usage_outbox_dir: usage_outbox_dir.clone(),
+        cloud_api_usage_report_timeout_secs: 5,
+        cloud_api_usage_retry_initial_backoff_ms: 10,
+        cloud_api_usage_retry_max_backoff_secs: 1,
         compose_manager_url: None,
         dev_mode: true,
         gpu_no_hw_mode: true,
@@ -5267,6 +5278,19 @@ fn build_test_app_with_cloud_api_retries(
     let signing_pair = signing::SigningPair { ecdsa, ed25519 };
     let chat_cache = cache::ChatCache::new("test-model", 1200);
     let http_client = reqwest::Client::new();
+    let usage_outbox = vllm_proxy_rs::usage_outbox::UsageOutbox::open(
+        vllm_proxy_rs::usage_outbox::UsageOutboxConfig {
+            directory: usage_outbox_dir,
+            cloud_api_url: cloud_api_url.to_string(),
+            cloud_api_usage_token: "test-usage-token".to_string(),
+            request_timeout: std::time::Duration::from_secs(5),
+            initial_backoff: std::time::Duration::from_millis(10),
+            max_backoff: std::time::Duration::from_secs(1),
+            delete_on_drop: true,
+        },
+        http_client.clone(),
+    )
+    .unwrap();
 
     let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
         .build_recorder()
@@ -5282,6 +5306,7 @@ fn build_test_app_with_cloud_api_retries(
         cache: Arc::new(chat_cache),
         attestation_cache: Arc::new(vllm_proxy_rs::attestation::AttestationCache::new(300)),
         http_client,
+        usage_outbox: Some(usage_outbox),
         metrics_handle,
         tls_cert_fingerprint: Arc::new(
             vllm_proxy_rs::attestation::TlsCertTracker::new(None).expect("tracker for None path"),
@@ -5709,6 +5734,7 @@ data: [DONE]\n\n";
     });
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -5962,6 +5988,7 @@ data: [DONE]\n\n";
     });
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -6186,6 +6213,7 @@ async fn test_usage_report_failure_does_not_affect_response() {
     });
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -6245,6 +6273,7 @@ async fn test_usage_reported_for_image_generation() {
     });
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -6306,6 +6335,7 @@ async fn test_usage_reported_for_embeddings() {
     });
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -7808,6 +7838,10 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
         cloud_api_usage_token: None,
+        cloud_api_usage_outbox_dir: std::path::PathBuf::from("/tmp/unused-usage-outbox"),
+        cloud_api_usage_report_timeout_secs: 5,
+        cloud_api_usage_retry_initial_backoff_ms: 10,
+        cloud_api_usage_retry_max_backoff_secs: 1,
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,
@@ -7879,6 +7913,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         cache: Arc::new(chat_cache),
         attestation_cache: Arc::new(attestation::AttestationCache::new(300)),
         http_client,
+        usage_outbox: None,
         metrics_handle,
         tls_cert_fingerprint: Arc::new(
             vllm_proxy_rs::attestation::TlsCertTracker::new(None).expect("tracker for None path"),
@@ -8233,6 +8268,10 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
         cloud_api_usage_token: None,
+        cloud_api_usage_outbox_dir: std::path::PathBuf::from("/tmp/unused-usage-outbox"),
+        cloud_api_usage_report_timeout_secs: 5,
+        cloud_api_usage_retry_initial_backoff_ms: 10,
+        cloud_api_usage_retry_max_backoff_secs: 1,
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,
@@ -8295,6 +8334,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         cache: Arc::new(cache::ChatCache::new("test-model", 1200)),
         attestation_cache: Arc::new(attestation::AttestationCache::new(300)),
         http_client: reqwest::Client::new(),
+        usage_outbox: None,
         metrics_handle,
         tls_cert_fingerprint: Arc::new(
             vllm_proxy_rs::attestation::TlsCertTracker::new(None).expect("tracker for None path"),

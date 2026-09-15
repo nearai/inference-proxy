@@ -73,6 +73,10 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
         cloud_api_usage_token: None,
+        cloud_api_usage_outbox_dir: std::path::PathBuf::from("/tmp/unused-usage-outbox"),
+        cloud_api_usage_report_timeout_secs: 5,
+        cloud_api_usage_retry_initial_backoff_ms: 10,
+        cloud_api_usage_retry_max_backoff_secs: 1,
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,
@@ -135,6 +139,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         cache: Arc::new(chat_cache),
         attestation_cache: Arc::new(attestation::AttestationCache::new(300)),
         http_client,
+        usage_outbox: None,
         metrics_handle,
         tls_cert_fingerprint: Arc::new(
             attestation::TlsCertTracker::new(None).expect("tracker for None path"),

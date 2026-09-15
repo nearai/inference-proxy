@@ -12,6 +12,11 @@ pub(crate) struct TestAppOptions {
 
 pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::Router {
     let base = mock_url.trim_end_matches('/');
+    let cloud_api_url = options.cloud_api_url.clone();
+    let usage_outbox_dir = std::env::temp_dir().join(format!(
+        "vllm-proxy-common-usage-test-{}",
+        uuid::Uuid::new_v4()
+    ));
     let config = config::Config {
         model_name: "test-model".to_string(),
         tokens: vec!["test-token".to_string()],
@@ -48,11 +53,15 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         rate_limit_per_second: 100,
         rate_limit_burst_size: 200,
         rate_limit_trust_proxy_headers: true,
-        cloud_api_url: options.cloud_api_url,
+        cloud_api_url: cloud_api_url.clone(),
         cloud_api_auth_max_attempts: 1,
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
         cloud_api_usage_token: Some("test-usage-token".to_string()),
+        cloud_api_usage_outbox_dir: usage_outbox_dir.clone(),
+        cloud_api_usage_report_timeout_secs: 5,
+        cloud_api_usage_retry_initial_backoff_ms: 10,
+        cloud_api_usage_retry_max_backoff_secs: 1,
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,
@@ -118,13 +127,30 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
     let backend_pool = Arc::new(vllm_proxy_rs::backend_pool::BackendPool::new(vec![
         mock_url.to_string(),
     ]));
+    let http_client = reqwest::Client::new();
+    let usage_outbox = cloud_api_url.map(|cloud_api_url| {
+        usage_outbox::UsageOutbox::open(
+            usage_outbox::UsageOutboxConfig {
+                directory: usage_outbox_dir,
+                cloud_api_url,
+                cloud_api_usage_token: "test-usage-token".to_string(),
+                request_timeout: std::time::Duration::from_secs(5),
+                initial_backoff: std::time::Duration::from_millis(10),
+                max_backoff: std::time::Duration::from_secs(1),
+                delete_on_drop: true,
+            },
+            http_client.clone(),
+        )
+        .unwrap()
+    });
 
     let state = AppState {
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),
         attestation_cache: Arc::new(vllm_proxy_rs::attestation::AttestationCache::new(300)),
-        http_client: reqwest::Client::new(),
+        http_client,
+        usage_outbox,
         metrics_handle,
         tls_cert_fingerprint: Arc::new(
             vllm_proxy_rs::attestation::TlsCertTracker::new(None).expect("tracker for None path"),

@@ -10,6 +10,7 @@ use tracing::{debug, error, info, warn};
 use crate::cache::ChatCache;
 use crate::error::AppError;
 use crate::signing::SigningPair;
+use crate::usage_outbox::{UsageEvent, UsageOutbox};
 use crate::{AppState, TracingIds};
 
 #[cfg(test)]
@@ -276,8 +277,6 @@ fn message_is_allowed_media_domain_error(message: &str) -> bool {
 /// posting to a deleted endpoint.
 #[derive(Clone)]
 pub struct UsageReporter {
-    pub http_client: reqwest::Client,
-    pub cloud_api_url: String,
     pub model_name: String,
     /// Shared infrastructure token for the service-token reporting path.
     /// Required: usage is reported only via `/v1/internal/usage`. cloud-api
@@ -285,6 +284,7 @@ pub struct UsageReporter {
     /// reporting is skipped (with an error log) when this or any identity
     /// field below is missing.
     pub cloud_api_usage_token: Option<String>,
+    pub usage_outbox: Option<Arc<UsageOutbox>>,
     pub org_id: Option<String>,
     pub workspace_id: Option<String>,
     pub api_key_id: Option<String>,
@@ -310,6 +310,8 @@ impl UsageReporter {
         } else if self.org_id.is_none() || self.workspace_id.is_none() || self.api_key_id.is_none()
         {
             Some(UsageReportOutcome::MissingAuthIdentity)
+        } else if self.usage_outbox.is_none() {
+            Some(UsageReportOutcome::MissingOutbox)
         } else {
             None
         }
@@ -321,15 +323,10 @@ impl UsageReporter {
 /// as metric labels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UsageReportOutcome {
-    Accepted,
-    Http4xx,
-    Http5xx,
-    HttpOther,
-    Timeout,
-    ConnectError,
-    TransportError,
     MissingUsageToken,
     MissingAuthIdentity,
+    MissingOutbox,
+    OutboxWriteError,
     InvalidBody,
     MissingBillableUsage,
     MissingResponseId,
@@ -338,41 +335,14 @@ enum UsageReportOutcome {
 impl UsageReportOutcome {
     fn as_label(self) -> &'static str {
         match self {
-            Self::Accepted => "accepted",
-            Self::Http4xx => "http_4xx",
-            Self::Http5xx => "http_5xx",
-            Self::HttpOther => "http_other",
-            Self::Timeout => "timeout",
-            Self::ConnectError => "connect_error",
-            Self::TransportError => "transport_error",
             Self::MissingUsageToken => "missing_usage_token",
             Self::MissingAuthIdentity => "missing_auth_identity",
+            Self::MissingOutbox => "missing_outbox",
+            Self::OutboxWriteError => "outbox_write_error",
             Self::InvalidBody => "invalid_body",
             Self::MissingBillableUsage => "missing_billable_usage",
             Self::MissingResponseId => "missing_response_id",
         }
-    }
-}
-
-fn classify_usage_http_status(status: reqwest::StatusCode) -> UsageReportOutcome {
-    if status.is_success() {
-        UsageReportOutcome::Accepted
-    } else if status.is_client_error() {
-        UsageReportOutcome::Http4xx
-    } else if status.is_server_error() {
-        UsageReportOutcome::Http5xx
-    } else {
-        UsageReportOutcome::HttpOther
-    }
-}
-
-fn classify_usage_request_error(error: &reqwest::Error) -> UsageReportOutcome {
-    if error.is_timeout() {
-        UsageReportOutcome::Timeout
-    } else if error.is_connect() {
-        UsageReportOutcome::ConnectError
-    } else {
-        UsageReportOutcome::TransportError
     }
 }
 
@@ -447,12 +417,11 @@ pub fn make_usage_reporter(
     // itself is no longer stored — usage is attributed via the identity fields
     // below, not the sk-.
     auth.cloud_api_key.as_ref()?;
-    let url = state.config.cloud_api_url.as_ref()?;
+    state.config.cloud_api_url.as_ref()?;
     Some(UsageReporter {
-        http_client: state.http_client.clone(),
-        cloud_api_url: url.clone(),
         model_name: state.config.model_name.clone(),
         cloud_api_usage_token: state.config.cloud_api_usage_token.clone(),
+        usage_outbox: state.usage_outbox.clone(),
         org_id: auth.org_id.clone(),
         workspace_id: auth.workspace_id.clone(),
         api_key_id: auth.api_key_id.clone(),
@@ -472,8 +441,8 @@ fn cached_tokens(usage: &serde_json::Value, prompt_tokens: i64) -> Option<i64> {
 
 /// Build the `/v1/internal/usage` request body for a parsed response, or
 /// `None` when there is nothing billable to report. Pure (no I/O) so it can
-/// be unit-tested directly; `try_report_usage` wraps it with the
-/// fire-and-forget send.
+/// be unit-tested directly; `try_report_usage` wraps it with the durable
+/// outbox enqueue.
 fn build_usage_body(
     usage_type: &UsageType,
     response_data: &serde_json::Value,
@@ -569,13 +538,13 @@ fn input_only_usage_body(
     }))
 }
 
-/// Extract usage from a parsed JSON response and fire-and-forget a report to the cloud API.
+/// Extract usage from a parsed JSON response and persist it for Cloud API delivery.
 pub(crate) fn try_report_usage(response_data: &serde_json::Value, id: &str, opts: &ProxyOpts) {
     let Some(reporter) = &opts.usage_reporter else {
         return;
     };
     match build_usage_body(&opts.usage_type, response_data, &reporter.model_name, id) {
-        Some(body) => spawn_usage_report(reporter, body),
+        Some(body) => enqueue_usage_report(reporter, body),
         None => {
             record_usage_report_outcome(reporter, UsageReportOutcome::MissingBillableUsage, None);
             warn!(
@@ -638,7 +607,7 @@ pub(crate) fn report_chat_usage_if_present(
         "output_tokens": output,
         "id": id,
     });
-    spawn_usage_report(reporter, body);
+    enqueue_usage_report(reporter, body);
     true
 }
 
@@ -674,7 +643,7 @@ fn report_stream_usage_on_finalize(
                 "cache_read_tokens": cache_read_tokens.unwrap_or(0),
                 "id": id,
             });
-            spawn_usage_report(reporter, body);
+            enqueue_usage_report(reporter, body);
             if !completed_cleanly {
                 info!(
                     request_id = %log_request_id,
@@ -697,12 +666,9 @@ fn report_stream_usage_on_finalize(
     }
 }
 
-/// Fire-and-forget POST of a usage event to cloud-api's `/v1/internal/usage`
-/// (service-token authenticated). The legacy `sk-`-authenticated `/v1/usage`
-/// endpoint has been removed from cloud-api, so when the service-token path is
-/// unavailable (missing usage token or identity fields) we log an error and
-/// skip — never post to the deleted endpoint.
-pub(crate) fn spawn_usage_report(reporter: &UsageReporter, mut body: serde_json::Value) {
+/// Persist a usage event before asynchronous delivery to Cloud API. The
+/// outbox retries until a 2xx and replays pending files after restart.
+pub(crate) fn enqueue_usage_report(reporter: &UsageReporter, mut body: serde_json::Value) {
     if let Some(outcome) = reporter.service_path_unavailable_reason() {
         record_usage_report_outcome(reporter, outcome, None);
         // No fallback exists anymore. This is a misconfiguration (usage token
@@ -710,6 +676,7 @@ pub(crate) fn spawn_usage_report(reporter: &UsageReporter, mut body: serde_json:
         // loudly rather than silently dropping billing.
         error!(
             has_usage_token = reporter.cloud_api_usage_token.is_some(),
+            has_usage_outbox = reporter.usage_outbox.is_some(),
             has_org = reporter.org_id.is_some(),
             has_workspace = reporter.workspace_id.is_some(),
             has_api_key_id = reporter.api_key_id.is_some(),
@@ -775,75 +742,31 @@ pub(crate) fn spawn_usage_report(reporter: &UsageReporter, mut body: serde_json:
         }
     }
 
-    let client = reporter.http_client.clone();
-    let url = format!("{}/v1/internal/usage", reporter.cloud_api_url);
-    let auth = format!("Bearer {}", reporter.cloud_api_usage_token.clone().unwrap());
-    let reporter = reporter.clone();
-    tokio::spawn(async move {
-        let started_at = std::time::Instant::now();
-        let mut request = client
-            .post(&url)
-            .header("authorization", &auth)
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(5));
-        if let Some(request_id) = reporter.request_id.as_deref() {
-            request = request.header("x-request-id", request_id);
-        }
-        match request.send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                let outcome = classify_usage_http_status(status);
-                let elapsed = started_at.elapsed();
-                record_usage_report_outcome(&reporter, outcome, Some(elapsed));
-                if outcome == UsageReportOutcome::Accepted {
-                    info!(
-                        request_id = %reporter.request_id.as_deref().unwrap_or(""),
-                        org_id = %reporter.org_id.as_deref().unwrap_or(""),
-                        workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
-                        api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
-                        model = %reporter.model_name,
-                        status = %status,
-                        duration_ms = elapsed.as_millis() as u64,
-                        auth_path = reporter.request_source.auth_path.as_label(),
-                        ingress_route = reporter.request_source.ingress_route.as_label(),
-                        "Direct-key usage report accepted by Cloud API"
-                    );
-                } else {
-                    warn!(
-                        request_id = %reporter.request_id.as_deref().unwrap_or(""),
-                        org_id = %reporter.org_id.as_deref().unwrap_or(""),
-                        workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
-                        api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
-                        model = %reporter.model_name,
-                        status = %status,
-                        duration_ms = elapsed.as_millis() as u64,
-                        auth_path = reporter.request_source.auth_path.as_label(),
-                        ingress_route = reporter.request_source.ingress_route.as_label(),
-                        outcome = outcome.as_label(),
-                        "Usage reporting returned non-success"
-                    );
-                }
-            }
-            Err(error) => {
-                let outcome = classify_usage_request_error(&error);
-                let elapsed = started_at.elapsed();
-                record_usage_report_outcome(&reporter, outcome, Some(elapsed));
-                warn!(
-                    request_id = %reporter.request_id.as_deref().unwrap_or(""),
-                    org_id = %reporter.org_id.as_deref().unwrap_or(""),
-                    workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
-                    api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
-                    model = %reporter.model_name,
-                    error = %error,
-                    duration_ms = elapsed.as_millis() as u64,
-                    auth_path = reporter.request_source.auth_path.as_label(),
-                    ingress_route = reporter.request_source.ingress_route.as_label(),
-                    outcome = outcome.as_label(),
-                    "Usage reporting failed"
-                );
-            }
-        }
-    });
+    let event = UsageEvent::new(
+        body,
+        reporter.request_id.clone(),
+        reporter.request_source.auth_path.as_label(),
+        reporter.request_source.ingress_route.as_label(),
+    );
+    if let Err(error) = reporter
+        .usage_outbox
+        .as_ref()
+        .expect("service path availability checked")
+        .enqueue(event)
+    {
+        record_usage_report_outcome(reporter, UsageReportOutcome::OutboxWriteError, None);
+        error!(
+            request_id = %reporter.request_id.as_deref().unwrap_or(""),
+            org_id = %reporter.org_id.as_deref().unwrap_or(""),
+            workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
+            api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
+            model = %reporter.model_name,
+            error = %error,
+            auth_path = reporter.request_source.auth_path.as_label(),
+            ingress_route = reporter.request_source.ingress_route.as_label(),
+            "Failed to persist usage report — usage NOT billed"
+        );
+    }
 }
 
 /// Options for proxy requests that need signing.
@@ -2880,10 +2803,9 @@ mod tests {
         api_key_id: Option<&str>,
     ) -> UsageReporter {
         UsageReporter {
-            http_client: reqwest::Client::new(),
-            cloud_api_url: "http://cloud-api.invalid".to_string(),
             model_name: "test-model".to_string(),
             cloud_api_usage_token: usage_token.map(String::from),
+            usage_outbox: None,
             org_id: org_id.map(String::from),
             workspace_id: workspace_id.map(String::from),
             api_key_id: api_key_id.map(String::from),
@@ -2895,13 +2817,32 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_can_use_service_token_path_requires_all_fields() {
+    #[tokio::test]
+    async fn test_can_use_service_token_path_requires_all_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = UsageOutbox::open(
+            crate::usage_outbox::UsageOutboxConfig {
+                directory: directory.path().to_path_buf(),
+                cloud_api_url: "http://127.0.0.1:1".to_string(),
+                cloud_api_usage_token: "tok".to_string(),
+                request_timeout: std::time::Duration::from_millis(10),
+                initial_backoff: std::time::Duration::from_millis(10),
+                max_backoff: std::time::Duration::from_millis(10),
+                delete_on_drop: true,
+            },
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
         // Token + all three identity fields: green light.
-        assert!(
-            reporter_with(Some("tok"), Some("org"), Some("ws"), Some("key"),)
-                .can_use_service_token_path()
+        let mut complete = reporter_with(Some("tok"), Some("org"), Some("ws"), Some("key"));
+        assert!(!complete.can_use_service_token_path());
+        assert_eq!(
+            complete.service_path_unavailable_reason(),
+            Some(UsageReportOutcome::MissingOutbox)
         );
+        complete.usage_outbox = Some(outbox.clone());
+        assert!(complete.can_use_service_token_path());
 
         // Token missing: reporting is skipped (no legacy fallback) even if
         // identity is fully populated.
@@ -2929,40 +2870,18 @@ mod tests {
     }
 
     #[test]
-    fn usage_report_outcomes_are_bounded_and_status_classification_is_stable() {
-        assert_eq!(
-            classify_usage_http_status(reqwest::StatusCode::OK),
-            UsageReportOutcome::Accepted
-        );
-        assert_eq!(
-            classify_usage_http_status(reqwest::StatusCode::UNAUTHORIZED),
-            UsageReportOutcome::Http4xx
-        );
-        assert_eq!(
-            classify_usage_http_status(reqwest::StatusCode::SERVICE_UNAVAILABLE),
-            UsageReportOutcome::Http5xx
-        );
-        assert_eq!(
-            classify_usage_http_status(reqwest::StatusCode::TEMPORARY_REDIRECT),
-            UsageReportOutcome::HttpOther
-        );
-
+    fn usage_report_outcomes_are_bounded() {
         let labels = [
-            UsageReportOutcome::Accepted,
-            UsageReportOutcome::Http4xx,
-            UsageReportOutcome::Http5xx,
-            UsageReportOutcome::HttpOther,
-            UsageReportOutcome::Timeout,
-            UsageReportOutcome::ConnectError,
-            UsageReportOutcome::TransportError,
             UsageReportOutcome::MissingUsageToken,
             UsageReportOutcome::MissingAuthIdentity,
+            UsageReportOutcome::MissingOutbox,
+            UsageReportOutcome::OutboxWriteError,
             UsageReportOutcome::InvalidBody,
             UsageReportOutcome::MissingBillableUsage,
             UsageReportOutcome::MissingResponseId,
         ]
         .map(UsageReportOutcome::as_label);
-        assert_eq!(labels.len(), 12);
+        assert_eq!(labels.len(), 7);
         assert!(labels.iter().all(|label| !label.is_empty()));
     }
 

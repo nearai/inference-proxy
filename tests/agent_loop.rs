@@ -38,6 +38,10 @@ fn build_agent_loop_app_with_cloud_and_idle(
     stream_idle_timeout_secs: u64,
 ) -> axum::Router {
     let base = upstream_mock_url.trim_end_matches('/');
+    let usage_outbox_dir = std::env::temp_dir().join(format!(
+        "vllm-proxy-agent-usage-test-{}",
+        uuid::Uuid::new_v4()
+    ));
     let config = config::Config {
         model_name: "test-model".to_string(),
         tokens: vec!["test-token".to_string()],
@@ -79,6 +83,10 @@ fn build_agent_loop_app_with_cloud_and_idle(
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
         cloud_api_usage_token: Some("test-usage-token".to_string()),
+        cloud_api_usage_outbox_dir: usage_outbox_dir.clone(),
+        cloud_api_usage_report_timeout_secs: 5,
+        cloud_api_usage_retry_initial_backoff_ms: 10,
+        cloud_api_usage_retry_max_backoff_secs: 1,
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,
@@ -137,6 +145,21 @@ fn build_agent_loop_app_with_cloud_and_idle(
     let signing_pair = signing::SigningPair { ecdsa, ed25519 };
     let chat_cache = cache::ChatCache::new("test-model", 1200);
     let http_client = reqwest::Client::new();
+    let usage_outbox = cloud_api_url.map(|cloud_api_url| {
+        usage_outbox::UsageOutbox::open(
+            usage_outbox::UsageOutboxConfig {
+                directory: usage_outbox_dir,
+                cloud_api_url: cloud_api_url.to_string(),
+                cloud_api_usage_token: "test-usage-token".to_string(),
+                request_timeout: std::time::Duration::from_secs(5),
+                initial_backoff: std::time::Duration::from_millis(10),
+                max_backoff: std::time::Duration::from_secs(1),
+                delete_on_drop: true,
+            },
+            http_client.clone(),
+        )
+        .unwrap()
+    });
     let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
         .build_recorder()
         .handle();
@@ -150,6 +173,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
         cache: Arc::new(chat_cache),
         attestation_cache: Arc::new(vllm_proxy_rs::attestation::AttestationCache::new(300)),
         http_client,
+        usage_outbox,
         metrics_handle,
         tls_cert_fingerprint: Arc::new(
             vllm_proxy_rs::attestation::TlsCertTracker::new(None).expect("tracker for None path"),
@@ -1670,7 +1694,7 @@ async fn interrupted_agent_loop_reports_usage_without_signature() {
     // Drain the stream so the spawned loop task runs to completion.
     let _ = response.into_body().collect().await;
 
-    // Usage is reported (fire-and-forget) even though the stream never saw [DONE].
+    // Usage is persisted for delivery even though the stream never saw [DONE].
     let mut usage_body = None;
     for _ in 0..50 {
         let reqs = cloud_api.received_requests().await.unwrap();

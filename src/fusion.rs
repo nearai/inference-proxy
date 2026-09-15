@@ -1512,6 +1512,8 @@ async fn finish_response(
         response_shape: ResponseShape::ChatCompletion,
         tracing_ids: Some(ctx.tracing_ids),
         upstream_data_parallel_rank: None,
+        admission: None,
+        connect_failover: None,
     };
 
     if ctx.is_stream {

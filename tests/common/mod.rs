@@ -86,6 +86,14 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         rejected_content_part_types: Vec::new(),
         allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,
+        admission_max_inflight: 0,
+        admission_start_inflight: 0,
+        admission_ramp_step: 8,
+        admission_ramp_interval_secs: 1800,
+        admission_ttft_p95_max_ms: 30_000,
+        admission_backpressure_secs: 10,
+        admission_retry_after_secs: 2,
+        backend_connect_failover: false,
         dstack_socket_path: options
             .dstack_socket_path
             .unwrap_or_else(|| "/var/run/dstack.sock".to_string()),
@@ -148,6 +156,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         backend_affinity: Arc::new(
             vllm_proxy_rs::backend_affinity::BackendConversationAffinity::new(false, 1, 8, 1_200),
         ),
+        admission: Arc::new(vllm_proxy_rs::admission::AdmissionController::disabled()),
     };
     let rate_limiter = rate_limit::build_rate_limiter(100, 200);
     let rate_limit_state = rate_limit::RateLimitState {

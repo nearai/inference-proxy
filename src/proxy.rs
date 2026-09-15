@@ -938,6 +938,129 @@ pub struct ProxyOpts {
     /// Optional vLLM data-parallel engine rank. Chat routes derive this from a
     /// stable conversation prefix when `VLLM_DATA_PARALLEL_SIZE` is configured.
     pub upstream_data_parallel_rank: Option<usize>,
+    /// Lane admission permit (gateway mode, `admission.rs`). Holds one budget
+    /// slot until the response is complete; the streaming path moves it into
+    /// the pump task next to `backend_guard`. `None` when admission is off.
+    pub admission: Option<crate::admission::Permit>,
+    /// Retry once on another healthy backend when the connection to the
+    /// chosen one fails before anything was sent (`VLLM_BACKEND_CONNECT_FAILOVER`).
+    pub connect_failover: Option<ConnectFailover>,
+}
+
+/// Where a chat/completions request may be re-sent when the connection to
+/// its backend fails.
+pub struct ConnectFailover {
+    pub pool: Arc<crate::backend_pool::BackendPool>,
+    /// Route path appended to the replacement backend's base URL.
+    pub path: &'static str,
+    /// Index of the backend the request is currently placed on.
+    pub index: usize,
+}
+
+fn build_upstream_request(
+    client: &reqwest::Client,
+    url: &str,
+    body: Bytes,
+    opts: &ProxyOpts,
+) -> reqwest::RequestBuilder {
+    let req = apply_tracing_headers(
+        client
+            .post(url)
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream"),
+        opts.tracing_ids.as_ref(),
+    );
+    apply_data_parallel_rank_header(req, opts.upstream_data_parallel_rank).body(body)
+}
+
+fn upstream_unreachable() -> AppError {
+    AppError::UpstreamParsed {
+        status: StatusCode::BAD_GATEWAY,
+        message: "No inference backend is reachable".to_string(),
+        error_type: "upstream_unreachable".to_string(),
+    }
+}
+
+/// Send the request to `url`. When the connection fails before anything was
+/// sent and `opts.connect_failover` is set, retry once on another healthy
+/// backend: `url` and `opts.backend_guard` then point at the replacement.
+/// Nothing else is retried here — an HTTP error, queue-full included, means
+/// the engine saw the request and the caller decides.
+async fn send_upstream(
+    client: &reqwest::Client,
+    url: &mut String,
+    body: Bytes,
+    opts: &mut ProxyOpts,
+    endpoint: &'static str,
+) -> Result<reqwest::Response, AppError> {
+    let upstream_start = std::time::Instant::now();
+    let first = build_upstream_request(client, url, body.clone(), opts)
+        .send()
+        .await;
+    let response = match first {
+        Ok(response) => response,
+        Err(error) if error.is_connect() && opts.connect_failover.is_some() => {
+            let (pool, path, failed) = {
+                let failover = opts.connect_failover.as_ref().expect("checked above");
+                (failover.pool.clone(), failover.path, failover.index)
+            };
+            let Some(next) = pool.select_excluding(failed) else {
+                metrics::counter!("backend_failover_total", "outcome" => "exhausted").increment(1);
+                warn!(
+                    backend = %sanitized_upstream_url_for_logs(url),
+                    error = %error,
+                    "Backend unreachable and no other healthy backend to fail over to"
+                );
+                return Err(upstream_unreachable());
+            };
+            metrics::counter!("backend_failover_total", "outcome" => "retried").increment(1);
+            warn!(
+                failed_backend = %sanitized_upstream_url_for_logs(url),
+                next_backend = %sanitized_upstream_url_for_logs(&next.backend.base_url),
+                error = %error,
+                "Backend unreachable, failing over"
+            );
+            *url = next.backend.url(path);
+            if let Some(failover) = opts.connect_failover.as_mut() {
+                failover.index = next.index;
+            }
+            if let Some(permit) = opts.admission.as_ref() {
+                permit.attach_backend(next.index);
+            }
+            opts.backend_guard = Some(crate::backend_pool::BackendGuard::new(next.backend));
+            match build_upstream_request(client, url, body, opts).send().await {
+                Ok(response) => response,
+                Err(error) if error.is_connect() => {
+                    metrics::counter!("backend_failover_total", "outcome" => "exhausted")
+                        .increment(1);
+                    warn!(
+                        backend = %sanitized_upstream_url_for_logs(url),
+                        error = %error,
+                        "Fail-over backend unreachable too"
+                    );
+                    return Err(upstream_unreachable());
+                }
+                Err(error) => return Err(AppError::Internal(error.into())),
+            }
+        }
+        Err(error) => return Err(AppError::Internal(error.into())),
+    };
+    metrics::histogram!("upstream_request_duration_seconds", "endpoint" => endpoint)
+        .record(upstream_start.elapsed().as_secs_f64());
+    Ok(response)
+}
+
+/// An engine admission rejection (queue full, priority abort) on a lane
+/// request: tell the admission controller which backend is saturated.
+fn note_engine_backpressure(
+    permit: Option<&crate::admission::Permit>,
+    info: Option<&UpstreamErrorInfo>,
+) {
+    if let (Some(permit), Some(info)) = (permit, info) {
+        if message_is_queue_full(&info.message) {
+            permit.observe_backpressure();
+        }
+    }
 }
 
 /// Apply upstream tracing headers to a `reqwest::RequestBuilder`. No-op when
@@ -1138,26 +1261,21 @@ pub async fn proxy_json_request(
     let streaming_body = inject_streaming(&request_body)?;
 
     let upstream_start = std::time::Instant::now();
-    let req = apply_tracing_headers(
-        client
-            .post(url)
-            .header("content-type", "application/json")
-            .header("accept", "text/event-stream"),
-        opts.tracing_ids.as_ref(),
-    );
-    let req = apply_data_parallel_rank_header(req, opts.upstream_data_parallel_rank);
-    let response = req
-        .body(streaming_body)
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(e.into()))?;
-    metrics::histogram!("upstream_request_duration_seconds", "endpoint" => "json_via_stream")
-        .record(upstream_start.elapsed().as_secs_f64());
+    let mut url = url.to_string();
+    let response = send_upstream(
+        client,
+        &mut url,
+        Bytes::from(streaming_body),
+        &mut opts,
+        "json_via_stream",
+    )
+    .await?;
 
     let status = response.status();
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
-        let info = log_upstream_error(status, url, &body, opts.tracing_ids.as_ref());
+        let info = log_upstream_error(status, &url, &body, opts.tracing_ids.as_ref());
+        note_engine_backpressure(opts.admission.as_ref(), info.as_ref());
         return Err(AppError::Upstream {
             status: effective_error_status(
                 status.as_u16(),
@@ -1238,6 +1356,9 @@ pub async fn proxy_json_request(
                         AppError::Internal(e.into())
                     }
                 })?;
+                if let Some(permit) = opts.admission.as_ref() {
+                    permit.observe_first_chunk();
+                }
                 received_upstream_progress |= stream_parser.process_chunk(&chunk);
                 assembler.process_chunk(&chunk);
             }
@@ -1282,7 +1403,8 @@ pub async fn proxy_json_request(
             let reqwest_status = reqwest::StatusCode::from_u16(status_code.as_u16())
                 .unwrap_or(reqwest::StatusCode::BAD_GATEWAY);
             let info =
-                log_upstream_error(reqwest_status, url, &body_bytes, opts.tracing_ids.as_ref());
+                log_upstream_error(reqwest_status, &url, &body_bytes, opts.tracing_ids.as_ref());
+            note_engine_backpressure(opts.admission.as_ref(), info.as_ref());
             return Err(AppError::Upstream {
                 // A client media-fetch failure can arrive as an SSE error chunk
                 // with code:500 + `403, message='…', url='…'` — downgrade to 400
@@ -1829,26 +1951,21 @@ pub async fn proxy_streaming_request(
         .unwrap_or_else(|| hex::encode(Sha256::digest(&request_body)));
 
     let upstream_start = std::time::Instant::now();
-    let req = apply_tracing_headers(
-        client
-            .post(url)
-            .header("content-type", "application/json")
-            .header("accept", "text/event-stream"),
-        opts.tracing_ids.as_ref(),
-    );
-    let req = apply_data_parallel_rank_header(req, opts.upstream_data_parallel_rank);
-    let response = req
-        .body(request_body)
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(e.into()))?;
-    metrics::histogram!("upstream_request_duration_seconds", "endpoint" => "streaming")
-        .record(upstream_start.elapsed().as_secs_f64());
+    let mut url = url.to_string();
+    let response = send_upstream(
+        client,
+        &mut url,
+        Bytes::from(request_body),
+        &mut opts,
+        "streaming",
+    )
+    .await?;
 
     let status = response.status();
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
-        let info = log_upstream_error(status, url, &body, opts.tracing_ids.as_ref());
+        let info = log_upstream_error(status, &url, &body, opts.tracing_ids.as_ref());
+        note_engine_backpressure(opts.admission.as_ref(), info.as_ref());
         return Err(AppError::Upstream {
             status: effective_error_status(
                 status.as_u16(),
@@ -1869,6 +1986,7 @@ pub async fn proxy_streaming_request(
     let model_name = opts.model_name.clone();
     let chunk_transform = opts.chunk_transform;
     let backend_guard = opts.backend_guard;
+    let admission = opts.admission;
     let stream_idle_timeout_secs = opts.stream_idle_timeout_secs;
     let sse_keepalive_secs = opts.sse_keepalive_secs;
 
@@ -1906,10 +2024,11 @@ pub async fn proxy_streaming_request(
                     let info = log_upstream_error(
                         reqwest::StatusCode::from_u16(code)
                             .unwrap_or(reqwest::StatusCode::BAD_GATEWAY),
-                        url,
+                        &url,
                         &body,
                         opts.tracing_ids.as_ref(),
                     );
+                    note_engine_backpressure(admission.as_ref(), info.as_ref());
                     metrics::counter!("upstream_stream_first_event_errors_total").increment(1);
                     return Err(AppError::Upstream {
                         status: effective_error_status(
@@ -1919,6 +2038,9 @@ pub async fn proxy_streaming_request(
                         ),
                         body,
                     });
+                }
+                if let Some(permit) = admission.as_ref() {
+                    permit.observe_first_chunk();
                 }
                 first_chunk = Some(chunk);
             }
@@ -1956,6 +2078,9 @@ pub async fn proxy_streaming_request(
         // Keep backend_guard alive for the full duration of the stream
         // so active_conns tracking is accurate for least-connections selection.
         let _backend_guard = backend_guard;
+        // Same for the admission permit: the budget slot is held until the
+        // stream ends, and the first chunk is its TTFT sample.
+        let admission = admission;
 
         let mut byte_stream = std::pin::pin!(byte_stream);
         let mut hasher = Sha256::new();
@@ -1987,6 +2112,9 @@ pub async fn proxy_streaming_request(
                         Some(Ok(chunk)) => {
                             keepalive.reset();
                             last_upstream_chunk = tokio::time::Instant::now();
+                            if let Some(permit) = admission.as_ref() {
+                                permit.observe_first_chunk();
+                            }
                             received_upstream_progress |= parser.process_chunk(&chunk);
 
                             // Normalize (and encrypt, if active) the chunk, then hash
@@ -3251,6 +3379,8 @@ mod tests {
             response_shape: ResponseShape::default(),
             tracing_ids: None,
             upstream_data_parallel_rank: None,
+            admission: None,
+            connect_failover: None,
         }
     }
 

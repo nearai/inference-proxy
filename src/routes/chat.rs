@@ -6,10 +6,13 @@ use axum::Extension;
 
 use sha2::Digest;
 
+use crate::admission::RejectReason;
 use crate::auth::RequireAuth;
 use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
-use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageType};
+use crate::proxy::{
+    self, make_usage_reporter, ConnectFailover, ProxyOpts, ResponseShape, UsageType,
+};
 use crate::{agent_loop, fusion};
 use crate::{AppState, TracingIds};
 
@@ -208,11 +211,33 @@ pub async fn chat_completions(
         (None, None)
     };
 
-    let (url, guard) = state.backend_affinity.select_url(
-        &state.backend_pool,
-        backend_affinity_key,
-        "/v1/chat/completions",
-    );
+    // Lane admission (gateway mode): budget and overload checks first, then a
+    // placement bounded by the per-host share. Both refuse with 429 before
+    // anything is sent upstream; disabled deployments get `None`s.
+    let permit = state.admission.try_admit(&state.backend_pool)?;
+    let placement = state
+        .backend_affinity
+        .place(
+            &state.backend_pool,
+            backend_affinity_key,
+            "/v1/chat/completions",
+            state
+                .admission
+                .host_share(state.backend_pool.healthy_count()),
+        )
+        .ok_or_else(|| AppError::from(state.admission.reject(RejectReason::HostShare)))?;
+    if let Some(permit) = permit.as_ref() {
+        permit.attach_backend(placement.index);
+    }
+    let connect_failover = state
+        .config
+        .backend_connect_failover
+        .then(|| ConnectFailover {
+            pool: state.backend_pool.clone(),
+            path: "/v1/chat/completions",
+            index: placement.index,
+        });
+    let url = placement.url;
 
     let opts = ProxyOpts {
         signing: state.signing.clone(),
@@ -224,7 +249,7 @@ pub async fn chat_completions(
         request_hash: Some(request_hash),
         response_transform,
         chunk_transform,
-        backend_guard: Some(guard),
+        backend_guard: Some(placement.guard),
         stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
         sse_keepalive_secs: state.config.sse_keepalive_secs,
         map_queue_full_to_429: state.config.map_queue_full_to_429,
@@ -232,6 +257,8 @@ pub async fn chat_completions(
         response_shape: ResponseShape::ChatCompletion,
         tracing_ids: Some(tracing_ids),
         upstream_data_parallel_rank,
+        admission: permit,
+        connect_failover,
     };
 
     if is_stream {

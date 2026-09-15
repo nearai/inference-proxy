@@ -130,6 +130,12 @@ All configuration is via environment variables:
 | `VLLM_PROXY_ALLOWED_ORG_IDS` | No | empty | Organizations whose cloud-api keys may use this deployment (comma-separated ids from `/v1/check_api_key`); other valid keys get 403 (counted in `cloud_api_org_allowlist_rejections_total`). Empty = everyone. Config-token callers are not gated |
 | `VLLM_PROXY_REJECTED_CONTENT_PART_TYPES` | No | empty | Chat content part `type`s refused with 400 before dispatch, e.g. `video_url,input_audio,file` |
 | `VLLM_PROXY_SSE_KEEPALIVE_SECS` | No | `0` (off) | Emit `: keep-alive` SSE comments to the client whenever the upstream stream is silent this long. Not hashed into signatures — keep off where clients verify raw stream bytes |
+| `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` | No | `0` (off) | Gateway mode: ceiling on chat/completions requests in flight across the fleet. Beyond it, and while the lane looks overloaded (see below), new requests get `429` + `Retry-After` before anything is sent upstream (`admission.rs`) |
+| `VLLM_PROXY_ADMISSION_START_INFLIGHT` | No | = max | Budget at start-up; it ramps by `VLLM_PROXY_ADMISSION_RAMP_STEP` (default `8`) every `VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS` (default `1800`) up to the maximum, but only after an interval without an overload signal |
+| `VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS` | No | `30000` (`0` = off) | Refuse new lane work while the gateway's own time-to-first-chunk p95 over the last minute (at least 5 samples) is above this |
+| `VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS` | No | `10` | Refuse new lane work while every healthy backend rejected at engine admission (queue full / priority abort) within this many seconds |
+| `VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS` | No | `2` | `Retry-After` value on admission refusals |
+| `VLLM_BACKEND_CONNECT_FAILOVER` | No | `false` | Retry a chat/completions request once on another healthy backend when the connection to the chosen one fails before anything was sent. HTTP errors, queue-full included, are never retried |
 | `VLLM_IMAGES_URL` | No | `{base}/v1/images/generations` | Override images endpoint |
 | `VLLM_IMAGES_EDITS_URL` | No | `{base}/v1/images/edits` | Override image edits endpoint |
 | `VLLM_TRANSCRIPTIONS_URL` | No | `{base}/v1/audio/transcriptions` | Override transcriptions endpoint |

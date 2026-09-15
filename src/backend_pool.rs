@@ -125,10 +125,7 @@ impl BackendPool {
     /// Select a backend using least-connections among healthy backends.
     /// If all are unhealthy, picks the least-loaded one anyway.
     pub fn select(&self) -> Arc<Backend> {
-        if self.backends.len() == 1 {
-            return self.backends[0].clone();
-        }
-        self.backends[self.least_connections_index()].clone()
+        self.select_with_preference(None, 0).backend
     }
 
     /// Least-connections selection with an optional preferred backend.
@@ -142,69 +139,108 @@ impl BackendPool {
         preferred: Option<usize>,
         max_imbalance: u32,
     ) -> Selection {
+        self.select_with_preference_bounded(preferred, max_imbalance, None)
+            .expect("unbounded selection always yields a backend")
+    }
+
+    /// `select_with_preference` restricted to backends with fewer than
+    /// `max_conns` requests in flight (the admission per-host share, see
+    /// `admission.rs`). A preferred backend at the bound is treated like an
+    /// overloaded one and the turn is rebalanced; `None` when no backend is
+    /// under the bound. Without a bound, and with every backend unhealthy, the
+    /// least-loaded backend is returned anyway (a probe will re-mark it;
+    /// refusing everything would be worse).
+    pub fn select_with_preference_bounded(
+        &self,
+        preferred: Option<usize>,
+        max_imbalance: u32,
+        max_conns: Option<u32>,
+    ) -> Option<Selection> {
+        let under_bound = |backend: &Backend| {
+            max_conns.is_none_or(|max| backend.active_conns.load(Ordering::Relaxed) < max)
+        };
         if self.backends.len() == 1 {
-            return Selection {
-                backend: self.backends[0].clone(),
+            let only = &self.backends[0];
+            return under_bound(only).then(|| Selection {
+                backend: only.clone(),
                 index: 0,
                 outcome: SelectionOutcome::Single,
-            };
+            });
         }
 
-        let least_index = self.least_connections_index();
+        let least_index = match self.least_index(|_, backend| {
+            backend.healthy.load(Ordering::Relaxed) && under_bound(backend)
+        }) {
+            Some(index) => index,
+            None if max_conns.is_none() => self
+                .least_index(|_, _| true)
+                .expect("backends is non-empty"),
+            None => return None,
+        };
         let least = &self.backends[least_index];
         let Some(preferred_index) = preferred.filter(|index| *index < self.backends.len()) else {
-            return Selection {
+            return Some(Selection {
                 backend: least.clone(),
                 index: least_index,
                 outcome: SelectionOutcome::New,
-            };
+            });
         };
 
         let candidate = &self.backends[preferred_index];
         if !candidate.healthy.load(Ordering::Relaxed) {
-            return Selection {
+            return Some(Selection {
                 backend: least.clone(),
                 index: least_index,
                 outcome: SelectionOutcome::Unhealthy,
-            };
+            });
         }
 
         let candidate_conns = candidate.active_conns.load(Ordering::Relaxed);
         let least_conns = least.active_conns.load(Ordering::Relaxed);
-        if candidate_conns <= least_conns.saturating_add(max_imbalance) {
-            Selection {
+        if under_bound(candidate) && candidate_conns <= least_conns.saturating_add(max_imbalance) {
+            Some(Selection {
                 backend: candidate.clone(),
                 index: preferred_index,
                 outcome: SelectionOutcome::Pinned,
-            }
+            })
         } else {
-            Selection {
+            Some(Selection {
                 backend: least.clone(),
                 index: least_index,
                 outcome: SelectionOutcome::Rebalanced,
-            }
+            })
         }
     }
 
-    /// Index of the least-loaded healthy backend, or of the least-loaded
-    /// backend overall when none is healthy.
-    fn least_connections_index(&self) -> usize {
-        let healthy = self
-            .backends
+    /// Least-loaded healthy backend other than `excluded` (connection
+    /// fail-over), or `None` when there is no such backend.
+    pub fn select_excluding(&self, excluded: usize) -> Option<Selection> {
+        let index = self.least_index(|index, backend| {
+            index != excluded && backend.healthy.load(Ordering::Relaxed)
+        })?;
+        Some(Selection {
+            backend: self.backends[index].clone(),
+            index,
+            outcome: SelectionOutcome::New,
+        })
+    }
+
+    /// Number of backends currently marked healthy.
+    pub fn healthy_count(&self) -> usize {
+        self.backends
+            .iter()
+            .filter(|b| b.healthy.load(Ordering::Relaxed))
+            .count()
+    }
+
+    /// Index of the least-loaded backend among those `eligible` accepts.
+    fn least_index(&self, eligible: impl Fn(usize, &Backend) -> bool) -> Option<usize> {
+        self.backends
             .iter()
             .enumerate()
-            .filter(|(_, b)| b.healthy.load(Ordering::Relaxed))
-            .min_by_key(|(_, b)| b.active_conns.load(Ordering::Relaxed))
-            .map(|(index, _)| index);
-
-        healthy.unwrap_or_else(|| {
-            self.backends
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, b)| b.active_conns.load(Ordering::Relaxed))
-                .map(|(index, _)| index)
-                .expect("backends is non-empty")
-        })
+            .filter(|(index, backend)| eligible(*index, backend))
+            .min_by_key(|(_, backend)| backend.active_conns.load(Ordering::Relaxed))
+            .map(|(index, _)| index)
     }
 
     /// Select a backend and return (full_url, guard).
@@ -435,6 +471,61 @@ mod tests {
 
         drop(guard);
         assert_eq!(pool.backends[0].active_conns.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_bounded_selection_skips_backends_at_the_share() {
+        let pool = two_backends();
+        pool.backends()[0].active_conns.store(2, Ordering::Relaxed);
+        pool.backends()[1].active_conns.store(1, Ordering::Relaxed);
+        // Share 2: only b2 has room.
+        let sel = pool
+            .select_with_preference_bounded(None, 8, Some(2))
+            .unwrap();
+        assert_eq!(sel.index, 1);
+        // A pin on the full backend is rebalanced even within the imbalance bound.
+        let sel = pool
+            .select_with_preference_bounded(Some(0), 8, Some(2))
+            .unwrap();
+        assert_eq!(sel.index, 1);
+        assert_eq!(sel.outcome, SelectionOutcome::Rebalanced);
+        // Everyone at the share: nothing to pick.
+        pool.backends()[1].active_conns.store(2, Ordering::Relaxed);
+        assert!(pool
+            .select_with_preference_bounded(Some(1), 8, Some(2))
+            .is_none());
+        assert!(pool
+            .select_with_preference_bounded(None, 8, Some(2))
+            .is_none());
+        // Without a bound the same state still selects.
+        assert!(pool.select_with_preference_bounded(None, 8, None).is_some());
+    }
+
+    #[test]
+    fn test_bounded_selection_single_backend() {
+        let pool = BackendPool::new(vec!["http://only:8000".to_string()]);
+        pool.backends()[0].active_conns.store(3, Ordering::Relaxed);
+        assert!(pool
+            .select_with_preference_bounded(None, 0, Some(3))
+            .is_none());
+        assert_eq!(
+            pool.select_with_preference_bounded(None, 0, Some(4))
+                .unwrap()
+                .outcome,
+            SelectionOutcome::Single
+        );
+    }
+
+    #[test]
+    fn test_select_excluding_picks_another_healthy_backend() {
+        let pool = two_backends();
+        assert_eq!(pool.select_excluding(0).unwrap().index, 1);
+        assert_eq!(pool.select_excluding(1).unwrap().index, 0);
+        pool.backends()[1].healthy.store(false, Ordering::Relaxed);
+        assert!(pool.select_excluding(0).is_none());
+        assert_eq!(pool.healthy_count(), 1);
+        let single = BackendPool::new(vec!["http://only:8000".to_string()]);
+        assert!(single.select_excluding(0).is_none());
     }
 
     #[test]

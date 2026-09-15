@@ -110,6 +110,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
         map_queue_full_to_429: false,
         stream_error_peek_ms: 0,
         rejected_content_part_types: Vec::new(),
+        allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,
         dstack_socket_path: "/var/run/dstack.sock".to_string(),
         gpu_evidence_delegate_url: None,

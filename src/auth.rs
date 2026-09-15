@@ -390,6 +390,25 @@ impl FromRequestParts<AppState> for RequireAuth {
                             request_id.as_deref(),
                         )
                         .await?;
+                        // Partner lane: only allow-listed organizations may use
+                        // this deployment. A key without an organization id is
+                        // refused too, since it cannot be matched.
+                        if !state.config.allowed_org_ids.is_empty()
+                            && !subject.org_id.as_deref().is_some_and(|org| {
+                                state.config.allowed_org_ids.iter().any(|a| a == org)
+                            })
+                        {
+                            // Separate from cloud_api_auth_attempts_total: the attempt
+                            // itself succeeded (cloud-api said 200), this is policy.
+                            metrics::counter!("cloud_api_org_allowlist_rejections_total")
+                                .increment(1);
+                            tracing::warn!(
+                                request_id = request_id.as_deref().unwrap_or("-"),
+                                org_id = subject.org_id.as_deref().unwrap_or("-"),
+                                "Cloud API key belongs to an organization that is not allowed on this deployment"
+                            );
+                            return Err(AppError::Forbidden);
+                        }
                         return Ok(RequireAuth {
                             cloud_api_key: Some(token.to_string()),
                             org_id: subject.org_id,

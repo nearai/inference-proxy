@@ -1975,6 +1975,10 @@ pub async fn proxy_streaming_request(
             tokio::time::interval(std::time::Duration::from_secs(sse_keepalive_secs.max(1)));
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         keepalive.tick().await;
+        // Idle watchdog deadline, measured from the last upstream chunk so the
+        // keep-alive ticks (which also wake this loop) cannot push it back.
+        let idle_timeout = std::time::Duration::from_secs(stream_idle_timeout_secs);
+        let mut last_upstream_chunk = tokio::time::Instant::now();
 
         loop {
             tokio::select! {
@@ -1982,6 +1986,7 @@ pub async fn proxy_streaming_request(
                     match chunk {
                         Some(Ok(chunk)) => {
                             keepalive.reset();
+                            last_upstream_chunk = tokio::time::Instant::now();
                             received_upstream_progress |= parser.process_chunk(&chunk);
 
                             // Normalize (and encrypt, if active) the chunk, then hash
@@ -2029,9 +2034,8 @@ pub async fn proxy_streaming_request(
                     }
                     metrics::counter!("sse_keepalive_comments_total").increment(1);
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(
-                    stream_idle_timeout_secs,
-                )), if stream_idle_timeout_secs > 0 && received_upstream_progress => {
+                _ = tokio::time::sleep_until(last_upstream_chunk + idle_timeout),
+                    if stream_idle_timeout_secs > 0 && received_upstream_progress => {
                     warn!(
                         request_id = %log_request_id,
                         org_id = %log_org_id,

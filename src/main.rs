@@ -292,8 +292,12 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
 
     // Bind and serve
-    let addr = format!("{}:{listen_port}", listen_addr);
-    let listener = TcpListener::bind(&addr).await?;
+    // Bind from the parsed address so an IPv6 `LISTEN_ADDR` gets its brackets.
+    let ip: std::net::IpAddr = listen_addr
+        .parse()
+        .map_err(|_| anyhow::anyhow!("LISTEN_ADDR must be an IP address"))?;
+    let addr = std::net::SocketAddr::new(ip, listen_port);
+    let listener = TcpListener::bind(addr).await?;
     info!("Listening on {addr}");
 
     axum::serve(listener, app)

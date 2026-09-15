@@ -24,6 +24,7 @@ struct GatewayOptions {
     stream_error_peek_ms: u64,
     rejected_content_part_types: Vec<String>,
     sse_keepalive_secs: u64,
+    stream_idle_timeout_secs: u64,
 }
 
 fn build_gateway(mock_url: &str, options: GatewayOptions) -> axum::Router {
@@ -73,7 +74,7 @@ fn build_gateway(mock_url: &str, options: GatewayOptions) -> axum::Router {
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,
-        stream_idle_timeout_secs: 0,
+        stream_idle_timeout_secs: options.stream_idle_timeout_secs,
         timeout_tokenize_secs: 5,
         openai_chat_compatibility_check_enabled: false,
         startup_check_retries: 1,
@@ -531,6 +532,108 @@ async fn sse_keepalive_comments_bridge_a_silent_upstream() {
             .any(|f| f.as_str() == ": keep-alive\n\n"),
         "no keep-alives once the upstream is streaming quickly: {frames:?}"
     );
+    handle.abort();
+}
+
+/// Backend that sends headers immediately, emits `first` after `delay`, then
+/// keeps the stream open but silent for `hang` — a stalled engine.
+async fn spawn_stream_then_hang_backend(
+    delay: Duration,
+    first: &'static str,
+    hang: Duration,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use axum::routing::post;
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        post(move || async move {
+            let (tx, rx) =
+                tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(8);
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let _ = tx
+                    .send(Ok(axum::body::Bytes::from_static(first.as_bytes())))
+                    .await;
+                tokio::time::sleep(hang).await;
+                drop(tx);
+            });
+            axum::response::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(axum::body::Body::from_stream(
+                    tokio_stream::wrappers::ReceiverStream::new(rx),
+                ))
+                .unwrap()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), handle)
+}
+
+#[tokio::test]
+async fn idle_timeout_is_not_reset_by_keepalive_ticks() {
+    // 1 s keep-alives must not push back a 2 s idle watchdog: the deadline is
+    // measured from the last upstream chunk, not from the last loop wake-up.
+    let (backend, handle) = spawn_stream_then_hang_backend(
+        Duration::from_millis(100),
+        "data: {\"id\":\"chatcmpl-idle\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"start\"},\"finish_reason\":null}]}\n\n",
+        Duration::from_secs(20),
+    )
+    .await;
+    let app = build_gateway(
+        &backend,
+        GatewayOptions {
+            sse_keepalive_secs: 1,
+            stream_idle_timeout_secs: 2,
+            ..Default::default()
+        },
+    );
+    let started = std::time::Instant::now();
+    let response = app
+        .oneshot(chat_request(serde_json::json!({
+            "model": "test-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let mut text = String::new();
+    let mut keepalives = 0;
+    let mut errored = false;
+    while let Some(frame) = body.frame().await {
+        match frame {
+            Ok(frame) => {
+                if let Ok(data) = frame.into_data() {
+                    let s = String::from_utf8_lossy(&data).to_string();
+                    if s == ": keep-alive\n\n" {
+                        keepalives += 1;
+                    }
+                    text.push_str(&s);
+                }
+            }
+            Err(_) => {
+                errored = true;
+                break;
+            }
+        }
+    }
+    let elapsed = started.elapsed();
+    assert!(text.contains("\"content\":\"start\""), "{text}");
+    assert!(!text.contains("[DONE]"), "{text}");
+    assert!(
+        errored,
+        "the idle timeout must end the stream with an error"
+    );
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "2 s idle timeout must fire despite 1 s keep-alives; took {elapsed:?}"
+    );
+    assert!(keepalives >= 1, "expected keep-alives before the timeout");
     handle.abort();
 }
 

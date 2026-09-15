@@ -439,8 +439,15 @@ impl Config {
             .parse()
             .map_err(|_| anyhow::anyhow!("LISTEN_PORT must be a valid port number"))?;
         let listen_addr = env_or("LISTEN_ADDR", "0.0.0.0");
-        if listen_addr.parse::<std::net::IpAddr>().is_err() {
-            anyhow::bail!("LISTEN_ADDR must be an IP address");
+        let listen_ip: std::net::IpAddr = listen_addr
+            .parse()
+            .map_err(|_| anyhow::anyhow!("LISTEN_ADDR must be an IP address"))?;
+        // The OHTTP gateway re-dispatches decoded requests to 127.0.0.1 on
+        // the listen port, so it needs a bind that loopback can reach.
+        if env_bool("OHTTP_ENABLED") && !(listen_ip.is_unspecified() || listen_ip.is_loopback()) {
+            anyhow::bail!(
+                "OHTTP_ENABLED requires LISTEN_ADDR to be unspecified (0.0.0.0/::) or loopback"
+            );
         }
         let backend_token = env::var("VLLM_BACKEND_TOKEN")
             .ok()
@@ -938,6 +945,16 @@ mod tests {
                 env::set_var("LISTEN_ADDR", "not-an-ip");
                 let err = Config::from_env().unwrap_err().to_string();
                 assert!(err.contains("LISTEN_ADDR"), "{err}");
+                env::set_var("LISTEN_ADDR", "10.0.0.5");
+                env::set_var("OHTTP_ENABLED", "1");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("OHTTP_ENABLED requires"), "{err}");
+                env::set_var("LISTEN_ADDR", "::1");
+                assert!(
+                    Config::from_env().is_ok(),
+                    "loopback v6 bind is fine with OHTTP"
+                );
+                env::remove_var("OHTTP_ENABLED");
                 env::remove_var("LISTEN_ADDR");
                 env::set_var("VLLM_BACKEND_HEALTH_PATH", "healthz");
                 let err = Config::from_env().unwrap_err().to_string();

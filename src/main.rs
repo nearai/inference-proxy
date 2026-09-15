@@ -160,19 +160,28 @@ async fn main() -> anyhow::Result<()> {
         http_builder.build()
     };
     let http_client = build_http_client(None)?;
-    // Backend-only client: carries the backend bearer (if any) as a default
-    // header so it can never be attached to a cloud-api or registry request.
-    let backend_client = match &config.backend_token {
-        Some(token) => {
-            let mut headers = reqwest::header::HeaderMap::new();
-            let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-                .map_err(|_| anyhow::anyhow!("VLLM_BACKEND_TOKEN is not a valid header value"))?;
-            value.set_sensitive(true);
-            headers.insert(reqwest::header::AUTHORIZATION, value);
-            info!("Backend requests will carry the configured VLLM_BACKEND_TOKEN");
-            build_http_client(Some(headers))?
-        }
-        None => http_client.clone(),
+    // Backend-only client: carries the backend bearer and the priority header
+    // (if any) as default headers so they can never be attached to a cloud-api
+    // or registry request.
+    let mut backend_headers = reqwest::header::HeaderMap::new();
+    if let Some(token) = &config.backend_token {
+        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| anyhow::anyhow!("VLLM_BACKEND_TOKEN is not a valid header value"))?;
+        value.set_sensitive(true);
+        backend_headers.insert(reqwest::header::AUTHORIZATION, value);
+        info!("Backend requests will carry the configured VLLM_BACKEND_TOKEN");
+    }
+    if let Some(priority) = config.backend_priority {
+        backend_headers.insert(
+            vllm_proxy_rs::priority::PRIORITY_HEADER,
+            reqwest::header::HeaderValue::from(priority),
+        );
+        info!(priority, "Backend requests will carry the priority header");
+    }
+    let backend_client = if backend_headers.is_empty() {
+        http_client.clone()
+    } else {
+        build_http_client(Some(backend_headers))?
     };
 
     // Initialize metrics

@@ -29,6 +29,11 @@ pub async fn chat_completions(
     // Strip empty tool_calls (vLLM bug workaround)
     strip_empty_tool_calls(&mut request_json);
 
+    // Engine `priority`: the proxy decides it (trusted callers may set it via
+    // header; any client value is discarded). Before any branch so the agent
+    // loop and fusion inherit it.
+    crate::priority::apply_priority(&mut request_json, &headers, auth.cloud_api_key.is_none());
+
     // Extract encryption context from headers
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
     let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);

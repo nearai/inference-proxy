@@ -248,6 +248,11 @@ pub struct Config {
     /// token, so they neither re-validate the customer key nor double-report
     /// usage. Never sent to cloud-api or any other service.
     pub backend_token: Option<String>,
+    /// Engine priority for this proxy's requests, sent as `X-NearAI-Priority`
+    /// on every backend request (`VLLM_BACKEND_PRIORITY`, gateway mode). The
+    /// CVM proxy honors it because the gateway authenticates with the trusted
+    /// token; everything else gets 0. See `priority.rs`.
+    pub backend_priority: Option<i64>,
     /// Path probed on each backend by the pool health checker and by
     /// `/healthz` (`VLLM_BACKEND_HEALTH_PATH`, default `/health`, the engine's
     /// lightweight route). Gateway mode points it at the inference-proxy's
@@ -464,6 +469,16 @@ impl Config {
                 );
             }
         }
+        let backend_priority = match env::var("VLLM_BACKEND_PRIORITY")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        {
+            Some(raw) => Some(
+                crate::priority::validate_priority(&raw)
+                    .map_err(|e| anyhow::anyhow!("VLLM_BACKEND_PRIORITY: {e}"))?,
+            ),
+            None => None,
+        };
         let backend_health_path = env_or("VLLM_BACKEND_HEALTH_PATH", "/health");
         if !backend_health_path.starts_with('/') {
             anyhow::bail!("VLLM_BACKEND_HEALTH_PATH must start with '/'");
@@ -607,6 +622,7 @@ impl Config {
             listen_port,
             listen_addr,
             backend_token,
+            backend_priority,
             backend_health_path,
             non_tee_deployment: env_bool("NON_TEE_DEPLOYMENT"),
             map_queue_full_to_429: env_bool("VLLM_PROXY_MAP_QUEUE_FULL_TO_429"),
@@ -841,6 +857,7 @@ mod tests {
             "VLLM_BACKEND_URLS",
             "VLLM_DATA_PARALLEL_SIZE",
             "VLLM_BACKEND_TOKEN",
+            "VLLM_BACKEND_PRIORITY",
             "VLLM_BACKEND_HEALTH_PATH",
             "NON_TEE_DEPLOYMENT",
             "VLLM_PROXY_MAP_QUEUE_FULL_TO_429",
@@ -860,6 +877,7 @@ mod tests {
             let config = Config::from_env().unwrap();
             assert_eq!(config.listen_addr, "0.0.0.0");
             assert!(config.backend_token.is_none());
+            assert!(config.backend_priority.is_none());
             assert_eq!(config.backend_health_path, "/health");
             assert!(!config.non_tee_deployment);
             assert!(!config.map_queue_full_to_429);
@@ -905,6 +923,27 @@ mod tests {
                 );
                 assert_eq!(config.sse_keepalive_secs, 15);
                 assert_eq!(config.listen_addr, "127.0.0.1");
+                gateway_env_cleanup();
+            },
+        );
+    }
+
+    #[test]
+    fn test_backend_priority_parses_and_validates() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                ("VLLM_BACKEND_PRIORITY", " -1 "),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.backend_priority, Some(-1));
+                for bad in ["high", "1.5", "5000"] {
+                    env::set_var("VLLM_BACKEND_PRIORITY", bad);
+                    let err = Config::from_env().unwrap_err().to_string();
+                    assert!(err.contains("VLLM_BACKEND_PRIORITY"), "{bad}: {err}");
+                }
                 gateway_env_cleanup();
             },
         );

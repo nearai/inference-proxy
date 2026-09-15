@@ -410,8 +410,9 @@ fn collect_response_headers(response: &reqwest::Response) -> Vec<(Vec<u8>, Vec<u
 ///
 /// `outer_authorization`: if it is a usable `Bearer` value (e.g. relay-injected
 /// `Authorization` on `POST /ohttp`), it is attached to the loopback request,
-/// the inner `Authorization` field is skipped, and trusted-only inner headers are
-/// scrubbed because the outer bearer establishes trusted-gateway semantics.
+/// the inner `Authorization` field is skipped, and trusted-only inner headers
+/// (`X-Request-Hash`, `X-NearAI-Priority`) are scrubbed because the outer bearer
+/// establishes trusted-gateway semantics.
 fn parse_bhttp_and_build_loopback(
     state: &AppState,
     bhttp_request: &[u8],
@@ -454,7 +455,11 @@ fn parse_bhttp_and_build_loopback(
             || name_bytes.eq_ignore_ascii_case(b"transfer-encoding")
             || name_bytes.eq_ignore_ascii_case(b"connection")
             || (relay_outer_bearer.is_some() && name_bytes.eq_ignore_ascii_case(b"authorization"))
-            || (relay_outer_bearer.is_some() && name_bytes.eq_ignore_ascii_case(b"x-request-hash"));
+            || (relay_outer_bearer.is_some() && name_bytes.eq_ignore_ascii_case(b"x-request-hash"))
+            // The loopback authenticates as a trusted caller; the inner headers
+            // come from the end customer, who must not pick the engine priority.
+            || (relay_outer_bearer.is_some()
+                && name_bytes.eq_ignore_ascii_case(crate::priority::PRIORITY_HEADER.as_bytes()));
         if skip {
             continue;
         }

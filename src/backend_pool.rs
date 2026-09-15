@@ -298,6 +298,13 @@ pub fn spawn_health_check(
                     }
                 }
             }
+            let healthy = pool
+                .backends()
+                .iter()
+                .filter(|b| b.healthy.load(Ordering::Relaxed))
+                .count();
+            metrics::gauge!("backend_pool_size").set(pool.len() as f64);
+            metrics::gauge!("backend_pool_healthy").set(healthy as f64);
         }
     });
 }

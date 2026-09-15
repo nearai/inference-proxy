@@ -229,15 +229,17 @@ pub async fn images_edits(
         upstream_data_parallel_rank: None,
     };
 
-    let (url, _guard) = match &state.config.images_edits_url_override {
-        Some(override_url) => (override_url.clone(), None),
+    // The backend bearer is scoped to pool members; an override URL is a
+    // separately configured endpoint and gets the plain client.
+    let (url, _guard, client) = match &state.config.images_edits_url_override {
+        Some(override_url) => (override_url.clone(), None, &state.http_client),
         None => {
             let (u, g) = state.backend_pool.select_url("/v1/images/edits");
-            (u, Some(g))
+            (u, Some(g), &state.backend_client)
         }
     };
 
-    proxy::proxy_multipart_request(&state.backend_client, &url, form, &request_sha256, opts).await
+    proxy::proxy_multipart_request(client, &url, form, &request_sha256, opts).await
 }
 
 /// POST /v1/audio/transcriptions — multipart proxy with signing.
@@ -318,15 +320,17 @@ pub async fn audio_transcriptions(
         upstream_data_parallel_rank: None,
     };
 
-    let (url, _guard) = match &state.config.transcriptions_url_override {
-        Some(override_url) => (override_url.clone(), None),
+    // The backend bearer is scoped to pool members; an override URL is a
+    // separately configured endpoint and gets the plain client.
+    let (url, _guard, client) = match &state.config.transcriptions_url_override {
+        Some(override_url) => (override_url.clone(), None, &state.http_client),
         None => {
             let (u, g) = state.backend_pool.select_url("/v1/audio/transcriptions");
-            (u, Some(g))
+            (u, Some(g), &state.backend_client)
         }
     };
 
-    proxy::proxy_multipart_request(&state.backend_client, &url, form, &request_sha256, opts).await
+    proxy::proxy_multipart_request(client, &url, form, &request_sha256, opts).await
 }
 
 /// Generic JSON passthrough with signing and optional encryption support.
@@ -388,7 +392,8 @@ async fn json_passthrough_encrypted(
                 tracing_ids: Some(tracing_ids.clone()),
                 upstream_data_parallel_rank: None,
             };
-            proxy::proxy_json_request(&state.backend_client, u, forward_body, opts).await
+            // Override URL: not a pool member, so no backend bearer.
+            proxy::proxy_json_request(&state.http_client, u, forward_body, opts).await
         }
         None => {
             let (url, guard) = state.backend_pool.select_url(pool_path);

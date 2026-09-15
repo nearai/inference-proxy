@@ -18,6 +18,9 @@ use vllm_proxy_rs::*;
 #[derive(Default)]
 struct GatewayOptions {
     backend_token: Option<String>,
+    backend_priority: Option<i64>,
+    /// Mock cloud-api base URL, for `sk-` key requests.
+    cloud_api_url: Option<String>,
     backend_health_path: Option<String>,
     non_tee_deployment: bool,
     map_queue_full_to_429: bool,
@@ -66,7 +69,7 @@ fn build_gateway(mock_url: &str, options: GatewayOptions) -> axum::Router {
         rate_limit_per_second: 100,
         rate_limit_burst_size: 200,
         rate_limit_trust_proxy_headers: true,
-        cloud_api_url: None,
+        cloud_api_url: options.cloud_api_url.clone(),
         cloud_api_auth_max_attempts: 1,
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
@@ -96,6 +99,7 @@ fn build_gateway(mock_url: &str, options: GatewayOptions) -> axum::Router {
         listen_port: 8000,
         listen_addr: "127.0.0.1".to_string(),
         backend_token: options.backend_token.clone(),
+        backend_priority: options.backend_priority,
         backend_health_path: options
             .backend_health_path
             .unwrap_or_else(|| "/health".to_string()),
@@ -141,22 +145,29 @@ fn build_gateway(mock_url: &str, options: GatewayOptions) -> axum::Router {
         .build_recorder()
         .handle();
 
-    // Mirror main.rs: the backend bearer is a default header on a dedicated
-    // client, never on the general-purpose one.
+    // Mirror main.rs: the backend bearer and priority header are default
+    // headers on a dedicated client, never on the general-purpose one.
     let http_client = reqwest::Client::new();
-    let backend_client = match &options.backend_token {
-        Some(token) => {
-            let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert(
-                reqwest::header::AUTHORIZATION,
-                reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
-            );
-            reqwest::Client::builder()
-                .default_headers(headers)
-                .build()
-                .unwrap()
-        }
-        None => http_client.clone(),
+    let mut backend_headers = reqwest::header::HeaderMap::new();
+    if let Some(token) = &options.backend_token {
+        backend_headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+    }
+    if let Some(priority) = options.backend_priority {
+        backend_headers.insert(
+            priority::PRIORITY_HEADER,
+            reqwest::header::HeaderValue::from(priority),
+        );
+    }
+    let backend_client = if backend_headers.is_empty() {
+        http_client.clone()
+    } else {
+        reqwest::Client::builder()
+            .default_headers(backend_headers)
+            .build()
+            .unwrap()
     };
 
     let backend_pool = Arc::new(backend_pool::BackendPool::new(backend_urls));
@@ -286,6 +297,165 @@ async fn without_backend_token_no_authorization_reaches_backend() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// Request priority: trusted callers set it by header, everyone else gets 0
+// ---------------------------------------------------------------------------
+
+fn chat_request_with(token: &str, priority_header: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json");
+    if let Some(value) = priority_header {
+        builder = builder.header(priority::PRIORITY_HEADER, value);
+    }
+    // A client-supplied priority is always overwritten.
+    builder
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "test-model",
+                "priority": 999,
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap()
+}
+
+fn expect_priority(value: i64) -> Mock {
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"priority": value}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+        .expect(1)
+}
+
+#[tokio::test]
+async fn gateway_sends_priority_header_next_to_backend_token() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", "Bearer backend-secret"))
+        .and(header(priority::PRIORITY_HEADER, "-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let app = build_gateway(
+        &mock.uri(),
+        GatewayOptions {
+            backend_token: Some("backend-secret".to_string()),
+            backend_priority: Some(-1),
+            ..Default::default()
+        },
+    );
+    let response = app
+        .oneshot(chat_request(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn trusted_caller_sets_priority_by_header_everything_else_is_zero() {
+    let mock = MockServer::start().await;
+    // Requests below use the proxy's config token, i.e. a trusted caller
+    // (cloud-api, or the gateway on the CVM hop).
+    for (header_value, expected) in [
+        (Some("-1"), -1),  // the OpenRouter gateway
+        (None, 0),         // cloud-api: no header, default
+        (Some("abc"), 0),  // garbage falls back to the default
+        (Some("5000"), 0), // out of bounds too
+    ] {
+        expect_priority(expected).mount(&mock).await;
+        let app = build_gateway(&mock.uri(), GatewayOptions::default());
+        let response = app
+            .oneshot(chat_request_with("test-token", header_value))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "header={header_value:?}");
+        mock.verify().await;
+        mock.reset().await;
+    }
+}
+
+#[tokio::test]
+async fn customer_key_cannot_set_priority() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "valid": true, "organization_id": "org", "workspace_id": "ws", "api_key_id": "k"
+        })))
+        .mount(&mock)
+        .await;
+    for header_value in [Some("5"), Some("-1"), None] {
+        expect_priority(0).mount(&mock).await;
+        let app = build_gateway(
+            &mock.uri(),
+            GatewayOptions {
+                cloud_api_url: Some(mock.uri()),
+                ..Default::default()
+            },
+        );
+        let response = app
+            .oneshot(chat_request_with("sk-live-customer", header_value))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "header={header_value:?}");
+        mock.verify().await;
+        mock.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/check_api_key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "valid": true, "organization_id": "org", "workspace_id": "ws", "api_key_id": "k"
+            })))
+            .mount(&mock)
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn completions_route_gets_priority_too() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/completions"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"priority": -1}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "cmpl-1", "object": "text_completion", "model": "test-model",
+            "choices": [{"index": 0, "text": "hi", "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let app = build_gateway(&mock.uri(), GatewayOptions::default());
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/completions")
+        .header("authorization", "Bearer test-token")
+        .header("content-type", "application/json")
+        .header(priority::PRIORITY_HEADER, "-1")
+        .body(Body::from(
+            serde_json::to_vec(
+                &serde_json::json!({"model": "test-model", "prompt": "hi", "priority": 3}),
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    mock.verify().await;
 }
 
 // ---------------------------------------------------------------------------

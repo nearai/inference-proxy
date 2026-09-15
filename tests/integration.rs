@@ -237,6 +237,7 @@ fn build_test_app_inner_with_pool(
         listen_port: 8000,
         listen_addr: "127.0.0.1".to_string(),
         backend_token: None,
+        backend_priority: None,
         backend_health_path: "/health".to_string(),
         non_tee_deployment: false,
         map_queue_full_to_429: false,
@@ -3952,14 +3953,16 @@ async fn test_strip_empty_tool_calls() {
     let mock_server = MockServer::start().await;
 
     // Expect the backend receives the request WITHOUT empty tool_calls.
-    // The proxy injects stream: true internally, so include those fields.
+    // The proxy injects stream: true and the engine priority internally, so
+    // include those fields.
     let expected_backend_body = serde_json::json!({
         "messages": [
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": "hello"}
         ],
         "stream": true,
-        "stream_options": {"include_usage": true}
+        "stream_options": {"include_usage": true},
+        "priority": 0
     });
 
     Mock::given(method("POST"))
@@ -5242,6 +5245,7 @@ fn build_test_app_with_cloud_api_retries(
         listen_port: 8000,
         listen_addr: "127.0.0.1".to_string(),
         backend_token: None,
+        backend_priority: None,
         backend_health_path: "/health".to_string(),
         non_tee_deployment: false,
         map_queue_full_to_429: false,
@@ -7851,6 +7855,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         listen_port: 0, // not used in oneshot tests
         listen_addr: "127.0.0.1".to_string(),
         backend_token: None,
+        backend_priority: None,
         backend_health_path: "/health".to_string(),
         non_tee_deployment: false,
         map_queue_full_to_429: false,
@@ -8285,6 +8290,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         listen_port: port,
         listen_addr: "127.0.0.1".to_string(),
         backend_token: None,
+        backend_priority: None,
         backend_health_path: "/health".to_string(),
         non_tee_deployment: false,
         map_queue_full_to_429: false,

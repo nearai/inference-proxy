@@ -104,6 +104,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
         listen_port: 8000,
         listen_addr: "127.0.0.1".to_string(),
         backend_token: None,
+        backend_priority: None,
         backend_health_path: "/health".to_string(),
         non_tee_deployment: false,
         map_queue_full_to_429: false,

@@ -20,6 +20,12 @@ pub async fn signature(
     Path(chat_id): Path<String>,
     Query(query): Query<SignatureQuery>,
 ) -> Result<impl IntoResponse, AppError> {
+    if state.config.non_tee_deployment {
+        return Err(AppError::NotFound(
+            "Response signatures are not available on this endpoint: it does not run inside a TEE."
+                .to_string(),
+        ));
+    }
     let cache_value = state
         .cache
         .get_chat(&chat_id)

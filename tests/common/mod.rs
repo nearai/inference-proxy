@@ -76,6 +76,14 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         score_url_override: None,
         ohttp_enabled: false,
         listen_port: 8000,
+        listen_addr: "127.0.0.1".to_string(),
+        backend_token: None,
+        backend_health_path: "/health".to_string(),
+        non_tee_deployment: false,
+        map_queue_full_to_429: false,
+        stream_error_peek_ms: 0,
+        rejected_content_part_types: Vec::new(),
+        sse_keepalive_secs: 0,
         dstack_socket_path: options
             .dstack_socket_path
             .unwrap_or_else(|| "/var/run/dstack.sock".to_string()),
@@ -125,6 +133,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         cache: Arc::new(chat_cache),
         attestation_cache: Arc::new(vllm_proxy_rs::attestation::AttestationCache::new(300)),
         http_client: reqwest::Client::new(),
+        backend_client: reqwest::Client::new(),
         metrics_handle,
         tls_cert_fingerprint: Arc::new(
             vllm_proxy_rs::attestation::TlsCertTracker::new(None).expect("tracker for None path"),

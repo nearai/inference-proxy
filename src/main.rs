@@ -56,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
     let config = config::Config::from_env()?;
 
     let listen_port = config.listen_port;
+    let listen_addr = config.listen_addr.clone();
 
     // Warn if any backend URL points to the proxy's own listen address
     let self_local = format!("://localhost:{listen_port}");
@@ -143,16 +144,36 @@ async fn main() -> anyhow::Result<()> {
     // closed. A reused-but-closed connection surfaces as
     // `error sending request for url ...` and produced ~12 spurious 401s/h
     // on `/v1/check_api_key` before we capped this. (See auth.rs retry path.)
-    let mut http_builder = reqwest::Client::builder()
-        .dns_resolver(Arc::new(Ipv4OnlyResolver))
-        .pool_max_idle_per_host(config.max_keepalive)
-        .timeout(std::time::Duration::from_secs(config.timeout_secs));
-    if config.pool_idle_timeout_secs > 0 {
-        http_builder = http_builder.pool_idle_timeout(std::time::Duration::from_secs(
-            config.pool_idle_timeout_secs,
-        ));
-    }
-    let http_client = http_builder.build()?;
+    let build_http_client = |default_headers: Option<reqwest::header::HeaderMap>| {
+        let mut http_builder = reqwest::Client::builder()
+            .dns_resolver(Arc::new(Ipv4OnlyResolver))
+            .pool_max_idle_per_host(config.max_keepalive)
+            .timeout(std::time::Duration::from_secs(config.timeout_secs));
+        if config.pool_idle_timeout_secs > 0 {
+            http_builder = http_builder.pool_idle_timeout(std::time::Duration::from_secs(
+                config.pool_idle_timeout_secs,
+            ));
+        }
+        if let Some(headers) = default_headers {
+            http_builder = http_builder.default_headers(headers);
+        }
+        http_builder.build()
+    };
+    let http_client = build_http_client(None)?;
+    // Backend-only client: carries the backend bearer (if any) as a default
+    // header so it can never be attached to a cloud-api or registry request.
+    let backend_client = match &config.backend_token {
+        Some(token) => {
+            let mut headers = reqwest::header::HeaderMap::new();
+            let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|_| anyhow::anyhow!("VLLM_BACKEND_TOKEN is not a valid header value"))?;
+            value.set_sensitive(true);
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+            info!("Backend requests will carry the configured VLLM_BACKEND_TOKEN");
+            build_http_client(Some(headers))?
+        }
+        None => http_client.clone(),
+    };
 
     // Initialize metrics
     let metrics_handle = metrics_middleware::setup_metrics_recorder();
@@ -168,6 +189,7 @@ async fn main() -> anyhow::Result<()> {
         cache: Arc::new(chat_cache),
         attestation_cache: attestation_cache.clone(),
         http_client,
+        backend_client,
         metrics_handle,
         tls_cert_fingerprint: tls_cert_fingerprint.clone(),
         backend_pool: backend_pool.clone(),
@@ -195,22 +217,29 @@ async fn main() -> anyhow::Result<()> {
             http_client: state.http_client.clone(),
         }
     });
-    attestation::spawn_cache_refresh_task(
-        attestation_cache,
-        model_name,
-        state.signing.clone(),
-        state.config.gpu_no_hw_mode,
-        tls_cert_fingerprint,
-        state.config.attestation_cache_ttl_secs / 2,
-        compose_manager,
-        ohttp_attestation_ed25519,
-        delegate_refresh,
-    );
+    if state.config.non_tee_deployment {
+        // Non-TEE deployment (gateway mode): no dstack guest agent, so there is
+        // nothing to attest and the periodic refresh would only log failures.
+        info!("dstack not available on this deployment; attestation cache refresh disabled");
+    } else {
+        attestation::spawn_cache_refresh_task(
+            attestation_cache,
+            model_name,
+            state.signing.clone(),
+            state.config.gpu_no_hw_mode,
+            tls_cert_fingerprint,
+            state.config.attestation_cache_ttl_secs / 2,
+            compose_manager,
+            ohttp_attestation_ed25519,
+            delegate_refresh,
+        );
+    }
 
     // Run OpenAI chat compatibility checks if enabled
     if state.config.openai_chat_compatibility_check_enabled {
         info!("OpenAI chat compatibility check enabled, verifying backend...");
-        if let Err(e) = startup_checks::run_startup_checks(&state.http_client, &state.config).await
+        if let Err(e) =
+            startup_checks::run_startup_checks(&state.backend_client, &state.config).await
         {
             tracing::error!(error = %e, "OpenAI chat compatibility check failed — exiting");
             return Err(e.into());
@@ -225,15 +254,16 @@ async fn main() -> anyhow::Result<()> {
             backends = backend_pool.len(),
             interval_secs = state.config.health_check_interval_secs,
             max_failures = state.config.health_check_max_failures,
+            health_path = %state.config.backend_health_path,
             "Spawning backend health checker"
         );
         backend_pool::spawn_health_check(
             backend_pool,
-            state.http_client.clone(),
+            state.backend_client.clone(),
             std::time::Duration::from_secs(state.config.health_check_interval_secs),
             std::time::Duration::from_secs(state.config.health_check_timeout_secs),
             state.config.health_check_max_failures,
-            routes::health::BACKEND_HEALTH_PATH,
+            &state.config.backend_health_path,
         );
     }
 
@@ -262,7 +292,7 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
 
     // Bind and serve
-    let addr = format!("0.0.0.0:{listen_port}");
+    let addr = format!("{}:{listen_port}", listen_addr);
     let listener = TcpListener::bind(&addr).await?;
     info!("Listening on {addr}");
 

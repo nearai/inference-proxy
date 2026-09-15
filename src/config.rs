@@ -239,6 +239,48 @@ pub struct Config {
     pub ohttp_enabled: bool,
     /// Listen port for the proxy (used by OHTTP handler for loopback requests).
     pub listen_port: u16,
+    /// Interface to bind (`LISTEN_ADDR`, default `0.0.0.0`). Gateway
+    /// deployments behind a local TLS terminator bind `127.0.0.1`.
+    pub listen_addr: String,
+    /// Bearer token attached to every request sent to the inference backends
+    /// (`VLLM_BACKEND_TOKEN`). Used when the backends are themselves
+    /// inference-proxies (gateway mode): they accept it as a trusted config
+    /// token, so they neither re-validate the customer key nor double-report
+    /// usage. Never sent to cloud-api or any other service.
+    pub backend_token: Option<String>,
+    /// Path probed on each backend by the pool health checker and by
+    /// `/healthz` (`VLLM_BACKEND_HEALTH_PATH`, default `/health`, the engine's
+    /// lightweight route). Gateway mode points it at the inference-proxy's
+    /// unauthenticated `/healthz`.
+    pub backend_health_path: String,
+    /// This proxy does not run inside a TEE (`NON_TEE_DEPLOYMENT=1`): no
+    /// dstack guest agent, no hardware evidence, dev signing keys. Effects:
+    /// `/healthz` skips the dstack probe, the attestation cache refresh is not
+    /// started, and `/v1/attestation/report`, `/v1/signature/{id}` and
+    /// `/internal/gpu_evidence` answer 404 so nothing unverifiable is
+    /// advertised. Inference routes are unaffected.
+    pub non_tee_deployment: bool,
+    /// Rewrite the engine's queue-full rejection (HTTP 503 / SSE error event
+    /// `"The request queue is full."`) to 429 (`VLLM_PROXY_MAP_QUEUE_FULL_TO_429`).
+    /// Aggregators treat 429 as back-pressure and 5xx as an outage; off by
+    /// default because cloud-api's peer fallback keys on the 503.
+    pub map_queue_full_to_429: bool,
+    /// For streaming requests, wait up to this many milliseconds for the
+    /// first upstream SSE chunk before committing a 200 to the client
+    /// (`VLLM_PROXY_STREAM_ERROR_PEEK_MS`, 0 = off). An engine that rejects
+    /// at admission (queue full, aborted) emits `data: {"error": …}` as its
+    /// first event on an HTTP 200 stream; peeking turns that into a real
+    /// error status instead of a 200 that fails mid-stream.
+    pub stream_error_peek_ms: u64,
+    /// Chat content part `type`s refused with 400 before dispatch
+    /// (`VLLM_PROXY_REJECTED_CONTENT_PART_TYPES`, e.g. `video_url,input_audio,file`).
+    pub rejected_content_part_types: Vec<String>,
+    /// Emit an SSE comment (`: keep-alive`) on client streams whenever the
+    /// upstream has been silent for this many seconds
+    /// (`VLLM_PROXY_SSE_KEEPALIVE_SECS`, 0 = off). Comments are not hashed into
+    /// the response signature, so leave this off where clients verify
+    /// signatures over the raw stream bytes.
+    pub sse_keepalive_secs: u64,
 
     // Endpoint URL overrides (Some = explicitly set, bypasses backend pool)
     pub images_url_override: Option<String>,
@@ -396,6 +438,21 @@ impl Config {
             .unwrap_or_else(|_| "8000".to_string())
             .parse()
             .map_err(|_| anyhow::anyhow!("LISTEN_PORT must be a valid port number"))?;
+        let listen_addr = env_or("LISTEN_ADDR", "0.0.0.0");
+        if listen_addr.parse::<std::net::IpAddr>().is_err() {
+            anyhow::bail!("LISTEN_ADDR must be an IP address");
+        }
+        let backend_token = env::var("VLLM_BACKEND_TOKEN")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let backend_health_path = env_or("VLLM_BACKEND_HEALTH_PATH", "/health");
+        if !backend_health_path.starts_with('/') {
+            anyhow::bail!("VLLM_BACKEND_HEALTH_PATH must start with '/'");
+        }
+        let rejected_content_part_types = crate::content_policy::parse_rejected_types(
+            &env::var("VLLM_PROXY_REJECTED_CONTENT_PART_TYPES").unwrap_or_default(),
+        );
 
         let git_rev = std::fs::read_to_string("/etc/.GIT_REV")
             .map(|s| s.trim().to_string())
@@ -530,6 +587,14 @@ impl Config {
             health_check_timeout_secs: env_int("HEALTH_CHECK_TIMEOUT_SECS", 3) as u64,
             ohttp_enabled: env_bool("OHTTP_ENABLED"),
             listen_port,
+            listen_addr,
+            backend_token,
+            backend_health_path,
+            non_tee_deployment: env_bool("NON_TEE_DEPLOYMENT"),
+            map_queue_full_to_429: env_bool("VLLM_PROXY_MAP_QUEUE_FULL_TO_429"),
+            stream_error_peek_ms: env_int("VLLM_PROXY_STREAM_ERROR_PEEK_MS", 0) as u64,
+            rejected_content_part_types,
+            sse_keepalive_secs: env_int("VLLM_PROXY_SSE_KEEPALIVE_SECS", 0) as u64,
             images_url_override,
             images_edits_url_override,
             transcriptions_url_override,
@@ -749,6 +814,100 @@ mod tests {
             || {
                 let config = Config::from_env().unwrap();
                 assert_eq!(config.tokens, vec!["tok-a", "tok-b", "tok-c"]);
+            },
+        );
+    }
+
+    fn gateway_env_cleanup() {
+        for key in [
+            "VLLM_BACKEND_URLS",
+            "VLLM_DATA_PARALLEL_SIZE",
+            "VLLM_BACKEND_TOKEN",
+            "VLLM_BACKEND_HEALTH_PATH",
+            "NON_TEE_DEPLOYMENT",
+            "VLLM_PROXY_MAP_QUEUE_FULL_TO_429",
+            "VLLM_PROXY_STREAM_ERROR_PEEK_MS",
+            "VLLM_PROXY_REJECTED_CONTENT_PART_TYPES",
+            "VLLM_PROXY_SSE_KEEPALIVE_SECS",
+            "LISTEN_ADDR",
+        ] {
+            env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn test_gateway_defaults_leave_existing_deployments_unchanged() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            gateway_env_cleanup();
+            let config = Config::from_env().unwrap();
+            assert_eq!(config.listen_addr, "0.0.0.0");
+            assert!(config.backend_token.is_none());
+            assert_eq!(config.backend_health_path, "/health");
+            assert!(!config.non_tee_deployment);
+            assert!(!config.map_queue_full_to_429);
+            assert_eq!(config.stream_error_peek_ms, 0);
+            assert!(config.rejected_content_part_types.is_empty());
+            assert_eq!(config.sse_keepalive_secs, 0);
+            assert_eq!(config.backend_urls, vec!["http://localhost:8000"]);
+        });
+    }
+
+    #[test]
+    fn test_gateway_settings_parse() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                ("VLLM_BACKEND_TOKEN", " backend-secret "),
+                ("VLLM_BACKEND_HEALTH_PATH", "/healthz"),
+                ("NON_TEE_DEPLOYMENT", "1"),
+                ("VLLM_PROXY_MAP_QUEUE_FULL_TO_429", "1"),
+                ("VLLM_PROXY_STREAM_ERROR_PEEK_MS", "750"),
+                (
+                    "VLLM_PROXY_REJECTED_CONTENT_PART_TYPES",
+                    "video_url, input_audio",
+                ),
+                ("VLLM_PROXY_SSE_KEEPALIVE_SECS", "15"),
+                ("LISTEN_ADDR", "127.0.0.1"),
+            ],
+            || {
+                env::remove_var("VLLM_BACKEND_URLS");
+                env::remove_var("VLLM_DATA_PARALLEL_SIZE");
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.backend_token.as_deref(), Some("backend-secret"));
+                assert_eq!(config.backend_health_path, "/healthz");
+                assert!(config.non_tee_deployment);
+                assert!(config.map_queue_full_to_429);
+                assert_eq!(config.stream_error_peek_ms, 750);
+                assert_eq!(
+                    config.rejected_content_part_types,
+                    vec!["video_url", "input_audio"]
+                );
+                assert_eq!(config.sse_keepalive_secs, 15);
+                assert_eq!(config.listen_addr, "127.0.0.1");
+                gateway_env_cleanup();
+            },
+        );
+    }
+
+    #[test]
+    fn test_gateway_listen_addr_and_health_path_are_validated() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                ("LISTEN_ADDR", "not-an-ip"),
+            ],
+            || {
+                gateway_env_cleanup();
+                env::set_var("LISTEN_ADDR", "not-an-ip");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("LISTEN_ADDR"), "{err}");
+                env::remove_var("LISTEN_ADDR");
+                env::set_var("VLLM_BACKEND_HEALTH_PATH", "healthz");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("VLLM_BACKEND_HEALTH_PATH"), "{err}");
+                gateway_env_cleanup();
             },
         );
     }

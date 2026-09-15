@@ -13,7 +13,7 @@ pub async fn metrics(
 ) -> Result<Response, AppError> {
     let (url, _guard) = state.backend_pool.select_url("/metrics");
     proxy::proxy_simple(
-        &state.http_client,
+        &state.backend_client,
         &url,
         reqwest::Method::GET,
         None,
@@ -31,7 +31,7 @@ pub async fn models(
 ) -> Result<Response, AppError> {
     let (url, _guard) = state.backend_pool.select_url("/v1/models");
     proxy::proxy_simple(
-        &state.http_client,
+        &state.backend_client,
         &url,
         reqwest::Method::GET,
         None,

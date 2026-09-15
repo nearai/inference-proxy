@@ -60,7 +60,7 @@ pub async fn classify(
     let (backend_url, backend_guard) = state.backend_pool.select_url(&path_with_query);
     let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
 
-    let mut request = state.http_client.post(&backend_url);
+    let mut request = state.backend_client.post(&backend_url);
     for (name, value) in &headers {
         if !EXCLUDED_REQUEST_HEADERS.contains(&name.as_str()) {
             request = request.header(name, value);
@@ -84,7 +84,7 @@ pub async fn classify(
         let body = response.bytes().await.unwrap_or_default();
         let info = proxy::log_upstream_error(status, &backend_url, &body, Some(&tracing_ids));
         return Err(AppError::UpstreamParsed {
-            status: proxy::effective_error_status(status.as_u16(), info.as_ref()),
+            status: proxy::effective_error_status(status.as_u16(), info.as_ref(), false),
             message: info
                 .as_ref()
                 .map(|error| error.message.clone())
@@ -127,6 +127,9 @@ pub async fn classify(
             chunk_transform: None,
             backend_guard: Some(backend_guard),
             stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
+            sse_keepalive_secs: 0,
+            map_queue_full_to_429: false,
+            stream_error_peek_ms: 0,
             response_shape: ResponseShape::ChatCompletion,
             tracing_ids: Some(tracing_ids),
             upstream_data_parallel_rank: None,

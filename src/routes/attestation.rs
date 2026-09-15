@@ -24,6 +24,12 @@ pub async fn attestation_report(
     State(state): State<AppState>,
     Query(query): Query<AttestationQuery>,
 ) -> Result<impl IntoResponse, AppError> {
+    if state.config.non_tee_deployment {
+        return Err(AppError::NotFound(
+            "Attestation is not available on this endpoint: it does not run inside a TEE."
+                .to_string(),
+        ));
+    }
     let signing_algo = query.signing_algo.as_deref().unwrap_or("ecdsa");
 
     if signing_algo != "ecdsa" && signing_algo != "ed25519" {

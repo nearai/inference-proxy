@@ -1483,7 +1483,9 @@ async fn connect_error_is_not_retried_without_failover() {
         },
     );
     let response = app.oneshot(chat_request(hello_body())).await.unwrap();
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let json = json_body(response).await;
+    assert_eq!(json["error"]["type"], "upstream_unreachable");
     mock.verify().await;
 }
 

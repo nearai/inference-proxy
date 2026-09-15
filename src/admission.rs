@@ -30,21 +30,20 @@
 //! endpoint or extra token is involved. Disabled (`max_inflight = 0`) the
 //! module is inert and the in-CVM behavior is unchanged.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
 use crate::backend_pool::BackendPool;
 
-/// Window over which time-to-first-generation samples are kept.
+/// Window over which time-to-first-generation observations are counted, as
+/// one-second buckets of `(samples, breaches)`: bounded memory and work at
+/// any request rate, and exactly this long.
 pub const TTFT_WINDOW: Duration = Duration::from_secs(60);
 /// Samples needed in the window before the bound is enforced at all.
 pub const TTFT_MIN_SAMPLES: usize = 20;
-/// Cap on retained samples (oldest dropped first) so evaluation stays cheap.
-pub const TTFT_MAX_SAMPLES: usize = 4096;
 /// Fraction of the window that must breach the bound to trip, with a floor
 /// of `TTFT_MIN_BREACHES`, so one slow request cannot close the fleet.
 pub const TTFT_BREACH_FRACTION: f64 = 0.05;
@@ -54,6 +53,12 @@ pub const TTFT_MIN_BREACHES: usize = 2;
 const BREAKER_REEVALUATE_AFTER: Duration = Duration::from_secs(1);
 /// Marker for a permit that has not been attached to a backend yet.
 const NO_BACKEND: usize = usize::MAX;
+
+// Permit lifecycle. Only `DISPATCHED` yields a TTFT observation.
+const PENDING: u8 = 0;
+const DISPATCHED: u8 = 1;
+const GENERATED: u8 = 2;
+const ABANDONED: u8 = 3;
 
 /// Operator settings, parsed and validated by `Config::from_env`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -117,15 +122,25 @@ struct Breaker {
     tripped: bool,
 }
 
+/// One second of time-to-first-generation observations.
+#[derive(Clone, Copy, Default)]
+struct Bucket {
+    /// Seconds since `epoch` this bucket currently holds (+1; 0 = unused).
+    second: u64,
+    samples: u32,
+    breaches: u32,
+}
+
+const TTFT_BUCKETS: usize = TTFT_WINDOW.as_secs() as usize;
+
 /// Fleet-wide admission state shared by every request (`AppState.admission`).
 pub struct AdmissionController {
     config: Option<AdmissionConfig>,
     inflight: AtomicU32,
     budget: AtomicU32,
     ramp: Mutex<Ramp>,
-    /// `(observed_at, ttft)` samples, oldest first, pruned to `TTFT_WINDOW`
-    /// and capped at `TTFT_MAX_SAMPLES`.
-    ttft: Mutex<VecDeque<(Instant, Duration)>>,
+    /// Ring of one-second buckets covering the last `TTFT_WINDOW`.
+    ttft: Mutex<[Bucket; TTFT_BUCKETS]>,
     breaker: Mutex<Breaker>,
     /// Per backend index: last engine admission rejection as milliseconds
     /// since `epoch`, plus one so that zero means "never".
@@ -153,7 +168,7 @@ impl AdmissionController {
                 interval_started: now,
                 dirty: false,
             }),
-            ttft: Mutex::new(VecDeque::new()),
+            ttft: Mutex::new([Bucket::default(); TTFT_BUCKETS]),
             breaker: Mutex::new(Breaker {
                 evaluated_at: None,
                 tripped: false,
@@ -234,6 +249,33 @@ impl AdmissionController {
         }
     }
 
+    /// The overload and budget checks without taking a slot: a cheap early
+    /// refusal for routes that still have expensive work (image validation)
+    /// ahead of `try_admit`. Nothing is reserved; the later `try_admit` can
+    /// still refuse.
+    pub fn precheck(&self, pool: &BackendPool) -> Result<(), Rejected> {
+        self.precheck_at(pool, Instant::now())
+    }
+
+    pub(crate) fn precheck_at(&self, pool: &BackendPool, now: Instant) -> Result<(), Rejected> {
+        let Some(config) = &self.config else {
+            return Ok(());
+        };
+        // Overload first, so a signal that just arrived cannot be preceded by
+        // a ramp step that treats the interval as clean.
+        if self.ttft_over_bound(config, now) {
+            return Err(self.reject(RejectReason::Ttft));
+        }
+        if self.every_backend_queued(config, pool, now) {
+            return Err(self.reject(RejectReason::BackendQueue));
+        }
+        self.tick_ramp(config, now);
+        if self.inflight.load(Ordering::Acquire) >= self.budget.load(Ordering::Relaxed) {
+            return Err(self.reject(RejectReason::Budget));
+        }
+        Ok(())
+    }
+
     /// Run the overload and budget checks for a new request. `Ok(None)` when
     /// admission is disabled; `Ok(Some(permit))` holds one budget slot until
     /// the permit is dropped. The per-host share is applied by the caller at
@@ -248,18 +290,10 @@ impl AdmissionController {
         pool: &BackendPool,
         now: Instant,
     ) -> Result<Option<Permit>, Rejected> {
-        let Some(config) = &self.config else {
+        if self.config.is_none() {
             return Ok(None);
-        };
-        // Overload first, so a signal that just arrived cannot be preceded by
-        // a ramp step that treats the interval as clean.
-        if self.ttft_over_bound(config, now) {
-            return Err(self.reject(RejectReason::Ttft));
         }
-        if self.every_backend_queued(config, pool, now) {
-            return Err(self.reject(RejectReason::BackendQueue));
-        }
-        self.tick_ramp(config, now);
+        self.precheck_at(pool, now)?;
         let mut current = self.inflight.load(Ordering::Acquire);
         loop {
             if current >= self.budget.load(Ordering::Relaxed) {
@@ -278,10 +312,9 @@ impl AdmissionController {
         metrics::gauge!("admission_inflight").increment(1.0);
         Ok(Some(Permit {
             controller: Arc::clone(self),
-            started: now,
             backend: AtomicUsize::new(NO_BACKEND),
-            dispatched: AtomicBool::new(false),
-            generation_seen: AtomicBool::new(false),
+            state: AtomicU8::new(PENDING),
+            dispatched_at: OnceLock::new(),
         }))
     }
 
@@ -289,8 +322,13 @@ impl AdmissionController {
         self.ramp.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn ttft_window(&self) -> MutexGuard<'_, VecDeque<(Instant, Duration)>> {
+    fn ttft_buckets(&self) -> MutexGuard<'_, [Bucket; TTFT_BUCKETS]> {
         self.ttft.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Seconds since `epoch`, plus one (bucket stamps use 0 for "unused").
+    fn stamp(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.epoch).as_secs() + 1
     }
 
     /// Grow the budget by one step when a whole interval passed without an
@@ -338,33 +376,48 @@ impl AdmissionController {
     /// request ended without a generation event after waiting `ttft`).
     fn record_ttft(&self, now: Instant, ttft: Duration) {
         metrics::histogram!("admission_ttft_seconds").record(ttft.as_secs_f64());
-        if self
-            .config
-            .as_ref()
-            .and_then(|c| c.ttft_p95_max)
-            .is_some_and(|max| ttft > max)
-        {
+        let Some(max) = self.config.as_ref().and_then(|c| c.ttft_p95_max) else {
+            return;
+        };
+        let breach = ttft > max;
+        if breach {
             // A breach counts against the current ramp interval even if the
             // breaker is not (yet) tripped.
             self.mark_dirty();
         }
-        let mut window = self.ttft_window();
-        window.push_back((now, ttft));
-        while window.len() > TTFT_MAX_SAMPLES {
-            window.pop_front();
+        let stamp = self.stamp(now);
+        let mut buckets = self.ttft_buckets();
+        let bucket = &mut buckets[(stamp % TTFT_BUCKETS as u64) as usize];
+        if bucket.second != stamp {
+            *bucket = Bucket {
+                second: stamp,
+                samples: 0,
+                breaches: 0,
+            };
         }
-        prune(&mut window, now);
+        bucket.samples = bucket.samples.saturating_add(1);
+        if breach {
+            bucket.breaches = bucket.breaches.saturating_add(1);
+        }
+    }
+
+    /// `(samples, breaches)` over the window, whatever the count.
+    fn ttft_totals(&self, now: Instant) -> (usize, usize) {
+        let newest = self.stamp(now);
+        let oldest = newest.saturating_sub(TTFT_BUCKETS as u64 - 1);
+        let buckets = self.ttft_buckets();
+        buckets
+            .iter()
+            .filter(|b| b.second != 0 && b.second >= oldest && b.second <= newest)
+            .fold((0, 0), |(s, b), bucket| {
+                (s + bucket.samples as usize, b + bucket.breaches as usize)
+            })
     }
 
     /// `(samples, breaches)` in the window, or `None` below the minimum.
-    pub fn ttft_breaches(&self, max: Duration, now: Instant) -> Option<(usize, usize)> {
-        let mut window = self.ttft_window();
-        prune(&mut window, now);
-        if window.len() < TTFT_MIN_SAMPLES {
-            return None;
-        }
-        let breaches = window.iter().filter(|(_, d)| *d > max).count();
-        Some((window.len(), breaches))
+    pub fn ttft_breaches(&self, now: Instant) -> Option<(usize, usize)> {
+        let (samples, breaches) = self.ttft_totals(now);
+        (samples >= TTFT_MIN_SAMPLES).then_some((samples, breaches))
     }
 
     fn ttft_over_bound(&self, config: &AdmissionConfig, now: Instant) -> bool {
@@ -376,13 +429,11 @@ impl AdmissionController {
             .evaluated_at
             .is_some_and(|at| now.saturating_duration_since(at) < BREAKER_REEVALUATE_AFTER);
         if !fresh {
-            let over = self
-                .ttft_breaches(max, now)
-                .is_some_and(|(samples, breaches)| {
-                    let needed = ((samples as f64 * TTFT_BREACH_FRACTION).ceil() as usize)
-                        .max(TTFT_MIN_BREACHES);
-                    breaches >= needed
-                });
+            let over = self.ttft_breaches(now).is_some_and(|(samples, breaches)| {
+                let needed = ((samples as f64 * TTFT_BREACH_FRACTION).ceil() as usize)
+                    .max(TTFT_MIN_BREACHES);
+                breaches >= needed
+            });
             if over != breaker.tripped {
                 if over {
                     warn!(
@@ -451,27 +502,21 @@ impl AdmissionController {
     }
 }
 
-fn prune(window: &mut VecDeque<(Instant, Duration)>, now: Instant) {
-    while let Some((at, _)) = window.front() {
-        if now.saturating_duration_since(*at) > TTFT_WINDOW {
-            window.pop_front();
-        } else {
-            break;
-        }
-    }
-}
-
 /// One admitted request's budget slot. Dropping it releases the slot; the
 /// streaming path moves it into the pump task next to the backend guard so
 /// the slot is held for the whole stream.
+///
+/// Lifecycle: `PENDING` (admitted) → `DISPATCHED` (the engine accepted the
+/// request; the TTFT clock starts here, after any pre-dispatch work such as
+/// image validation) → `GENERATED` (first generation event: one sample) or
+/// `ABANDONED` (the accepted request turned out to be an engine rejection:
+/// no sample). A permit released while still `DISPATCHED` records the time
+/// it waited as a censored sample.
 pub struct Permit {
     controller: Arc<AdmissionController>,
-    started: Instant,
     backend: AtomicUsize,
-    /// The engine accepted the request (2xx); a first-generation sample is
-    /// expected, and its absence at drop is a censored slow observation.
-    dispatched: AtomicBool,
-    generation_seen: AtomicBool,
+    state: AtomicU8,
+    dispatched_at: OnceLock<Instant>,
 }
 
 impl Permit {
@@ -493,29 +538,59 @@ impl Permit {
         self.controller.backend_saturated(index)
     }
 
+    /// The current per-host share (see `AdmissionController::host_share`).
+    pub fn host_share(&self, healthy_backends: usize) -> Option<u32> {
+        self.controller.host_share(healthy_backends)
+    }
+
+    /// A refusal because no backend has room under its share.
+    pub fn reject_host_share(&self) -> Rejected {
+        self.controller.reject(RejectReason::HostShare)
+    }
+
     /// The engine accepted the request; the clock now runs against the
     /// first generation event.
     pub fn mark_dispatched(&self) {
-        self.dispatched.store(true, Ordering::Relaxed);
+        self.mark_dispatched_at(Instant::now());
+    }
+
+    pub(crate) fn mark_dispatched_at(&self, now: Instant) {
+        if self
+            .state
+            .compare_exchange(PENDING, DISPATCHED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let _ = self.dispatched_at.set(now);
+        }
     }
 
     /// The accepted request turned out to be an engine rejection (an error
-    /// event in the stream): no TTFT observation for it.
+    /// event in the stream): no TTFT observation for it. A no-op once a
+    /// generation event was seen (a later error is a mid-stream failure).
     pub fn abandon(&self) {
-        self.dispatched.store(false, Ordering::Relaxed);
+        let _ =
+            self.state
+                .compare_exchange(DISPATCHED, ABANDONED, Ordering::AcqRel, Ordering::Acquire);
     }
 
-    /// The first generation event arrived: one TTFT sample. Idempotent.
+    /// The first generation event arrived: one TTFT sample. Idempotent, and
+    /// a no-op unless the request was dispatched and not abandoned.
     pub fn observe_generation_started(&self) {
         self.observe_generation_started_at(Instant::now());
     }
 
     pub(crate) fn observe_generation_started_at(&self, now: Instant) {
-        if self.generation_seen.swap(true, Ordering::Relaxed) {
+        if self
+            .state
+            .compare_exchange(DISPATCHED, GENERATED, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return;
         }
-        self.controller
-            .record_ttft(now, now.saturating_duration_since(self.started));
+        if let Some(dispatched_at) = self.dispatched_at.get() {
+            self.controller
+                .record_ttft(now, now.saturating_duration_since(*dispatched_at));
+        }
     }
 
     /// The engine refused this request at admission (queue full or displaced
@@ -536,11 +611,15 @@ impl Permit {
         // A dispatched request that ended (client gone, idle timeout, stream
         // cut) before any generation event waited at least this long: record
         // it, or slow requests that clients give up on would never count.
-        if self.dispatched.load(Ordering::Relaxed)
-            && !self.generation_seen.swap(true, Ordering::Relaxed)
+        if self
+            .state
+            .compare_exchange(DISPATCHED, GENERATED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
         {
-            self.controller
-                .record_ttft(now, now.saturating_duration_since(self.started));
+            if let Some(dispatched_at) = self.dispatched_at.get() {
+                self.controller
+                    .record_ttft(now, now.saturating_duration_since(*dispatched_at));
+            }
         }
         self.controller.inflight.fetch_sub(1, Ordering::AcqRel);
         metrics::gauge!("admission_inflight").decrement(1.0);
@@ -551,11 +630,7 @@ impl std::fmt::Debug for Permit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Permit")
             .field("backend", &self.backend())
-            .field("dispatched", &self.dispatched.load(Ordering::Relaxed))
-            .field(
-                "generation_seen",
-                &self.generation_seen.load(Ordering::Relaxed),
-            )
+            .field("state", &self.state.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -593,7 +668,7 @@ mod tests {
     /// Admit at `t0` and record a first-generation sample `ttft` later.
     fn sample(c: &Arc<AdmissionController>, p: &BackendPool, t0: Instant, ttft: Duration) {
         let permit = c.try_admit_at(p, t0).unwrap().unwrap();
-        permit.mark_dispatched();
+        permit.mark_dispatched_at(t0);
         permit.observe_generation_started_at(t0 + ttft);
     }
 
@@ -729,10 +804,7 @@ mod tests {
             );
         }
         sample(&c, &p, t0, Duration::from_secs(40));
-        assert_eq!(
-            c.ttft_breaches(Duration::from_secs(10), t0 + Duration::from_secs(41)),
-            Some((20, 1))
-        );
+        assert_eq!(c.ttft_breaches(t0 + Duration::from_secs(41)), Some((20, 1)));
         // 20 samples with a single breach: one slow request is not overload.
         assert!(c.try_admit_at(&p, t0 + Duration::from_secs(41)).is_ok());
         // A second breach (2 of 21 ≥ max(2, ceil(5 %))) trips the breaker.
@@ -745,14 +817,16 @@ mod tests {
         // of the window and admission resumes.
         let later = t0 + Duration::from_secs(42) + TTFT_WINDOW + Duration::from_secs(2);
         assert!(c.try_admit_at(&p, later).is_ok());
-        assert_eq!(c.ttft_breaches(Duration::from_secs(10), later), None);
+        assert_eq!(c.ttft_breaches(later), None);
     }
 
     #[test]
     fn ttft_breaker_verdict_is_cached_for_a_second() {
         let c = controller(config(), 1);
         let p = pool(1);
-        let t0 = Instant::now();
+        // Everything happens well after the controller's epoch so dispatch
+        // times can precede their observations.
+        let t0 = Instant::now() + Duration::from_secs(100);
         for i in 0..20 {
             sample(
                 &c,
@@ -761,12 +835,15 @@ mod tests {
                 Duration::from_secs(1),
             );
         }
-        // Evaluated (clean) at t1; two breaches recorded right after are not
+        // Evaluated (clean) at t1; two breaches observed right after are not
         // seen until the cache expires.
         let t1 = t0 + Duration::from_secs(2);
         assert!(c.try_admit_at(&p, t1).is_ok());
-        sample(&c, &p, t1, Duration::from_secs(20));
-        sample(&c, &p, t1, Duration::from_secs(20));
+        for _ in 0..2 {
+            let permit = c.try_admit_at(&p, t1).unwrap().unwrap();
+            permit.mark_dispatched_at(t1 - Duration::from_secs(20));
+            permit.observe_generation_started_at(t1);
+        }
         assert!(c.try_admit_at(&p, t1 + Duration::from_millis(500)).is_ok());
         let rejected = c
             .try_admit_at(&p, t1 + Duration::from_millis(1500))
@@ -792,19 +869,22 @@ mod tests {
     }
 
     #[test]
-    fn generation_start_is_recorded_once_per_permit() {
+    fn generation_start_is_recorded_once_and_only_after_dispatch() {
         let c = controller(config(), 1);
         let p = pool(1);
         let t0 = Instant::now();
+        // Not dispatched yet: nothing to observe.
         let permit = c.try_admit_at(&p, t0).unwrap().unwrap();
-        permit.mark_dispatched();
-        permit.observe_generation_started_at(t0 + Duration::from_millis(100));
         permit.observe_generation_started_at(t0 + Duration::from_secs(50));
+        assert_eq!(c.ttft_totals(t0 + Duration::from_secs(50)), (0, 0));
+        // Dispatched 5 s after admission (image validation): the clock starts
+        // at dispatch, and a second observation (50 s, a breach) is ignored.
+        permit.mark_dispatched_at(t0 + Duration::from_secs(5));
+        permit.observe_generation_started_at(t0 + Duration::from_millis(5100));
+        permit.observe_generation_started_at(t0 + Duration::from_secs(55));
         permit.release_at(t0 + Duration::from_secs(60));
         std::mem::forget(permit);
-        let window = c.ttft_window();
-        assert_eq!(window.len(), 1);
-        assert_eq!(window[0].1, Duration::from_millis(100));
+        assert_eq!(c.ttft_totals(t0 + Duration::from_secs(60)), (1, 0));
     }
 
     #[test]
@@ -816,31 +896,72 @@ mod tests {
         let permit = c.try_admit_at(&p, t0).unwrap().unwrap();
         permit.release_at(t0 + Duration::from_secs(30));
         std::mem::forget(permit);
-        assert!(c.ttft_window().is_empty());
-        // Accepted, then the client gave up after 30 s: a 30 s observation.
+        assert_eq!(c.ttft_totals(t0 + Duration::from_secs(30)), (0, 0));
+        // Accepted, then the client gave up after 30 s: one breaching sample.
         let permit = c.try_admit_at(&p, t0).unwrap().unwrap();
-        permit.mark_dispatched();
+        permit.mark_dispatched_at(t0);
         permit.release_at(t0 + Duration::from_secs(30));
         std::mem::forget(permit);
-        assert_eq!(c.ttft_window()[0].1, Duration::from_secs(30));
-        // Accepted but the stream's first event was an engine rejection.
+        assert_eq!(c.ttft_totals(t0 + Duration::from_secs(30)), (1, 1));
+        // Accepted but the stream's first event was an engine rejection: no
+        // sample, and a generation event after abandoning is ignored too.
         let permit = c.try_admit_at(&p, t0).unwrap().unwrap();
-        permit.mark_dispatched();
+        permit.mark_dispatched_at(t0);
         permit.abandon();
+        permit.observe_generation_started_at(t0 + Duration::from_secs(1));
         permit.release_at(t0 + Duration::from_secs(1));
         std::mem::forget(permit);
-        assert_eq!(c.ttft_window().len(), 1);
+        assert_eq!(c.ttft_totals(t0 + Duration::from_secs(30)), (1, 1));
+        // An error after generation started is a mid-stream failure, not a
+        // rejection: the sample stays.
+        let permit = c.try_admit_at(&p, t0).unwrap().unwrap();
+        permit.mark_dispatched_at(t0);
+        permit.observe_generation_started_at(t0 + Duration::from_secs(1));
+        permit.abandon();
+        permit.release_at(t0 + Duration::from_secs(2));
+        std::mem::forget(permit);
+        assert_eq!(c.ttft_totals(t0 + Duration::from_secs(30)), (2, 1));
         assert_eq!(c.inflight(), 0);
     }
 
     #[test]
-    fn window_is_capped() {
+    fn window_covers_exactly_the_last_minute_at_any_rate() {
         let c = controller(config(), 1);
         let p = pool(1);
         let t0 = Instant::now();
-        for _ in 0..(TTFT_MAX_SAMPLES + 10) {
-            sample(&c, &p, t0, Duration::from_millis(5));
+        // A burst of slow samples, then far more fast ones than any cap.
+        for _ in 0..50 {
+            sample(&c, &p, t0, Duration::from_secs(20));
         }
-        assert_eq!(c.ttft_window().len(), TTFT_MAX_SAMPLES);
+        for i in 0..10_000u64 {
+            sample(
+                &c,
+                &p,
+                t0 + Duration::from_millis(i % 30_000),
+                Duration::from_millis(1),
+            );
+        }
+        let (samples, breaches) = c.ttft_totals(t0 + Duration::from_secs(30));
+        assert_eq!(
+            (samples, breaches),
+            (10_050, 50),
+            "nothing evicted inside the window"
+        );
+        // The slow burst (observed at t0+20) ages out a minute later, the
+        // fast samples (observed up to t0+30) ten seconds after that.
+        assert_eq!(c.ttft_totals(t0 + Duration::from_secs(79)).1, 50);
+        assert_eq!(c.ttft_totals(t0 + Duration::from_secs(81)).1, 0);
+        assert_eq!(c.ttft_totals(t0 + Duration::from_secs(120)), (0, 0));
+    }
+
+    #[test]
+    fn precheck_refuses_without_taking_a_slot() {
+        let c = controller(config(), 1);
+        let p = pool(1);
+        assert!(c.precheck(&p).is_ok());
+        let _a = c.try_admit(&p).unwrap().unwrap();
+        let _b = c.try_admit(&p).unwrap().unwrap();
+        assert_eq!(c.precheck(&p).unwrap_err().reason, RejectReason::Budget);
+        assert_eq!(c.inflight(), 2);
     }
 }

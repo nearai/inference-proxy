@@ -120,7 +120,6 @@ pub async fn completions(
             pool: state.backend_pool.clone(),
             path: "/v1/completions",
             index: placement.index,
-            max_conns: host_share,
             affinity: None,
         });
     let url = placement.url;

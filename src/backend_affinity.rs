@@ -287,6 +287,16 @@ mod tests {
         assert_eq!(affinity.assignment(&key), Some(1));
     }
 
+    /// Simulate `n` lane requests on backend `index`.
+    fn set_lane_conns(pool: &BackendPool, index: usize, n: u32) {
+        pool.backends()[index]
+            .active_conns
+            .store(n, Ordering::Relaxed);
+        pool.backends()[index]
+            .lane_conns
+            .store(n, Ordering::Relaxed);
+    }
+
     #[test]
     fn pinned_conversation_moves_when_its_host_is_at_the_share() {
         let pool = two_backend_pool();
@@ -301,9 +311,9 @@ mod tests {
         assert_eq!(url, "http://b1:8000/v1/chat/completions");
         drop(guard);
 
-        // b1 holds its whole share (2 in flight): the next turn moves to b2
-        // even though the imbalance (2) is within the bound (8).
-        pool.backends()[0].active_conns.store(2, Ordering::Relaxed);
+        // b1 holds its whole share (2 lane requests in flight): the next turn
+        // moves to b2 even though the imbalance (2) is within the bound (8).
+        set_lane_conns(&pool, 0, 2);
         let placement = affinity
             .place(&pool, Some(key), "/v1/chat/completions", Some(2), &|_| {
                 false
@@ -314,7 +324,7 @@ mod tests {
         drop(placement);
 
         // Both at the share: nothing to place, with or without a key.
-        pool.backends()[1].active_conns.store(2, Ordering::Relaxed);
+        set_lane_conns(&pool, 1, 2);
         assert!(affinity
             .place(&pool, Some(key), "/v1/chat/completions", Some(2), &|_| {
                 false

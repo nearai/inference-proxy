@@ -858,7 +858,6 @@ impl Config {
         Ok(config)
     }
 
-    /// Build the runtime config for pre-dispatch image validation.
     /// Lane admission settings, `None` unless `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` is set.
     pub fn admission(&self) -> Option<crate::admission::AdmissionConfig> {
         if self.admission_max_inflight == 0 {
@@ -876,6 +875,7 @@ impl Config {
         })
     }
 
+    /// Build the runtime config for pre-dispatch image validation.
     pub fn image_validation(&self) -> crate::image_validation::ImageValidationConfig {
         crate::image_validation::ImageValidationConfig {
             enabled: self.image_validation_enabled,
@@ -1846,15 +1846,23 @@ mod tests {
                     "{err}"
                 );
                 env::set_var("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS", "2");
-                // Unbudgeted execution modes cannot coexist with admission.
+                // Unbudgeted execution modes cannot coexist with admission
+                // (each mode is otherwise fully configured, so this is the
+                // only reason the config can fail).
                 env::set_var("FUSION_ENABLED", "1");
+                env::set_var("FUSION_INTERNAL_BEARER_TOKEN", "fusion-secret");
+                env::set_var("FUSION_ENDPOINTS_URL", "https://fusion.example/endpoints");
                 let err = Config::from_env().unwrap_err().to_string();
                 assert!(err.contains("FUSION_ENABLED"), "{err}");
                 env::remove_var("FUSION_ENABLED");
+                env::remove_var("FUSION_INTERNAL_BEARER_TOKEN");
+                env::remove_var("FUSION_ENDPOINTS_URL");
                 env::set_var("WEB_CONTEXT_SEARCH_URL", "https://search.example");
+                env::set_var("WEB_CONTEXT_SEARCH_API_KEY", "search-secret");
                 let err = Config::from_env().unwrap_err().to_string();
                 assert!(err.contains("WEB_CONTEXT_SEARCH_URL"), "{err}");
                 env::remove_var("WEB_CONTEXT_SEARCH_URL");
+                env::remove_var("WEB_CONTEXT_SEARCH_API_KEY");
                 env::remove_var("VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS");
             },
         );

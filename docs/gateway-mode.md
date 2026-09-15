@@ -149,8 +149,9 @@ upstream:
    `VLLM_PROXY_ADMISSION_RAMP_STEP` every `VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS`
    up to `VLLM_PROXY_ADMISSION_MAX_INFLIGHT`, but only after an interval
    without any overload signal; a restart goes back to the start value.
-3. **Per-host share.** `ceil(budget / healthy backends)` in flight per backend,
-   reserved atomically at selection so concurrent requests cannot overshoot it,
+3. **Per-host share.** `ceil(budget / healthy backends)` lane requests in
+   flight per backend (other traffic on the pool does not count), reserved
+   atomically at selection so concurrent requests cannot overshoot it,
    so a conversation-affinity pin cannot pile the whole budget onto one host: a
    pinned conversation whose host is at its share (or steered around) moves to
    the least-loaded host with room, and only when no host has room is the
@@ -161,7 +162,9 @@ and an error of type `overloaded`; the slot is released when the response —
 the whole stream, for SSE — is complete. Nothing is retried on the engine's
 behalf: one upstream attempt per request, with the single exception of a
 connection that cannot be established at all (`VLLM_BACKEND_CONNECT_FAILOVER`),
-where nothing reached the engine yet. An engine rejection that arrives after
+where nothing reached the engine yet (a connection failure without fail-over
+is a typed `502 upstream_unreachable`, a timeout a `504`). An engine rejection
+that arrives after
 the peek window is already on a committed 200 stream; it still counts as
 back-pressure for the next admission decision
 (`upstream_stream_error_events_total{phase="after_headers"}`).

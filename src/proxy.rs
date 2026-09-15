@@ -955,9 +955,7 @@ pub struct ConnectFailover {
     pub path: &'static str,
     /// Index of the backend the request is currently placed on.
     pub index: usize,
-    /// Per-host in-flight bound for the replacement (the admission share).
-    pub max_conns: Option<u32>,
-    /// Conversation to re-pin onto the replacement backend.
+    /// Conversation to re-pin onto the replacement backend once it answers.
     pub affinity: Option<(
         Arc<crate::backend_affinity::BackendConversationAffinity>,
         crate::backend_affinity::ConversationKey,
@@ -988,6 +986,38 @@ fn upstream_unreachable() -> AppError {
     }
 }
 
+/// A request that never got a response: a connection that could not be
+/// established is 502, a timeout 504; anything else stays a generic 500.
+fn transport_error(error: reqwest::Error) -> AppError {
+    if error.is_connect() {
+        upstream_unreachable()
+    } else if error.is_timeout() {
+        AppError::UpstreamParsed {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            message: "Upstream request timed out".to_string(),
+            error_type: "upstream_request_timeout".to_string(),
+        }
+    } else {
+        AppError::Internal(error.into())
+    }
+}
+
+fn mark_backend_unreachable(pool: &crate::backend_pool::BackendPool, index: usize) {
+    // Nothing listens there right now: take it out of rotation until the
+    // health checker sees it answer again.
+    if let Some(backend) = pool.backends().get(index) {
+        if backend
+            .healthy
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            warn!(
+                backend = %sanitized_upstream_url_for_logs(&backend.base_url),
+                "Backend marked unhealthy after a connection failure"
+            );
+        }
+    }
+}
+
 /// Send the request to `url`. When the connection fails before anything was
 /// sent and `opts.connect_failover` is set, retry once on another healthy
 /// backend: `url` and `opts.backend_guard` then point at the replacement.
@@ -1007,35 +1037,35 @@ async fn send_upstream(
     let response = match first {
         Ok(response) => response,
         Err(error) if error.is_connect() && opts.connect_failover.is_some() => {
-            let (pool, path, failed, max_conns, affinity) = {
+            let (pool, path, failed, affinity) = {
                 let failover = opts.connect_failover.as_ref().expect("checked above");
                 (
                     failover.pool.clone(),
                     failover.path,
                     failover.index,
-                    failover.max_conns,
                     failover.affinity.clone(),
                 )
             };
-            // Nothing listens there right now: take it out of rotation until
-            // the health checker sees it answer again.
-            if let Some(backend) = pool.backends().get(failed) {
-                if backend
-                    .healthy
-                    .swap(false, std::sync::atomic::Ordering::Relaxed)
-                {
-                    warn!(
-                        backend = %sanitized_upstream_url_for_logs(&backend.base_url),
-                        "Backend marked unhealthy after a connection failure"
-                    );
-                }
-            }
+            mark_backend_unreachable(&pool, failed);
+            // The share is recomputed for the pool as it is now (one host
+            // fewer), and recently saturated hosts are steered around.
+            let max_conns = opts
+                .admission
+                .as_ref()
+                .and_then(|permit| permit.host_share(pool.healthy_count()));
             let avoid = |index: usize| {
                 opts.admission
                     .as_ref()
                     .is_some_and(|permit| permit.backend_saturated(index))
             };
             let Some(next) = pool.select_excluding(failed, max_conns, &avoid) else {
+                if pool.has_healthy_other_than(failed) {
+                    if let Some(permit) = opts.admission.as_ref() {
+                        // Somewhere to go, but every candidate is at its share
+                        // or steered around: that is admission, not an outage.
+                        return Err(AppError::from(permit.reject_host_share()));
+                    }
+                }
                 metrics::counter!("backend_failover_total", "outcome" => "exhausted").increment(1);
                 warn!(
                     backend = %sanitized_upstream_url_for_logs(url),
@@ -1058,14 +1088,17 @@ async fn send_upstream(
             if let Some(permit) = opts.admission.as_ref() {
                 permit.attach_backend(next.index);
             }
-            if let Some((affinity, key)) = affinity {
-                // Later turns follow the request, not the dead host.
-                affinity.repin(key, next.index);
-            }
             opts.backend_guard = Some(next.guard);
             match build_upstream_request(client, url, body, opts).send().await {
-                Ok(response) => response,
+                Ok(response) => {
+                    if let Some((affinity, key)) = affinity {
+                        // Later turns follow the request, not the dead host.
+                        affinity.repin(key, next.index);
+                    }
+                    response
+                }
                 Err(error) if error.is_connect() => {
+                    mark_backend_unreachable(&pool, next.index);
                     metrics::counter!("backend_failover_total", "outcome" => "exhausted")
                         .increment(1);
                     warn!(
@@ -1075,10 +1108,10 @@ async fn send_upstream(
                     );
                     return Err(upstream_unreachable());
                 }
-                Err(error) => return Err(AppError::Internal(error.into())),
+                Err(error) => return Err(transport_error(error)),
             }
         }
-        Err(error) => return Err(AppError::Internal(error.into())),
+        Err(error) => return Err(transport_error(error)),
     };
     metrics::histogram!("upstream_request_duration_seconds", "endpoint" => endpoint)
         .record(upstream_start.elapsed().as_secs_f64());
@@ -1400,7 +1433,13 @@ pub async fn proxy_json_request(
                     }
                 })?;
                 received_upstream_progress |= stream_parser.process_chunk(&chunk);
-                if received_upstream_progress {
+                if let Some(error) = stream_parser.take_error_event() {
+                    note_engine_error(
+                        opts.admission.as_ref(),
+                        error.get("message").and_then(|m| m.as_str()),
+                    );
+                }
+                if stream_parser.seen_generation_output {
                     if let Some(permit) = opts.admission.as_ref() {
                         permit.observe_generation_started();
                     }
@@ -1409,27 +1448,6 @@ pub async fn proxy_json_request(
             }
         }
         stream_parser.finish();
-        if opts.stream_idle_timeout_secs > 0 && !stream_parser.seen_done {
-            metrics::counter!(
-                "upstream_stream_incomplete_total",
-                "reason" => "missing_done",
-                "mode" => "json_via_stream"
-            )
-            .increment(1);
-            let (request_id, org_id, workspace_id) = log_ids_or_empty(&opts.tracing_ids);
-            warn!(
-                request_id = %request_id,
-                org_id = %org_id,
-                workspace_id = %workspace_id,
-                model = %opts.model_name.to_lowercase(),
-                "Upstream SSE stream ended without [DONE]"
-            );
-            return Err(AppError::UpstreamParsed {
-                status: StatusCode::BAD_GATEWAY,
-                message: "Upstream response stream ended before completion".to_string(),
-                error_type: "upstream_stream_incomplete".to_string(),
-            });
-        }
         // If the stream surfaced an upstream error chunk (e.g. SGLang queue-full
         // abort), propagate it as a real upstream error. Otherwise the empty
         // `choices: []` final chunk would be signed and returned as HTTP 200,
@@ -1465,6 +1483,27 @@ pub async fn proxy_json_request(
                 body: body_bytes,
             });
         }
+        if opts.stream_idle_timeout_secs > 0 && !stream_parser.seen_done {
+            metrics::counter!(
+                "upstream_stream_incomplete_total",
+                "reason" => "missing_done",
+                "mode" => "json_via_stream"
+            )
+            .increment(1);
+            let (request_id, org_id, workspace_id) = log_ids_or_empty(&opts.tracing_ids);
+            warn!(
+                request_id = %request_id,
+                org_id = %org_id,
+                workspace_id = %workspace_id,
+                model = %opts.model_name.to_lowercase(),
+                "Upstream SSE stream ended without [DONE]"
+            );
+            return Err(AppError::UpstreamParsed {
+                status: StatusCode::BAD_GATEWAY,
+                message: "Upstream response stream ended before completion".to_string(),
+                error_type: "upstream_stream_incomplete".to_string(),
+            });
+        }
         assembler.into_response(&opts.id_prefix)
     } else {
         // Backend returned plain JSON — process as before.
@@ -1472,12 +1511,35 @@ pub async fn proxy_json_request(
             .bytes()
             .await
             .map_err(|e| AppError::Internal(e.into()))?;
+        let mut data: serde_json::Value =
+            serde_json::from_slice(&response_bytes).map_err(|e| AppError::Internal(e.into()))?;
+        if let Some(error) = data.get("error").filter(|e| e.is_object()) {
+            // An error body on a 2xx: an engine rejection, not a completion.
+            let code = error
+                .get("code")
+                .and_then(|v| v.as_u64())
+                .and_then(|c| u16::try_from(c).ok())
+                .filter(|c| (400..600).contains(c))
+                .unwrap_or(502);
+            let info = log_upstream_error(
+                reqwest::StatusCode::from_u16(code).unwrap_or(reqwest::StatusCode::BAD_GATEWAY),
+                &url,
+                &response_bytes,
+                opts.tracing_ids.as_ref(),
+            );
+            note_engine_error(
+                opts.admission.as_ref(),
+                info.as_ref().map(|i| i.message.as_str()),
+            );
+            return Err(AppError::Upstream {
+                status: effective_error_status(code, info.as_ref(), opts.map_queue_full_to_429),
+                body: response_bytes,
+            });
+        }
         if let Some(permit) = opts.admission.as_ref() {
             // The whole completion arrived at once: that is its generation start.
             permit.observe_generation_started();
         }
-        let mut data: serde_json::Value =
-            serde_json::from_slice(&response_bytes).map_err(|e| AppError::Internal(e.into()))?;
         // Generate an ID if not present.
         if data.get("id").and_then(|v| v.as_str()).is_none() {
             let id = format!(
@@ -2168,14 +2230,10 @@ pub async fn proxy_streaming_request(
                             keepalive.reset();
                             last_upstream_chunk = tokio::time::Instant::now();
                             received_upstream_progress |= parser.process_chunk(&chunk);
-                            if received_upstream_progress {
-                                if let Some(permit) = admission.as_ref() {
-                                    permit.observe_generation_started();
-                                }
-                            }
                             // An engine rejection that arrived after the peek
                             // window (or split across chunks) is already on a
-                            // committed 200; admission still learns about it.
+                            // committed 200; admission still learns about it,
+                            // and it is not a generation event.
                             if let Some(error) = parser.take_error_event() {
                                 metrics::counter!(
                                     "upstream_stream_error_events_total",
@@ -2186,6 +2244,11 @@ pub async fn proxy_streaming_request(
                                     admission.as_ref(),
                                     error.get("message").and_then(|m| m.as_str()),
                                 );
+                            }
+                            if parser.seen_generation_output {
+                                if let Some(permit) = admission.as_ref() {
+                                    permit.observe_generation_started();
+                                }
                             }
 
                             // Normalize (and encrypt, if active) the chunk, then hash
@@ -3003,6 +3066,10 @@ pub struct SseParser {
     /// A role-only chat chunk is metadata, not progress: vLLM emits it before
     /// hidden reasoning and may then remain byte-silent for an unbounded time.
     pub seen_generation_progress: bool,
+    /// Whether the model has produced output (content, reasoning, tool
+    /// calls, or completion text): the time-to-first-token event. Role-only
+    /// chunks, usage-only chunks, errors and `[DONE]` do not count.
+    pub seen_generation_output: bool,
     /// Token usage extracted from the final SSE chunk (prompt_tokens, completion_tokens).
     pub usage: Option<(i64, i64)>,
     cached_tokens: Option<i64>,
@@ -3023,6 +3090,7 @@ impl SseParser {
             chat_id: None,
             seen_done: false,
             seen_generation_progress: false,
+            seen_generation_output: false,
             usage: None,
             cached_tokens: None,
             error_event: None,
@@ -3054,7 +3122,14 @@ impl SseParser {
                 };
 
             // Borrow the line from the buffer, extract what we need, then release the borrow
-            let (is_done, extracted_id, extracted_usage, has_generation_progress, error_event) = {
+            let (
+                is_done,
+                extracted_id,
+                extracted_usage,
+                has_generation_progress,
+                has_generation_output,
+                error_event,
+            ) = {
                 let line = &self.line_buffer[..line_end];
                 let data = line
                     .strip_prefix("data: ")
@@ -3063,9 +3138,9 @@ impl SseParser {
                     .trim();
 
                 if data.is_empty() {
-                    (false, None, None, false, None)
+                    (false, None, None, false, false, None)
                 } else if data == "[DONE]" {
-                    (true, None, None, true, None)
+                    (true, None, None, true, false, None)
                 } else if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
                     let id = if self.chat_id.is_none() {
                         parsed
@@ -3094,16 +3169,20 @@ impl SseParser {
                             }
                         });
                     let progress = sse_value_has_generation_progress(&parsed);
+                    let output = sse_value_has_generation_output(&parsed);
                     let error_event = if self.error_event.is_none() {
                         parsed.get("error").filter(|e| e.is_object()).cloned()
                     } else {
                         None
                     };
-                    (false, id, usage, progress, error_event)
+                    (false, id, usage, progress, output, error_event)
                 } else {
-                    (false, None, None, false, None)
+                    (false, None, None, false, false, None)
                 }
             };
+            if has_generation_output {
+                self.seen_generation_output = true;
+            }
             if let Some(error_event) = error_event {
                 self.error_event = Some(error_event);
             }
@@ -3138,6 +3217,38 @@ impl SseParser {
             let _ = self.process_chunk(b"\n");
         }
     }
+}
+
+/// The model produced output: a chat delta with content, reasoning or tool
+/// calls, or completion text. Unlike `sse_value_has_generation_progress`
+/// this excludes errors, usage-only chunks, `finish_reason`-only chunks and
+/// unknown schemas, so it marks the first token rather than any activity.
+fn sse_value_has_generation_output(value: &serde_json::Value) -> bool {
+    if value.get("error").is_some_and(|error| !error.is_null()) {
+        return false;
+    }
+    let Some(choices) = value.get("choices").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    choices.iter().any(|choice| {
+        if choice.get("text").is_some_and(json_value_has_payload) {
+            return true;
+        }
+        choice
+            .get("delta")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|delta| {
+                [
+                    "content",
+                    "reasoning_content",
+                    "reasoning",
+                    "tool_calls",
+                    "function_call",
+                ]
+                .iter()
+                .any(|key| delta.get(*key).is_some_and(json_value_has_payload))
+            })
+    })
 }
 
 fn sse_value_has_generation_progress(value: &serde_json::Value) -> bool {
@@ -4738,5 +4849,36 @@ mod tests {
         assert_eq!(json["stream"], true);
         assert_eq!(json["max_tokens"], 100);
         assert_eq!(json["temperature"], 0.7);
+    }
+
+    #[test]
+    fn generation_output_marks_the_first_token_not_activity() {
+        let mut parser = SseParser::new();
+        parser.process_chunk(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n");
+        assert!(!parser.seen_generation_output, "role-only chunk");
+        parser.process_chunk(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":0}}\n\n",
+        );
+        assert!(!parser.seen_generation_output, "usage-only chunk");
+        parser.process_chunk(
+            b"data: {\"error\":{\"message\":\"The request queue is full.\",\"code\":503}}\n\n",
+        );
+        assert!(!parser.seen_generation_output, "error event");
+        assert!(
+            parser.seen_generation_progress,
+            "errors are still watchdog progress"
+        );
+        assert!(parser.take_error_event().is_some());
+        parser.process_chunk(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"Th\"}}]}\n\n",
+        );
+        assert!(parser.seen_generation_output, "first reasoning token");
+
+        let mut completions = SseParser::new();
+        completions.process_chunk(b"data: {\"choices\":[{\"index\":0,\"text\":\"Hi\"}]}\n\n");
+        assert!(completions.seen_generation_output);
+        let mut tool = SseParser::new();
+        tool.process_chunk(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"f\"}}]}}]}\n\n");
+        assert!(tool.seen_generation_output);
     }
 }

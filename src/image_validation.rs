@@ -376,8 +376,8 @@ async fn validate_http_url(url: &str, cfg: &ImageValidationConfig) -> Verdict {
         }
 
         // Present like a normal client: many image CDNs gate on User-Agent/Accept
-        // (see catch_all.rs / cloud-api#606). A UA-less request would 403 here while
-        // the engine's fetcher succeeds, producing false rejects.
+        // (see cloud-api#606). A UA-less request would 403 here while the engine's
+        // fetcher succeeds, producing false rejects.
         let resp = match validation_client(cfg.allow_private_hosts)
             .get(current.clone())
             .timeout(cfg.timeout)

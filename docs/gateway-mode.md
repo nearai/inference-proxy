@@ -18,7 +18,9 @@ client ──sk-key──▶ inference-proxy (gateway, non-TEE) ──backend to
 ## What the gateway does per request
 
 1. `Authorization: Bearer sk-…` → `POST {CLOUD_API_URL}/v1/check_api_key`
-   (retries on transport/5xx; 401/402/429 pass through).
+   (retries on transport/5xx; 401/402/429 pass through). With
+   `VLLM_PROXY_ALLOWED_ORG_IDS` set, a valid key from any other organization
+   gets a 403 here.
 2. Policy: any content part whose `type` is in
    `VLLM_PROXY_REJECTED_CONTENT_PART_TYPES` (e.g. `video_url`) → `400` before
    anything is fetched or dispatched; image inputs are validated as today.
@@ -76,6 +78,7 @@ to the current in-CVM behavior.
 | `VLLM_BACKEND_HEALTH_PATH` | `/healthz` | The CVM proxy's unauthenticated readiness route (dstack + engine). |
 | `VLLM_BACKEND_CONVERSATION_AFFINITY` | `1` | Fleet-level conversation affinity (the CVM proxy still does its own across its replicas). |
 | `HEALTH_CHECK_INTERVAL_SECS` / `_TIMEOUT_SECS` / `_MAX_FAILURES` | `5` / `4` / `3` | The timeout must exceed the CVM proxy's own 3 s backend probe. |
+| `VLLM_PROXY_ALLOWED_ORG_IDS` | the partner's organization id | Only that organization's keys are served; any other valid key gets 403. Without it any cloud-api key works here, same as the direct `*.completions.near.ai` endpoints. |
 | `VLLM_PROXY_REJECTED_CONTENT_PART_TYPES` | `video_url,input_audio,file` | Modalities this deployment does not serve → deterministic `400`. |
 | `VLLM_PROXY_SSE_KEEPALIVE_SECS` | `15` | `: keep-alive` SSE comments while the upstream is silent (long prefill/queueing), so intermediaries with read timeouts do not cancel. Off in CVMs: comments are not part of the signed bytes. |
 | `VLLM_PROXY_MAP_QUEUE_FULL_TO_429` | `1` | The engine's admission rejection (queue full, or a queued request displaced by a higher-priority one) becomes 429: back-pressure, not an outage. Off in CVMs: cloud-api's peer fallback keys on the 503. |

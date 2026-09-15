@@ -23,6 +23,11 @@ pub enum AppError {
     #[error("unauthorized")]
     Unauthorized,
 
+    /// The key is valid but its organization may not use this deployment
+    /// (`VLLM_PROXY_ALLOWED_ORG_IDS`).
+    #[error("forbidden")]
+    Forbidden,
+
     #[error("insufficient credits")]
     InsufficientCredits,
 
@@ -86,6 +91,11 @@ impl IntoResponse for AppError {
                 StatusCode::UNAUTHORIZED,
                 "Invalid or missing Authorization header".to_string(),
                 "unauthorized",
+            ),
+            AppError::Forbidden => (
+                StatusCode::FORBIDDEN,
+                "This API key's organization is not allowed to use this endpoint.".to_string(),
+                "forbidden",
             ),
             AppError::InsufficientCredits => (
                 StatusCode::PAYMENT_REQUIRED,

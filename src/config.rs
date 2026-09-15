@@ -280,6 +280,11 @@ pub struct Config {
     /// Chat content part `type`s refused with 400 before dispatch
     /// (`VLLM_PROXY_REJECTED_CONTENT_PART_TYPES`, e.g. `video_url,input_audio,file`).
     pub rejected_content_part_types: Vec<String>,
+    /// Organizations whose cloud-api keys may use this deployment
+    /// (`VLLM_PROXY_ALLOWED_ORG_IDS`, comma-separated organization ids). Empty
+    /// = every valid key. Config-token callers are not affected. Gateway mode
+    /// uses it to keep a partner lane to that partner.
+    pub allowed_org_ids: Vec<String>,
     /// Emit an SSE comment (`: keep-alive`) on client streams whenever the
     /// upstream has been silent for this many seconds
     /// (`VLLM_PROXY_SSE_KEEPALIVE_SECS`, 0 = off). Comments are not hashed into
@@ -483,6 +488,12 @@ impl Config {
         if !backend_health_path.starts_with('/') {
             anyhow::bail!("VLLM_BACKEND_HEALTH_PATH must start with '/'");
         }
+        let allowed_org_ids: Vec<String> = env::var("VLLM_PROXY_ALLOWED_ORG_IDS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
         let rejected_content_part_types = crate::content_policy::parse_rejected_types(
             &env::var("VLLM_PROXY_REJECTED_CONTENT_PART_TYPES").unwrap_or_default(),
         );
@@ -628,6 +639,7 @@ impl Config {
             map_queue_full_to_429: env_bool("VLLM_PROXY_MAP_QUEUE_FULL_TO_429"),
             stream_error_peek_ms: env_int("VLLM_PROXY_STREAM_ERROR_PEEK_MS", 0) as u64,
             rejected_content_part_types,
+            allowed_org_ids,
             sse_keepalive_secs: env_int("VLLM_PROXY_SSE_KEEPALIVE_SECS", 0) as u64,
             images_url_override,
             images_edits_url_override,
@@ -863,6 +875,7 @@ mod tests {
             "VLLM_PROXY_MAP_QUEUE_FULL_TO_429",
             "VLLM_PROXY_STREAM_ERROR_PEEK_MS",
             "VLLM_PROXY_REJECTED_CONTENT_PART_TYPES",
+            "VLLM_PROXY_ALLOWED_ORG_IDS",
             "VLLM_PROXY_SSE_KEEPALIVE_SECS",
             "LISTEN_ADDR",
         ] {
@@ -883,6 +896,7 @@ mod tests {
             assert!(!config.map_queue_full_to_429);
             assert_eq!(config.stream_error_peek_ms, 0);
             assert!(config.rejected_content_part_types.is_empty());
+            assert!(config.allowed_org_ids.is_empty());
             assert_eq!(config.sse_keepalive_secs, 0);
             assert_eq!(config.backend_urls, vec!["http://localhost:8000"]);
         });
@@ -907,11 +921,13 @@ mod tests {
                 ),
                 ("VLLM_PROXY_SSE_KEEPALIVE_SECS", "15"),
                 ("LISTEN_ADDR", "127.0.0.1"),
+                ("VLLM_PROXY_ALLOWED_ORG_IDS", " org-a, org-b ,,"),
             ],
             || {
                 env::remove_var("VLLM_BACKEND_URLS");
                 env::remove_var("VLLM_DATA_PARALLEL_SIZE");
                 let config = Config::from_env().unwrap();
+                assert_eq!(config.allowed_org_ids, vec!["org-a", "org-b"]);
                 assert_eq!(config.backend_token.as_deref(), Some("backend-secret"));
                 assert_eq!(config.backend_health_path, "/healthz");
                 assert!(config.non_tee_deployment);

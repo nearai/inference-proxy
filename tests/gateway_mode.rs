@@ -26,6 +26,7 @@ struct GatewayOptions {
     map_queue_full_to_429: bool,
     stream_error_peek_ms: u64,
     rejected_content_part_types: Vec<String>,
+    allowed_org_ids: Vec<String>,
     sse_keepalive_secs: u64,
     stream_idle_timeout_secs: u64,
 }
@@ -107,6 +108,7 @@ fn build_gateway(mock_url: &str, options: GatewayOptions) -> axum::Router {
         map_queue_full_to_429: options.map_queue_full_to_429,
         stream_error_peek_ms: options.stream_error_peek_ms,
         rejected_content_part_types: options.rejected_content_part_types,
+        allowed_org_ids: options.allowed_org_ids,
         sse_keepalive_secs: options.sse_keepalive_secs,
         dstack_socket_path: "/nonexistent/dstack.sock".to_string(),
         gpu_evidence_delegate_url: None,
@@ -454,6 +456,91 @@ async fn completions_route_gets_priority_too() {
         ))
         .unwrap();
     let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    mock.verify().await;
+}
+
+// ---------------------------------------------------------------------------
+// VLLM_PROXY_ALLOWED_ORG_IDS: only the partner's keys may use the lane
+// ---------------------------------------------------------------------------
+
+async fn mount_key_check(mock: &MockServer, key: &str, org: Option<&str>) {
+    let mut body = serde_json::json!({"valid": true, "workspace_id": "ws", "api_key_id": "k"});
+    if let Some(org) = org {
+        body["organization_id"] = serde_json::json!(org);
+    }
+    // The proxy presents the customer key as the bearer of the check call.
+    let bearer = format!("Bearer {key}");
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .and(header("authorization", bearer.as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(mock)
+        .await;
+}
+
+#[tokio::test]
+async fn org_allowlist_admits_partner_keys_and_refuses_others() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+        .expect(2) // the partner key and the config token
+        .mount(&mock)
+        .await;
+    mount_key_check(&mock, "sk-live-partner", Some("org-partner")).await;
+    mount_key_check(&mock, "sk-live-other", Some("org-other")).await;
+    mount_key_check(&mock, "sk-live-noorg", None).await;
+
+    let app = build_gateway(
+        &mock.uri(),
+        GatewayOptions {
+            cloud_api_url: Some(mock.uri()),
+            allowed_org_ids: vec!["org-partner".to_string()],
+            ..Default::default()
+        },
+    );
+    for (token, expected) in [
+        ("sk-live-partner", StatusCode::OK),
+        ("sk-live-other", StatusCode::FORBIDDEN),
+        ("sk-live-noorg", StatusCode::FORBIDDEN),
+        ("test-token", StatusCode::OK), // config token: operators are not gated
+    ] {
+        let response = app
+            .clone()
+            .oneshot(chat_request_with(token, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "token={token}");
+        if expected == StatusCode::FORBIDDEN {
+            let json = json_body(response).await;
+            assert_eq!(json["error"]["type"], "forbidden");
+        }
+    }
+    mock.verify().await;
+}
+
+#[tokio::test]
+async fn empty_org_allowlist_admits_every_valid_key() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    mount_key_check(&mock, "sk-live-other", Some("org-other")).await;
+    let app = build_gateway(
+        &mock.uri(),
+        GatewayOptions {
+            cloud_api_url: Some(mock.uri()),
+            ..Default::default()
+        },
+    );
+    let response = app
+        .oneshot(chat_request_with("sk-live-other", None))
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     mock.verify().await;
 }

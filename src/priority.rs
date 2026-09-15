@@ -42,7 +42,7 @@ pub fn validate_priority(raw: &str) -> Result<i64, String> {
         .trim()
         .parse()
         .map_err(|_| "priority must be an integer".to_string())?;
-    if value.abs() > MAX_ABS_PRIORITY {
+    if !(-MAX_ABS_PRIORITY..=MAX_ABS_PRIORITY).contains(&value) {
         return Err(format!("priority must be within ±{MAX_ABS_PRIORITY}"));
     }
     Ok(value)
@@ -89,7 +89,7 @@ mod tests {
     fn validates_operator_values() {
         assert_eq!(validate_priority(" -1 ").unwrap(), -1);
         assert_eq!(validate_priority("1000").unwrap(), 1000);
-        for bad in ["", "high", "1.5", "1001", "-1001"] {
+        for bad in ["", "high", "1.5", "1001", "-1001", "-9223372036854775808"] {
             assert!(validate_priority(bad).is_err(), "{bad}");
         }
     }

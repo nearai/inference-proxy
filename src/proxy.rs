@@ -2263,8 +2263,12 @@ pub async fn proxy_streaming_request(
 
     // Consume upstream and forward chunks. Uses select! on tx.closed() to
     // detect client disconnect while waiting for upstream data, preventing
-    // resource leaks from abandoned connections.
-    tokio::spawn(async move {
+    // resource leaks from abandoned connections. Instrumented with the request
+    // span: a spawned task does not inherit it, and opening the upstream (the
+    // connect failures and fail-overs, and every failure before the first
+    // event) happens in here now, where those lines are only useful with the
+    // request_id on them.
+    let task = async move {
         let upstream_start = std::time::Instant::now();
         let mut start_tx = Some(start_tx);
         let mut committed = false;
@@ -2590,7 +2594,11 @@ pub async fn proxy_streaming_request(
                 "Skipping streaming signature cache: stream did not complete cleanly"
             );
         }
-    });
+    };
+    tokio::spawn(tracing::Instrument::instrument(
+        task,
+        tracing::Span::current(),
+    ));
 
     // The upstream gets `commit_after` to prove itself; past that the response
     // is committed and any failure becomes a stream event instead of a status.

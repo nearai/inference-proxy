@@ -957,6 +957,9 @@ pub struct ConnectFailover {
     pub path: &'static str,
     /// Index of the backend the request is currently placed on.
     pub index: usize,
+    /// Context tier the replacement must belong to (`None` = the whole pool,
+    /// see `context_tier.rs`).
+    pub tier: Option<crate::context_tier::ContextTier>,
     /// Conversation to re-pin onto the replacement backend once it answers.
     pub affinity: Option<(
         Arc<crate::backend_affinity::BackendConversationAffinity>,
@@ -1046,12 +1049,13 @@ async fn send_upstream(
     let response = match first {
         Ok(response) => response,
         Err(error) if error.is_connect() && opts.connect_failover.is_some() => {
-            let (pool, path, failed, affinity) = {
+            let (pool, path, failed, tier, affinity) = {
                 let failover = opts.connect_failover.as_ref().expect("checked above");
                 (
                     failover.pool.clone(),
                     failover.path,
                     failover.index,
+                    failover.tier,
                     failover.affinity.clone(),
                 )
             };
@@ -1073,6 +1077,7 @@ async fn send_upstream(
                     max_conns,
                     avoid: &avoid,
                     engine: &engine,
+                    tier,
                 };
                 pool.select_excluding(failed, &policy)
             };
@@ -1107,7 +1112,7 @@ async fn send_upstream(
                 failover.index = next.index;
             }
             if let Some(permit) = opts.admission.as_ref() {
-                permit.attach_backend(next.index);
+                permit.attach_backend(next.index, next.backend.tier);
             }
             opts.backend_guard = Some(next.guard);
             match build_upstream_request(client, url, body, opts).send().await {
@@ -5121,7 +5126,7 @@ mod tests {
         ));
         let pool = crate::backend_pool::BackendPool::new(vec![format!("http://{addr}")]);
         let mut opts = test_proxy_opts();
-        opts.admission = controller.try_admit(&pool).unwrap();
+        opts.admission = controller.try_admit(&pool, None).unwrap();
 
         let mut url = format!("http://{addr}/v1/chat/completions");
         let response = send_upstream(

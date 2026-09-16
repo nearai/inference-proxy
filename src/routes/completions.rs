@@ -96,8 +96,14 @@ pub async fn completions(
         (None, None)
     };
 
-    // Lane admission (gateway mode), see the chat route.
-    let permit = state.admission.try_admit(&state.backend_pool)?;
+    // Long-context tier and lane admission (gateway mode), see the chat
+    // route. Token ids in `prompt` are counted exactly; text is estimated.
+    let tier = crate::context_tier::decide(
+        &state.backend_pool,
+        state.config.long_context_above_tokens,
+        || crate::context_tier::completion_estimate(&request_json),
+    );
+    let permit = state.admission.try_admit(&state.backend_pool, tier)?;
     let host_share = state
         .admission
         .host_share(state.backend_pool.healthy_count());
@@ -106,6 +112,7 @@ pub async fn completions(
             max_conns: host_share,
             avoid: &|index| state.admission.backend_saturated(index),
             engine: &|index| state.admission.engine(index),
+            tier,
         };
         state
             .backend_affinity
@@ -113,7 +120,7 @@ pub async fn completions(
     }
     .ok_or_else(|| AppError::from(state.admission.reject(RejectReason::HostShare)))?;
     if let Some(permit) = permit.as_ref() {
-        permit.attach_backend(placement.index);
+        permit.attach_backend(placement.index, placement.tier);
     }
     let connect_failover = state
         .config
@@ -122,6 +129,7 @@ pub async fn completions(
             pool: state.backend_pool.clone(),
             path: "/v1/completions",
             index: placement.index,
+            tier,
             affinity: None,
         });
     let url = placement.url;

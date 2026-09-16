@@ -20,6 +20,7 @@ use moka::sync::Cache;
 use serde_json::Value;
 
 use crate::backend_pool::{BackendGuard, BackendPool, Policy, Selection};
+use crate::context_tier::ContextTier;
 use crate::vllm_dp_affinity::conversation_key;
 
 const MAX_AFFINITY_ASSIGNMENTS: u64 = 100_000;
@@ -34,6 +35,9 @@ pub struct Placement {
     pub url: String,
     pub guard: BackendGuard,
     pub index: usize,
+    /// Context tier of the backend the request actually landed on, which is
+    /// the requested one unless that tier had no healthy host.
+    pub tier: ContextTier,
 }
 
 impl Placement {
@@ -41,6 +45,7 @@ impl Placement {
         Self {
             url: selection.backend.url(path),
             index: selection.index,
+            tier: selection.backend.tier,
             guard: selection.guard,
         }
     }

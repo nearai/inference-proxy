@@ -1053,12 +1053,21 @@ async fn send_upstream(
                 .admission
                 .as_ref()
                 .and_then(|permit| permit.host_share(pool.healthy_count()));
-            let avoid = |index: usize| {
-                opts.admission
-                    .as_ref()
-                    .is_some_and(|permit| permit.backend_saturated(index))
+            let next = {
+                let avoid = |index: usize| {
+                    opts.admission
+                        .as_ref()
+                        .is_some_and(|permit| permit.backend_saturated(index))
+                };
+                let engine = |index: usize| opts.admission.as_ref().and_then(|p| p.engine(index));
+                let policy = crate::backend_pool::Policy {
+                    max_conns,
+                    avoid: &avoid,
+                    engine: &engine,
+                };
+                pool.select_excluding(failed, &policy)
             };
-            let Some(next) = pool.select_excluding(failed, max_conns, &avoid) else {
+            let Some(next) = next else {
                 if pool.has_healthy_other_than(failed) {
                     if let Some(permit) = opts.admission.as_ref() {
                         // Somewhere to go, but every candidate is at its share

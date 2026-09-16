@@ -120,6 +120,8 @@ fn build_agent_loop_app_with_cloud_and_idle(
         admission_backpressure_secs: 10,
         admission_retry_after_secs: 2,
         backend_connect_failover: false,
+        backend_probe_urls: Vec::new(),
+        backend_probe_interval_secs: 2,
         dstack_socket_path: "/var/run/dstack.sock".to_string(),
         gpu_evidence_delegate_url: None,
         gpu_evidence_delegate_timeout_secs: 30,

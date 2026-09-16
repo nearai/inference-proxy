@@ -37,6 +37,8 @@ struct GatewayOptions {
     admission_ttft_p95_max_ms: Option<u64>,
     admission_backpressure_secs: Option<u64>,
     backend_connect_failover: bool,
+    /// Engine metrics probe base URLs, one per backend (polled every 100 ms here).
+    backend_probe_urls: Vec<String>,
 }
 
 fn build_gateway(mock_url: &str, options: GatewayOptions) -> axum::Router {
@@ -132,6 +134,8 @@ fn build_gateway(mock_url: &str, options: GatewayOptions) -> axum::Router {
         admission_backpressure_secs: options.admission_backpressure_secs.unwrap_or(10),
         admission_retry_after_secs: 2,
         backend_connect_failover: options.backend_connect_failover,
+        backend_probe_urls: options.backend_probe_urls.clone(),
+        backend_probe_interval_secs: 2,
         dstack_socket_path: "/nonexistent/dstack.sock".to_string(),
         gpu_evidence_delegate_url: None,
         gpu_evidence_delegate_timeout_secs: 30,
@@ -195,9 +199,22 @@ fn build_gateway(mock_url: &str, options: GatewayOptions) -> axum::Router {
     };
 
     let backend_pool = Arc::new(backend_pool::BackendPool::new(backend_urls));
+    let engine_load = Arc::new(engine_load::EngineLoad::new(
+        backend_pool.len(),
+        Duration::from_secs(5),
+    ));
+    if !config.backend_probe_urls.is_empty() {
+        engine_load::spawn_engine_load_poller(
+            engine_load.clone(),
+            reqwest::Client::new(),
+            config.backend_probe_urls.clone(),
+            Duration::from_millis(100),
+        );
+    }
     let admission = Arc::new(admission::AdmissionController::new(
         config.admission(),
         backend_pool.len(),
+        engine_load,
     ));
     let backend_affinity = Arc::new(backend_affinity::BackendConversationAffinity::new(
         config.backend_conversation_affinity,
@@ -1638,4 +1655,66 @@ async fn engine_rejection_after_the_peek_window_still_reaches_admission() {
     let second = app.oneshot(chat_request(stream_body)).await.unwrap();
     assert_overloaded(second).await;
     handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Engine load view: placement and admission follow the engines' queues
+// ---------------------------------------------------------------------------
+
+fn metrics_body(running: u32, queued: u32) -> String {
+    format!(
+        "sglang:num_running_reqs{{model_name=\"m\"}} {running}.0\nsglang:num_queue_reqs{{model_name=\"m\"}} {queued}.0\n"
+    )
+}
+
+async fn mount_engine(mock: &MockServer, running: u32, queued: u32, expected_chats: u64) {
+    Mock::given(method("GET"))
+        .and(path("/v1/metrics"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(metrics_body(running, queued)))
+        .mount(mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+        .expect(expected_chats)
+        .mount(mock)
+        .await;
+}
+
+#[tokio::test]
+async fn a_queueing_engine_is_steered_around_and_a_fleet_wide_queue_refuses() {
+    let busy = MockServer::start().await;
+    let idle = MockServer::start().await;
+    // busy is first in the pool, so least-connections alone would pick it.
+    mount_engine(&busy, 20, 3, 0).await;
+    mount_engine(&idle, 2, 0, 2).await;
+    let app = build_gateway(
+        &busy.uri(),
+        GatewayOptions {
+            backend_urls: vec![busy.uri(), idle.uri()],
+            backend_probe_urls: vec![busy.uri(), idle.uri()],
+            admission_max_inflight: 8,
+            ..Default::default()
+        },
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await; // a few polls
+
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(chat_request(hello_body()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    busy.verify().await;
+    idle.verify().await;
+
+    // Now the idle host queues too: nothing has room, refuse before dispatch.
+    idle.reset().await;
+    mount_engine(&idle, 20, 1, 0).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let response = app.oneshot(chat_request(hello_body())).await.unwrap();
+    assert_overloaded(response).await;
+    idle.verify().await;
 }

@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use crate::backend_pool::BackendPool;
+use crate::engine_load::EngineLoad;
 
 /// Window over which time-to-first-generation observations are counted, as
 /// one-second buckets of `(samples, breaches)`: bounded memory and work at
@@ -145,6 +146,8 @@ pub struct AdmissionController {
     /// Per backend index: last engine admission rejection as milliseconds
     /// since `epoch`, plus one so that zero means "never".
     backpressure: Vec<AtomicU64>,
+    /// Live engine view per backend when `VLLM_BACKEND_PROBE_URLS` is set.
+    engine: Arc<EngineLoad>,
     epoch: Instant,
     queue_tripped: AtomicBool,
 }
@@ -152,7 +155,11 @@ pub struct AdmissionController {
 impl AdmissionController {
     /// `backend_count` sizes the per-backend back-pressure slots; it must be
     /// the pool size (backend indexes are stable for the process lifetime).
-    pub fn new(config: Option<AdmissionConfig>, backend_count: usize) -> Self {
+    pub fn new(
+        config: Option<AdmissionConfig>,
+        backend_count: usize,
+        engine: Arc<EngineLoad>,
+    ) -> Self {
         let now = Instant::now();
         let budget = config.as_ref().map_or(0, |c| c.start_inflight);
         if let Some(config) = &config {
@@ -174,6 +181,7 @@ impl AdmissionController {
                 tripped: false,
             }),
             backpressure: (0..backend_count).map(|_| AtomicU64::new(0)).collect(),
+            engine,
             epoch: now,
             queue_tripped: AtomicBool::new(false),
         }
@@ -181,7 +189,12 @@ impl AdmissionController {
 
     /// An inert controller: every request is admitted, nothing is counted.
     pub fn disabled() -> Self {
-        Self::new(None, 0)
+        Self::new(None, 0, Arc::new(EngineLoad::disabled()))
+    }
+
+    /// Fresh engine view `(running, queued)` for backend `index`, when polled.
+    pub fn engine(&self, index: usize) -> Option<(u32, u32)> {
+        self.engine.get(index).map(|s| (s.running, s.queued))
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -212,13 +225,18 @@ impl AdmissionController {
         Some(budget.div_ceil(hosts))
     }
 
-    /// Whether backend `index` rejected at engine admission within the TTL,
-    /// i.e. selection should steer around it while other hosts have room.
+    /// Whether backend `index` is saturated right now — its engine reports a
+    /// non-empty queue, or it rejected a lane request at engine admission
+    /// within the TTL — i.e. selection should steer around it while other
+    /// hosts have room.
     pub fn backend_saturated(&self, index: usize) -> bool {
         self.backend_saturated_at(index, Instant::now())
     }
 
     pub(crate) fn backend_saturated_at(&self, index: usize, now: Instant) -> bool {
+        if self.engine.get_at(index, now).is_some_and(|s| s.queued > 0) {
+            return true;
+        }
         let Some(config) = &self.config else {
             return false;
         };
@@ -533,9 +551,14 @@ impl Permit {
         }
     }
 
-    /// Steer selection around backends that rejected recently.
+    /// Steer selection around backends that are queueing or rejected recently.
     pub fn backend_saturated(&self, index: usize) -> bool {
         self.controller.backend_saturated(index)
+    }
+
+    /// Fresh engine view for backend `index` (see `AdmissionController::engine`).
+    pub fn engine(&self, index: usize) -> Option<(u32, u32)> {
+        self.controller.engine(index)
     }
 
     /// The current per-host share (see `AdmissionController::host_share`).
@@ -662,7 +685,11 @@ mod tests {
     }
 
     fn controller(config: AdmissionConfig, backends: usize) -> Arc<AdmissionController> {
-        Arc::new(AdmissionController::new(Some(config), backends))
+        Arc::new(AdmissionController::new(
+            Some(config),
+            backends,
+            Arc::new(EngineLoad::disabled()),
+        ))
     }
 
     /// Admit at `t0` and record a first-generation sample `ttft` later.
@@ -952,6 +979,35 @@ mod tests {
         assert_eq!(c.ttft_totals(t0 + Duration::from_secs(79)).1, 50);
         assert_eq!(c.ttft_totals(t0 + Duration::from_secs(81)).1, 0);
         assert_eq!(c.ttft_totals(t0 + Duration::from_secs(120)), (0, 0));
+    }
+
+    #[test]
+    fn a_queueing_engine_counts_as_saturated_until_the_sample_ages() {
+        let engine = Arc::new(EngineLoad::new(2, Duration::from_secs(6)));
+        let c = Arc::new(AdmissionController::new(Some(config()), 2, engine.clone()));
+        let p = pool(2);
+        let t0 = Instant::now();
+        let busy = crate::engine_load::Sample {
+            running: 30,
+            queued: 2,
+        };
+        let idle = crate::engine_load::Sample {
+            running: 3,
+            queued: 0,
+        };
+        engine.record_at(0, busy, t0);
+        engine.record_at(1, idle, t0);
+        assert!(c.backend_saturated_at(0, t0 + Duration::from_secs(1)));
+        assert!(!c.backend_saturated_at(1, t0 + Duration::from_secs(1)));
+        assert_eq!(c.engine(0), Some((30, 2)));
+        assert!(c.try_admit_at(&p, t0 + Duration::from_secs(1)).is_ok());
+        // Every host queueing: refuse before dispatch.
+        engine.record_at(1, busy, t0 + Duration::from_secs(2));
+        let rejected = c.try_admit_at(&p, t0 + Duration::from_secs(3)).unwrap_err();
+        assert_eq!(rejected.reason, RejectReason::BackendQueue);
+        // Stale samples are unknown, not saturation.
+        assert!(!c.backend_saturated_at(0, t0 + Duration::from_secs(10)));
+        assert!(c.try_admit_at(&p, t0 + Duration::from_secs(10)).is_ok());
     }
 
     #[test]

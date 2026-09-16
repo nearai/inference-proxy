@@ -6,7 +6,7 @@ use tokio::net::TcpListener;
 use tracing::info;
 use vllm_proxy_rs::ohttp_gateway::OhttpGateway;
 use vllm_proxy_rs::{
-    admission, attestation, backend_affinity, backend_pool, cache, config, fusion,
+    admission, attestation, backend_affinity, backend_pool, cache, config, engine_load, fusion,
     metrics_middleware, rate_limit, request_id_middleware, routes, signing, startup_checks,
     vllm_dp_affinity, AppState,
 };
@@ -191,10 +191,32 @@ async fn main() -> anyhow::Result<()> {
     // Initialize backend pool
     let backend_pool = Arc::new(backend_pool::BackendPool::new(config.backend_urls.clone()));
 
+    // Live engine load per backend (gateway mode): polled when probe URLs are
+    // configured; a sample older than three intervals counts as unknown.
+    let probe_interval = std::time::Duration::from_secs(config.backend_probe_interval_secs);
+    let engine_load = Arc::new(engine_load::EngineLoad::new(
+        backend_pool.len(),
+        probe_interval * 3,
+    ));
+    if !config.backend_probe_urls.is_empty() {
+        info!(
+            backends = config.backend_probe_urls.len(),
+            interval_secs = config.backend_probe_interval_secs,
+            "Polling engine load from the backends' metrics"
+        );
+        engine_load::spawn_engine_load_poller(
+            engine_load.clone(),
+            http_client.clone(),
+            config.backend_probe_urls.clone(),
+            probe_interval,
+        );
+    }
+
     // Lane admission (gateway mode): inert unless configured.
     let admission = Arc::new(admission::AdmissionController::new(
         config.admission(),
         backend_pool.len(),
+        engine_load,
     ));
     if let Some(settings) = admission.config() {
         info!(

@@ -126,6 +126,39 @@ pub struct Selection {
     pub guard: BackendGuard,
 }
 
+/// What a placement may consider besides health and least-connections.
+#[derive(Clone, Copy)]
+pub struct Policy<'a> {
+    /// Per-backend bound on lane requests in flight (`None` = unbounded).
+    pub max_conns: Option<u32>,
+    /// Backends to steer around (recent engine rejection, non-empty engine
+    /// queue).
+    pub avoid: &'a (dyn Fn(usize) -> bool + Sync),
+    /// Fresh engine view `(running, queued)` when the engines are polled
+    /// (`engine_load.rs`). It ranks backends for new conversations and keeps a
+    /// pinned conversation where it is regardless of running counts: a host
+    /// with a free batch slot serves the cached prefix at once, and only a
+    /// queueing host (via `avoid`) moves it.
+    pub engine: &'a (dyn Fn(usize) -> Option<(u32, u32)> + Sync),
+}
+
+fn never(_: usize) -> bool {
+    false
+}
+
+fn unknown(_: usize) -> Option<(u32, u32)> {
+    None
+}
+
+impl Policy<'static> {
+    /// Health and least-connections only (admission off, no engine polling).
+    pub const NONE: Policy<'static> = Policy {
+        max_conns: None,
+        avoid: &never,
+        engine: &unknown,
+    };
+}
+
 /// Minimum attempts to turn a pick into a reservation before giving up; a
 /// lost race (another request took the last slot under the bound) picks
 /// again, and a burst can lose once per backend, so the pool scales this.
@@ -160,10 +193,11 @@ impl BackendPool {
     /// If all are unhealthy, picks the least-loaded one anyway. No slot is
     /// reserved; callers create their own `BackendGuard`.
     pub fn select(&self) -> Arc<Backend> {
+        let conns = |_: usize, backend: &Backend| backend.active_conns.load(Ordering::Relaxed);
         let index = self
-            .least_index(|_, backend| backend.healthy.load(Ordering::Relaxed))
+            .least_index(|_, backend| backend.healthy.load(Ordering::Relaxed), conns)
             .unwrap_or_else(|| {
-                self.least_index(|_, _| true)
+                self.least_index(|_, _| true, conns)
                     .expect("backends is non-empty")
             });
         self.backends[index].clone()
@@ -183,53 +217,41 @@ impl BackendPool {
         preferred: Option<usize>,
         max_imbalance: u32,
     ) -> Selection {
-        self.reserve(preferred, max_imbalance, None, &|_| false, true)
+        self.reserve(preferred, max_imbalance, &Policy::NONE, true)
             .expect("unbounded selection always yields a backend")
     }
 
-    /// `select_with_preference` restricted to backends that are not `avoid`ed
-    /// and have fewer than `max_conns` requests in flight (the admission
-    /// per-host share, see `admission.rs`). The slot is taken atomically, so
-    /// concurrent selections cannot overshoot the bound. A preferred backend
-    /// that is avoided or at the bound is treated like an overloaded one and
-    /// the turn is rebalanced; `None` when no backend is eligible.
+    /// `select_with_preference` under a `Policy`: only backends that are not
+    /// avoided and have fewer than `max_conns` lane requests in flight (the
+    /// admission per-host share, see `admission.rs`), ranked by the engine
+    /// view when polled. The slot is taken atomically, so concurrent
+    /// selections cannot overshoot the bound. A preferred backend that is
+    /// avoided or at the bound is treated like an overloaded one and the turn
+    /// is rebalanced; `None` when no backend is eligible.
     pub fn select_with_preference_bounded(
         &self,
         preferred: Option<usize>,
         max_imbalance: u32,
-        max_conns: Option<u32>,
-        avoid: &dyn Fn(usize) -> bool,
+        policy: &Policy<'_>,
     ) -> Option<Selection> {
         // Without a bound (admission off) keep the legacy degradation when
         // every backend is unhealthy; with one, refusing is the point.
-        self.reserve(
-            preferred,
-            max_imbalance,
-            max_conns,
-            avoid,
-            max_conns.is_none(),
-        )
+        self.reserve(preferred, max_imbalance, policy, policy.max_conns.is_none())
     }
 
     /// Least-loaded eligible backend other than `excluded` (connection
-    /// fail-over), under the same bound and avoidance as
-    /// `select_with_preference_bounded`; `None` when there is none.
-    pub fn select_excluding(
-        &self,
-        excluded: usize,
-        max_conns: Option<u32>,
-        avoid: &dyn Fn(usize) -> bool,
-    ) -> Option<Selection> {
+    /// fail-over), under the same policy as `select_with_preference_bounded`;
+    /// `None` when there is none.
+    pub fn select_excluding(&self, excluded: usize, policy: &Policy<'_>) -> Option<Selection> {
         if self.backends.len() == 1 {
             return None;
         }
-        self.reserve(
-            None,
-            0,
-            max_conns,
-            &|index| index == excluded || avoid(index),
-            false,
-        )
+        let avoid = |index: usize| index == excluded || (policy.avoid)(index);
+        let policy = Policy {
+            avoid: &avoid,
+            ..*policy
+        };
+        self.reserve(None, 0, &policy, false)
     }
 
     /// Whether some backend other than `index` is healthy (fail-over could
@@ -255,25 +277,20 @@ impl BackendPool {
         &self,
         preferred: Option<usize>,
         max_imbalance: u32,
-        max_conns: Option<u32>,
-        avoid: &dyn Fn(usize) -> bool,
+        policy: &Policy<'_>,
         degrade_when_all_unhealthy: bool,
     ) -> Option<Selection> {
         let attempts = (self.backends.len() * 4).max(RESERVE_ATTEMPTS);
         for _ in 0..attempts {
-            let (index, outcome) = self.pick(
-                preferred,
-                max_imbalance,
-                max_conns,
-                avoid,
-                degrade_when_all_unhealthy,
-            )?;
+            let (index, outcome) =
+                self.pick(preferred, max_imbalance, policy, degrade_when_all_unhealthy)?;
             let backend = &self.backends[index];
             let taken =
                 backend
                     .lane_conns
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |conns| {
-                        max_conns
+                        policy
+                            .max_conns
                             .is_none_or(|max| conns < max)
                             .then(|| conns.saturating_add(1))
                     });
@@ -295,12 +312,21 @@ impl BackendPool {
         &self,
         preferred: Option<usize>,
         max_imbalance: u32,
-        max_conns: Option<u32>,
-        avoid: &dyn Fn(usize) -> bool,
+        policy: &Policy<'_>,
         degrade_when_all_unhealthy: bool,
     ) -> Option<(usize, SelectionOutcome)> {
+        let avoid = policy.avoid;
         let under_bound = |backend: &Backend| {
-            max_conns.is_none_or(|max| backend.lane_conns.load(Ordering::Relaxed) < max)
+            policy
+                .max_conns
+                .is_none_or(|max| backend.lane_conns.load(Ordering::Relaxed) < max)
+        };
+        // Engine view when polled (running + queued), the gateway's own
+        // connection count otherwise.
+        let load = |index: usize, backend: &Backend| {
+            (policy.engine)(index)
+                .map(|(running, queued)| running.saturating_add(queued))
+                .unwrap_or_else(|| backend.active_conns.load(Ordering::Relaxed))
         };
         if self.backends.len() == 1 {
             let only = &self.backends[0];
@@ -312,13 +338,13 @@ impl BackendPool {
         let eligible = |index: usize, backend: &Backend| {
             !avoid(index) && backend.healthy.load(Ordering::Relaxed) && under_bound(backend)
         };
-        let least_index = match self.least_index(eligible) {
+        let least_index = match self.least_index(eligible, load) {
             Some(index) => index,
             // Everything unhealthy: degrade to the least-loaded backend that is
             // not avoided rather than refusing every request (a probe will
             // re-mark them). Never for a bounded or fail-over selection.
             None if degrade_when_all_unhealthy => {
-                self.least_index(|index, backend| !avoid(index) && under_bound(backend))?
+                self.least_index(|index, backend| !avoid(index) && under_bound(backend), load)?
             }
             None => return None,
         };
@@ -330,13 +356,19 @@ impl BackendPool {
         if !candidate.healthy.load(Ordering::Relaxed) {
             return Some((least_index, SelectionOutcome::Unhealthy));
         }
-        let candidate_conns = candidate.active_conns.load(Ordering::Relaxed);
-        let least_conns = self.backends[least_index]
-            .active_conns
-            .load(Ordering::Relaxed);
-        if eligible(preferred_index, candidate)
-            && candidate_conns <= least_conns.saturating_add(max_imbalance)
-        {
+        if !eligible(preferred_index, candidate) {
+            return Some((least_index, SelectionOutcome::Rebalanced));
+        }
+        // With the engine view the pin holds: a host that is not queueing
+        // serves the cached prefix at once, whatever its running count. Only
+        // the gateway-count fallback applies the imbalance bound.
+        let within_bound = (policy.engine)(preferred_index).is_some()
+            || candidate.active_conns.load(Ordering::Relaxed)
+                <= self.backends[least_index]
+                    .active_conns
+                    .load(Ordering::Relaxed)
+                    .saturating_add(max_imbalance);
+        if within_bound {
             Some((preferred_index, SelectionOutcome::Pinned))
         } else {
             Some((least_index, SelectionOutcome::Rebalanced))
@@ -344,12 +376,16 @@ impl BackendPool {
     }
 
     /// Index of the least-loaded backend among those `eligible` accepts.
-    fn least_index(&self, eligible: impl Fn(usize, &Backend) -> bool) -> Option<usize> {
+    fn least_index(
+        &self,
+        eligible: impl Fn(usize, &Backend) -> bool,
+        load: impl Fn(usize, &Backend) -> u32,
+    ) -> Option<usize> {
         self.backends
             .iter()
             .enumerate()
             .filter(|(index, backend)| eligible(*index, backend))
-            .min_by_key(|(_, backend)| backend.active_conns.load(Ordering::Relaxed))
+            .min_by_key(|(index, backend)| load(*index, backend))
             .map(|(index, _)| index)
     }
 
@@ -583,8 +619,18 @@ mod tests {
         assert_eq!(pool.backends[0].active_conns.load(Ordering::Relaxed), 0);
     }
 
-    fn no_avoid(_: usize) -> bool {
-        false
+    fn bounded(max_conns: u32) -> Policy<'static> {
+        Policy {
+            max_conns: Some(max_conns),
+            ..Policy::NONE
+        }
+    }
+
+    fn avoiding(avoid: &(dyn Fn(usize) -> bool + Sync)) -> Policy<'_> {
+        Policy {
+            avoid,
+            ..Policy::NONE
+        }
     }
 
     /// Simulate `n` requests on backend `index` (both counters).
@@ -604,7 +650,7 @@ mod tests {
         set_conns(&pool, 1, 1);
         // Share 2: only b2 has room, and the reservation is taken on it.
         let sel = pool
-            .select_with_preference_bounded(None, 8, Some(2), &no_avoid)
+            .select_with_preference_bounded(None, 8, &bounded(2))
             .unwrap();
         assert_eq!(sel.index, 1);
         assert_eq!(pool.backends()[1].active_conns.load(Ordering::Relaxed), 2);
@@ -612,7 +658,7 @@ mod tests {
         assert_eq!(pool.backends()[1].active_conns.load(Ordering::Relaxed), 1);
         // A pin on the full backend is rebalanced even within the imbalance bound.
         let sel = pool
-            .select_with_preference_bounded(Some(0), 8, Some(2), &no_avoid)
+            .select_with_preference_bounded(Some(0), 8, &bounded(2))
             .unwrap();
         assert_eq!(sel.index, 1);
         assert_eq!(sel.outcome, SelectionOutcome::Rebalanced);
@@ -620,14 +666,14 @@ mod tests {
         // Everyone at the share: nothing to pick.
         set_conns(&pool, 1, 2);
         assert!(pool
-            .select_with_preference_bounded(Some(1), 8, Some(2), &no_avoid)
+            .select_with_preference_bounded(Some(1), 8, &bounded(2))
             .is_none());
         assert!(pool
-            .select_with_preference_bounded(None, 8, Some(2), &no_avoid)
+            .select_with_preference_bounded(None, 8, &bounded(2))
             .is_none());
         // Without a bound the same state still selects.
         assert!(pool
-            .select_with_preference_bounded(None, 8, None, &no_avoid)
+            .select_with_preference_bounded(None, 8, &Policy::NONE)
             .is_some());
     }
 
@@ -636,17 +682,17 @@ mod tests {
         let pool = two_backends();
         let avoid_b1 = |index: usize| index == 0;
         let sel = pool
-            .select_with_preference_bounded(Some(0), 8, None, &avoid_b1)
+            .select_with_preference_bounded(Some(0), 8, &avoiding(&avoid_b1))
             .unwrap();
         assert_eq!(sel.index, 1);
         assert_eq!(sel.outcome, SelectionOutcome::Rebalanced);
         drop(sel);
         assert!(pool
-            .select_with_preference_bounded(None, 8, None, &|_| true)
+            .select_with_preference_bounded(None, 8, &avoiding(&|_| true))
             .is_none());
         let single = BackendPool::new(vec!["http://only:8000".to_string()]);
         assert!(single
-            .select_with_preference_bounded(None, 0, None, &|_| true)
+            .select_with_preference_bounded(None, 0, &avoiding(&|_| true))
             .is_none());
     }
 
@@ -655,10 +701,10 @@ mod tests {
         let pool = BackendPool::new(vec!["http://only:8000".to_string()]);
         set_conns(&pool, 0, 3);
         assert!(pool
-            .select_with_preference_bounded(None, 0, Some(3), &no_avoid)
+            .select_with_preference_bounded(None, 0, &bounded(3))
             .is_none());
         let sel = pool
-            .select_with_preference_bounded(None, 0, Some(4), &no_avoid)
+            .select_with_preference_bounded(None, 0, &bounded(4))
             .unwrap();
         assert_eq!(sel.outcome, SelectionOutcome::Single);
         assert_eq!(pool.backends()[0].active_conns.load(Ordering::Relaxed), 4);
@@ -667,19 +713,19 @@ mod tests {
     #[test]
     fn test_select_excluding_picks_another_healthy_backend() {
         let pool = two_backends();
-        assert_eq!(pool.select_excluding(0, None, &no_avoid).unwrap().index, 1);
-        assert_eq!(pool.select_excluding(1, None, &no_avoid).unwrap().index, 0);
+        assert_eq!(pool.select_excluding(0, &Policy::NONE).unwrap().index, 1);
+        assert_eq!(pool.select_excluding(1, &Policy::NONE).unwrap().index, 0);
         pool.backends()[1].healthy.store(false, Ordering::Relaxed);
-        assert!(pool.select_excluding(0, None, &no_avoid).is_none());
+        assert!(pool.select_excluding(0, &Policy::NONE).is_none());
         assert_eq!(pool.healthy_count(), 1);
         pool.backends()[1].healthy.store(true, Ordering::Relaxed);
         set_conns(&pool, 1, 2);
-        assert!(pool.select_excluding(0, Some(2), &no_avoid).is_none());
+        assert!(pool.select_excluding(0, &bounded(2)).is_none());
         assert!(pool
-            .select_excluding(0, None, &|index| index == 1)
+            .select_excluding(0, &avoiding(&|index| index == 1))
             .is_none());
         let single = BackendPool::new(vec!["http://only:8000".to_string()]);
-        assert!(single.select_excluding(0, None, &no_avoid).is_none());
+        assert!(single.select_excluding(0, &Policy::NONE).is_none());
     }
 
     #[test]
@@ -694,7 +740,7 @@ mod tests {
                 std::thread::spawn(move || {
                     for _ in 0..500 {
                         if let Some(sel) =
-                            pool.select_with_preference_bounded(None, 8, Some(bound), &no_avoid)
+                            pool.select_with_preference_bounded(None, 8, &bounded(bound))
                         {
                             if sel.backend.lane_conns.load(Ordering::Relaxed) > bound {
                                 overshoot.store(true, Ordering::Relaxed);
@@ -724,7 +770,7 @@ mod tests {
         let plain = BackendGuard::new(pool.backends()[0].clone());
         let plain2 = BackendGuard::new(pool.backends()[0].clone());
         let sel = pool
-            .select_with_preference_bounded(Some(0), 8, Some(1), &no_avoid)
+            .select_with_preference_bounded(Some(0), 8, &bounded(1))
             .unwrap();
         assert_eq!(sel.index, 0, "share applies to lane requests only");
         assert_eq!(pool.backends()[0].lane_conns.load(Ordering::Relaxed), 1);
@@ -741,7 +787,7 @@ mod tests {
         let pool = BackendPool::new(vec!["http://only:8000".to_string()]);
         pool.backends()[0].healthy.store(false, Ordering::Relaxed);
         assert!(pool
-            .select_with_preference_bounded(None, 0, Some(4), &no_avoid)
+            .select_with_preference_bounded(None, 0, &bounded(4))
             .is_none());
         // Admission off: the legacy degradation still serves it.
         assert_eq!(pool.select_with_preference(None, 0).index, 0);
@@ -760,7 +806,7 @@ mod tests {
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
-                    pool.select_with_preference_bounded(None, 8, Some(1), &no_avoid)
+                    pool.select_with_preference_bounded(None, 8, &bounded(1))
                 })
             })
             .collect();
@@ -776,6 +822,40 @@ mod tests {
         indexes.sort_unstable();
         indexes.dedup();
         assert_eq!(indexes.len(), 40);
+    }
+
+    #[test]
+    fn test_engine_view_ranks_new_conversations_and_keeps_pins() {
+        let pool = two_backends();
+        // Gateway counts favor b1 (0 vs 3), the engines say b1 is the busy one.
+        set_conns(&pool, 1, 3);
+        let engine = |index: usize| Some(if index == 0 { (40, 0) } else { (5, 0) });
+        let policy = Policy {
+            engine: &engine,
+            ..Policy::NONE
+        };
+        let sel = pool
+            .select_with_preference_bounded(None, 8, &policy)
+            .unwrap();
+        assert_eq!(
+            sel.index, 1,
+            "a new conversation goes to the least-loaded engine"
+        );
+        drop(sel);
+        // A conversation pinned to the busy host stays: it is not queueing, and
+        // running counts never move a pin (the gateway-count bound would have).
+        let sel = pool
+            .select_with_preference_bounded(Some(0), 0, &policy)
+            .unwrap();
+        assert_eq!((sel.index, sel.outcome), (0, SelectionOutcome::Pinned));
+        drop(sel);
+        // Without the engine view the gateway-count bound still applies.
+        set_conns(&pool, 0, 9);
+        set_conns(&pool, 1, 0);
+        let sel = pool
+            .select_with_preference_bounded(Some(0), 8, &Policy::NONE)
+            .unwrap();
+        assert_eq!(sel.outcome, SelectionOutcome::Rebalanced);
     }
 
     #[test]

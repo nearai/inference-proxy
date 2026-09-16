@@ -11,6 +11,7 @@ pub mod cache;
 pub mod config;
 pub mod content_policy;
 pub mod encryption;
+pub mod engine_load;
 pub mod error;
 pub mod fusion;
 pub mod gpu_evidence_delegate;

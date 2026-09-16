@@ -334,6 +334,14 @@ pub struct Config {
     /// (`VLLM_BACKEND_CONNECT_FAILOVER`). HTTP errors, queue-full included,
     /// are never retried.
     pub backend_connect_failover: bool,
+    /// Gateway mode: one plain-HTTP probe base URL per backend (same order as
+    /// `VLLM_BACKEND_URLS`) whose `/v1/metrics` is polled for the engine's
+    /// running and queued request counts (`VLLM_BACKEND_PROBE_URLS`). Empty =
+    /// no engine view; placement and admission use the gateway's own counts.
+    pub backend_probe_urls: Vec<String>,
+    /// Poll interval for the probes (`VLLM_BACKEND_PROBE_INTERVAL_SECS`,
+    /// default 2).
+    pub backend_probe_interval_secs: u64,
 
     // Endpoint URL overrides (Some = explicitly set, bypasses backend pool)
     pub images_url_override: Option<String>,
@@ -636,6 +644,21 @@ impl Config {
             }
         }
         let backend_connect_failover = env_bool("VLLM_BACKEND_CONNECT_FAILOVER");
+        let backend_probe_urls: Vec<String> = env::var("VLLM_BACKEND_PROBE_URLS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|u| u.trim().trim_end_matches('/').to_string())
+            .filter(|u| !u.is_empty())
+            .collect();
+        if !backend_probe_urls.is_empty() && backend_probe_urls.len() != backend_urls.len() {
+            anyhow::bail!(
+                "VLLM_BACKEND_PROBE_URLS must list one probe URL per VLLM_BACKEND_URLS entry, in the same order"
+            );
+        }
+        let backend_probe_interval_secs: u64 = env_parse("VLLM_BACKEND_PROBE_INTERVAL_SECS", 2)?;
+        if backend_probe_interval_secs == 0 {
+            anyhow::bail!("VLLM_BACKEND_PROBE_INTERVAL_SECS must be at least 1");
+        }
 
         let config = Config {
             model_name,
@@ -729,6 +752,8 @@ impl Config {
             admission_backpressure_secs,
             admission_retry_after_secs,
             backend_connect_failover,
+            backend_probe_urls,
+            backend_probe_interval_secs,
             images_url_override,
             images_edits_url_override,
             transcriptions_url_override,
@@ -997,6 +1022,8 @@ mod tests {
             "VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS",
             "VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS",
             "VLLM_BACKEND_CONNECT_FAILOVER",
+            "VLLM_BACKEND_PROBE_URLS",
+            "VLLM_BACKEND_PROBE_INTERVAL_SECS",
             "LISTEN_ADDR",
         ] {
             env::remove_var(key);
@@ -1021,6 +1048,8 @@ mod tests {
             assert_eq!(config.admission_max_inflight, 0);
             assert!(config.admission().is_none());
             assert!(!config.backend_connect_failover);
+            assert!(config.backend_probe_urls.is_empty());
+            assert_eq!(config.backend_probe_interval_secs, 2);
             assert_eq!(config.backend_urls, vec!["http://localhost:8000"]);
         });
     }
@@ -1863,6 +1892,22 @@ mod tests {
                 assert!(err.contains("WEB_CONTEXT_SEARCH_URL"), "{err}");
                 env::remove_var("WEB_CONTEXT_SEARCH_URL");
                 env::remove_var("WEB_CONTEXT_SEARCH_API_KEY");
+                // Probe URLs pair with the backend URLs one to one.
+                env::set_var("VLLM_BACKEND_URLS", "https://a.example,https://b.example");
+                env::set_var("VLLM_BACKEND_PROBE_URLS", "http://10.0.0.1:8000/");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("VLLM_BACKEND_PROBE_URLS"), "{err}");
+                env::set_var(
+                    "VLLM_BACKEND_PROBE_URLS",
+                    "http://10.0.0.1:8000/, http://10.0.0.2:8000",
+                );
+                let config = Config::from_env().unwrap();
+                assert_eq!(
+                    config.backend_probe_urls,
+                    vec!["http://10.0.0.1:8000", "http://10.0.0.2:8000"]
+                );
+                env::remove_var("VLLM_BACKEND_PROBE_URLS");
+                env::remove_var("VLLM_BACKEND_URLS");
                 env::remove_var("VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS");
             },
         );

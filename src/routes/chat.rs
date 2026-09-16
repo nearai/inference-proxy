@@ -8,6 +8,7 @@ use sha2::Digest;
 
 use crate::admission::RejectReason;
 use crate::auth::RequireAuth;
+use crate::backend_pool;
 use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
 use crate::proxy::{
@@ -224,16 +225,20 @@ pub async fn chat_completions(
     let host_share = state
         .admission
         .host_share(state.backend_pool.healthy_count());
-    let placement = state
-        .backend_affinity
-        .place(
+    let placement = {
+        let policy = backend_pool::Policy {
+            max_conns: host_share,
+            avoid: &|index| state.admission.backend_saturated(index),
+            engine: &|index| state.admission.engine(index),
+        };
+        state.backend_affinity.place(
             &state.backend_pool,
             backend_affinity_key,
             "/v1/chat/completions",
-            host_share,
-            &|index| state.admission.backend_saturated(index),
+            &policy,
         )
-        .ok_or_else(|| AppError::from(state.admission.reject(RejectReason::HostShare)))?;
+    }
+    .ok_or_else(|| AppError::from(state.admission.reject(RejectReason::HostShare)))?;
     if let Some(permit) = permit.as_ref() {
         permit.attach_backend(placement.index);
     }

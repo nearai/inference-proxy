@@ -87,6 +87,7 @@ to the current in-CVM behavior.
 | `VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS` | `30000` | Refuse new work while, over the last minute, at least 20 lane requests reached the engine and 5 % of them (at least two) waited longer than this for their first generation event. |
 | `VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS` | `10` | A backend that rejected at engine admission within this window is steered around; when every healthy backend did, new work is refused. |
 | `VLLM_BACKEND_CONNECT_FAILOVER` | `1` | A backend that refuses the connection (host down, proxy restarting) costs the request nothing: it is re-sent once to another healthy backend, the dead one leaves the rotation until a probe succeeds, and a pinned conversation follows. Never on an HTTP error. |
+| `VLLM_BACKEND_PROBE_URLS` / `_INTERVAL_SECS` | `http://<host-ip>:8000,…` / `2` | The engines' live running/queued counts, read from each host's plain metrics port (the same route model-proxy samples; reachable from the model-proxy hosts, no token). Drives placement and the fleet-wide queue refusal below. |
 | `NON_TEE_DEPLOYMENT` | `1` | No dstack socket outside a CVM: `/healthz` reports `"dstack":"skipped"`, no attestation refresh, and `/v1/attestation/report`, `/v1/signature/{id}`, `/internal/gpu_evidence` answer 404 so nothing unverifiable is advertised. |
 | `DEV` / `GPU_NO_HW_MODE` | `1` / `1` | Non-TEE: random signing keys, no hardware evidence. |
 | `LISTEN_ADDR` / `LISTEN_PORT` | `127.0.0.1` / `31700` | Bind behind the local TLS terminator. |
@@ -131,7 +132,11 @@ prefills and their time to first token is minutes. The gateway therefore
 bounds the lane itself (`admission.rs`), in this order, before anything is sent
 upstream:
 
-1. **Observed overload.** Two signals the gateway measures on its own traffic.
+1. **Observed overload.** The engines' own queues first: with
+   `VLLM_BACKEND_PROBE_URLS` each host's running and queued request counts are
+   polled every two seconds; a host with a non-empty queue is steered around,
+   and once every healthy host queues, new work is refused (reason
+   `backend_queue`). Then two signals the gateway measures on its own traffic.
    Time to first generation: over the last minute, at least 20 lane requests
    reached the engine and 5 % of them (at least two) waited longer than
    `VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS` for their first generation event — a
@@ -149,13 +154,18 @@ upstream:
    `VLLM_PROXY_ADMISSION_RAMP_STEP` every `VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS`
    up to `VLLM_PROXY_ADMISSION_MAX_INFLIGHT`, but only after an interval
    without any overload signal; a restart goes back to the start value.
-3. **Per-host share.** `ceil(budget / healthy backends)` lane requests in
-   flight per backend (other traffic on the pool does not count), reserved
-   atomically at selection so concurrent requests cannot overshoot it,
-   so a conversation-affinity pin cannot pile the whole budget onto one host: a
-   pinned conversation whose host is at its share (or steered around) moves to
-   the least-loaded host with room, and only when no host has room is the
-   request refused (reason `host_share`).
+3. **Per-host share and placement.** `ceil(budget / healthy backends)` lane
+   requests in flight per backend (other traffic on the pool does not count),
+   reserved atomically at selection so concurrent requests cannot overshoot
+   it, so a conversation-affinity pin cannot pile the whole budget onto one
+   host. New conversations go to the host with the lowest engine load (running
+   + queued) when the engines are polled, the gateway's own connection count
+   otherwise. A pinned conversation stays on its host regardless of running
+   counts — a free batch slot serves the cached prefix at once, a move costs a
+   full re-prefill — and moves only when that host is queueing, at its share
+   or steered around, to the least-loaded host with room; it is then re-pinned
+   there. Only when no host has room is the request refused (reason
+   `host_share`).
 
 A refusal is `429` with `Retry-After: VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS`
 and an error of type `overloaded`; the slot is released when the response —
@@ -175,8 +185,9 @@ back-pressure for the next admission decision
 `stream_client_disconnects_total`, `admission_inflight`, `admission_budget`,
 `admission_rejections_total{reason}`, `admission_ttft_seconds`,
 `admission_backpressure_total{backend}`, `backend_failover_total{outcome}`,
-`upstream_stream_error_events_total{phase}`, plus the existing usage-report and
-upstream metrics.
+`upstream_stream_error_events_total{phase}`, `backend_engine_running{backend}`,
+`backend_engine_queued{backend}`, `backend_engine_probe_failures_total{backend}`,
+plus the existing usage-report and upstream metrics.
 
 ## What is deliberately not offered here
 

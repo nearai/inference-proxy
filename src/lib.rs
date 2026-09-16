@@ -25,6 +25,7 @@ pub mod request_tracing;
 pub mod routes;
 pub mod signing;
 pub mod startup_checks;
+pub mod tool_calls;
 pub mod types;
 pub mod vllm_dp_affinity;
 

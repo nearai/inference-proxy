@@ -59,6 +59,12 @@ pub async fn chat_completions(
         )?;
     }
 
+    // Repair tool-call `arguments` the engine would refuse (empty, missing,
+    // double-encoded, non-object): one odd historical turn must not 400 the
+    // whole conversation. After decryption, so an encrypted field is judged
+    // on its plaintext, never on the ciphertext. See nearai/inference-proxy#239.
+    crate::tool_calls::normalize_tool_call_arguments(&mut request_json);
+
     // Reject clearly-bad image inputs (unfetchable / non-image) before forwarding
     // to the engine, so a flood of dead URLs can't load the model. Runs only when
     // the request actually contains images; conservative/fail-open otherwise.

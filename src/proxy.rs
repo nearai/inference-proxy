@@ -1031,6 +1031,13 @@ async fn send_upstream(
     endpoint: &'static str,
 ) -> Result<reqwest::Response, AppError> {
     let upstream_start = std::time::Instant::now();
+    // The lane's time-to-first-token clock starts here. The engine sends the
+    // SSE response headers only once it has something to say, so measuring
+    // from the response would skip exactly the wait we care about: queueing
+    // and prefill. Idempotent, so a fail-over keeps the original start.
+    if let Some(permit) = opts.admission.as_ref() {
+        permit.mark_dispatched();
+    }
     let first = build_upstream_request(client, url, body.clone(), opts)
         .send()
         .await;
@@ -1072,6 +1079,8 @@ async fn send_upstream(
                     if let Some(permit) = opts.admission.as_ref() {
                         // Somewhere to go, but every candidate is at its share
                         // or steered around: that is admission, not an outage.
+                        // Nothing waited on an engine here either.
+                        permit.abandon();
                         return Err(AppError::from(permit.reject_host_share()));
                     }
                 }
@@ -1081,6 +1090,7 @@ async fn send_upstream(
                     error = %error,
                     "Backend unreachable and no other healthy backend to fail over to"
                 );
+                abandon_without_dispatch(opts.admission.as_ref());
                 return Err(upstream_unreachable());
             };
             metrics::counter!("backend_failover_total", "outcome" => "retried").increment(1);
@@ -1115,21 +1125,37 @@ async fn send_upstream(
                         error = %error,
                         "Fail-over backend unreachable too"
                     );
+                    abandon_without_dispatch(opts.admission.as_ref());
                     return Err(upstream_unreachable());
                 }
-                Err(error) => return Err(transport_error(error)),
+                Err(error) => return Err(terminal_transport_error(error, opts.admission.as_ref())),
             }
         }
-        Err(error) => return Err(transport_error(error)),
+        Err(error) => return Err(terminal_transport_error(error, opts.admission.as_ref())),
     };
     metrics::histogram!("upstream_request_duration_seconds", "endpoint" => endpoint)
         .record(upstream_start.elapsed().as_secs_f64());
-    if response.status().is_success() {
-        if let Some(permit) = opts.admission.as_ref() {
-            permit.mark_dispatched();
-        }
-    }
     Ok(response)
+}
+
+/// A connection that was never established means the request did not wait on
+/// an engine: no time-to-first-token observation for it.
+fn abandon_without_dispatch(permit: Option<&crate::admission::Permit>) {
+    if let Some(permit) = permit {
+        permit.abandon();
+    }
+}
+
+/// Classify a transport failure and keep the admission observation honest: a
+/// connect failure is not a wait on an engine, a timeout is.
+fn terminal_transport_error(
+    error: reqwest::Error,
+    permit: Option<&crate::admission::Permit>,
+) -> AppError {
+    if error.is_connect() {
+        abandon_without_dispatch(permit);
+    }
+    transport_error(error)
 }
 
 /// The engine answered a lane request with an error instead of generating:
@@ -4889,5 +4915,72 @@ mod tests {
         let mut tool = SseParser::new();
         tool.process_chunk(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"f\"}}]}}]}\n\n");
         assert!(tool.seen_generation_output);
+    }
+
+    /// The engine's SSE headers only arrive once it has something to say, so
+    /// the admission clock has to start when the request goes out. Otherwise
+    /// the queueing and prefill wait — the thing the lane watches for — is
+    /// measured as a few milliseconds.
+    #[tokio::test]
+    async fn ttft_clock_starts_when_the_request_goes_out_not_when_headers_arrive() {
+        use axum::routing::post;
+
+        let delay = std::time::Duration::from_millis(300);
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move || async move {
+                tokio::time::sleep(delay).await;
+                axum::response::Response::builder()
+                    .status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from("data: [DONE]\n\n"))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let controller = Arc::new(crate::admission::AdmissionController::new(
+            Some(crate::admission::AdmissionConfig {
+                max_inflight: 4,
+                start_inflight: 4,
+                ramp_step: 1,
+                ramp_interval: std::time::Duration::from_secs(60),
+                ttft_p95_max: Some(std::time::Duration::from_secs(30)),
+                backpressure_ttl: std::time::Duration::from_secs(10),
+                retry_after: std::time::Duration::from_secs(2),
+            }),
+            1,
+            Arc::new(crate::engine_load::EngineLoad::disabled()),
+        ));
+        let pool = crate::backend_pool::BackendPool::new(vec![format!("http://{addr}")]);
+        let mut opts = test_proxy_opts();
+        opts.admission = controller.try_admit(&pool).unwrap();
+
+        let mut url = format!("http://{addr}/v1/chat/completions");
+        let response = send_upstream(
+            &reqwest::Client::new(),
+            &mut url,
+            Bytes::from_static(b"{}"),
+            &mut opts,
+            "streaming",
+        )
+        .await
+        .unwrap();
+        assert!(response.status().is_success());
+
+        let permit = opts.admission.as_ref().expect("admission is enabled");
+        let waited = permit
+            .dispatched_at()
+            .expect("the request was dispatched")
+            .elapsed();
+        assert!(
+            waited >= delay,
+            "the clock must already cover the engine's silence, got {waited:?}"
+        );
+        server.abort();
     }
 }

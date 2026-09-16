@@ -577,6 +577,12 @@ impl Permit {
         self.mark_dispatched_at(Instant::now());
     }
 
+    /// When the request went out, i.e. when its time-to-first-token clock
+    /// started. `None` until it is dispatched.
+    pub fn dispatched_at(&self) -> Option<Instant> {
+        self.dispatched_at.get().copied()
+    }
+
     pub(crate) fn mark_dispatched_at(&self, now: Instant) {
         if self
             .state
@@ -1008,6 +1014,22 @@ mod tests {
         // Stale samples are unknown, not saturation.
         assert!(!c.backend_saturated_at(0, t0 + Duration::from_secs(10)));
         assert!(c.try_admit_at(&p, t0 + Duration::from_secs(10)).is_ok());
+    }
+
+    #[test]
+    fn a_refusal_after_dispatch_records_nothing() {
+        // Fail-over that ends in a refusal (every other host at its share):
+        // the request was marked dispatched but never waited on an engine.
+        let c = controller(config(), 2);
+        let p = pool(2);
+        let t0 = Instant::now();
+        let permit = c.try_admit_at(&p, t0).unwrap().unwrap();
+        permit.mark_dispatched_at(t0);
+        permit.abandon();
+        permit.release_at(t0 + Duration::from_millis(30));
+        std::mem::forget(permit);
+        assert_eq!(c.ttft_totals(t0 + Duration::from_secs(1)), (0, 0));
+        assert_eq!(c.inflight(), 0);
     }
 
     #[test]

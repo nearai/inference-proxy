@@ -87,7 +87,7 @@ to the current in-CVM behavior.
 | `VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS` | `30000` | Refuse new work while, over the last minute, at least 20 lane requests reached the engine and 5 % of them (at least two) waited longer than this for their first generation event. |
 | `VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS` | `10` | A backend that rejected at engine admission within this window is steered around; when every healthy backend did, new work is refused. |
 | `VLLM_BACKEND_CONNECT_FAILOVER` | `1` | A backend that refuses the connection (host down, proxy restarting) costs the request nothing: it is re-sent once to another healthy backend, the dead one leaves the rotation until a probe succeeds, and a pinned conversation follows. Never on an HTTP error. |
-| `VLLM_BACKEND_PROBE_URLS` / `_INTERVAL_SECS` | `http://<host-ip>:8000,…` / `2` | The engines' live running/queued counts, read from each host's plain metrics port (the same route model-proxy samples; reachable from the model-proxy hosts, no token). Drives placement and the fleet-wide queue refusal below. |
+| `VLLM_BACKEND_PROBE_URLS` / `_INTERVAL_SECS` | `http://<host-ip>:8000,…` / `2` | The engines' live running/queued counts, read from each host's plain metrics port (the same route model-proxy samples; reachable from the model-proxy hosts, no token). One reading covers the replica the host would route to, so a queue in it means no replica is free. Drives placement and the fleet-wide queue refusal below. |
 | `NON_TEE_DEPLOYMENT` | `1` | No dstack socket outside a CVM: `/healthz` reports `"dstack":"skipped"`, no attestation refresh, and `/v1/attestation/report`, `/v1/signature/{id}`, `/internal/gpu_evidence` answer 404 so nothing unverifiable is advertised. |
 | `DEV` / `GPU_NO_HW_MODE` | `1` / `1` | Non-TEE: random signing keys, no hardware evidence. |
 | `LISTEN_ADDR` / `LISTEN_PORT` | `127.0.0.1` / `31700` | Bind behind the local TLS terminator. |
@@ -137,7 +137,10 @@ upstream:
    polled every two seconds; a host with a non-empty queue is steered around,
    and once every healthy host queues, new work is refused (reason
    `backend_queue`). Then two signals the gateway measures on its own traffic.
-   Time to first generation: over the last minute, at least 20 lane requests
+   Time to first generation, measured from the moment the request is sent
+   upstream (the engine sends its SSE headers only once it has something to
+   say, so measuring from the response would skip the queueing and prefill
+   wait): over the last minute, at least 20 lane requests
    reached the engine and 5 % of them (at least two) waited longer than
    `VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS` for their first generation event — a
    request that ends (client gone, idle timeout) before generating counts with

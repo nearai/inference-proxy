@@ -130,6 +130,7 @@ pub async fn classify(
             sse_keepalive_secs: 0,
             map_queue_full_to_429: false,
             stream_error_peek_ms: 0,
+            stream_commit_ms: 0,
             response_shape: ResponseShape::ChatCompletion,
             tracing_ids: Some(tracing_ids),
             upstream_data_parallel_rank: None,

@@ -925,6 +925,8 @@ pub struct ProxyOpts {
     pub map_queue_full_to_429: bool,
     /// See `Config::stream_error_peek_ms` (streaming requests only).
     pub stream_error_peek_ms: u64,
+    /// See `Config::stream_commit_ms` (streaming requests only).
+    pub stream_commit_ms: u64,
     /// Shape of the reassembled response when forwarding an SSE stream as
     /// a non-streaming JSON body. Defaults to `ChatCompletion`; the
     /// `/v1/completions` route sets this to `TextCompletion`.
@@ -2087,33 +2089,25 @@ impl ChoiceAssembler {
     }
 }
 
-/// Proxy a streaming SSE request. Hashes all chunks, signs at end, caches signature.
-pub async fn proxy_streaming_request(
+/// Open the upstream stream, or produce the error that must decide the
+/// response. The bounded first-event peek lives here (opt-in): an engine that
+/// rejects at admission (queue full, priority abort) still answers HTTP 200 and
+/// puts `data: {"error": …}` first; surfacing that as a real error status lets
+/// clients retry elsewhere instead of consuming a 200 that fails mid-stream. A
+/// slow first token simply times the peek out and the stream proceeds
+/// unchanged. Dropping this future drops the upstream connection with it.
+async fn open_upstream_stream(
     client: &reqwest::Client,
-    url: &str,
+    url: &mut String,
     request_body: Vec<u8>,
-    mut opts: ProxyOpts,
-) -> Result<Response, AppError> {
-    let request_sha256 = opts
-        .request_hash
-        .take()
-        .unwrap_or_else(|| hex::encode(Sha256::digest(&request_body)));
-
-    let upstream_start = std::time::Instant::now();
-    let mut url = url.to_string();
-    let response = send_upstream(
-        client,
-        &mut url,
-        Bytes::from(request_body),
-        &mut opts,
-        "streaming",
-    )
-    .await?;
+    opts: &mut ProxyOpts,
+) -> Result<UpstreamByteStream, AppError> {
+    let response = send_upstream(client, url, Bytes::from(request_body), opts, "streaming").await?;
 
     let status = response.status();
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
-        let info = log_upstream_error(status, &url, &body, opts.tracing_ids.as_ref());
+        let info = log_upstream_error(status, url, &body, opts.tracing_ids.as_ref());
         note_engine_error(
             opts.admission.as_ref(),
             info.as_ref().map(|i| i.message.as_str()),
@@ -2128,29 +2122,6 @@ pub async fn proxy_streaming_request(
         });
     }
 
-    // Capture log fields before any partial moves from opts.
-    let (log_request_id, log_org_id, log_workspace_id) = log_ids_or_empty(&opts.tracing_ids);
-    let completion_tracing_ids = opts.tracing_ids.clone();
-
-    let signing = opts.signing.clone();
-    let cache = opts.cache.clone();
-    let usage_reporter = opts.usage_reporter.clone();
-    let model_name = opts.model_name.clone();
-    let chunk_transform = opts.chunk_transform;
-    let backend_guard = opts.backend_guard;
-    let admission = opts.admission;
-    let stream_idle_timeout_secs = opts.stream_idle_timeout_secs;
-    let sse_keepalive_secs = opts.sse_keepalive_secs;
-
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
-
-    // Bounded peek at the first upstream chunk (opt-in). An engine that
-    // rejects at admission (queue full, priority abort) still answers HTTP 200
-    // and puts `data: {"error": …}` first; surfacing that as a real error
-    // status lets clients retry elsewhere instead of consuming a 200 that
-    // fails mid-stream. A slow first token simply times the peek out and the
-    // stream proceeds unchanged. Client disconnect during the peek drops this
-    // future, and with it the upstream connection.
     let mut byte_stream = response.bytes_stream();
     let mut first_chunk: Option<Bytes> = None;
     if opts.stream_error_peek_ms > 0 {
@@ -2176,12 +2147,12 @@ pub async fn proxy_streaming_request(
                     let info = log_upstream_error(
                         reqwest::StatusCode::from_u16(code)
                             .unwrap_or(reqwest::StatusCode::BAD_GATEWAY),
-                        &url,
+                        url,
                         &body,
                         opts.tracing_ids.as_ref(),
                     );
                     note_engine_error(
-                        admission.as_ref(),
+                        opts.admission.as_ref(),
                         info.as_ref().map(|i| i.message.as_str()),
                     );
                     metrics::counter!("upstream_stream_first_event_errors_total").increment(1);
@@ -2214,16 +2185,175 @@ pub async fn proxy_streaming_request(
             Err(_elapsed) => {}
         }
     }
-    // Re-attach the peeked chunk so the pump below sees the complete stream.
-    let byte_stream = futures_util::stream::StreamExt::chain(
+
+    // Re-attach the peeked chunk so the pump sees the complete stream.
+    Ok(Box::pin(futures_util::stream::StreamExt::chain(
         futures_util::stream::iter(first_chunk.map(Ok)),
         byte_stream,
-    );
+    )))
+}
 
-    // Spawn a task to consume upstream and forward chunks.
-    // Uses select! on tx.closed() to detect client disconnect while waiting
-    // for upstream data, preventing resource leaks from abandoned connections.
-    tokio::spawn(async move {
+/// The upstream body, boxed so the peeked first chunk can be re-attached
+/// without naming the combinator's type.
+type UpstreamByteStream =
+    std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<Bytes>> + Send>>;
+
+/// Body of a failure the client can no longer be told about with a status code.
+const LATE_STREAM_ERROR: &[u8] = br#"{"error":{"message":"Upstream request failed","type":"upstream_error","param":null,"code":null}}"#;
+
+/// Render a late upstream failure as the terminal SSE event pair an engine
+/// would have sent on an already-committed 200: the same sanitized body
+/// `AppError` produces for a status response, then `[DONE]`.
+async fn late_error_event(err: AppError) -> Bytes {
+    use http_body_util::BodyExt;
+    let body = axum::response::IntoResponse::into_response(err)
+        .into_body()
+        .collect()
+        .await
+        .map(|collected| collected.to_bytes())
+        .unwrap_or_else(|_| Bytes::from_static(LATE_STREAM_ERROR));
+    let mut frame = Vec::with_capacity(body.len() + 24);
+    frame.extend_from_slice(b"data: ");
+    frame.extend_from_slice(&body);
+    frame.extend_from_slice(b"\n\ndata: [DONE]\n\n");
+    Bytes::from(frame)
+}
+
+/// Proxy a streaming SSE request. Hashes all chunks, signs at end, caches signature.
+///
+/// The upstream decides the HTTP status, as long as it answers within
+/// `stream_commit_ms`. That window exists because an engine sends its SSE
+/// response headers only together with its first event (SGLang kick-starts the
+/// generator before returning the stream), so a long prefill is complete
+/// silence on the wire — a 192k-token prompt measured 23.6 s of it — and an
+/// aggregator that cancels a silent provider fails the request over to someone
+/// else. Once the window expires this commits `200 text/event-stream` itself
+/// and the keep-alive comments start, which is what tells the aggregator the
+/// request is still being worked on.
+///
+/// The trade is deliberate: an upstream failure arriving after the commit can
+/// no longer be a status code and is delivered as a terminal SSE `error` event
+/// instead. Engine rejections arrive in milliseconds, well inside any sane
+/// window, but a genuine validation error can be slow when it follows the
+/// tokenization of a very large prompt (a context-length 400 measured 13.9 s on
+/// a 1.2M-token body), so size the window above the errors a deployment
+/// actually produces. Zero — the default, and every in-CVM deployment — keeps
+/// the old behavior: nothing reaches the client until the upstream has answered.
+pub async fn proxy_streaming_request(
+    client: &reqwest::Client,
+    url: &str,
+    request_body: Vec<u8>,
+    mut opts: ProxyOpts,
+) -> Result<Response, AppError> {
+    let request_sha256 = opts
+        .request_hash
+        .take()
+        .unwrap_or_else(|| hex::encode(Sha256::digest(&request_body)));
+
+    let commit_after = opts.stream_commit_ms;
+    let keepalive_secs = opts.sse_keepalive_secs;
+    let client = client.clone();
+    let mut url = url.to_string();
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    // Carries the upstream's verdict back while it can still become a status
+    // code. Dropping the receiver is the "already committed" signal the task
+    // below watches for.
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel::<Result<(), AppError>>();
+
+    // Consume upstream and forward chunks. Uses select! on tx.closed() to
+    // detect client disconnect while waiting for upstream data, preventing
+    // resource leaks from abandoned connections. Instrumented with the request
+    // span: a spawned task does not inherit it, and opening the upstream (the
+    // connect failures and fail-overs, and every failure before the first
+    // event) happens in here now, where those lines are only useful with the
+    // request_id on them.
+    let task = async move {
+        let upstream_start = std::time::Instant::now();
+        let mut start_tx = Some(start_tx);
+        let mut committed = false;
+
+        // Opening the upstream stream is itself a wait — the engine answers
+        // only when it has something to say. Keep-alives run here too, from
+        // the moment the response is committed, so the client is not left
+        // staring at a silent socket for the whole prefill.
+        let opened = {
+            let open = open_upstream_stream(&client, &mut url, request_body, &mut opts);
+            tokio::pin!(open);
+            let mut keepalive =
+                tokio::time::interval(std::time::Duration::from_secs(keepalive_secs.max(1)));
+            keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            keepalive.tick().await;
+            loop {
+                tokio::select! {
+                    opened = &mut open => break opened,
+                    _ = async {
+                        start_tx
+                            .as_mut()
+                            .expect("kept until the verdict is sent")
+                            .closed()
+                            .await
+                    }, if !committed => {
+                        committed = true;
+                        keepalive.reset();
+                    }
+                    _ = keepalive.tick(), if committed && keepalive_secs > 0 => {
+                        if tx
+                            .send(Ok(Bytes::from_static(SSE_KEEPALIVE_COMMENT)))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        metrics::counter!("sse_keepalive_comments_total").increment(1);
+                    }
+                    _ = tx.closed(), if committed => {
+                        info!("Client disconnected before the upstream answered");
+                        metrics::counter!("stream_client_disconnects_total").increment(1);
+                        return;
+                    }
+                }
+            }
+        };
+
+        let byte_stream = match opened {
+            Ok(stream) => {
+                if let Some(sender) = start_tx.take() {
+                    let _ = sender.send(Ok(()));
+                }
+                stream
+            }
+            Err(err) => {
+                let undelivered = match start_tx.take() {
+                    Some(sender) => sender
+                        .send(Err(err))
+                        .err()
+                        .and_then(|verdict| verdict.err()),
+                    None => Some(err),
+                };
+                if let Some(err) = undelivered {
+                    // Too late for a status line: the client already has a 200.
+                    metrics::counter!("stream_late_upstream_errors_total").increment(1);
+                    let _ = tx.send(Ok(late_error_event(err).await)).await;
+                }
+                return;
+            }
+        };
+
+        // Capture log fields before any partial moves from opts.
+        let (log_request_id, log_org_id, log_workspace_id) = log_ids_or_empty(&opts.tracing_ids);
+        let completion_tracing_ids = opts.tracing_ids.clone();
+
+        let signing = opts.signing;
+        let cache = opts.cache;
+        let usage_reporter = opts.usage_reporter;
+        let model_name = opts.model_name;
+        let chunk_transform = opts.chunk_transform;
+        let backend_guard = opts.backend_guard;
+        let admission = opts.admission;
+        let stream_idle_timeout_secs = opts.stream_idle_timeout_secs;
+        let sse_keepalive_secs = keepalive_secs;
+
         use futures_util::StreamExt;
 
         let _guard = StreamingGuard::new();
@@ -2464,7 +2594,39 @@ pub async fn proxy_streaming_request(
                 "Skipping streaming signature cache: stream did not complete cleanly"
             );
         }
-    });
+    };
+    tokio::spawn(tracing::Instrument::instrument(
+        task,
+        tracing::Span::current(),
+    ));
+
+    // The upstream gets `commit_after` to prove itself; past that the response
+    // is committed and any failure becomes a stream event instead of a status.
+    let verdict = if commit_after > 0 {
+        match tokio::time::timeout(std::time::Duration::from_millis(commit_after), start_rx).await {
+            Ok(received) => Some(received),
+            Err(_elapsed) => {
+                metrics::counter!("stream_committed_before_upstream_total").increment(1);
+                debug!(
+                    commit_after_ms = commit_after,
+                    "Committing the SSE response before the upstream answered"
+                );
+                None
+            }
+        }
+    } else {
+        Some(start_rx.await)
+    };
+    match verdict {
+        Some(Ok(Ok(()))) => {}
+        Some(Ok(Err(err))) => return Err(err),
+        Some(Err(_recv)) => {
+            return Err(AppError::Internal(anyhow::anyhow!(
+                "streaming task ended before the upstream answered"
+            )))
+        }
+        None => {}
+    }
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let body = Body::from_stream(stream);
@@ -3609,6 +3771,7 @@ mod tests {
             sse_keepalive_secs: 0,
             map_queue_full_to_429: false,
             stream_error_peek_ms: 0,
+            stream_commit_ms: 0,
             response_shape: ResponseShape::default(),
             tracing_ids: None,
             upstream_data_parallel_rank: None,

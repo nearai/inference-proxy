@@ -85,6 +85,7 @@ to the current in-CVM behavior.
 | `VLLM_PROXY_SSE_KEEPALIVE_SECS` | `15` | `: keep-alive` SSE comments while the upstream is silent (long prefill/queueing), so intermediaries with read timeouts do not cancel. Off in CVMs: comments are not part of the signed bytes. |
 | `VLLM_PROXY_MAP_QUEUE_FULL_TO_429` | `1` | The engine's admission rejection (queue full, or a queued request displaced by a higher-priority one) becomes 429 with `Retry-After: 2` and type `overloaded`, the same shape as the gateway's own refusals: back-pressure, not an outage. Off in CVMs: cloud-api's peer fallback keys on the 503. |
 | `VLLM_PROXY_STREAM_ERROR_PEEK_MS` | `1000` | Streams wait up to 1 s for the first upstream event; an admission-time `data: {"error":…}` becomes a real 429/5xx instead of a 200 that fails mid-stream. A slow first token just times the peek out. |
+| `VLLM_PROXY_STREAM_COMMIT_MS` | `5000` | Commit the stream's `200 text/event-stream` after 5 s even if the engine has not answered, so the keep-alives above actually reach the client during a long prefill (see below). |
 | `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` / `_START_INFLIGHT` | `48` / `32` | The lane's in-flight budget: refuse with 429 + `Retry-After` before dispatch instead of queueing (see below). Starts at 32 and ramps by 8 every 30 min while the lane stays healthy. |
 | `VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS` | `30000` | Refuse new work while, over the last minute, at least 20 lane requests reached the engine and 5 % of them (at least two) waited longer than this for their first generation event. |
 | `VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS` | `10` | A backend that rejected at engine admission within this window is steered around; when every healthy backend did, new work is refused. |
@@ -140,6 +141,35 @@ requests, and for streams a first SSE event `data: {"error": …, "code": 503}`
 on an HTTP 200. With `VLLM_PROXY_STREAM_ERROR_PEEK_MS` the gateway holds the
 stream's status line for up to that long, so the rejection surfaces as a
 status; with `VLLM_PROXY_MAP_QUEUE_FULL_TO_429` that status is 429.
+
+### Silence during a long prefill
+
+An engine sends the SSE response headers only together with its first event —
+SGLang kick-starts the generator before returning the stream — so from the
+client's side a long prefill is not a slow stream, it is *no bytes at all*: a
+192k-token prompt measured 23.6 s of silence, and the keep-alive comments above
+could not help because they only start once the upstream has answered.
+Aggregators cancel a provider that goes quiet (OpenRouter: "send SSE comments as
+keep-alives so we know you're still working on the request. Otherwise we may
+cancel with a fetch timeout and fallback to another provider"), so the silence
+costs the request and the fail-over is counted against us.
+
+`VLLM_PROXY_STREAM_COMMIT_MS` bounds it: when the upstream has not answered
+within the window, the gateway commits `200 text/event-stream` on its own and
+the keep-alive ticks start immediately, while the same task keeps waiting for
+the engine and then pumps the real stream through untouched.
+
+The cost is explicit. After the commit the status line is spent, so an upstream
+failure can only be delivered as a terminal `data: {"error": …}` event followed
+by `[DONE]` — the same shape the engine itself uses when it rejects on a
+committed 200, and the sanitized body the status response would have carried
+(counter `stream_late_upstream_errors_total`). Engine rejections arrive in
+milliseconds and are unaffected, but a genuine validation error can be slow when
+it follows the tokenization of a very large prompt: a context-length 400 on a
+1.2M-token body took 13.9 s. Size the window above the errors the deployment
+actually produces, and keep it at `0` (the default, and every in-CVM
+deployment) where the status must always come from the upstream. Counter
+`stream_committed_before_upstream_total` says how often the window fires.
 
 ## Admission budget
 

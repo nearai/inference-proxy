@@ -90,6 +90,9 @@ redeploys), backend requests carry `VLLM_BACKEND_TOKEN` via the dedicated
 `AppState.backend_client` (never `http_client`, which talks to cloud-api), and
 `VLLM_PROXY_REJECTED_CONTENT_PART_TYPES`, `VLLM_PROXY_SSE_KEEPALIVE_SECS`,
 `VLLM_PROXY_MAP_QUEUE_FULL_TO_429`, `VLLM_PROXY_STREAM_ERROR_PEEK_MS`,
+`VLLM_PROXY_STREAM_COMMIT_MS` (commit the stream's 200 after N ms so keep-alives
+reach the client during a prefill; past it an upstream failure is an SSE error
+event, not a status),
 `NON_TEE_DEPLOYMENT` (404s the attestation, signature and GPU-evidence routes),
 `VLLM_BACKEND_HEALTH_PATH`, `LISTEN_ADDR`, `VLLM_PROXY_MODELS_DOCUMENT_URL` +
 `VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE` (`/v1/models` = cloud-api's entry for

@@ -957,6 +957,9 @@ pub struct ConnectFailover {
     pub path: &'static str,
     /// Index of the backend the request is currently placed on.
     pub index: usize,
+    /// Context tier the replacement must belong to (`None` = the whole pool,
+    /// see `context_tier.rs`).
+    pub tier: Option<crate::context_tier::ContextTier>,
     /// Conversation to re-pin onto the replacement backend once it answers.
     pub affinity: Option<(
         Arc<crate::backend_affinity::BackendConversationAffinity>,
@@ -1046,16 +1049,21 @@ async fn send_upstream(
     let response = match first {
         Ok(response) => response,
         Err(error) if error.is_connect() && opts.connect_failover.is_some() => {
-            let (pool, path, failed, affinity) = {
+            let (pool, path, failed, tier, affinity) = {
                 let failover = opts.connect_failover.as_ref().expect("checked above");
                 (
                     failover.pool.clone(),
                     failover.path,
                     failover.index,
+                    failover.tier,
                     failover.affinity.clone(),
                 )
             };
             mark_backend_unreachable(&pool, failed);
+            // The failed host may have been its tier's last one: re-resolve
+            // the restriction now that it is out of the rotation, so the
+            // request falls back to the other tier instead of being refused.
+            let tier = tier.and_then(|tier| crate::context_tier::recheck_restriction(&pool, tier));
             // The share is recomputed for the pool as it is now (one host
             // fewer), and recently saturated hosts are steered around.
             let max_conns = opts
@@ -1073,6 +1081,7 @@ async fn send_upstream(
                     max_conns,
                     avoid: &avoid,
                     engine: &engine,
+                    tier,
                 };
                 pool.select_excluding(failed, &policy)
             };
@@ -5121,7 +5130,7 @@ mod tests {
         ));
         let pool = crate::backend_pool::BackendPool::new(vec![format!("http://{addr}")]);
         let mut opts = test_proxy_opts();
-        opts.admission = controller.try_admit(&pool).unwrap();
+        opts.admission = controller.try_admit(&pool, None).unwrap();
 
         let mut url = format!("http://{addr}/v1/chat/completions");
         let response = send_upstream(

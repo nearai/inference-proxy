@@ -62,7 +62,11 @@ async fn main() -> anyhow::Result<()> {
     // Warn if any backend URL points to the proxy's own listen address
     let self_local = format!("://localhost:{listen_port}");
     let self_ip = format!("://127.0.0.1:{listen_port}");
-    for url in &config.backend_urls {
+    for url in config
+        .backend_urls
+        .iter()
+        .chain(&config.backend_long_context_urls)
+    {
         let backend_base = url.trim_end_matches('/');
         if backend_base.contains(&self_local) || backend_base.contains(&self_ip) {
             tracing::warn!(
@@ -119,15 +123,16 @@ async fn main() -> anyhow::Result<()> {
         config.vllm_data_parallel_size,
         config.chat_cache_expiration_secs,
     ));
+    let backend_count = config.backend_urls.len() + config.backend_long_context_urls.len();
     let backend_affinity = Arc::new(backend_affinity::BackendConversationAffinity::new(
         config.backend_conversation_affinity,
-        config.backend_urls.len(),
+        backend_count,
         config.backend_affinity_max_imbalance,
         config.chat_cache_expiration_secs,
     ));
     if backend_affinity.is_active() {
         info!(
-            backends = config.backend_urls.len(),
+            backends = backend_count,
             max_imbalance = config.backend_affinity_max_imbalance,
             "Backend conversation affinity enabled"
         );
@@ -188,8 +193,19 @@ async fn main() -> anyhow::Result<()> {
     // Initialize metrics
     let metrics_handle = metrics_middleware::setup_metrics_recorder();
 
-    // Initialize backend pool
-    let backend_pool = Arc::new(backend_pool::BackendPool::new(config.backend_urls.clone()));
+    // Initialize backend pool: the long-context tier, when configured, sits
+    // after the base backends so their indexes never move.
+    let backend_pool = Arc::new(backend_pool::BackendPool::with_long_context(
+        config.backend_urls.clone(),
+        config.backend_long_context_urls.clone(),
+    ));
+    if !config.backend_long_context_urls.is_empty() {
+        info!(
+            backends = config.backend_long_context_urls.len(),
+            above_tokens = config.long_context_above_tokens,
+            "Long-context tier enabled"
+        );
+    }
 
     // Live engine load per backend (gateway mode): polled when probe URLs are
     // configured; a sample older than three intervals counts as unknown.
@@ -198,16 +214,17 @@ async fn main() -> anyhow::Result<()> {
         backend_pool.len(),
         probe_interval * 3,
     ));
-    if !config.backend_probe_urls.is_empty() {
+    let probe_urls = config.pool_probe_urls();
+    if !probe_urls.is_empty() {
         info!(
-            backends = config.backend_probe_urls.len(),
+            backends = probe_urls.len(),
             interval_secs = config.backend_probe_interval_secs,
             "Polling engine load from the backends' metrics"
         );
         engine_load::spawn_engine_load_poller(
             engine_load.clone(),
             http_client.clone(),
-            config.backend_probe_urls.clone(),
+            probe_urls,
             probe_interval,
         );
     }

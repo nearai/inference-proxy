@@ -84,11 +84,20 @@ pub async fn chat_completions(
         &request_json,
         &state.config.rejected_content_part_types,
     )?;
+    // Long-context tier (gateway mode): a request whose estimated input is
+    // above the threshold belongs on the long-context backends, and every
+    // candidate selection below is restricted to its tier. `None` when the
+    // feature is off or that tier has no healthy host (see `context_tier.rs`).
+    let tier = crate::context_tier::decide(
+        &state.backend_pool,
+        state.config.long_context_above_tokens,
+        || crate::context_tier::chat_estimate(&request_json),
+    );
     // Lane admission (gateway mode), first half: the overload and budget
     // checks, so a request the lane cannot take is refused before any image
     // is fetched. The slot and the backend placement are taken on the normal
     // proxy path below, after the special branches, right before dispatch.
-    state.admission.precheck(&state.backend_pool)?;
+    state.admission.precheck(&state.backend_pool, tier)?;
     // Same conversation digest, applied across independent backends: later
     // turns follow the backend that already holds this conversation's prefix.
     let backend_affinity_key = state
@@ -236,15 +245,17 @@ pub async fn chat_completions(
     // by the per-host share that steers around backends which just rejected
     // at engine admission. Refuses with 429 before anything is sent upstream;
     // disabled deployments get `None`s and plain least-connections.
-    let permit = state.admission.try_admit(&state.backend_pool)?;
+    let permit = state.admission.try_admit(&state.backend_pool, tier)?;
     let host_share = state
         .admission
         .host_share(state.backend_pool.healthy_count());
-    let placement = {
+    let mut restrict = tier.and_then(|tier| tier.restrict);
+    let place = |tier| {
         let policy = backend_pool::Policy {
             max_conns: host_share,
             avoid: &|index| state.admission.backend_saturated(index),
             engine: &|index| state.admission.engine(index),
+            tier,
         };
         state.backend_affinity.place(
             &state.backend_pool,
@@ -252,8 +263,21 @@ pub async fn chat_completions(
             "/v1/chat/completions",
             &policy,
         )
+    };
+    let mut placement = place(restrict);
+    // The tier may have emptied since the decision (a fail-over just marked
+    // its last host unreachable): fall back, do not refuse. `restrict` then
+    // follows the placement, so a connection fail-over uses the same one.
+    if placement.is_none()
+        && restrict.is_some_and(|tier| {
+            crate::context_tier::recheck_restriction(&state.backend_pool, tier).is_none()
+        })
+    {
+        restrict = None;
+        placement = place(None);
     }
-    .ok_or_else(|| AppError::from(state.admission.reject(RejectReason::HostShare)))?;
+    let placement =
+        placement.ok_or_else(|| AppError::from(state.admission.reject(RejectReason::HostShare)))?;
     if let Some(permit) = permit.as_ref() {
         permit.attach_backend(placement.index);
     }
@@ -264,6 +288,7 @@ pub async fn chat_completions(
             pool: state.backend_pool.clone(),
             path: "/v1/chat/completions",
             index: placement.index,
+            tier: restrict,
             affinity: backend_affinity_key.map(|key| (state.backend_affinity.clone(), key)),
         });
     let url = placement.url;

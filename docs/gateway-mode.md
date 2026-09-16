@@ -91,6 +91,9 @@ to the current in-CVM behavior.
 | `VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS` | `10` | A backend that rejected at engine admission within this window is steered around; when every healthy backend did, new work is refused. |
 | `VLLM_BACKEND_CONNECT_FAILOVER` | `1` | A backend that refuses the connection (host down, proxy restarting) costs the request nothing: it is re-sent once to another healthy backend, the dead one leaves the rotation until a probe succeeds, and a pinned conversation follows. Never on an HTTP error. |
 | `VLLM_BACKEND_PROBE_URLS` / `_INTERVAL_SECS` | `http://<host-ip>:8000,…` / `2` | The engines' live running/queued counts, read from each host's plain metrics port (the same route model-proxy samples; reachable from the model-proxy hosts, no token). One reading covers the replica the host would route to, so a queue in it means no replica is free. Drives placement and the fleet-wide queue refusal below. |
+| `VLLM_BACKEND_LONG_CONTEXT_URLS` | the `-long-b<handle>` URLs | The hosts of the long-context tier, listed as their handle URLs under the model's `-long` model-proxy domain (see below). Appended to the pool after `VLLM_BACKEND_URLS`, so the base backends keep their indexes. Empty = one flat pool, as today. |
+| `VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS` | `http://<host-ip>:8000,…` | One engine-load probe per long-context backend, same order. Required when `VLLM_BACKEND_PROBE_URLS` is set, and empty when it is not; internally the two lists are concatenated in pool order. |
+| `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` | `100000` | Estimated input tokens above which a request is placed on that tier. `0`/unset switches the whole feature off, and nothing is even estimated. |
 | `NON_TEE_DEPLOYMENT` | `1` | No dstack socket outside a CVM: `/healthz` reports `"dstack":"skipped"`, no attestation refresh, and `/v1/attestation/report`, `/v1/signature/{id}`, `/internal/gpu_evidence` answer 404 so nothing unverifiable is advertised. |
 | `DEV` / `GPU_NO_HW_MODE` | `1` / `1` | Non-TEE: random signing keys, no hardware evidence. |
 | `LISTEN_ADDR` / `LISTEN_PORT` | `127.0.0.1` / `31700` | Bind behind the local TLS terminator. |
@@ -237,7 +240,86 @@ back-pressure for the next admission decision
 `admission_backpressure_total{backend}`, `backend_failover_total{outcome}`,
 `upstream_stream_error_events_total{phase}`, `backend_engine_running{backend}`,
 `backend_engine_queued{backend}`, `backend_engine_probe_failures_total{backend}`,
+`backend_tier_requests_total{tier,outcome=routed|fallback|fallback_late}`,
+`request_estimated_prompt_tokens`,
 plus the existing usage-report and upstream metrics.
+
+## Long-context tier
+
+A model can serve oversized prompts from dedicated hosts: the same CVMs
+registered a second time under a `…-long.completions.near.ai` domain, so a
+200k-token prefill does not sit in front of the short requests on the base
+fleet. `VLLM_BACKEND_LONG_CONTEXT_URLS` lists those hosts the same way
+`VLLM_BACKEND_URLS` does — `https://<model>-long-b<handle>.completions.near.ai`,
+the handle being the same salted digest of the host's `ip:port` under the other
+domain — and they are appended to the pool, so every backend index, engine
+probe and affinity assignment of the base fleet is unchanged. The forwarded
+body is not touched either: `model` stays the canonical id on both domains.
+
+cloud-api routes to the tier from the model row's `long_context`
+providerConfig; the gateway bypasses cloud-api, so it makes the same decision
+itself and mirrors the estimate cloud-api routes with
+(`inference_provider_pool::context_routing::estimate_input` plus the `required`
+computation next to it):
+
+```text
+countable = (message text + serialized tool_calls + serialized tools) / 4
+uncounted = media parts × 1024 + messages × 4
+required  = ceil(countable × 1.2) + uncounted + max_tokens reserve
+```
+
+`required` strictly above `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` means the
+long tier. The 1.2 safety factor covers the byte estimate only — media parts,
+template overhead, the reserved output window and `/v1/completions` token ids
+are already token counts. Tool definitions and tool-call arguments are counted
+because the lane's traffic is agentic, where they are most of the prompt.
+cloud-api additionally refines the decision near the boundary with an exact
+`POST /v1/tokenize`; the gateway deliberately does not — a tokenizer dependency
+and an extra upstream round trip are not worth it for a placement that is a
+preference rather than a correctness rule. Both tiers run the same engine with
+the same context length, so a request on the "wrong" tier still succeeds.
+
+Everything downstream of the decision is restricted to the request's tier:
+placement, the connection fail-over, and the fleet-wide "every backend is
+queueing" refusal. The consequences are deliberate:
+
+- **Per-host share.** Unchanged: `ceil(budget / healthy backends)` over the
+  whole pool. With 3 base hosts, 1 long host and a budget of 48 the long host
+  holds at most 12 lane requests, which is about what its KV cache fits for
+  200k-token prompts. The budget is the lever; there is no separate knob.
+  Note that adding the tier also lowers each base host's share
+  (`ceil(48/3) = 16` becomes `ceil(48/4) = 12`), so the base fleet's ceiling
+  drops from 48 to 36 with the remaining 12 reserved for oversized prompts:
+  raise `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` if it needs its old headroom.
+- **Untiered traffic stays on the base fleet.** `/tokenize`, media, `/v1/models`
+  and the health probe carry no size of their own; they would all land on the
+  idle long host under least-connections, so they are restricted to the base
+  backends (cloud-api keeps its tokenize traffic off that host for the same
+  reason). The pool health checker still probes every backend.
+- **Full is a refusal, not a spill.** A long-tier host at its share or steered
+  around (engine queue, recent engine rejection) means `429` + `Retry-After`
+  for the next oversized request — keeping those prefills off the base fleet is
+  the whole point, and a fast refusal lets the aggregator route elsewhere.
+- **A tier with no healthy backend falls back.** If the wanted tier is down
+  entirely the request is placed in the other one rather than refused
+  (`backend_tier_requests_total{outcome="fallback"}`), including when its last
+  host goes unreachable mid-request: both the placement and the connection
+  fail-over re-resolve the restriction after taking that host out of the
+  rotation and cross over, counted `fallback_late` — so each request adds
+  exactly one `routed` or `fallback`, plus a `fallback_late` if its tier died
+  under it.
+- **Conversation affinity crosses tiers.** A conversation pinned on a base host
+  that grows past the threshold is placed fresh in the long tier and re-pinned
+  there — the same re-prefill cloud-api pays at the boundary.
+- **The TTFT breaker ignores long-context requests.** A 100k-token prefill
+  takes tens of seconds by nature — on either tier — so a request estimated
+  above the threshold contributes no time-to-first-generation sample, and that
+  is fixed at admission: a request that falls back onto the base fleet does not
+  start counting. Back-pressure marks and engine-queue avoidance still apply.
+- **Not for fusion or the agent loop.** `VLLM_BACKEND_LONG_CONTEXT_URLS`
+  together with `FUSION_ENABLED` or `WEB_CONTEXT_SEARCH_URL` is refused at
+  startup: those modes place their own backend requests, which no tier
+  restriction reaches.
 
 ## What is deliberately not offered here
 

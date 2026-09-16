@@ -4,9 +4,14 @@ use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
+use crate::context_tier::ContextTier;
+
 /// A single backend instance (e.g., one vLLM process).
 pub struct Backend {
     pub base_url: String,
+    /// Which context tier this backend serves. Everything is `Base` unless
+    /// `VLLM_BACKEND_LONG_CONTEXT_URLS` is configured (see `context_tier.rs`).
+    pub tier: ContextTier,
     pub healthy: AtomicBool,
     /// Every request placed on this backend (least-connections signal).
     pub active_conns: AtomicU32,
@@ -17,14 +22,21 @@ pub struct Backend {
 }
 
 impl Backend {
-    fn new(base_url: String) -> Self {
+    fn new(base_url: String, tier: ContextTier) -> Self {
         Self {
             base_url,
+            tier,
             healthy: AtomicBool::new(true),
             active_conns: AtomicU32::new(0),
             lane_conns: AtomicU32::new(0),
             consecutive_failures: AtomicU32::new(0),
         }
+    }
+
+    /// Whether this backend may serve a request restricted to `tier`
+    /// (`None` = no restriction).
+    fn in_tier(&self, tier: Option<ContextTier>) -> bool {
+        tier.is_none_or(|tier| tier == self.tier)
     }
 
     /// Build a full URL by appending a path to this backend's base URL.
@@ -43,6 +55,7 @@ impl std::fmt::Debug for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Backend")
             .field("base_url", &self.base_url)
+            .field("tier", &self.tier)
             .field("healthy", &self.healthy.load(Ordering::Relaxed))
             .field("active_conns", &self.active_conns.load(Ordering::Relaxed))
             .field("lane_conns", &self.lane_conns.load(Ordering::Relaxed))
@@ -140,6 +153,9 @@ pub struct Policy<'a> {
     /// with a free batch slot serves the cached prefix at once, and only a
     /// queueing host (via `avoid`) moves it.
     pub engine: &'a (dyn Fn(usize) -> Option<(u32, u32)> + Sync),
+    /// Only backends of this context tier are candidates (`None` = the whole
+    /// pool; see `context_tier.rs`).
+    pub tier: Option<ContextTier>,
 }
 
 fn never(_: usize) -> bool {
@@ -156,6 +172,7 @@ impl Policy<'static> {
         max_conns: None,
         avoid: &never,
         engine: &unknown,
+        tier: None,
     };
 }
 
@@ -167,16 +184,35 @@ const RESERVE_ATTEMPTS: usize = 16;
 /// Pool of backends for the same model, with least-connections selection.
 pub struct BackendPool {
     backends: Vec<Arc<Backend>>,
+    /// `Some(Base)` once a long-context tier exists: traffic that carries no
+    /// tier of its own (tokenize, media, models, health probes) stays off the
+    /// long hosts, which are idle by design and would otherwise attract all
+    /// of it. `None` for an untiered pool.
+    untiered: Option<ContextTier>,
 }
 
 impl BackendPool {
     pub fn new(base_urls: Vec<String>) -> Self {
+        Self::with_long_context(base_urls, Vec::new())
+    }
+
+    /// Pool with a long-context tier appended after the base backends
+    /// (`VLLM_BACKEND_LONG_CONTEXT_URLS`): the base backends keep their
+    /// indexes, so everything keyed on them — back-pressure slots, engine
+    /// probes, affinity assignments — is unaffected by the tier's existence.
+    pub fn with_long_context(base_urls: Vec<String>, long_urls: Vec<String>) -> Self {
         assert!(!base_urls.is_empty(), "at least one backend URL required");
+        let untiered = (!long_urls.is_empty()).then_some(ContextTier::Base);
         let backends = base_urls
             .into_iter()
-            .map(|u| Arc::new(Backend::new(u)))
+            .map(|u| Arc::new(Backend::new(u, ContextTier::Base)))
+            .chain(
+                long_urls
+                    .into_iter()
+                    .map(|u| Arc::new(Backend::new(u, ContextTier::Long))),
+            )
             .collect();
-        Self { backends }
+        Self { backends, untiered }
     }
 
     /// Number of backends in the pool.
@@ -189,13 +225,21 @@ impl BackendPool {
         self.backends.is_empty()
     }
 
-    /// Select a backend using least-connections among healthy backends.
-    /// If all are unhealthy, picks the least-loaded one anyway. No slot is
-    /// reserved; callers create their own `BackendGuard`.
+    /// Select a backend using least-connections among healthy backends of the
+    /// untiered half of the pool (see `untiered`). If none is healthy, picks
+    /// the least-loaded backend of the whole pool anyway — a healthy long host
+    /// beats a dead base one when the fleet is down, and `/healthz` must not
+    /// report 503 while the gateway still answers through the fallback. No
+    /// slot is reserved; callers create their own `BackendGuard`.
     pub fn select(&self) -> Arc<Backend> {
         let conns = |_: usize, backend: &Backend| backend.active_conns.load(Ordering::Relaxed);
         let index = self
-            .least_index(|_, backend| backend.healthy.load(Ordering::Relaxed), conns)
+            .least_index(
+                |_, backend| {
+                    backend.in_tier(self.untiered) && backend.healthy.load(Ordering::Relaxed)
+                },
+                conns,
+            )
             .unwrap_or_else(|| {
                 self.least_index(|_, _| true, conns)
                     .expect("backends is non-empty")
@@ -265,9 +309,16 @@ impl BackendPool {
 
     /// Number of backends currently marked healthy.
     pub fn healthy_count(&self) -> usize {
+        self.healthy_count_in(None)
+    }
+
+    /// Number of healthy backends in `tier` (`None` = the whole pool). A tier
+    /// with none is why a request falls back to the other one instead of
+    /// waiting for a host that is not there.
+    pub fn healthy_count_in(&self, tier: Option<ContextTier>) -> usize {
         self.backends
             .iter()
-            .filter(|b| b.healthy.load(Ordering::Relaxed))
+            .filter(|b| b.in_tier(tier) && b.healthy.load(Ordering::Relaxed))
             .count()
     }
 
@@ -331,19 +382,25 @@ impl BackendPool {
         if self.backends.len() == 1 {
             let only = &self.backends[0];
             let usable = only.healthy.load(Ordering::Relaxed) || degrade_when_all_unhealthy;
-            return (usable && !avoid(0) && under_bound(only))
+            return (usable && !avoid(0) && under_bound(only) && only.in_tier(policy.tier))
                 .then_some((0, SelectionOutcome::Single));
         }
 
         let eligible = |index: usize, backend: &Backend| {
-            !avoid(index) && backend.healthy.load(Ordering::Relaxed) && under_bound(backend)
+            !avoid(index)
+                && backend.healthy.load(Ordering::Relaxed)
+                && under_bound(backend)
+                && backend.in_tier(policy.tier)
         };
         let least_index = match self.least_index(eligible, load) {
             Some(index) => index,
             // Everything unhealthy: degrade to the least-loaded backend that is
             // not avoided rather than refusing every request (a probe will
-            // re-mark them). Never for a bounded or fail-over selection.
-            None if degrade_when_all_unhealthy => {
+            // re-mark them). Never for a bounded or fail-over selection, and
+            // never inside a tier restriction — a host known to be down is
+            // worse than the other tier, which the caller reaches by placing
+            // again without the restriction.
+            None if degrade_when_all_unhealthy && policy.tier.is_none() => {
                 self.least_index(|index, backend| !avoid(index) && under_bound(backend), load)?
             }
             None => return None,
@@ -858,6 +915,125 @@ mod tests {
         assert_eq!(sel.outcome, SelectionOutcome::Rebalanced);
     }
 
+    fn tiered() -> BackendPool {
+        BackendPool::with_long_context(
+            vec!["http://b1:8000".to_string(), "http://b2:8000".to_string()],
+            vec!["http://long:8000".to_string()],
+        )
+    }
+
+    fn in_tier(tier: ContextTier) -> Policy<'static> {
+        Policy {
+            tier: Some(tier),
+            ..Policy::NONE
+        }
+    }
+
+    #[test]
+    fn test_untiered_traffic_stays_off_the_long_hosts() {
+        let pool = tiered();
+        // Least-connections alone would send tokenize, media and health
+        // probes to the idle long host; they stay on the base fleet.
+        set_conns(&pool, 0, 4);
+        set_conns(&pool, 1, 4);
+        assert_eq!(pool.select().base_url, "http://b1:8000");
+        pool.backends()[0].healthy.store(false, Ordering::Relaxed);
+        pool.backends()[1].healthy.store(false, Ordering::Relaxed);
+        assert_eq!(
+            pool.select().base_url,
+            "http://long:8000",
+            "with the base fleet down, a healthy long host beats a dead base one"
+        );
+        // An untiered pool is unaffected.
+        let plain = two_backends();
+        set_conns(&plain, 0, 4);
+        assert_eq!(plain.select().base_url, "http://b2:8000");
+    }
+
+    #[test]
+    fn test_selection_stays_inside_the_requested_tier() {
+        let pool = tiered();
+        assert_eq!(
+            pool.len(),
+            3,
+            "the long tier is appended, base indexes hold"
+        );
+        assert_eq!(pool.healthy_count(), 3);
+        assert_eq!(pool.healthy_count_in(Some(ContextTier::Long)), 1);
+
+        let sel = pool
+            .select_with_preference_bounded(None, 8, &in_tier(ContextTier::Long))
+            .unwrap();
+        assert_eq!(sel.index, 2);
+        drop(sel);
+        // A conversation pinned on a base host is no pin for a long request:
+        // it is placed fresh in its tier (and `place` re-pins it there).
+        let sel = pool
+            .select_with_preference_bounded(Some(0), 8, &in_tier(ContextTier::Long))
+            .unwrap();
+        assert_eq!((sel.index, sel.outcome), (2, SelectionOutcome::Rebalanced));
+        drop(sel);
+        // A base request never lands on the long host, however idle it is.
+        let held: Vec<_> = (0..4)
+            .map(|_| {
+                pool.select_with_preference_bounded(None, 8, &in_tier(ContextTier::Base))
+                    .unwrap()
+            })
+            .collect();
+        assert!(held.iter().all(|sel| sel.index < 2));
+        drop(held);
+        // The long tier at its share is a refusal, not a spill onto the base
+        // fleet: keeping the big prefills off it is the whole point.
+        set_conns(&pool, 2, 2);
+        let full = Policy {
+            max_conns: Some(2),
+            ..in_tier(ContextTier::Long)
+        };
+        assert!(pool
+            .select_with_preference_bounded(None, 8, &full)
+            .is_none());
+        // Fail-over picks another host of the same tier, or none.
+        assert!(pool
+            .select_excluding(2, &in_tier(ContextTier::Long))
+            .is_none());
+        assert_eq!(
+            pool.select_excluding(0, &in_tier(ContextTier::Base))
+                .unwrap()
+                .index,
+            1
+        );
+    }
+
+    #[test]
+    fn test_a_restricted_tier_never_degrades_onto_an_unhealthy_host() {
+        let pool = tiered();
+        pool.backends()[2].healthy.store(false, Ordering::Relaxed);
+        // Admission off (no share bound), so selection may degrade onto an
+        // unhealthy host — but not inside a tier: the caller places again
+        // without the restriction and reaches the healthy base fleet instead
+        // of a host it knows is down.
+        assert!(pool
+            .select_with_preference_bounded(None, 8, &in_tier(ContextTier::Long))
+            .is_none());
+        assert!(pool
+            .select_with_preference_bounded(Some(2), 8, &in_tier(ContextTier::Long))
+            .is_none());
+        assert_eq!(
+            pool.select_with_preference_bounded(None, 8, &Policy::NONE)
+                .unwrap()
+                .index,
+            0
+        );
+        // With the whole pool down and nothing restricted, degrading is still
+        // better than refusing everything.
+        for backend in pool.backends() {
+            backend.healthy.store(false, Ordering::Relaxed);
+        }
+        assert!(pool
+            .select_with_preference_bounded(None, 8, &Policy::NONE)
+            .is_some());
+    }
+
     #[test]
     fn test_select_url_builds_correct_url() {
         let pool = BackendPool::new(vec!["http://b1:8000".to_string()]);
@@ -867,7 +1043,7 @@ mod tests {
 
     #[test]
     fn test_backend_url_handles_trailing_slash() {
-        let b = Backend::new("http://b1:8000/".to_string());
+        let b = Backend::new("http://b1:8000/".to_string(), ContextTier::Base);
         assert_eq!(b.url("/v1/models"), "http://b1:8000/v1/models");
         assert_eq!(b.url(""), "http://b1:8000");
     }

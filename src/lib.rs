@@ -10,6 +10,7 @@ pub mod backend_pool;
 pub mod cache;
 pub mod config;
 pub mod content_policy;
+pub mod context_tier;
 pub mod encryption;
 pub mod engine_load;
 pub mod error;

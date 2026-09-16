@@ -40,6 +40,11 @@ struct GatewayOptions {
     backend_connect_failover: bool,
     /// Engine metrics probe base URLs, one per backend (polled every 100 ms here).
     backend_probe_urls: Vec<String>,
+    /// Long-context tier: backends appended after `backend_urls`, their probe
+    /// URLs, and the estimated-input threshold above which requests go there.
+    backend_long_context_urls: Vec<String>,
+    backend_long_context_probe_urls: Vec<String>,
+    long_context_above_tokens: u64,
     /// Source of the models document (a mock cloud-api `/v1/models`).
     models_document_url: Option<String>,
     capacity_requests_per_minute: u64,
@@ -149,6 +154,9 @@ fn build_gateway(mock_url: &str, options: GatewayOptions) -> axum::Router {
         backend_connect_failover: options.backend_connect_failover,
         backend_probe_urls: options.backend_probe_urls.clone(),
         backend_probe_interval_secs: 2,
+        backend_long_context_urls: options.backend_long_context_urls.clone(),
+        backend_long_context_probe_urls: options.backend_long_context_probe_urls.clone(),
+        long_context_above_tokens: options.long_context_above_tokens,
         dstack_socket_path: "/nonexistent/dstack.sock".to_string(),
         gpu_evidence_delegate_url: None,
         gpu_evidence_delegate_timeout_secs: 30,
@@ -211,16 +219,20 @@ fn build_gateway(mock_url: &str, options: GatewayOptions) -> axum::Router {
             .unwrap()
     };
 
-    let backend_pool = Arc::new(backend_pool::BackendPool::new(backend_urls));
+    let backend_pool = Arc::new(backend_pool::BackendPool::with_long_context(
+        backend_urls,
+        options.backend_long_context_urls.clone(),
+    ));
     let engine_load = Arc::new(engine_load::EngineLoad::new(
         backend_pool.len(),
         Duration::from_secs(5),
     ));
-    if !config.backend_probe_urls.is_empty() {
+    let probe_urls = config.pool_probe_urls();
+    if !probe_urls.is_empty() {
         engine_load::spawn_engine_load_poller(
             engine_load.clone(),
             reqwest::Client::new(),
-            config.backend_probe_urls.clone(),
+            probe_urls,
             Duration::from_millis(100),
         );
     }
@@ -1757,6 +1769,294 @@ async fn a_queueing_engine_is_steered_around_and_a_fleet_wide_queue_refuses() {
     let response = app.oneshot(chat_request(hello_body())).await.unwrap();
     assert_overloaded(response).await;
     idle.verify().await;
+}
+
+// ---------------------------------------------------------------------------
+// Long-context tier: oversized prompts are placed on their own backends
+// ---------------------------------------------------------------------------
+
+/// Estimated-input threshold used below. A body of `bytes` text estimates
+/// `bytes / 4` tokens, which the 1.2 safety factor compares against this, so
+/// 4000 bytes (1200) crosses it and 400 bytes (120) does not.
+const ABOVE_TOKENS: u64 = 1_000;
+
+async fn mount_chat(mock: &MockServer, expected: u64) {
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+        .expect(expected)
+        .mount(mock)
+        .await;
+}
+
+fn sized_body(bytes: usize) -> serde_json::Value {
+    serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "x".repeat(bytes)}]
+    })
+}
+
+/// Turn `n` of one append-only conversation: the same leading messages (the
+/// affinity key) with a history that is far above the threshold from the
+/// first follow-up on.
+fn conversation(turn: usize) -> serde_json::Value {
+    let mut messages = vec![
+        serde_json::json!({"role": "system", "content": "be brief"}),
+        serde_json::json!({"role": "user", "content": "start"}),
+    ];
+    for i in 0..turn {
+        messages.push(serde_json::json!({"role": "assistant", "content": "y".repeat(4_000)}));
+        messages.push(serde_json::json!({"role": "user", "content": format!("more {i}")}));
+    }
+    serde_json::json!({"model": "test-model", "messages": messages})
+}
+
+#[tokio::test]
+async fn oversized_requests_go_to_the_long_tier_and_the_rest_to_the_base_fleet() {
+    let base = MockServer::start().await;
+    let long = MockServer::start().await;
+    mount_chat(&base, 1).await;
+    mount_chat(&long, 1).await;
+    let app = build_gateway(
+        &base.uri(),
+        GatewayOptions {
+            backend_urls: vec![base.uri()],
+            backend_long_context_urls: vec![long.uri()],
+            long_context_above_tokens: ABOVE_TOKENS,
+            ..Default::default()
+        },
+    );
+    for bytes in [4_000, 400] {
+        let response = app
+            .clone()
+            .oneshot(chat_request(sized_body(bytes)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    base.verify().await;
+    long.verify().await;
+}
+
+#[tokio::test]
+async fn a_conversation_that_grows_past_the_threshold_moves_and_stays_there() {
+    let base = MockServer::start().await;
+    let long = MockServer::start().await;
+    let long_peer = MockServer::start().await;
+    mount_chat(&base, 1).await;
+    // One slow unrelated request parks on the long host the conversation
+    // moves onto, so plain least-connections would send the turn after it to
+    // the idle peer instead.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"user": "holder"}),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(chat_completion_json())
+                .set_delay(Duration::from_millis(700)),
+        )
+        .expect(1)
+        .mount(&long)
+        .await;
+    mount_chat(&long, 2).await;
+    mount_chat(&long_peer, 0).await;
+    let app = build_gateway(
+        &base.uri(),
+        GatewayOptions {
+            backend_urls: vec![base.uri()],
+            backend_long_context_urls: vec![long.uri(), long_peer.uri()],
+            long_context_above_tokens: ABOVE_TOKENS,
+            backend_conversation_affinity: true,
+            ..Default::default()
+        },
+    );
+    // The first turn is short: it goes to the base fleet and pins there. The
+    // second is above the threshold, so the pin is outside its tier — it is
+    // placed on the first long host and re-pinned onto it.
+    for turn in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(chat_request(conversation(turn)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let holder = tokio::spawn({
+        let app = app.clone();
+        async move {
+            let mut body = sized_body(4_000);
+            body["user"] = "holder".into();
+            app.oneshot(chat_request(body)).await.unwrap()
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The third turn follows the pin onto the busy host rather than the idle
+    // peer: its prefix cache is there and a move would re-prefill it.
+    let response = app
+        .clone()
+        .oneshot(chat_request(conversation(2)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(holder.await.unwrap().status(), StatusCode::OK);
+    base.verify().await;
+    long.verify().await;
+    long_peer.verify().await;
+}
+
+#[tokio::test]
+async fn a_tier_without_a_healthy_backend_falls_back_to_the_other_one() {
+    let live = MockServer::start().await;
+    let dead = unreachable_backend_url();
+    // The long tier is down...
+    let app = build_gateway(
+        &live.uri(),
+        GatewayOptions {
+            backend_urls: vec![live.uri()],
+            backend_long_context_urls: vec![dead],
+            long_context_above_tokens: ABOVE_TOKENS,
+            backend_connect_failover: true,
+            admission_max_inflight: 4,
+            ..Default::default()
+        },
+    );
+    mount_chat(&live, 2).await;
+    // ...the first oversized request fails over out of its tier as soon as
+    // that host leaves the rotation, and the next one is placed on the base
+    // fleet straight away. Neither is refused.
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(chat_request(sized_body(4_000)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    live.verify().await;
+    live.reset().await;
+
+    // And the other way around: with the base fleet gone, a short request is
+    // served by the long-context host.
+    let dead = unreachable_backend_url();
+    let app = build_gateway(
+        &live.uri(),
+        GatewayOptions {
+            backend_urls: vec![dead],
+            backend_long_context_urls: vec![live.uri()],
+            long_context_above_tokens: ABOVE_TOKENS,
+            backend_connect_failover: true,
+            admission_max_inflight: 4,
+            ..Default::default()
+        },
+    );
+    mount_chat(&live, 2).await;
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(chat_request(sized_body(400)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    live.verify().await;
+}
+
+#[tokio::test]
+async fn a_full_long_tier_refuses_while_the_base_fleet_keeps_serving() {
+    let base = MockServer::start().await;
+    let long = MockServer::start().await;
+    mount_chat(&base, 1).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(chat_completion_json())
+                .set_delay(Duration::from_millis(700)),
+        )
+        .expect(1)
+        .mount(&long)
+        .await;
+    // Budget 2 over two hosts: one lane request each.
+    let app = build_gateway(
+        &base.uri(),
+        GatewayOptions {
+            backend_urls: vec![base.uri()],
+            backend_long_context_urls: vec![long.uri()],
+            long_context_above_tokens: ABOVE_TOKENS,
+            admission_max_inflight: 2,
+            ..Default::default()
+        },
+    );
+    let first = tokio::spawn({
+        let app = app.clone();
+        async move { app.oneshot(chat_request(sized_body(4_000))).await.unwrap() }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The long host holds its whole share: the next oversized request is
+    // refused instead of spilling its prefill onto the base fleet. (The 429
+    // body carries only the generic `overloaded` type; which refusal it was
+    // lives in the log line and in `admission_rejections_total{reason}`,
+    // neither observable from here.)
+    let second = app
+        .clone()
+        .oneshot(chat_request(sized_body(4_000)))
+        .await
+        .unwrap();
+    assert_overloaded(second).await;
+    // ...which keeps serving short requests throughout.
+    let third = app.oneshot(chat_request(sized_body(400))).await.unwrap();
+    assert_eq!(third.status(), StatusCode::OK);
+    assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+    base.verify().await;
+    long.verify().await;
+}
+
+#[tokio::test]
+async fn a_token_id_prompt_is_routed_by_its_exact_length() {
+    let base = MockServer::start().await;
+    let long = MockServer::start().await;
+    for mock in [&base, &long] {
+        Mock::given(method("POST"))
+            .and(path("/v1/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-1", "object": "text_completion", "model": "test-model",
+                "choices": [{"index": 0, "text": "hi", "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1)
+            .mount(mock)
+            .await;
+    }
+    let app = build_gateway(
+        &base.uri(),
+        GatewayOptions {
+            backend_urls: vec![base.uri()],
+            backend_long_context_urls: vec![long.uri()],
+            long_context_above_tokens: ABOVE_TOKENS,
+            ..Default::default()
+        },
+    );
+    // Token ids count exactly and carry no safety factor, and the bound is
+    // strict: 1001 ids is the long tier, 1000 is not.
+    for ids in [1_001u32, 1_000] {
+        let body = serde_json::json!({
+            "model": "test-model",
+            "prompt": (0..ids).collect::<Vec<u32>>()
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("authorization", "Bearer test-token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    base.verify().await;
+    long.verify().await;
 }
 
 // ---- Models document ----

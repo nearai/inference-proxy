@@ -31,6 +31,17 @@ where
     }
 }
 
+/// Comma-separated backend/probe base URLs, trimmed of blanks and trailing
+/// slashes. Missing or empty = no URLs.
+fn url_list(name: &str) -> Vec<String> {
+    env::var(name)
+        .unwrap_or_default()
+        .split(',')
+        .map(|u| u.trim().trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty())
+        .collect()
+}
+
 fn parse_bool(v: &str) -> bool {
     matches!(v.to_lowercase().as_str(), "1" | "true" | "yes")
 }
@@ -367,6 +378,19 @@ pub struct Config {
     /// Poll interval for the probes (`VLLM_BACKEND_PROBE_INTERVAL_SECS`,
     /// default 2).
     pub backend_probe_interval_secs: u64,
+    /// Gateway mode: backend URLs of the long-context tier
+    /// (`VLLM_BACKEND_LONG_CONTEXT_URLS`, the same hosts' handle URLs under
+    /// the model's `-long` model-proxy domain). Appended to the pool after
+    /// `backend_urls`, so the base backends keep their indexes.
+    pub backend_long_context_urls: Vec<String>,
+    /// One engine-load probe URL per long-context backend, same order
+    /// (`VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS`). Required with
+    /// `VLLM_BACKEND_PROBE_URLS`, empty without it.
+    pub backend_long_context_probe_urls: Vec<String>,
+    /// Estimated input tokens above which a request is placed on the
+    /// long-context tier (`VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS`, 0 = off,
+    /// the default). See `context_tier.rs` for the estimate.
+    pub long_context_above_tokens: u64,
 
     // Endpoint URL overrides (Some = explicitly set, bypasses backend pool)
     pub images_url_override: Option<String>,
@@ -678,12 +702,7 @@ impl Config {
             }
         }
         let backend_connect_failover = env_bool("VLLM_BACKEND_CONNECT_FAILOVER");
-        let backend_probe_urls: Vec<String> = env::var("VLLM_BACKEND_PROBE_URLS")
-            .unwrap_or_default()
-            .split(',')
-            .map(|u| u.trim().trim_end_matches('/').to_string())
-            .filter(|u| !u.is_empty())
-            .collect();
+        let backend_probe_urls = url_list("VLLM_BACKEND_PROBE_URLS");
         if !backend_probe_urls.is_empty() && backend_probe_urls.len() != backend_urls.len() {
             anyhow::bail!(
                 "VLLM_BACKEND_PROBE_URLS must list one probe URL per VLLM_BACKEND_URLS entry, in the same order"
@@ -692,6 +711,54 @@ impl Config {
         let backend_probe_interval_secs: u64 = env_parse("VLLM_BACKEND_PROBE_INTERVAL_SECS", 2)?;
         if backend_probe_interval_secs == 0 {
             anyhow::bail!("VLLM_BACKEND_PROBE_INTERVAL_SECS must be at least 1");
+        }
+
+        // Long-context tier: a second set of hosts, registered under the
+        // model's `-long` model-proxy domain, for oversized prompts.
+        let backend_long_context_urls = url_list("VLLM_BACKEND_LONG_CONTEXT_URLS");
+        let backend_long_context_probe_urls = url_list("VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS");
+        let long_context_above_tokens: u64 =
+            env_parse("VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS", 0)?;
+        if !backend_long_context_urls.is_empty() && long_context_above_tokens == 0 {
+            anyhow::bail!(
+                "VLLM_BACKEND_LONG_CONTEXT_URLS requires VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS: without a threshold nothing would ever be placed there"
+            );
+        }
+        if long_context_above_tokens > 0 && backend_long_context_urls.is_empty() {
+            anyhow::bail!(
+                "VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS requires VLLM_BACKEND_LONG_CONTEXT_URLS"
+            );
+        }
+        if let Some(both) = backend_long_context_urls
+            .iter()
+            .find(|url| backend_urls.contains(url))
+        {
+            anyhow::bail!(
+                "{both} is listed in both VLLM_BACKEND_URLS and VLLM_BACKEND_LONG_CONTEXT_URLS; one pool entry serves one tier"
+            );
+        }
+        let expected_long_probes = if backend_probe_urls.is_empty() {
+            0
+        } else {
+            backend_long_context_urls.len()
+        };
+        if backend_long_context_probe_urls.len() != expected_long_probes {
+            anyhow::bail!(
+                "VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS must list one probe URL per VLLM_BACKEND_LONG_CONTEXT_URLS entry when VLLM_BACKEND_PROBE_URLS is set, and none when it is not"
+            );
+        }
+        if let Some(twice) = backend_long_context_probe_urls
+            .iter()
+            .find(|url| backend_probe_urls.contains(url))
+        {
+            anyhow::bail!(
+                "{twice} is listed in both VLLM_BACKEND_PROBE_URLS and VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS: a host serving both tiers has two pool entries but one engine, which the share and the engine samples would count twice"
+            );
+        }
+        if !backend_long_context_urls.is_empty() && vllm_data_parallel_size.is_some() {
+            anyhow::bail!(
+                "VLLM_BACKEND_LONG_CONTEXT_URLS and VLLM_DATA_PARALLEL_SIZE are mutually exclusive; data-parallel affinity serves one backend"
+            );
         }
 
         let config = Config {
@@ -792,6 +859,9 @@ impl Config {
             backend_connect_failover,
             backend_probe_urls,
             backend_probe_interval_secs,
+            backend_long_context_urls,
+            backend_long_context_probe_urls,
+            long_context_above_tokens,
             images_url_override,
             images_edits_url_override,
             transcriptions_url_override,
@@ -918,7 +988,24 @@ impl Config {
                 "VLLM_PROXY_ADMISSION_MAX_INFLIGHT cannot be combined with FUSION_ENABLED or WEB_CONTEXT_SEARCH_URL: those execution modes run outside the lane budget"
             );
         }
+        if !config.backend_long_context_urls.is_empty()
+            && (config.fusion_enabled || config.web_context_search_url.is_some())
+        {
+            anyhow::bail!(
+                "VLLM_BACKEND_LONG_CONTEXT_URLS cannot be combined with FUSION_ENABLED or WEB_CONTEXT_SEARCH_URL: those execution modes place their own backend requests, outside the tier"
+            );
+        }
         Ok(config)
+    }
+
+    /// Engine-load probe URLs in pool order: the base tier, then the
+    /// long-context one, matching how `BackendPool` is built.
+    pub fn pool_probe_urls(&self) -> Vec<String> {
+        self.backend_probe_urls
+            .iter()
+            .chain(&self.backend_long_context_probe_urls)
+            .cloned()
+            .collect()
     }
 
     /// Lane admission settings, `None` unless `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` is set.
@@ -1062,6 +1149,9 @@ mod tests {
             "VLLM_BACKEND_CONNECT_FAILOVER",
             "VLLM_BACKEND_PROBE_URLS",
             "VLLM_BACKEND_PROBE_INTERVAL_SECS",
+            "VLLM_BACKEND_LONG_CONTEXT_URLS",
+            "VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS",
+            "VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS",
             "LISTEN_ADDR",
         ] {
             env::remove_var(key);
@@ -1089,6 +1179,9 @@ mod tests {
             assert!(!config.backend_connect_failover);
             assert!(config.backend_probe_urls.is_empty());
             assert_eq!(config.backend_probe_interval_secs, 2);
+            assert!(config.backend_long_context_urls.is_empty());
+            assert!(config.pool_probe_urls().is_empty());
+            assert_eq!(config.long_context_above_tokens, 0);
             assert_eq!(config.backend_urls, vec!["http://localhost:8000"]);
         });
     }
@@ -1208,6 +1301,86 @@ mod tests {
                 gateway_env_cleanup();
             },
         );
+    }
+
+    #[test]
+    fn test_long_context_tier_settings_are_validated() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            gateway_env_cleanup();
+            let err = || Config::from_env().unwrap_err().to_string();
+            env::set_var("VLLM_BACKEND_URLS", "https://m-b1.test,https://m-b2.test");
+            // Without the tier nothing changes, repeated probe URLs included
+            // (two proxies in front of one engine is a deployment's business).
+            env::set_var("VLLM_BACKEND_PROBE_URLS", "http://p1:8000,http://p1:8000");
+            assert!(Config::from_env().is_ok());
+            env::remove_var("VLLM_BACKEND_PROBE_URLS");
+            // The tier and its threshold only make sense together.
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_URLS", "https://m-long-b3.test");
+            assert!(
+                err().contains("VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS"),
+                "{}",
+                err()
+            );
+            env::remove_var("VLLM_BACKEND_LONG_CONTEXT_URLS");
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS", "100000");
+            assert!(
+                err().contains("VLLM_BACKEND_LONG_CONTEXT_URLS"),
+                "{}",
+                err()
+            );
+            // One pool entry serves one tier.
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_URLS", "https://m-b2.test");
+            assert!(err().contains("both"), "{}", err());
+
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_URLS", "https://m-long-b3.test/");
+            let config = Config::from_env().unwrap();
+            assert_eq!(config.backend_long_context_urls, ["https://m-long-b3.test"]);
+            assert_eq!(config.long_context_above_tokens, 100_000);
+            assert!(config.pool_probe_urls().is_empty());
+
+            // Probes: one per backend of each tier, in pool order.
+            env::set_var("VLLM_BACKEND_PROBE_URLS", "http://p1:8000,http://p2:8000");
+            assert!(
+                err().contains("VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS"),
+                "{}",
+                err()
+            );
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS", "http://p3:8000");
+            assert_eq!(
+                Config::from_env().unwrap().pool_probe_urls(),
+                ["http://p1:8000", "http://p2:8000", "http://p3:8000"]
+            );
+            // A host serving both tiers has two pool entries but one engine.
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS", "http://p2:8000");
+            assert!(err().contains("both"), "{}", err());
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS", "http://p3:8000");
+            // Long probes alone would poll a tier nothing else is polled for.
+            env::remove_var("VLLM_BACKEND_PROBE_URLS");
+            assert!(
+                err().contains("VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS"),
+                "{}",
+                err()
+            );
+            env::remove_var("VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS");
+
+            // A data-parallel backend is a single engine: no second tier.
+            env::set_var("VLLM_BACKEND_URLS", "https://m-b1.test");
+            env::set_var("VLLM_DATA_PARALLEL_SIZE", "4");
+            assert!(err().contains("VLLM_DATA_PARALLEL_SIZE"), "{}", err());
+            env::remove_var("VLLM_DATA_PARALLEL_SIZE");
+
+            // Fusion and the agent loop place their own backend requests,
+            // which no tier restriction reaches.
+            env::set_var("WEB_CONTEXT_SEARCH_URL", "https://brave.test");
+            assert!(err().contains("WEB_CONTEXT_SEARCH_URL"), "{}", err());
+            env::remove_var("WEB_CONTEXT_SEARCH_URL");
+            env::set_var("FUSION_ENABLED", "1");
+            env::set_var("FUSION_INTERNAL_BEARER_TOKEN", "fusion-secret");
+            assert!(err().contains("FUSION_ENABLED"), "{}", err());
+            env::remove_var("FUSION_ENABLED");
+            env::remove_var("FUSION_INTERNAL_BEARER_TOKEN");
+            gateway_env_cleanup();
+        });
     }
 
     #[test]

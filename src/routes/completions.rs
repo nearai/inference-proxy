@@ -96,22 +96,42 @@ pub async fn completions(
         (None, None)
     };
 
-    // Lane admission (gateway mode), see the chat route.
-    let permit = state.admission.try_admit(&state.backend_pool)?;
+    // Long-context tier and lane admission (gateway mode), see the chat
+    // route. Token ids in `prompt` are counted exactly; text is estimated.
+    let tier = crate::context_tier::decide(
+        &state.backend_pool,
+        state.config.long_context_above_tokens,
+        || crate::context_tier::completion_estimate(&request_json),
+    );
+    let permit = state.admission.try_admit(&state.backend_pool, tier)?;
     let host_share = state
         .admission
         .host_share(state.backend_pool.healthy_count());
-    let placement = {
+    let mut restrict = tier.and_then(|tier| tier.restrict);
+    let place = |tier| {
         let policy = backend_pool::Policy {
             max_conns: host_share,
             avoid: &|index| state.admission.backend_saturated(index),
             engine: &|index| state.admission.engine(index),
+            tier,
         };
         state
             .backend_affinity
             .place(&state.backend_pool, None, "/v1/completions", &policy)
+    };
+    // See the chat route: a tier that just emptied falls back, and `restrict`
+    // follows the placement.
+    let mut placement = place(restrict);
+    if placement.is_none()
+        && restrict.is_some_and(|tier| {
+            crate::context_tier::recheck_restriction(&state.backend_pool, tier).is_none()
+        })
+    {
+        restrict = None;
+        placement = place(None);
     }
-    .ok_or_else(|| AppError::from(state.admission.reject(RejectReason::HostShare)))?;
+    let placement =
+        placement.ok_or_else(|| AppError::from(state.admission.reject(RejectReason::HostShare)))?;
     if let Some(permit) = permit.as_ref() {
         permit.attach_backend(placement.index);
     }
@@ -122,6 +142,7 @@ pub async fn completions(
             pool: state.backend_pool.clone(),
             path: "/v1/completions",
             index: placement.index,
+            tier: restrict,
             affinity: None,
         });
     let url = placement.url;

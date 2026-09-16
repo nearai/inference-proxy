@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use crate::backend_pool::BackendPool;
+use crate::context_tier::{ContextTier, TierDecision};
 use crate::engine_load::EngineLoad;
 
 /// Window over which time-to-first-generation observations are counted, as
@@ -149,7 +150,10 @@ pub struct AdmissionController {
     /// Live engine view per backend when `VLLM_BACKEND_PROBE_URLS` is set.
     engine: Arc<EngineLoad>,
     epoch: Instant,
-    queue_tripped: AtomicBool,
+    /// Latched "every backend queues" state, one per tier: the verdict is
+    /// computed over the request's own tier, so a single flag would flap
+    /// between a queueing base fleet and an idle long host.
+    queue_tripped: [AtomicBool; 2],
 }
 
 impl AdmissionController {
@@ -183,7 +187,7 @@ impl AdmissionController {
             backpressure: (0..backend_count).map(|_| AtomicU64::new(0)).collect(),
             engine,
             epoch: now,
-            queue_tripped: AtomicBool::new(false),
+            queue_tripped: [AtomicBool::new(false), AtomicBool::new(false)],
         }
     }
 
@@ -270,21 +274,32 @@ impl AdmissionController {
     /// The overload and budget checks without taking a slot: a cheap early
     /// refusal for routes that still have expensive work (image validation)
     /// ahead of `try_admit`. Nothing is reserved; the later `try_admit` can
-    /// still refuse.
-    pub fn precheck(&self, pool: &BackendPool) -> Result<(), Rejected> {
-        self.precheck_at(pool, Instant::now())
+    /// still refuse. The tier decision restricts the fleet-wide queue check
+    /// to the backends this request may use (`None` = the whole pool).
+    pub fn precheck(&self, pool: &BackendPool, tier: Option<TierDecision>) -> Result<(), Rejected> {
+        self.precheck_at(pool, tier, Instant::now())
     }
 
-    pub(crate) fn precheck_at(&self, pool: &BackendPool, now: Instant) -> Result<(), Rejected> {
+    pub(crate) fn precheck_at(
+        &self,
+        pool: &BackendPool,
+        tier: Option<TierDecision>,
+        now: Instant,
+    ) -> Result<(), Rejected> {
         let Some(config) = &self.config else {
             return Ok(());
         };
         // Overload first, so a signal that just arrived cannot be preceded by
-        // a ramp step that treats the interval as clean.
-        if self.ttft_over_bound(config, now) {
+        // a ramp step that treats the interval as clean. The window holds base
+        // requests only (a long prefill is no lane observation), so its
+        // verdict says nothing about a request that is actually going to the
+        // long tier — but it does apply to one that fell back onto the base
+        // fleet, which is the fleet the breaker just declared overloaded.
+        let on_long_tier = tier.is_some_and(|tier| tier.restrict == Some(ContextTier::Long));
+        if !on_long_tier && self.ttft_over_bound(config, now) {
             return Err(self.reject(RejectReason::Ttft));
         }
-        if self.every_backend_queued(config, pool, now) {
+        if self.every_backend_queued(config, pool, tier.and_then(|tier| tier.restrict), now) {
             return Err(self.reject(RejectReason::BackendQueue));
         }
         self.tick_ramp(config, now);
@@ -299,19 +314,24 @@ impl AdmissionController {
     /// the permit is dropped. The per-host share is applied by the caller at
     /// selection time (`host_share`, `backend_saturated`), since it needs the
     /// chosen backend.
-    pub fn try_admit(self: &Arc<Self>, pool: &BackendPool) -> Result<Option<Permit>, Rejected> {
-        self.try_admit_at(pool, Instant::now())
+    pub fn try_admit(
+        self: &Arc<Self>,
+        pool: &BackendPool,
+        tier: Option<TierDecision>,
+    ) -> Result<Option<Permit>, Rejected> {
+        self.try_admit_at(pool, tier, Instant::now())
     }
 
     pub(crate) fn try_admit_at(
         self: &Arc<Self>,
         pool: &BackendPool,
+        tier: Option<TierDecision>,
         now: Instant,
     ) -> Result<Option<Permit>, Rejected> {
         if self.config.is_none() {
             return Ok(None);
         }
-        self.precheck_at(pool, now)?;
+        self.precheck_at(pool, tier, now)?;
         let mut current = self.inflight.load(Ordering::Acquire);
         loop {
             if current >= self.budget.load(Ordering::Relaxed) {
@@ -331,6 +351,7 @@ impl AdmissionController {
         Ok(Some(Permit {
             controller: Arc::clone(self),
             backend: AtomicUsize::new(NO_BACKEND),
+            long_request: tier.is_some_and(|tier| tier.estimated == ContextTier::Long),
             state: AtomicU8::new(PENDING),
             dispatched_at: OnceLock::new(),
         }))
@@ -485,17 +506,21 @@ impl AdmissionController {
         self.mark_dirty();
     }
 
-    /// Every healthy backend rejected at engine admission within the TTL.
+    /// Every healthy backend of the request's tier rejected at engine
+    /// admission within the TTL.
     fn every_backend_queued(
         &self,
         config: &AdmissionConfig,
         pool: &BackendPool,
+        tier: Option<ContextTier>,
         now: Instant,
     ) -> bool {
         let mut healthy = 0usize;
         let mut all_queued = true;
         for (index, backend) in pool.backends().iter().enumerate() {
-            if !backend.healthy.load(Ordering::Relaxed) {
+            if !backend.healthy.load(Ordering::Relaxed)
+                || tier.is_some_and(|tier| tier != backend.tier)
+            {
                 continue;
             }
             healthy += 1;
@@ -505,15 +530,18 @@ impl AdmissionController {
             }
         }
         let queued = healthy > 0 && all_queued;
-        if queued != self.queue_tripped.swap(queued, Ordering::Relaxed) {
+        let latch = &self.queue_tripped[usize::from(tier == Some(ContextTier::Long))];
+        if queued != latch.swap(queued, Ordering::Relaxed) {
+            let tier = tier.map_or("any", ContextTier::as_str);
             if queued {
                 warn!(
+                    tier,
                     healthy_backends = healthy,
                     ttl_secs = config.backpressure_ttl.as_secs(),
                     "Every backend rejected at engine admission recently, refusing new work"
                 );
             } else {
-                info!("A backend accepts lane work again");
+                info!(tier, "A backend accepts lane work again");
             }
         }
         queued
@@ -533,6 +561,11 @@ impl AdmissionController {
 pub struct Permit {
     controller: Arc<AdmissionController>,
     backend: AtomicUsize,
+    /// The request's estimated input is above the long-context threshold.
+    /// Decided once, at admission: a prefill of that size takes tens of
+    /// seconds on either tier, so the wait is not a lane observation wherever
+    /// the request ends up running.
+    long_request: bool,
     state: AtomicU8,
     dispatched_at: OnceLock<Instant>,
 }
@@ -616,6 +649,17 @@ impl Permit {
         {
             return;
         }
+        self.record_ttft(now);
+    }
+
+    /// One time-to-first-generation observation for the lane — unless this is
+    /// a long-context request, whose >100k-token prefill takes tens of seconds
+    /// by nature: that wait says nothing about the lane's health and would
+    /// trip its breaker for everyone.
+    fn record_ttft(&self, now: Instant) {
+        if self.long_request {
+            return;
+        }
         if let Some(dispatched_at) = self.dispatched_at.get() {
             self.controller
                 .record_ttft(now, now.saturating_duration_since(*dispatched_at));
@@ -645,10 +689,7 @@ impl Permit {
             .compare_exchange(DISPATCHED, GENERATED, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            if let Some(dispatched_at) = self.dispatched_at.get() {
-                self.controller
-                    .record_ttft(now, now.saturating_duration_since(*dispatched_at));
-            }
+            self.record_ttft(now);
         }
         self.controller.inflight.fetch_sub(1, Ordering::AcqRel);
         metrics::gauge!("admission_inflight").decrement(1.0);
@@ -659,6 +700,7 @@ impl std::fmt::Debug for Permit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Permit")
             .field("backend", &self.backend())
+            .field("long_request", &self.long_request)
             .field("state", &self.state.load(Ordering::Relaxed))
             .finish()
     }
@@ -698,9 +740,18 @@ mod tests {
         ))
     }
 
+    /// A tier decision for a request estimated onto `estimated` that may use
+    /// the backends of `restrict`.
+    fn tier(estimated: ContextTier, restrict: Option<ContextTier>) -> Option<TierDecision> {
+        Some(TierDecision {
+            estimated,
+            restrict,
+        })
+    }
+
     /// Admit at `t0` and record a first-generation sample `ttft` later.
     fn sample(c: &Arc<AdmissionController>, p: &BackendPool, t0: Instant, ttft: Duration) {
-        let permit = c.try_admit_at(p, t0).unwrap().unwrap();
+        let permit = c.try_admit_at(p, None, t0).unwrap().unwrap();
         permit.mark_dispatched_at(t0);
         permit.observe_generation_started_at(t0 + ttft);
     }
@@ -710,7 +761,7 @@ mod tests {
         let c = Arc::new(AdmissionController::disabled());
         let p = pool(1);
         for _ in 0..100 {
-            assert!(c.try_admit(&p).unwrap().is_none());
+            assert!(c.try_admit(&p, None).unwrap().is_none());
         }
         assert_eq!(c.inflight(), 0);
         assert_eq!(c.host_share(1), None);
@@ -721,15 +772,15 @@ mod tests {
     fn budget_bounds_inflight_and_permits_release_on_drop() {
         let c = controller(config(), 2);
         let p = pool(2);
-        let a = c.try_admit(&p).unwrap().unwrap();
-        let b = c.try_admit(&p).unwrap().unwrap();
+        let a = c.try_admit(&p, None).unwrap().unwrap();
+        let b = c.try_admit(&p, None).unwrap().unwrap();
         assert_eq!(c.inflight(), 2);
-        let rejected = c.try_admit(&p).unwrap_err();
+        let rejected = c.try_admit(&p, None).unwrap_err();
         assert_eq!(rejected.reason, RejectReason::Budget);
         assert_eq!(rejected.retry_after, Duration::from_secs(3));
         drop(a);
         assert_eq!(c.inflight(), 1);
-        let _c2 = c.try_admit(&p).unwrap().unwrap();
+        let _c2 = c.try_admit(&p, None).unwrap().unwrap();
         drop(b);
         assert_eq!(c.inflight(), 1);
     }
@@ -750,28 +801,46 @@ mod tests {
         let t0 = Instant::now();
         assert_eq!(c.budget(), 2);
         // Half an interval: nothing.
-        drop(c.try_admit_at(&p, t0 + Duration::from_secs(30)).unwrap());
+        drop(
+            c.try_admit_at(&p, None, t0 + Duration::from_secs(30))
+                .unwrap(),
+        );
         assert_eq!(c.budget(), 2);
         // A full clean interval: one step.
-        drop(c.try_admit_at(&p, t0 + Duration::from_secs(61)).unwrap());
+        drop(
+            c.try_admit_at(&p, None, t0 + Duration::from_secs(61))
+                .unwrap(),
+        );
         assert_eq!(c.budget(), 4);
         // Back-pressure during the next interval holds the budget...
         let permit = c
-            .try_admit_at(&p, t0 + Duration::from_secs(70))
+            .try_admit_at(&p, None, t0 + Duration::from_secs(70))
             .unwrap()
             .unwrap();
         permit.attach_backend(0);
         permit.observe_backpressure_at(t0 + Duration::from_secs(70));
         drop(permit);
-        drop(c.try_admit_at(&p, t0 + Duration::from_secs(130)).unwrap());
+        drop(
+            c.try_admit_at(&p, None, t0 + Duration::from_secs(130))
+                .unwrap(),
+        );
         assert_eq!(c.budget(), 4);
         // ...and the interval after that is clean again.
-        drop(c.try_admit_at(&p, t0 + Duration::from_secs(200)).unwrap());
+        drop(
+            c.try_admit_at(&p, None, t0 + Duration::from_secs(200))
+                .unwrap(),
+        );
         assert_eq!(c.budget(), 6);
-        drop(c.try_admit_at(&p, t0 + Duration::from_secs(270)).unwrap());
+        drop(
+            c.try_admit_at(&p, None, t0 + Duration::from_secs(270))
+                .unwrap(),
+        );
         assert_eq!(c.budget(), 8);
         // Capped at max.
-        drop(c.try_admit_at(&p, t0 + Duration::from_secs(340)).unwrap());
+        drop(
+            c.try_admit_at(&p, None, t0 + Duration::from_secs(340))
+                .unwrap(),
+        );
         assert_eq!(c.budget(), 8);
     }
 
@@ -787,9 +856,15 @@ mod tests {
             t0 + Duration::from_secs(50),
             Duration::from_secs(11),
         );
-        drop(c.try_admit_at(&p, t0 + Duration::from_secs(62)).unwrap());
+        drop(
+            c.try_admit_at(&p, None, t0 + Duration::from_secs(62))
+                .unwrap(),
+        );
         assert_eq!(c.budget(), 2, "the interval with a breach is not clean");
-        drop(c.try_admit_at(&p, t0 + Duration::from_secs(125)).unwrap());
+        drop(
+            c.try_admit_at(&p, None, t0 + Duration::from_secs(125))
+                .unwrap(),
+        );
         assert_eq!(c.budget(), 4);
     }
 
@@ -799,27 +874,35 @@ mod tests {
         let p = pool(2);
         let t0 = Instant::now();
         // Only backend 0 rejected: it is steered around, the other may have room.
-        let permit = c.try_admit_at(&p, t0).unwrap().unwrap();
+        let permit = c.try_admit_at(&p, None, t0).unwrap().unwrap();
         permit.attach_backend(0);
         permit.observe_backpressure_at(t0);
         drop(permit);
         assert!(c.backend_saturated_at(0, t0 + Duration::from_secs(1)));
         assert!(!c.backend_saturated_at(1, t0 + Duration::from_secs(1)));
-        assert!(c.try_admit_at(&p, t0 + Duration::from_secs(1)).is_ok());
+        assert!(c
+            .try_admit_at(&p, None, t0 + Duration::from_secs(1))
+            .is_ok());
         // Both rejected: refuse.
-        let permit = c.try_admit_at(&p, t0).unwrap().unwrap();
+        let permit = c.try_admit_at(&p, None, t0).unwrap().unwrap();
         permit.attach_backend(1);
         permit.observe_backpressure_at(t0 + Duration::from_secs(2));
         drop(permit);
-        let rejected = c.try_admit_at(&p, t0 + Duration::from_secs(3)).unwrap_err();
+        let rejected = c
+            .try_admit_at(&p, None, t0 + Duration::from_secs(3))
+            .unwrap_err();
         assert_eq!(rejected.reason, RejectReason::BackendQueue);
         // An unhealthy backend does not count; the healthy one is still queued.
         p.backends()[1].healthy.store(false, Ordering::Relaxed);
-        let rejected = c.try_admit_at(&p, t0 + Duration::from_secs(5)).unwrap_err();
+        let rejected = c
+            .try_admit_at(&p, None, t0 + Duration::from_secs(5))
+            .unwrap_err();
         assert_eq!(rejected.reason, RejectReason::BackendQueue);
         // Past the TTL the marks expire.
         assert!(!c.backend_saturated_at(0, t0 + Duration::from_secs(20)));
-        assert!(c.try_admit_at(&p, t0 + Duration::from_secs(20)).is_ok());
+        assert!(c
+            .try_admit_at(&p, None, t0 + Duration::from_secs(20))
+            .is_ok());
     }
 
     #[test]
@@ -839,17 +922,19 @@ mod tests {
         sample(&c, &p, t0, Duration::from_secs(40));
         assert_eq!(c.ttft_breaches(t0 + Duration::from_secs(41)), Some((20, 1)));
         // 20 samples with a single breach: one slow request is not overload.
-        assert!(c.try_admit_at(&p, t0 + Duration::from_secs(41)).is_ok());
+        assert!(c
+            .try_admit_at(&p, None, t0 + Duration::from_secs(41))
+            .is_ok());
         // A second breach (2 of 21 ≥ max(2, ceil(5 %))) trips the breaker.
         sample(&c, &p, t0 + Duration::from_secs(1), Duration::from_secs(41));
         let rejected = c
-            .try_admit_at(&p, t0 + Duration::from_secs(43))
+            .try_admit_at(&p, None, t0 + Duration::from_secs(43))
             .unwrap_err();
         assert_eq!(rejected.reason, RejectReason::Ttft);
         // Samples (stamped when their generation started, ≤ t0+42) fall out
         // of the window and admission resumes.
         let later = t0 + Duration::from_secs(42) + TTFT_WINDOW + Duration::from_secs(2);
-        assert!(c.try_admit_at(&p, later).is_ok());
+        assert!(c.try_admit_at(&p, None, later).is_ok());
         assert_eq!(c.ttft_breaches(later), None);
     }
 
@@ -871,15 +956,17 @@ mod tests {
         // Evaluated (clean) at t1; two breaches observed right after are not
         // seen until the cache expires.
         let t1 = t0 + Duration::from_secs(2);
-        assert!(c.try_admit_at(&p, t1).is_ok());
+        assert!(c.try_admit_at(&p, None, t1).is_ok());
         for _ in 0..2 {
-            let permit = c.try_admit_at(&p, t1).unwrap().unwrap();
+            let permit = c.try_admit_at(&p, None, t1).unwrap().unwrap();
             permit.mark_dispatched_at(t1 - Duration::from_secs(20));
             permit.observe_generation_started_at(t1);
         }
-        assert!(c.try_admit_at(&p, t1 + Duration::from_millis(500)).is_ok());
+        assert!(c
+            .try_admit_at(&p, None, t1 + Duration::from_millis(500))
+            .is_ok());
         let rejected = c
-            .try_admit_at(&p, t1 + Duration::from_millis(1500))
+            .try_admit_at(&p, None, t1 + Duration::from_millis(1500))
             .unwrap_err();
         assert_eq!(rejected.reason, RejectReason::Ttft);
     }
@@ -898,7 +985,9 @@ mod tests {
         for _ in 0..25 {
             sample(&c, &p, t0, Duration::from_secs(100));
         }
-        assert!(c.try_admit_at(&p, t0 + Duration::from_secs(1)).is_ok());
+        assert!(c
+            .try_admit_at(&p, None, t0 + Duration::from_secs(1))
+            .is_ok());
     }
 
     #[test]
@@ -907,7 +996,7 @@ mod tests {
         let p = pool(1);
         let t0 = Instant::now();
         // Not dispatched yet: nothing to observe.
-        let permit = c.try_admit_at(&p, t0).unwrap().unwrap();
+        let permit = c.try_admit_at(&p, None, t0).unwrap().unwrap();
         permit.observe_generation_started_at(t0 + Duration::from_secs(50));
         assert_eq!(c.ttft_totals(t0 + Duration::from_secs(50)), (0, 0));
         // Dispatched 5 s after admission (image validation): the clock starts
@@ -926,19 +1015,19 @@ mod tests {
         let p = pool(1);
         let t0 = Instant::now();
         // Never reached the engine: nothing recorded.
-        let permit = c.try_admit_at(&p, t0).unwrap().unwrap();
+        let permit = c.try_admit_at(&p, None, t0).unwrap().unwrap();
         permit.release_at(t0 + Duration::from_secs(30));
         std::mem::forget(permit);
         assert_eq!(c.ttft_totals(t0 + Duration::from_secs(30)), (0, 0));
         // Accepted, then the client gave up after 30 s: one breaching sample.
-        let permit = c.try_admit_at(&p, t0).unwrap().unwrap();
+        let permit = c.try_admit_at(&p, None, t0).unwrap().unwrap();
         permit.mark_dispatched_at(t0);
         permit.release_at(t0 + Duration::from_secs(30));
         std::mem::forget(permit);
         assert_eq!(c.ttft_totals(t0 + Duration::from_secs(30)), (1, 1));
         // Accepted but the stream's first event was an engine rejection: no
         // sample, and a generation event after abandoning is ignored too.
-        let permit = c.try_admit_at(&p, t0).unwrap().unwrap();
+        let permit = c.try_admit_at(&p, None, t0).unwrap().unwrap();
         permit.mark_dispatched_at(t0);
         permit.abandon();
         permit.observe_generation_started_at(t0 + Duration::from_secs(1));
@@ -947,7 +1036,7 @@ mod tests {
         assert_eq!(c.ttft_totals(t0 + Duration::from_secs(30)), (1, 1));
         // An error after generation started is a mid-stream failure, not a
         // rejection: the sample stays.
-        let permit = c.try_admit_at(&p, t0).unwrap().unwrap();
+        let permit = c.try_admit_at(&p, None, t0).unwrap().unwrap();
         permit.mark_dispatched_at(t0);
         permit.observe_generation_started_at(t0 + Duration::from_secs(1));
         permit.abandon();
@@ -1006,14 +1095,20 @@ mod tests {
         assert!(c.backend_saturated_at(0, t0 + Duration::from_secs(1)));
         assert!(!c.backend_saturated_at(1, t0 + Duration::from_secs(1)));
         assert_eq!(c.engine(0), Some((30, 2)));
-        assert!(c.try_admit_at(&p, t0 + Duration::from_secs(1)).is_ok());
+        assert!(c
+            .try_admit_at(&p, None, t0 + Duration::from_secs(1))
+            .is_ok());
         // Every host queueing: refuse before dispatch.
         engine.record_at(1, busy, t0 + Duration::from_secs(2));
-        let rejected = c.try_admit_at(&p, t0 + Duration::from_secs(3)).unwrap_err();
+        let rejected = c
+            .try_admit_at(&p, None, t0 + Duration::from_secs(3))
+            .unwrap_err();
         assert_eq!(rejected.reason, RejectReason::BackendQueue);
         // Stale samples are unknown, not saturation.
         assert!(!c.backend_saturated_at(0, t0 + Duration::from_secs(10)));
-        assert!(c.try_admit_at(&p, t0 + Duration::from_secs(10)).is_ok());
+        assert!(c
+            .try_admit_at(&p, None, t0 + Duration::from_secs(10))
+            .is_ok());
     }
 
     #[test]
@@ -1023,7 +1118,7 @@ mod tests {
         let c = controller(config(), 2);
         let p = pool(2);
         let t0 = Instant::now();
-        let permit = c.try_admit_at(&p, t0).unwrap().unwrap();
+        let permit = c.try_admit_at(&p, None, t0).unwrap().unwrap();
         permit.mark_dispatched_at(t0);
         permit.abandon();
         permit.release_at(t0 + Duration::from_millis(30));
@@ -1033,13 +1128,106 @@ mod tests {
     }
 
     #[test]
+    fn a_long_context_request_does_not_add_a_ttft_sample() {
+        let c = controller(config(), 2);
+        let p = pool(2);
+        let t0 = Instant::now();
+        // A base request that waited 40 s is one breaching sample...
+        let base = tier(ContextTier::Base, Some(ContextTier::Base));
+        let permit = c.try_admit_at(&p, base, t0).unwrap().unwrap();
+        permit.attach_backend(0);
+        permit.mark_dispatched_at(t0);
+        permit.observe_generation_started_at(t0 + Duration::from_secs(40));
+        drop(permit);
+        assert_eq!(c.ttft_totals(t0 + Duration::from_secs(40)), (1, 1));
+        // ...the same wait on a long-context request is not a sample at all:
+        // a 100k-token prefill takes that long by nature, on either tier —
+        // this one fell back onto the base fleet.
+        let long = tier(ContextTier::Long, None);
+        let permit = c.try_admit_at(&p, long, t0).unwrap().unwrap();
+        permit.attach_backend(1);
+        permit.mark_dispatched_at(t0);
+        permit.observe_generation_started_at(t0 + Duration::from_secs(40));
+        drop(permit);
+        // Nor is the censored one a client gave up on.
+        let permit = c.try_admit_at(&p, long, t0).unwrap().unwrap();
+        permit.attach_backend(1);
+        permit.mark_dispatched_at(t0);
+        permit.release_at(t0 + Duration::from_secs(60));
+        std::mem::forget(permit);
+        assert_eq!(c.ttft_totals(t0 + Duration::from_secs(60)), (1, 1));
+    }
+
+    #[test]
+    fn the_ttft_breaker_does_not_refuse_long_context_requests() {
+        let c = controller(config(), 1);
+        let p = pool(1);
+        let t0 = Instant::now();
+        // Trip the breaker on base traffic: 20 samples, two of them slow.
+        for i in 0..18 {
+            sample(
+                &c,
+                &p,
+                t0 + Duration::from_millis(i),
+                Duration::from_secs(1),
+            );
+        }
+        for _ in 0..2 {
+            sample(&c, &p, t0, Duration::from_secs(40));
+        }
+        let t1 = t0 + Duration::from_secs(41);
+        assert_eq!(
+            c.try_admit_at(&p, None, t1).unwrap_err().reason,
+            RejectReason::Ttft
+        );
+        // An oversized request bound for the long tier is not what the window
+        // measured, and that host may well have room: it is still admitted.
+        assert!(c
+            .try_admit_at(&p, tier(ContextTier::Long, Some(ContextTier::Long)), t1)
+            .is_ok());
+        // One that fell back onto the base fleet, though, is going exactly
+        // where the breaker is tripped.
+        assert_eq!(
+            c.try_admit_at(&p, tier(ContextTier::Long, None), t1)
+                .unwrap_err()
+                .reason,
+            RejectReason::Ttft
+        );
+    }
+
+    #[test]
+    fn the_queue_refusal_counts_only_the_requests_own_tier() {
+        let c = controller(config(), 2);
+        let p = BackendPool::with_long_context(
+            vec!["http://b0:8000".to_string()],
+            vec!["http://long:8000".to_string()],
+        );
+        let t0 = Instant::now();
+        // The base host rejected at engine admission, the long one has room.
+        let permit = c.try_admit_at(&p, None, t0).unwrap().unwrap();
+        permit.attach_backend(0);
+        permit.observe_backpressure_at(t0);
+        drop(permit);
+        let t1 = t0 + Duration::from_secs(1);
+        let base = tier(ContextTier::Base, Some(ContextTier::Base));
+        let rejected = c.try_admit_at(&p, base, t1).unwrap_err();
+        assert_eq!(rejected.reason, RejectReason::BackendQueue);
+        let long = tier(ContextTier::Long, Some(ContextTier::Long));
+        assert!(c.try_admit_at(&p, long, t1).is_ok());
+        assert!(c.try_admit_at(&p, None, t1).is_ok());
+    }
+
+    #[test]
     fn precheck_refuses_without_taking_a_slot() {
         let c = controller(config(), 1);
         let p = pool(1);
-        assert!(c.precheck(&p).is_ok());
-        let _a = c.try_admit(&p).unwrap().unwrap();
-        let _b = c.try_admit(&p).unwrap().unwrap();
-        assert_eq!(c.precheck(&p).unwrap_err().reason, RejectReason::Budget);
+        assert!(c.precheck(&p, None).is_ok());
+        let _a = c.try_admit(&p, None).unwrap().unwrap();
+        let _b = c.try_admit(&p, None).unwrap().unwrap();
+        assert_eq!(
+            c.precheck(&p, None).unwrap_err().reason,
+            RejectReason::Budget
+        );
         assert_eq!(c.inflight(), 2);
     }
 }

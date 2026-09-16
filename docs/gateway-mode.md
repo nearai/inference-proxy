@@ -280,15 +280,22 @@ queueing" refusal. The consequences are deliberate:
   for the next oversized request — keeping those prefills off the base fleet is
   the whole point, and a fast refusal lets the aggregator route elsewhere.
 - **A tier with no healthy backend falls back.** If the wanted tier is down
-  entirely, the request is placed in the other one rather than refused
-  (`backend_tier_requests_total{outcome="fallback"}`).
+  entirely the request is placed in the other one rather than refused
+  (`backend_tier_requests_total{outcome="fallback"}`), including when its last
+  host goes unreachable mid-request: the connection fail-over re-resolves the
+  restriction after taking that host out of the rotation, and crosses over.
 - **Conversation affinity crosses tiers.** A conversation pinned on a base host
   that grows past the threshold is placed fresh in the long tier and re-pinned
   there — the same re-prefill cloud-api pays at the boundary.
-- **The TTFT breaker ignores long-tier placements.** A 100k-token prefill takes
-  tens of seconds by nature; counting those waits would trip the lane's
-  breaker for everyone. Back-pressure marks and engine-queue avoidance still
-  apply to long-tier hosts within their tier.
+- **The TTFT breaker ignores long-context requests.** A 100k-token prefill
+  takes tens of seconds by nature — on either tier — so a request estimated
+  above the threshold contributes no time-to-first-generation sample, and that
+  is fixed at admission: a request that falls back onto the base fleet does not
+  start counting. Back-pressure marks and engine-queue avoidance still apply.
+- **Not for fusion or the agent loop.** `VLLM_BACKEND_LONG_CONTEXT_URLS`
+  together with `FUSION_ENABLED` or `WEB_CONTEXT_SEARCH_URL` is refused at
+  startup: those modes place their own backend requests, which no tier
+  restriction reaches.
 
 ## What is deliberately not offered here
 

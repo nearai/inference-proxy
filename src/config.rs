@@ -980,6 +980,13 @@ impl Config {
                 "VLLM_PROXY_ADMISSION_MAX_INFLIGHT cannot be combined with FUSION_ENABLED or WEB_CONTEXT_SEARCH_URL: those execution modes run outside the lane budget"
             );
         }
+        if !config.backend_long_context_urls.is_empty()
+            && (config.fusion_enabled || config.web_context_search_url.is_some())
+        {
+            anyhow::bail!(
+                "VLLM_BACKEND_LONG_CONTEXT_URLS cannot be combined with FUSION_ENABLED or WEB_CONTEXT_SEARCH_URL: those execution modes place their own backend requests, outside the tier"
+            );
+        }
         Ok(config)
     }
 
@@ -1343,6 +1350,18 @@ mod tests {
             env::set_var("VLLM_BACKEND_URLS", "https://m-b1.test");
             env::set_var("VLLM_DATA_PARALLEL_SIZE", "4");
             assert!(err().contains("VLLM_DATA_PARALLEL_SIZE"), "{}", err());
+            env::remove_var("VLLM_DATA_PARALLEL_SIZE");
+
+            // Fusion and the agent loop place their own backend requests,
+            // which no tier restriction reaches.
+            env::set_var("WEB_CONTEXT_SEARCH_URL", "https://brave.test");
+            assert!(err().contains("WEB_CONTEXT_SEARCH_URL"), "{}", err());
+            env::remove_var("WEB_CONTEXT_SEARCH_URL");
+            env::set_var("FUSION_ENABLED", "1");
+            env::set_var("FUSION_INTERNAL_BEARER_TOKEN", "fusion-secret");
+            assert!(err().contains("FUSION_ENABLED"), "{}", err());
+            env::remove_var("FUSION_ENABLED");
+            env::remove_var("FUSION_INTERNAL_BEARER_TOKEN");
             gateway_env_cleanup();
         });
     }

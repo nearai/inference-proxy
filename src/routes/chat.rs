@@ -249,7 +249,8 @@ pub async fn chat_completions(
     let host_share = state
         .admission
         .host_share(state.backend_pool.healthy_count());
-    let placement = {
+    let restrict = tier.and_then(|tier| tier.restrict);
+    let place = |tier| {
         let policy = backend_pool::Policy {
             max_conns: host_share,
             avoid: &|index| state.admission.backend_saturated(index),
@@ -262,10 +263,19 @@ pub async fn chat_completions(
             "/v1/chat/completions",
             &policy,
         )
-    }
-    .ok_or_else(|| AppError::from(state.admission.reject(RejectReason::HostShare)))?;
+    };
+    let placement = place(restrict)
+        .or_else(|| match restrict {
+            // The tier may have emptied since the decision (a fail-over just
+            // marked its last host unreachable): fall back, do not refuse.
+            Some(tier) if crate::context_tier::restriction(&state.backend_pool, tier).is_none() => {
+                place(None)
+            }
+            _ => None,
+        })
+        .ok_or_else(|| AppError::from(state.admission.reject(RejectReason::HostShare)))?;
     if let Some(permit) = permit.as_ref() {
-        permit.attach_backend(placement.index, placement.tier);
+        permit.attach_backend(placement.index);
     }
     let connect_failover = state
         .config
@@ -274,7 +284,7 @@ pub async fn chat_completions(
             pool: state.backend_pool.clone(),
             path: "/v1/chat/completions",
             index: placement.index,
-            tier,
+            tier: restrict,
             affinity: backend_affinity_key.map(|key| (state.backend_affinity.clone(), key)),
         });
     let url = placement.url;

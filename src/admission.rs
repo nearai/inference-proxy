@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use crate::backend_pool::BackendPool;
-use crate::context_tier::ContextTier;
+use crate::context_tier::{ContextTier, TierDecision};
 use crate::engine_load::EngineLoad;
 
 /// Window over which time-to-first-generation observations are counted, as
@@ -271,16 +271,16 @@ impl AdmissionController {
     /// The overload and budget checks without taking a slot: a cheap early
     /// refusal for routes that still have expensive work (image validation)
     /// ahead of `try_admit`. Nothing is reserved; the later `try_admit` can
-    /// still refuse. `tier` restricts the fleet-wide queue check to the
-    /// backends this request may use (`None` = the whole pool).
-    pub fn precheck(&self, pool: &BackendPool, tier: Option<ContextTier>) -> Result<(), Rejected> {
+    /// still refuse. The tier decision restricts the fleet-wide queue check
+    /// to the backends this request may use (`None` = the whole pool).
+    pub fn precheck(&self, pool: &BackendPool, tier: Option<TierDecision>) -> Result<(), Rejected> {
         self.precheck_at(pool, tier, Instant::now())
     }
 
     pub(crate) fn precheck_at(
         &self,
         pool: &BackendPool,
-        tier: Option<ContextTier>,
+        tier: Option<TierDecision>,
         now: Instant,
     ) -> Result<(), Rejected> {
         let Some(config) = &self.config else {
@@ -291,7 +291,7 @@ impl AdmissionController {
         if self.ttft_over_bound(config, now) {
             return Err(self.reject(RejectReason::Ttft));
         }
-        if self.every_backend_queued(config, pool, tier, now) {
+        if self.every_backend_queued(config, pool, tier.and_then(|tier| tier.restrict), now) {
             return Err(self.reject(RejectReason::BackendQueue));
         }
         self.tick_ramp(config, now);
@@ -309,7 +309,7 @@ impl AdmissionController {
     pub fn try_admit(
         self: &Arc<Self>,
         pool: &BackendPool,
-        tier: Option<ContextTier>,
+        tier: Option<TierDecision>,
     ) -> Result<Option<Permit>, Rejected> {
         self.try_admit_at(pool, tier, Instant::now())
     }
@@ -317,7 +317,7 @@ impl AdmissionController {
     pub(crate) fn try_admit_at(
         self: &Arc<Self>,
         pool: &BackendPool,
-        tier: Option<ContextTier>,
+        tier: Option<TierDecision>,
         now: Instant,
     ) -> Result<Option<Permit>, Rejected> {
         if self.config.is_none() {
@@ -343,7 +343,7 @@ impl AdmissionController {
         Ok(Some(Permit {
             controller: Arc::clone(self),
             backend: AtomicUsize::new(NO_BACKEND),
-            long_tier: AtomicBool::new(false),
+            long_request: tier.is_some_and(|tier| tier.estimated == ContextTier::Long),
             state: AtomicU8::new(PENDING),
             dispatched_at: OnceLock::new(),
         }))
@@ -550,21 +550,20 @@ impl AdmissionController {
 pub struct Permit {
     controller: Arc<AdmissionController>,
     backend: AtomicUsize,
-    /// The request was placed on a long-context backend.
-    long_tier: AtomicBool,
+    /// The request's estimated input is above the long-context threshold.
+    /// Decided once, at admission: a prefill of that size takes tens of
+    /// seconds on either tier, so the wait is not a lane observation wherever
+    /// the request ends up running.
+    long_request: bool,
     state: AtomicU8,
     dispatched_at: OnceLock<Instant>,
 }
 
 impl Permit {
-    /// Record which backend the request was placed on, and its tier (needed
-    /// to attribute engine back-pressure, and to keep long-context prefills
-    /// out of the lane's time-to-first-generation window). Called again after
-    /// a connection fail-over.
-    pub fn attach_backend(&self, index: usize, tier: ContextTier) {
+    /// Record which backend the request was placed on (needed to attribute
+    /// engine back-pressure). Called again after a connection fail-over.
+    pub fn attach_backend(&self, index: usize) {
         self.backend.store(index, Ordering::Relaxed);
-        self.long_tier
-            .store(tier == ContextTier::Long, Ordering::Relaxed);
     }
 
     pub fn backend(&self) -> Option<usize> {
@@ -642,12 +641,12 @@ impl Permit {
         self.record_ttft(now);
     }
 
-    /// One time-to-first-generation observation for the lane — unless the
-    /// request was placed on the long-context tier, where a >100k-token
-    /// prefill takes tens of seconds by nature: those waits say nothing about
-    /// the base fleet's health and would trip its breaker for everyone.
+    /// One time-to-first-generation observation for the lane — unless this is
+    /// a long-context request, whose >100k-token prefill takes tens of seconds
+    /// by nature: that wait says nothing about the lane's health and would
+    /// trip its breaker for everyone.
     fn record_ttft(&self, now: Instant) {
-        if self.long_tier.load(Ordering::Relaxed) {
+        if self.long_request {
             return;
         }
         if let Some(dispatched_at) = self.dispatched_at.get() {
@@ -690,7 +689,7 @@ impl std::fmt::Debug for Permit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Permit")
             .field("backend", &self.backend())
-            .field("long_tier", &self.long_tier.load(Ordering::Relaxed))
+            .field("long_request", &self.long_request)
             .field("state", &self.state.load(Ordering::Relaxed))
             .finish()
     }
@@ -728,6 +727,15 @@ mod tests {
             backends,
             Arc::new(EngineLoad::disabled()),
         ))
+    }
+
+    /// A tier decision for a request estimated onto `estimated` that may use
+    /// the backends of `restrict`.
+    fn tier(estimated: ContextTier, restrict: Option<ContextTier>) -> Option<TierDecision> {
+        Some(TierDecision {
+            estimated,
+            restrict,
+        })
     }
 
     /// Admit at `t0` and record a first-generation sample `ttft` later.
@@ -798,7 +806,7 @@ mod tests {
             .try_admit_at(&p, None, t0 + Duration::from_secs(70))
             .unwrap()
             .unwrap();
-        permit.attach_backend(0, ContextTier::Base);
+        permit.attach_backend(0);
         permit.observe_backpressure_at(t0 + Duration::from_secs(70));
         drop(permit);
         drop(
@@ -856,7 +864,7 @@ mod tests {
         let t0 = Instant::now();
         // Only backend 0 rejected: it is steered around, the other may have room.
         let permit = c.try_admit_at(&p, None, t0).unwrap().unwrap();
-        permit.attach_backend(0, ContextTier::Base);
+        permit.attach_backend(0);
         permit.observe_backpressure_at(t0);
         drop(permit);
         assert!(c.backend_saturated_at(0, t0 + Duration::from_secs(1)));
@@ -866,7 +874,7 @@ mod tests {
             .is_ok());
         // Both rejected: refuse.
         let permit = c.try_admit_at(&p, None, t0).unwrap().unwrap();
-        permit.attach_backend(1, ContextTier::Base);
+        permit.attach_backend(1);
         permit.observe_backpressure_at(t0 + Duration::from_secs(2));
         drop(permit);
         let rejected = c
@@ -1109,27 +1117,30 @@ mod tests {
     }
 
     #[test]
-    fn a_long_context_placement_does_not_add_a_ttft_sample() {
+    fn a_long_context_request_does_not_add_a_ttft_sample() {
         let c = controller(config(), 2);
         let p = pool(2);
         let t0 = Instant::now();
-        // A base placement that waited 40 s is one breaching sample...
-        let permit = c.try_admit_at(&p, None, t0).unwrap().unwrap();
-        permit.attach_backend(0, ContextTier::Base);
+        // A base request that waited 40 s is one breaching sample...
+        let base = tier(ContextTier::Base, Some(ContextTier::Base));
+        let permit = c.try_admit_at(&p, base, t0).unwrap().unwrap();
+        permit.attach_backend(0);
         permit.mark_dispatched_at(t0);
         permit.observe_generation_started_at(t0 + Duration::from_secs(40));
         drop(permit);
         assert_eq!(c.ttft_totals(t0 + Duration::from_secs(40)), (1, 1));
-        // ...the same wait on the long-context tier is not a sample at all:
-        // a 100k-token prefill takes that long by nature.
-        let permit = c.try_admit_at(&p, None, t0).unwrap().unwrap();
-        permit.attach_backend(1, ContextTier::Long);
+        // ...the same wait on a long-context request is not a sample at all:
+        // a 100k-token prefill takes that long by nature, on either tier —
+        // this one fell back onto the base fleet.
+        let long = tier(ContextTier::Long, None);
+        let permit = c.try_admit_at(&p, long, t0).unwrap().unwrap();
+        permit.attach_backend(1);
         permit.mark_dispatched_at(t0);
         permit.observe_generation_started_at(t0 + Duration::from_secs(40));
         drop(permit);
         // Nor is the censored one a client gave up on.
-        let permit = c.try_admit_at(&p, None, t0).unwrap().unwrap();
-        permit.attach_backend(1, ContextTier::Long);
+        let permit = c.try_admit_at(&p, long, t0).unwrap().unwrap();
+        permit.attach_backend(1);
         permit.mark_dispatched_at(t0);
         permit.release_at(t0 + Duration::from_secs(60));
         std::mem::forget(permit);
@@ -1146,13 +1157,15 @@ mod tests {
         let t0 = Instant::now();
         // The base host rejected at engine admission, the long one has room.
         let permit = c.try_admit_at(&p, None, t0).unwrap().unwrap();
-        permit.attach_backend(0, ContextTier::Base);
+        permit.attach_backend(0);
         permit.observe_backpressure_at(t0);
         drop(permit);
         let t1 = t0 + Duration::from_secs(1);
-        let rejected = c.try_admit_at(&p, Some(ContextTier::Base), t1).unwrap_err();
+        let base = tier(ContextTier::Base, Some(ContextTier::Base));
+        let rejected = c.try_admit_at(&p, base, t1).unwrap_err();
         assert_eq!(rejected.reason, RejectReason::BackendQueue);
-        assert!(c.try_admit_at(&p, Some(ContextTier::Long), t1).is_ok());
+        let long = tier(ContextTier::Long, Some(ContextTier::Long));
+        assert!(c.try_admit_at(&p, long, t1).is_ok());
         assert!(c.try_admit_at(&p, None, t1).is_ok());
     }
 

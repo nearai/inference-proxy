@@ -1841,25 +1841,41 @@ async fn oversized_requests_go_to_the_long_tier_and_the_rest_to_the_base_fleet()
 #[tokio::test]
 async fn a_conversation_that_grows_past_the_threshold_moves_and_stays_there() {
     let base = MockServer::start().await;
-    let other = MockServer::start().await;
     let long = MockServer::start().await;
+    let long_peer = MockServer::start().await;
     mount_chat(&base, 1).await;
-    mount_chat(&other, 0).await;
+    // One slow unrelated request parks on the long host the conversation
+    // moves onto, so plain least-connections would send the turn after it to
+    // the idle peer instead.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"user": "holder"}),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(chat_completion_json())
+                .set_delay(Duration::from_millis(700)),
+        )
+        .expect(1)
+        .mount(&long)
+        .await;
     mount_chat(&long, 2).await;
+    mount_chat(&long_peer, 0).await;
     let app = build_gateway(
         &base.uri(),
         GatewayOptions {
-            backend_urls: vec![base.uri(), other.uri()],
-            backend_long_context_urls: vec![long.uri()],
+            backend_urls: vec![base.uri()],
+            backend_long_context_urls: vec![long.uri(), long_peer.uri()],
             long_context_above_tokens: ABOVE_TOKENS,
             backend_conversation_affinity: true,
             ..Default::default()
         },
     );
     // The first turn is short: it goes to the base fleet and pins there. The
-    // next two are above the threshold, so the pin is outside their tier —
-    // they are placed on the long host and re-pinned onto it.
-    for turn in 0..3 {
+    // second is above the threshold, so the pin is outside its tier — it is
+    // placed on the first long host and re-pinned onto it.
+    for turn in 0..2 {
         let response = app
             .clone()
             .oneshot(chat_request(conversation(turn)))
@@ -1867,17 +1883,34 @@ async fn a_conversation_that_grows_past_the_threshold_moves_and_stays_there() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
+    let holder = tokio::spawn({
+        let app = app.clone();
+        async move {
+            let mut body = sized_body(4_000);
+            body["user"] = "holder".into();
+            app.oneshot(chat_request(body)).await.unwrap()
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The third turn follows the pin onto the busy host rather than the idle
+    // peer: its prefix cache is there and a move would re-prefill it.
+    let response = app
+        .clone()
+        .oneshot(chat_request(conversation(2)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(holder.await.unwrap().status(), StatusCode::OK);
     base.verify().await;
-    other.verify().await;
     long.verify().await;
+    long_peer.verify().await;
 }
 
 #[tokio::test]
 async fn a_tier_without_a_healthy_backend_falls_back_to_the_other_one() {
     let live = MockServer::start().await;
     let dead = unreachable_backend_url();
-    // The long tier is down. The first oversized request cannot fail over out
-    // of its tier, but it takes the dead host out of the rotation...
+    // The long tier is down...
     let app = build_gateway(
         &live.uri(),
         GatewayOptions {
@@ -1889,17 +1922,18 @@ async fn a_tier_without_a_healthy_backend_falls_back_to_the_other_one() {
             ..Default::default()
         },
     );
-    mount_chat(&live, 1).await;
-    assert_overloaded(
-        app.clone()
+    mount_chat(&live, 2).await;
+    // ...the first oversized request fails over out of its tier as soon as
+    // that host leaves the rotation, and the next one is placed on the base
+    // fleet straight away. Neither is refused.
+    for _ in 0..2 {
+        let response = app
+            .clone()
             .oneshot(chat_request(sized_body(4_000)))
             .await
-            .unwrap(),
-    )
-    .await;
-    // ...so the next one is served by the base fleet instead of refused.
-    let response = app.oneshot(chat_request(sized_body(4_000))).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
     live.verify().await;
     live.reset().await;
 
@@ -1917,16 +1951,15 @@ async fn a_tier_without_a_healthy_backend_falls_back_to_the_other_one() {
             ..Default::default()
         },
     );
-    mount_chat(&live, 1).await;
-    assert_overloaded(
-        app.clone()
+    mount_chat(&live, 2).await;
+    for _ in 0..2 {
+        let response = app
+            .clone()
             .oneshot(chat_request(sized_body(400)))
             .await
-            .unwrap(),
-    )
-    .await;
-    let response = app.oneshot(chat_request(sized_body(400))).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
     live.verify().await;
 }
 
@@ -1962,7 +1995,10 @@ async fn a_full_long_tier_refuses_while_the_base_fleet_keeps_serving() {
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
     // The long host holds its whole share: the next oversized request is
-    // refused instead of spilling its prefill onto the base fleet...
+    // refused instead of spilling its prefill onto the base fleet. (The 429
+    // body carries only the generic `overloaded` type; which refusal it was
+    // lives in the log line and in `admission_rejections_total{reason}`,
+    // neither observable from here.)
     let second = app
         .clone()
         .oneshot(chat_request(sized_body(4_000)))

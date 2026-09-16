@@ -1060,6 +1060,10 @@ async fn send_upstream(
                 )
             };
             mark_backend_unreachable(&pool, failed);
+            // The failed host may have been its tier's last one: re-resolve
+            // the restriction now that it is out of the rotation, so the
+            // request falls back to the other tier instead of being refused.
+            let tier = tier.and_then(|tier| crate::context_tier::restriction(&pool, tier));
             // The share is recomputed for the pool as it is now (one host
             // fewer), and recently saturated hosts are steered around.
             let max_conns = opts
@@ -1112,7 +1116,7 @@ async fn send_upstream(
                 failover.index = next.index;
             }
             if let Some(permit) = opts.admission.as_ref() {
-                permit.attach_backend(next.index, next.backend.tier);
+                permit.attach_backend(next.index);
             }
             opts.backend_guard = Some(next.guard);
             match build_upstream_request(client, url, body, opts).send().await {

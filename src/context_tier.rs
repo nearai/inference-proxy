@@ -134,38 +134,70 @@ pub fn completion_estimate(request: &Value) -> Estimate {
     }
 }
 
-/// The tier restriction for one request, applied at every candidate selection
-/// (placement, connection fail-over, the fleet-wide saturation checks).
-///
-/// `None` restricts nothing: the feature is off, or the wanted tier has no
-/// healthy backend and the request falls back to the other one instead of
-/// being refused. A tier whose backends are merely full or steered around is
-/// *not* a fallback — that is a refusal, exactly as within one pool today.
+/// What the tier decision produced for one request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TierDecision {
+    /// The tier the request's estimated size asks for. Fixed for the whole
+    /// request: admission keeps a long request's wait out of the lane's
+    /// time-to-first-generation window wherever it ends up running, because
+    /// the prefill takes tens of seconds on either tier.
+    pub estimated: ContextTier,
+    /// The tier candidate selection is restricted to — placement, connection
+    /// fail-over and the fleet-wide saturation checks — or `None` once that
+    /// tier has no healthy backend.
+    pub restrict: Option<ContextTier>,
+}
+
+/// Decide a request's tier. `None` when the feature is off; nothing is
+/// estimated then.
 pub fn decide(
     pool: &BackendPool,
     above_tokens: u64,
     estimate: impl FnOnce() -> Estimate,
-) -> Option<ContextTier> {
+) -> Option<TierDecision> {
     if above_tokens == 0 {
         return None;
     }
     let estimate = estimate();
-    let tier = estimate.tier(above_tokens);
-    let available = pool.healthy_count_in(Some(tier)) > 0;
+    let estimated = estimate.tier(above_tokens);
+    let restrict = restriction(pool, estimated);
     metrics::histogram!("request_estimated_prompt_tokens").record(estimate.tokens() as f64);
+    if restrict.is_some() {
+        metrics::counter!(
+            "backend_tier_requests_total",
+            "tier" => estimated.as_str(),
+            "outcome" => "routed"
+        )
+        .increment(1);
+    }
+    debug!(
+        estimated_tokens = estimate.tokens(),
+        tier = estimated.as_str(),
+        fallback = restrict.is_none(),
+        "Context tier decided"
+    );
+    Some(TierDecision {
+        estimated,
+        restrict,
+    })
+}
+
+/// The restriction to apply right now: `tier` while it still has a healthy
+/// backend, `None` once it has none — an empty tier falls back to the other
+/// one rather than refusing, since both run the same engine. Re-resolved
+/// whenever the pool may have changed under the request (a connection
+/// fail-over takes a host out of the rotation); the fallback is counted here.
+pub fn restriction(pool: &BackendPool, tier: ContextTier) -> Option<ContextTier> {
+    if pool.healthy_count_in(Some(tier)) > 0 {
+        return Some(tier);
+    }
     metrics::counter!(
         "backend_tier_requests_total",
         "tier" => tier.as_str(),
-        "outcome" => if available { "routed" } else { "fallback" }
+        "outcome" => "fallback"
     )
     .increment(1);
-    debug!(
-        estimated_tokens = estimate.tokens(),
-        tier = tier.as_str(),
-        fallback = !available,
-        "Context tier decided"
-    );
-    available.then_some(tier)
+    None
 }
 
 #[cfg(test)]
@@ -251,23 +283,35 @@ mod tests {
             vec!["http://long:8000".to_string()],
         );
         let huge = || Estimate::from_text_bytes(4_000_000);
+        let health = |index: usize, healthy: bool| {
+            pool.backends()[index]
+                .healthy
+                .store(healthy, std::sync::atomic::Ordering::Relaxed)
+        };
+        let decided = |estimated, restrict| {
+            Some(TierDecision {
+                estimated,
+                restrict,
+            })
+        };
         assert_eq!(decide(&pool, 0, || panic!("not estimated when off")), None);
-        assert_eq!(decide(&pool, 100_000, huge), Some(ContextTier::Long));
-        // The long tier is down: place it on the base fleet rather than refuse.
-        pool.backends()[1]
-            .healthy
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(decide(&pool, 100_000, huge), None);
+        assert_eq!(
+            decide(&pool, 100_000, huge),
+            decided(ContextTier::Long, Some(ContextTier::Long))
+        );
+        // The long tier is down: place it on the base fleet rather than
+        // refuse, but the request stays a long one for the breaker.
+        health(1, false);
+        assert_eq!(
+            decide(&pool, 100_000, huge),
+            decided(ContextTier::Long, None)
+        );
         // And the other way around.
-        pool.backends()[1]
-            .healthy
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        pool.backends()[0]
-            .healthy
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        health(1, true);
+        health(0, false);
         assert_eq!(
             decide(&pool, 100_000, || Estimate::from_text_bytes(8)),
-            None
+            decided(ContextTier::Base, None)
         );
     }
 }

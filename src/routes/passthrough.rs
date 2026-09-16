@@ -227,6 +227,8 @@ pub async fn images_edits(
         response_shape: ResponseShape::ChatCompletion,
         tracing_ids: Some(tracing_ids),
         upstream_data_parallel_rank: None,
+        admission: None,
+        connect_failover: None,
     };
 
     // The backend bearer is scoped to pool members; an override URL is a
@@ -318,6 +320,8 @@ pub async fn audio_transcriptions(
         response_shape: ResponseShape::ChatCompletion,
         tracing_ids: Some(tracing_ids),
         upstream_data_parallel_rank: None,
+        admission: None,
+        connect_failover: None,
     };
 
     // The backend bearer is scoped to pool members; an override URL is a
@@ -391,6 +395,8 @@ async fn json_passthrough_encrypted(
                 response_shape: ResponseShape::ChatCompletion,
                 tracing_ids: Some(tracing_ids.clone()),
                 upstream_data_parallel_rank: None,
+                admission: None,
+                connect_failover: None,
             };
             // Override URL: not a pool member, so no backend bearer.
             proxy::proxy_json_request(&state.http_client, u, forward_body, opts).await
@@ -415,6 +421,8 @@ async fn json_passthrough_encrypted(
                 response_shape: ResponseShape::ChatCompletion,
                 tracing_ids: Some(tracing_ids),
                 upstream_data_parallel_rank: None,
+                admission: None,
+                connect_failover: None,
             };
             proxy::proxy_json_request(&state.backend_client, &url, forward_body, opts).await
         }

@@ -6,8 +6,9 @@ use tokio::net::TcpListener;
 use tracing::info;
 use vllm_proxy_rs::ohttp_gateway::OhttpGateway;
 use vllm_proxy_rs::{
-    attestation, backend_affinity, backend_pool, cache, config, fusion, metrics_middleware,
-    rate_limit, request_id_middleware, routes, signing, startup_checks, vllm_dp_affinity, AppState,
+    admission, attestation, backend_affinity, backend_pool, cache, config, engine_load, fusion,
+    metrics_middleware, rate_limit, request_id_middleware, routes, signing, startup_checks,
+    vllm_dp_affinity, AppState,
 };
 
 /// DNS resolver that returns only IPv4 addresses.
@@ -190,6 +191,49 @@ async fn main() -> anyhow::Result<()> {
     // Initialize backend pool
     let backend_pool = Arc::new(backend_pool::BackendPool::new(config.backend_urls.clone()));
 
+    // Live engine load per backend (gateway mode): polled when probe URLs are
+    // configured; a sample older than three intervals counts as unknown.
+    let probe_interval = std::time::Duration::from_secs(config.backend_probe_interval_secs);
+    let engine_load = Arc::new(engine_load::EngineLoad::new(
+        backend_pool.len(),
+        probe_interval * 3,
+    ));
+    if !config.backend_probe_urls.is_empty() {
+        info!(
+            backends = config.backend_probe_urls.len(),
+            interval_secs = config.backend_probe_interval_secs,
+            "Polling engine load from the backends' metrics"
+        );
+        engine_load::spawn_engine_load_poller(
+            engine_load.clone(),
+            http_client.clone(),
+            config.backend_probe_urls.clone(),
+            probe_interval,
+        );
+    }
+
+    // Lane admission (gateway mode): inert unless configured.
+    let admission = Arc::new(admission::AdmissionController::new(
+        config.admission(),
+        backend_pool.len(),
+        engine_load,
+    ));
+    if let Some(settings) = admission.config() {
+        info!(
+            max_inflight = settings.max_inflight,
+            start_inflight = settings.start_inflight,
+            ramp_step = settings.ramp_step,
+            ramp_interval_secs = settings.ramp_interval.as_secs(),
+            ttft_p95_max_ms = settings.ttft_p95_max.map_or(0, |d| d.as_millis()),
+            backpressure_secs = settings.backpressure_ttl.as_secs(),
+            retry_after_secs = settings.retry_after.as_secs(),
+            "Lane admission enabled"
+        );
+    }
+    if config.backend_connect_failover {
+        info!("Connection fail-over to another backend enabled for chat/completions");
+    }
+
     // Build app state
     let model_name = config.model_name.clone();
     let state = AppState {
@@ -207,6 +251,7 @@ async fn main() -> anyhow::Result<()> {
         fusion_caches: Arc::new(fusion::FusionCaches::default()),
         vllm_dp_affinity,
         backend_affinity,
+        admission,
     };
 
     // Spawn background attestation cache refresh task.

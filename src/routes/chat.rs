@@ -6,10 +6,14 @@ use axum::Extension;
 
 use sha2::Digest;
 
+use crate::admission::RejectReason;
 use crate::auth::RequireAuth;
+use crate::backend_pool;
 use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
-use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageType};
+use crate::proxy::{
+    self, make_usage_reporter, ConnectFailover, ProxyOpts, ResponseShape, UsageType,
+};
 use crate::{agent_loop, fusion};
 use crate::{AppState, TracingIds};
 
@@ -65,6 +69,17 @@ pub async fn chat_completions(
         &request_json,
         &state.config.rejected_content_part_types,
     )?;
+    // Lane admission (gateway mode), first half: the overload and budget
+    // checks, so a request the lane cannot take is refused before any image
+    // is fetched. The slot and the backend placement are taken on the normal
+    // proxy path below, after the special branches, right before dispatch.
+    state.admission.precheck(&state.backend_pool)?;
+    // Same conversation digest, applied across independent backends: later
+    // turns follow the backend that already holds this conversation's prefix.
+    let backend_affinity_key = state
+        .backend_affinity
+        .key_for_chat_request(&request_json, &state.config.model_name);
+
     crate::image_validation::reject_invalid_images(&request_json, &state.config.image_validation())
         .await?;
 
@@ -180,12 +195,6 @@ pub async fn chat_completions(
     let upstream_data_parallel_rank = state
         .vllm_dp_affinity
         .rank_for_chat_request(&request_json, &state.config.model_name);
-    // Same conversation digest, applied across independent backends: later
-    // turns follow the backend that already holds this conversation's prefix.
-    let backend_affinity_key = state
-        .backend_affinity
-        .key_for_chat_request(&request_json, &state.config.model_name);
-
     let modified_body =
         serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?;
 
@@ -208,12 +217,41 @@ pub async fn chat_completions(
         (None, None)
     };
 
-    let (url, guard) = state.backend_affinity.select_url(
-        &state.backend_pool,
-        backend_affinity_key,
-        "/v1/chat/completions",
-    );
-
+    // Lane admission, second half: one budget slot, then a placement bounded
+    // by the per-host share that steers around backends which just rejected
+    // at engine admission. Refuses with 429 before anything is sent upstream;
+    // disabled deployments get `None`s and plain least-connections.
+    let permit = state.admission.try_admit(&state.backend_pool)?;
+    let host_share = state
+        .admission
+        .host_share(state.backend_pool.healthy_count());
+    let placement = {
+        let policy = backend_pool::Policy {
+            max_conns: host_share,
+            avoid: &|index| state.admission.backend_saturated(index),
+            engine: &|index| state.admission.engine(index),
+        };
+        state.backend_affinity.place(
+            &state.backend_pool,
+            backend_affinity_key,
+            "/v1/chat/completions",
+            &policy,
+        )
+    }
+    .ok_or_else(|| AppError::from(state.admission.reject(RejectReason::HostShare)))?;
+    if let Some(permit) = permit.as_ref() {
+        permit.attach_backend(placement.index);
+    }
+    let connect_failover = state
+        .config
+        .backend_connect_failover
+        .then(|| ConnectFailover {
+            pool: state.backend_pool.clone(),
+            path: "/v1/chat/completions",
+            index: placement.index,
+            affinity: backend_affinity_key.map(|key| (state.backend_affinity.clone(), key)),
+        });
+    let url = placement.url;
     let opts = ProxyOpts {
         signing: state.signing.clone(),
         cache: state.cache.clone(),
@@ -224,7 +262,7 @@ pub async fn chat_completions(
         request_hash: Some(request_hash),
         response_transform,
         chunk_transform,
-        backend_guard: Some(guard),
+        backend_guard: Some(placement.guard),
         stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
         sse_keepalive_secs: state.config.sse_keepalive_secs,
         map_queue_full_to_429: state.config.map_queue_full_to_429,
@@ -232,6 +270,8 @@ pub async fn chat_completions(
         response_shape: ResponseShape::ChatCompletion,
         tracing_ids: Some(tracing_ids),
         upstream_data_parallel_rank,
+        admission: permit,
+        connect_failover,
     };
 
     if is_stream {

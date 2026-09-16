@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+pub mod admission;
 pub mod agent_loop;
 pub mod attestation;
 pub mod attestation_sdk;
@@ -10,6 +11,7 @@ pub mod cache;
 pub mod config;
 pub mod content_policy;
 pub mod encryption;
+pub mod engine_load;
 pub mod error;
 pub mod fusion;
 pub mod gpu_evidence_delegate;
@@ -57,4 +59,8 @@ pub struct AppState {
     /// Conversation → backend pinning across `backend_pool` (see
     /// `VLLM_BACKEND_CONVERSATION_AFFINITY`). Inactive with one backend.
     pub backend_affinity: Arc<backend_affinity::BackendConversationAffinity>,
+    /// Lane admission: in-flight budget, per-host share and overload refusal
+    /// for chat/completions (gateway mode, `VLLM_PROXY_ADMISSION_*`). Inert
+    /// unless configured.
+    pub admission: Arc<admission::AdmissionController>,
 }

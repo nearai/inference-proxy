@@ -133,6 +133,8 @@ pub async fn classify(
             response_shape: ResponseShape::ChatCompletion,
             tracing_ids: Some(tracing_ids),
             upstream_data_parallel_rank: None,
+            admission: None,
+            connect_failover: None,
         };
         proxy::sign_and_cache_json_response(
             &response_bytes,

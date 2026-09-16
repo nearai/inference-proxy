@@ -112,6 +112,16 @@ fn build_agent_loop_app_with_cloud_and_idle(
         rejected_content_part_types: Vec::new(),
         allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,
+        admission_max_inflight: 0,
+        admission_start_inflight: 0,
+        admission_ramp_step: 8,
+        admission_ramp_interval_secs: 1800,
+        admission_ttft_p95_max_ms: 30_000,
+        admission_backpressure_secs: 10,
+        admission_retry_after_secs: 2,
+        backend_connect_failover: false,
+        backend_probe_urls: Vec::new(),
+        backend_probe_interval_secs: 2,
         dstack_socket_path: "/var/run/dstack.sock".to_string(),
         gpu_evidence_delegate_url: None,
         gpu_evidence_delegate_timeout_secs: 30,
@@ -173,6 +183,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
         backend_affinity: Arc::new(
             vllm_proxy_rs::backend_affinity::BackendConversationAffinity::new(false, 1, 8, 1_200),
         ),
+        admission: Arc::new(vllm_proxy_rs::admission::AdmissionController::disabled()),
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(1000, 2000);

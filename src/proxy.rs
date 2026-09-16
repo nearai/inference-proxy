@@ -938,6 +938,211 @@ pub struct ProxyOpts {
     /// Optional vLLM data-parallel engine rank. Chat routes derive this from a
     /// stable conversation prefix when `VLLM_DATA_PARALLEL_SIZE` is configured.
     pub upstream_data_parallel_rank: Option<usize>,
+    /// Lane admission permit (gateway mode, `admission.rs`). Holds one budget
+    /// slot until the response is complete; the streaming path moves it into
+    /// the pump task next to `backend_guard`. `None` when admission is off.
+    pub admission: Option<crate::admission::Permit>,
+    /// Retry once on another healthy backend when the connection to the
+    /// chosen one fails before anything was sent (`VLLM_BACKEND_CONNECT_FAILOVER`).
+    pub connect_failover: Option<ConnectFailover>,
+}
+
+/// Where a chat/completions request may be re-sent when the connection to
+/// its backend fails.
+pub struct ConnectFailover {
+    pub pool: Arc<crate::backend_pool::BackendPool>,
+    /// Route path appended to the replacement backend's base URL.
+    pub path: &'static str,
+    /// Index of the backend the request is currently placed on.
+    pub index: usize,
+    /// Conversation to re-pin onto the replacement backend once it answers.
+    pub affinity: Option<(
+        Arc<crate::backend_affinity::BackendConversationAffinity>,
+        crate::backend_affinity::ConversationKey,
+    )>,
+}
+
+fn build_upstream_request(
+    client: &reqwest::Client,
+    url: &str,
+    body: Bytes,
+    opts: &ProxyOpts,
+) -> reqwest::RequestBuilder {
+    let req = apply_tracing_headers(
+        client
+            .post(url)
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream"),
+        opts.tracing_ids.as_ref(),
+    );
+    apply_data_parallel_rank_header(req, opts.upstream_data_parallel_rank).body(body)
+}
+
+fn upstream_unreachable() -> AppError {
+    AppError::UpstreamParsed {
+        status: StatusCode::BAD_GATEWAY,
+        message: "No inference backend is reachable".to_string(),
+        error_type: "upstream_unreachable".to_string(),
+    }
+}
+
+/// A request that never got a response: a connection that could not be
+/// established is 502, a timeout 504; anything else stays a generic 500.
+fn transport_error(error: reqwest::Error) -> AppError {
+    if error.is_connect() {
+        upstream_unreachable()
+    } else if error.is_timeout() {
+        AppError::UpstreamParsed {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            message: "Upstream request timed out".to_string(),
+            error_type: "upstream_request_timeout".to_string(),
+        }
+    } else {
+        AppError::Internal(error.into())
+    }
+}
+
+fn mark_backend_unreachable(pool: &crate::backend_pool::BackendPool, index: usize) {
+    // Nothing listens there right now: take it out of rotation until the
+    // health checker sees it answer again.
+    if let Some(backend) = pool.backends().get(index) {
+        if backend
+            .healthy
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            warn!(
+                backend = %sanitized_upstream_url_for_logs(&backend.base_url),
+                "Backend marked unhealthy after a connection failure"
+            );
+        }
+    }
+}
+
+/// Send the request to `url`. When the connection fails before anything was
+/// sent and `opts.connect_failover` is set, retry once on another healthy
+/// backend: `url` and `opts.backend_guard` then point at the replacement.
+/// Nothing else is retried here — an HTTP error, queue-full included, means
+/// the engine saw the request and the caller decides.
+async fn send_upstream(
+    client: &reqwest::Client,
+    url: &mut String,
+    body: Bytes,
+    opts: &mut ProxyOpts,
+    endpoint: &'static str,
+) -> Result<reqwest::Response, AppError> {
+    let upstream_start = std::time::Instant::now();
+    let first = build_upstream_request(client, url, body.clone(), opts)
+        .send()
+        .await;
+    let response = match first {
+        Ok(response) => response,
+        Err(error) if error.is_connect() && opts.connect_failover.is_some() => {
+            let (pool, path, failed, affinity) = {
+                let failover = opts.connect_failover.as_ref().expect("checked above");
+                (
+                    failover.pool.clone(),
+                    failover.path,
+                    failover.index,
+                    failover.affinity.clone(),
+                )
+            };
+            mark_backend_unreachable(&pool, failed);
+            // The share is recomputed for the pool as it is now (one host
+            // fewer), and recently saturated hosts are steered around.
+            let max_conns = opts
+                .admission
+                .as_ref()
+                .and_then(|permit| permit.host_share(pool.healthy_count()));
+            let next = {
+                let avoid = |index: usize| {
+                    opts.admission
+                        .as_ref()
+                        .is_some_and(|permit| permit.backend_saturated(index))
+                };
+                let engine = |index: usize| opts.admission.as_ref().and_then(|p| p.engine(index));
+                let policy = crate::backend_pool::Policy {
+                    max_conns,
+                    avoid: &avoid,
+                    engine: &engine,
+                };
+                pool.select_excluding(failed, &policy)
+            };
+            let Some(next) = next else {
+                if pool.has_healthy_other_than(failed) {
+                    if let Some(permit) = opts.admission.as_ref() {
+                        // Somewhere to go, but every candidate is at its share
+                        // or steered around: that is admission, not an outage.
+                        return Err(AppError::from(permit.reject_host_share()));
+                    }
+                }
+                metrics::counter!("backend_failover_total", "outcome" => "exhausted").increment(1);
+                warn!(
+                    backend = %sanitized_upstream_url_for_logs(url),
+                    error = %error,
+                    "Backend unreachable and no other healthy backend to fail over to"
+                );
+                return Err(upstream_unreachable());
+            };
+            metrics::counter!("backend_failover_total", "outcome" => "retried").increment(1);
+            warn!(
+                failed_backend = %sanitized_upstream_url_for_logs(url),
+                next_backend = %sanitized_upstream_url_for_logs(&next.backend.base_url),
+                error = %error,
+                "Backend unreachable, failing over"
+            );
+            *url = next.backend.url(path);
+            if let Some(failover) = opts.connect_failover.as_mut() {
+                failover.index = next.index;
+            }
+            if let Some(permit) = opts.admission.as_ref() {
+                permit.attach_backend(next.index);
+            }
+            opts.backend_guard = Some(next.guard);
+            match build_upstream_request(client, url, body, opts).send().await {
+                Ok(response) => {
+                    if let Some((affinity, key)) = affinity {
+                        // Later turns follow the request, not the dead host.
+                        affinity.repin(key, next.index);
+                    }
+                    response
+                }
+                Err(error) if error.is_connect() => {
+                    mark_backend_unreachable(&pool, next.index);
+                    metrics::counter!("backend_failover_total", "outcome" => "exhausted")
+                        .increment(1);
+                    warn!(
+                        backend = %sanitized_upstream_url_for_logs(url),
+                        error = %error,
+                        "Fail-over backend unreachable too"
+                    );
+                    return Err(upstream_unreachable());
+                }
+                Err(error) => return Err(transport_error(error)),
+            }
+        }
+        Err(error) => return Err(transport_error(error)),
+    };
+    metrics::histogram!("upstream_request_duration_seconds", "endpoint" => endpoint)
+        .record(upstream_start.elapsed().as_secs_f64());
+    if response.status().is_success() {
+        if let Some(permit) = opts.admission.as_ref() {
+            permit.mark_dispatched();
+        }
+    }
+    Ok(response)
+}
+
+/// The engine answered a lane request with an error instead of generating:
+/// no TTFT observation for it, and an admission rejection (queue full,
+/// priority abort) tells the admission controller which backend is saturated.
+fn note_engine_error(permit: Option<&crate::admission::Permit>, message: Option<&str>) {
+    let Some(permit) = permit else {
+        return;
+    };
+    permit.abandon();
+    if message.is_some_and(message_is_queue_full) {
+        permit.observe_backpressure();
+    }
 }
 
 /// Apply upstream tracing headers to a `reqwest::RequestBuilder`. No-op when
@@ -1138,26 +1343,24 @@ pub async fn proxy_json_request(
     let streaming_body = inject_streaming(&request_body)?;
 
     let upstream_start = std::time::Instant::now();
-    let req = apply_tracing_headers(
-        client
-            .post(url)
-            .header("content-type", "application/json")
-            .header("accept", "text/event-stream"),
-        opts.tracing_ids.as_ref(),
-    );
-    let req = apply_data_parallel_rank_header(req, opts.upstream_data_parallel_rank);
-    let response = req
-        .body(streaming_body)
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(e.into()))?;
-    metrics::histogram!("upstream_request_duration_seconds", "endpoint" => "json_via_stream")
-        .record(upstream_start.elapsed().as_secs_f64());
+    let mut url = url.to_string();
+    let response = send_upstream(
+        client,
+        &mut url,
+        Bytes::from(streaming_body),
+        &mut opts,
+        "json_via_stream",
+    )
+    .await?;
 
     let status = response.status();
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
-        let info = log_upstream_error(status, url, &body, opts.tracing_ids.as_ref());
+        let info = log_upstream_error(status, &url, &body, opts.tracing_ids.as_ref());
+        note_engine_error(
+            opts.admission.as_ref(),
+            info.as_ref().map(|i| i.message.as_str()),
+        );
         return Err(AppError::Upstream {
             status: effective_error_status(
                 status.as_u16(),
@@ -1239,10 +1442,56 @@ pub async fn proxy_json_request(
                     }
                 })?;
                 received_upstream_progress |= stream_parser.process_chunk(&chunk);
+                if let Some(error) = stream_parser.take_error_event() {
+                    note_engine_error(
+                        opts.admission.as_ref(),
+                        error.get("message").and_then(|m| m.as_str()),
+                    );
+                }
+                if stream_parser.seen_generation_output {
+                    if let Some(permit) = opts.admission.as_ref() {
+                        permit.observe_generation_started();
+                    }
+                }
                 assembler.process_chunk(&chunk);
             }
         }
         stream_parser.finish();
+        // If the stream surfaced an upstream error chunk (e.g. SGLang queue-full
+        // abort), propagate it as a real upstream error. Otherwise the empty
+        // `choices: []` final chunk would be signed and returned as HTTP 200,
+        // hiding the failure from cloud-api's retry logic.
+        if let Some(err) = assembler.take_error() {
+            let status_code = err
+                .get("code")
+                .and_then(|v| v.as_u64())
+                .and_then(|c| u16::try_from(c).ok())
+                .and_then(|c| StatusCode::from_u16(c).ok())
+                .unwrap_or(StatusCode::BAD_GATEWAY);
+            let body_bytes = Bytes::from(
+                serde_json::to_vec(&serde_json::json!({ "error": err }))
+                    .map_err(|e| AppError::Internal(e.into()))?,
+            );
+            let reqwest_status = reqwest::StatusCode::from_u16(status_code.as_u16())
+                .unwrap_or(reqwest::StatusCode::BAD_GATEWAY);
+            let info =
+                log_upstream_error(reqwest_status, &url, &body_bytes, opts.tracing_ids.as_ref());
+            note_engine_error(
+                opts.admission.as_ref(),
+                info.as_ref().map(|i| i.message.as_str()),
+            );
+            return Err(AppError::Upstream {
+                // A client media-fetch failure can arrive as an SSE error chunk
+                // with code:500 + `403, message='…', url='…'` — downgrade to 400
+                // here too so it isn't retried/masked as a 502 (cloud-api#606).
+                status: effective_error_status(
+                    status_code.as_u16(),
+                    info.as_ref(),
+                    opts.map_queue_full_to_429,
+                ),
+                body: body_bytes,
+            });
+        }
         if opts.stream_idle_timeout_secs > 0 && !stream_parser.seen_done {
             metrics::counter!(
                 "upstream_stream_incomplete_total",
@@ -1264,37 +1513,6 @@ pub async fn proxy_json_request(
                 error_type: "upstream_stream_incomplete".to_string(),
             });
         }
-        // If the stream surfaced an upstream error chunk (e.g. SGLang queue-full
-        // abort), propagate it as a real upstream error. Otherwise the empty
-        // `choices: []` final chunk would be signed and returned as HTTP 200,
-        // hiding the failure from cloud-api's retry logic.
-        if let Some(err) = assembler.take_error() {
-            let status_code = err
-                .get("code")
-                .and_then(|v| v.as_u64())
-                .and_then(|c| u16::try_from(c).ok())
-                .and_then(|c| StatusCode::from_u16(c).ok())
-                .unwrap_or(StatusCode::BAD_GATEWAY);
-            let body_bytes = Bytes::from(
-                serde_json::to_vec(&serde_json::json!({ "error": err }))
-                    .map_err(|e| AppError::Internal(e.into()))?,
-            );
-            let reqwest_status = reqwest::StatusCode::from_u16(status_code.as_u16())
-                .unwrap_or(reqwest::StatusCode::BAD_GATEWAY);
-            let info =
-                log_upstream_error(reqwest_status, url, &body_bytes, opts.tracing_ids.as_ref());
-            return Err(AppError::Upstream {
-                // A client media-fetch failure can arrive as an SSE error chunk
-                // with code:500 + `403, message='…', url='…'` — downgrade to 400
-                // here too so it isn't retried/masked as a 502 (cloud-api#606).
-                status: effective_error_status(
-                    status_code.as_u16(),
-                    info.as_ref(),
-                    opts.map_queue_full_to_429,
-                ),
-                body: body_bytes,
-            });
-        }
         assembler.into_response(&opts.id_prefix)
     } else {
         // Backend returned plain JSON — process as before.
@@ -1304,6 +1522,33 @@ pub async fn proxy_json_request(
             .map_err(|e| AppError::Internal(e.into()))?;
         let mut data: serde_json::Value =
             serde_json::from_slice(&response_bytes).map_err(|e| AppError::Internal(e.into()))?;
+        if let Some(error) = data.get("error").filter(|e| e.is_object()) {
+            // An error body on a 2xx: an engine rejection, not a completion.
+            let code = error
+                .get("code")
+                .and_then(|v| v.as_u64())
+                .and_then(|c| u16::try_from(c).ok())
+                .filter(|c| (400..600).contains(c))
+                .unwrap_or(502);
+            let info = log_upstream_error(
+                reqwest::StatusCode::from_u16(code).unwrap_or(reqwest::StatusCode::BAD_GATEWAY),
+                &url,
+                &response_bytes,
+                opts.tracing_ids.as_ref(),
+            );
+            note_engine_error(
+                opts.admission.as_ref(),
+                info.as_ref().map(|i| i.message.as_str()),
+            );
+            return Err(AppError::Upstream {
+                status: effective_error_status(code, info.as_ref(), opts.map_queue_full_to_429),
+                body: response_bytes,
+            });
+        }
+        if let Some(permit) = opts.admission.as_ref() {
+            // The whole completion arrived at once: that is its generation start.
+            permit.observe_generation_started();
+        }
         // Generate an ID if not present.
         if data.get("id").and_then(|v| v.as_str()).is_none() {
             let id = format!(
@@ -1829,26 +2074,24 @@ pub async fn proxy_streaming_request(
         .unwrap_or_else(|| hex::encode(Sha256::digest(&request_body)));
 
     let upstream_start = std::time::Instant::now();
-    let req = apply_tracing_headers(
-        client
-            .post(url)
-            .header("content-type", "application/json")
-            .header("accept", "text/event-stream"),
-        opts.tracing_ids.as_ref(),
-    );
-    let req = apply_data_parallel_rank_header(req, opts.upstream_data_parallel_rank);
-    let response = req
-        .body(request_body)
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(e.into()))?;
-    metrics::histogram!("upstream_request_duration_seconds", "endpoint" => "streaming")
-        .record(upstream_start.elapsed().as_secs_f64());
+    let mut url = url.to_string();
+    let response = send_upstream(
+        client,
+        &mut url,
+        Bytes::from(request_body),
+        &mut opts,
+        "streaming",
+    )
+    .await?;
 
     let status = response.status();
     if !status.is_success() {
         let body = response.bytes().await.unwrap_or_else(|_| Bytes::from("{}"));
-        let info = log_upstream_error(status, url, &body, opts.tracing_ids.as_ref());
+        let info = log_upstream_error(status, &url, &body, opts.tracing_ids.as_ref());
+        note_engine_error(
+            opts.admission.as_ref(),
+            info.as_ref().map(|i| i.message.as_str()),
+        );
         return Err(AppError::Upstream {
             status: effective_error_status(
                 status.as_u16(),
@@ -1869,6 +2112,7 @@ pub async fn proxy_streaming_request(
     let model_name = opts.model_name.clone();
     let chunk_transform = opts.chunk_transform;
     let backend_guard = opts.backend_guard;
+    let admission = opts.admission;
     let stream_idle_timeout_secs = opts.stream_idle_timeout_secs;
     let sse_keepalive_secs = opts.sse_keepalive_secs;
 
@@ -1906,9 +2150,13 @@ pub async fn proxy_streaming_request(
                     let info = log_upstream_error(
                         reqwest::StatusCode::from_u16(code)
                             .unwrap_or(reqwest::StatusCode::BAD_GATEWAY),
-                        url,
+                        &url,
                         &body,
                         opts.tracing_ids.as_ref(),
+                    );
+                    note_engine_error(
+                        admission.as_ref(),
+                        info.as_ref().map(|i| i.message.as_str()),
                     );
                     metrics::counter!("upstream_stream_first_event_errors_total").increment(1);
                     return Err(AppError::Upstream {
@@ -1956,6 +2204,9 @@ pub async fn proxy_streaming_request(
         // Keep backend_guard alive for the full duration of the stream
         // so active_conns tracking is accurate for least-connections selection.
         let _backend_guard = backend_guard;
+        // Same for the admission permit: the budget slot is held until the
+        // stream ends, and the first chunk is its TTFT sample.
+        let admission = admission;
 
         let mut byte_stream = std::pin::pin!(byte_stream);
         let mut hasher = Sha256::new();
@@ -1988,6 +2239,26 @@ pub async fn proxy_streaming_request(
                             keepalive.reset();
                             last_upstream_chunk = tokio::time::Instant::now();
                             received_upstream_progress |= parser.process_chunk(&chunk);
+                            // An engine rejection that arrived after the peek
+                            // window (or split across chunks) is already on a
+                            // committed 200; admission still learns about it,
+                            // and it is not a generation event.
+                            if let Some(error) = parser.take_error_event() {
+                                metrics::counter!(
+                                    "upstream_stream_error_events_total",
+                                    "phase" => "after_headers"
+                                )
+                                .increment(1);
+                                note_engine_error(
+                                    admission.as_ref(),
+                                    error.get("message").and_then(|m| m.as_str()),
+                                );
+                            }
+                            if parser.seen_generation_output {
+                                if let Some(permit) = admission.as_ref() {
+                                    permit.observe_generation_started();
+                                }
+                            }
 
                             // Normalize (and encrypt, if active) the chunk, then hash
                             // what the client actually receives for signatures.
@@ -2804,9 +3075,15 @@ pub struct SseParser {
     /// A role-only chat chunk is metadata, not progress: vLLM emits it before
     /// hidden reasoning and may then remain byte-silent for an unbounded time.
     pub seen_generation_progress: bool,
+    /// Whether the model has produced output (content, reasoning, tool
+    /// calls, or completion text): the time-to-first-token event. Role-only
+    /// chunks, usage-only chunks, errors and `[DONE]` do not count.
+    pub seen_generation_output: bool,
     /// Token usage extracted from the final SSE chunk (prompt_tokens, completion_tokens).
     pub usage: Option<(i64, i64)>,
     cached_tokens: Option<i64>,
+    /// The first `data: {"error": …}` event seen, until taken.
+    error_event: Option<serde_json::Value>,
 }
 
 impl Default for SseParser {
@@ -2822,9 +3099,16 @@ impl SseParser {
             chat_id: None,
             seen_done: false,
             seen_generation_progress: false,
+            seen_generation_output: false,
             usage: None,
             cached_tokens: None,
+            error_event: None,
         }
+    }
+
+    /// The engine's error event, if one arrived (taken once).
+    pub fn take_error_event(&mut self) -> Option<serde_json::Value> {
+        self.error_event.take()
     }
 
     pub fn process_chunk(&mut self, chunk: &[u8]) -> bool {
@@ -2847,7 +3131,14 @@ impl SseParser {
                 };
 
             // Borrow the line from the buffer, extract what we need, then release the borrow
-            let (is_done, extracted_id, extracted_usage, has_generation_progress) = {
+            let (
+                is_done,
+                extracted_id,
+                extracted_usage,
+                has_generation_progress,
+                has_generation_output,
+                error_event,
+            ) = {
                 let line = &self.line_buffer[..line_end];
                 let data = line
                     .strip_prefix("data: ")
@@ -2856,9 +3147,9 @@ impl SseParser {
                     .trim();
 
                 if data.is_empty() {
-                    (false, None, None, false)
+                    (false, None, None, false, false, None)
                 } else if data == "[DONE]" {
-                    (true, None, None, true)
+                    (true, None, None, true, false, None)
                 } else if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
                     let id = if self.chat_id.is_none() {
                         parsed
@@ -2887,11 +3178,23 @@ impl SseParser {
                             }
                         });
                     let progress = sse_value_has_generation_progress(&parsed);
-                    (false, id, usage, progress)
+                    let output = sse_value_has_generation_output(&parsed);
+                    let error_event = if self.error_event.is_none() {
+                        parsed.get("error").filter(|e| e.is_object()).cloned()
+                    } else {
+                        None
+                    };
+                    (false, id, usage, progress, output, error_event)
                 } else {
-                    (false, None, None, false)
+                    (false, None, None, false, false, None)
                 }
             };
+            if has_generation_output {
+                self.seen_generation_output = true;
+            }
+            if let Some(error_event) = error_event {
+                self.error_event = Some(error_event);
+            }
 
             if is_done {
                 self.seen_done = true;
@@ -2923,6 +3226,38 @@ impl SseParser {
             let _ = self.process_chunk(b"\n");
         }
     }
+}
+
+/// The model produced output: a chat delta with content, reasoning or tool
+/// calls, or completion text. Unlike `sse_value_has_generation_progress`
+/// this excludes errors, usage-only chunks, `finish_reason`-only chunks and
+/// unknown schemas, so it marks the first token rather than any activity.
+fn sse_value_has_generation_output(value: &serde_json::Value) -> bool {
+    if value.get("error").is_some_and(|error| !error.is_null()) {
+        return false;
+    }
+    let Some(choices) = value.get("choices").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    choices.iter().any(|choice| {
+        if choice.get("text").is_some_and(json_value_has_payload) {
+            return true;
+        }
+        choice
+            .get("delta")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|delta| {
+                [
+                    "content",
+                    "reasoning_content",
+                    "reasoning",
+                    "tool_calls",
+                    "function_call",
+                ]
+                .iter()
+                .any(|key| delta.get(*key).is_some_and(json_value_has_payload))
+            })
+    })
 }
 
 fn sse_value_has_generation_progress(value: &serde_json::Value) -> bool {
@@ -3251,6 +3586,8 @@ mod tests {
             response_shape: ResponseShape::default(),
             tracing_ids: None,
             upstream_data_parallel_rank: None,
+            admission: None,
+            connect_failover: None,
         }
     }
 
@@ -4521,5 +4858,36 @@ mod tests {
         assert_eq!(json["stream"], true);
         assert_eq!(json["max_tokens"], 100);
         assert_eq!(json["temperature"], 0.7);
+    }
+
+    #[test]
+    fn generation_output_marks_the_first_token_not_activity() {
+        let mut parser = SseParser::new();
+        parser.process_chunk(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n");
+        assert!(!parser.seen_generation_output, "role-only chunk");
+        parser.process_chunk(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":0}}\n\n",
+        );
+        assert!(!parser.seen_generation_output, "usage-only chunk");
+        parser.process_chunk(
+            b"data: {\"error\":{\"message\":\"The request queue is full.\",\"code\":503}}\n\n",
+        );
+        assert!(!parser.seen_generation_output, "error event");
+        assert!(
+            parser.seen_generation_progress,
+            "errors are still watchdog progress"
+        );
+        assert!(parser.take_error_event().is_some());
+        parser.process_chunk(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"Th\"}}]}\n\n",
+        );
+        assert!(parser.seen_generation_output, "first reasoning token");
+
+        let mut completions = SseParser::new();
+        completions.process_chunk(b"data: {\"choices\":[{\"index\":0,\"text\":\"Hi\"}]}\n\n");
+        assert!(completions.seen_generation_output);
+        let mut tool = SseParser::new();
+        tool.process_chunk(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"f\"}}]}}]}\n\n");
+        assert!(tool.seen_generation_output);
     }
 }

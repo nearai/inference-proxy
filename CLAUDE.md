@@ -90,8 +90,12 @@ redeploys), backend requests carry `VLLM_BACKEND_TOKEN` via the dedicated
 `VLLM_PROXY_REJECTED_CONTENT_PART_TYPES`, `VLLM_PROXY_SSE_KEEPALIVE_SECS`,
 `VLLM_PROXY_MAP_QUEUE_FULL_TO_429`, `VLLM_PROXY_STREAM_ERROR_PEEK_MS`,
 `NON_TEE_DEPLOYMENT` (404s the attestation, signature and GPU-evidence routes),
-`VLLM_BACKEND_HEALTH_PATH` and `LISTEN_ADDR` are the opt-in policies. All default
-to the in-CVM behavior. Request priority (`priority.rs`, no CVM config): every
+`VLLM_BACKEND_HEALTH_PATH`, `LISTEN_ADDR`, the lane admission budget
+(`VLLM_PROXY_ADMISSION_*`, `admission.rs`: in-flight budget with a ramp, per-host
+share, refusal on observed TTFT/engine back-pressure — 429 + `Retry-After` before
+dispatch) and `VLLM_BACKEND_CONNECT_FAILOVER` (one retry on another backend, only
+when the connection itself fails) are the opt-in policies. All default to the
+in-CVM behavior. Request priority (`priority.rs`, no CVM config): every
 chat/completions body gets `priority` set by the proxy — the `X-NearAI-Priority`
 header value for callers using the config `TOKEN` (a gateway sets it from
 `VLLM_BACKEND_PRIORITY`), 0 for everyone else; client values are discarded.

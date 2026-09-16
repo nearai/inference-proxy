@@ -84,6 +84,8 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         map_queue_full_to_429: false,
         stream_error_peek_ms: 0,
         rejected_content_part_types: Vec::new(),
+        models_document_url: None,
+        capacity_requests_per_minute: 0,
         allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,
         admission_max_inflight: 0,

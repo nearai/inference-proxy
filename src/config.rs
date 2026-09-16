@@ -296,6 +296,15 @@ pub struct Config {
     /// Chat content part `type`s refused with 400 before dispatch
     /// (`VLLM_PROXY_REJECTED_CONTENT_PART_TYPES`, e.g. `video_url,input_audio,file`).
     pub rejected_content_part_types: Vec<String>,
+    /// Gateway mode: serve `/v1/models` from this URL (cloud-api's
+    /// `/v1/models`) reduced to `MODEL_NAME` and completed with the lane's
+    /// declared capacity, instead of passing the engine's list through
+    /// (`VLLM_PROXY_MODELS_DOCUMENT_URL`). Unset = engine passthrough.
+    pub models_document_url: Option<String>,
+    /// Requests per minute declared in the models document's `capacity`
+    /// (`VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE`, 0 = not declared). The
+    /// concurrency entry comes from `VLLM_PROXY_ADMISSION_MAX_INFLIGHT`.
+    pub capacity_requests_per_minute: u64,
     /// Organizations whose cloud-api keys may use this deployment
     /// (`VLLM_PROXY_ALLOWED_ORG_IDS`, comma-separated organization ids). Empty
     /// = every valid key. Config-token callers are not affected. Gateway mode
@@ -545,6 +554,12 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
+        let models_document_url = env::var("VLLM_PROXY_MODELS_DOCUMENT_URL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let capacity_requests_per_minute: u64 =
+            env_parse("VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE", 0)?;
         let rejected_content_part_types = crate::content_policy::parse_rejected_types(
             &env::var("VLLM_PROXY_REJECTED_CONTENT_PART_TYPES").unwrap_or_default(),
         );
@@ -742,6 +757,8 @@ impl Config {
             map_queue_full_to_429: env_bool("VLLM_PROXY_MAP_QUEUE_FULL_TO_429"),
             stream_error_peek_ms: env_int("VLLM_PROXY_STREAM_ERROR_PEEK_MS", 0) as u64,
             rejected_content_part_types,
+            models_document_url,
+            capacity_requests_per_minute,
             allowed_org_ids,
             sse_keepalive_secs: env_int("VLLM_PROXY_SSE_KEEPALIVE_SECS", 0) as u64,
             admission_max_inflight,

@@ -8,6 +8,13 @@
 //! and admission (every host queueing = refuse). A sample older than three
 //! intervals counts as unknown, so a probe outage degrades to the gateway's
 //! own view instead of blocking the lane.
+//!
+//! One reading covers one engine replica: the probe goes to the host's proxy,
+//! which forwards it to whichever of its replicas is least busy — the same
+//! choice it makes for the inference request that follows, so the reading
+//! describes where the work would land. A queue in that reading therefore
+//! means the host has no free replica, while a zero means at least one
+//! replica is free.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -23,7 +30,7 @@ pub struct Sample {
 
 pub struct EngineLoad {
     samples: Vec<Mutex<Option<(Instant, Sample)>>>,
-    stale_after: Duration,
+    pub(crate) stale_after: Duration,
 }
 
 impl EngineLoad {
@@ -65,11 +72,16 @@ impl EngineLoad {
     }
 }
 
-/// Sum of a Prometheus gauge over all its label sets, under any of `names`
-/// (SGLang and vLLM spell them differently).
+/// Value of a Prometheus gauge under any of `names` (SGLang and vLLM spell
+/// them differently), summed over its label sets.
+///
+/// SGLang with priority scheduling reports each of these gauges once per
+/// `priority` bucket *and* once as an aggregate carrying an empty `priority`
+/// label, so a plain sum counts every request twice. When the aggregate is
+/// present it is authoritative and the buckets are ignored.
 pub fn metric_sum(body: &str, names: &[&str]) -> Option<u32> {
-    let mut total = 0.0f64;
-    let mut found = false;
+    let mut all = None::<f64>;
+    let mut aggregate = None::<f64>;
     for line in body.lines() {
         let Some(name) = names.iter().copied().find(|name| {
             line.starts_with(name)
@@ -80,16 +92,16 @@ pub fn metric_sum(body: &str, names: &[&str]) -> Option<u32> {
         }) else {
             continue;
         };
-        let value = line[name.len()..]
-            .rsplit(' ')
-            .next()
-            .and_then(|v| v.parse::<f64>().ok());
-        if let Some(value) = value {
-            total += value;
-            found = true;
+        let rest = &line[name.len()..];
+        let Some(value) = rest.rsplit(' ').next().and_then(|v| v.parse::<f64>().ok()) else {
+            continue;
+        };
+        *all.get_or_insert(0.0) += value;
+        if rest.contains("priority=\"\"") {
+            *aggregate.get_or_insert(0.0) += value;
         }
     }
-    found.then(|| total.max(0.0).round() as u32)
+    aggregate.or(all).map(|value| value.max(0.0).round() as u32)
 }
 
 pub fn parse_sample(body: &str) -> Option<Sample> {
@@ -107,20 +119,24 @@ pub fn parse_sample(body: &str) -> Option<Sample> {
 }
 
 /// Poll every probe URL's `/v1/metrics` on `interval`; `probe_urls[i]` is
-/// backend `i`. Failures leave the previous sample to age out.
+/// backend `i`. A probe may take as long as a sample stays fresh — the route
+/// shares the engine's request loop and slows down exactly when the host is
+/// busy, which is when the reading matters. Failures leave the previous
+/// sample to age out.
 pub fn spawn_engine_load_poller(
     load: Arc<EngineLoad>,
     client: reqwest::Client,
     probe_urls: Vec<String>,
     interval: Duration,
 ) {
+    let timeout = load.stale_after.max(interval);
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
         loop {
             tick.tick().await;
             for (index, probe) in probe_urls.iter().enumerate() {
                 let url = format!("{}/v1/metrics", probe.trim_end_matches('/'));
-                let body = match client.get(&url).timeout(interval).send().await {
+                let body = match client.get(&url).timeout(timeout).send().await {
                     Ok(response) if response.status().is_success() => response.text().await.ok(),
                     Ok(response) => {
                         debug!(backend = index, status = %response.status(), "Engine metrics probe failed");
@@ -159,6 +175,28 @@ sglang:num_running_reqs{engine_type=\"unified\",model_name=\"m\",tp_rank=\"0\"} 
 sglang:num_running_reqs{engine_type=\"unified\",model_name=\"m\",tp_rank=\"1\"} 4.0\n\
 sglang:num_queue_reqs{engine_type=\"unified\",model_name=\"m\"} 3.0\n\
 sglang:num_running_reqs_total 100\n";
+
+    /// What a priority-scheduling engine actually serves: per-bucket series
+    /// plus an aggregate with an empty `priority` label.
+    const SGLANG_WITH_PRIORITY: &str =
+        "sglang:num_running_reqs{pp_rank=\"0\",priority=\"\",tp_rank=\"0\"} 14.0\n\
+sglang:num_running_reqs{pp_rank=\"0\",priority=\"-9223372036854775808\",tp_rank=\"0\"} 0.0\n\
+sglang:num_running_reqs{pp_rank=\"0\",priority=\"-1\",tp_rank=\"0\"} 0.0\n\
+sglang:num_running_reqs{pp_rank=\"0\",priority=\"0\",tp_rank=\"0\"} 14.0\n\
+sglang:num_queue_reqs{pp_rank=\"0\",priority=\"\",tp_rank=\"0\"} 2.0\n\
+sglang:num_queue_reqs{pp_rank=\"0\",priority=\"-1\",tp_rank=\"0\"} 2.0\n";
+
+    #[test]
+    fn the_priority_aggregate_wins_over_its_buckets() {
+        // 14 running, not 28: the empty-priority series is the total.
+        assert_eq!(
+            parse_sample(SGLANG_WITH_PRIORITY),
+            Some(Sample {
+                running: 14,
+                queued: 2
+            })
+        );
+    }
 
     #[test]
     fn sums_gauges_across_label_sets_and_ignores_prefixed_names() {

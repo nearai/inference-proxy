@@ -37,6 +37,15 @@ pub async fn chat_completions(
     // header; any client value is discarded). Before any branch so the agent
     // loop and fusion inherit it.
     crate::priority::apply_priority(&mut request_json, &headers, auth.cloud_api_key.is_none());
+    // Gateway mode: an aggregator's `reasoning` object becomes the engine's
+    // `reasoning_effort` switch (`enabled: false` → `none`), otherwise the
+    // model keeps thinking and the caller pays for it.
+    if state.config.backend_token.is_some() {
+        crate::reasoning::apply_reasoning_switch(
+            &mut request_json,
+            &state.config.reasoning_off_effort,
+        );
+    }
 
     // Extract encryption context from headers
     let enc_ctx = encryption::extract_encryption_context(&headers)?;

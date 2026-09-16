@@ -21,6 +21,7 @@ pub mod ohttp_gateway;
 pub mod priority;
 pub mod proxy;
 pub mod rate_limit;
+pub mod reasoning;
 pub mod request_tracing;
 pub mod routes;
 pub mod signing;

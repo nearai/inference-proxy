@@ -52,6 +52,10 @@ pub enum AppError {
     Internal(#[from] anyhow::Error),
 }
 
+/// `Retry-After` on an engine admission rejection rewritten to 429: the
+/// engine's queue drains in seconds, same as the gateway's own default.
+const ENGINE_REJECTION_RETRY_AFTER: &str = "2";
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, message, error_type) = match &self {
@@ -68,6 +72,16 @@ impl IntoResponse for AppError {
                         (msg, "upstream_error".to_string())
                     }
                 };
+                // An engine admission rejection rewritten to 429 (queue full,
+                // or a queued request displaced by a higher-priority one) is
+                // back-pressure like the gateway's own refusals: same type,
+                // same Retry-After, so clients handle both the same way.
+                let overloaded = *status == StatusCode::TOO_MANY_REQUESTS;
+                let error_type = if overloaded {
+                    "overloaded".to_string()
+                } else {
+                    error_type
+                };
                 let sanitized_body = serde_json::json!({
                     "error": {
                         "message": message,
@@ -76,7 +90,14 @@ impl IntoResponse for AppError {
                         "code": null,
                     }
                 });
-                return (*status, axum::Json(sanitized_body)).into_response();
+                let mut response = (*status, axum::Json(sanitized_body)).into_response();
+                if overloaded {
+                    response.headers_mut().insert(
+                        axum::http::header::RETRY_AFTER,
+                        axum::http::HeaderValue::from_static(ENGINE_REJECTION_RETRY_AFTER),
+                    );
+                }
+                return response;
             }
             AppError::UpstreamParsed {
                 status,
@@ -215,6 +236,47 @@ mod tests {
         let (status, json) = response_to_json(response).await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(json["error"]["type"], "overloaded");
+    }
+
+    #[tokio::test]
+    async fn test_upstream_429_is_overloaded_with_retry_after() {
+        let err = AppError::Upstream {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            body: Bytes::from_static(
+                br#"{"object":"error","message":"The request is aborted by a higher priority request.","type":"SERVICE_UNAVAILABLE","code":503}"#,
+            ),
+        };
+        let response = err.into_response();
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("2")
+        );
+        let (status, json) = response_to_json(response).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(json["error"]["type"], "overloaded");
+        assert_eq!(
+            json["error"]["message"],
+            "The request is aborted by a higher priority request."
+        );
+
+        // Other upstream statuses keep the engine's type and carry no header.
+        let err = AppError::Upstream {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            body: Bytes::from_static(
+                br#"{"object":"error","message":"Model is loading","type":"ServiceUnavailable","code":503}"#,
+            ),
+        };
+        let response = err.into_response();
+        assert!(response
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .is_none());
+        let (status, json) = response_to_json(response).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["error"]["type"], "ServiceUnavailable");
     }
 
     #[tokio::test]

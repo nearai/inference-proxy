@@ -305,6 +305,14 @@ pub struct Config {
     /// (`VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE`, 0 = not declared). The
     /// concurrency entry comes from `VLLM_PROXY_ADMISSION_MAX_INFLIGHT`.
     pub capacity_requests_per_minute: u64,
+    /// Gateway mode: the `reasoning_effort` that stands for "as little
+    /// reasoning as possible" on the served model
+    /// (`VLLM_PROXY_REASONING_OFF_EFFORT`, default `none`). Applied to an
+    /// aggregator's `reasoning.enabled: false`, to an effort of `none` or
+    /// `minimal`, and to those values sent as `reasoning_effort` directly.
+    /// GLM-5.3 Flash needs `low`: its template only knows `low` and `high`,
+    /// and switched off outright it writes its reasoning as visible content.
+    pub reasoning_off_effort: String,
     /// Organizations whose cloud-api keys may use this deployment
     /// (`VLLM_PROXY_ALLOWED_ORG_IDS`, comma-separated organization ids). Empty
     /// = every valid key. Config-token callers are not affected. Gateway mode
@@ -560,6 +568,9 @@ impl Config {
             .filter(|s| !s.is_empty());
         let capacity_requests_per_minute: u64 =
             env_parse("VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE", 0)?;
+        let reasoning_off_effort = env_or("VLLM_PROXY_REASONING_OFF_EFFORT", "none")
+            .trim()
+            .to_string();
         let rejected_content_part_types = crate::content_policy::parse_rejected_types(
             &env::var("VLLM_PROXY_REJECTED_CONTENT_PART_TYPES").unwrap_or_default(),
         );
@@ -759,6 +770,7 @@ impl Config {
             rejected_content_part_types,
             models_document_url,
             capacity_requests_per_minute,
+            reasoning_off_effort,
             allowed_org_ids,
             sse_keepalive_secs: env_int("VLLM_PROXY_SSE_KEEPALIVE_SECS", 0) as u64,
             admission_max_inflight,

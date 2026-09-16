@@ -1017,6 +1017,22 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_after_dispatch_records_nothing() {
+        // Fail-over that ends in a refusal (every other host at its share):
+        // the request was marked dispatched but never waited on an engine.
+        let c = controller(config(), 2);
+        let p = pool(2);
+        let t0 = Instant::now();
+        let permit = c.try_admit_at(&p, t0).unwrap().unwrap();
+        permit.mark_dispatched_at(t0);
+        permit.abandon();
+        permit.release_at(t0 + Duration::from_millis(30));
+        std::mem::forget(permit);
+        assert_eq!(c.ttft_totals(t0 + Duration::from_secs(1)), (0, 0));
+        assert_eq!(c.inflight(), 0);
+    }
+
+    #[test]
     fn precheck_refuses_without_taking_a_slot() {
         let c = controller(config(), 1);
         let p = pool(1);

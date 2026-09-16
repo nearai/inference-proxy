@@ -1079,6 +1079,8 @@ async fn send_upstream(
                     if let Some(permit) = opts.admission.as_ref() {
                         // Somewhere to go, but every candidate is at its share
                         // or steered around: that is admission, not an outage.
+                        // Nothing waited on an engine here either.
+                        permit.abandon();
                         return Err(AppError::from(permit.reject_host_share()));
                     }
                 }

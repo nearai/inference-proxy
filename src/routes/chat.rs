@@ -32,6 +32,10 @@ pub async fn chat_completions(
 
     // Strip empty tool_calls (vLLM bug workaround)
     strip_empty_tool_calls(&mut request_json);
+    // Repair tool-call `arguments` the engine would refuse (empty, missing,
+    // double-encoded, non-object): one odd historical turn must not 400 the
+    // whole conversation. See nearai/inference-proxy#239.
+    crate::tool_calls::normalize_tool_call_arguments(&mut request_json);
 
     // Engine `priority`: the proxy decides it (trusted callers may set it via
     // header; any client value is discarded). Before any branch so the agent

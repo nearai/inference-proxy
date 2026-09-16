@@ -4015,6 +4015,73 @@ async fn test_strip_empty_tool_calls() {
     // The mock expectation (body_json) verifies the backend received stripped body
 }
 
+#[tokio::test]
+async fn test_tool_call_arguments_are_normalized_before_dispatch() {
+    use wiremock::matchers::body_json;
+
+    let mock_server = MockServer::start().await;
+
+    // The engine refuses `function.arguments` that is not a string holding a
+    // JSON object; the proxy repairs each shape and leaves good ones alone.
+    let expected_backend_body = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "time?"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "a", "type": "function", "function": {"name": "get_time", "arguments": "{}"}},
+                {"id": "b", "type": "function", "function": {"name": "lookup", "arguments": "{\"value\":[]}"}},
+                {"id": "c", "type": "function", "function": {"name": "noop", "arguments": "{}"}},
+                {"id": "d", "type": "function", "function": {"name": "search", "arguments": "{\"q\": \"x\"}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "a", "content": "12:00"}
+        ],
+        "stream": true,
+        "stream_options": {"include_usage": true},
+        "priority": 0
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_json(&expected_backend_body))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-tc",
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let request_body = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "time?"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "a", "type": "function", "function": {"name": "get_time", "arguments": ""}},
+                {"id": "b", "type": "function", "function": {"name": "lookup", "arguments": "[]"}},
+                {"id": "c", "type": "function", "function": {"name": "noop"}},
+                {"id": "d", "type": "function", "function": {"name": "search", "arguments": "{\"q\": \"x\"}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "a", "content": "12:00"}
+        ]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    // The mock expectation (body_json) verifies the backend received the repaired history
+}
+
 // ---- Response ID generation ----
 
 #[tokio::test]

@@ -46,6 +46,7 @@ This is a Rust rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-pro
 - `reqwest::multipart::Part::mime_str()` consumes self — use `.expect()` not `?` in chains
 - Streaming uses `tokio::spawn` + `mpsc` channel: background task hashes chunks and signs on stream completion
 - `strip_empty_tool_calls` in `routes/chat.rs` is a vLLM bug workaround (still needed as of vLLM v0.15.1)
+- `tool_calls::normalize_tool_call_arguments` repairs `tool_calls[].function.arguments` in history (empty, missing, double-encoded, non-object) before dispatch; SGLang otherwise 400s the whole request (nearai/inference-proxy#239)
 - Signed text format: `"{model_name}:{sha256_request}:{sha256_response}"` signed by both algos
 - `serde_json::to_string` matches Python's `json.dumps(separators=(",",":"))`
 

@@ -42,6 +42,8 @@ struct GatewayOptions {
     /// Source of the models document (a mock cloud-api `/v1/models`).
     models_document_url: Option<String>,
     capacity_requests_per_minute: u64,
+    /// `VLLM_PROXY_REASONING_OFF_EFFORT` (default `none`).
+    reasoning_off_effort: Option<String>,
 }
 
 fn build_gateway(mock_url: &str, options: GatewayOptions) -> axum::Router {
@@ -127,6 +129,10 @@ fn build_gateway(mock_url: &str, options: GatewayOptions) -> axum::Router {
         rejected_content_part_types: options.rejected_content_part_types,
         models_document_url: options.models_document_url.clone(),
         capacity_requests_per_minute: options.capacity_requests_per_minute,
+        reasoning_off_effort: options
+            .reasoning_off_effort
+            .clone()
+            .unwrap_or_else(|| "none".to_string()),
         allowed_org_ids: options.allowed_org_ids,
         sse_keepalive_secs: options.sse_keepalive_secs,
         admission_max_inflight: options.admission_max_inflight,
@@ -1117,8 +1123,20 @@ async fn queue_full_503_becomes_429_only_when_enabled() {
             .await
             .unwrap();
         assert_eq!(response.status(), expected, "enabled={enabled}");
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .map(|v| v.to_str().unwrap().to_string());
         let body = json_body(response).await;
         assert_eq!(body["error"]["message"], "The request queue is full.");
+        if enabled {
+            // Same shape as the gateway's own refusals: clients back off once.
+            assert_eq!(retry_after.as_deref(), Some("2"));
+            assert_eq!(body["error"]["type"], "overloaded");
+        } else {
+            assert!(retry_after.is_none());
+            assert_eq!(body["error"]["type"], "abort");
+        }
     }
 }
 
@@ -1185,8 +1203,16 @@ async fn streaming_queue_full_first_event_becomes_429_with_peek() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+        Some("2")
+    );
     let body = json_body(response).await;
     assert_eq!(body["error"]["message"], "The request queue is full.");
+    assert_eq!(body["error"]["type"], "overloaded");
 }
 
 #[tokio::test]
@@ -1443,14 +1469,21 @@ async fn engine_queue_full_on_every_backend_refuses_new_work_without_dispatch() 
             ..Default::default()
         },
     );
-    // The engine's rejection reaches the client as 429 (mapped)...
+    // The engine's rejection reaches the client as 429 (mapped), with the
+    // same Retry-After as a gateway refusal...
     let first = app
         .clone()
         .oneshot(chat_request(hello_body()))
         .await
         .unwrap();
     assert_eq!(first.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert!(first.headers().get("retry-after").is_none());
+    assert_eq!(
+        first
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+        Some("2")
+    );
     // ...and the only backend is now known to be saturated: the next request
     // is refused by the gateway itself, with Retry-After, and never dispatched.
     let second = app
@@ -1865,4 +1898,82 @@ async fn models_document_falls_back_to_the_engine_list_when_the_source_fails() {
     let (status, body) = get_models(app).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"][0]["owned_by"], "sglang");
+}
+
+// ---- Reasoning switch ----
+
+/// Matches a chat body that carries no `reasoning_effort` at all.
+struct NoReasoningEffort;
+
+impl wiremock::Match for NoReasoningEffort {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        serde_json::from_slice::<serde_json::Value>(&request.body)
+            .map(|body| body.get("reasoning_effort").is_none())
+            .unwrap_or(false)
+    }
+}
+
+#[tokio::test]
+async fn reasoning_object_becomes_reasoning_effort_in_gateway_mode() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(wiremock::matchers::body_partial_json(serde_json::json!({
+            "reasoning_effort": "low",
+            "reasoning": {"enabled": false, "effort": "low"}
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+        .expect(2)
+        .mount(&mock)
+        .await;
+    let app = build_gateway(
+        &mock.uri(),
+        GatewayOptions {
+            backend_token: Some("backend-secret".to_string()),
+            reasoning_off_effort: Some("low".to_string()),
+            ..Default::default()
+        },
+    );
+    // The aggregator's object, and the same intent as an explicit value the
+    // model cannot honour cleanly: both become the configured off effort.
+    for body in [
+        serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning": {"enabled": false}
+        }),
+        serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_effort": "none",
+            "reasoning": {"enabled": false, "effort": "none"}
+        }),
+    ] {
+        let response = app.clone().oneshot(chat_request(body)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    mock.verify().await;
+}
+
+#[tokio::test]
+async fn reasoning_object_is_left_alone_outside_gateway_mode() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(NoReasoningEffort)
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let app = build_gateway(&mock.uri(), GatewayOptions::default());
+    let response = app
+        .oneshot(chat_request(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning": {"enabled": false}
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    mock.verify().await;
 }

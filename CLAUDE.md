@@ -102,6 +102,10 @@ in-CVM behavior. Request priority (`priority.rs`, no CVM config): every
 chat/completions body gets `priority` set by the proxy — the `X-NearAI-Priority`
 header value for callers using the config `TOKEN` (a gateway sets it from
 `VLLM_BACKEND_PRIORITY`), 0 for everyone else; client values are discarded.
+In gateway mode `reasoning.rs` maps an aggregator's `reasoning` object
+(`enabled: false`, `effort`) onto `reasoning_effort`; "off" is
+`VLLM_PROXY_REASONING_OFF_EFFORT` (`low` for GLM-5.3 Flash, whose template only
+knows `low`/`high` and leaks its thinking into `content` when switched off).
 
 ### Cloud API integration
 

@@ -81,8 +81,9 @@ to the current in-CVM behavior.
 | `VLLM_PROXY_ALLOWED_ORG_IDS` | the partner's organization id | Only that organization's keys are served; any other valid key gets 403. Without it any cloud-api key works here, same as the direct `*.completions.near.ai` endpoints. |
 | `VLLM_PROXY_REJECTED_CONTENT_PART_TYPES` | `video_url,input_audio,file` | Modalities this deployment does not serve → deterministic `400`. |
 | `VLLM_PROXY_MODELS_DOCUMENT_URL` / `VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE` | `https://cloud-api.near.ai/v1/models` / `150` | `GET /v1/models` serves cloud-api's entry for `MODEL_NAME` (pricing, modalities, `is_ready`, `openrouter.slug`) with `capacity` added: concurrency = `VLLM_PROXY_ADMISSION_MAX_INFLIGHT`, requests per minute = this value. One URL for inference and the listing; `is_ready` stays under cloud-api's catalog control (the kill switch). Source unreadable → the engine's list, as without the variable. |
+| `VLLM_PROXY_REASONING_OFF_EFFORT` | `low` | What "no reasoning" means for GLM-5.3 Flash (see below). |
 | `VLLM_PROXY_SSE_KEEPALIVE_SECS` | `15` | `: keep-alive` SSE comments while the upstream is silent (long prefill/queueing), so intermediaries with read timeouts do not cancel. Off in CVMs: comments are not part of the signed bytes. |
-| `VLLM_PROXY_MAP_QUEUE_FULL_TO_429` | `1` | The engine's admission rejection (queue full, or a queued request displaced by a higher-priority one) becomes 429: back-pressure, not an outage. Off in CVMs: cloud-api's peer fallback keys on the 503. |
+| `VLLM_PROXY_MAP_QUEUE_FULL_TO_429` | `1` | The engine's admission rejection (queue full, or a queued request displaced by a higher-priority one) becomes 429 with `Retry-After: 2` and type `overloaded`, the same shape as the gateway's own refusals: back-pressure, not an outage. Off in CVMs: cloud-api's peer fallback keys on the 503. |
 | `VLLM_PROXY_STREAM_ERROR_PEEK_MS` | `1000` | Streams wait up to 1 s for the first upstream event; an admission-time `data: {"error":…}` becomes a real 429/5xx instead of a 200 that fails mid-stream. A slow first token just times the peek out. |
 | `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` / `_START_INFLIGHT` | `48` / `32` | The lane's in-flight budget: refuse with 429 + `Retry-After` before dispatch instead of queueing (see below). Starts at 32 and ramps by 8 every 30 min while the lane stays healthy. |
 | `VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS` | `30000` | Refuse new work while, over the last minute, at least 20 lane requests reached the engine and 5 % of them (at least two) waited longer than this for their first generation event. |
@@ -93,6 +94,21 @@ to the current in-CVM behavior.
 | `DEV` / `GPU_NO_HW_MODE` | `1` / `1` | Non-TEE: random signing keys, no hardware evidence. |
 | `LISTEN_ADDR` / `LISTEN_PORT` | `127.0.0.1` / `31700` | Bind behind the local TLS terminator. |
 | `RATE_LIMIT_PER_SECOND` / `RATE_LIMIT_BURST_SIZE` | raised | Per-IP limiter; an aggregator arrives from a handful of IPs. |
+
+In gateway mode the proxy also maps an aggregator's reasoning controls onto
+the engine's switch (`reasoning.rs`). `{"reasoning": {"enabled": false}}`, an
+effort of `none` or `minimal`, and those values sent as `reasoning_effort`
+become `VLLM_PROXY_REASONING_OFF_EFFORT`; other efforts in the `reasoning`
+object are copied to `reasoning_effort`; a caller's own `reasoning_effort` is
+otherwise respected. The mapped value is also written back into
+`reasoning.effort`, because the engine reads the object's field first when both
+are present. Without this the model keeps thinking and the caller pays
+for tokens it asked not to have. The off value is per model: GLM-5.3 Flash's
+template only honours `low` and `high` (anything else means max), and with
+thinking switched off outright it writes its reasoning as visible content, so
+the lane runs with `low` (about 1-9 reasoning tokens, clean content). `exclude`
+and `max_tokens` have no engine equivalent and are left to the aggregator.
+Applied counts are in `reasoning_switch_applied_total{kind}`.
 
 The router fails closed: only declared routes exist. The TLS terminator in
 front of the gateway should additionally expose only `/v1/chat/completions`,

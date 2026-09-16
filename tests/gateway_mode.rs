@@ -39,6 +39,9 @@ struct GatewayOptions {
     backend_connect_failover: bool,
     /// Engine metrics probe base URLs, one per backend (polled every 100 ms here).
     backend_probe_urls: Vec<String>,
+    /// Source of the models document (a mock cloud-api `/v1/models`).
+    models_document_url: Option<String>,
+    capacity_requests_per_minute: u64,
 }
 
 fn build_gateway(mock_url: &str, options: GatewayOptions) -> axum::Router {
@@ -122,6 +125,8 @@ fn build_gateway(mock_url: &str, options: GatewayOptions) -> axum::Router {
         map_queue_full_to_429: options.map_queue_full_to_429,
         stream_error_peek_ms: options.stream_error_peek_ms,
         rejected_content_part_types: options.rejected_content_part_types,
+        models_document_url: options.models_document_url.clone(),
+        capacity_requests_per_minute: options.capacity_requests_per_minute,
         allowed_org_ids: options.allowed_org_ids,
         sse_keepalive_secs: options.sse_keepalive_secs,
         admission_max_inflight: options.admission_max_inflight,
@@ -1717,4 +1722,147 @@ async fn a_queueing_engine_is_steered_around_and_a_fleet_wide_queue_refuses() {
     let response = app.oneshot(chat_request(hello_body())).await.unwrap();
     assert_overloaded(response).await;
     idle.verify().await;
+}
+
+// ---- Models document ----
+
+async fn get_models(app: axum::Router) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+#[tokio::test]
+async fn models_document_is_reduced_to_this_model_and_carries_capacity() {
+    let engine = MockServer::start().await;
+    let source = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "other-model", "name": "Other", "is_ready": true},
+                {"id": "test-model", "name": "Test Model", "is_ready": true,
+                 "pricing": {"prompt": "0.00000015"}, "openrouter": {"slug": "test-model"}}
+            ]
+        })))
+        .expect(1)
+        .mount(&source)
+        .await;
+
+    let app = build_gateway(
+        &engine.uri(),
+        GatewayOptions {
+            models_document_url: Some(format!("{}/v1/models", source.uri())),
+            capacity_requests_per_minute: 150,
+            admission_max_inflight: 48,
+            admission_start_inflight: Some(32),
+            ..Default::default()
+        },
+    );
+    let (status, body) = get_models(app).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["object"], "list");
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 1, "{body}");
+    assert_eq!(data[0]["id"], "test-model");
+    assert_eq!(data[0]["name"], "Test Model");
+    assert_eq!(data[0]["pricing"]["prompt"], "0.00000015");
+    assert_eq!(data[0]["openrouter"]["slug"], "test-model");
+    assert_eq!(
+        data[0]["capacity"],
+        serde_json::json!([
+            {"type": "concurrency", "unit": "request", "value": 48},
+            {"type": "request", "unit": "request", "per": "minute", "value": 150}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn models_document_without_a_budget_or_rate_declares_no_capacity() {
+    let engine = MockServer::start().await;
+    let source = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "test-model", "name": "Test Model"}]
+        })))
+        .mount(&source)
+        .await;
+    let app = build_gateway(
+        &engine.uri(),
+        GatewayOptions {
+            models_document_url: Some(format!("{}/v1/models", source.uri())),
+            ..Default::default()
+        },
+    );
+    let (status, body) = get_models(app).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["data"][0].get("capacity").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn models_document_falls_back_to_the_engine_list_when_the_source_fails() {
+    let engine = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "test-model", "object": "model", "owned_by": "sglang"}]
+        })))
+        .expect(2)
+        .mount(&engine)
+        .await;
+    let source = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&source)
+        .await;
+
+    // Source down: the engine list is served.
+    let app = build_gateway(
+        &engine.uri(),
+        GatewayOptions {
+            models_document_url: Some(format!("{}/v1/models", source.uri())),
+            admission_max_inflight: 48,
+            ..Default::default()
+        },
+    );
+    let (status, body) = get_models(app).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"][0]["owned_by"], "sglang");
+    assert!(body["data"][0].get("capacity").is_none());
+
+    // Source serving a document that lacks this model: same fallback.
+    let empty = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "other-model"}]
+        })))
+        .mount(&empty)
+        .await;
+    let app = build_gateway(
+        &engine.uri(),
+        GatewayOptions {
+            models_document_url: Some(format!("{}/v1/models", empty.uri())),
+            ..Default::default()
+        },
+    );
+    let (status, body) = get_models(app).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"][0]["owned_by"], "sglang");
 }

@@ -81,7 +81,11 @@ pub async fn run_startup_checks(
     let mut any_passed = false;
     let mut last_error = None;
 
-    for base_url in &config.backend_urls {
+    for base_url in config
+        .backend_urls
+        .iter()
+        .chain(&config.backend_long_context_urls)
+    {
         let base = base_url.trim_end_matches('/');
         let models_url = format!("{base}/v1/models");
         let chat_url = format!("{base}/v1/chat/completions");

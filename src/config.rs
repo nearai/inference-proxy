@@ -747,6 +747,16 @@ impl Config {
                 "VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS must list one probe URL per VLLM_BACKEND_LONG_CONTEXT_URLS entry when VLLM_BACKEND_PROBE_URLS is set, and none when it is not"
             );
         }
+        let mut seen = std::collections::HashSet::new();
+        if let Some(twice) = backend_probe_urls
+            .iter()
+            .chain(&backend_long_context_probe_urls)
+            .find(|url| !seen.insert(*url))
+        {
+            anyhow::bail!(
+                "{twice} is listed twice across VLLM_BACKEND_PROBE_URLS and VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS: a host serving both tiers has two pool entries but one engine, which would be counted twice"
+            );
+        }
         if !backend_long_context_urls.is_empty() && vllm_data_parallel_size.is_some() {
             anyhow::bail!(
                 "VLLM_BACKEND_LONG_CONTEXT_URLS and VLLM_DATA_PARALLEL_SIZE are mutually exclusive; data-parallel affinity serves one backend"
@@ -1337,6 +1347,10 @@ mod tests {
                 Config::from_env().unwrap().pool_probe_urls(),
                 ["http://p1:8000", "http://p2:8000", "http://p3:8000"]
             );
+            // A host serving both tiers has two pool entries but one engine.
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS", "http://p2:8000");
+            assert!(err().contains("twice"), "{}", err());
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS", "http://p3:8000");
             // Long probes alone would poll a tier nothing else is polled for.
             env::remove_var("VLLM_BACKEND_PROBE_URLS");
             assert!(

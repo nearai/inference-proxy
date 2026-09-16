@@ -150,7 +150,10 @@ pub struct AdmissionController {
     /// Live engine view per backend when `VLLM_BACKEND_PROBE_URLS` is set.
     engine: Arc<EngineLoad>,
     epoch: Instant,
-    queue_tripped: AtomicBool,
+    /// Latched "every backend queues" state, one per tier: the verdict is
+    /// computed over the request's own tier, so a single flag would flap
+    /// between a queueing base fleet and an idle long host.
+    queue_tripped: [AtomicBool; 2],
 }
 
 impl AdmissionController {
@@ -184,7 +187,7 @@ impl AdmissionController {
             backpressure: (0..backend_count).map(|_| AtomicU64::new(0)).collect(),
             engine,
             epoch: now,
-            queue_tripped: AtomicBool::new(false),
+            queue_tripped: [AtomicBool::new(false), AtomicBool::new(false)],
         }
     }
 
@@ -287,8 +290,12 @@ impl AdmissionController {
             return Ok(());
         };
         // Overload first, so a signal that just arrived cannot be preceded by
-        // a ramp step that treats the interval as clean.
-        if self.ttft_over_bound(config, now) {
+        // a ramp step that treats the interval as clean. The window holds base
+        // requests only (a long prefill is no lane observation), so its
+        // verdict says nothing about an oversized request the long tier may
+        // well have room for.
+        let long_request = tier.is_some_and(|tier| tier.estimated == ContextTier::Long);
+        if !long_request && self.ttft_over_bound(config, now) {
             return Err(self.reject(RejectReason::Ttft));
         }
         if self.every_backend_queued(config, pool, tier.and_then(|tier| tier.restrict), now) {
@@ -522,15 +529,18 @@ impl AdmissionController {
             }
         }
         let queued = healthy > 0 && all_queued;
-        if queued != self.queue_tripped.swap(queued, Ordering::Relaxed) {
+        let latch = &self.queue_tripped[usize::from(tier == Some(ContextTier::Long))];
+        if queued != latch.swap(queued, Ordering::Relaxed) {
+            let tier = tier.map_or("any", ContextTier::as_str);
             if queued {
                 warn!(
+                    tier,
                     healthy_backends = healthy,
                     ttl_secs = config.backpressure_ttl.as_secs(),
                     "Every backend rejected at engine admission recently, refusing new work"
                 );
             } else {
-                info!("A backend accepts lane work again");
+                info!(tier, "A backend accepts lane work again");
             }
         }
         queued
@@ -1145,6 +1155,35 @@ mod tests {
         permit.release_at(t0 + Duration::from_secs(60));
         std::mem::forget(permit);
         assert_eq!(c.ttft_totals(t0 + Duration::from_secs(60)), (1, 1));
+    }
+
+    #[test]
+    fn the_ttft_breaker_does_not_refuse_long_context_requests() {
+        let c = controller(config(), 1);
+        let p = pool(1);
+        let t0 = Instant::now();
+        // Trip the breaker on base traffic: 20 samples, two of them slow.
+        for i in 0..18 {
+            sample(
+                &c,
+                &p,
+                t0 + Duration::from_millis(i),
+                Duration::from_secs(1),
+            );
+        }
+        for _ in 0..2 {
+            sample(&c, &p, t0, Duration::from_secs(40));
+        }
+        let t1 = t0 + Duration::from_secs(41);
+        assert_eq!(
+            c.try_admit_at(&p, None, t1).unwrap_err().reason,
+            RejectReason::Ttft
+        );
+        // An oversized request is not what the window measured, and the long
+        // tier may well have room: it is still admitted.
+        assert!(c
+            .try_admit_at(&p, tier(ContextTier::Long, Some(ContextTier::Long)), t1)
+            .is_ok());
     }
 
     #[test]

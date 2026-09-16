@@ -184,6 +184,11 @@ const RESERVE_ATTEMPTS: usize = 16;
 /// Pool of backends for the same model, with least-connections selection.
 pub struct BackendPool {
     backends: Vec<Arc<Backend>>,
+    /// `Some(Base)` once a long-context tier exists: traffic that carries no
+    /// tier of its own (tokenize, media, models, health probes) stays off the
+    /// long hosts, which are idle by design and would otherwise attract all
+    /// of it. `None` for an untiered pool.
+    untiered: Option<ContextTier>,
 }
 
 impl BackendPool {
@@ -197,6 +202,7 @@ impl BackendPool {
     /// probes, affinity assignments — is unaffected by the tier's existence.
     pub fn with_long_context(base_urls: Vec<String>, long_urls: Vec<String>) -> Self {
         assert!(!base_urls.is_empty(), "at least one backend URL required");
+        let untiered = (!long_urls.is_empty()).then_some(ContextTier::Base);
         let backends = base_urls
             .into_iter()
             .map(|u| Arc::new(Backend::new(u, ContextTier::Base)))
@@ -206,7 +212,7 @@ impl BackendPool {
                     .map(|u| Arc::new(Backend::new(u, ContextTier::Long))),
             )
             .collect();
-        Self { backends }
+        Self { backends, untiered }
     }
 
     /// Number of backends in the pool.
@@ -219,16 +225,21 @@ impl BackendPool {
         self.backends.is_empty()
     }
 
-    /// Select a backend using least-connections among healthy backends.
-    /// If all are unhealthy, picks the least-loaded one anyway. No slot is
-    /// reserved; callers create their own `BackendGuard`.
+    /// Select a backend using least-connections among healthy backends of the
+    /// untiered half of the pool (see `untiered`). If all are unhealthy, picks
+    /// the least-loaded one anyway. No slot is reserved; callers create their
+    /// own `BackendGuard`.
     pub fn select(&self) -> Arc<Backend> {
         let conns = |_: usize, backend: &Backend| backend.active_conns.load(Ordering::Relaxed);
+        let usable = |backend: &Backend| backend.in_tier(self.untiered);
         let index = self
-            .least_index(|_, backend| backend.healthy.load(Ordering::Relaxed), conns)
+            .least_index(
+                |_, backend| usable(backend) && backend.healthy.load(Ordering::Relaxed),
+                conns,
+            )
             .unwrap_or_else(|| {
-                self.least_index(|_, _| true, conns)
-                    .expect("backends is non-empty")
+                self.least_index(|_, backend| usable(backend), conns)
+                    .expect("the pool always has a base backend")
             });
         self.backends[index].clone()
     }
@@ -913,6 +924,27 @@ mod tests {
             tier: Some(tier),
             ..Policy::NONE
         }
+    }
+
+    #[test]
+    fn test_untiered_traffic_stays_off_the_long_hosts() {
+        let pool = tiered();
+        // Least-connections alone would send tokenize, media and health
+        // probes to the idle long host; they stay on the base fleet.
+        set_conns(&pool, 0, 4);
+        set_conns(&pool, 1, 4);
+        assert_eq!(pool.select().base_url, "http://b1:8000");
+        pool.backends()[0].healthy.store(false, Ordering::Relaxed);
+        pool.backends()[1].healthy.store(false, Ordering::Relaxed);
+        assert_eq!(
+            pool.select().base_url,
+            "http://b1:8000",
+            "an unhealthy base fleet still serves its own traffic"
+        );
+        // An untiered pool is unaffected.
+        let plain = two_backends();
+        set_conns(&plain, 0, 4);
+        assert_eq!(plain.select().base_url, "http://b2:8000");
     }
 
     #[test]

@@ -257,15 +257,26 @@ body is not touched either: `model` stays the canonical id on both domains.
 
 cloud-api routes to the tier from the model row's `long_context`
 providerConfig; the gateway bypasses cloud-api, so it makes the same decision
-itself and mirrors cloud-api's estimate (`estimate_input_tokens`): the byte
-length of the request's text divided by four (`prompt` token ids count
-exactly), multiplied by cloud-api's 1.2 safety factor, and strictly above
-`VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` means the long tier. cloud-api
-additionally refines that near the boundary with an exact `POST /v1/tokenize`;
-the gateway deliberately does not — a tokenizer dependency and an extra
-upstream round trip are not worth it for a placement that is a preference
-rather than a correctness rule. Both tiers run the same engine with the same
-context length, so a request on the "wrong" tier still succeeds.
+itself and mirrors the estimate cloud-api routes with
+(`inference_provider_pool::context_routing::estimate_input` plus the `required`
+computation next to it):
+
+```text
+countable = (message text + serialized tool_calls + serialized tools) / 4
+uncounted = media parts × 1024 + messages × 4
+required  = ceil(countable × 1.2) + uncounted + max_tokens reserve
+```
+
+`required` strictly above `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` means the
+long tier. The 1.2 safety factor covers the byte estimate only — media parts,
+template overhead, the reserved output window and `/v1/completions` token ids
+are already token counts. Tool definitions and tool-call arguments are counted
+because the lane's traffic is agentic, where they are most of the prompt.
+cloud-api additionally refines the decision near the boundary with an exact
+`POST /v1/tokenize`; the gateway deliberately does not — a tokenizer dependency
+and an extra upstream round trip are not worth it for a placement that is a
+preference rather than a correctness rule. Both tiers run the same engine with
+the same context length, so a request on the "wrong" tier still succeeds.
 
 Everything downstream of the decision is restricted to the request's tier:
 placement, the connection fail-over, and the fleet-wide "every backend is
@@ -275,6 +286,15 @@ queueing" refusal. The consequences are deliberate:
   whole pool. With 3 base hosts, 1 long host and a budget of 48 the long host
   holds at most 12 lane requests, which is about what its KV cache fits for
   200k-token prompts. The budget is the lever; there is no separate knob.
+  Note that adding the tier also lowers each base host's share
+  (`ceil(48/3) = 16` becomes `ceil(48/4) = 12`), so the base fleet's ceiling
+  drops from 48 to 36 with the remaining 12 reserved for oversized prompts:
+  raise `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` if it needs its old headroom.
+- **Untiered traffic stays on the base fleet.** `/tokenize`, media, `/v1/models`
+  and the health probe carry no size of their own; they would all land on the
+  idle long host under least-connections, so they are restricted to the base
+  backends (cloud-api keeps its tokenize traffic off that host for the same
+  reason). The pool health checker still probes every backend.
 - **Full is a refusal, not a spill.** A long-tier host at its share or steered
   around (engine queue, recent engine rejection) means `429` + `Retry-After`
   for the next oversized request — keeping those prefills off the base fleet is

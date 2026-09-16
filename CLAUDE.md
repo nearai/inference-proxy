@@ -99,7 +99,10 @@ event, not a status),
 `MODEL_NAME` plus declared `capacity`), the lane admission budget
 (`VLLM_PROXY_ADMISSION_*`, `admission.rs`: in-flight budget with a ramp, per-host
 share, refusal on observed TTFT/engine back-pressure — 429 + `Retry-After` before
-dispatch) and `VLLM_BACKEND_CONNECT_FAILOVER` (one retry on another backend, only
+dispatch), the long-context tier (`VLLM_BACKEND_LONG_CONTEXT_URLS` +
+`_PROBE_URLS` + `_ABOVE_TOKENS`, `context_tier.rs`: oversized prompts go to
+backends registered under the model's `-long` domain, estimated as cloud-api
+does it) and `VLLM_BACKEND_CONNECT_FAILOVER` (one retry on another backend, only
 when the connection itself fails) are the opt-in policies. All default to the
 in-CVM behavior. Request priority (`priority.rs`, no CVM config): every
 chat/completions body gets `priority` set by the proxy — the `X-NearAI-Priority`

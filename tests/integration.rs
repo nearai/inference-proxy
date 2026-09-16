@@ -4082,6 +4082,89 @@ async fn test_tool_call_arguments_are_normalized_before_dispatch() {
     // The mock expectation (body_json) verifies the backend received the repaired history
 }
 
+/// Matches a chat body whose first assistant tool call carries exactly these
+/// plaintext `function.arguments`.
+struct FirstToolCallArguments(&'static str);
+
+impl wiremock::Match for FirstToolCallArguments {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        let Ok(body) = serde_json::from_slice::<serde_json::Value>(&request.body) else {
+            return false;
+        };
+        body["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|m| m["tool_calls"][0]["function"]["arguments"].as_str())
+            .any(|arguments| arguments == self.0)
+    }
+}
+
+#[tokio::test]
+async fn test_tool_call_arguments_are_normalized_after_decryption() {
+    use vllm_proxy_rs::encryption;
+
+    // With `X-Encrypt-All-Fields: true` the tool-call arguments arrive as
+    // ciphertext. Normalisation must judge the plaintext (here an empty
+    // string, repaired to `{}`), never the hex, or the backend would receive
+    // a wrapped ciphertext it cannot use.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(FirstToolCallArguments("{}"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-enc-tc",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 1}
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+    let client_pair = test_client_signing_pair();
+    let server_pub_bytes = hex::decode(test_ed25519_pub_key_hex()).unwrap();
+    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
+    let enc = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: server_pub_bytes,
+        version: 1,
+        encrypt_all_fields: true,
+    };
+    let seal = |plain: &str| encryption::encrypt_string(plain, &enc, &client_pair).unwrap();
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [
+            {"role": "user", "content": seal("time?")},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": seal("get_time"), "arguments": seal("")}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": seal("12:00")}
+        ],
+        "stream": false
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header("x-signing-algo", "ed25519")
+                .header("x-client-pub-key", &client_pub_hex)
+                .header("x-encrypt-all-fields", "true")
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    // The mock expectation verifies the backend saw the repaired plaintext.
+}
+
 // ---- Response ID generation ----
 
 #[tokio::test]

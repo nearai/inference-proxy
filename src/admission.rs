@@ -577,6 +577,12 @@ impl Permit {
         self.mark_dispatched_at(Instant::now());
     }
 
+    /// When the request went out, i.e. when its time-to-first-token clock
+    /// started. `None` until it is dispatched.
+    pub fn dispatched_at(&self) -> Option<Instant> {
+        self.dispatched_at.get().copied()
+    }
+
     pub(crate) fn mark_dispatched_at(&self, now: Instant) {
         if self
             .state

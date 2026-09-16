@@ -137,7 +137,10 @@ upstream:
    polled every two seconds; a host with a non-empty queue is steered around,
    and once every healthy host queues, new work is refused (reason
    `backend_queue`). Then two signals the gateway measures on its own traffic.
-   Time to first generation: over the last minute, at least 20 lane requests
+   Time to first generation, measured from the moment the request is sent
+   upstream (the engine sends its SSE headers only once it has something to
+   say, so measuring from the response would skip the queueing and prefill
+   wait): over the last minute, at least 20 lane requests
    reached the engine and 5 % of them (at least two) waited longer than
    `VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS` for their first generation event — a
    request that ends (client gone, idle timeout) before generating counts with

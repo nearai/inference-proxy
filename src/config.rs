@@ -293,6 +293,14 @@ pub struct Config {
     /// first event on an HTTP 200 stream; peeking turns that into a real
     /// error status instead of a 200 that fails mid-stream.
     pub stream_error_peek_ms: u64,
+    /// Commit `200 text/event-stream` to the client after this many
+    /// milliseconds even when the upstream has not answered yet, so the
+    /// keep-alive comments can start during a long prefill (an engine sends
+    /// its response headers only with its first event). Zero disables it and
+    /// the status always comes from the upstream. A failure that arrives after
+    /// the commit is delivered as a terminal SSE `error` event instead of a
+    /// status code, so set this above the slowest error a deployment produces.
+    pub stream_commit_ms: u64,
     /// Chat content part `type`s refused with 400 before dispatch
     /// (`VLLM_PROXY_REJECTED_CONTENT_PART_TYPES`, e.g. `video_url,input_audio,file`).
     pub rejected_content_part_types: Vec<String>,
@@ -767,6 +775,7 @@ impl Config {
             non_tee_deployment: env_bool("NON_TEE_DEPLOYMENT"),
             map_queue_full_to_429: env_bool("VLLM_PROXY_MAP_QUEUE_FULL_TO_429"),
             stream_error_peek_ms: env_int("VLLM_PROXY_STREAM_ERROR_PEEK_MS", 0) as u64,
+            stream_commit_ms: env_int("VLLM_PROXY_STREAM_COMMIT_MS", 0) as u64,
             rejected_content_part_types,
             models_document_url,
             capacity_requests_per_minute,
@@ -1071,6 +1080,7 @@ mod tests {
             assert!(!config.non_tee_deployment);
             assert!(!config.map_queue_full_to_429);
             assert_eq!(config.stream_error_peek_ms, 0);
+            assert_eq!(config.stream_commit_ms, 0);
             assert!(config.rejected_content_part_types.is_empty());
             assert!(config.allowed_org_ids.is_empty());
             assert_eq!(config.sse_keepalive_secs, 0);

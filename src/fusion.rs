@@ -1509,6 +1509,7 @@ async fn finish_response(
         sse_keepalive_secs: ctx.state.config.sse_keepalive_secs,
         map_queue_full_to_429: ctx.state.config.map_queue_full_to_429,
         stream_error_peek_ms: ctx.state.config.stream_error_peek_ms,
+        stream_commit_ms: ctx.state.config.stream_commit_ms,
         response_shape: ResponseShape::ChatCompletion,
         tracing_ids: Some(ctx.tracing_ids),
         upstream_data_parallel_rank: None,

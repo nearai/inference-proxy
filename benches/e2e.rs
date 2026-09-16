@@ -100,6 +100,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         non_tee_deployment: false,
         map_queue_full_to_429: false,
         stream_error_peek_ms: 0,
+        stream_commit_ms: 0,
         rejected_content_part_types: Vec::new(),
         models_document_url: None,
         capacity_requests_per_minute: 0,

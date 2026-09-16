@@ -25,6 +25,7 @@ struct GatewayOptions {
     non_tee_deployment: bool,
     map_queue_full_to_429: bool,
     stream_error_peek_ms: u64,
+    stream_commit_ms: u64,
     rejected_content_part_types: Vec<String>,
     allowed_org_ids: Vec<String>,
     sse_keepalive_secs: u64,
@@ -126,6 +127,7 @@ fn build_gateway(mock_url: &str, options: GatewayOptions) -> axum::Router {
         non_tee_deployment: options.non_tee_deployment,
         map_queue_full_to_429: options.map_queue_full_to_429,
         stream_error_peek_ms: options.stream_error_peek_ms,
+        stream_commit_ms: options.stream_commit_ms,
         rejected_content_part_types: options.rejected_content_part_types,
         models_document_url: options.models_document_url.clone(),
         capacity_requests_per_minute: options.capacity_requests_per_minute,
@@ -1976,4 +1978,217 @@ async fn reasoning_object_is_left_alone_outside_gateway_mode() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     mock.verify().await;
+}
+
+// ---------------------------------------------------------------------------
+// Committing the stream before the upstream answers (long prefill)
+// ---------------------------------------------------------------------------
+
+/// Backend that withholds its response *headers* for `delay` — the shape of an
+/// engine prefilling a long prompt, which sends nothing at all until it has its
+/// first token — and then answers with `status` and `body`.
+async fn spawn_delayed_response_backend(
+    delay: Duration,
+    status: u16,
+    content_type: &'static str,
+    body: &'static str,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use axum::routing::post;
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        post(move || async move {
+            tokio::time::sleep(delay).await;
+            axum::response::Response::builder()
+                .status(status)
+                .header("content-type", content_type)
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), handle)
+}
+
+fn stream_request() -> Request<Body> {
+    chat_request(serde_json::json!({
+        "model": "test-model",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hello"}]
+    }))
+}
+
+const ONE_TOKEN_STREAM: &str = concat!(
+    "data: {\"id\":\"chatcmpl-c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+    "data: {\"id\":\"chatcmpl-c\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n",
+    "data: [DONE]\n\n",
+);
+
+/// Collect the frames of a committed stream in arrival order.
+async fn stream_frames(response: axum::response::Response) -> Vec<String> {
+    let mut body = response.into_body();
+    let mut frames = Vec::new();
+    while let Some(frame) = body.frame().await {
+        if let Ok(data) = frame.unwrap().into_data() {
+            frames.push(String::from_utf8_lossy(&data).to_string());
+        }
+    }
+    frames
+}
+
+#[tokio::test]
+async fn stream_is_committed_with_keepalives_while_the_engine_prefills() {
+    let (backend, handle) = spawn_delayed_response_backend(
+        Duration::from_millis(2500),
+        200,
+        "text/event-stream",
+        ONE_TOKEN_STREAM,
+    )
+    .await;
+    let app = build_gateway(
+        &backend,
+        GatewayOptions {
+            stream_commit_ms: 300,
+            sse_keepalive_secs: 1,
+            stream_error_peek_ms: 1000,
+            ..Default::default()
+        },
+    );
+
+    let started = std::time::Instant::now();
+    let response = app.oneshot(stream_request()).await.unwrap();
+    let committed_after = started.elapsed();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream")
+    );
+    // Committed on the window, not on the engine: headers are out long before
+    // the backend has anything to say.
+    assert!(
+        committed_after < Duration::from_millis(1500),
+        "expected the response before the backend answered, took {committed_after:?}"
+    );
+
+    let frames = stream_frames(response).await;
+    let joined = frames.concat();
+    assert!(joined.contains("data: [DONE]"), "{joined}");
+    assert!(joined.contains("\"content\":\"hi\""), "{joined}");
+    let first_data = frames
+        .iter()
+        .position(|f| f.starts_with("data:"))
+        .expect("a data frame");
+    let keepalives = frames[..first_data]
+        .iter()
+        .filter(|f| f.as_str() == ": keep-alive\n\n")
+        .count();
+    assert!(
+        keepalives >= 1,
+        "expected keep-alives during the 2.5s prefill, got {keepalives}: {frames:?}"
+    );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn an_upstream_failure_after_the_commit_becomes_a_terminal_stream_event() {
+    // The trade the commit window makes: past it, the status is already 200,
+    // so the engine's rejection has to travel as an SSE error event.
+    let (backend, handle) = spawn_delayed_response_backend(
+        Duration::from_millis(1200),
+        503,
+        "application/json",
+        QUEUE_FULL_BODY,
+    )
+    .await;
+    let app = build_gateway(
+        &backend,
+        GatewayOptions {
+            stream_commit_ms: 200,
+            map_queue_full_to_429: true,
+            sse_keepalive_secs: 1,
+            ..Default::default()
+        },
+    );
+
+    let response = app.oneshot(stream_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let joined = stream_frames(response).await.concat();
+    let event = joined
+        .lines()
+        .find(|l| l.starts_with("data: {"))
+        .expect("an error event");
+    let parsed: serde_json::Value =
+        serde_json::from_str(event.trim_start_matches("data: ")).unwrap();
+    assert_eq!(parsed["error"]["message"], "The request queue is full.");
+    assert_eq!(parsed["error"]["type"], "overloaded");
+    assert!(joined.ends_with("data: [DONE]\n\n"), "{joined}");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn an_upstream_failure_inside_the_window_is_still_a_status_code() {
+    let (backend, handle) = spawn_delayed_response_backend(
+        Duration::from_millis(50),
+        503,
+        "application/json",
+        QUEUE_FULL_BODY,
+    )
+    .await;
+    let app = build_gateway(
+        &backend,
+        GatewayOptions {
+            stream_commit_ms: 3000,
+            map_queue_full_to_429: true,
+            ..Default::default()
+        },
+    );
+
+    let response = app.oneshot(stream_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+        Some("2")
+    );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn without_a_commit_window_a_slow_upstream_still_decides_the_status() {
+    // Every in-CVM deployment: nothing is sent until the upstream has answered,
+    // however long that takes.
+    let (backend, handle) = spawn_delayed_response_backend(
+        Duration::from_millis(700),
+        503,
+        "application/json",
+        QUEUE_FULL_BODY,
+    )
+    .await;
+    let app = build_gateway(
+        &backend,
+        GatewayOptions {
+            map_queue_full_to_429: true,
+            sse_keepalive_secs: 1,
+            ..Default::default()
+        },
+    );
+
+    let started = std::time::Instant::now();
+    let response = app.oneshot(stream_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        started.elapsed() >= Duration::from_millis(600),
+        "the handler must wait for the upstream when no window is set"
+    );
+    handle.abort();
 }

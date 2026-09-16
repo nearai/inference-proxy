@@ -292,10 +292,11 @@ impl AdmissionController {
         // Overload first, so a signal that just arrived cannot be preceded by
         // a ramp step that treats the interval as clean. The window holds base
         // requests only (a long prefill is no lane observation), so its
-        // verdict says nothing about an oversized request the long tier may
-        // well have room for.
-        let long_request = tier.is_some_and(|tier| tier.estimated == ContextTier::Long);
-        if !long_request && self.ttft_over_bound(config, now) {
+        // verdict says nothing about a request that is actually going to the
+        // long tier — but it does apply to one that fell back onto the base
+        // fleet, which is the fleet the breaker just declared overloaded.
+        let on_long_tier = tier.is_some_and(|tier| tier.restrict == Some(ContextTier::Long));
+        if !on_long_tier && self.ttft_over_bound(config, now) {
             return Err(self.reject(RejectReason::Ttft));
         }
         if self.every_backend_queued(config, pool, tier.and_then(|tier| tier.restrict), now) {
@@ -1179,11 +1180,19 @@ mod tests {
             c.try_admit_at(&p, None, t1).unwrap_err().reason,
             RejectReason::Ttft
         );
-        // An oversized request is not what the window measured, and the long
-        // tier may well have room: it is still admitted.
+        // An oversized request bound for the long tier is not what the window
+        // measured, and that host may well have room: it is still admitted.
         assert!(c
             .try_admit_at(&p, tier(ContextTier::Long, Some(ContextTier::Long)), t1)
             .is_ok());
+        // One that fell back onto the base fleet, though, is going exactly
+        // where the breaker is tripped.
+        assert_eq!(
+            c.try_admit_at(&p, tier(ContextTier::Long, None), t1)
+                .unwrap_err()
+                .reason,
+            RejectReason::Ttft
+        );
     }
 
     #[test]

@@ -747,14 +747,12 @@ impl Config {
                 "VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS must list one probe URL per VLLM_BACKEND_LONG_CONTEXT_URLS entry when VLLM_BACKEND_PROBE_URLS is set, and none when it is not"
             );
         }
-        let mut seen = std::collections::HashSet::new();
-        if let Some(twice) = backend_probe_urls
+        if let Some(twice) = backend_long_context_probe_urls
             .iter()
-            .chain(&backend_long_context_probe_urls)
-            .find(|url| !seen.insert(*url))
+            .find(|url| backend_probe_urls.contains(url))
         {
             anyhow::bail!(
-                "{twice} is listed twice across VLLM_BACKEND_PROBE_URLS and VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS: a host serving both tiers has two pool entries but one engine, which would be counted twice"
+                "{twice} is listed in both VLLM_BACKEND_PROBE_URLS and VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS: a host serving both tiers has two pool entries but one engine, which the share and the engine samples would count twice"
             );
         }
         if !backend_long_context_urls.is_empty() && vllm_data_parallel_size.is_some() {
@@ -1311,6 +1309,11 @@ mod tests {
             gateway_env_cleanup();
             let err = || Config::from_env().unwrap_err().to_string();
             env::set_var("VLLM_BACKEND_URLS", "https://m-b1.test,https://m-b2.test");
+            // Without the tier nothing changes, repeated probe URLs included
+            // (two proxies in front of one engine is a deployment's business).
+            env::set_var("VLLM_BACKEND_PROBE_URLS", "http://p1:8000,http://p1:8000");
+            assert!(Config::from_env().is_ok());
+            env::remove_var("VLLM_BACKEND_PROBE_URLS");
             // The tier and its threshold only make sense together.
             env::set_var("VLLM_BACKEND_LONG_CONTEXT_URLS", "https://m-long-b3.test");
             assert!(
@@ -1349,7 +1352,7 @@ mod tests {
             );
             // A host serving both tiers has two pool entries but one engine.
             env::set_var("VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS", "http://p2:8000");
-            assert!(err().contains("twice"), "{}", err());
+            assert!(err().contains("both"), "{}", err());
             env::set_var("VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS", "http://p3:8000");
             // Long probes alone would poll a tier nothing else is polled for.
             env::remove_var("VLLM_BACKEND_PROBE_URLS");

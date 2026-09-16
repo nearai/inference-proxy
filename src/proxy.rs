@@ -1063,7 +1063,7 @@ async fn send_upstream(
             // The failed host may have been its tier's last one: re-resolve
             // the restriction now that it is out of the rotation, so the
             // request falls back to the other tier instead of being refused.
-            let tier = tier.and_then(|tier| crate::context_tier::restriction(&pool, tier));
+            let tier = tier.and_then(|tier| crate::context_tier::recheck_restriction(&pool, tier));
             // The share is recomputed for the pool as it is now (one host
             // fewer), and recently saturated hosts are steered around.
             let max_conns = opts

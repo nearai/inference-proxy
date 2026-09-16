@@ -107,7 +107,7 @@ pub async fn completions(
     let host_share = state
         .admission
         .host_share(state.backend_pool.healthy_count());
-    let restrict = tier.and_then(|tier| tier.restrict);
+    let mut restrict = tier.and_then(|tier| tier.restrict);
     let place = |tier| {
         let policy = backend_pool::Policy {
             max_conns: host_share,
@@ -119,15 +119,19 @@ pub async fn completions(
             .backend_affinity
             .place(&state.backend_pool, None, "/v1/completions", &policy)
     };
-    let placement = place(restrict)
-        .or_else(|| match restrict {
-            // See the chat route: a tier that just emptied falls back.
-            Some(tier) if crate::context_tier::restriction(&state.backend_pool, tier).is_none() => {
-                place(None)
-            }
-            _ => None,
+    // See the chat route: a tier that just emptied falls back, and `restrict`
+    // follows the placement.
+    let mut placement = place(restrict);
+    if placement.is_none()
+        && restrict.is_some_and(|tier| {
+            crate::context_tier::recheck_restriction(&state.backend_pool, tier).is_none()
         })
-        .ok_or_else(|| AppError::from(state.admission.reject(RejectReason::HostShare)))?;
+    {
+        restrict = None;
+        placement = place(None);
+    }
+    let placement =
+        placement.ok_or_else(|| AppError::from(state.admission.reject(RejectReason::HostShare)))?;
     if let Some(permit) = permit.as_ref() {
         permit.attach_backend(placement.index);
     }

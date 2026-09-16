@@ -32,6 +32,13 @@
 //! placement that is a preference, not a correctness rule (both tiers run the
 //! same engine with the same context length, so the "wrong" tier still
 //! answers).
+//!
+//! Two small differences from cloud-api remain by construction: the gateway
+//! serializes the incoming `tool_calls`/`tools` values where cloud-api
+//! serializes its own typed structs, and it measures after
+//! `tool_calls::normalize_tool_call_arguments` has repaired the history, so
+//! byte counts can differ slightly at the boundary — far less than the
+//! tokenize refinement the gateway skips anyway.
 
 use serde_json::Value;
 use tracing::debug;
@@ -206,14 +213,12 @@ pub fn decide(
     let estimated = estimate.tier(above_tokens);
     let restrict = restriction(pool, estimated);
     metrics::histogram!("request_estimated_prompt_tokens").record(estimate.tokens() as f64);
-    if restrict.is_some() {
-        metrics::counter!(
-            "backend_tier_requests_total",
-            "tier" => estimated.as_str(),
-            "outcome" => "routed"
-        )
-        .increment(1);
-    }
+    metrics::counter!(
+        "backend_tier_requests_total",
+        "tier" => estimated.as_str(),
+        "outcome" => if restrict.is_some() { "routed" } else { "fallback" }
+    )
+    .increment(1);
     debug!(
         estimated_tokens = estimate.tokens(),
         tier = estimated.as_str(),
@@ -226,22 +231,29 @@ pub fn decide(
     })
 }
 
-/// The restriction to apply right now: `tier` while it still has a healthy
-/// backend, `None` once it has none — an empty tier falls back to the other
-/// one rather than refusing, since both run the same engine. Re-resolved
-/// whenever the pool may have changed under the request (a connection
-/// fail-over takes a host out of the rotation); the fallback is counted here.
+/// The restriction to apply: `tier` while it still has a healthy backend,
+/// `None` once it has none — an empty tier falls back to the other one rather
+/// than refusing, since both run the same engine.
 pub fn restriction(pool: &BackendPool, tier: ContextTier) -> Option<ContextTier> {
-    if pool.healthy_count_in(Some(tier)) > 0 {
-        return Some(tier);
+    (pool.healthy_count_in(Some(tier)) > 0).then_some(tier)
+}
+
+/// The same, re-resolved after the pool may have changed under a request that
+/// was already routed: a connection fail-over marks a host unreachable, or a
+/// placement loses the race with one. A tier that emptied in the meantime is
+/// counted as `fallback_late`, apart from the one outcome `decide` records
+/// per request.
+pub fn recheck_restriction(pool: &BackendPool, tier: ContextTier) -> Option<ContextTier> {
+    let restrict = restriction(pool, tier);
+    if restrict.is_none() {
+        metrics::counter!(
+            "backend_tier_requests_total",
+            "tier" => tier.as_str(),
+            "outcome" => "fallback_late"
+        )
+        .increment(1);
     }
-    metrics::counter!(
-        "backend_tier_requests_total",
-        "tier" => tier.as_str(),
-        "outcome" => "fallback"
-    )
-    .increment(1);
-    None
+    restrict
 }
 
 #[cfg(test)]

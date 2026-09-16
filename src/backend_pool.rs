@@ -226,20 +226,23 @@ impl BackendPool {
     }
 
     /// Select a backend using least-connections among healthy backends of the
-    /// untiered half of the pool (see `untiered`). If all are unhealthy, picks
-    /// the least-loaded one anyway. No slot is reserved; callers create their
-    /// own `BackendGuard`.
+    /// untiered half of the pool (see `untiered`). If none is healthy, picks
+    /// the least-loaded backend of the whole pool anyway — a healthy long host
+    /// beats a dead base one when the fleet is down, and `/healthz` must not
+    /// report 503 while the gateway still answers through the fallback. No
+    /// slot is reserved; callers create their own `BackendGuard`.
     pub fn select(&self) -> Arc<Backend> {
         let conns = |_: usize, backend: &Backend| backend.active_conns.load(Ordering::Relaxed);
-        let usable = |backend: &Backend| backend.in_tier(self.untiered);
         let index = self
             .least_index(
-                |_, backend| usable(backend) && backend.healthy.load(Ordering::Relaxed),
+                |_, backend| {
+                    backend.in_tier(self.untiered) && backend.healthy.load(Ordering::Relaxed)
+                },
                 conns,
             )
             .unwrap_or_else(|| {
-                self.least_index(|_, backend| usable(backend), conns)
-                    .expect("the pool always has a base backend")
+                self.least_index(|_, _| true, conns)
+                    .expect("backends is non-empty")
             });
         self.backends[index].clone()
     }
@@ -393,13 +396,13 @@ impl BackendPool {
             Some(index) => index,
             // Everything unhealthy: degrade to the least-loaded backend that is
             // not avoided rather than refusing every request (a probe will
-            // re-mark them). Never for a bounded or fail-over selection.
-            None if degrade_when_all_unhealthy => self.least_index(
-                |index, backend| {
-                    !avoid(index) && under_bound(backend) && backend.in_tier(policy.tier)
-                },
-                load,
-            )?,
+            // re-mark them). Never for a bounded or fail-over selection, and
+            // never inside a tier restriction — a host known to be down is
+            // worse than the other tier, which the caller reaches by placing
+            // again without the restriction.
+            None if degrade_when_all_unhealthy && policy.tier.is_none() => {
+                self.least_index(|index, backend| !avoid(index) && under_bound(backend), load)?
+            }
             None => return None,
         };
         let Some(preferred_index) = preferred.filter(|index| *index < self.backends.len()) else {
@@ -938,8 +941,8 @@ mod tests {
         pool.backends()[1].healthy.store(false, Ordering::Relaxed);
         assert_eq!(
             pool.select().base_url,
-            "http://b1:8000",
-            "an unhealthy base fleet still serves its own traffic"
+            "http://long:8000",
+            "with the base fleet down, a healthy long host beats a dead base one"
         );
         // An untiered pool is unaffected.
         let plain = two_backends();
@@ -999,6 +1002,36 @@ mod tests {
                 .index,
             1
         );
+    }
+
+    #[test]
+    fn test_a_restricted_tier_never_degrades_onto_an_unhealthy_host() {
+        let pool = tiered();
+        pool.backends()[2].healthy.store(false, Ordering::Relaxed);
+        // Admission off (no share bound), so selection may degrade onto an
+        // unhealthy host — but not inside a tier: the caller places again
+        // without the restriction and reaches the healthy base fleet instead
+        // of a host it knows is down.
+        assert!(pool
+            .select_with_preference_bounded(None, 8, &in_tier(ContextTier::Long))
+            .is_none());
+        assert!(pool
+            .select_with_preference_bounded(Some(2), 8, &in_tier(ContextTier::Long))
+            .is_none());
+        assert_eq!(
+            pool.select_with_preference_bounded(None, 8, &Policy::NONE)
+                .unwrap()
+                .index,
+            0
+        );
+        // With the whole pool down and nothing restricted, degrading is still
+        // better than refusing everything.
+        for backend in pool.backends() {
+            backend.healthy.store(false, Ordering::Relaxed);
+        }
+        assert!(pool
+            .select_with_preference_bounded(None, 8, &Policy::NONE)
+            .is_some());
     }
 
     #[test]

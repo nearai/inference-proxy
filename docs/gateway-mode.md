@@ -240,7 +240,8 @@ back-pressure for the next admission decision
 `admission_backpressure_total{backend}`, `backend_failover_total{outcome}`,
 `upstream_stream_error_events_total{phase}`, `backend_engine_running{backend}`,
 `backend_engine_queued{backend}`, `backend_engine_probe_failures_total{backend}`,
-`backend_tier_requests_total{tier,outcome}`, `request_estimated_prompt_tokens`,
+`backend_tier_requests_total{tier,outcome=routed|fallback|fallback_late}`,
+`request_estimated_prompt_tokens`,
 plus the existing usage-report and upstream metrics.
 
 ## Long-context tier
@@ -302,8 +303,11 @@ queueing" refusal. The consequences are deliberate:
 - **A tier with no healthy backend falls back.** If the wanted tier is down
   entirely the request is placed in the other one rather than refused
   (`backend_tier_requests_total{outcome="fallback"}`), including when its last
-  host goes unreachable mid-request: the connection fail-over re-resolves the
-  restriction after taking that host out of the rotation, and crosses over.
+  host goes unreachable mid-request: both the placement and the connection
+  fail-over re-resolve the restriction after taking that host out of the
+  rotation and cross over, counted `fallback_late` — so each request adds
+  exactly one `routed` or `fallback`, plus a `fallback_late` if its tier died
+  under it.
 - **Conversation affinity crosses tiers.** A conversation pinned on a base host
   that grows past the threshold is placed fresh in the long tier and re-pinned
   there — the same re-prefill cloud-api pays at the boundary.

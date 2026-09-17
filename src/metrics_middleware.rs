@@ -48,5 +48,6 @@ pub async fn metrics_middleware(request: Request<axum::body::Body>, next: Next) 
 
 /// Handler for `GET /metrics` — renders Prometheus text format.
 pub async fn prometheus_metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    state.admission.record_backend_metrics(&state.backend_pool);
     state.metrics_handle.render()
 }

@@ -19,12 +19,16 @@
 //!    flight across the fleet. The budget starts at `start_inflight` and grows
 //!    by `ramp_step` every `ramp_interval` up to `max_inflight`, but only after
 //!    an interval without any overload signal.
-//! 3. **Per-host share.** `ceil(budget / healthy backends)` in flight per
+//! 3. **Per-host share.** By default `ceil(budget / healthy backends)` in flight per
 //!    backend, so a conversation-affinity pin cannot pile the whole budget onto
 //!    one host. Selection (`BackendPool::select_with_preference_bounded`)
 //!    reserves the slot atomically and only on backends under their share: a
 //!    pinned conversation moves when its host is full, and only when no host
 //!    has room is the request refused.
+//!
+//! Opt-in tier borrowing uses configured counts instead: base hosts may each
+//! use ceil(budget / base hosts); long hosts keep a separate ceiling. See
+//! `backend_limits`. The global budget is shared, with no reserved tier slots.
 //!
 //! Everything is derived from what the gateway observes itself; no admin
 //! endpoint or extra token is involved. Disabled (`max_inflight = 0`) the
@@ -67,6 +71,8 @@ const ABANDONED: u8 = 3;
 pub struct AdmissionConfig {
     /// Hard ceiling on lane requests in flight across the fleet.
     pub max_inflight: u32,
+    pub tier_borrowing: bool,
+    pub long_max_inflight_per_host: u32,
     /// Budget at start-up; ramps toward `max_inflight`.
     pub start_inflight: u32,
     /// Budget increase per clean ramp interval.
@@ -227,6 +233,44 @@ impl AdmissionController {
         let budget = self.budget.load(Ordering::Relaxed).max(1);
         let hosts = u32::try_from(healthy_backends.max(1)).unwrap_or(u32::MAX);
         Some(budget.div_ceil(hosts))
+    }
+
+    /// Snapshot limits by destination backend, shared by placement and failover.
+    /// Configured counts deliberately prevent load concentration on host loss.
+    pub fn backend_limits(&self, pool: &BackendPool) -> Option<Vec<u32>> {
+        let config = self.config.as_ref()?;
+        let budget = self.budget().max(1);
+        if !config.tier_borrowing {
+            return Some(vec![self.host_share(pool.healthy_count())?; pool.len()]);
+        }
+        let base_count = pool
+            .backends()
+            .iter()
+            .filter(|b| b.tier == ContextTier::Base)
+            .count()
+            .max(1) as u32;
+        let long_limit = budget
+            .div_ceil(pool.len().max(1) as u32)
+            .min(config.long_max_inflight_per_host);
+        Some(
+            pool.backends()
+                .iter()
+                .map(|backend| match backend.tier {
+                    ContextTier::Base => budget.div_ceil(base_count),
+                    ContextTier::Long => long_limit,
+                })
+                .collect(),
+        )
+    }
+
+    /// Scrape-time snapshots avoid racing gauge set operations on reservation/drop.
+    pub fn record_backend_metrics(&self, pool: &BackendPool) {
+        if let Some(limits) = self.backend_limits(pool) {
+            for (index, (backend, limit)) in pool.backends().iter().zip(limits).enumerate() {
+                metrics::gauge!("admission_backend_limit", "backend" => index.to_string(), "tier" => backend.tier.as_str()).set(f64::from(limit));
+                metrics::gauge!("admission_backend_inflight", "backend" => index.to_string(), "tier" => backend.tier.as_str()).set(f64::from(backend.lane_conns.load(Ordering::Acquire)));
+            }
+        }
     }
 
     /// Whether backend `index` is saturated right now — its engine reports a
@@ -571,6 +615,14 @@ pub struct Permit {
 }
 
 impl Permit {
+    pub fn requested_tier(&self) -> ContextTier {
+        if self.long_request {
+            ContextTier::Long
+        } else {
+            ContextTier::Base
+        }
+    }
+
     /// Record which backend the request was placed on (needed to attribute
     /// engine back-pressure). Called again after a connection fail-over.
     pub fn attach_backend(&self, index: usize) {
@@ -594,9 +646,8 @@ impl Permit {
         self.controller.engine(index)
     }
 
-    /// The current per-host share (see `AdmissionController::host_share`).
-    pub fn host_share(&self, healthy_backends: usize) -> Option<u32> {
-        self.controller.host_share(healthy_backends)
+    pub fn backend_limits(&self, pool: &BackendPool) -> Option<Vec<u32>> {
+        self.controller.backend_limits(pool)
     }
 
     /// A refusal because no backend has room under its share.
@@ -719,6 +770,8 @@ mod tests {
     fn config() -> AdmissionConfig {
         AdmissionConfig {
             max_inflight: 8,
+            tier_borrowing: false,
+            long_max_inflight_per_host: 0,
             start_inflight: 2,
             ramp_step: 2,
             ramp_interval: Duration::from_secs(60),
@@ -754,6 +807,155 @@ mod tests {
         let permit = c.try_admit_at(p, None, t0).unwrap().unwrap();
         permit.mark_dispatched_at(t0);
         permit.observe_generation_started_at(t0 + ttft);
+    }
+
+    #[test]
+    fn borrowing_limits_follow_budget_but_not_health() {
+        let p = BackendPool::with_long_context(
+            vec!["b0".into(), "b1".into(), "b2".into()],
+            vec!["long".into()],
+        );
+        let c = controller(
+            AdmissionConfig {
+                max_inflight: 64,
+                start_inflight: 32,
+                tier_borrowing: true,
+                long_max_inflight_per_host: 12,
+                ..config()
+            },
+            4,
+        );
+        for (budget, expected) in [
+            (32, vec![11, 11, 11, 8]),
+            (40, vec![14, 14, 14, 10]),
+            (48, vec![16, 16, 16, 12]),
+            (56, vec![19, 19, 19, 12]),
+            (64, vec![22, 22, 22, 12]),
+        ] {
+            c.budget.store(budget, Ordering::Relaxed);
+            assert_eq!(c.backend_limits(&p).unwrap(), expected);
+            p.backends()[0].healthy.store(false, Ordering::Relaxed);
+            assert_eq!(c.backend_limits(&p).unwrap(), expected);
+            p.backends()[0].healthy.store(true, Ordering::Relaxed);
+        }
+        let legacy = controller(
+            AdmissionConfig {
+                max_inflight: 48,
+                start_inflight: 48,
+                ..config()
+            },
+            4,
+        );
+        assert_eq!(legacy.backend_limits(&p).unwrap(), vec![12; 4]);
+        p.backends()[0].healthy.store(false, Ordering::Relaxed);
+        assert_eq!(legacy.backend_limits(&p).unwrap(), vec![16; 4]);
+        assert_eq!(AdmissionController::disabled().backend_limits(&p), None);
+    }
+
+    #[test]
+    fn borrowing_reservations_enforce_shared_and_long_limits_under_concurrency() {
+        use crate::backend_pool::Policy;
+        use std::sync::Barrier;
+        let p = Arc::new(BackendPool::with_long_context(
+            vec!["b0".into(), "b1".into(), "b2".into()],
+            vec!["long".into()],
+        ));
+        let c = controller(
+            AdmissionConfig {
+                max_inflight: 48,
+                start_inflight: 48,
+                tier_borrowing: true,
+                long_max_inflight_per_host: 12,
+                ..config()
+            },
+            4,
+        );
+        let limits = c.backend_limits(&p).unwrap();
+        let long_policy = Policy {
+            max_conns_by_backend: Some(&limits),
+            tier: Some(ContextTier::Long),
+            ..Policy::NONE
+        };
+        let mut long = Vec::new();
+        for _ in 0..12 {
+            let permit = c
+                .try_admit(&p, tier(ContextTier::Long, Some(ContextTier::Long)))
+                .unwrap();
+            let selection = p
+                .select_with_preference_bounded(None, 8, &long_policy)
+                .unwrap();
+            long.push((permit, selection));
+        }
+        assert!(p
+            .select_with_preference_bounded(None, 8, &long_policy)
+            .is_none());
+        let barrier = Arc::new(Barrier::new(65));
+        let workers: Vec<_> = (0..64)
+            .map(|_| {
+                let (p, c, barrier) = (p.clone(), c.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    let limits = c.backend_limits(&p).unwrap();
+                    let policy = Policy {
+                        max_conns_by_backend: Some(&limits),
+                        tier: Some(ContextTier::Base),
+                        ..Policy::NONE
+                    };
+                    barrier.wait();
+                    let held = c
+                        .try_admit(&p, tier(ContextTier::Base, Some(ContextTier::Base)))
+                        .ok()
+                        .map(|permit| {
+                            let selection = p
+                                .select_with_preference_bounded(Some(0), 8, &policy)
+                                .unwrap();
+                            (permit, selection)
+                        });
+                    barrier.wait();
+                    barrier.wait();
+                    held.is_some()
+                })
+            })
+            .collect();
+        barrier.wait();
+        barrier.wait();
+        assert_eq!(c.inflight(), 48);
+        assert!(p.backends()[..3]
+            .iter()
+            .all(|b| b.lane_conns.load(Ordering::Acquire) <= 16));
+        assert_eq!(p.backends()[3].lane_conns.load(Ordering::Acquire), 12);
+        barrier.wait();
+        assert_eq!(
+            workers
+                .into_iter()
+                .map(|w| usize::from(w.join().unwrap()))
+                .sum::<usize>(),
+            36
+        );
+        drop(long);
+        assert_eq!(c.inflight(), 0);
+        assert!(p
+            .backends()
+            .iter()
+            .all(|b| b.lane_conns.load(Ordering::Acquire) == 0));
+        // No reservation for long traffic: base can consume the entire budget.
+        let policy = Policy {
+            max_conns_by_backend: Some(&limits),
+            tier: Some(ContextTier::Base),
+            ..Policy::NONE
+        };
+        let held: Vec<_> = (0..48)
+            .map(|_| {
+                (
+                    c.try_admit(&p, None).unwrap(),
+                    p.select_with_preference_bounded(None, 8, &policy).unwrap(),
+                )
+            })
+            .collect();
+        assert!(c
+            .try_admit(&p, tier(ContextTier::Long, Some(ContextTier::Long)))
+            .is_err());
+        drop(held);
+        assert_eq!(c.inflight(), 0);
     }
 
     #[test]

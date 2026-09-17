@@ -1064,12 +1064,12 @@ async fn send_upstream(
             // the restriction now that it is out of the rotation, so the
             // request falls back to the other tier instead of being refused.
             let tier = tier.and_then(|tier| crate::context_tier::recheck_restriction(&pool, tier));
-            // The share is recomputed for the pool as it is now (one host
-            // fewer), and recently saturated hosts are steered around.
-            let max_conns = opts
+            // Re-resolve destination limits after failure. Borrowing keeps
+            // configured host counts; legacy mode follows healthy counts.
+            let limits = opts
                 .admission
                 .as_ref()
-                .and_then(|permit| permit.host_share(pool.healthy_count()));
+                .and_then(|permit| permit.backend_limits(&pool));
             let next = {
                 let avoid = |index: usize| {
                     opts.admission
@@ -1078,7 +1078,9 @@ async fn send_upstream(
                 };
                 let engine = |index: usize| opts.admission.as_ref().and_then(|p| p.engine(index));
                 let policy = crate::backend_pool::Policy {
-                    max_conns,
+                    max_conns: None,
+                    max_conns_by_backend: limits.as_deref(),
+                    requested_tier: opts.admission.as_ref().map(|p| p.requested_tier()),
                     avoid: &avoid,
                     engine: &engine,
                     tier,
@@ -5118,6 +5120,8 @@ mod tests {
         let controller = Arc::new(crate::admission::AdmissionController::new(
             Some(crate::admission::AdmissionConfig {
                 max_inflight: 4,
+                tier_borrowing: false,
+                long_max_inflight_per_host: 0,
                 start_inflight: 4,
                 ramp_step: 1,
                 ramp_interval: std::time::Duration::from_secs(60),

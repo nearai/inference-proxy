@@ -1286,6 +1286,10 @@ fn request_metric_labels(tracing_ids: Option<&TracingIds>) -> RequestMetricLabel
     }
 }
 
+pub(crate) fn tenant_context_label(tracing_ids: Option<&TracingIds>) -> &'static str {
+    request_metric_labels(tracing_ids).tenant_context
+}
+
 fn record_completed_request_metrics(
     labels: RequestMetricLabels,
     input_tokens: i64,
@@ -1430,42 +1434,45 @@ pub async fn proxy_json_request(
             let mut byte_stream = std::pin::pin!(response.bytes_stream());
             let mut received_upstream_progress = false;
             loop {
-                let next_chunk =
-                    if opts.stream_idle_timeout_secs == 0 || !received_upstream_progress {
-                        byte_stream.next().await
-                    } else {
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(opts.stream_idle_timeout_secs),
-                            byte_stream.next(),
-                        )
-                        .await
-                        {
-                            Ok(chunk) => chunk,
-                            Err(_) => {
-                                metrics::counter!(
-                                    "upstream_stream_incomplete_total",
-                                    "reason" => "idle_timeout",
-                                    "mode" => "json_via_stream"
-                                )
-                                .increment(1);
-                                let (request_id, org_id, workspace_id) =
-                                    log_ids_or_empty(&opts.tracing_ids);
-                                warn!(
-                                    request_id = %request_id,
-                                    org_id = %org_id,
-                                    workspace_id = %workspace_id,
-                                    model = %opts.model_name.to_lowercase(),
-                                    timeout_secs = opts.stream_idle_timeout_secs,
-                                    "Upstream SSE stream exceeded the idle timeout"
-                                );
-                                return Err(AppError::UpstreamParsed {
-                                    status: StatusCode::GATEWAY_TIMEOUT,
-                                    message: "Upstream response stream timed out".to_string(),
-                                    error_type: "upstream_stream_idle_timeout".to_string(),
-                                });
-                            }
+                let next_chunk = if opts.stream_idle_timeout_secs == 0
+                    || !received_upstream_progress
+                {
+                    byte_stream.next().await
+                } else {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(opts.stream_idle_timeout_secs),
+                        byte_stream.next(),
+                    )
+                    .await
+                    {
+                        Ok(chunk) => chunk,
+                        Err(_) => {
+                            let tenant_context = tenant_context_label(opts.tracing_ids.as_ref());
+                            metrics::counter!(
+                                "upstream_stream_incomplete_total",
+                                "reason" => "idle_timeout",
+                                "mode" => "json_via_stream",
+                                "tenant_context" => tenant_context
+                            )
+                            .increment(1);
+                            let (request_id, org_id, workspace_id) =
+                                log_ids_or_empty(&opts.tracing_ids);
+                            warn!(
+                                request_id = %request_id,
+                                org_id = %org_id,
+                                workspace_id = %workspace_id,
+                                model = %opts.model_name.to_lowercase(),
+                                timeout_secs = opts.stream_idle_timeout_secs,
+                                "Upstream SSE stream exceeded the idle timeout"
+                            );
+                            return Err(AppError::UpstreamParsed {
+                                status: StatusCode::GATEWAY_TIMEOUT,
+                                message: "Upstream response stream timed out".to_string(),
+                                error_type: "upstream_stream_idle_timeout".to_string(),
+                            });
                         }
-                    };
+                    }
+                };
                 let Some(chunk) = next_chunk else {
                     break;
                 };
@@ -1535,7 +1542,8 @@ pub async fn proxy_json_request(
             metrics::counter!(
                 "upstream_stream_incomplete_total",
                 "reason" => "missing_done",
-                "mode" => "json_via_stream"
+                "mode" => "json_via_stream",
+                "tenant_context" => tenant_context_label(opts.tracing_ids.as_ref())
             )
             .increment(1);
             let (request_id, org_id, workspace_id) = log_ids_or_empty(&opts.tracing_ids);
@@ -1551,6 +1559,23 @@ pub async fn proxy_json_request(
                 message: "Upstream response stream ended before completion".to_string(),
                 error_type: "upstream_stream_incomplete".to_string(),
             });
+        }
+        if stream_parser.seen_done && stream_parser.finish_reason.is_none() {
+            metrics::counter!(
+                "upstream_stream_incomplete_total",
+                "reason" => "missing_finish_reason",
+                "mode" => "json_via_stream",
+                "tenant_context" => tenant_context_label(opts.tracing_ids.as_ref())
+            )
+            .increment(1);
+            let (request_id, org_id, workspace_id) = log_ids_or_empty(&opts.tracing_ids);
+            warn!(
+                request_id = %request_id,
+                org_id = %org_id,
+                workspace_id = %workspace_id,
+                model = %opts.model_name.to_lowercase(),
+                "Upstream stream terminated without declaring a finish reason"
+            );
         }
         assembler.into_response(&opts.id_prefix)
     } else {
@@ -2539,9 +2564,37 @@ pub async fn proxy_streaming_request(
             metrics::counter!(
                 "upstream_stream_incomplete_total",
                 "reason" => reason,
-                "mode" => "streaming_request"
+                "mode" => "streaming_request",
+                "tenant_context" => tenant_context_label(opts.tracing_ids.as_ref())
             )
             .increment(1);
+            warn!(
+                request_id = %log_request_id,
+                org_id = %log_org_id,
+                workspace_id = %log_workspace_id,
+                chat_id = parser.chat_id.as_deref().unwrap_or(""),
+                model = %model_name.to_lowercase(),
+                reason,
+                mode = "streaming_request",
+                "Upstream stream did not complete"
+            );
+        } else if completed_cleanly && parser.finish_reason.is_none() {
+            metrics::counter!(
+                "upstream_stream_incomplete_total",
+                "reason" => "missing_finish_reason",
+                "mode" => "streaming_request",
+                "tenant_context" => tenant_context_label(opts.tracing_ids.as_ref())
+            )
+            .increment(1);
+            warn!(
+                request_id = %log_request_id,
+                org_id = %log_org_id,
+                workspace_id = %log_workspace_id,
+                chat_id = parser.chat_id.as_deref().unwrap_or(""),
+                model = %model_name.to_lowercase(),
+                mode = "streaming_request",
+                "Upstream stream terminated without declaring a finish reason"
+            );
         }
 
         // Bill for the tokens the backend already produced, even when the stream
@@ -3170,9 +3223,37 @@ pub async fn proxy_streaming_response(
             metrics::counter!(
                 "upstream_stream_incomplete_total",
                 "reason" => reason,
-                "mode" => "streaming_response"
+                "mode" => "streaming_response",
+                "tenant_context" => tenant_context_label(opts.tracing_ids.as_ref())
             )
             .increment(1);
+            warn!(
+                request_id = %log_request_id,
+                org_id = %log_org_id,
+                workspace_id = %log_workspace_id,
+                chat_id = parser.chat_id.as_deref().unwrap_or(""),
+                model = %model_name.to_lowercase(),
+                reason,
+                mode = "streaming_response",
+                "Upstream stream did not complete"
+            );
+        } else if completed_cleanly && parser.finish_reason.is_none() {
+            metrics::counter!(
+                "upstream_stream_incomplete_total",
+                "reason" => "missing_finish_reason",
+                "mode" => "streaming_response",
+                "tenant_context" => tenant_context_label(opts.tracing_ids.as_ref())
+            )
+            .increment(1);
+            warn!(
+                request_id = %log_request_id,
+                org_id = %log_org_id,
+                workspace_id = %log_workspace_id,
+                chat_id = parser.chat_id.as_deref().unwrap_or(""),
+                model = %model_name.to_lowercase(),
+                mode = "streaming_response",
+                "Upstream stream terminated without declaring a finish reason"
+            );
         }
 
         // Bill for tokens already produced even on an interrupted stream
@@ -3280,6 +3361,7 @@ pub struct SseParser {
     pub seen_generation_output: bool,
     /// Token usage extracted from the final SSE chunk (prompt_tokens, completion_tokens).
     pub usage: Option<(i64, i64)>,
+    pub finish_reason: Option<String>,
     cached_tokens: Option<i64>,
     /// The first `data: {"error": …}` event seen, until taken.
     error_event: Option<serde_json::Value>,
@@ -3300,6 +3382,7 @@ impl SseParser {
             seen_generation_progress: false,
             seen_generation_output: false,
             usage: None,
+            finish_reason: None,
             cached_tokens: None,
             error_event: None,
         }
@@ -3336,6 +3419,7 @@ impl SseParser {
                 extracted_usage,
                 has_generation_progress,
                 has_generation_output,
+                extracted_finish,
                 error_event,
             ) = {
                 let line = &self.line_buffer[..line_end];
@@ -3346,9 +3430,9 @@ impl SseParser {
                     .trim();
 
                 if data.is_empty() {
-                    (false, None, None, false, false, None)
+                    (false, None, None, false, false, None, None)
                 } else if data == "[DONE]" {
-                    (true, None, None, true, false, None)
+                    (true, None, None, true, false, None, None)
                 } else if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
                     let id = if self.chat_id.is_none() {
                         parsed
@@ -3378,14 +3462,26 @@ impl SseParser {
                         });
                     let progress = sse_value_has_generation_progress(&parsed);
                     let output = sse_value_has_generation_output(&parsed);
+                    let finish =
+                        parsed
+                            .get("choices")
+                            .and_then(|c| c.as_array())
+                            .and_then(|choices| {
+                                choices.iter().find_map(|choice| {
+                                    choice
+                                        .get("finish_reason")
+                                        .and_then(|v| v.as_str())
+                                        .map(String::from)
+                                })
+                            });
                     let error_event = if self.error_event.is_none() {
                         parsed.get("error").filter(|e| e.is_object()).cloned()
                     } else {
                         None
                     };
-                    (false, id, usage, progress, output, error_event)
+                    (false, id, usage, progress, output, finish, error_event)
                 } else {
-                    (false, None, None, false, false, None)
+                    (false, None, None, false, false, None, None)
                 }
             };
             if has_generation_output {
@@ -3405,6 +3501,9 @@ impl SseParser {
                 self.usage = Some(usage);
                 self.cached_tokens = cached_tokens
                     .or_else(|| self.cached_tokens.map(|tokens| tokens.min(usage.0.max(0))));
+            }
+            if let Some(finish) = extracted_finish {
+                self.finish_reason = Some(finish);
             }
             if has_generation_progress {
                 self.seen_generation_progress = true;
@@ -3566,6 +3665,39 @@ mod tests {
             request_metric_labels(trusted_without_tenant.as_ref()).tenant_context,
             "trusted_no_tenant"
         );
+    }
+
+    #[test]
+    fn tenant_context_label_separates_customer_streams_from_probes() {
+        let customer = Some(TracingIds {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            request_id_inbound: true,
+            org_id: Some("org".to_string()),
+            workspace_id: Some("workspace".to_string()),
+            request_source: Some(RequestSource {
+                auth_path: AuthPath::CloudApiKey,
+                ingress_route: IngressRouteKind::Canonical,
+            }),
+            forward_tenant_headers: false,
+        });
+
+        let probe = Some(TracingIds {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            request_id_inbound: false,
+            org_id: None,
+            workspace_id: None,
+            request_source: None,
+            forward_tenant_headers: false,
+        });
+
+        assert_eq!(tenant_context_label(customer.as_ref()), "verified");
+        assert_eq!(
+            tenant_context_label(probe.as_ref()),
+            "absent",
+            "health probes carry no tenant, so an incomplete-stream count must be \
+             separable from customer traffic"
+        );
+        assert_eq!(tenant_context_label(None), "unknown");
     }
 
     fn reporter_with(
@@ -4406,6 +4538,55 @@ mod tests {
         parser.process_chunk(b"data: {\"id\":\"chat-1\",\"content\":\"hi\"}\n\ndata: [DONE]\n\n");
         assert_eq!(parser.chat_id.as_deref(), Some("chat-1"));
         assert!(parser.seen_done);
+    }
+
+    #[test]
+    fn test_sse_parser_captures_finish_reason() {
+        let mut parser = SseParser::new();
+        parser.process_chunk(
+            br#"data: {"id":"chat-1","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}
+
+"#,
+        );
+        assert_eq!(parser.finish_reason, None);
+
+        parser.process_chunk(
+            br#"data: {"id":"chat-1","choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#,
+        );
+        assert!(parser.seen_done);
+        assert_eq!(parser.finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn test_sse_parser_done_without_finish_reason_is_distinguishable() {
+        let mut parser = SseParser::new();
+        parser.process_chunk(
+            br#"data: {"id":"chat-1","choices":[{"delta":{"content":"half an ans"}}]}
+
+data: [DONE]
+
+"#,
+        );
+
+        let mut finished = SseParser::new();
+        finished.process_chunk(
+            br#"data: {"id":"chat-1","choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#,
+        );
+
+        assert_eq!(parser.seen_done, finished.seen_done);
+        assert_ne!(
+            parser.finish_reason, finished.finish_reason,
+            "both streams end on [DONE], so finish_reason is the only signal separating \
+             a model that stopped mid-answer from one that completed"
+        );
     }
 
     #[test]

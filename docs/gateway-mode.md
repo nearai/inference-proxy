@@ -86,7 +86,7 @@ to the current in-CVM behavior.
 | `VLLM_PROXY_MAP_QUEUE_FULL_TO_429` | `1` | The engine's admission rejection (queue full, or a queued request displaced by a higher-priority one) becomes 429 with `Retry-After: 2` and type `overloaded`, the same shape as the gateway's own refusals: back-pressure, not an outage. Off in CVMs: cloud-api's peer fallback keys on the 503. |
 | `VLLM_PROXY_STREAM_ERROR_PEEK_MS` | `1000` | Streams wait up to 1 s for the first upstream event; an admission-time `data: {"error":…}` becomes a real 429/5xx instead of a 200 that fails mid-stream. A slow first token just times the peek out. |
 | `VLLM_PROXY_STREAM_COMMIT_MS` | `5000` | Commit the stream's `200 text/event-stream` after 5 s even if the engine has not answered, so the keep-alives above actually reach the client during a long prefill (see below). |
-| `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` / `_START_INFLIGHT` | `48` / `32` | The lane's in-flight budget: refuse with 429 + `Retry-After` before dispatch instead of queueing (see below). Starts at 32 and ramps by 8 every 30 min while the lane stays healthy. |
+| `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` / `_START_INFLIGHT` | `48` / `48` | The lane's in-flight budget: refuse with 429 + `Retry-After` before dispatch instead of queueing (see below). Set start equal to maximum for separately reviewed rollout stages; optional ramp settings remain available. |
 | `VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS` | `30000` | Refuse new work while, over the last minute, at least 20 lane requests reached the engine and 5 % of them (at least two) waited longer than this for their first generation event. |
 | `VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS` | `10` | A backend that rejected at engine admission within this window is steered around; when every healthy backend did, new work is refused. |
 | `VLLM_BACKEND_CONNECT_FAILOVER` | `1` | A backend that refuses the connection (host down, proxy restarting) costs the request nothing: it is re-sent once to another healthy backend, the dead one leaves the rotation until a probe succeeds, and a pinned conversation follows. Never on an HTTP error. |
@@ -176,6 +176,29 @@ deployment) where the status must always come from the upstream. Counter
 
 ## Admission budget
 
+Tier borrowing is opt-in: `VLLM_PROXY_ADMISSION_TIER_BORROWING=1` requires
+admission, both backend tiers, and a positive
+`VLLM_PROXY_ADMISSION_LONG_MAX_INFLIGHT_PER_HOST` (use 12 for the initial lane
+rollout). Defaults preserve the legacy uniform-share policy.
+
+With borrowing, each base host may hold `ceil(current_budget / configured_base_hosts)`;
+each long host may hold `min(ceil(current_budget / configured_total_hosts), long_host_limit)`.
+Configured counts prevent surviving hosts receiving larger limits during an outage.
+The atomic global budget still bounds their sum, and no slots are reserved for long
+traffic. At 48 with three base hosts and one long host, base can use all 48 slots
+(16 per host); the long host remains capped at 12. At budgets 56 and 64 the base
+bounds become 19 and 22, while long stays at 12. A full shared budget refuses
+both tiers. These bounds follow the destination backend during fallback and
+connection failover; the context threshold and engine back-pressure policy are unchanged.
+
+`admission_backend_inflight{backend,tier}` and `admission_backend_limit{backend,tier}`
+are snapshots at metrics scrape time. `admission_selection_failures_total{requested_tier,tier,reason}`
+separates host limits, back-pressure, mixed blockage, no healthy host, and reservation
+contention. It counts failed **selection attempts**, including attempts recovered
+by fallback; use existing `admission_rejections_total` for terminal request refusals.
+The `fallback` destination label means selection was unrestricted.
+
+
 Mapping the engine's rejection to 429 only helps once the engine's queue is
 full; by then the lane's earlier requests are already waiting behind large
 prefills and their time to first token is minutes. The gateway therefore
@@ -207,7 +230,7 @@ upstream:
    `VLLM_PROXY_ADMISSION_RAMP_STEP` every `VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS`
    up to `VLLM_PROXY_ADMISSION_MAX_INFLIGHT`, but only after an interval
    without any overload signal; a restart goes back to the start value.
-3. **Per-host share and placement.** `ceil(budget / healthy backends)` lane
+3. **Per-host share and placement.** By default, `ceil(budget / healthy backends)` lane
    requests in flight per backend (other traffic on the pool does not count),
    reserved atomically at selection so concurrent requests cannot overshoot
    it, so a conversation-affinity pin cannot pile the whole budget onto one
@@ -283,14 +306,10 @@ Everything downstream of the decision is restricted to the request's tier:
 placement, the connection fail-over, and the fleet-wide "every backend is
 queueing" refusal. The consequences are deliberate:
 
-- **Per-host share.** Unchanged: `ceil(budget / healthy backends)` over the
-  whole pool. With 3 base hosts, 1 long host and a budget of 48 the long host
-  holds at most 12 lane requests, which is about what its KV cache fits for
-  200k-token prompts. The budget is the lever; there is no separate knob.
-  Note that adding the tier also lowers each base host's share
-  (`ceil(48/3) = 16` becomes `ceil(48/4) = 12`), so the base fleet's ceiling
-  drops from 48 to 36 with the remaining 12 reserved for oversized prompts:
-  raise `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` if it needs its old headroom.
+- **Per-host share.** Legacy mode divides the budget across every healthy host.
+  With three base hosts, one long host and budget 48, that limits base to 36.
+  Enable the borrowing policy above to let base use idle shared capacity without
+  increasing the long-host ceiling. A host cap is not a reserved allocation.
 - **Untiered traffic stays on the base fleet.** `/tokenize`, media, `/v1/models`
   and the health probe carry no size of their own; they would all land on the
   idle long host under least-connections, so they are restricted to the base

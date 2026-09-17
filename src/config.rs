@@ -347,6 +347,10 @@ pub struct Config {
     /// chat/completions requests in flight across the fleet
     /// (`VLLM_PROXY_ADMISSION_MAX_INFLIGHT`, 0 = off, the default).
     pub admission_max_inflight: u32,
+    /// Opt-in base-tier borrowing with fixed topology denominators.
+    pub admission_tier_borrowing: bool,
+    /// Long-host ceiling while borrowing (positive when enabled).
+    pub admission_long_max_inflight_per_host: u32,
     /// Budget at start-up (`VLLM_PROXY_ADMISSION_START_INFLIGHT`, default =
     /// the maximum, i.e. no ramp).
     pub admission_start_inflight: u32,
@@ -666,6 +670,9 @@ impl Config {
             .filter(|s| !s.is_empty())
             .collect();
 
+        let admission_tier_borrowing = env_bool("VLLM_PROXY_ADMISSION_TIER_BORROWING");
+        let admission_long_max_inflight_per_host: u32 =
+            env_parse("VLLM_PROXY_ADMISSION_LONG_MAX_INFLIGHT_PER_HOST", 0)?;
         let admission_max_inflight: u32 = env_parse("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", 0)?;
         let admission_start_inflight: u32 = env_parse(
             "VLLM_PROXY_ADMISSION_START_INFLIGHT",
@@ -728,6 +735,14 @@ impl Config {
             anyhow::bail!(
                 "VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS requires VLLM_BACKEND_LONG_CONTEXT_URLS"
             );
+        }
+        if admission_tier_borrowing
+            && (admission_max_inflight == 0
+                || backend_urls.is_empty()
+                || backend_long_context_urls.is_empty()
+                || admission_long_max_inflight_per_host == 0)
+        {
+            anyhow::bail!("VLLM_PROXY_ADMISSION_TIER_BORROWING requires admission, both backend tiers, and positive VLLM_PROXY_ADMISSION_LONG_MAX_INFLIGHT_PER_HOST");
         }
         if let Some(both) = backend_long_context_urls
             .iter()
@@ -850,6 +865,8 @@ impl Config {
             allowed_org_ids,
             sse_keepalive_secs: env_int("VLLM_PROXY_SSE_KEEPALIVE_SECS", 0) as u64,
             admission_max_inflight,
+            admission_tier_borrowing,
+            admission_long_max_inflight_per_host,
             admission_start_inflight,
             admission_ramp_step,
             admission_ramp_interval_secs,
@@ -1015,6 +1032,8 @@ impl Config {
         }
         Some(crate::admission::AdmissionConfig {
             max_inflight: self.admission_max_inflight,
+            tier_borrowing: self.admission_tier_borrowing,
+            long_max_inflight_per_host: self.admission_long_max_inflight_per_host,
             start_inflight: self.admission_start_inflight,
             ramp_step: self.admission_ramp_step,
             ramp_interval: std::time::Duration::from_secs(self.admission_ramp_interval_secs),
@@ -1139,6 +1158,8 @@ mod tests {
             "VLLM_PROXY_REJECTED_CONTENT_PART_TYPES",
             "VLLM_PROXY_ALLOWED_ORG_IDS",
             "VLLM_PROXY_SSE_KEEPALIVE_SECS",
+            "VLLM_PROXY_ADMISSION_TIER_BORROWING",
+            "VLLM_PROXY_ADMISSION_LONG_MAX_INFLIGHT_PER_HOST",
             "VLLM_PROXY_ADMISSION_MAX_INFLIGHT",
             "VLLM_PROXY_ADMISSION_START_INFLIGHT",
             "VLLM_PROXY_ADMISSION_RAMP_STEP",
@@ -2022,6 +2043,46 @@ mod tests {
     }
 
     #[test]
+    fn borrowing_config_requires_admission_and_a_bounded_long_tier() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                ("VLLM_PROXY_ADMISSION_TIER_BORROWING", "1"),
+                ("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", "48"),
+                ("VLLM_PROXY_ADMISSION_START_INFLIGHT", "48"),
+                ("VLLM_PROXY_ADMISSION_LONG_MAX_INFLIGHT_PER_HOST", "12"),
+                ("VLLM_BACKEND_URLS", "http://base"),
+                ("VLLM_BACKEND_LONG_CONTEXT_URLS", "http://long"),
+                ("VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS", "100000"),
+            ],
+            || {
+                let c = Config::from_env().unwrap();
+                assert!(c.admission().unwrap().tier_borrowing);
+                assert_eq!(c.admission_long_max_inflight_per_host, 12);
+                env::set_var("VLLM_PROXY_ADMISSION_LONG_MAX_INFLIGHT_PER_HOST", "0");
+                assert!(Config::from_env()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("TIER_BORROWING"));
+                env::set_var("VLLM_PROXY_ADMISSION_LONG_MAX_INFLIGHT_PER_HOST", "12");
+                env::set_var("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", "0");
+                assert!(Config::from_env()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("TIER_BORROWING"));
+                env::set_var("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", "48");
+                env::remove_var("VLLM_BACKEND_LONG_CONTEXT_URLS");
+                env::remove_var("VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS");
+                assert!(Config::from_env()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("TIER_BORROWING"));
+            },
+        );
+    }
+
+    #[test]
     fn test_admission_config_parses_and_validates() {
         with_env_vars(
             &[
@@ -2042,6 +2103,8 @@ mod tests {
                     config.admission(),
                     Some(crate::admission::AdmissionConfig {
                         max_inflight: 48,
+                        tier_borrowing: false,
+                        long_max_inflight_per_host: 0,
                         start_inflight: 32,
                         ramp_step: 8,
                         ramp_interval: std::time::Duration::from_secs(1800),

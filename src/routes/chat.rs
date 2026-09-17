@@ -246,13 +246,14 @@ pub async fn chat_completions(
     // at engine admission. Refuses with 429 before anything is sent upstream;
     // disabled deployments get `None`s and plain least-connections.
     let permit = state.admission.try_admit(&state.backend_pool, tier)?;
-    let host_share = state
-        .admission
-        .host_share(state.backend_pool.healthy_count());
+    let limits = state.admission.backend_limits(&state.backend_pool);
     let mut restrict = tier.and_then(|tier| tier.restrict);
+    let requested_tier = tier.map(|decision| decision.estimated);
     let place = |tier| {
         let policy = backend_pool::Policy {
-            max_conns: host_share,
+            max_conns: None,
+            max_conns_by_backend: limits.as_deref(),
+            requested_tier,
             avoid: &|index| state.admission.backend_saturated(index),
             engine: &|index| state.admission.engine(index),
             tier,

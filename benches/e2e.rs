@@ -108,6 +108,8 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,
         admission_max_inflight: 0,
+        admission_tier_borrowing: false,
+        admission_long_max_inflight_per_host: 0,
         admission_start_inflight: 0,
         admission_ramp_step: 8,
         admission_ramp_interval_secs: 1800,

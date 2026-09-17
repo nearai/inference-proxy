@@ -34,6 +34,9 @@ struct GatewayOptions {
     backend_urls: Vec<String>,
     backend_conversation_affinity: bool,
     admission_max_inflight: u32,
+    admission_tier_borrowing: bool,
+    admission_long_max_inflight_per_host: u32,
+
     admission_start_inflight: Option<u32>,
     admission_ttft_p95_max_ms: Option<u64>,
     admission_backpressure_secs: Option<u64>,
@@ -53,6 +56,10 @@ struct GatewayOptions {
 }
 
 fn build_gateway(mock_url: &str, options: GatewayOptions) -> axum::Router {
+    build_gateway_with_state(mock_url, options).0
+}
+
+fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::Router, AppState) {
     let base = mock_url.trim_end_matches('/');
     let backend_urls = if options.backend_urls.is_empty() {
         vec![mock_url.to_string()]
@@ -143,6 +150,8 @@ fn build_gateway(mock_url: &str, options: GatewayOptions) -> axum::Router {
         allowed_org_ids: options.allowed_org_ids,
         sse_keepalive_secs: options.sse_keepalive_secs,
         admission_max_inflight: options.admission_max_inflight,
+        admission_tier_borrowing: options.admission_tier_borrowing,
+        admission_long_max_inflight_per_host: options.admission_long_max_inflight_per_host,
         admission_start_inflight: options
             .admission_start_inflight
             .unwrap_or(options.admission_max_inflight),
@@ -270,11 +279,12 @@ fn build_gateway(mock_url: &str, options: GatewayOptions) -> axum::Router {
         limiter: rate_limit::build_rate_limiter(100, 200),
         trust_proxy_headers: true,
     };
-    routes::build_router()
+    let router = routes::build_router()
         .layer(middleware::from_fn(rate_limit::rate_limit_middleware))
         .layer(axum::Extension(rate_limit_state))
         .layer(middleware::from_fn(request_id_middleware))
-        .with_state(state)
+        .with_state(state.clone());
+    (router, state)
 }
 
 fn chat_request(body: serde_json::Value) -> Request<Body> {
@@ -2491,4 +2501,239 @@ async fn without_a_commit_window_a_slow_upstream_still_decides_the_status() {
         "the handler must wait for the upstream when no window is set"
     );
     handle.abort();
+}
+
+// Four real HTTP stubs hold streams until the test explicitly ends them.
+async fn borrowing_gateway() -> (
+    axum::Router,
+    AppState,
+    tokio::sync::watch::Sender<u8>,
+    Vec<tokio::task::JoinHandle<()>>,
+) {
+    let (release, receiver) = tokio::sync::watch::channel(0u8);
+    let mut urls = Vec::new();
+    let mut tasks = Vec::new();
+    for _ in 0..4 {
+        let receiver = receiver.clone();
+        let serve = move || {
+            let mut receiver = receiver.clone();
+            async move {
+                let (tx, rx) =
+                    tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(4);
+                tokio::spawn(async move {
+                    let first = "data: {\"id\":\"synthetic\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n";
+                    if tx.send(Ok(first.into())).await.is_err() {
+                        return;
+                    }
+                    tokio::select! {
+                        _ = tx.closed() => return,
+                        _ = receiver.changed() => {},
+                    }
+                    let tail = if *receiver.borrow() == 2 {
+                        "data: {\"error\":{\"message\":\"synthetic failure\",\"type\":\"api_error\",\"code\":500}}\n\ndata: [DONE]\n\n"
+                    } else {
+                        "data: {\"id\":\"synthetic\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\ndata: [DONE]\n\n"
+                    };
+                    let _ = tx.send(Ok(tail.into())).await;
+                });
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(
+                        tokio_stream::wrappers::ReceiverStream::new(rx),
+                    ))
+                    .unwrap()
+            }
+        };
+        let stub = axum::Router::new()
+            .route("/v1/chat/completions", axum::routing::post(serve.clone()))
+            .route("/v1/completions", axum::routing::post(serve));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        urls.push(format!("http://{}", listener.local_addr().unwrap()));
+        tasks.push(tokio::spawn(async move {
+            axum::serve(listener, stub).await.unwrap();
+        }));
+    }
+    let (app, state) = build_gateway_with_state(
+        &urls[0],
+        GatewayOptions {
+            backend_urls: urls[..3].to_vec(),
+            backend_long_context_urls: vec![urls[3].clone()],
+            long_context_above_tokens: ABOVE_TOKENS,
+            admission_max_inflight: 48,
+            admission_tier_borrowing: true,
+            admission_long_max_inflight_per_host: 12,
+            backend_connect_failover: true,
+            ..Default::default()
+        },
+    );
+    (app, state, release, tasks)
+}
+
+async fn borrowing_request(
+    app: axum::Router,
+    long: bool,
+    completions: bool,
+) -> axum::response::Response {
+    let body = if completions {
+        serde_json::json!({"model":"test-model","prompt":"x".repeat(if long {4000} else {4}),"stream":true})
+    } else {
+        let mut body = sized_body(if long { 4000 } else { 4 });
+        body["stream"] = true.into();
+        body
+    };
+    let mut request = chat_request(body);
+    if completions {
+        *request.uri_mut() = "/v1/completions".parse().unwrap();
+    }
+    app.oneshot(request).await.unwrap()
+}
+
+async fn assert_borrowing_released(state: &AppState) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if state.admission.inflight() == 0
+                && state
+                    .backend_pool
+                    .backends()
+                    .iter()
+                    .all(|b| b.lane_conns.load(std::sync::atomic::Ordering::Acquire) == 0)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("all global and backend slots released");
+}
+
+#[tokio::test]
+async fn borrowing_serves_48_base_streams_and_releases_after_done() {
+    let (app, state, release, tasks) = borrowing_gateway().await;
+    let responses = futures_util::future::join_all(
+        (0..48).map(|_| borrowing_request(app.clone(), false, false)),
+    )
+    .await;
+    assert!(responses.iter().all(|r| r.status() == StatusCode::OK));
+    assert_eq!(state.admission.inflight(), 48);
+    for backend in &state.backend_pool.backends()[..3] {
+        assert_eq!(
+            backend
+                .lane_conns
+                .load(std::sync::atomic::Ordering::Acquire),
+            16
+        );
+    }
+    assert_overloaded(borrowing_request(app.clone(), false, false).await).await;
+    assert_overloaded(borrowing_request(app.clone(), true, false).await).await;
+    release.send(1).unwrap();
+    for response in responses {
+        let body = stream_frames(response).await.concat();
+        assert!(
+            body.contains("[DONE]") && body.contains("finish_reason") && body.contains("usage"),
+            "{body}"
+        );
+    }
+    assert_borrowing_released(&state).await;
+    for task in tasks {
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn borrowing_caps_long_completions_and_releases_on_cancel() {
+    let (app, state, _release, tasks) = borrowing_gateway().await;
+    let mut held = Vec::new();
+    for _ in 0..12 {
+        let response = borrowing_request(app.clone(), true, true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        held.push(response);
+    }
+    assert_overloaded(borrowing_request(app.clone(), true, true).await).await;
+    for _ in 0..36 {
+        let response = borrowing_request(app.clone(), false, true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        held.push(response);
+    }
+    assert_eq!(state.admission.inflight(), 48);
+    assert_overloaded(borrowing_request(app.clone(), false, true).await).await;
+    drop(held);
+    assert_borrowing_released(&state).await;
+    for task in tasks {
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn borrowing_fallback_uses_destination_limit_and_late_error_releases() {
+    let (app, state, release, tasks) = borrowing_gateway().await;
+    // Simulate the entire base tier disappearing: base requests land on long,
+    // whose bound remains 12 rather than inheriting the base allowance of 16.
+    for backend in &state.backend_pool.backends()[..3] {
+        backend
+            .healthy
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+    let mut responses = Vec::new();
+    for _ in 0..12 {
+        let response = borrowing_request(app.clone(), false, false).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        responses.push(response);
+    }
+    assert_overloaded(borrowing_request(app.clone(), false, false).await).await;
+    release.send(2).unwrap();
+    for response in responses {
+        assert!(stream_frames(response).await.concat().contains("error"));
+    }
+    assert_borrowing_released(&state).await;
+    for task in tasks {
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn borrowing_connect_failover_keeps_destination_cap_and_one_permit() {
+    let (app, state, release, mut tasks) = borrowing_gateway().await;
+    let failed = tasks.remove(0);
+    failed.abort();
+    let _ = failed.await;
+    for backend in &state.backend_pool.backends()[1..3] {
+        backend
+            .healthy
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+    // The last nominally healthy base host refuses the TCP connection.
+    let first = borrowing_request(app.clone(), false, false).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    assert!(!state.backend_pool.backends()[0]
+        .healthy
+        .load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(state.admission.inflight(), 1);
+    assert_eq!(
+        state.backend_pool.backends()[0]
+            .lane_conns
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    let mut held = vec![first];
+    for _ in 0..11 {
+        let r = borrowing_request(app.clone(), false, false).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        held.push(r);
+    }
+    assert_overloaded(borrowing_request(app.clone(), false, false).await).await;
+    assert_eq!(
+        state.backend_pool.backends()[3]
+            .lane_conns
+            .load(std::sync::atomic::Ordering::Acquire),
+        12
+    );
+    release.send(1).unwrap();
+    for r in held {
+        assert!(stream_frames(r).await.concat().contains("[DONE]"));
+    }
+    assert_borrowing_released(&state).await;
+    for task in tasks {
+        task.abort();
+    }
 }

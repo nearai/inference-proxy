@@ -144,6 +144,10 @@ pub struct Selection {
 pub struct Policy<'a> {
     /// Per-backend bound on lane requests in flight (`None` = unbounded).
     pub max_conns: Option<u32>,
+    /// Destination-specific bounds override the uniform limit.
+    pub max_conns_by_backend: Option<&'a [u32]>,
+    /// Estimated request tier, retained when destination restrictions fall back.
+    pub requested_tier: Option<ContextTier>,
     /// Backends to steer around (recent engine rejection, non-empty engine
     /// queue).
     pub avoid: &'a (dyn Fn(usize) -> bool + Sync),
@@ -166,10 +170,24 @@ fn unknown(_: usize) -> Option<(u32, u32)> {
     None
 }
 
+impl Policy<'_> {
+    fn limit(&self, index: usize) -> Option<u32> {
+        self.max_conns_by_backend
+            .map(|limits| limits.get(index).copied().unwrap_or(0))
+            .or(self.max_conns)
+    }
+
+    fn bounded(&self) -> bool {
+        self.max_conns.is_some() || self.max_conns_by_backend.is_some()
+    }
+}
+
 impl Policy<'static> {
     /// Health and least-connections only (admission off, no engine polling).
     pub const NONE: Policy<'static> = Policy {
         max_conns: None,
+        max_conns_by_backend: None,
+        requested_tier: None,
         avoid: &never,
         engine: &unknown,
         tier: None,
@@ -280,7 +298,7 @@ impl BackendPool {
     ) -> Option<Selection> {
         // Without a bound (admission off) keep the legacy degradation when
         // every backend is unhealthy; with one, refusing is the point.
-        self.reserve(preferred, max_imbalance, policy, policy.max_conns.is_none())
+        self.reserve(preferred, max_imbalance, policy, !policy.bounded())
     }
 
     /// Least-loaded eligible backend other than `excluded` (connection
@@ -333,15 +351,19 @@ impl BackendPool {
     ) -> Option<Selection> {
         let attempts = (self.backends.len() * 4).max(RESERVE_ATTEMPTS);
         for _ in 0..attempts {
-            let (index, outcome) =
-                self.pick(preferred, max_imbalance, policy, degrade_when_all_unhealthy)?;
+            let Some((index, outcome)) =
+                self.pick(preferred, max_imbalance, policy, degrade_when_all_unhealthy)
+            else {
+                self.record_selection_refusal(policy, None);
+                return None;
+            };
             let backend = &self.backends[index];
             let taken =
                 backend
                     .lane_conns
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |conns| {
                         policy
-                            .max_conns
+                            .limit(index)
                             .is_none_or(|max| conns < max)
                             .then(|| conns.saturating_add(1))
                     });
@@ -355,7 +377,35 @@ impl BackendPool {
                 });
             }
         }
+        self.record_selection_refusal(policy, Some("reservation_contention"));
         None
+    }
+
+    fn record_selection_refusal(&self, policy: &Policy<'_>, reason: Option<&'static str>) {
+        if !policy.bounded() {
+            return;
+        }
+        let mut healthy = false;
+        let mut limited = false;
+        let mut avoided = false;
+        for (index, backend) in self.backends.iter().enumerate() {
+            if !backend.in_tier(policy.tier) || !backend.healthy.load(Ordering::Relaxed) {
+                continue;
+            }
+            healthy = true;
+            limited |= policy
+                .limit(index)
+                .is_some_and(|max| backend.lane_conns.load(Ordering::Relaxed) >= max);
+            avoided |= (policy.avoid)(index);
+        }
+        let reason = reason.unwrap_or(match (healthy, limited, avoided) {
+            (false, _, _) => "no_healthy",
+            (_, true, true) => "mixed",
+            (_, true, false) => "host_limit",
+            (_, false, true) => "backpressure",
+            _ => "reservation_contention",
+        });
+        metrics::counter!("admission_selection_failures_total", "requested_tier" => policy.requested_tier.map_or("base", ContextTier::as_str), "tier" => policy.tier.map_or("fallback", ContextTier::as_str), "reason" => reason).increment(1);
     }
 
     /// The selection policy on a snapshot of the counters (no reservation).
@@ -367,9 +417,9 @@ impl BackendPool {
         degrade_when_all_unhealthy: bool,
     ) -> Option<(usize, SelectionOutcome)> {
         let avoid = policy.avoid;
-        let under_bound = |backend: &Backend| {
+        let under_bound = |index: usize, backend: &Backend| {
             policy
-                .max_conns
+                .limit(index)
                 .is_none_or(|max| backend.lane_conns.load(Ordering::Relaxed) < max)
         };
         // Engine view when polled (running + queued), the gateway's own
@@ -382,14 +432,14 @@ impl BackendPool {
         if self.backends.len() == 1 {
             let only = &self.backends[0];
             let usable = only.healthy.load(Ordering::Relaxed) || degrade_when_all_unhealthy;
-            return (usable && !avoid(0) && under_bound(only) && only.in_tier(policy.tier))
+            return (usable && !avoid(0) && under_bound(0, only) && only.in_tier(policy.tier))
                 .then_some((0, SelectionOutcome::Single));
         }
 
         let eligible = |index: usize, backend: &Backend| {
             !avoid(index)
                 && backend.healthy.load(Ordering::Relaxed)
-                && under_bound(backend)
+                && under_bound(index, backend)
                 && backend.in_tier(policy.tier)
         };
         let least_index = match self.least_index(eligible, load) {
@@ -400,9 +450,10 @@ impl BackendPool {
             // never inside a tier restriction — a host known to be down is
             // worse than the other tier, which the caller reaches by placing
             // again without the restriction.
-            None if degrade_when_all_unhealthy && policy.tier.is_none() => {
-                self.least_index(|index, backend| !avoid(index) && under_bound(backend), load)?
-            }
+            None if degrade_when_all_unhealthy && policy.tier.is_none() => self.least_index(
+                |index, backend| !avoid(index) && under_bound(index, backend),
+                load,
+            )?,
             None => return None,
         };
         let Some(preferred_index) = preferred.filter(|index| *index < self.backends.len()) else {

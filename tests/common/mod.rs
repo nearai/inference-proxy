@@ -76,6 +76,33 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         score_url_override: None,
         ohttp_enabled: false,
         listen_port: 8000,
+        listen_addr: "127.0.0.1".to_string(),
+        backend_token: None,
+        backend_priority: None,
+        backend_health_path: "/health".to_string(),
+        non_tee_deployment: false,
+        map_queue_full_to_429: false,
+        stream_error_peek_ms: 0,
+        stream_commit_ms: 0,
+        rejected_content_part_types: Vec::new(),
+        models_document_url: None,
+        capacity_requests_per_minute: 0,
+        reasoning_off_effort: "none".to_string(),
+        allowed_org_ids: Vec::new(),
+        sse_keepalive_secs: 0,
+        admission_max_inflight: 0,
+        admission_start_inflight: 0,
+        admission_ramp_step: 8,
+        admission_ramp_interval_secs: 1800,
+        admission_ttft_p95_max_ms: 30_000,
+        admission_backpressure_secs: 10,
+        admission_retry_after_secs: 2,
+        backend_connect_failover: false,
+        backend_probe_urls: Vec::new(),
+        backend_long_context_urls: Vec::new(),
+        backend_long_context_probe_urls: Vec::new(),
+        long_context_above_tokens: 0,
+        backend_probe_interval_secs: 2,
         dstack_socket_path: options
             .dstack_socket_path
             .unwrap_or_else(|| "/var/run/dstack.sock".to_string()),
@@ -125,6 +152,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         cache: Arc::new(chat_cache),
         attestation_cache: Arc::new(vllm_proxy_rs::attestation::AttestationCache::new(300)),
         http_client: reqwest::Client::new(),
+        backend_client: reqwest::Client::new(),
         metrics_handle,
         tls_cert_fingerprint: Arc::new(
             vllm_proxy_rs::attestation::TlsCertTracker::new(None).expect("tracker for None path"),
@@ -137,6 +165,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         backend_affinity: Arc::new(
             vllm_proxy_rs::backend_affinity::BackendConversationAffinity::new(false, 1, 8, 1_200),
         ),
+        admission: Arc::new(vllm_proxy_rs::admission::AdmissionController::disabled()),
     };
     let rate_limiter = rate_limit::build_rate_limiter(100, 200);
     let rate_limit_state = rate_limit::RateLimitState {

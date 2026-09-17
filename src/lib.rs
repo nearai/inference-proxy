@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+pub mod admission;
 pub mod agent_loop;
 pub mod attestation;
 pub mod attestation_sdk;
@@ -8,19 +9,25 @@ pub mod backend_affinity;
 pub mod backend_pool;
 pub mod cache;
 pub mod config;
+pub mod content_policy;
+pub mod context_tier;
 pub mod encryption;
+pub mod engine_load;
 pub mod error;
 pub mod fusion;
 pub mod gpu_evidence_delegate;
 pub mod image_validation;
 pub mod metrics_middleware;
 pub mod ohttp_gateway;
+pub mod priority;
 pub mod proxy;
 pub mod rate_limit;
+pub mod reasoning;
 pub mod request_tracing;
 pub mod routes;
 pub mod signing;
 pub mod startup_checks;
+pub mod tool_calls;
 pub mod types;
 pub mod vllm_dp_affinity;
 
@@ -34,6 +41,12 @@ pub struct AppState {
     pub cache: Arc<cache::ChatCache>,
     pub attestation_cache: Arc<attestation::AttestationCache>,
     pub http_client: reqwest::Client,
+    /// Client for requests to the inference backends. Identical to
+    /// `http_client` unless `VLLM_BACKEND_TOKEN` or `VLLM_BACKEND_PRIORITY`
+    /// is set, in which case it carries `Authorization: Bearer <token>` and/or
+    /// `X-NearAI-Priority: <n>` by default so those only ever reach backends —
+    /// never cloud-api or other services.
+    pub backend_client: reqwest::Client,
     pub metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
     /// Live SHA-256 hash of the TLS certificate's SPKI (Subject Public Key
     /// Info). The tracker re-stats the cert on every attestation-cache
@@ -49,4 +62,8 @@ pub struct AppState {
     /// Conversation → backend pinning across `backend_pool` (see
     /// `VLLM_BACKEND_CONVERSATION_AFFINITY`). Inactive with one backend.
     pub backend_affinity: Arc<backend_affinity::BackendConversationAffinity>,
+    /// Lane admission: in-flight budget, per-host share and overload refusal
+    /// for chat/completions (gateway mode, `VLLM_PROXY_ADMISSION_*`). Inert
+    /// unless configured.
+    pub admission: Arc<admission::AdmissionController>,
 }

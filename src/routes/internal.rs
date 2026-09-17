@@ -7,14 +7,14 @@
 //!   delegate evidence collection to centralize NVML access. See
 //!   [`crate::gpu_evidence_delegate`] for the why.
 //!
-//! Auth: shares the standard `TOKEN`-based `RequireAuth` extractor.
-//! On a multi-proxy host the leader and delegators all carry the same
-//! `PROXY_TOKEN`, so no new secret is needed.
+//! Auth: accepts only the configured infrastructure `TOKEN`. Ordinary Cloud
+//! API keys are deliberately rejected. On a multi-proxy host the leader and
+//! delegators all carry the same `PROXY_TOKEN`, so no new secret is needed.
 
 use axum::extract::State;
 use axum::Json;
 
-use crate::auth::RequireAuth;
+use crate::auth::RequireTrustedAuth;
 use crate::error::AppError;
 use crate::gpu_evidence_delegate::{DelegateRequest, DelegateResponse};
 use crate::AppState;
@@ -36,9 +36,15 @@ use crate::AppState;
 /// nonce they sent.
 pub async fn gpu_evidence(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    _auth: RequireTrustedAuth,
     Json(req): Json<DelegateRequest>,
 ) -> Result<Json<DelegateResponse>, AppError> {
+    if state.config.non_tee_deployment {
+        return Err(AppError::NotFound(
+            "GPU evidence is not available on this endpoint: it does not run inside a TEE."
+                .to_string(),
+        ));
+    }
     // Decode + length-check the nonce up front so a malformed request
     // surfaces a clean 400 instead of a generic 500 from the SDK /
     // Python paths deep in the call stack. We need the bytes anyway

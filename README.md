@@ -27,11 +27,16 @@ Rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-proxy) (Python).
 | POST | `/v1/tokenize` | Yes | Tokenization (no signing) |
 | POST | `/v1/rerank` | Yes | Reranking |
 | POST | `/v1/score` | Yes | Scoring |
+| POST | `/v1/privacy/classify` | Yes | Privacy classification |
 | POST | `/v1/images/generations` | Yes | Image generation |
 | POST | `/v1/images/edits` | Yes | Image editing (multipart) |
 | POST | `/v1/audio/transcriptions` | Yes | Audio transcription (multipart) |
 | GET | `/v1/signature/{chat_id}` | Yes | Retrieve cached signature |
-| GET | `/v1/attestation/report` | Yes | TEE attestation report |
+| GET | `/v1/attestation/report` | No | TEE attestation report |
+| POST | `/internal/gpu_evidence` | Trusted token | Sibling-proxy GPU evidence |
+
+All other paths return `404` locally. They are never forwarded to the backend
+inference engine.
 
 ## Error Handling
 
@@ -54,7 +59,7 @@ All error responses use the OpenAI-compatible JSON format:
 
 ### Upstream errors (vLLM/sglang)
 
-Named routes (`/v1/chat/completions`, `/v1/completions`, etc.) pass through the backend error body verbatim, preserving the original status code. The catch-all route (arbitrary paths) parses the backend error and re-wraps it in the OpenAI format above.
+Named routes (`/v1/chat/completions`, `/v1/completions`, etc.) pass through the backend error body verbatim, preserving the original status code.
 
 Common upstream errors:
 
@@ -115,6 +120,31 @@ All configuration is via environment variables:
 | `VLLM_PROXY_MAX_KEEPALIVE` | No | `100` | Connection pool max idle per host |
 | `VLLM_PROXY_STREAM_IDLE_TIMEOUT_SECS` | No | `0` (disabled) | Maximum idle time between upstream SSE chunks after the first client-visible generation-progress event. It does not cap queueing, prefill, or a metadata-only assistant-role event (vLLM may emit that before hidden reasoning). When enabled, internally reassembled JSON fails with 504; native streams terminate with a body error. EOF without `[DONE]` is also treated as incomplete |
 | `LISTEN_PORT` | No | `8000` | Server listen port |
+| `LISTEN_ADDR` | No | `0.0.0.0` | Interface to bind |
+| `VLLM_BACKEND_TOKEN` | No | unset | Bearer attached to backend requests only (gateway mode: the backends are CVM inference-proxies and accept it as a trusted config token). Never sent to cloud-api |
+| `VLLM_BACKEND_PRIORITY` | No | unset | Gateway mode: engine priority for this proxy's traffic, sent as `X-NearAI-Priority` on every backend request (e.g. `-1` for the OpenRouter lane). The CVM proxy honors the header only from callers using its `TOKEN`; it sets `priority` on every chat/completions body itself (header value or 0), discarding client values |
+| `VLLM_BACKEND_HEALTH_PATH` | No | `/health` | Path probed by the pool health checker and `/healthz` |
+| `NON_TEE_DEPLOYMENT` | No | `false` | This proxy runs outside a TEE: `/healthz` skips the dstack probe, the attestation cache refresh is not started, and `/v1/attestation/report`, `/v1/signature/{id}`, `/internal/gpu_evidence` return 404 |
+| `VLLM_PROXY_MAP_QUEUE_FULL_TO_429` | No | `false` | Rewrite the engine's admission rejection (503 "The request queue is full." / "aborted by a higher priority request") to 429 with `Retry-After: 2` and type `overloaded`. Off in CVMs: cloud-api's peer fallback keys on the 503 |
+| `VLLM_PROXY_STREAM_ERROR_PEEK_MS` | No | `0` (off) | Streaming: wait up to this long for the first upstream SSE chunk before committing a 200; an admission-time `data: {"error":…}` first event becomes a real error status instead of a 200 that fails mid-stream |
+| `VLLM_PROXY_STREAM_COMMIT_MS` | No | `0` (off) | Streaming: commit `200 text/event-stream` after this long even when the upstream has not answered, so keep-alives can start during a long prefill. Past the window an upstream failure arrives as a terminal SSE `error` event, not a status — set it above the slowest error the deployment produces |
+| `VLLM_PROXY_ALLOWED_ORG_IDS` | No | empty | Organizations whose cloud-api keys may use this deployment (comma-separated ids from `/v1/check_api_key`); other valid keys get 403 (counted in `cloud_api_org_allowlist_rejections_total`). Empty = everyone. Config-token callers are not gated |
+| `VLLM_PROXY_REJECTED_CONTENT_PART_TYPES` | No | empty | Chat content part `type`s refused with 400 before dispatch, e.g. `video_url,input_audio,file` |
+| `VLLM_PROXY_MODELS_DOCUMENT_URL` | No | empty | Gateway mode: serve `GET /v1/models` from this URL (cloud-api's `/v1/models`: pricing, modalities, `is_ready`, `openrouter.slug`) reduced to `MODEL_NAME` and completed with `capacity`; when the source cannot be read the engine's own list is passed through (counted in `models_document_source_failures_total`) |
+| `VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE` | No | `0` (not declared) | Requests per minute declared in the models document's `capacity`; the concurrency entry is `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` |
+| `VLLM_PROXY_REASONING_OFF_EFFORT` | No | `none` | Gateway mode: the `reasoning_effort` sent for "as little reasoning as possible" when an aggregator asks for `reasoning.enabled: false`, an effort of `none`/`minimal`, or sends those as `reasoning_effort`. Other efforts in the `reasoning` object are copied. GLM-5.3 Flash needs `low` (its template only knows `low`/`high`; switched off outright it writes its reasoning as content) |
+| `VLLM_PROXY_SSE_KEEPALIVE_SECS` | No | `0` (off) | Emit `: keep-alive` SSE comments to the client whenever the upstream stream is silent this long. Not hashed into signatures — keep off where clients verify raw stream bytes |
+| `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` | No | `0` (off) | Gateway mode: ceiling on chat/completions requests in flight across the fleet. Beyond it, and while the lane looks overloaded (see below), new requests get `429` + `Retry-After` before anything is sent upstream (`admission.rs`) |
+| `VLLM_PROXY_ADMISSION_START_INFLIGHT` | No | = max | Budget at start-up; it ramps by `VLLM_PROXY_ADMISSION_RAMP_STEP` (default `8`) every `VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS` (default `1800`) up to the maximum, but only after an interval without an overload signal |
+| `VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS` | No | `30000` (`0` = off) | Refuse new lane work while, over the last minute, at least 20 lane requests reached the engine and 5 % of them (at least two) waited longer than this for their first generation event. A request that ends before generating counts with the time it waited |
+| `VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS` | No | `10` | A backend that rejected at engine admission (queue full / priority abort) within this many seconds is steered around while other hosts have room; when every healthy backend did, new lane work is refused |
+| `VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS` | No | `2` | `Retry-After` value on admission refusals |
+| `VLLM_BACKEND_CONNECT_FAILOVER` | No | `false` | Retry a chat/completions request once on another healthy backend when the connection to the chosen one fails before anything was sent; the unreachable backend leaves the rotation until the health checker sees it again and a pinned conversation follows the request. HTTP errors, queue-full included, are never retried |
+| `VLLM_BACKEND_PROBE_URLS` | No | empty | Gateway mode: one plain-HTTP base URL per backend (same order as `VLLM_BACKEND_URLS`) whose `/v1/metrics` is polled for the engine's running and queued requests. New conversations go to the least-loaded engine, a queueing host is steered around, and when every host queues new lane work gets 429. Empty = the gateway's own counts only |
+| `VLLM_BACKEND_PROBE_INTERVAL_SECS` | No | `2` | Poll interval for the probes; a sample older than three intervals counts as unknown |
+| `VLLM_BACKEND_LONG_CONTEXT_URLS` | No | empty | Gateway mode: backends of the long-context tier — the same hosts' handle URLs under the model's `-long` model-proxy domain — appended to the pool after `VLLM_BACKEND_URLS` so their indexes do not move. Requests estimated above `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` are placed there, everything else on the base backends. Mutually exclusive with `VLLM_DATA_PARALLEL_SIZE` |
+| `VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS` | No | empty | One engine-load probe base URL per long-context backend, same order. Required when `VLLM_BACKEND_PROBE_URLS` is set, empty when it is not |
+| `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` | No | `0` (off) | Estimated input tokens above which a request goes to the long-context tier, using cloud-api's own routing estimate (text, tool calls and tool definitions at bytes/4 with its 1.2 safety factor, plus a flat cost per media part, per-message template overhead and the reserved output window; `prompt` token ids counted exactly). A tier with no healthy backend falls back to the other one; a full one refuses with 429. Not combinable with `FUSION_ENABLED` or `WEB_CONTEXT_SEARCH_URL` |
 | `VLLM_IMAGES_URL` | No | `{base}/v1/images/generations` | Override images endpoint |
 | `VLLM_IMAGES_EDITS_URL` | No | `{base}/v1/images/edits` | Override image edits endpoint |
 | `VLLM_TRANSCRIPTIONS_URL` | No | `{base}/v1/audio/transcriptions` | Override transcriptions endpoint |

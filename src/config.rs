@@ -15,6 +15,33 @@ fn env_int(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Parse an optional numeric variable, failing loudly on garbage (unlike
+/// `env_int`, which silently falls back to the default).
+fn env_parse<T>(name: &str, default: T) -> anyhow::Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    match env::var(name) {
+        Ok(raw) if !raw.trim().is_empty() => raw
+            .trim()
+            .parse::<T>()
+            .map_err(|e| anyhow::anyhow!("{name}: {e}")),
+        _ => Ok(default),
+    }
+}
+
+/// Comma-separated backend/probe base URLs, trimmed of blanks and trailing
+/// slashes. Missing or empty = no URLs.
+fn url_list(name: &str) -> Vec<String> {
+    env::var(name)
+        .unwrap_or_default()
+        .split(',')
+        .map(|u| u.trim().trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty())
+        .collect()
+}
+
 fn parse_bool(v: &str) -> bool {
     matches!(v.to_lowercase().as_str(), "1" | "true" | "yes")
 }
@@ -239,6 +266,131 @@ pub struct Config {
     pub ohttp_enabled: bool,
     /// Listen port for the proxy (used by OHTTP handler for loopback requests).
     pub listen_port: u16,
+    /// Interface to bind (`LISTEN_ADDR`, default `0.0.0.0`). Gateway
+    /// deployments behind a local TLS terminator bind `127.0.0.1`.
+    pub listen_addr: String,
+    /// Bearer token attached to every request sent to the inference backends
+    /// (`VLLM_BACKEND_TOKEN`). Used when the backends are themselves
+    /// inference-proxies (gateway mode): they accept it as a trusted config
+    /// token, so they neither re-validate the customer key nor double-report
+    /// usage. Never sent to cloud-api or any other service.
+    pub backend_token: Option<String>,
+    /// Engine priority for this proxy's requests, sent as `X-NearAI-Priority`
+    /// on every backend request (`VLLM_BACKEND_PRIORITY`, gateway mode). The
+    /// CVM proxy honors it because the gateway authenticates with the trusted
+    /// token; everything else gets 0. See `priority.rs`.
+    pub backend_priority: Option<i64>,
+    /// Path probed on each backend by the pool health checker and by
+    /// `/healthz` (`VLLM_BACKEND_HEALTH_PATH`, default `/health`, the engine's
+    /// lightweight route). Gateway mode points it at the inference-proxy's
+    /// unauthenticated `/healthz`.
+    pub backend_health_path: String,
+    /// This proxy does not run inside a TEE (`NON_TEE_DEPLOYMENT=1`): no
+    /// dstack guest agent, no hardware evidence, dev signing keys. Effects:
+    /// `/healthz` skips the dstack probe, the attestation cache refresh is not
+    /// started, and `/v1/attestation/report`, `/v1/signature/{id}` and
+    /// `/internal/gpu_evidence` answer 404 so nothing unverifiable is
+    /// advertised. Inference routes are unaffected.
+    pub non_tee_deployment: bool,
+    /// Rewrite the engine's queue-full rejection (HTTP 503 / SSE error event
+    /// `"The request queue is full."`) to 429 (`VLLM_PROXY_MAP_QUEUE_FULL_TO_429`).
+    /// Aggregators treat 429 as back-pressure and 5xx as an outage; off by
+    /// default because cloud-api's peer fallback keys on the 503.
+    pub map_queue_full_to_429: bool,
+    /// For streaming requests, wait up to this many milliseconds for the
+    /// first upstream SSE chunk before committing a 200 to the client
+    /// (`VLLM_PROXY_STREAM_ERROR_PEEK_MS`, 0 = off). An engine that rejects
+    /// at admission (queue full, aborted) emits `data: {"error": …}` as its
+    /// first event on an HTTP 200 stream; peeking turns that into a real
+    /// error status instead of a 200 that fails mid-stream.
+    pub stream_error_peek_ms: u64,
+    /// Commit `200 text/event-stream` to the client after this many
+    /// milliseconds even when the upstream has not answered yet, so the
+    /// keep-alive comments can start during a long prefill (an engine sends
+    /// its response headers only with its first event). Zero disables it and
+    /// the status always comes from the upstream. A failure that arrives after
+    /// the commit is delivered as a terminal SSE `error` event instead of a
+    /// status code, so set this above the slowest error a deployment produces.
+    pub stream_commit_ms: u64,
+    /// Chat content part `type`s refused with 400 before dispatch
+    /// (`VLLM_PROXY_REJECTED_CONTENT_PART_TYPES`, e.g. `video_url,input_audio,file`).
+    pub rejected_content_part_types: Vec<String>,
+    /// Gateway mode: serve `/v1/models` from this URL (cloud-api's
+    /// `/v1/models`) reduced to `MODEL_NAME` and completed with the lane's
+    /// declared capacity, instead of passing the engine's list through
+    /// (`VLLM_PROXY_MODELS_DOCUMENT_URL`). Unset = engine passthrough.
+    pub models_document_url: Option<String>,
+    /// Requests per minute declared in the models document's `capacity`
+    /// (`VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE`, 0 = not declared). The
+    /// concurrency entry comes from `VLLM_PROXY_ADMISSION_MAX_INFLIGHT`.
+    pub capacity_requests_per_minute: u64,
+    /// Gateway mode: the `reasoning_effort` that stands for "as little
+    /// reasoning as possible" on the served model
+    /// (`VLLM_PROXY_REASONING_OFF_EFFORT`, default `none`). Applied to an
+    /// aggregator's `reasoning.enabled: false`, to an effort of `none` or
+    /// `minimal`, and to those values sent as `reasoning_effort` directly.
+    /// GLM-5.3 Flash needs `low`: its template only knows `low` and `high`,
+    /// and switched off outright it writes its reasoning as visible content.
+    pub reasoning_off_effort: String,
+    /// Organizations whose cloud-api keys may use this deployment
+    /// (`VLLM_PROXY_ALLOWED_ORG_IDS`, comma-separated organization ids). Empty
+    /// = every valid key. Config-token callers are not affected. Gateway mode
+    /// uses it to keep a partner lane to that partner.
+    pub allowed_org_ids: Vec<String>,
+    /// Emit an SSE comment (`: keep-alive`) on client streams whenever the
+    /// upstream has been silent for this many seconds
+    /// (`VLLM_PROXY_SSE_KEEPALIVE_SECS`, 0 = off). Comments are not hashed into
+    /// the response signature, so leave this off where clients verify
+    /// signatures over the raw stream bytes.
+    pub sse_keepalive_secs: u64,
+    /// Lane admission (gateway mode, see `admission.rs`): hard ceiling on
+    /// chat/completions requests in flight across the fleet
+    /// (`VLLM_PROXY_ADMISSION_MAX_INFLIGHT`, 0 = off, the default).
+    pub admission_max_inflight: u32,
+    /// Budget at start-up (`VLLM_PROXY_ADMISSION_START_INFLIGHT`, default =
+    /// the maximum, i.e. no ramp).
+    pub admission_start_inflight: u32,
+    /// Budget increase per clean ramp interval
+    /// (`VLLM_PROXY_ADMISSION_RAMP_STEP`, default 8).
+    pub admission_ramp_step: u32,
+    /// Ramp interval (`VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS`, default 1800).
+    pub admission_ramp_interval_secs: u64,
+    /// Refuse new work while the lane's time-to-first-chunk p95 over the last
+    /// minute is above this (`VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS`, default
+    /// 30000, 0 = no TTFT check).
+    pub admission_ttft_p95_max_ms: u64,
+    /// How long an engine admission rejection counts against its backend
+    /// (`VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS`, default 10).
+    pub admission_backpressure_secs: u64,
+    /// `Retry-After` on refusals (`VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS`,
+    /// default 2).
+    pub admission_retry_after_secs: u64,
+    /// Retry a chat/completions request once on another healthy backend when
+    /// the connection to the chosen one fails before anything was sent
+    /// (`VLLM_BACKEND_CONNECT_FAILOVER`). HTTP errors, queue-full included,
+    /// are never retried.
+    pub backend_connect_failover: bool,
+    /// Gateway mode: one plain-HTTP probe base URL per backend (same order as
+    /// `VLLM_BACKEND_URLS`) whose `/v1/metrics` is polled for the engine's
+    /// running and queued request counts (`VLLM_BACKEND_PROBE_URLS`). Empty =
+    /// no engine view; placement and admission use the gateway's own counts.
+    pub backend_probe_urls: Vec<String>,
+    /// Poll interval for the probes (`VLLM_BACKEND_PROBE_INTERVAL_SECS`,
+    /// default 2).
+    pub backend_probe_interval_secs: u64,
+    /// Gateway mode: backend URLs of the long-context tier
+    /// (`VLLM_BACKEND_LONG_CONTEXT_URLS`, the same hosts' handle URLs under
+    /// the model's `-long` model-proxy domain). Appended to the pool after
+    /// `backend_urls`, so the base backends keep their indexes.
+    pub backend_long_context_urls: Vec<String>,
+    /// One engine-load probe URL per long-context backend, same order
+    /// (`VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS`). Required with
+    /// `VLLM_BACKEND_PROBE_URLS`, empty without it.
+    pub backend_long_context_probe_urls: Vec<String>,
+    /// Estimated input tokens above which a request is placed on the
+    /// long-context tier (`VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS`, 0 = off,
+    /// the default). See `context_tier.rs` for the estimate.
+    pub long_context_above_tokens: u64,
 
     // Endpoint URL overrides (Some = explicitly set, bypasses backend pool)
     pub images_url_override: Option<String>,
@@ -396,6 +548,64 @@ impl Config {
             .unwrap_or_else(|_| "8000".to_string())
             .parse()
             .map_err(|_| anyhow::anyhow!("LISTEN_PORT must be a valid port number"))?;
+        let listen_addr = env_or("LISTEN_ADDR", "0.0.0.0");
+        let listen_ip: std::net::IpAddr = listen_addr
+            .parse()
+            .map_err(|_| anyhow::anyhow!("LISTEN_ADDR must be an IP address"))?;
+        // The OHTTP gateway re-dispatches decoded requests to 127.0.0.1 on
+        // the listen port, so it needs a bind that loopback can reach.
+        if env_bool("OHTTP_ENABLED") && !(listen_ip.is_unspecified() || listen_ip.is_loopback()) {
+            anyhow::bail!(
+                "OHTTP_ENABLED requires LISTEN_ADDR to be unspecified (0.0.0.0/::) or loopback"
+            );
+        }
+        let backend_token = env::var("VLLM_BACKEND_TOKEN")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        // A backend bearer means the backends treat this proxy as trusted and
+        // do not bill its requests, so this proxy must be able to: fail closed
+        // at startup instead of serving unbilled inference.
+        if backend_token.is_some() {
+            let set = |name: &str| env::var(name).is_ok_and(|v| !v.trim().is_empty());
+            if !set("CLOUD_API_URL") || !set("CLOUD_API_USAGE_TOKEN") {
+                anyhow::bail!(
+                    "VLLM_BACKEND_TOKEN requires CLOUD_API_URL and CLOUD_API_USAGE_TOKEN: backends do not bill trusted-token requests"
+                );
+            }
+        }
+        let backend_priority = match env::var("VLLM_BACKEND_PRIORITY")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        {
+            Some(raw) => Some(
+                crate::priority::validate_priority(&raw)
+                    .map_err(|e| anyhow::anyhow!("VLLM_BACKEND_PRIORITY: {e}"))?,
+            ),
+            None => None,
+        };
+        let backend_health_path = env_or("VLLM_BACKEND_HEALTH_PATH", "/health");
+        if !backend_health_path.starts_with('/') {
+            anyhow::bail!("VLLM_BACKEND_HEALTH_PATH must start with '/'");
+        }
+        let allowed_org_ids: Vec<String> = env::var("VLLM_PROXY_ALLOWED_ORG_IDS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let models_document_url = env::var("VLLM_PROXY_MODELS_DOCUMENT_URL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let capacity_requests_per_minute: u64 =
+            env_parse("VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE", 0)?;
+        let reasoning_off_effort = env_or("VLLM_PROXY_REASONING_OFF_EFFORT", "none")
+            .trim()
+            .to_string();
+        let rejected_content_part_types = crate::content_policy::parse_rejected_types(
+            &env::var("VLLM_PROXY_REJECTED_CONTENT_PART_TYPES").unwrap_or_default(),
+        );
 
         let git_rev = std::fs::read_to_string("/etc/.GIT_REV")
             .map(|s| s.trim().to_string())
@@ -455,6 +665,101 @@ impl Config {
             .map(|s| s.trim().trim_start_matches('~').to_string())
             .filter(|s| !s.is_empty())
             .collect();
+
+        let admission_max_inflight: u32 = env_parse("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", 0)?;
+        let admission_start_inflight: u32 = env_parse(
+            "VLLM_PROXY_ADMISSION_START_INFLIGHT",
+            admission_max_inflight,
+        )?;
+        let admission_ramp_step: u32 = env_parse("VLLM_PROXY_ADMISSION_RAMP_STEP", 8)?;
+        let admission_ramp_interval_secs: u64 =
+            env_parse("VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS", 1800)?;
+        let admission_ttft_p95_max_ms: u64 =
+            env_parse("VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS", 30_000)?;
+        let admission_backpressure_secs: u64 =
+            env_parse("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS", 10)?;
+        let admission_retry_after_secs: u64 =
+            env_parse("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS", 2)?;
+        if admission_max_inflight > 0 {
+            if admission_start_inflight == 0 || admission_start_inflight > admission_max_inflight {
+                anyhow::bail!(
+                    "VLLM_PROXY_ADMISSION_START_INFLIGHT must be between 1 and VLLM_PROXY_ADMISSION_MAX_INFLIGHT"
+                );
+            }
+            if admission_start_inflight < admission_max_inflight && admission_ramp_step == 0 {
+                anyhow::bail!(
+                    "VLLM_PROXY_ADMISSION_RAMP_STEP must be at least 1 when the budget ramps"
+                );
+            }
+            if admission_ramp_interval_secs == 0 {
+                anyhow::bail!("VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS must be at least 1");
+            }
+            if admission_backpressure_secs == 0 {
+                anyhow::bail!("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS must be at least 1");
+            }
+            if admission_retry_after_secs == 0 {
+                anyhow::bail!("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS must be at least 1");
+            }
+        }
+        let backend_connect_failover = env_bool("VLLM_BACKEND_CONNECT_FAILOVER");
+        let backend_probe_urls = url_list("VLLM_BACKEND_PROBE_URLS");
+        if !backend_probe_urls.is_empty() && backend_probe_urls.len() != backend_urls.len() {
+            anyhow::bail!(
+                "VLLM_BACKEND_PROBE_URLS must list one probe URL per VLLM_BACKEND_URLS entry, in the same order"
+            );
+        }
+        let backend_probe_interval_secs: u64 = env_parse("VLLM_BACKEND_PROBE_INTERVAL_SECS", 2)?;
+        if backend_probe_interval_secs == 0 {
+            anyhow::bail!("VLLM_BACKEND_PROBE_INTERVAL_SECS must be at least 1");
+        }
+
+        // Long-context tier: a second set of hosts, registered under the
+        // model's `-long` model-proxy domain, for oversized prompts.
+        let backend_long_context_urls = url_list("VLLM_BACKEND_LONG_CONTEXT_URLS");
+        let backend_long_context_probe_urls = url_list("VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS");
+        let long_context_above_tokens: u64 =
+            env_parse("VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS", 0)?;
+        if !backend_long_context_urls.is_empty() && long_context_above_tokens == 0 {
+            anyhow::bail!(
+                "VLLM_BACKEND_LONG_CONTEXT_URLS requires VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS: without a threshold nothing would ever be placed there"
+            );
+        }
+        if long_context_above_tokens > 0 && backend_long_context_urls.is_empty() {
+            anyhow::bail!(
+                "VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS requires VLLM_BACKEND_LONG_CONTEXT_URLS"
+            );
+        }
+        if let Some(both) = backend_long_context_urls
+            .iter()
+            .find(|url| backend_urls.contains(url))
+        {
+            anyhow::bail!(
+                "{both} is listed in both VLLM_BACKEND_URLS and VLLM_BACKEND_LONG_CONTEXT_URLS; one pool entry serves one tier"
+            );
+        }
+        let expected_long_probes = if backend_probe_urls.is_empty() {
+            0
+        } else {
+            backend_long_context_urls.len()
+        };
+        if backend_long_context_probe_urls.len() != expected_long_probes {
+            anyhow::bail!(
+                "VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS must list one probe URL per VLLM_BACKEND_LONG_CONTEXT_URLS entry when VLLM_BACKEND_PROBE_URLS is set, and none when it is not"
+            );
+        }
+        if let Some(twice) = backend_long_context_probe_urls
+            .iter()
+            .find(|url| backend_probe_urls.contains(url))
+        {
+            anyhow::bail!(
+                "{twice} is listed in both VLLM_BACKEND_PROBE_URLS and VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS: a host serving both tiers has two pool entries but one engine, which the share and the engine samples would count twice"
+            );
+        }
+        if !backend_long_context_urls.is_empty() && vllm_data_parallel_size.is_some() {
+            anyhow::bail!(
+                "VLLM_BACKEND_LONG_CONTEXT_URLS and VLLM_DATA_PARALLEL_SIZE are mutually exclusive; data-parallel affinity serves one backend"
+            );
+        }
 
         let config = Config {
             model_name,
@@ -530,6 +835,33 @@ impl Config {
             health_check_timeout_secs: env_int("HEALTH_CHECK_TIMEOUT_SECS", 3) as u64,
             ohttp_enabled: env_bool("OHTTP_ENABLED"),
             listen_port,
+            listen_addr,
+            backend_token,
+            backend_priority,
+            backend_health_path,
+            non_tee_deployment: env_bool("NON_TEE_DEPLOYMENT"),
+            map_queue_full_to_429: env_bool("VLLM_PROXY_MAP_QUEUE_FULL_TO_429"),
+            stream_error_peek_ms: env_int("VLLM_PROXY_STREAM_ERROR_PEEK_MS", 0) as u64,
+            stream_commit_ms: env_int("VLLM_PROXY_STREAM_COMMIT_MS", 0) as u64,
+            rejected_content_part_types,
+            models_document_url,
+            capacity_requests_per_minute,
+            reasoning_off_effort,
+            allowed_org_ids,
+            sse_keepalive_secs: env_int("VLLM_PROXY_SSE_KEEPALIVE_SECS", 0) as u64,
+            admission_max_inflight,
+            admission_start_inflight,
+            admission_ramp_step,
+            admission_ramp_interval_secs,
+            admission_ttft_p95_max_ms,
+            admission_backpressure_secs,
+            admission_retry_after_secs,
+            backend_connect_failover,
+            backend_probe_urls,
+            backend_probe_interval_secs,
+            backend_long_context_urls,
+            backend_long_context_probe_urls,
+            long_context_above_tokens,
             images_url_override,
             images_edits_url_override,
             transcriptions_url_override,
@@ -649,7 +981,48 @@ impl Config {
             }
         }
 
+        if config.admission_max_inflight > 0
+            && (config.fusion_enabled || config.web_context_search_url.is_some())
+        {
+            anyhow::bail!(
+                "VLLM_PROXY_ADMISSION_MAX_INFLIGHT cannot be combined with FUSION_ENABLED or WEB_CONTEXT_SEARCH_URL: those execution modes run outside the lane budget"
+            );
+        }
+        if !config.backend_long_context_urls.is_empty()
+            && (config.fusion_enabled || config.web_context_search_url.is_some())
+        {
+            anyhow::bail!(
+                "VLLM_BACKEND_LONG_CONTEXT_URLS cannot be combined with FUSION_ENABLED or WEB_CONTEXT_SEARCH_URL: those execution modes place their own backend requests, outside the tier"
+            );
+        }
         Ok(config)
+    }
+
+    /// Engine-load probe URLs in pool order: the base tier, then the
+    /// long-context one, matching how `BackendPool` is built.
+    pub fn pool_probe_urls(&self) -> Vec<String> {
+        self.backend_probe_urls
+            .iter()
+            .chain(&self.backend_long_context_probe_urls)
+            .cloned()
+            .collect()
+    }
+
+    /// Lane admission settings, `None` unless `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` is set.
+    pub fn admission(&self) -> Option<crate::admission::AdmissionConfig> {
+        if self.admission_max_inflight == 0 {
+            return None;
+        }
+        Some(crate::admission::AdmissionConfig {
+            max_inflight: self.admission_max_inflight,
+            start_inflight: self.admission_start_inflight,
+            ramp_step: self.admission_ramp_step,
+            ramp_interval: std::time::Duration::from_secs(self.admission_ramp_interval_secs),
+            ttft_p95_max: (self.admission_ttft_p95_max_ms > 0)
+                .then(|| std::time::Duration::from_millis(self.admission_ttft_p95_max_ms)),
+            backpressure_ttl: std::time::Duration::from_secs(self.admission_backpressure_secs),
+            retry_after: std::time::Duration::from_secs(self.admission_retry_after_secs),
+        })
     }
 
     /// Build the runtime config for pre-dispatch image validation.
@@ -751,6 +1124,263 @@ mod tests {
                 assert_eq!(config.tokens, vec!["tok-a", "tok-b", "tok-c"]);
             },
         );
+    }
+
+    fn gateway_env_cleanup() {
+        for key in [
+            "VLLM_BACKEND_URLS",
+            "VLLM_DATA_PARALLEL_SIZE",
+            "VLLM_BACKEND_TOKEN",
+            "VLLM_BACKEND_PRIORITY",
+            "VLLM_BACKEND_HEALTH_PATH",
+            "NON_TEE_DEPLOYMENT",
+            "VLLM_PROXY_MAP_QUEUE_FULL_TO_429",
+            "VLLM_PROXY_STREAM_ERROR_PEEK_MS",
+            "VLLM_PROXY_REJECTED_CONTENT_PART_TYPES",
+            "VLLM_PROXY_ALLOWED_ORG_IDS",
+            "VLLM_PROXY_SSE_KEEPALIVE_SECS",
+            "VLLM_PROXY_ADMISSION_MAX_INFLIGHT",
+            "VLLM_PROXY_ADMISSION_START_INFLIGHT",
+            "VLLM_PROXY_ADMISSION_RAMP_STEP",
+            "VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS",
+            "VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS",
+            "VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS",
+            "VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS",
+            "VLLM_BACKEND_CONNECT_FAILOVER",
+            "VLLM_BACKEND_PROBE_URLS",
+            "VLLM_BACKEND_PROBE_INTERVAL_SECS",
+            "VLLM_BACKEND_LONG_CONTEXT_URLS",
+            "VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS",
+            "VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS",
+            "LISTEN_ADDR",
+        ] {
+            env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn test_gateway_defaults_leave_existing_deployments_unchanged() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            gateway_env_cleanup();
+            let config = Config::from_env().unwrap();
+            assert_eq!(config.listen_addr, "0.0.0.0");
+            assert!(config.backend_token.is_none());
+            assert!(config.backend_priority.is_none());
+            assert_eq!(config.backend_health_path, "/health");
+            assert!(!config.non_tee_deployment);
+            assert!(!config.map_queue_full_to_429);
+            assert_eq!(config.stream_error_peek_ms, 0);
+            assert_eq!(config.stream_commit_ms, 0);
+            assert!(config.rejected_content_part_types.is_empty());
+            assert!(config.allowed_org_ids.is_empty());
+            assert_eq!(config.sse_keepalive_secs, 0);
+            assert_eq!(config.admission_max_inflight, 0);
+            assert!(config.admission().is_none());
+            assert!(!config.backend_connect_failover);
+            assert!(config.backend_probe_urls.is_empty());
+            assert_eq!(config.backend_probe_interval_secs, 2);
+            assert!(config.backend_long_context_urls.is_empty());
+            assert!(config.pool_probe_urls().is_empty());
+            assert_eq!(config.long_context_above_tokens, 0);
+            assert_eq!(config.backend_urls, vec!["http://localhost:8000"]);
+        });
+    }
+
+    #[test]
+    fn test_gateway_settings_parse() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                ("VLLM_BACKEND_TOKEN", " backend-secret "),
+                ("CLOUD_API_URL", "https://cloud-api.test"),
+                ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+                ("VLLM_BACKEND_HEALTH_PATH", "/healthz"),
+                ("NON_TEE_DEPLOYMENT", "1"),
+                ("VLLM_PROXY_MAP_QUEUE_FULL_TO_429", "1"),
+                ("VLLM_PROXY_STREAM_ERROR_PEEK_MS", "750"),
+                (
+                    "VLLM_PROXY_REJECTED_CONTENT_PART_TYPES",
+                    "video_url, input_audio",
+                ),
+                ("VLLM_PROXY_SSE_KEEPALIVE_SECS", "15"),
+                ("LISTEN_ADDR", "127.0.0.1"),
+                ("VLLM_PROXY_ALLOWED_ORG_IDS", " org-a, org-b ,,"),
+            ],
+            || {
+                env::remove_var("VLLM_BACKEND_URLS");
+                env::remove_var("VLLM_DATA_PARALLEL_SIZE");
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.allowed_org_ids, vec!["org-a", "org-b"]);
+                assert_eq!(config.backend_token.as_deref(), Some("backend-secret"));
+                assert_eq!(config.backend_health_path, "/healthz");
+                assert!(config.non_tee_deployment);
+                assert!(config.map_queue_full_to_429);
+                assert_eq!(config.stream_error_peek_ms, 750);
+                assert_eq!(
+                    config.rejected_content_part_types,
+                    vec!["video_url", "input_audio"]
+                );
+                assert_eq!(config.sse_keepalive_secs, 15);
+                assert_eq!(config.listen_addr, "127.0.0.1");
+                gateway_env_cleanup();
+            },
+        );
+    }
+
+    #[test]
+    fn test_backend_priority_parses_and_validates() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                ("VLLM_BACKEND_PRIORITY", " -1 "),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.backend_priority, Some(-1));
+                for bad in ["high", "1.5", "5000"] {
+                    env::set_var("VLLM_BACKEND_PRIORITY", bad);
+                    let err = Config::from_env().unwrap_err().to_string();
+                    assert!(err.contains("VLLM_BACKEND_PRIORITY"), "{bad}: {err}");
+                }
+                gateway_env_cleanup();
+            },
+        );
+    }
+
+    #[test]
+    fn test_backend_token_requires_cloud_api_billing() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                ("VLLM_BACKEND_TOKEN", "backend-secret"),
+                ("CLOUD_API_URL", "https://cloud-api.test"),
+                ("CLOUD_API_USAGE_TOKEN", ""),
+            ],
+            || {
+                gateway_env_cleanup();
+                env::set_var("VLLM_BACKEND_TOKEN", "backend-secret");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("CLOUD_API_USAGE_TOKEN"), "{err}");
+                env::set_var("CLOUD_API_USAGE_TOKEN", "usage-secret");
+                assert!(Config::from_env().is_ok());
+                gateway_env_cleanup();
+            },
+        );
+    }
+
+    #[test]
+    fn test_gateway_listen_addr_and_health_path_are_validated() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                ("LISTEN_ADDR", "not-an-ip"),
+            ],
+            || {
+                gateway_env_cleanup();
+                env::set_var("LISTEN_ADDR", "not-an-ip");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("LISTEN_ADDR"), "{err}");
+                env::set_var("LISTEN_ADDR", "10.0.0.5");
+                env::set_var("OHTTP_ENABLED", "1");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("OHTTP_ENABLED requires"), "{err}");
+                env::set_var("LISTEN_ADDR", "::1");
+                assert!(
+                    Config::from_env().is_ok(),
+                    "loopback v6 bind is fine with OHTTP"
+                );
+                env::remove_var("OHTTP_ENABLED");
+                env::remove_var("LISTEN_ADDR");
+                env::set_var("VLLM_BACKEND_HEALTH_PATH", "healthz");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("VLLM_BACKEND_HEALTH_PATH"), "{err}");
+                gateway_env_cleanup();
+            },
+        );
+    }
+
+    #[test]
+    fn test_long_context_tier_settings_are_validated() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            gateway_env_cleanup();
+            let err = || Config::from_env().unwrap_err().to_string();
+            env::set_var("VLLM_BACKEND_URLS", "https://m-b1.test,https://m-b2.test");
+            // Without the tier nothing changes, repeated probe URLs included
+            // (two proxies in front of one engine is a deployment's business).
+            env::set_var("VLLM_BACKEND_PROBE_URLS", "http://p1:8000,http://p1:8000");
+            assert!(Config::from_env().is_ok());
+            env::remove_var("VLLM_BACKEND_PROBE_URLS");
+            // The tier and its threshold only make sense together.
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_URLS", "https://m-long-b3.test");
+            assert!(
+                err().contains("VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS"),
+                "{}",
+                err()
+            );
+            env::remove_var("VLLM_BACKEND_LONG_CONTEXT_URLS");
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS", "100000");
+            assert!(
+                err().contains("VLLM_BACKEND_LONG_CONTEXT_URLS"),
+                "{}",
+                err()
+            );
+            // One pool entry serves one tier.
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_URLS", "https://m-b2.test");
+            assert!(err().contains("both"), "{}", err());
+
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_URLS", "https://m-long-b3.test/");
+            let config = Config::from_env().unwrap();
+            assert_eq!(config.backend_long_context_urls, ["https://m-long-b3.test"]);
+            assert_eq!(config.long_context_above_tokens, 100_000);
+            assert!(config.pool_probe_urls().is_empty());
+
+            // Probes: one per backend of each tier, in pool order.
+            env::set_var("VLLM_BACKEND_PROBE_URLS", "http://p1:8000,http://p2:8000");
+            assert!(
+                err().contains("VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS"),
+                "{}",
+                err()
+            );
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS", "http://p3:8000");
+            assert_eq!(
+                Config::from_env().unwrap().pool_probe_urls(),
+                ["http://p1:8000", "http://p2:8000", "http://p3:8000"]
+            );
+            // A host serving both tiers has two pool entries but one engine.
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS", "http://p2:8000");
+            assert!(err().contains("both"), "{}", err());
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS", "http://p3:8000");
+            // Long probes alone would poll a tier nothing else is polled for.
+            env::remove_var("VLLM_BACKEND_PROBE_URLS");
+            assert!(
+                err().contains("VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS"),
+                "{}",
+                err()
+            );
+            env::remove_var("VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS");
+
+            // A data-parallel backend is a single engine: no second tier.
+            env::set_var("VLLM_BACKEND_URLS", "https://m-b1.test");
+            env::set_var("VLLM_DATA_PARALLEL_SIZE", "4");
+            assert!(err().contains("VLLM_DATA_PARALLEL_SIZE"), "{}", err());
+            env::remove_var("VLLM_DATA_PARALLEL_SIZE");
+
+            // Fusion and the agent loop place their own backend requests,
+            // which no tier restriction reaches.
+            env::set_var("WEB_CONTEXT_SEARCH_URL", "https://brave.test");
+            assert!(err().contains("WEB_CONTEXT_SEARCH_URL"), "{}", err());
+            env::remove_var("WEB_CONTEXT_SEARCH_URL");
+            env::set_var("FUSION_ENABLED", "1");
+            env::set_var("FUSION_INTERNAL_BEARER_TOKEN", "fusion-secret");
+            assert!(err().contains("FUSION_ENABLED"), "{}", err());
+            env::remove_var("FUSION_ENABLED");
+            env::remove_var("FUSION_INTERNAL_BEARER_TOKEN");
+            gateway_env_cleanup();
+        });
     }
 
     #[test]
@@ -1389,5 +2019,109 @@ mod tests {
         with_env_vars(&[("_TEST_INT_VALID", "99")], || {
             assert_eq!(env_int("_TEST_INT_VALID", 42), 99);
         });
+    }
+
+    #[test]
+    fn test_admission_config_parses_and_validates() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                ("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", "48"),
+                ("VLLM_PROXY_ADMISSION_START_INFLIGHT", "32"),
+                ("VLLM_PROXY_ADMISSION_RAMP_STEP", "8"),
+                ("VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS", "1800"),
+                ("VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS", "30000"),
+                ("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS", "10"),
+                ("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS", "2"),
+                ("VLLM_BACKEND_CONNECT_FAILOVER", "1"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(
+                    config.admission(),
+                    Some(crate::admission::AdmissionConfig {
+                        max_inflight: 48,
+                        start_inflight: 32,
+                        ramp_step: 8,
+                        ramp_interval: std::time::Duration::from_secs(1800),
+                        ttft_p95_max: Some(std::time::Duration::from_secs(30)),
+                        backpressure_ttl: std::time::Duration::from_secs(10),
+                        retry_after: std::time::Duration::from_secs(2),
+                    })
+                );
+                assert!(config.backend_connect_failover);
+
+                // No TTFT check when the bound is 0; no ramp when start is omitted.
+                env::set_var("VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS", "0");
+                env::remove_var("VLLM_PROXY_ADMISSION_START_INFLIGHT");
+                let config = Config::from_env().unwrap();
+                let admission = config.admission().unwrap();
+                assert_eq!(admission.ttft_p95_max, None);
+                assert_eq!(admission.start_inflight, 48);
+
+                // Validation.
+                env::set_var("VLLM_PROXY_ADMISSION_START_INFLIGHT", "64");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("VLLM_PROXY_ADMISSION_START_INFLIGHT"), "{err}");
+                env::set_var("VLLM_PROXY_ADMISSION_START_INFLIGHT", "32");
+                env::set_var("VLLM_PROXY_ADMISSION_RAMP_STEP", "0");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("VLLM_PROXY_ADMISSION_RAMP_STEP"), "{err}");
+                env::set_var("VLLM_PROXY_ADMISSION_RAMP_STEP", "8");
+                env::set_var("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", "lots");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("VLLM_PROXY_ADMISSION_MAX_INFLIGHT"), "{err}");
+                env::set_var("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", "48");
+                env::set_var("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS", "0");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS"),
+                    "{err}"
+                );
+                env::remove_var("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS");
+                env::set_var("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS", "0");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS"),
+                    "{err}"
+                );
+                env::set_var("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS", "2");
+                // Unbudgeted execution modes cannot coexist with admission
+                // (each mode is otherwise fully configured, so this is the
+                // only reason the config can fail).
+                env::set_var("FUSION_ENABLED", "1");
+                env::set_var("FUSION_INTERNAL_BEARER_TOKEN", "fusion-secret");
+                env::set_var("FUSION_ENDPOINTS_URL", "https://fusion.example/endpoints");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("FUSION_ENABLED"), "{err}");
+                env::remove_var("FUSION_ENABLED");
+                env::remove_var("FUSION_INTERNAL_BEARER_TOKEN");
+                env::remove_var("FUSION_ENDPOINTS_URL");
+                env::set_var("WEB_CONTEXT_SEARCH_URL", "https://search.example");
+                env::set_var("WEB_CONTEXT_SEARCH_API_KEY", "search-secret");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("WEB_CONTEXT_SEARCH_URL"), "{err}");
+                env::remove_var("WEB_CONTEXT_SEARCH_URL");
+                env::remove_var("WEB_CONTEXT_SEARCH_API_KEY");
+                // Probe URLs pair with the backend URLs one to one.
+                env::set_var("VLLM_BACKEND_URLS", "https://a.example,https://b.example");
+                env::set_var("VLLM_BACKEND_PROBE_URLS", "http://10.0.0.1:8000/");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("VLLM_BACKEND_PROBE_URLS"), "{err}");
+                env::set_var(
+                    "VLLM_BACKEND_PROBE_URLS",
+                    "http://10.0.0.1:8000/, http://10.0.0.2:8000",
+                );
+                let config = Config::from_env().unwrap();
+                assert_eq!(
+                    config.backend_probe_urls,
+                    vec!["http://10.0.0.1:8000", "http://10.0.0.2:8000"]
+                );
+                env::remove_var("VLLM_BACKEND_PROBE_URLS");
+                env::remove_var("VLLM_BACKEND_URLS");
+                env::remove_var("VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS");
+            },
+        );
     }
 }

@@ -6,8 +6,9 @@ use tokio::net::TcpListener;
 use tracing::info;
 use vllm_proxy_rs::ohttp_gateway::OhttpGateway;
 use vllm_proxy_rs::{
-    attestation, backend_affinity, backend_pool, cache, config, fusion, metrics_middleware,
-    rate_limit, request_id_middleware, routes, signing, startup_checks, vllm_dp_affinity, AppState,
+    admission, attestation, backend_affinity, backend_pool, cache, config, engine_load, fusion,
+    metrics_middleware, rate_limit, request_id_middleware, routes, signing, startup_checks,
+    vllm_dp_affinity, AppState,
 };
 
 /// DNS resolver that returns only IPv4 addresses.
@@ -56,11 +57,16 @@ async fn main() -> anyhow::Result<()> {
     let config = config::Config::from_env()?;
 
     let listen_port = config.listen_port;
+    let listen_addr = config.listen_addr.clone();
 
     // Warn if any backend URL points to the proxy's own listen address
     let self_local = format!("://localhost:{listen_port}");
     let self_ip = format!("://127.0.0.1:{listen_port}");
-    for url in &config.backend_urls {
+    for url in config
+        .backend_urls
+        .iter()
+        .chain(&config.backend_long_context_urls)
+    {
         let backend_base = url.trim_end_matches('/');
         if backend_base.contains(&self_local) || backend_base.contains(&self_ip) {
             tracing::warn!(
@@ -117,15 +123,16 @@ async fn main() -> anyhow::Result<()> {
         config.vllm_data_parallel_size,
         config.chat_cache_expiration_secs,
     ));
+    let backend_count = config.backend_urls.len() + config.backend_long_context_urls.len();
     let backend_affinity = Arc::new(backend_affinity::BackendConversationAffinity::new(
         config.backend_conversation_affinity,
-        config.backend_urls.len(),
+        backend_count,
         config.backend_affinity_max_imbalance,
         config.chat_cache_expiration_secs,
     ));
     if backend_affinity.is_active() {
         info!(
-            backends = config.backend_urls.len(),
+            backends = backend_count,
             max_imbalance = config.backend_affinity_max_imbalance,
             "Backend conversation affinity enabled"
         );
@@ -143,22 +150,106 @@ async fn main() -> anyhow::Result<()> {
     // closed. A reused-but-closed connection surfaces as
     // `error sending request for url ...` and produced ~12 spurious 401s/h
     // on `/v1/check_api_key` before we capped this. (See auth.rs retry path.)
-    let mut http_builder = reqwest::Client::builder()
-        .dns_resolver(Arc::new(Ipv4OnlyResolver))
-        .pool_max_idle_per_host(config.max_keepalive)
-        .timeout(std::time::Duration::from_secs(config.timeout_secs));
-    if config.pool_idle_timeout_secs > 0 {
-        http_builder = http_builder.pool_idle_timeout(std::time::Duration::from_secs(
-            config.pool_idle_timeout_secs,
-        ));
+    let build_http_client = |default_headers: Option<reqwest::header::HeaderMap>| {
+        let mut http_builder = reqwest::Client::builder()
+            .dns_resolver(Arc::new(Ipv4OnlyResolver))
+            .pool_max_idle_per_host(config.max_keepalive)
+            .timeout(std::time::Duration::from_secs(config.timeout_secs));
+        if config.pool_idle_timeout_secs > 0 {
+            http_builder = http_builder.pool_idle_timeout(std::time::Duration::from_secs(
+                config.pool_idle_timeout_secs,
+            ));
+        }
+        if let Some(headers) = default_headers {
+            http_builder = http_builder.default_headers(headers);
+        }
+        http_builder.build()
+    };
+    let http_client = build_http_client(None)?;
+    // Backend-only client: carries the backend bearer and the priority header
+    // (if any) as default headers so they can never be attached to a cloud-api
+    // or registry request.
+    let mut backend_headers = reqwest::header::HeaderMap::new();
+    if let Some(token) = &config.backend_token {
+        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| anyhow::anyhow!("VLLM_BACKEND_TOKEN is not a valid header value"))?;
+        value.set_sensitive(true);
+        backend_headers.insert(reqwest::header::AUTHORIZATION, value);
+        info!("Backend requests will carry the configured VLLM_BACKEND_TOKEN");
     }
-    let http_client = http_builder.build()?;
+    if let Some(priority) = config.backend_priority {
+        backend_headers.insert(
+            vllm_proxy_rs::priority::PRIORITY_HEADER,
+            reqwest::header::HeaderValue::from(priority),
+        );
+        info!(priority, "Backend requests will carry the priority header");
+    }
+    let backend_client = if backend_headers.is_empty() {
+        http_client.clone()
+    } else {
+        build_http_client(Some(backend_headers))?
+    };
 
     // Initialize metrics
     let metrics_handle = metrics_middleware::setup_metrics_recorder();
 
-    // Initialize backend pool
-    let backend_pool = Arc::new(backend_pool::BackendPool::new(config.backend_urls.clone()));
+    // Initialize backend pool: the long-context tier, when configured, sits
+    // after the base backends so their indexes never move.
+    let backend_pool = Arc::new(backend_pool::BackendPool::with_long_context(
+        config.backend_urls.clone(),
+        config.backend_long_context_urls.clone(),
+    ));
+    if !config.backend_long_context_urls.is_empty() {
+        info!(
+            backends = config.backend_long_context_urls.len(),
+            above_tokens = config.long_context_above_tokens,
+            "Long-context tier enabled"
+        );
+    }
+
+    // Live engine load per backend (gateway mode): polled when probe URLs are
+    // configured; a sample older than three intervals counts as unknown.
+    let probe_interval = std::time::Duration::from_secs(config.backend_probe_interval_secs);
+    let engine_load = Arc::new(engine_load::EngineLoad::new(
+        backend_pool.len(),
+        probe_interval * 3,
+    ));
+    let probe_urls = config.pool_probe_urls();
+    if !probe_urls.is_empty() {
+        info!(
+            backends = probe_urls.len(),
+            interval_secs = config.backend_probe_interval_secs,
+            "Polling engine load from the backends' metrics"
+        );
+        engine_load::spawn_engine_load_poller(
+            engine_load.clone(),
+            http_client.clone(),
+            probe_urls,
+            probe_interval,
+        );
+    }
+
+    // Lane admission (gateway mode): inert unless configured.
+    let admission = Arc::new(admission::AdmissionController::new(
+        config.admission(),
+        backend_pool.len(),
+        engine_load,
+    ));
+    if let Some(settings) = admission.config() {
+        info!(
+            max_inflight = settings.max_inflight,
+            start_inflight = settings.start_inflight,
+            ramp_step = settings.ramp_step,
+            ramp_interval_secs = settings.ramp_interval.as_secs(),
+            ttft_p95_max_ms = settings.ttft_p95_max.map_or(0, |d| d.as_millis()),
+            backpressure_secs = settings.backpressure_ttl.as_secs(),
+            retry_after_secs = settings.retry_after.as_secs(),
+            "Lane admission enabled"
+        );
+    }
+    if config.backend_connect_failover {
+        info!("Connection fail-over to another backend enabled for chat/completions");
+    }
 
     // Build app state
     let model_name = config.model_name.clone();
@@ -168,6 +259,7 @@ async fn main() -> anyhow::Result<()> {
         cache: Arc::new(chat_cache),
         attestation_cache: attestation_cache.clone(),
         http_client,
+        backend_client,
         metrics_handle,
         tls_cert_fingerprint: tls_cert_fingerprint.clone(),
         backend_pool: backend_pool.clone(),
@@ -176,6 +268,7 @@ async fn main() -> anyhow::Result<()> {
         fusion_caches: Arc::new(fusion::FusionCaches::default()),
         vllm_dp_affinity,
         backend_affinity,
+        admission,
     };
 
     // Spawn background attestation cache refresh task.
@@ -195,22 +288,29 @@ async fn main() -> anyhow::Result<()> {
             http_client: state.http_client.clone(),
         }
     });
-    attestation::spawn_cache_refresh_task(
-        attestation_cache,
-        model_name,
-        state.signing.clone(),
-        state.config.gpu_no_hw_mode,
-        tls_cert_fingerprint,
-        state.config.attestation_cache_ttl_secs / 2,
-        compose_manager,
-        ohttp_attestation_ed25519,
-        delegate_refresh,
-    );
+    if state.config.non_tee_deployment {
+        // Non-TEE deployment (gateway mode): no dstack guest agent, so there is
+        // nothing to attest and the periodic refresh would only log failures.
+        info!("dstack not available on this deployment; attestation cache refresh disabled");
+    } else {
+        attestation::spawn_cache_refresh_task(
+            attestation_cache,
+            model_name,
+            state.signing.clone(),
+            state.config.gpu_no_hw_mode,
+            tls_cert_fingerprint,
+            state.config.attestation_cache_ttl_secs / 2,
+            compose_manager,
+            ohttp_attestation_ed25519,
+            delegate_refresh,
+        );
+    }
 
     // Run OpenAI chat compatibility checks if enabled
     if state.config.openai_chat_compatibility_check_enabled {
         info!("OpenAI chat compatibility check enabled, verifying backend...");
-        if let Err(e) = startup_checks::run_startup_checks(&state.http_client, &state.config).await
+        if let Err(e) =
+            startup_checks::run_startup_checks(&state.backend_client, &state.config).await
         {
             tracing::error!(error = %e, "OpenAI chat compatibility check failed — exiting");
             return Err(e.into());
@@ -225,6 +325,7 @@ async fn main() -> anyhow::Result<()> {
             backends = backend_pool.len(),
             interval_secs = state.config.health_check_interval_secs,
             max_failures = state.config.health_check_max_failures,
+            health_path = %state.config.backend_health_path,
             "Spawning backend health checker"
         );
         backend_pool::spawn_health_check(
@@ -233,7 +334,7 @@ async fn main() -> anyhow::Result<()> {
             std::time::Duration::from_secs(state.config.health_check_interval_secs),
             std::time::Duration::from_secs(state.config.health_check_timeout_secs),
             state.config.health_check_max_failures,
-            routes::health::BACKEND_HEALTH_PATH,
+            &state.config.backend_health_path,
         );
     }
 
@@ -262,8 +363,12 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
 
     // Bind and serve
-    let addr = format!("0.0.0.0:{listen_port}");
-    let listener = TcpListener::bind(&addr).await?;
+    // Bind from the parsed address so an IPv6 `LISTEN_ADDR` gets its brackets.
+    let ip: std::net::IpAddr = listen_addr
+        .parse()
+        .map_err(|_| anyhow::anyhow!("LISTEN_ADDR must be an IP address"))?;
+    let addr = std::net::SocketAddr::new(ip, listen_port);
+    let listener = TcpListener::bind(addr).await?;
     info!("Listening on {addr}");
 
     axum::serve(listener, app)

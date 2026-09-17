@@ -110,6 +110,13 @@ pub struct RequireAuth {
     pub request_source: RequestSource,
 }
 
+/// Authentication for infrastructure-only routes.
+///
+/// Unlike [`RequireAuth`], this extractor accepts only a configured `TOKEN`
+/// value. It never falls back to Cloud API key validation, so an ordinary
+/// customer `sk-` key cannot cross into the proxy's internal control plane.
+pub struct RequireTrustedAuth;
+
 /// Subject identity extracted from a successful `/v1/check_api_key` response.
 /// Each field is `Option` so we degrade gracefully when paired with a
 /// cloud-api version that doesn't surface that field yet.
@@ -383,6 +390,25 @@ impl FromRequestParts<AppState> for RequireAuth {
                             request_id.as_deref(),
                         )
                         .await?;
+                        // Partner lane: only allow-listed organizations may use
+                        // this deployment. A key without an organization id is
+                        // refused too, since it cannot be matched.
+                        if !state.config.allowed_org_ids.is_empty()
+                            && !subject.org_id.as_deref().is_some_and(|org| {
+                                state.config.allowed_org_ids.iter().any(|a| a == org)
+                            })
+                        {
+                            // Separate from cloud_api_auth_attempts_total: the attempt
+                            // itself succeeded (cloud-api said 200), this is policy.
+                            metrics::counter!("cloud_api_org_allowlist_rejections_total")
+                                .increment(1);
+                            tracing::warn!(
+                                request_id = request_id.as_deref().unwrap_or("-"),
+                                org_id = subject.org_id.as_deref().unwrap_or("-"),
+                                "Cloud API key belongs to an organization that is not allowed on this deployment"
+                            );
+                            return Err(AppError::Forbidden);
+                        }
                         return Ok(RequireAuth {
                             cloud_api_key: Some(token.to_string()),
                             org_id: subject.org_id,
@@ -400,6 +426,33 @@ impl FromRequestParts<AppState> for RequireAuth {
                 Err(AppError::Unauthorized)
             }
             _ => Err(AppError::Unauthorized),
+        }
+    }
+}
+
+impl FromRequestParts<AppState> for RequireTrustedAuth {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let token = parts
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|header| header.strip_prefix("Bearer "))
+            .ok_or(AppError::Unauthorized)?;
+
+        if state
+            .config
+            .tokens
+            .iter()
+            .any(|trusted| token_eq(token, trusted))
+        {
+            Ok(Self)
+        } else {
+            Err(AppError::Unauthorized)
         }
     }
 }

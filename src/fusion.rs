@@ -993,8 +993,14 @@ async fn post_chat_json(
     let attempts = max_attempts.max(1);
     for attempt in 1..=attempts {
         let attempt_started = Instant::now();
-        let mut req = state
-            .http_client
+        // Local (pool) calls carry the backend credential; direct panel/judge
+        // calls to other endpoints use their own bearer on the plain client.
+        let client = if bearer.is_some() {
+            &state.http_client
+        } else {
+            &state.backend_client
+        };
+        let mut req = client
             .post(url)
             .timeout(Duration::from_secs(state.config.fusion_panel_timeout_secs))
             .header("content-type", "application/json")
@@ -1500,9 +1506,15 @@ async fn finish_response(
         chunk_transform: ctx.chunk_transform,
         backend_guard: None,
         stream_idle_timeout_secs: ctx.state.config.stream_idle_timeout_secs,
+        sse_keepalive_secs: ctx.state.config.sse_keepalive_secs,
+        map_queue_full_to_429: ctx.state.config.map_queue_full_to_429,
+        stream_error_peek_ms: ctx.state.config.stream_error_peek_ms,
+        stream_commit_ms: ctx.state.config.stream_commit_ms,
         response_shape: ResponseShape::ChatCompletion,
         tracing_ids: Some(ctx.tracing_ids),
         upstream_data_parallel_rank: None,
+        admission: None,
+        connect_failover: None,
     };
 
     if ctx.is_stream {

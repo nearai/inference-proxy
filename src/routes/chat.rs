@@ -6,10 +6,14 @@ use axum::Extension;
 
 use sha2::Digest;
 
+use crate::admission::RejectReason;
 use crate::auth::RequireAuth;
+use crate::backend_pool;
 use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
-use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageType};
+use crate::proxy::{
+    self, make_usage_reporter, ConnectFailover, ProxyOpts, ResponseShape, UsageType,
+};
 use crate::{agent_loop, fusion};
 use crate::{AppState, TracingIds};
 
@@ -28,6 +32,20 @@ pub async fn chat_completions(
 
     // Strip empty tool_calls (vLLM bug workaround)
     strip_empty_tool_calls(&mut request_json);
+
+    // Engine `priority`: the proxy decides it (trusted callers may set it via
+    // header; any client value is discarded). Before any branch so the agent
+    // loop and fusion inherit it.
+    crate::priority::apply_priority(&mut request_json, &headers, auth.cloud_api_key.is_none());
+    // Gateway mode: an aggregator's `reasoning` object becomes the engine's
+    // `reasoning_effort` switch (`enabled: false` → `none`), otherwise the
+    // model keeps thinking and the caller pays for it.
+    if state.config.backend_token.is_some() {
+        crate::reasoning::apply_reasoning_switch(
+            &mut request_json,
+            &state.config.reasoning_off_effort,
+        );
+    }
 
     // Extract encryption context from headers
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
@@ -50,10 +68,42 @@ pub async fn chat_completions(
         )?;
     }
 
+    // Repair tool-call `arguments` the engine would refuse (empty, missing,
+    // double-encoded, non-object): one odd historical turn must not 400 the
+    // whole conversation. After decryption, so an encrypted field is judged
+    // on its plaintext, never on the ciphertext. See nearai/inference-proxy#239.
+    crate::tool_calls::normalize_tool_call_arguments(&mut request_json);
+
     // Reject clearly-bad image inputs (unfetchable / non-image) before forwarding
     // to the engine, so a flood of dead URLs can't load the model. Runs only when
     // the request actually contains images; conservative/fail-open otherwise.
     // See nearai/infra#159, #172.
+    // Refuse modalities this deployment does not serve (e.g. video) with a
+    // deterministic 400 before anything is fetched or dispatched.
+    crate::content_policy::reject_unsupported_content_parts(
+        &request_json,
+        &state.config.rejected_content_part_types,
+    )?;
+    // Long-context tier (gateway mode): a request whose estimated input is
+    // above the threshold belongs on the long-context backends, and every
+    // candidate selection below is restricted to its tier. `None` when the
+    // feature is off or that tier has no healthy host (see `context_tier.rs`).
+    let tier = crate::context_tier::decide(
+        &state.backend_pool,
+        state.config.long_context_above_tokens,
+        || crate::context_tier::chat_estimate(&request_json),
+    );
+    // Lane admission (gateway mode), first half: the overload and budget
+    // checks, so a request the lane cannot take is refused before any image
+    // is fetched. The slot and the backend placement are taken on the normal
+    // proxy path below, after the special branches, right before dispatch.
+    state.admission.precheck(&state.backend_pool, tier)?;
+    // Same conversation digest, applied across independent backends: later
+    // turns follow the backend that already holds this conversation's prefix.
+    let backend_affinity_key = state
+        .backend_affinity
+        .key_for_chat_request(&request_json, &state.config.model_name);
+
     crate::image_validation::reject_invalid_images(&request_json, &state.config.image_validation())
         .await?;
 
@@ -169,12 +219,6 @@ pub async fn chat_completions(
     let upstream_data_parallel_rank = state
         .vllm_dp_affinity
         .rank_for_chat_request(&request_json, &state.config.model_name);
-    // Same conversation digest, applied across independent backends: later
-    // turns follow the backend that already holds this conversation's prefix.
-    let backend_affinity_key = state
-        .backend_affinity
-        .key_for_chat_request(&request_json, &state.config.model_name);
-
     let modified_body =
         serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?;
 
@@ -197,12 +241,57 @@ pub async fn chat_completions(
         (None, None)
     };
 
-    let (url, guard) = state.backend_affinity.select_url(
-        &state.backend_pool,
-        backend_affinity_key,
-        "/v1/chat/completions",
-    );
-
+    // Lane admission, second half: one budget slot, then a placement bounded
+    // by the per-host share that steers around backends which just rejected
+    // at engine admission. Refuses with 429 before anything is sent upstream;
+    // disabled deployments get `None`s and plain least-connections.
+    let permit = state.admission.try_admit(&state.backend_pool, tier)?;
+    let host_share = state
+        .admission
+        .host_share(state.backend_pool.healthy_count());
+    let mut restrict = tier.and_then(|tier| tier.restrict);
+    let place = |tier| {
+        let policy = backend_pool::Policy {
+            max_conns: host_share,
+            avoid: &|index| state.admission.backend_saturated(index),
+            engine: &|index| state.admission.engine(index),
+            tier,
+        };
+        state.backend_affinity.place(
+            &state.backend_pool,
+            backend_affinity_key,
+            "/v1/chat/completions",
+            &policy,
+        )
+    };
+    let mut placement = place(restrict);
+    // The tier may have emptied since the decision (a fail-over just marked
+    // its last host unreachable): fall back, do not refuse. `restrict` then
+    // follows the placement, so a connection fail-over uses the same one.
+    if placement.is_none()
+        && restrict.is_some_and(|tier| {
+            crate::context_tier::recheck_restriction(&state.backend_pool, tier).is_none()
+        })
+    {
+        restrict = None;
+        placement = place(None);
+    }
+    let placement =
+        placement.ok_or_else(|| AppError::from(state.admission.reject(RejectReason::HostShare)))?;
+    if let Some(permit) = permit.as_ref() {
+        permit.attach_backend(placement.index);
+    }
+    let connect_failover = state
+        .config
+        .backend_connect_failover
+        .then(|| ConnectFailover {
+            pool: state.backend_pool.clone(),
+            path: "/v1/chat/completions",
+            index: placement.index,
+            tier: restrict,
+            affinity: backend_affinity_key.map(|key| (state.backend_affinity.clone(), key)),
+        });
+    let url = placement.url;
     let opts = ProxyOpts {
         signing: state.signing.clone(),
         cache: state.cache.clone(),
@@ -213,17 +302,23 @@ pub async fn chat_completions(
         request_hash: Some(request_hash),
         response_transform,
         chunk_transform,
-        backend_guard: Some(guard),
+        backend_guard: Some(placement.guard),
         stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
+        sse_keepalive_secs: state.config.sse_keepalive_secs,
+        map_queue_full_to_429: state.config.map_queue_full_to_429,
+        stream_error_peek_ms: state.config.stream_error_peek_ms,
+        stream_commit_ms: state.config.stream_commit_ms,
         response_shape: ResponseShape::ChatCompletion,
         tracing_ids: Some(tracing_ids),
         upstream_data_parallel_rank,
+        admission: permit,
+        connect_failover,
     };
 
     if is_stream {
-        proxy::proxy_streaming_request(&state.http_client, &url, modified_body, opts).await
+        proxy::proxy_streaming_request(&state.backend_client, &url, modified_body, opts).await
     } else {
-        proxy::proxy_json_request(&state.http_client, &url, modified_body, opts).await
+        proxy::proxy_json_request(&state.backend_client, &url, modified_body, opts).await
     }
 }
 

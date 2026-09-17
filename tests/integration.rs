@@ -235,6 +235,33 @@ fn build_test_app_inner_with_pool(
         score_url_override: None,
         ohttp_enabled: false,
         listen_port: 8000,
+        listen_addr: "127.0.0.1".to_string(),
+        backend_token: None,
+        backend_priority: None,
+        backend_health_path: "/health".to_string(),
+        non_tee_deployment: false,
+        map_queue_full_to_429: false,
+        stream_error_peek_ms: 0,
+        stream_commit_ms: 0,
+        rejected_content_part_types: Vec::new(),
+        models_document_url: None,
+        capacity_requests_per_minute: 0,
+        reasoning_off_effort: "none".to_string(),
+        allowed_org_ids: Vec::new(),
+        sse_keepalive_secs: 0,
+        admission_max_inflight: 0,
+        admission_start_inflight: 0,
+        admission_ramp_step: 8,
+        admission_ramp_interval_secs: 1800,
+        admission_ttft_p95_max_ms: 30_000,
+        admission_backpressure_secs: 10,
+        admission_retry_after_secs: 2,
+        backend_connect_failover: false,
+        backend_probe_urls: Vec::new(),
+        backend_long_context_urls: Vec::new(),
+        backend_long_context_probe_urls: Vec::new(),
+        long_context_above_tokens: 0,
+        backend_probe_interval_secs: 2,
         dstack_socket_path: options.dstack_socket_path,
         gpu_evidence_delegate_url: None,
         gpu_evidence_delegate_timeout_secs: 30,
@@ -299,12 +326,14 @@ fn build_test_app_inner_with_pool(
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),
         attestation_cache: Arc::new(vllm_proxy_rs::attestation::AttestationCache::new(300)),
-        http_client,
+        http_client: http_client.clone(),
+        backend_client: http_client,
         metrics_handle,
         tls_cert_fingerprint: Arc::new(
             vllm_proxy_rs::attestation::TlsCertTracker::new(None).expect("tracker for None path"),
         ),
         backend_pool: backend_pool.clone(),
+        admission: Arc::new(vllm_proxy_rs::admission::AdmissionController::disabled()),
         ohttp_gateway: None,
         ohttp_attestation_ed25519: None,
         fusion_caches: Arc::new(fusion::FusionCaches::default()),
@@ -632,51 +661,6 @@ async fn test_chat_completions_forwards_derived_vllm_data_parallel_rank() {
     assert_eq!(response.status(), StatusCode::OK);
 }
 
-#[tokio::test]
-async fn test_catch_all_chat_alias_forwards_derived_vllm_data_parallel_rank() {
-    let mock_server = MockServer::start().await;
-    let request_body = serde_json::json!({
-        "model": "client-alias",
-        "messages": [{"role": "user", "content": "Hi from an alias"}],
-        "stream": false
-    });
-
-    let backend_response = serde_json::json!({
-        "id": "chatcmpl-affinity-alias",
-        "object": "chat.completion",
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": "Hello!"},
-            "finish_reason": "stop"
-        }],
-        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
-    });
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions/"))
-        .and(header(vllm_dp_affinity::DATA_PARALLEL_RANK_HEADER, "0"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&backend_response))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app_with_vllm_dp_affinity(&mock_server.uri(), 4);
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions/")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .header(vllm_dp_affinity::DATA_PARALLEL_RANK_HEADER, "99")
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-}
-
 // ---- Backend conversation affinity (multi-backend pools) ----
 
 /// Chat body with `turns` extra assistant/user exchanges appended to the same
@@ -841,33 +825,6 @@ async fn test_backend_affinity_skips_unhealthy_pinned_backend() {
 }
 
 #[tokio::test]
-async fn test_catch_all_chat_alias_honors_backend_affinity() {
-    let backend_a = MockServer::start().await;
-    let backend_b = MockServer::start().await;
-    mount_chat_ok(&backend_a, "/v1/chat/completions", 1).await;
-    mount_chat_ok(&backend_a, "/v1/chat/completions/", 1).await;
-    mount_chat_ok(&backend_b, "/v1/chat/completions", 0).await;
-    mount_chat_ok(&backend_b, "/v1/chat/completions/", 0).await;
-    let (app, pool) = build_test_app_with_backends(vec![backend_a.uri(), backend_b.uri()], true, 8);
-
-    assert_eq!(
-        post_chat(app.clone(), "/v1/chat/completions", &affinity_chat_body(0)).await,
-        StatusCode::OK
-    );
-    pool.backends()[0]
-        .active_conns
-        .store(3, std::sync::atomic::Ordering::Relaxed);
-    // The trailing-slash alias goes through the catch-all handler, which must
-    // derive the same conversation key and land on the pinned backend.
-    assert_eq!(
-        post_chat(app, "/v1/chat/completions/", &affinity_chat_body(1)).await,
-        StatusCode::OK
-    );
-    assert_eq!(requests_seen(&backend_a).await, 2);
-    assert_eq!(requests_seen(&backend_b).await, 0);
-}
-
-#[tokio::test]
 async fn test_multiple_backends_without_affinity_stay_least_connections() {
     let backend_a = MockServer::start().await;
     let backend_b = MockServer::start().await;
@@ -993,153 +950,6 @@ async fn test_chat_completions_image_validation_rejects_remote_video_image_url()
         body["error"]["message"].is_string(),
         "expected OpenAI error shape, got: {body}"
     );
-}
-
-#[tokio::test]
-async fn test_catch_all_chat_alias_runs_image_validation() {
-    // A trailing-slash chat-completions alias lands in catch_all. It must still
-    // run image validation so backend-accepted aliases cannot bypass the guard.
-    let mock_server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions/"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"x"})))
-        .expect(0)
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app_with_image_validation(&mock_server.uri());
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": "file:///etc/passwd"}}
-        ]}],
-        "stream": false
-    });
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions/")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = body_to_json(response).await;
-    assert!(body["error"]["message"].is_string());
-}
-
-#[tokio::test]
-async fn test_catch_all_percent_encoded_chat_alias_runs_image_validation() {
-    // `/v1/chat/%63ompletions` (c = %63) misses the exact axum route but a
-    // uvicorn backend decodes it. catch_all compares the percent-DECODED path,
-    // so the alias is still validated (bad image → 400, backend not hit).
-    let mock_server = MockServer::start().await;
-    let app = build_test_app_with_image_validation(&mock_server.uri());
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": "file:///etc/passwd"}}
-        ]}],
-        "stream": false
-    });
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/%63ompletions")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn test_catch_all_chat_alias_over_json_cap_is_rejected() {
-    // A chat-completions alias lands in catch_all, whose generic body limit is
-    // larger than the normal JSON chat limit. It must still enforce the chat
-    // limit instead of forwarding an oversized padded request around the
-    // dedicated route and image-validation parse.
-    let mock_server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions/"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"x"})))
-        .expect(0)
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app_with_image_validation(&mock_server.uri());
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": "Hi"}],
-        "padding": "x".repeat(1024 * 1024)
-    });
-    let body = serde_json::to_vec(&request_body).unwrap();
-    assert!(body.len() > 1024 * 1024);
-    assert!(body.len() < 10 * 1024 * 1024);
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions/")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-}
-
-#[tokio::test]
-async fn test_catch_all_non_chat_json_skips_image_validation() {
-    // The catch-all image-validation hook is only for chat-completions aliases.
-    // Other forwarded JSON endpoints must not parse/fetch arbitrary
-    // image_url-shaped fields or turn them into local 400s.
-    let mock_server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/completions/"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"x"})))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app_with_image_validation(&mock_server.uri());
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": "file:///etc/passwd"}}
-        ]}]
-    });
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/completions/")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -4162,14 +3972,16 @@ async fn test_strip_empty_tool_calls() {
     let mock_server = MockServer::start().await;
 
     // Expect the backend receives the request WITHOUT empty tool_calls.
-    // The proxy injects stream: true internally, so include those fields.
+    // The proxy injects stream: true and the engine priority internally, so
+    // include those fields.
     let expected_backend_body = serde_json::json!({
         "messages": [
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": "hello"}
         ],
         "stream": true,
-        "stream_options": {"include_usage": true}
+        "stream_options": {"include_usage": true},
+        "priority": 0
     });
 
     Mock::given(method("POST"))
@@ -4208,6 +4020,156 @@ async fn test_strip_empty_tool_calls() {
 
     assert_eq!(response.status(), StatusCode::OK);
     // The mock expectation (body_json) verifies the backend received stripped body
+}
+
+#[tokio::test]
+async fn test_tool_call_arguments_are_normalized_before_dispatch() {
+    use wiremock::matchers::body_json;
+
+    let mock_server = MockServer::start().await;
+
+    // The engine refuses `function.arguments` that is not a string holding a
+    // JSON object; the proxy repairs each shape and leaves good ones alone.
+    let expected_backend_body = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "time?"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "a", "type": "function", "function": {"name": "get_time", "arguments": "{}"}},
+                {"id": "b", "type": "function", "function": {"name": "lookup", "arguments": "{\"value\":[]}"}},
+                {"id": "c", "type": "function", "function": {"name": "noop", "arguments": "{}"}},
+                {"id": "d", "type": "function", "function": {"name": "search", "arguments": "{\"q\": \"x\"}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "a", "content": "12:00"}
+        ],
+        "stream": true,
+        "stream_options": {"include_usage": true},
+        "priority": 0
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_json(&expected_backend_body))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-tc",
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let request_body = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "time?"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "a", "type": "function", "function": {"name": "get_time", "arguments": ""}},
+                {"id": "b", "type": "function", "function": {"name": "lookup", "arguments": "[]"}},
+                {"id": "c", "type": "function", "function": {"name": "noop"}},
+                {"id": "d", "type": "function", "function": {"name": "search", "arguments": "{\"q\": \"x\"}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "a", "content": "12:00"}
+        ]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    // The mock expectation (body_json) verifies the backend received the repaired history
+}
+
+/// Matches a chat body whose first assistant tool call carries exactly these
+/// plaintext `function.arguments`.
+struct FirstToolCallArguments(&'static str);
+
+impl wiremock::Match for FirstToolCallArguments {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        let Ok(body) = serde_json::from_slice::<serde_json::Value>(&request.body) else {
+            return false;
+        };
+        body["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|m| m["tool_calls"][0]["function"]["arguments"].as_str())
+            .any(|arguments| arguments == self.0)
+    }
+}
+
+#[tokio::test]
+async fn test_tool_call_arguments_are_normalized_after_decryption() {
+    use vllm_proxy_rs::encryption;
+
+    // With `X-Encrypt-All-Fields: true` the tool-call arguments arrive as
+    // ciphertext. Normalisation must judge the plaintext (here an empty
+    // string, repaired to `{}`), never the hex, or the backend would receive
+    // a wrapped ciphertext it cannot use.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(FirstToolCallArguments("{}"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-enc-tc",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 1}
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+    let client_pair = test_client_signing_pair();
+    let server_pub_bytes = hex::decode(test_ed25519_pub_key_hex()).unwrap();
+    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
+    let enc = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: server_pub_bytes,
+        version: 1,
+        encrypt_all_fields: true,
+    };
+    let seal = |plain: &str| encryption::encrypt_string(plain, &enc, &client_pair).unwrap();
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [
+            {"role": "user", "content": seal("time?")},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": seal("get_time"), "arguments": seal("")}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": seal("12:00")}
+        ],
+        "stream": false
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header("x-signing-algo", "ed25519")
+                .header("x-client-pub-key", &client_pub_hex)
+                .header("x-encrypt-all-fields", "true")
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    // The mock expectation verifies the backend saw the repaired plaintext.
 }
 
 // ---- Response ID generation ----
@@ -4575,6 +4537,44 @@ async fn test_internal_gpu_evidence_requires_auth() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_internal_gpu_evidence_rejects_cloud_api_keys() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-test"
+        })))
+        .mount(&cloud_api)
+        .await;
+
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/gpu_evidence")
+                .header("authorization", "Bearer sk-test-customer")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"nonce":"00"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        cloud_api
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "infrastructure-only auth must never validate customer keys"
+    );
 }
 
 #[tokio::test]
@@ -5218,836 +5218,6 @@ async fn test_audio_transcriptions_large_body_not_rejected() {
     assert_eq!(resp_body["id"], "trans-large");
 }
 
-// ---- Catch-all passthrough ----
-
-#[tokio::test]
-async fn test_passthrough_json_post() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/custom/endpoint"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "pt-custom-1",
-            "result": "ok"
-        })))
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app(&mock_server.uri());
-
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/custom/endpoint")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(r#"{"data":"test"}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_to_json(response).await;
-    assert_eq!(body["id"], "pt-custom-1");
-    assert_eq!(body["result"], "ok");
-
-    // Verify signature was cached
-    let sig_response = app
-        .oneshot(
-            Request::builder()
-                .uri("/v1/signature/pt-custom-1?signing_algo=ecdsa")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(sig_response.status(), StatusCode::OK);
-    let sig_body = body_to_json(sig_response).await;
-    assert!(sig_body["text"].as_str().unwrap().contains(":"));
-}
-
-#[tokio::test]
-async fn test_passthrough_get_json() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/v1/custom/info"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"id": "pt-info-1", "status": "healthy"}))
-                .insert_header("content-type", "application/json"),
-        )
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app(&mock_server.uri());
-
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/v1/custom/info")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_to_json(response).await;
-    assert_eq!(body["status"], "healthy");
-
-    // Verify signature was cached
-    let sig_response = app
-        .oneshot(
-            Request::builder()
-                .uri("/v1/signature/pt-info-1?signing_algo=ecdsa")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(sig_response.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn test_passthrough_streaming() {
-    let mock_server = MockServer::start().await;
-
-    let sse_body =
-        "data: {\"id\":\"pt-stream-1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
-
-    Mock::given(method("POST"))
-        .and(path("/v1/custom/stream"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_raw(sse_body, "text/event-stream"),
-        )
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app(&mock_server.uri());
-
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/custom/stream")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(r#"{"stream":true}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers().get("content-type").unwrap(),
-        "text/event-stream"
-    );
-
-    let body_bytes = body_to_bytes(response).await;
-    let body_str = String::from_utf8_lossy(&body_bytes);
-    assert!(body_str.contains("pt-stream-1"));
-    assert!(body_str.contains("[DONE]"));
-
-    // Wait for background signing task
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    // Verify signature was cached
-    let sig_response = app
-        .oneshot(
-            Request::builder()
-                .uri("/v1/signature/pt-stream-1?signing_algo=ecdsa")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(sig_response.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn test_passthrough_raw_response() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/v1/custom/text"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string("plain text output")
-                .insert_header("content-type", "text/plain"),
-        )
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app(&mock_server.uri());
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/v1/custom/text")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers().get("content-type").unwrap(),
-        "text/plain"
-    );
-    let body_bytes = body_to_bytes(response).await;
-    assert_eq!(String::from_utf8_lossy(&body_bytes), "plain text output");
-}
-
-#[tokio::test]
-async fn test_passthrough_path_traversal() {
-    let app = build_test_app("http://unused");
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/../etc/passwd")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = body_to_json(response).await;
-    assert!(body["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("Path traversal"));
-}
-
-#[tokio::test]
-async fn test_passthrough_auth_required() {
-    let app = build_test_app("http://unused");
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/v1/custom/anything")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn test_passthrough_upstream_error() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/v1/custom/broken"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("internal secret error details"))
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app(&mock_server.uri());
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/v1/custom/broken")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    // Should preserve the upstream status code (500)
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    let body = body_to_json(response).await;
-    let msg = body["error"]["message"].as_str().unwrap();
-    assert!(msg.contains("Upstream request failed with status"));
-    // Should NOT leak the raw upstream body
-    assert!(!msg.contains("internal secret error details"));
-}
-
-#[tokio::test]
-async fn test_passthrough_upstream_json_error_rewrapped() {
-    let mock_server = MockServer::start().await;
-
-    // vLLM-style flat error response
-    let vllm_error = serde_json::json!({
-        "object": "error",
-        "message": "This model's maximum context length is 2048 tokens. However, you requested 4374 tokens (3350 in the messages, 1024 in the completion). Please reduce the length of the messages or completion.",
-        "type": "BadRequestError",
-        "param": null,
-        "code": 400
-    });
-
-    Mock::given(method("POST"))
-        .and(path("/v1/custom/chat"))
-        .respond_with(ResponseTemplate::new(400).set_body_json(&vllm_error))
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app(&mock_server.uri());
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/custom/chat")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(r#"{"prompt":"test"}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    // Should preserve the upstream status code
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = body_to_json(response).await;
-    // Should re-wrap with the actual error message from vLLM
-    let msg = body["error"]["message"].as_str().unwrap();
-    assert!(msg.contains("maximum context length is 2048 tokens"));
-    assert_eq!(body["error"]["type"], "BadRequestError");
-    // Should be in OpenAI-compatible format (nested under "error")
-    assert!(body["error"]["param"].is_null());
-    assert!(body["error"]["code"].is_null());
-}
-
-#[tokio::test]
-async fn test_passthrough_upstream_model_not_found() {
-    let mock_server = MockServer::start().await;
-
-    let vllm_error = serde_json::json!({
-        "object": "error",
-        "message": "The model `gpt-5` does not exist.",
-        "type": "Not Found",
-        "param": null,
-        "code": 404
-    });
-
-    Mock::given(method("GET"))
-        .and(path("/v1/custom/models/gpt-5"))
-        .respond_with(ResponseTemplate::new(404).set_body_json(&vllm_error))
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app(&mock_server.uri());
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/v1/custom/models/gpt-5")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    let body = body_to_json(response).await;
-    assert!(body["error"]["message"].as_str().unwrap().contains("gpt-5"));
-    assert_eq!(body["error"]["type"], "Not Found");
-}
-
-#[tokio::test]
-async fn test_passthrough_upstream_invalid_param() {
-    let mock_server = MockServer::start().await;
-
-    let vllm_error = serde_json::json!({
-        "object": "error",
-        "message": "temperature must be non-negative, got -0.5.",
-        "type": "BadRequestError",
-        "param": null,
-        "code": 400
-    });
-
-    Mock::given(method("POST"))
-        .and(path("/v1/custom/complete"))
-        .respond_with(ResponseTemplate::new(400).set_body_json(&vllm_error))
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app(&mock_server.uri());
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/custom/complete")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(r#"{"temperature":-0.5}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = body_to_json(response).await;
-    assert!(body["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("temperature must be non-negative"));
-}
-
-#[tokio::test]
-async fn test_passthrough_upstream_internal_server_error() {
-    let mock_server = MockServer::start().await;
-
-    // vLLM sometimes returns 500 with just "Internal Server Error"
-    let vllm_error = serde_json::json!({
-        "object": "error",
-        "message": "Internal server error",
-        "type": "InternalServerError",
-        "param": null,
-        "code": 500
-    });
-
-    Mock::given(method("POST"))
-        .and(path("/v1/custom/inference"))
-        .respond_with(ResponseTemplate::new(500).set_body_json(&vllm_error))
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app(&mock_server.uri());
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/custom/inference")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(r#"{}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    let body = body_to_json(response).await;
-    assert_eq!(body["error"]["type"], "InternalServerError");
-}
-
-#[tokio::test]
-async fn test_passthrough_upstream_nested_error_format() {
-    let mock_server = MockServer::start().await;
-
-    // sglang-style nested error format
-    let sglang_error = serde_json::json!({
-        "error": {
-            "message": "Tools cannot be empty if tool choice is set to required.",
-            "type": "BadRequestError",
-            "param": null,
-            "code": 400
-        }
-    });
-
-    Mock::given(method("POST"))
-        .and(path("/v1/custom/tools"))
-        .respond_with(ResponseTemplate::new(400).set_body_json(&sglang_error))
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app(&mock_server.uri());
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/custom/tools")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(r#"{"tool_choice":"required"}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = body_to_json(response).await;
-    assert!(body["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("Tools cannot be empty"));
-    assert_eq!(body["error"]["type"], "BadRequestError");
-}
-
-#[tokio::test]
-async fn test_passthrough_upstream_empty_body_error() {
-    let mock_server = MockServer::start().await;
-
-    // vLLM intermittently returns 500 with empty body (Content-Length: 0)
-    Mock::given(method("POST"))
-        .and(path("/v1/custom/empty"))
-        .respond_with(ResponseTemplate::new(500).set_body_string(""))
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app(&mock_server.uri());
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/custom/empty")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(r#"{}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    let body = body_to_json(response).await;
-    // Falls back to generic message when body is unparseable
-    assert!(body["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("Upstream request failed with status"));
-}
-
-#[tokio::test]
-async fn test_passthrough_headers_forwarded() {
-    use wiremock::matchers::header;
-
-    let mock_server = MockServer::start().await;
-
-    // Expect that custom headers are forwarded, but host/content-length/authorization are excluded
-    Mock::given(method("POST"))
-        .and(path("/v1/custom/headers"))
-        .and(header("x-custom-header", "custom-value"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "pt-headers-1",
-            "ok": true
-        })))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app(&mock_server.uri());
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/custom/headers")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .header("x-custom-header", "custom-value")
-                .body(Body::from(r#"{"test": true}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    // The mock expectation (header matcher) verifies the custom header was forwarded
-}
-
-#[tokio::test]
-async fn test_passthrough_excluded_headers_not_forwarded() {
-    use wiremock::matchers::header_exists;
-    use wiremock::Match;
-
-    /// Matcher that asserts a header does NOT exist on the request.
-    struct HeaderAbsent(&'static str);
-    impl Match for HeaderAbsent {
-        fn matches(&self, request: &wiremock::Request) -> bool {
-            !request.headers.contains_key(self.0)
-        }
-    }
-
-    let mock_server = MockServer::start().await;
-
-    // Verify: custom headers forwarded, authorization excluded.
-    // Note: we don't assert host is absent because reqwest always adds Host per HTTP/1.1.
-    Mock::given(method("POST"))
-        .and(path("/v1/custom/excl"))
-        .and(header_exists("x-custom-header"))
-        .and(HeaderAbsent("authorization"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "pt-excl-1",
-            "ok": true
-        })))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app(&mock_server.uri());
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/custom/excl")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .header("x-custom-header", "present")
-                .body(Body::from(r#"{"test": true}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    // The mock expectations verify: x-custom-header present, authorization absent, host absent
-}
-
-#[tokio::test]
-async fn test_passthrough_json_array_response() {
-    let mock_server = MockServer::start().await;
-
-    // Backend returns a JSON array (not an object) — should not panic
-    Mock::given(method("POST"))
-        .and(path("/v1/custom/array"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!([1, 2, 3]))
-                .insert_header("content-type", "application/json"),
-        )
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app(&mock_server.uri());
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/custom/array")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(r#"{"data":"test"}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_to_json(response).await;
-    // Should return the array unmodified (can't inject ID into non-object)
-    assert!(body.is_array());
-    assert_eq!(body[0], 1);
-}
-
-#[tokio::test]
-async fn test_passthrough_raw_response_no_signature_cached() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/v1/custom/binary"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(b"binary data".to_vec())
-                .insert_header("content-type", "application/octet-stream"),
-        )
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app(&mock_server.uri());
-
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/v1/custom/binary")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body_bytes = body_to_bytes(response).await;
-    assert_eq!(body_bytes, b"binary data");
-
-    // Raw passthrough should NOT have any signature cached.
-    // Use a generated ID pattern — since there's no signing, no ID is generated at all.
-    // Try fetching with a plausible ID prefix to confirm nothing was cached.
-    let sig_response = app
-        .oneshot(
-            Request::builder()
-                .uri("/v1/signature/pt-does-not-exist?signing_algo=ecdsa")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(sig_response.status(), StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn test_passthrough_upstream_404_preserved() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/v1/custom/notfound"))
-        .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app(&mock_server.uri());
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/v1/custom/notfound")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    let body = body_to_json(response).await;
-    assert!(body["error"]["message"].as_str().unwrap().contains("404"));
-}
-
-#[tokio::test]
-async fn test_passthrough_upstream_429_preserved() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/custom/ratelimit"))
-        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app(&mock_server.uri());
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/custom/ratelimit")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(r#"{}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-}
-
-#[tokio::test]
-async fn test_passthrough_success_status_preserved() {
-    let mock_server = MockServer::start().await;
-
-    // Backend returns 201 Created with JSON
-    Mock::given(method("POST"))
-        .and(path("/v1/custom/create"))
-        .respond_with(
-            ResponseTemplate::new(201)
-                .set_body_json(serde_json::json!({"id": "pt-created-1", "created": true})),
-        )
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app(&mock_server.uri());
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/custom/create")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(r#"{"name":"test"}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    // Should preserve 201, not normalize to 200
-    assert_eq!(response.status(), StatusCode::CREATED);
-    let body = body_to_json(response).await;
-    assert_eq!(body["created"], true);
-}
-
-#[tokio::test]
-async fn test_passthrough_raw_response_headers_preserved() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/v1/custom/headers_resp"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string("data")
-                .insert_header("content-type", "text/plain")
-                .insert_header("x-custom-response", "from-backend")
-                .insert_header("cache-control", "max-age=60"),
-        )
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app(&mock_server.uri());
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/v1/custom/headers_resp")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    // Upstream response headers should be preserved
-    assert_eq!(
-        response.headers().get("x-custom-response").unwrap(),
-        "from-backend"
-    );
-    assert_eq!(
-        response.headers().get("cache-control").unwrap(),
-        "max-age=60"
-    );
-    assert_eq!(
-        response.headers().get("content-type").unwrap(),
-        "text/plain"
-    );
-}
-
 // ---- Rate limiting ----
 
 #[tokio::test]
@@ -6242,6 +5412,33 @@ fn build_test_app_with_cloud_api_retries(
         score_url_override: None,
         ohttp_enabled: false,
         listen_port: 8000,
+        listen_addr: "127.0.0.1".to_string(),
+        backend_token: None,
+        backend_priority: None,
+        backend_health_path: "/health".to_string(),
+        non_tee_deployment: false,
+        map_queue_full_to_429: false,
+        stream_error_peek_ms: 0,
+        stream_commit_ms: 0,
+        rejected_content_part_types: Vec::new(),
+        models_document_url: None,
+        capacity_requests_per_minute: 0,
+        reasoning_off_effort: "none".to_string(),
+        allowed_org_ids: Vec::new(),
+        sse_keepalive_secs: 0,
+        admission_max_inflight: 0,
+        admission_start_inflight: 0,
+        admission_ramp_step: 8,
+        admission_ramp_interval_secs: 1800,
+        admission_ttft_p95_max_ms: 30_000,
+        admission_backpressure_secs: 10,
+        admission_retry_after_secs: 2,
+        backend_connect_failover: false,
+        backend_probe_urls: Vec::new(),
+        backend_long_context_urls: Vec::new(),
+        backend_long_context_probe_urls: Vec::new(),
+        long_context_above_tokens: 0,
+        backend_probe_interval_secs: 2,
         dstack_socket_path: "/var/run/dstack.sock".to_string(),
         gpu_evidence_delegate_url: None,
         gpu_evidence_delegate_timeout_secs: 30,
@@ -6292,7 +5489,8 @@ fn build_test_app_with_cloud_api_retries(
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),
         attestation_cache: Arc::new(vllm_proxy_rs::attestation::AttestationCache::new(300)),
-        http_client,
+        http_client: http_client.clone(),
+        backend_client: http_client,
         metrics_handle,
         tls_cert_fingerprint: Arc::new(
             vllm_proxy_rs::attestation::TlsCertTracker::new(None).expect("tracker for None path"),
@@ -6305,6 +5503,7 @@ fn build_test_app_with_cloud_api_retries(
         backend_affinity: Arc::new(
             vllm_proxy_rs::backend_affinity::BackendConversationAffinity::new(false, 1, 8, 1_200),
         ),
+        admission: Arc::new(vllm_proxy_rs::admission::AdmissionController::disabled()),
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(100, 200);
@@ -6884,7 +6083,7 @@ async fn test_responses_subpaths_refused() {
         assert_eq!(
             response.status(),
             StatusCode::NOT_FOUND,
-            "{uri} must be refused by the catch-all"
+            "{uri} must be refused by the route allowlist"
         );
     }
 
@@ -6896,20 +6095,9 @@ async fn test_responses_subpaths_refused() {
 }
 
 #[tokio::test]
-async fn test_catch_all_still_proxies_other_unknown_paths() {
-    // The guard must be narrow: a path that merely shares the prefix is a
-    // different endpoint and keeps its passthrough behaviour.
+async fn test_similar_unknown_paths_are_refused() {
+    // Prefix lookalikes must not bypass the exact-route allowlist.
     let backend = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/responsesx"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"id": "pt-not-responses", "ok": true})),
-        )
-        .mount(&backend)
-        .await;
-
     let app = build_test_app(&backend.uri());
 
     let response = app
@@ -6925,9 +6113,17 @@ async fn test_catch_all_still_proxies_other_unknown_paths() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let body = body_to_json(response).await;
-    assert_eq!(body["ok"], true);
+    assert_eq!(body["error"]["type"], "not_found");
+    assert!(
+        backend
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "unknown path must not reach the backend"
+    );
 }
 
 #[tokio::test]
@@ -8845,6 +8041,33 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         score_url_override: None,
         ohttp_enabled: true,
         listen_port: 0, // not used in oneshot tests
+        listen_addr: "127.0.0.1".to_string(),
+        backend_token: None,
+        backend_priority: None,
+        backend_health_path: "/health".to_string(),
+        non_tee_deployment: false,
+        map_queue_full_to_429: false,
+        stream_error_peek_ms: 0,
+        stream_commit_ms: 0,
+        rejected_content_part_types: Vec::new(),
+        models_document_url: None,
+        capacity_requests_per_minute: 0,
+        reasoning_off_effort: "none".to_string(),
+        allowed_org_ids: Vec::new(),
+        sse_keepalive_secs: 0,
+        admission_max_inflight: 0,
+        admission_start_inflight: 0,
+        admission_ramp_step: 8,
+        admission_ramp_interval_secs: 1800,
+        admission_ttft_p95_max_ms: 30_000,
+        admission_backpressure_secs: 10,
+        admission_retry_after_secs: 2,
+        backend_connect_failover: false,
+        backend_probe_urls: Vec::new(),
+        backend_long_context_urls: Vec::new(),
+        backend_long_context_probe_urls: Vec::new(),
+        long_context_above_tokens: 0,
+        backend_probe_interval_secs: 2,
         dstack_socket_path: "/var/run/dstack.sock".to_string(),
         gpu_evidence_delegate_url: None,
         gpu_evidence_delegate_timeout_secs: 30,
@@ -8892,7 +8115,8 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),
         attestation_cache: Arc::new(attestation::AttestationCache::new(300)),
-        http_client,
+        http_client: http_client.clone(),
+        backend_client: http_client,
         metrics_handle,
         tls_cert_fingerprint: Arc::new(
             vllm_proxy_rs::attestation::TlsCertTracker::new(None).expect("tracker for None path"),
@@ -8905,6 +8129,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         backend_affinity: Arc::new(
             vllm_proxy_rs::backend_affinity::BackendConversationAffinity::new(false, 1, 8, 1_200),
         ),
+        admission: Arc::new(vllm_proxy_rs::admission::AdmissionController::disabled()),
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(100, 200);
@@ -9270,6 +8495,33 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         score_url_override: None,
         ohttp_enabled: true,
         listen_port: port,
+        listen_addr: "127.0.0.1".to_string(),
+        backend_token: None,
+        backend_priority: None,
+        backend_health_path: "/health".to_string(),
+        non_tee_deployment: false,
+        map_queue_full_to_429: false,
+        stream_error_peek_ms: 0,
+        stream_commit_ms: 0,
+        rejected_content_part_types: Vec::new(),
+        models_document_url: None,
+        capacity_requests_per_minute: 0,
+        reasoning_off_effort: "none".to_string(),
+        allowed_org_ids: Vec::new(),
+        sse_keepalive_secs: 0,
+        admission_max_inflight: 0,
+        admission_start_inflight: 0,
+        admission_ramp_step: 8,
+        admission_ramp_interval_secs: 1800,
+        admission_ttft_p95_max_ms: 30_000,
+        admission_backpressure_secs: 10,
+        admission_retry_after_secs: 2,
+        backend_connect_failover: false,
+        backend_probe_urls: Vec::new(),
+        backend_long_context_urls: Vec::new(),
+        backend_long_context_probe_urls: Vec::new(),
+        long_context_above_tokens: 0,
+        backend_probe_interval_secs: 2,
         dstack_socket_path: "/var/run/dstack.sock".to_string(),
         gpu_evidence_delegate_url: None,
         gpu_evidence_delegate_timeout_secs: 30,
@@ -9309,6 +8561,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         cache: Arc::new(cache::ChatCache::new("test-model", 1200)),
         attestation_cache: Arc::new(attestation::AttestationCache::new(300)),
         http_client: reqwest::Client::new(),
+        backend_client: reqwest::Client::new(),
         metrics_handle,
         tls_cert_fingerprint: Arc::new(
             vllm_proxy_rs::attestation::TlsCertTracker::new(None).expect("tracker for None path"),
@@ -9321,6 +8574,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         backend_affinity: Arc::new(
             vllm_proxy_rs::backend_affinity::BackendConversationAffinity::new(false, 1, 8, 1_200),
         ),
+        admission: Arc::new(vllm_proxy_rs::admission::AdmissionController::disabled()),
     };
 
     let rate_limiter = rate_limit::build_rate_limiter(100, 200);
@@ -9553,6 +8807,113 @@ async fn test_ohttp_outer_authorization_relay_injected() {
         "Relay auth OK"
     );
     assert_eq!(resp_body["id"], "chatcmpl-relay");
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_ohttp_outer_bearer_scrubs_inner_x_nearai_priority() {
+    // Behind a relay the loopback request authenticates with the relay's outer
+    // bearer (trusted), while the inner headers come from the end customer:
+    // an inner X-NearAI-Priority must be dropped so the body gets the default.
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"priority": 0}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-ohttp-scrubbed-priority",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock.uri()).await;
+
+    let body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "priority": 999,
+        "stream": false
+    });
+    let mut inner_req = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/chat/completions".to_vec(),
+    );
+    inner_req.put_header("content-type", "application/json");
+    inner_req.put_header("x-nearai-priority", "1000");
+    inner_req.write_content(serde_json::to_vec(&body).unwrap());
+
+    let (enc_request, client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{base_url}/ohttp"))
+        .header("content-type", "message/ohttp-req")
+        .header("authorization", "Bearer test-token")
+        .body(enc_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let enc_response = response.bytes().await.unwrap();
+    let inner_resp = ohttp_decrypt_response(client_response, &enc_response);
+    assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+    mock.verify().await;
+    mock.reset().await;
+
+    // Without a relay bearer the inner request authenticates itself; a trusted
+    // client (config token) may set its own priority through OHTTP.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"priority": -1}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-ohttp-trusted-priority",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let mut inner_req = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/chat/completions".to_vec(),
+    );
+    inner_req.put_header("content-type", "application/json");
+    inner_req.put_header("authorization", "Bearer test-token");
+    inner_req.put_header("x-nearai-priority", "-1");
+    inner_req.write_content(serde_json::to_vec(&body).unwrap());
+    let (enc_request, client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+    let response = client
+        .post(format!("{base_url}/ohttp"))
+        .header("content-type", "message/ohttp-req")
+        .body(enc_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let enc_response = response.bytes().await.unwrap();
+    let inner_resp = ohttp_decrypt_response(client_response, &enc_response);
+    assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+    mock.verify().await;
 
     server_handle.abort();
 }

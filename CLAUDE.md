@@ -46,6 +46,7 @@ This is a Rust rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-pro
 - `reqwest::multipart::Part::mime_str()` consumes self — use `.expect()` not `?` in chains
 - Streaming uses `tokio::spawn` + `mpsc` channel: background task hashes chunks and signs on stream completion
 - `strip_empty_tool_calls` in `routes/chat.rs` is a vLLM bug workaround (still needed as of vLLM v0.15.1)
+- `tool_calls::normalize_tool_call_arguments` repairs `tool_calls[].function.arguments` in history (empty, missing, double-encoded, non-object) before dispatch; SGLang otherwise 400s the whole request (nearai/inference-proxy#239)
 - Signed text format: `"{model_name}:{sha256_request}:{sha256_response}"` signed by both algos
 - `serde_json::to_string` matches Python's `json.dumps(separators=(",",":"))`
 
@@ -79,6 +80,39 @@ This is a Rust rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-pro
 - Pre-dispatch image validation is enabled by default for chat-completions image inputs. `VLLM_PROXY_IMAGE_VALIDATION_DISABLED=1` disables it. Tunables: `VLLM_PROXY_IMAGE_VALIDATION_TIMEOUT_SECS` (default 5), `VLLM_PROXY_IMAGE_VALIDATION_MAX_BYTES` (8192), `VLLM_PROXY_IMAGE_VALIDATION_MAX_CONCURRENCY` (8), `VLLM_PROXY_IMAGE_VALIDATION_ALLOW_PRIVATE_HOSTS` (default off), `VLLM_PROXY_IMAGE_VALIDATION_ALLOWED_DOMAINS` (exact remote `image_url` host allowlist checked before fetch and on every redirect; falls back to `VLLM_ALLOWED_MEDIA_DOMAINS` when unset; Gemma-4 defaults to `prod-files-secure.s3.us-west-2.amazonaws.com`; explicitly set empty to disable the proxy-side domain restriction), `VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB` (default off; `1` forces strict non-RGB PNG/JPEG rejection. Gemma-4 model names still auto-reject observed one-channel PNG/JPEG crash inputs).
 - `ATTESTATION_CACHE_TTL` (default 300s) — TTL for cached nonce-less attestation reports; background refresh runs at half-TTL
 - `DSTACK_SOCKET_PATH` (default `/var/run/dstack.sock`) — probed by `GET /healthz` so upstream load balancers (e.g. model-proxy) can detach this instance when the dstack guest-agent socket is unreachable. `/v1/models` alone won't catch this failure mode — sglang/vLLM keep serving while `/v1/attestation/report` silently 500s. The backend leg of `/healthz` probes `/health` (not `/v1/models`) since `/v1/models` serializes against the OpenAI request loop and can stall for >1s during prefill, producing spurious 503s on otherwise-healthy hosts.
+
+### Gateway mode (fleet-wide, non-TEE)
+
+The proxy can also run outside a CVM in front of a whole model fleet — see
+[docs/gateway-mode.md](docs/gateway-mode.md). Membership is static
+(`VLLM_BACKEND_URLS` = model-proxy `-b<handle>` URLs, one per host, stable across
+redeploys), backend requests carry `VLLM_BACKEND_TOKEN` via the dedicated
+`AppState.backend_client` (never `http_client`, which talks to cloud-api), and
+`VLLM_PROXY_REJECTED_CONTENT_PART_TYPES`, `VLLM_PROXY_SSE_KEEPALIVE_SECS`,
+`VLLM_PROXY_MAP_QUEUE_FULL_TO_429`, `VLLM_PROXY_STREAM_ERROR_PEEK_MS`,
+`VLLM_PROXY_STREAM_COMMIT_MS` (commit the stream's 200 after N ms so keep-alives
+reach the client during a prefill; past it an upstream failure is an SSE error
+event, not a status),
+`NON_TEE_DEPLOYMENT` (404s the attestation, signature and GPU-evidence routes),
+`VLLM_BACKEND_HEALTH_PATH`, `LISTEN_ADDR`, `VLLM_PROXY_MODELS_DOCUMENT_URL` +
+`VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE` (`/v1/models` = cloud-api's entry for
+`MODEL_NAME` plus declared `capacity`), the lane admission budget
+(`VLLM_PROXY_ADMISSION_*`, `admission.rs`: in-flight budget with a ramp, per-host
+share, refusal on observed TTFT/engine back-pressure — 429 + `Retry-After` before
+dispatch), the long-context tier (`VLLM_BACKEND_LONG_CONTEXT_URLS` +
+`_PROBE_URLS` + `_ABOVE_TOKENS`, `context_tier.rs`: oversized prompts go to
+backends registered under the model's `-long` domain, estimated exactly as
+cloud-api's `context_routing::estimate_input` does it) and
+`VLLM_BACKEND_CONNECT_FAILOVER` (one retry on another backend, only when the
+connection itself fails) are the opt-in policies. All default to the
+in-CVM behavior. Request priority (`priority.rs`, no CVM config): every
+chat/completions body gets `priority` set by the proxy — the `X-NearAI-Priority`
+header value for callers using the config `TOKEN` (a gateway sets it from
+`VLLM_BACKEND_PRIORITY`), 0 for everyone else; client values are discarded.
+In gateway mode `reasoning.rs` maps an aggregator's `reasoning` object
+(`enabled: false`, `effort`) onto `reasoning_effort`; "off" is
+`VLLM_PROXY_REASONING_OFF_EFFORT` (`low` for GLM-5.3 Flash, whose template only
+knows `low`/`high` and leaks its thinking into `content` when switched off).
 
 ### Cloud API integration
 

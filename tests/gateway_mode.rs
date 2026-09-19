@@ -297,6 +297,16 @@ fn chat_request(body: serde_json::Value) -> Request<Body> {
         .unwrap()
 }
 
+fn completion_request() -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/completions")
+        .header("authorization", "Bearer test-token")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"model":"test-model","prompt":"hello"}"#))
+        .unwrap()
+}
+
 fn chat_completion_json() -> serde_json::Value {
     serde_json::json!({
         "id": "chatcmpl-gw-1",
@@ -304,6 +314,16 @@ fn chat_completion_json() -> serde_json::Value {
         "model": "test-model",
         "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
         "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+    })
+}
+
+fn text_completion_json() -> serde_json::Value {
+    serde_json::json!({
+        "id": "cmpl-gw-1",
+        "object": "text_completion",
+        "model": "test-model",
+        "choices": [{"index": 0, "text": "hi", "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
     })
 }
 
@@ -1597,6 +1617,101 @@ async fn failover_never_retries_an_engine_rejection() {
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     saturated.verify().await;
     idle.verify().await;
+}
+
+#[tokio::test]
+async fn completions_connect_error_fails_over_to_another_backend() {
+    let live = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(text_completion_json()))
+        .expect(1)
+        .mount(&live)
+        .await;
+    let dead = unreachable_backend_url();
+    let app = build_gateway(
+        &live.uri(),
+        GatewayOptions {
+            backend_urls: vec![dead, live.uri()],
+            backend_connect_failover: true,
+            admission_max_inflight: 4,
+            ..Default::default()
+        },
+    );
+
+    let response = app.oneshot(completion_request()).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await["choices"][0]["text"], "hi");
+    live.verify().await;
+}
+
+#[tokio::test]
+async fn completions_failover_never_retries_an_engine_rejection() {
+    let rejected = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/completions"))
+        .respond_with(ResponseTemplate::new(503).set_body_string(QUEUE_FULL_BODY))
+        .expect(1)
+        .mount(&rejected)
+        .await;
+    let idle = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(text_completion_json()))
+        .expect(0)
+        .mount(&idle)
+        .await;
+    let app = build_gateway(
+        &rejected.uri(),
+        GatewayOptions {
+            backend_urls: vec![rejected.uri(), idle.uri()],
+            backend_connect_failover: true,
+            map_queue_full_to_429: true,
+            ..Default::default()
+        },
+    );
+
+    let response = app.oneshot(completion_request()).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    rejected.verify().await;
+    idle.verify().await;
+}
+
+#[tokio::test]
+async fn completions_admission_slot_is_held_until_response_and_then_released() {
+    let backend = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(text_completion_json())
+                .set_delay(Duration::from_millis(700)),
+        )
+        .expect(2)
+        .mount(&backend)
+        .await;
+    let app = build_gateway(
+        &backend.uri(),
+        GatewayOptions {
+            admission_max_inflight: 1,
+            ..Default::default()
+        },
+    );
+    let first = tokio::spawn({
+        let app = app.clone();
+        async move { app.oneshot(completion_request()).await.unwrap() }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let second = app.clone().oneshot(completion_request()).await.unwrap();
+    assert_overloaded(second).await;
+    assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+
+    let third = app.oneshot(completion_request()).await.unwrap();
+    assert_eq!(third.status(), StatusCode::OK);
+    backend.verify().await;
 }
 
 #[tokio::test]

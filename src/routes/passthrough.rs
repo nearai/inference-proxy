@@ -7,11 +7,42 @@ use axum::Extension;
 use sha2::Digest;
 
 use crate::auth::RequireAuth;
+use crate::backend_pool::BackendGuard;
 use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
 use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageReporter, UsageType};
 use crate::routes::chat::read_body_with_limit;
 use crate::{AppState, TracingIds};
+
+struct PassthroughTarget<'a> {
+    client: &'a reqwest::Client,
+    url: String,
+    backend_guard: Option<BackendGuard>,
+}
+
+/// Resolve the transport boundary shared by passthrough routes. Configured
+/// overrides are outside the backend pool and must not receive its bearer.
+fn passthrough_target<'a>(
+    state: &'a AppState,
+    override_url: Option<&str>,
+    pool_path: &str,
+) -> PassthroughTarget<'a> {
+    match override_url {
+        Some(url) => PassthroughTarget {
+            client: &state.http_client,
+            url: url.to_string(),
+            backend_guard: None,
+        },
+        None => {
+            let (url, guard) = state.backend_pool.select_url(pool_path);
+            PassthroughTarget {
+                client: &state.backend_client,
+                url,
+                backend_guard: Some(guard),
+            }
+        }
+    }
+}
 
 /// POST /v1/tokenize — simple proxy, no signing.
 pub async fn tokenize(
@@ -208,6 +239,11 @@ pub async fn images_edits(
             state.signing.clone(),
         )
     });
+    let target = passthrough_target(
+        &state,
+        state.config.images_edits_url_override.as_deref(),
+        "/v1/images/edits",
+    );
 
     let opts = ProxyOpts {
         signing: state.signing.clone(),
@@ -219,7 +255,7 @@ pub async fn images_edits(
         request_hash: None,
         response_transform,
         chunk_transform: None,
-        backend_guard: None,
+        backend_guard: target.backend_guard,
         stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
         sse_keepalive_secs: 0,
         map_queue_full_to_429: false,
@@ -232,17 +268,7 @@ pub async fn images_edits(
         connect_failover: None,
     };
 
-    // The backend bearer is scoped to pool members; an override URL is a
-    // separately configured endpoint and gets the plain client.
-    let (url, _guard, client) = match &state.config.images_edits_url_override {
-        Some(override_url) => (override_url.clone(), None, &state.http_client),
-        None => {
-            let (u, g) = state.backend_pool.select_url("/v1/images/edits");
-            (u, Some(g), &state.backend_client)
-        }
-    };
-
-    proxy::proxy_multipart_request(client, &url, form, &request_sha256, opts).await
+    proxy::proxy_multipart_request(target.client, &target.url, form, &request_sha256, opts).await
 }
 
 /// POST /v1/audio/transcriptions — multipart proxy with signing.
@@ -302,6 +328,11 @@ pub async fn audio_transcriptions(
             state.signing.clone(),
         )
     });
+    let target = passthrough_target(
+        &state,
+        state.config.transcriptions_url_override.as_deref(),
+        "/v1/audio/transcriptions",
+    );
 
     let opts = ProxyOpts {
         signing: state.signing.clone(),
@@ -313,7 +344,7 @@ pub async fn audio_transcriptions(
         request_hash: None,
         response_transform,
         chunk_transform: None,
-        backend_guard: None,
+        backend_guard: target.backend_guard,
         stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
         sse_keepalive_secs: 0,
         map_queue_full_to_429: false,
@@ -326,17 +357,7 @@ pub async fn audio_transcriptions(
         connect_failover: None,
     };
 
-    // The backend bearer is scoped to pool members; an override URL is a
-    // separately configured endpoint and gets the plain client.
-    let (url, _guard, client) = match &state.config.transcriptions_url_override {
-        Some(override_url) => (override_url.clone(), None, &state.http_client),
-        None => {
-            let (u, g) = state.backend_pool.select_url("/v1/audio/transcriptions");
-            (u, Some(g), &state.backend_client)
-        }
-    };
-
-    proxy::proxy_multipart_request(client, &url, form, &request_sha256, opts).await
+    proxy::proxy_multipart_request(target.client, &target.url, form, &request_sha256, opts).await
 }
 
 /// Generic JSON passthrough with signing and optional encryption support.
@@ -377,15 +398,7 @@ async fn json_passthrough_encrypted(
         (request_body, None, None)
     };
 
-    // Override URLs are not pool members, so they use the plain client and do
-    // not receive the backend bearer.
-    let (client, url, backend_guard) = match url_override {
-        Some(url) => (&state.http_client, url.to_string(), None),
-        None => {
-            let (url, guard) = state.backend_pool.select_url(pool_path);
-            (&state.backend_client, url, Some(guard))
-        }
-    };
+    let target = passthrough_target(&state, url_override, pool_path);
     let opts = ProxyOpts {
         signing: state.signing.clone(),
         cache: state.cache.clone(),
@@ -396,7 +409,7 @@ async fn json_passthrough_encrypted(
         request_hash: original_request_hash,
         response_transform,
         chunk_transform: None,
-        backend_guard,
+        backend_guard: target.backend_guard,
         stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
         sse_keepalive_secs: 0,
         map_queue_full_to_429: false,
@@ -409,7 +422,7 @@ async fn json_passthrough_encrypted(
         connect_failover: None,
     };
 
-    proxy::proxy_json_request(client, &url, forward_body, opts).await
+    proxy::proxy_json_request(target.client, &target.url, forward_body, opts).await
 }
 
 /// Read a multipart field incrementally, enforcing the cumulative size limit and

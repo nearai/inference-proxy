@@ -149,10 +149,10 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
     let http_client = reqwest::Client::new();
     let backend_client = if let Some(token) = &config.backend_token {
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
-            reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
-        );
+        let mut authorization =
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).unwrap();
+        authorization.set_sensitive(true);
+        headers.insert(reqwest::header::AUTHORIZATION, authorization);
         reqwest::Client::builder()
             .default_headers(headers)
             .build()

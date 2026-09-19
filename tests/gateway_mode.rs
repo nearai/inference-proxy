@@ -303,7 +303,6 @@ async fn call(app: axum::Router, route: &str) -> axum::response::Response {
     *request.uri_mut() = route.parse().unwrap();
     app.oneshot(request).await.unwrap()
 }
-
 fn chat_completion_json() -> serde_json::Value {
     serde_json::json!({
         "id": "chatcmpl-gw-1",
@@ -1415,7 +1414,6 @@ async fn assert_overloaded(response: axum::response::Response) {
     let json = json_body(response).await;
     assert_eq!(json["error"]["type"], "overloaded");
 }
-
 #[tokio::test]
 async fn admission_budget_refuses_with_429_before_dispatch() {
     for route in COMPLETION_ROUTES {
@@ -1441,14 +1439,16 @@ async fn admission_budget_refuses_with_429_before_dispatch() {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let started = std::time::Instant::now();
         let second = call(app.clone(), route).await;
-        assert!(started.elapsed() < Duration::from_millis(300));
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "refusal must not wait for the in-flight request"
+        );
         assert_overloaded(second).await;
         assert_eq!(first.await.unwrap().status(), StatusCode::OK);
         assert_eq!(call(app, route).await.status(), StatusCode::OK);
         mock.verify().await;
     }
 }
-
 #[tokio::test]
 async fn admission_is_inert_when_not_configured() {
     let mock = MockServer::start().await;

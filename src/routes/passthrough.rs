@@ -180,8 +180,8 @@ pub async fn images_edits(
 
         if let (true, Some(ctx)) = (name == "prompt", enc_ctx.as_ref()) {
             // Read field, hash the raw (encrypted) bytes, then decrypt for forwarding
-            let raw_data = read_field_data(&mut field, &mut total_size, max_size).await?;
-            hasher.update(&raw_data);
+            let raw_data =
+                read_field_chunks(&mut field, &mut total_size, max_size, &mut hasher).await?;
             let text = String::from_utf8(raw_data)
                 .map_err(|_| AppError::BadRequest("prompt field is not UTF-8".to_string()))?;
             let data = if !text.is_empty() {
@@ -274,8 +274,8 @@ pub async fn audio_transcriptions(
 
         if let (true, Some(ctx)) = (name == "prompt", enc_ctx.as_ref()) {
             // Read field, hash the raw (encrypted) bytes, then decrypt for forwarding
-            let raw_data = read_field_data(&mut field, &mut total_size, max_size).await?;
-            hasher.update(&raw_data);
+            let raw_data =
+                read_field_chunks(&mut field, &mut total_size, max_size, &mut hasher).await?;
             let text = String::from_utf8(raw_data)
                 .map_err(|_| AppError::BadRequest("prompt field is not UTF-8".to_string()))?;
             let data = if !text.is_empty() {
@@ -412,30 +412,8 @@ async fn json_passthrough_encrypted(
     proxy::proxy_json_request(client, &url, forward_body, opts).await
 }
 
-/// Read a multipart field incrementally, checking cumulative size (without hashing).
-/// Used when the raw bytes should not be hashed (e.g., encrypted fields that will
-/// be decrypted and hashed separately).
-async fn read_field_data(
-    field: &mut Field<'_>,
-    total_size: &mut usize,
-    max_size: usize,
-) -> Result<Vec<u8>, AppError> {
-    let mut data = Vec::new();
-    while let Some(chunk) = field
-        .chunk()
-        .await
-        .map_err(|e| AppError::BadRequest(format!("Error reading field: {e}")))?
-    {
-        *total_size = total_size.saturating_add(chunk.len());
-        if *total_size > max_size {
-            return Err(AppError::PayloadTooLarge { max_size });
-        }
-        data.extend_from_slice(&chunk);
-    }
-    Ok(data)
-}
-
-/// Read a multipart field incrementally, checking cumulative size and hashing all bytes.
+/// Read a multipart field incrementally, enforcing the cumulative size limit and
+/// hashing the original bytes before any encrypted field is transformed.
 async fn read_field_chunks(
     field: &mut Field<'_>,
     total_size: &mut usize,

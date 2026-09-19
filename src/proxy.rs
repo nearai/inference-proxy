@@ -4106,6 +4106,7 @@ mod tests {
         let mut opts = test_proxy_opts();
         opts.stream_idle_timeout_secs = 1;
         opts.request_hash = Some("request-sha256".into());
+        let cache = opts.cache.clone();
         let response = proxy_streaming_request(
             &reqwest::Client::new(),
             &url,
@@ -4123,6 +4124,13 @@ mod tests {
         .expect("hidden reasoning should finish after the idle threshold")
         .expect("role-only metadata must not arm the idle watchdog");
         assert!(body.ends_with(b"data: [DONE]\n\n"));
+        let signed: crate::types::SignedChat = serde_json::from_str(
+            &cache
+                .get_chat("chat-hidden-reasoning")
+                .expect("completed stream must cache its signature"),
+        )
+        .unwrap();
+        assert!(signed.text.starts_with("test-model:request-sha256:"));
     }
 
     #[tokio::test]

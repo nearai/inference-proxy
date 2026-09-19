@@ -14,7 +14,8 @@
 //! least-loaded healthy backend, the turn is rebalanced to the least-loaded
 //! backend and the conversation is re-pinned there.
 
-use std::time::Duration;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use moka::sync::Cache;
 use serde_json::Value;
@@ -36,6 +37,20 @@ pub struct Placement {
     pub index: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Assignment {
+    backend: usize,
+    last_success: Option<Instant>,
+}
+
+/// A completion-confirmed affinity candidate. Recency is a placement hint;
+/// the backend still has to pass admission and reserving selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecentBackend {
+    pub backend: usize,
+    pub completed_ago: Duration,
+}
+
 impl Placement {
     fn new(selection: Selection, path: &str) -> Self {
         Self {
@@ -51,27 +66,27 @@ impl Placement {
 pub struct BackendConversationAffinity {
     enabled: bool,
     max_imbalance: u32,
-    assignments: Cache<ConversationKey, usize>,
+    assignments: Cache<ConversationKey, Assignment>,
     affinity_salt: [u8; 32],
 }
 
 impl BackendConversationAffinity {
-    /// `enabled` is the operator flag; affinity is only active when the pool
-    /// has more than one backend (a single backend has nothing to pin to).
-    pub fn new(enabled: bool, backend_count: usize, max_imbalance: u32, ttl_secs: u64) -> Self {
+    /// A single-backend pool still records completion recency for continuation
+    /// admission even though placement itself has nowhere else to go.
+    pub fn new(enabled: bool, _backend_count: usize, max_imbalance: u32, ttl_secs: u64) -> Self {
         let assignments = Cache::builder()
             .max_capacity(MAX_AFFINITY_ASSIGNMENTS)
             .time_to_idle(Duration::from_secs(ttl_secs.max(1)))
             .build();
         Self {
-            enabled: enabled && backend_count > 1,
+            enabled,
             max_imbalance,
             assignments,
             affinity_salt: rand::random(),
         }
     }
 
-    /// Whether requests can actually be pinned (flag set and ≥2 backends).
+    /// Whether affinity and completion-recency tracking are enabled.
     pub fn is_active(&self) -> bool {
         self.enabled
     }
@@ -109,13 +124,20 @@ impl BackendConversationAffinity {
         };
 
         let existing = self.assignments.get(&key);
+        let preferred = existing.map(|assignment| assignment.backend);
         let selection =
-            pool.select_with_preference_bounded(existing, self.max_imbalance, policy)?;
-        if existing != Some(selection.index) {
+            pool.select_with_preference_bounded(preferred, self.max_imbalance, policy)?;
+        if preferred != Some(selection.index) {
             // New conversation, or the pinned backend was unhealthy/overloaded:
             // remember where this turn actually went so the next turn follows
-            // the prefix cache that is being built there.
-            self.assignments.insert(key, selection.index);
+            // the prefix cache that is being built there. Moving cannot carry
+            // completion recency from the previous backend.
+            self.assignments.entry(key).and_compute_with(|_| {
+                moka::ops::compute::Op::Put(Assignment {
+                    backend: selection.index,
+                    last_success: None,
+                })
+            });
         }
 
         metrics::counter!(
@@ -137,14 +159,89 @@ impl BackendConversationAffinity {
     /// Move a conversation to `index` (connection fail-over placed it there).
     pub fn repin(&self, key: ConversationKey, index: usize) {
         if self.enabled {
-            self.assignments.insert(key, index);
+            self.assignments.entry(key).and_compute_with(|_| {
+                moka::ops::compute::Op::Put(Assignment {
+                    backend: index,
+                    last_success: None,
+                })
+            });
         }
+    }
+
+    /// Record a valid terminal completion on the backend currently assigned
+    /// to `key`. A late completion from a backend the conversation already
+    /// moved away from is ignored.
+    pub fn mark_completed(&self, key: ConversationKey, backend: usize) {
+        self.mark_completed_at(key, backend, Instant::now());
+    }
+
+    fn mark_completed_at(&self, key: ConversationKey, backend: usize, now: Instant) {
+        if !self.enabled {
+            return;
+        }
+        self.assignments.entry(key).and_compute_with(|entry| {
+            let Some(current) = entry.map(|entry| *entry.value()) else {
+                return moka::ops::compute::Op::Nop;
+            };
+            if current.backend != backend {
+                return moka::ops::compute::Op::Nop;
+            }
+            moka::ops::compute::Op::Put(Assignment {
+                backend,
+                last_success: Some(now),
+            })
+        });
+        metrics::counter!(
+            "backend_affinity_completions_total",
+            "backend" => backend.to_string()
+        )
+        .increment(1);
+    }
+
+    /// Return a recent, healthy assignment in the requested tier. This never
+    /// advances the completion timestamp; repeated reads cannot extend the
+    /// recency window.
+    pub fn recent_backend(
+        &self,
+        key: ConversationKey,
+        pool: &BackendPool,
+        tier: Option<crate::context_tier::ContextTier>,
+        max_age: Duration,
+    ) -> Option<RecentBackend> {
+        self.recent_backend_at(key, pool, tier, max_age, Instant::now())
+    }
+
+    fn recent_backend_at(
+        &self,
+        key: ConversationKey,
+        pool: &BackendPool,
+        tier: Option<crate::context_tier::ContextTier>,
+        max_age: Duration,
+        now: Instant,
+    ) -> Option<RecentBackend> {
+        let assignment = self.assignments.get(&key)?;
+        let completed_at = assignment.last_success?;
+        let completed_ago = now.saturating_duration_since(completed_at);
+        if completed_ago > max_age {
+            return None;
+        }
+        let backend = pool.backends().get(assignment.backend)?;
+        if !backend.healthy.load(Ordering::Relaxed) || tier.is_some_and(|tier| backend.tier != tier)
+        {
+            return None;
+        }
+        Some(RecentBackend {
+            backend: assignment.backend,
+            completed_ago,
+        })
     }
 
     /// Current pinned backend index for a key (tests and diagnostics).
     #[cfg(test)]
     fn assignment(&self, key: &ConversationKey) -> Option<usize> {
-        self.assignments.get(key)
+        self.assignments
+            .get(key)
+            .map(|assignment| assignment.backend)
     }
 }
 
@@ -191,15 +288,15 @@ mod tests {
     }
 
     #[test]
-    fn disabled_or_single_backend_yields_no_key() {
+    fn disabled_yields_no_key_but_a_single_backend_can_track_recency() {
         let chat = turn(0);
         assert!(BackendConversationAffinity::new(false, 2, 8, 1_200)
             .key_for_chat_request(&chat, "model")
             .is_none());
         assert!(BackendConversationAffinity::new(true, 1, 8, 1_200)
             .key_for_chat_request(&chat, "model")
-            .is_none());
-        assert!(!BackendConversationAffinity::new(true, 1, 8, 1_200).is_active());
+            .is_some());
+        assert!(BackendConversationAffinity::new(true, 1, 8, 1_200).is_active());
         assert!(BackendConversationAffinity::new(true, 2, 8, 1_200).is_active());
     }
 
@@ -381,5 +478,87 @@ mod tests {
             .place(&pool, None, "/v1/completions", &Policy::NONE)
             .unwrap();
         assert_eq!(url, "http://b2:8000/v1/completions");
+    }
+
+    #[test]
+    fn completion_recency_starts_cold_and_only_success_warms_the_assigned_backend() {
+        let pool = two_backend_pool();
+        let affinity = BackendConversationAffinity::new(true, 2, 8, 1_200);
+        let key = affinity.key_for_chat_request(&turn(0), "model").unwrap();
+        let placed = affinity
+            .place(&pool, Some(key), "/v1/chat/completions", &Policy::NONE)
+            .unwrap();
+        let backend = placed.index;
+        drop(placed);
+        let now = std::time::Instant::now();
+
+        assert_eq!(
+            affinity.recent_backend_at(key, &pool, None, Duration::from_secs(180), now),
+            None,
+            "placement alone must not claim a warm prefix"
+        );
+
+        affinity.mark_completed_at(key, backend, now);
+        assert_eq!(
+            affinity
+                .recent_backend_at(
+                    key,
+                    &pool,
+                    None,
+                    Duration::from_secs(180),
+                    now + Duration::from_secs(30),
+                )
+                .map(|recent| recent.backend),
+            Some(backend)
+        );
+    }
+
+    #[test]
+    fn stale_completion_and_backend_movement_are_not_recent() {
+        let pool = two_backend_pool();
+        let affinity = BackendConversationAffinity::new(true, 2, 8, 1_200);
+        let key = affinity.key_for_chat_request(&turn(0), "model").unwrap();
+        let placed = affinity
+            .place(&pool, Some(key), "/v1/chat/completions", &Policy::NONE)
+            .unwrap();
+        let first = placed.index;
+        drop(placed);
+        let now = std::time::Instant::now();
+        affinity.mark_completed_at(key, first, now);
+
+        assert!(affinity
+            .recent_backend_at(
+                key,
+                &pool,
+                None,
+                Duration::from_secs(180),
+                now + Duration::from_secs(181),
+            )
+            .is_none());
+
+        let replacement = usize::from(first == 0);
+        affinity.repin(key, replacement);
+        assert!(affinity
+            .recent_backend_at(
+                key,
+                &pool,
+                None,
+                Duration::from_secs(180),
+                now + Duration::from_secs(1),
+            )
+            .is_none());
+        affinity.mark_completed_at(key, first, now + Duration::from_secs(2));
+        assert!(
+            affinity
+                .recent_backend_at(
+                    key,
+                    &pool,
+                    None,
+                    Duration::from_secs(180),
+                    now + Duration::from_secs(3),
+                )
+                .is_none(),
+            "completion on an old backend cannot warm the new assignment"
+        );
     }
 }

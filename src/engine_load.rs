@@ -16,6 +16,7 @@
 //! means the host has no free replica, while a zero means at least one
 //! replica is free.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -31,6 +32,8 @@ pub struct Sample {
 pub struct EngineLoad {
     samples: Vec<Mutex<Option<(Instant, Sample)>>>,
     pub(crate) stale_after: Duration,
+    revision: AtomicU64,
+    changed: tokio::sync::Notify,
 }
 
 impl EngineLoad {
@@ -38,6 +41,8 @@ impl EngineLoad {
         Self {
             samples: (0..backends).map(|_| Mutex::new(None)).collect(),
             stale_after,
+            revision: AtomicU64::new(0),
+            changed: tokio::sync::Notify::new(),
         }
     }
 
@@ -69,6 +74,26 @@ impl EngineLoad {
             .set(f64::from(sample.running));
         metrics::gauge!("backend_engine_queued", "backend" => index.to_string())
             .set(f64::from(sample.queued));
+        self.revision.fetch_add(1, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    /// Wait for a probe update without losing a change that races registration.
+    pub async fn changed_since(&self, revision: u64) {
+        loop {
+            let changed = self.changed.notified();
+            if self.revision() != revision {
+                return;
+            }
+            changed.await;
+            if self.revision() != revision {
+                return;
+            }
+        }
     }
 }
 

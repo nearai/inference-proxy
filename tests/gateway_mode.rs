@@ -51,7 +51,6 @@ struct GatewayOptions {
     /// Source of the models document (a mock cloud-api `/v1/models`).
     models_document_url: Option<String>,
     capacity_requests_per_minute: u64,
-    rerank_url_override: Option<String>,
     /// `VLLM_PROXY_REASONING_OFF_EFFORT` (default `none`).
     reasoning_off_effort: Option<String>,
 }
@@ -127,7 +126,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         images_url_override: None,
         images_edits_url_override: None,
         transcriptions_url_override: None,
-        rerank_url_override: options.rerank_url_override.clone(),
+        rerank_url_override: None,
         score_url_override: None,
         ohttp_enabled: false,
         listen_port: 8000,
@@ -383,91 +382,6 @@ async fn without_backend_token_no_authorization_reaches_backend() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn json_passthrough_pool_route_uses_backend_bearer() {
-    let mock = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/rerank"))
-        .and(header("authorization", "Bearer backend-secret"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "rerank-pool",
-            "results": []
-        })))
-        .expect(1)
-        .mount(&mock)
-        .await;
-
-    let app = build_gateway(
-        &mock.uri(),
-        GatewayOptions {
-            backend_token: Some("backend-secret".to_string()),
-            ..Default::default()
-        },
-    );
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/rerank")
-                .header("authorization", "Bearer test-token")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    r#"{"model":"test-model","query":"q","documents":["a"]}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(json_body(response).await["id"], "rerank-pool");
-}
-
-#[tokio::test]
-async fn json_passthrough_override_uses_plain_client_without_backend_bearer() {
-    let pool = MockServer::start().await;
-    let override_server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/custom/rerank"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "rerank-override",
-            "results": []
-        })))
-        .expect(1)
-        .mount(&override_server)
-        .await;
-
-    let app = build_gateway(
-        &pool.uri(),
-        GatewayOptions {
-            backend_token: Some("backend-secret".to_string()),
-            rerank_url_override: Some(format!("{}/custom/rerank", override_server.uri())),
-            ..Default::default()
-        },
-    );
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/rerank")
-                .header("authorization", "Bearer test-token")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    r#"{"model":"test-model","query":"q","documents":["a"]}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(json_body(response).await["id"], "rerank-override");
-    assert!(pool.received_requests().await.unwrap().is_empty());
-    let requests = override_server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 1);
-    assert!(requests[0].headers.get("authorization").is_none());
 }
 
 // ---------------------------------------------------------------------------

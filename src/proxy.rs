@@ -4111,49 +4111,78 @@ mod tests {
         );
     }
 
-    async fn raw_sse_response(body: Option<&'static str>, hold_open: bool) -> reqwest::Response {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn assert_streaming_post(socket: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+
+        let mut request = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0_u8; 1024];
+            let read = socket.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "client closed before sending request headers");
+            request.extend_from_slice(&chunk[..read]);
+            assert!(request.len() <= 16 * 1024, "test request headers too large");
+            if let Some(offset) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break offset + 4;
+            }
+        };
+
+        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+        assert!(headers.starts_with("POST / HTTP/1.1\r\n"));
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .expect("native proxy request must include content-length");
+        while request.len() < header_end + content_length {
+            let mut chunk = [0_u8; 1024];
+            let read = socket.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "client closed before sending request body");
+            request.extend_from_slice(&chunk[..read]);
+        }
+        let body: serde_json::Value =
+            serde_json::from_slice(&request[header_end..header_end + content_length]).unwrap();
+        assert_eq!(
+            body.get("model").and_then(|value| value.as_str()),
+            Some("test-model")
+        );
+        assert_eq!(body.get("stream"), Some(&serde_json::Value::Bool(true)));
+    }
+
+    async fn raw_sse_server_url(body: &'static str) -> String {
+        use tokio::io::AsyncWriteExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 2048];
-            let _ = socket.read(&mut request).await;
+            assert_streaming_post(&mut socket).await;
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
                 )
                 .await
                 .unwrap();
-            if let Some(body) = body {
-                let encoded = format!("{:X}\r\n{}\r\n0\r\n\r\n", body.len(), body);
-                socket.write_all(encoded.as_bytes()).await.unwrap();
-            }
-            if hold_open {
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            }
+            let encoded = format!("{:X}\r\n{}\r\n0\r\n\r\n", body.len(), body);
+            socket.write_all(encoded.as_bytes()).await.unwrap();
         });
 
-        reqwest::Client::new()
-            .get(format!("http://{address}"))
-            .send()
-            .await
-            .unwrap()
+        format!("http://{address}")
     }
 
     async fn delayed_sse_server_url(
         body: &'static str,
         initial_delay: std::time::Duration,
     ) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 2048];
-            let _ = socket.read(&mut request).await;
+            assert_streaming_post(&mut socket).await;
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
@@ -4168,29 +4197,17 @@ mod tests {
         format!("http://{address}")
     }
 
-    async fn delayed_sse_response(
-        body: &'static str,
-        initial_delay: std::time::Duration,
-    ) -> reqwest::Response {
-        reqwest::Client::new()
-            .get(delayed_sse_server_url(body, initial_delay).await)
-            .send()
-            .await
-            .unwrap()
-    }
-
-    async fn sse_response_then_stall(
+    async fn sse_server_url_then_stall(
         body: &'static str,
         stall_duration: std::time::Duration,
-    ) -> reqwest::Response {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    ) -> String {
+        use tokio::io::AsyncWriteExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 2048];
-            let _ = socket.read(&mut request).await;
+            assert_streaming_post(&mut socket).await;
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
@@ -4202,11 +4219,7 @@ mod tests {
             tokio::time::sleep(stall_duration).await;
         });
 
-        reqwest::Client::new()
-            .get(format!("http://{address}"))
-            .send()
-            .await
-            .unwrap()
+        format!("http://{address}")
     }
 
     async fn sse_server_url_with_delayed_tail(
@@ -4214,14 +4227,13 @@ mod tests {
         tail: &'static str,
         delay: std::time::Duration,
     ) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 2048];
-            let _ = socket.read(&mut request).await;
+            assert_streaming_post(&mut socket).await;
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
@@ -4240,19 +4252,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_idle_watchdog_does_not_limit_time_to_first_chunk() {
-        let upstream = delayed_sse_response(
+        let url = delayed_sse_server_url(
             "data: {\"id\":\"chat-slow-prefill\",\"choices\":[]}\n\ndata: [DONE]\n\n",
             std::time::Duration::from_secs(2),
         )
         .await;
         let mut opts = test_proxy_opts();
         opts.stream_idle_timeout_secs = 1;
-        let response = proxy_streaming_response(
-            upstream,
-            "request-sha256",
+        opts.request_hash = Some("request-sha256".into());
+        let response = proxy_streaming_request(
+            &reqwest::Client::new(),
+            &url,
+            br#"{"model":"test-model","stream":true}"#.to_vec(),
             opts,
-            StatusCode::OK,
-            std::time::Instant::now(),
         )
         .await
         .unwrap();
@@ -4339,22 +4351,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_streaming_response_watchdog_ignores_role_only_hidden_reasoning_gap() {
+    async fn test_fixed_hash_streaming_watchdog_ignores_role_only_hidden_reasoning_gap() {
         let url = sse_server_url_with_delayed_tail(
             ROLE_ONLY_CHAT_SSE,
             FINISH_CHAT_SSE,
             std::time::Duration::from_secs(2),
         )
         .await;
-        let upstream = reqwest::Client::new().get(url).send().await.unwrap();
         let mut opts = test_proxy_opts();
         opts.stream_idle_timeout_secs = 1;
-        let response = proxy_streaming_response(
-            upstream,
-            "request-sha256",
+        opts.request_hash = Some("request-sha256".into());
+        let response = proxy_streaming_request(
+            &reqwest::Client::new(),
+            &url,
+            br#"{"model":"test-model","stream":true}"#.to_vec(),
             opts,
-            StatusCode::OK,
-            std::time::Instant::now(),
         )
         .await
         .unwrap();
@@ -4455,19 +4466,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_idle_watchdog_fails_after_first_chunk() {
-        let upstream = sse_response_then_stall(
+        let url = sse_server_url_then_stall(
             "data: {\"id\":\"chat-stalled\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
             std::time::Duration::from_secs(3),
         )
         .await;
         let mut opts = test_proxy_opts();
         opts.stream_idle_timeout_secs = 1;
-        let response = proxy_streaming_response(
-            upstream,
-            "request-sha256",
+        opts.request_hash = Some("request-sha256".into());
+        let response = proxy_streaming_request(
+            &reqwest::Client::new(),
+            &url,
+            br#"{"model":"test-model","stream":true}"#.to_vec(),
             opts,
-            StatusCode::OK,
-            std::time::Instant::now(),
         )
         .await
         .unwrap();
@@ -4486,16 +4497,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_missing_done_fails_downstream_body_when_watchdog_enabled() {
-        let upstream =
-            raw_sse_response(Some("data: {\"id\":\"chat-1\",\"choices\":[]}\n\n"), false).await;
+        let url = raw_sse_server_url("data: {\"id\":\"chat-1\",\"choices\":[]}\n\n").await;
         let mut opts = test_proxy_opts();
         opts.stream_idle_timeout_secs = 1;
-        let response = proxy_streaming_response(
-            upstream,
-            "request-sha256",
+        opts.request_hash = Some("request-sha256".into());
+        let response = proxy_streaming_request(
+            &reqwest::Client::new(),
+            &url,
+            br#"{"model":"test-model","stream":true}"#.to_vec(),
             opts,
-            StatusCode::OK,
-            std::time::Instant::now(),
         )
         .await
         .unwrap();
@@ -4509,19 +4519,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_done_without_trailing_newline_completes_cleanly() {
-        let upstream = raw_sse_response(
-            Some("data: {\"id\":\"chat-1\",\"choices\":[]}\n\ndata: [DONE]"),
-            false,
-        )
-        .await;
+        let url =
+            raw_sse_server_url("data: {\"id\":\"chat-1\",\"choices\":[]}\n\ndata: [DONE]").await;
         let mut opts = test_proxy_opts();
         opts.stream_idle_timeout_secs = 1;
-        let response = proxy_streaming_response(
-            upstream,
-            "request-sha256",
+        opts.request_hash = Some("request-sha256".into());
+        let response = proxy_streaming_request(
+            &reqwest::Client::new(),
+            &url,
+            br#"{"model":"test-model","stream":true}"#.to_vec(),
             opts,
-            StatusCode::OK,
-            std::time::Instant::now(),
         )
         .await
         .unwrap();

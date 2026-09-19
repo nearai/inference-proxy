@@ -71,22 +71,22 @@ pub struct BackendConversationAffinity {
 }
 
 impl BackendConversationAffinity {
-    /// `enabled` is the operator flag; affinity is only active when the pool
-    /// has more than one backend (a single backend has nothing to pin to).
-    pub fn new(enabled: bool, backend_count: usize, max_imbalance: u32, ttl_secs: u64) -> Self {
+    /// A single-backend pool still records completion recency for continuation
+    /// admission even though placement itself has nowhere else to go.
+    pub fn new(enabled: bool, _backend_count: usize, max_imbalance: u32, ttl_secs: u64) -> Self {
         let assignments = Cache::builder()
             .max_capacity(MAX_AFFINITY_ASSIGNMENTS)
             .time_to_idle(Duration::from_secs(ttl_secs.max(1)))
             .build();
         Self {
-            enabled: enabled && backend_count > 1,
+            enabled,
             max_imbalance,
             assignments,
             affinity_salt: rand::random(),
         }
     }
 
-    /// Whether requests can actually be pinned (flag set and ≥2 backends).
+    /// Whether affinity and completion-recency tracking are enabled.
     pub fn is_active(&self) -> bool {
         self.enabled
     }
@@ -288,15 +288,15 @@ mod tests {
     }
 
     #[test]
-    fn disabled_or_single_backend_yields_no_key() {
+    fn disabled_yields_no_key_but_a_single_backend_can_track_recency() {
         let chat = turn(0);
         assert!(BackendConversationAffinity::new(false, 2, 8, 1_200)
             .key_for_chat_request(&chat, "model")
             .is_none());
         assert!(BackendConversationAffinity::new(true, 1, 8, 1_200)
             .key_for_chat_request(&chat, "model")
-            .is_none());
-        assert!(!BackendConversationAffinity::new(true, 1, 8, 1_200).is_active());
+            .is_some());
+        assert!(BackendConversationAffinity::new(true, 1, 8, 1_200).is_active());
         assert!(BackendConversationAffinity::new(true, 2, 8, 1_200).is_active());
     }
 

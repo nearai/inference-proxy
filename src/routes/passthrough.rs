@@ -7,11 +7,42 @@ use axum::Extension;
 use sha2::Digest;
 
 use crate::auth::RequireAuth;
+use crate::backend_pool::BackendGuard;
 use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
 use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageReporter, UsageType};
 use crate::routes::chat::read_body_with_limit;
 use crate::{AppState, TracingIds};
+
+struct PassthroughTarget<'a> {
+    client: &'a reqwest::Client,
+    url: String,
+    backend_guard: Option<BackendGuard>,
+}
+
+/// Resolve the transport boundary shared by passthrough routes. Configured
+/// overrides are outside the backend pool and must not receive its bearer.
+fn passthrough_target<'a>(
+    state: &'a AppState,
+    override_url: Option<&str>,
+    pool_path: &str,
+) -> PassthroughTarget<'a> {
+    match override_url {
+        Some(url) => PassthroughTarget {
+            client: &state.http_client,
+            url: url.to_string(),
+            backend_guard: None,
+        },
+        None => {
+            let (url, guard) = state.backend_pool.select_url(pool_path);
+            PassthroughTarget {
+                client: &state.backend_client,
+                url,
+                backend_guard: Some(guard),
+            }
+        }
+    }
+}
 
 /// POST /v1/tokenize — simple proxy, no signing.
 pub async fn tokenize(
@@ -180,8 +211,8 @@ pub async fn images_edits(
 
         if let (true, Some(ctx)) = (name == "prompt", enc_ctx.as_ref()) {
             // Read field, hash the raw (encrypted) bytes, then decrypt for forwarding
-            let raw_data = read_field_data(&mut field, &mut total_size, max_size).await?;
-            hasher.update(&raw_data);
+            let raw_data =
+                read_field_chunks(&mut field, &mut total_size, max_size, &mut hasher).await?;
             let text = String::from_utf8(raw_data)
                 .map_err(|_| AppError::BadRequest("prompt field is not UTF-8".to_string()))?;
             let data = if !text.is_empty() {
@@ -208,6 +239,11 @@ pub async fn images_edits(
             state.signing.clone(),
         )
     });
+    let target = passthrough_target(
+        &state,
+        state.config.images_edits_url_override.as_deref(),
+        "/v1/images/edits",
+    );
 
     let opts = ProxyOpts {
         signing: state.signing.clone(),
@@ -219,7 +255,7 @@ pub async fn images_edits(
         request_hash: None,
         response_transform,
         chunk_transform: None,
-        backend_guard: None,
+        backend_guard: target.backend_guard,
         stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
         sse_keepalive_secs: 0,
         map_queue_full_to_429: false,
@@ -232,17 +268,7 @@ pub async fn images_edits(
         connect_failover: None,
     };
 
-    // The backend bearer is scoped to pool members; an override URL is a
-    // separately configured endpoint and gets the plain client.
-    let (url, _guard, client) = match &state.config.images_edits_url_override {
-        Some(override_url) => (override_url.clone(), None, &state.http_client),
-        None => {
-            let (u, g) = state.backend_pool.select_url("/v1/images/edits");
-            (u, Some(g), &state.backend_client)
-        }
-    };
-
-    proxy::proxy_multipart_request(client, &url, form, &request_sha256, opts).await
+    proxy::proxy_multipart_request(target.client, &target.url, form, &request_sha256, opts).await
 }
 
 /// POST /v1/audio/transcriptions — multipart proxy with signing.
@@ -274,8 +300,8 @@ pub async fn audio_transcriptions(
 
         if let (true, Some(ctx)) = (name == "prompt", enc_ctx.as_ref()) {
             // Read field, hash the raw (encrypted) bytes, then decrypt for forwarding
-            let raw_data = read_field_data(&mut field, &mut total_size, max_size).await?;
-            hasher.update(&raw_data);
+            let raw_data =
+                read_field_chunks(&mut field, &mut total_size, max_size, &mut hasher).await?;
             let text = String::from_utf8(raw_data)
                 .map_err(|_| AppError::BadRequest("prompt field is not UTF-8".to_string()))?;
             let data = if !text.is_empty() {
@@ -302,6 +328,11 @@ pub async fn audio_transcriptions(
             state.signing.clone(),
         )
     });
+    let target = passthrough_target(
+        &state,
+        state.config.transcriptions_url_override.as_deref(),
+        "/v1/audio/transcriptions",
+    );
 
     let opts = ProxyOpts {
         signing: state.signing.clone(),
@@ -313,7 +344,7 @@ pub async fn audio_transcriptions(
         request_hash: None,
         response_transform,
         chunk_transform: None,
-        backend_guard: None,
+        backend_guard: target.backend_guard,
         stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
         sse_keepalive_secs: 0,
         map_queue_full_to_429: false,
@@ -326,17 +357,7 @@ pub async fn audio_transcriptions(
         connect_failover: None,
     };
 
-    // The backend bearer is scoped to pool members; an override URL is a
-    // separately configured endpoint and gets the plain client.
-    let (url, _guard, client) = match &state.config.transcriptions_url_override {
-        Some(override_url) => (override_url.clone(), None, &state.http_client),
-        None => {
-            let (u, g) = state.backend_pool.select_url("/v1/audio/transcriptions");
-            (u, Some(g), &state.backend_client)
-        }
-    };
-
-    proxy::proxy_multipart_request(client, &url, form, &request_sha256, opts).await
+    proxy::proxy_multipart_request(target.client, &target.url, form, &request_sha256, opts).await
 }
 
 /// Generic JSON passthrough with signing and optional encryption support.
@@ -377,86 +398,35 @@ async fn json_passthrough_encrypted(
         (request_body, None, None)
     };
 
-    match url_override {
-        Some(u) => {
-            let opts = ProxyOpts {
-                signing: state.signing.clone(),
-                cache: state.cache.clone(),
-                id_prefix: id_prefix.to_string(),
-                model_name: state.config.model_name.clone(),
-                usage_reporter,
-                usage_type,
-                request_hash: original_request_hash,
-                response_transform,
-                chunk_transform: None,
-                backend_guard: None,
-                stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
-                sse_keepalive_secs: 0,
-                map_queue_full_to_429: false,
-                stream_error_peek_ms: 0,
-                stream_commit_ms: 0,
-                response_shape: ResponseShape::ChatCompletion,
-                tracing_ids: Some(tracing_ids.clone()),
-                upstream_data_parallel_rank: None,
-                admission: None,
-                connect_failover: None,
-            };
-            // Override URL: not a pool member, so no backend bearer.
-            proxy::proxy_json_request(&state.http_client, u, forward_body, opts).await
-        }
-        None => {
-            let (url, guard) = state.backend_pool.select_url(pool_path);
-            let opts = ProxyOpts {
-                signing: state.signing.clone(),
-                cache: state.cache.clone(),
-                id_prefix: id_prefix.to_string(),
-                model_name: state.config.model_name.clone(),
-                usage_reporter,
-                usage_type,
-                request_hash: original_request_hash,
-                response_transform,
-                chunk_transform: None,
-                backend_guard: Some(guard),
-                stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
-                sse_keepalive_secs: 0,
-                map_queue_full_to_429: false,
-                stream_error_peek_ms: 0,
-                stream_commit_ms: 0,
-                response_shape: ResponseShape::ChatCompletion,
-                tracing_ids: Some(tracing_ids),
-                upstream_data_parallel_rank: None,
-                admission: None,
-                connect_failover: None,
-            };
-            proxy::proxy_json_request(&state.backend_client, &url, forward_body, opts).await
-        }
-    }
+    let target = passthrough_target(&state, url_override, pool_path);
+    let opts = ProxyOpts {
+        signing: state.signing.clone(),
+        cache: state.cache.clone(),
+        id_prefix: id_prefix.to_string(),
+        model_name: state.config.model_name.clone(),
+        usage_reporter,
+        usage_type,
+        request_hash: original_request_hash,
+        response_transform,
+        chunk_transform: None,
+        backend_guard: target.backend_guard,
+        stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
+        sse_keepalive_secs: 0,
+        map_queue_full_to_429: false,
+        stream_error_peek_ms: 0,
+        stream_commit_ms: 0,
+        response_shape: ResponseShape::ChatCompletion,
+        tracing_ids: Some(tracing_ids),
+        upstream_data_parallel_rank: None,
+        admission: None,
+        connect_failover: None,
+    };
+
+    proxy::proxy_json_request(target.client, &target.url, forward_body, opts).await
 }
 
-/// Read a multipart field incrementally, checking cumulative size (without hashing).
-/// Used when the raw bytes should not be hashed (e.g., encrypted fields that will
-/// be decrypted and hashed separately).
-async fn read_field_data(
-    field: &mut Field<'_>,
-    total_size: &mut usize,
-    max_size: usize,
-) -> Result<Vec<u8>, AppError> {
-    let mut data = Vec::new();
-    while let Some(chunk) = field
-        .chunk()
-        .await
-        .map_err(|e| AppError::BadRequest(format!("Error reading field: {e}")))?
-    {
-        *total_size = total_size.saturating_add(chunk.len());
-        if *total_size > max_size {
-            return Err(AppError::PayloadTooLarge { max_size });
-        }
-        data.extend_from_slice(&chunk);
-    }
-    Ok(data)
-}
-
-/// Read a multipart field incrementally, checking cumulative size and hashing all bytes.
+/// Read a multipart field incrementally, enforcing the cumulative size limit and
+/// hashing the original bytes before any encrypted field is transformed.
 async fn read_field_chunks(
     field: &mut Field<'_>,
     total_size: &mut usize,

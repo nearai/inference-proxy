@@ -8,6 +8,8 @@ use vllm_proxy_rs::*;
 pub(crate) struct TestAppOptions {
     pub(crate) cloud_api_url: Option<String>,
     pub(crate) dstack_socket_path: Option<String>,
+    pub(crate) backend_token: Option<String>,
+    pub(crate) rerank_url_override: Option<String>,
 }
 
 pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::Router {
@@ -72,12 +74,12 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         images_url_override: None,
         images_edits_url_override: None,
         transcriptions_url_override: None,
-        rerank_url_override: None,
+        rerank_url_override: options.rerank_url_override,
         score_url_override: None,
         ohttp_enabled: false,
         listen_port: 8000,
         listen_addr: "127.0.0.1".to_string(),
-        backend_token: None,
+        backend_token: options.backend_token,
         backend_priority: None,
         backend_health_path: "/health".to_string(),
         non_tee_deployment: false,
@@ -144,6 +146,20 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
     let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
         .build_recorder()
         .handle();
+    let http_client = reqwest::Client::new();
+    let backend_client = if let Some(token) = &config.backend_token {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let mut authorization =
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).unwrap();
+        authorization.set_sensitive(true);
+        headers.insert(reqwest::header::AUTHORIZATION, authorization);
+        reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap()
+    } else {
+        http_client.clone()
+    };
     let backend_pool = Arc::new(vllm_proxy_rs::backend_pool::BackendPool::new(vec![
         mock_url.to_string(),
     ]));
@@ -153,8 +169,8 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),
         attestation_cache: Arc::new(vllm_proxy_rs::attestation::AttestationCache::new(300)),
-        http_client: reqwest::Client::new(),
-        backend_client: reqwest::Client::new(),
+        http_client,
+        backend_client,
         metrics_handle,
         tls_cert_fingerprint: Arc::new(
             vllm_proxy_rs::attestation::TlsCertTracker::new(None).expect("tracker for None path"),

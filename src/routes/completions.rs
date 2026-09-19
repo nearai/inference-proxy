@@ -4,7 +4,7 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use axum::Extension;
 
-use crate::admission::RejectReason;
+use crate::admission::{AdmissionClass, RejectReason};
 use crate::auth::RequireAuth;
 use crate::backend_pool;
 use crate::encryption::{self, Endpoint};
@@ -103,7 +103,10 @@ pub async fn completions(
         state.config.long_context_above_tokens,
         || crate::context_tier::completion_estimate(&request_json),
     );
-    let permit = state.admission.try_admit(&state.backend_pool, tier)?;
+    let permit = state
+        .admission
+        .admit(&state.backend_pool, tier, AdmissionClass::Cold)
+        .await?;
     let limits = state.admission.backend_limits(&state.backend_pool);
     let mut restrict = tier.and_then(|tier| tier.restrict);
     let requested_tier = tier.map(|decision| decision.estimated);
@@ -112,7 +115,12 @@ pub async fn completions(
             max_conns: None,
             max_conns_by_backend: limits.as_deref(),
             requested_tier,
-            avoid: &|index| state.admission.backend_saturated(index),
+            avoid: &|index| {
+                state.admission.backend_saturated(index)
+                    || permit
+                        .as_ref()
+                        .is_some_and(|permit| !permit.backend_allowed(index))
+            },
             engine: &|index| state.admission.engine(index),
             tier,
         };

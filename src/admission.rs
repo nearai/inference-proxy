@@ -34,6 +34,7 @@
 //! endpoint or extra token is involved. Disabled (`max_inflight = 0`) the
 //! module is inert and the in-CVM behavior is unchanged.
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
@@ -86,6 +87,28 @@ pub struct AdmissionConfig {
     pub backpressure_ttl: Duration,
     /// `Retry-After` value on every refusal.
     pub retry_after: Duration,
+    /// A bounded exception for recently completed large-prefix continuations.
+    pub continuation: Option<ContinuationConfig>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContinuationConfig {
+    pub min_input_tokens: u64,
+    pub max_age: Duration,
+    pub max_wait: Duration,
+    pub max_waiters: usize,
+    pub max_buffered_bytes: u64,
+    pub max_estimated_tokens: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionClass {
+    Cold,
+    RecentPrefix {
+        preferred_backend: usize,
+        body_bytes: u64,
+        estimated_tokens: u64,
+    },
 }
 
 /// Why a request was refused. The label of `admission_rejections_total`.
@@ -99,6 +122,8 @@ pub enum RejectReason {
     BackendQueue,
     /// The lane's own time-to-first-generation is above the bound.
     Ttft,
+    /// A released slot is being handed to an older warm continuation.
+    ContinuationHandoff,
 }
 
 impl RejectReason {
@@ -108,6 +133,7 @@ impl RejectReason {
             RejectReason::HostShare => "host_share",
             RejectReason::BackendQueue => "backend_queue",
             RejectReason::Ttft => "ttft",
+            RejectReason::ContinuationHandoff => "continuation_handoff",
         }
     }
 }
@@ -128,6 +154,25 @@ struct Ramp {
 struct Breaker {
     evaluated_at: Option<Instant>,
     tripped: bool,
+}
+
+struct ContinuationWaiter {
+    ticket: u64,
+    preferred_backend: usize,
+    body_bytes: u64,
+    estimated_tokens: u64,
+    tier: Option<ContextTier>,
+}
+
+#[derive(Default)]
+struct ContinuationState {
+    next_ticket: u64,
+    waiters: VecDeque<ContinuationWaiter>,
+    buffered_bytes: u64,
+    estimated_tokens: u64,
+    /// Backend slots handed to admitted warm requests which have not yet
+    /// completed atomic backend placement.
+    handoffs: HashMap<usize, u32>,
 }
 
 /// One second of time-to-first-generation observations.
@@ -160,6 +205,8 @@ pub struct AdmissionController {
     /// computed over the request's own tier, so a single flag would flap
     /// between a queueing base fleet and an idle long host.
     queue_tripped: [AtomicBool; 2],
+    continuation: Mutex<ContinuationState>,
+    capacity_changed: tokio::sync::Notify,
 }
 
 impl AdmissionController {
@@ -194,6 +241,8 @@ impl AdmissionController {
             engine,
             epoch: now,
             queue_tripped: [AtomicBool::new(false), AtomicBool::new(false)],
+            continuation: Mutex::new(ContinuationState::default()),
+            capacity_changed: tokio::sync::Notify::new(),
         }
     }
 
@@ -213,6 +262,52 @@ impl AdmissionController {
 
     pub fn config(&self) -> Option<&AdmissionConfig> {
         self.config.as_ref()
+    }
+
+    pub fn continuation_config(&self) -> Option<&ContinuationConfig> {
+        self.config.as_ref()?.continuation.as_ref()
+    }
+
+    fn continuation_state(&self) -> MutexGuard<'_, ContinuationState> {
+        self.continuation.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn add_handoff(&self, backend: usize) {
+        let mut state = self.continuation_state();
+        *state.handoffs.entry(backend).or_default() += 1;
+    }
+
+    fn remove_handoff(&self, backend: usize) {
+        let mut state = self.continuation_state();
+        if let Some(count) = state.handoffs.get_mut(&backend) {
+            *count -= 1;
+            if *count == 0 {
+                state.handoffs.remove(&backend);
+            }
+        }
+    }
+
+    fn handoff_active(&self, backend: usize) -> bool {
+        self.continuation_state().handoffs.contains_key(&backend)
+    }
+
+    fn oldest_ready_waiter(&self, state: &ContinuationState, pool: &BackendPool) -> Option<u64> {
+        state.waiters.iter().find_map(|waiter| {
+            let backend = pool.backends().get(waiter.preferred_backend)?;
+            (backend.healthy.load(Ordering::Relaxed)
+                && waiter.tier.is_none_or(|tier| tier == backend.tier)
+                && !self.backend_saturated(waiter.preferred_backend))
+            .then_some(waiter.ticket)
+        })
+    }
+
+    pub fn waiter_count(&self) -> usize {
+        self.continuation_state().waiters.len()
+    }
+
+    pub fn waiter_usage(&self) -> (u64, u64) {
+        let state = self.continuation_state();
+        (state.buffered_bytes, state.estimated_tokens)
     }
 
     /// Current effective budget (0 when disabled).
@@ -324,12 +419,46 @@ impl AdmissionController {
         self.precheck_at(pool, tier, Instant::now())
     }
 
+    /// Early validation for routes with pre-dispatch work. Recent-prefix work
+    /// may proceed to the consuming admission call when only budget or engine
+    /// queue pressure is blocking it; TTFT overload still fails immediately.
+    pub fn precheck_for(
+        &self,
+        pool: &BackendPool,
+        tier: Option<TierDecision>,
+        class: AdmissionClass,
+    ) -> Result<(), Rejected> {
+        if class == AdmissionClass::Cold || self.continuation_config().is_none() {
+            return self.precheck(pool, tier);
+        }
+        let Some(config) = &self.config else {
+            return Ok(());
+        };
+        let now = Instant::now();
+        let on_long_tier = tier.is_some_and(|tier| tier.restrict == Some(ContextTier::Long));
+        if !on_long_tier && self.ttft_over_bound(config, now) {
+            return Err(self.reject(RejectReason::Ttft));
+        }
+        self.tick_ramp(config, now);
+        Ok(())
+    }
+
     pub(crate) fn precheck_at(
         &self,
         pool: &BackendPool,
         tier: Option<TierDecision>,
         now: Instant,
     ) -> Result<(), Rejected> {
+        self.check_at(pool, tier, now)
+            .map_err(|reason| self.reject(reason))
+    }
+
+    fn check_at(
+        &self,
+        pool: &BackendPool,
+        tier: Option<TierDecision>,
+        now: Instant,
+    ) -> Result<(), RejectReason> {
         let Some(config) = &self.config else {
             return Ok(());
         };
@@ -341,23 +470,144 @@ impl AdmissionController {
         // fleet, which is the fleet the breaker just declared overloaded.
         let on_long_tier = tier.is_some_and(|tier| tier.restrict == Some(ContextTier::Long));
         if !on_long_tier && self.ttft_over_bound(config, now) {
-            return Err(self.reject(RejectReason::Ttft));
+            return Err(RejectReason::Ttft);
         }
         if self.every_backend_queued(config, pool, tier.and_then(|tier| tier.restrict), now) {
-            return Err(self.reject(RejectReason::BackendQueue));
+            return Err(RejectReason::BackendQueue);
         }
         self.tick_ramp(config, now);
         if self.inflight.load(Ordering::Acquire) >= self.budget.load(Ordering::Relaxed) {
-            return Err(self.reject(RejectReason::Budget));
+            return Err(RejectReason::Budget);
         }
         Ok(())
     }
 
-    /// Run the overload and budget checks for a new request. `Ok(None)` when
-    /// admission is disabled; `Ok(Some(permit))` holds one budget slot until
-    /// the permit is dropped. The per-host share is applied by the caller at
-    /// selection time (`host_share`, `backend_saturated`), since it needs the
-    /// chosen backend.
+    /// Admit one request. Cold work keeps the existing fail-fast behavior.
+    /// An eligible recent-prefix continuation may wait briefly for budget or
+    /// engine-queue pressure to clear; its permit is pinned to the backend
+    /// which still holds the prefix.
+    pub async fn admit(
+        self: &Arc<Self>,
+        pool: &BackendPool,
+        tier: Option<TierDecision>,
+        class: AdmissionClass,
+    ) -> Result<Option<Permit>, Rejected> {
+        let Some(continuation) = self.continuation_config() else {
+            return self.try_admit(pool, tier);
+        };
+
+        if class == AdmissionClass::Cold {
+            let ready_waiter = {
+                let state = self.continuation_state();
+                self.oldest_ready_waiter(&state, pool).is_some()
+            };
+            if ready_waiter && self.inflight() < self.budget() {
+                return Err(self.reject(RejectReason::ContinuationHandoff));
+            }
+            return self.try_admit(pool, tier);
+        }
+
+        let AdmissionClass::RecentPrefix {
+            preferred_backend,
+            body_bytes,
+            estimated_tokens,
+        } = class
+        else {
+            unreachable!()
+        };
+        let tier_compatible = pool
+            .backends()
+            .get(preferred_backend)
+            .is_some_and(|backend| {
+                backend.healthy.load(Ordering::Relaxed)
+                    && tier
+                        .and_then(|decision| decision.restrict)
+                        .is_none_or(|required| required == backend.tier)
+            });
+        if !tier_compatible
+            || estimated_tokens < continuation.min_input_tokens
+            || body_bytes > continuation.max_buffered_bytes
+            || estimated_tokens > continuation.max_estimated_tokens
+        {
+            return self.try_admit(pool, tier);
+        }
+
+        let immediate = if self.backend_saturated(preferred_backend) {
+            Err(RejectReason::BackendQueue)
+        } else {
+            self.try_admit_reason_at(pool, tier, Instant::now())
+        };
+        match immediate {
+            Ok(permit) => {
+                metrics::counter!("continuation_admission_total", "outcome" => "immediate", "reason" => "none")
+                    .increment(1);
+                Ok(permit.map(|permit| permit.pin(preferred_backend)))
+            }
+            Err(reason) if !matches!(reason, RejectReason::Budget | RejectReason::BackendQueue) => {
+                Err(self.reject(reason))
+            }
+            Err(initial_reason) => {
+                let ticket = {
+                    let mut state = self.continuation_state();
+                    if state.waiters.len() >= continuation.max_waiters
+                        || state.buffered_bytes.saturating_add(body_bytes)
+                            > continuation.max_buffered_bytes
+                        || state.estimated_tokens.saturating_add(estimated_tokens)
+                            > continuation.max_estimated_tokens
+                    {
+                        metrics::counter!("continuation_admission_total", "outcome" => "rejected", "reason" => initial_reason.as_str())
+                            .increment(1);
+                        return Err(self.reject(initial_reason));
+                    }
+                    let ticket = state.next_ticket;
+                    state.next_ticket = state.next_ticket.wrapping_add(1);
+                    state.waiters.push_back(ContinuationWaiter {
+                        ticket,
+                        preferred_backend,
+                        body_bytes,
+                        estimated_tokens,
+                        tier: tier.and_then(|decision| decision.restrict),
+                    });
+                    state.buffered_bytes += body_bytes;
+                    state.estimated_tokens += estimated_tokens;
+                    metrics::gauge!("continuation_admission_waiters")
+                        .set(state.waiters.len() as f64);
+                    ticket
+                };
+                let mut registration = WaiterRegistration::new(Arc::clone(self), ticket);
+                let deadline = tokio::time::Instant::now() + continuation.max_wait;
+                loop {
+                    let notified = self.capacity_changed.notified();
+                    let engine_revision = self.engine.revision();
+                    let is_oldest_ready = {
+                        let state = self.continuation_state();
+                        self.oldest_ready_waiter(&state, pool) == Some(ticket)
+                    };
+                    if is_oldest_ready {
+                        if let Ok(permit) = self.try_admit_reason_at(pool, tier, Instant::now()) {
+                            registration.remove();
+                            metrics::counter!("continuation_admission_total", "outcome" => "admitted", "reason" => initial_reason.as_str())
+                                .increment(1);
+                            return Ok(permit.map(|permit| permit.pin(preferred_backend)));
+                        }
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        metrics::counter!("continuation_admission_total", "outcome" => "timeout", "reason" => initial_reason.as_str())
+                            .increment(1);
+                        return Err(self.reject(initial_reason));
+                    }
+                    tokio::select! {
+                        _ = notified => {}
+                        _ = self.engine.changed_since(engine_revision) => {}
+                        _ = tokio::time::sleep_until(deadline) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// Synchronous primitive retained for the unbuffered path and invariant
+    /// tests. Production routes use `admit` so there is one admission path.
     pub fn try_admit(
         self: &Arc<Self>,
         pool: &BackendPool,
@@ -372,14 +622,24 @@ impl AdmissionController {
         tier: Option<TierDecision>,
         now: Instant,
     ) -> Result<Option<Permit>, Rejected> {
+        self.try_admit_reason_at(pool, tier, now)
+            .map_err(|reason| self.reject(reason))
+    }
+
+    fn try_admit_reason_at(
+        self: &Arc<Self>,
+        pool: &BackendPool,
+        tier: Option<TierDecision>,
+        now: Instant,
+    ) -> Result<Option<Permit>, RejectReason> {
         if self.config.is_none() {
             return Ok(None);
         }
-        self.precheck_at(pool, tier, now)?;
+        self.check_at(pool, tier, now)?;
         let mut current = self.inflight.load(Ordering::Acquire);
         loop {
             if current >= self.budget.load(Ordering::Relaxed) {
-                return Err(self.reject(RejectReason::Budget));
+                return Err(RejectReason::Budget);
             }
             match self.inflight.compare_exchange_weak(
                 current,
@@ -398,6 +658,9 @@ impl AdmissionController {
             long_request: tier.is_some_and(|tier| tier.estimated == ContextTier::Long),
             state: AtomicU8::new(PENDING),
             dispatched_at: OnceLock::new(),
+            required_backend: None,
+            completion_affinity: OnceLock::new(),
+            handoff_active: AtomicBool::new(false),
         }))
     }
 
@@ -592,6 +855,48 @@ impl AdmissionController {
     }
 }
 
+/// Removes queue accounting even when an admission future is cancelled.
+struct WaiterRegistration {
+    controller: Arc<AdmissionController>,
+    ticket: Option<u64>,
+}
+
+impl WaiterRegistration {
+    fn new(controller: Arc<AdmissionController>, ticket: u64) -> Self {
+        Self {
+            controller,
+            ticket: Some(ticket),
+        }
+    }
+
+    fn remove(&mut self) {
+        let Some(ticket) = self.ticket.take() else {
+            return;
+        };
+        let mut state = self.controller.continuation_state();
+        if let Some(index) = state
+            .waiters
+            .iter()
+            .position(|waiter| waiter.ticket == ticket)
+        {
+            let waiter = state.waiters.remove(index).expect("waiter index exists");
+            state.buffered_bytes = state.buffered_bytes.saturating_sub(waiter.body_bytes);
+            state.estimated_tokens = state
+                .estimated_tokens
+                .saturating_sub(waiter.estimated_tokens);
+            metrics::gauge!("continuation_admission_waiters").set(state.waiters.len() as f64);
+        }
+        drop(state);
+        self.controller.capacity_changed.notify_waiters();
+    }
+}
+
+impl Drop for WaiterRegistration {
+    fn drop(&mut self) {
+        self.remove();
+    }
+}
+
 /// One admitted request's budget slot. Dropping it releases the slot; the
 /// streaming path moves it into the pump task next to the backend guard so
 /// the slot is held for the whole stream.
@@ -612,9 +917,51 @@ pub struct Permit {
     long_request: bool,
     state: AtomicU8,
     dispatched_at: OnceLock<Instant>,
+    required_backend: Option<usize>,
+    completion_affinity: OnceLock<(
+        Arc<crate::backend_affinity::BackendConversationAffinity>,
+        crate::backend_affinity::ConversationKey,
+    )>,
+    handoff_active: AtomicBool,
 }
 
 impl Permit {
+    fn pin(mut self, backend: usize) -> Self {
+        self.required_backend = Some(backend);
+        self.controller.add_handoff(backend);
+        self.handoff_active.store(true, Ordering::Release);
+        self
+    }
+
+    /// Whether placement may use this backend. A warm continuation must use
+    /// the backend whose cache made it eligible.
+    pub fn backend_allowed(&self, index: usize) -> bool {
+        self.required_backend.map_or_else(
+            || !self.controller.handoff_active(index),
+            |required| required == index,
+        )
+    }
+
+    pub fn track_affinity_completion(
+        &self,
+        affinity: Arc<crate::backend_affinity::BackendConversationAffinity>,
+        key: crate::backend_affinity::ConversationKey,
+    ) {
+        let _ = self.completion_affinity.set((affinity, key));
+    }
+
+    /// Mark the currently attached backend warm only after a valid terminal
+    /// completion. Failover updates `backend`, so stale destinations cannot be
+    /// recorded as warm.
+    pub fn observe_completion(&self) {
+        let (Some((affinity, key)), Some(backend)) =
+            (self.completion_affinity.get(), self.backend())
+        else {
+            return;
+        };
+        affinity.mark_completed(*key, backend);
+    }
+
     pub fn requested_tier(&self) -> ContextTier {
         if self.long_request {
             ContextTier::Long
@@ -627,6 +974,7 @@ impl Permit {
     /// engine back-pressure). Called again after a connection fail-over.
     pub fn attach_backend(&self, index: usize) {
         self.backend.store(index, Ordering::Relaxed);
+        self.release_handoff();
     }
 
     pub fn backend(&self) -> Option<usize> {
@@ -732,6 +1080,7 @@ impl Permit {
     }
 
     pub(crate) fn release_at(&self, now: Instant) {
+        self.release_handoff();
         // A dispatched request that ended (client gone, idle timeout, stream
         // cut) before any generation event waited at least this long: record
         // it, or slow requests that clients give up on would never count.
@@ -744,6 +1093,15 @@ impl Permit {
         }
         self.controller.inflight.fetch_sub(1, Ordering::AcqRel);
         metrics::gauge!("admission_inflight").decrement(1.0);
+        self.controller.capacity_changed.notify_waiters();
+    }
+
+    fn release_handoff(&self) {
+        if self.handoff_active.swap(false, Ordering::AcqRel) {
+            if let Some(backend) = self.required_backend {
+                self.controller.remove_handoff(backend);
+            }
+        }
     }
 }
 
@@ -752,6 +1110,7 @@ impl std::fmt::Debug for Permit {
         f.debug_struct("Permit")
             .field("backend", &self.backend())
             .field("long_request", &self.long_request)
+            .field("required_backend", &self.required_backend)
             .field("state", &self.state.load(Ordering::Relaxed))
             .finish()
     }
@@ -778,6 +1137,26 @@ mod tests {
             ttft_p95_max: Some(Duration::from_secs(10)),
             backpressure_ttl: Duration::from_secs(10),
             retry_after: Duration::from_secs(3),
+            continuation: None,
+        }
+    }
+
+    fn continuation_config() -> ContinuationConfig {
+        ContinuationConfig {
+            min_input_tokens: 100_000,
+            max_age: Duration::from_secs(180),
+            max_wait: Duration::from_millis(100),
+            max_waiters: 8,
+            max_buffered_bytes: 8 * 1024 * 1024,
+            max_estimated_tokens: 2_000_000,
+        }
+    }
+
+    fn recent(backend: usize) -> AdmissionClass {
+        AdmissionClass::RecentPrefix {
+            preferred_backend: backend,
+            body_bytes: 1024,
+            estimated_tokens: 150_000,
         }
     }
 
@@ -1431,5 +1810,192 @@ mod tests {
             RejectReason::Budget
         );
         assert_eq!(c.inflight(), 2);
+    }
+
+    #[tokio::test]
+    async fn empty_recency_state_keeps_cold_admission_behavior() {
+        let c = controller(
+            AdmissionConfig {
+                max_inflight: 1,
+                start_inflight: 1,
+                continuation: Some(continuation_config()),
+                ..config()
+            },
+            1,
+        );
+        let p = pool(1);
+        let held = c
+            .admit(&p, None, AdmissionClass::Cold)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.waiter_count(), 0);
+        assert_eq!(
+            c.admit(&p, None, AdmissionClass::Cold)
+                .await
+                .unwrap_err()
+                .reason,
+            RejectReason::Budget
+        );
+        assert_eq!(c.waiter_count(), 0, "cold requests are never buffered");
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn recent_prefix_gets_the_released_slot_before_new_cold_work() {
+        let c = controller(
+            AdmissionConfig {
+                max_inflight: 1,
+                start_inflight: 1,
+                continuation: Some(continuation_config()),
+                ..config()
+            },
+            1,
+        );
+        let p = Arc::new(pool(1));
+        let held = c
+            .admit(&p, None, AdmissionClass::Cold)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let waiting = {
+            let c = c.clone();
+            let p = p.clone();
+            tokio::spawn(async move { c.admit(&p, None, recent(0)).await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while c.waiter_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        drop(held);
+        assert_eq!(
+            c.admit(&p, None, AdmissionClass::Cold)
+                .await
+                .unwrap_err()
+                .reason,
+            RejectReason::ContinuationHandoff
+        );
+        let hot = waiting.await.unwrap().unwrap().unwrap();
+        assert!(hot.backend_allowed(0));
+        assert!(!hot.backend_allowed(1));
+        hot.attach_backend(0);
+        drop(hot);
+        assert_eq!(c.waiter_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn timed_out_waiter_releases_every_bound() {
+        let mut continuation = continuation_config();
+        continuation.max_wait = Duration::from_millis(10);
+        let c = controller(
+            AdmissionConfig {
+                max_inflight: 1,
+                start_inflight: 1,
+                continuation: Some(continuation),
+                ..config()
+            },
+            1,
+        );
+        let p = pool(1);
+        let held = c
+            .admit(&p, None, AdmissionClass::Cold)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            c.admit(&p, None, recent(0)).await.unwrap_err().reason,
+            RejectReason::Budget
+        );
+        assert_eq!(c.waiter_count(), 0);
+        assert_eq!(c.waiter_usage(), (0, 0));
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn backend_probe_wakes_a_waiter_without_blocking_ready_cold_capacity() {
+        let engine = Arc::new(EngineLoad::new(2, Duration::from_secs(10)));
+        let c = Arc::new(AdmissionController::new(
+            Some(AdmissionConfig {
+                max_inflight: 2,
+                start_inflight: 2,
+                continuation: Some(continuation_config()),
+                ..config()
+            }),
+            2,
+            engine.clone(),
+        ));
+        let p = Arc::new(pool(2));
+        engine.record_at(
+            0,
+            crate::engine_load::Sample {
+                running: 1,
+                queued: 1,
+            },
+            Instant::now(),
+        );
+        let waiting = {
+            let c = c.clone();
+            let p = p.clone();
+            tokio::spawn(async move { c.admit(&p, None, recent(0)).await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while c.waiter_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let cold = c
+            .admit(&p, None, AdmissionClass::Cold)
+            .await
+            .expect("a blocked warm backend must not reserve unrelated capacity")
+            .unwrap();
+        engine.record_at(
+            0,
+            crate::engine_load::Sample {
+                running: 1,
+                queued: 0,
+            },
+            Instant::now(),
+        );
+        let hot = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(hot.backend_allowed(0));
+        drop(cold);
+        drop(hot);
+    }
+
+    #[tokio::test]
+    async fn admitted_warm_handoff_keeps_cold_placement_off_its_backend() {
+        let c = controller(
+            AdmissionConfig {
+                max_inflight: 2,
+                start_inflight: 2,
+                continuation: Some(continuation_config()),
+                ..config()
+            },
+            2,
+        );
+        let p = pool(2);
+        let hot = c.admit(&p, None, recent(0)).await.unwrap().unwrap();
+        let cold = c
+            .admit(&p, None, AdmissionClass::Cold)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!cold.backend_allowed(0));
+        assert!(cold.backend_allowed(1));
+        hot.attach_backend(0);
+        assert!(cold.backend_allowed(0));
     }
 }

@@ -246,6 +246,17 @@ async fn main() -> anyhow::Result<()> {
             retry_after_secs = settings.retry_after.as_secs(),
             "Lane admission enabled"
         );
+        if let Some(continuation) = &settings.continuation {
+            info!(
+                min_input_tokens = continuation.min_input_tokens,
+                max_age_secs = continuation.max_age.as_secs(),
+                max_wait_ms = continuation.max_wait.as_millis(),
+                max_waiters = continuation.max_waiters,
+                max_buffered_bytes = continuation.max_buffered_bytes,
+                max_estimated_tokens = continuation.max_estimated_tokens,
+                "Completion-confirmed continuation admission enabled"
+            );
+        }
     }
     if config.backend_connect_failover {
         info!("Connection fail-over to another backend enabled for chat/completions");

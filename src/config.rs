@@ -369,6 +369,14 @@ pub struct Config {
     /// `Retry-After` on refusals (`VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS`,
     /// default 2).
     pub admission_retry_after_secs: u64,
+    /// Minimum estimated input tokens for completion-confirmed continuation
+    /// waiting. Zero disables the feature.
+    pub backend_continuation_min_input_tokens: u64,
+    pub backend_continuation_max_age_secs: u64,
+    pub backend_continuation_max_wait_ms: u64,
+    pub backend_continuation_max_waiters: usize,
+    pub backend_continuation_max_buffered_bytes: u64,
+    pub backend_continuation_max_estimated_tokens: u64,
     /// Retry a chat/completions request once on another healthy backend when
     /// the connection to the chosen one fails before anything was sent
     /// (`VLLM_BACKEND_CONNECT_FAILOVER`). HTTP errors, queue-full included,
@@ -687,6 +695,18 @@ impl Config {
             env_parse("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS", 10)?;
         let admission_retry_after_secs: u64 =
             env_parse("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS", 2)?;
+        let backend_continuation_min_input_tokens: u64 =
+            env_parse("VLLM_BACKEND_CONTINUATION_MIN_INPUT_TOKENS", 0)?;
+        let backend_continuation_max_age_secs: u64 =
+            env_parse("VLLM_BACKEND_CONTINUATION_MAX_AGE_SECS", 180)?;
+        let backend_continuation_max_wait_ms: u64 =
+            env_parse("VLLM_BACKEND_CONTINUATION_MAX_WAIT_MS", 1_000)?;
+        let backend_continuation_max_waiters: usize =
+            env_parse("VLLM_BACKEND_CONTINUATION_MAX_WAITERS", 8)?;
+        let backend_continuation_max_buffered_bytes: u64 =
+            env_parse("VLLM_BACKEND_CONTINUATION_MAX_BUFFERED_BYTES", 67_108_864)?;
+        let backend_continuation_max_estimated_tokens: u64 =
+            env_parse("VLLM_BACKEND_CONTINUATION_MAX_ESTIMATED_TOKENS", 8_000_000)?;
         if admission_max_inflight > 0 {
             if admission_start_inflight == 0 || admission_start_inflight > admission_max_inflight {
                 anyhow::bail!(
@@ -706,6 +726,27 @@ impl Config {
             }
             if admission_retry_after_secs == 0 {
                 anyhow::bail!("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS must be at least 1");
+            }
+        }
+        if backend_continuation_min_input_tokens > 0 {
+            if admission_max_inflight == 0 || !backend_conversation_affinity {
+                anyhow::bail!("VLLM_BACKEND_CONTINUATION_MIN_INPUT_TOKENS requires admission and VLLM_BACKEND_CONVERSATION_AFFINITY=1");
+            }
+            if backend_continuation_max_age_secs == 0 || backend_continuation_max_age_secs > 180 {
+                anyhow::bail!("VLLM_BACKEND_CONTINUATION_MAX_AGE_SECS must be between 1 and 180");
+            }
+            if backend_continuation_max_wait_ms == 0 || backend_continuation_max_wait_ms > 5_000 {
+                anyhow::bail!("VLLM_BACKEND_CONTINUATION_MAX_WAIT_MS must be between 1 and 5000");
+            }
+            if backend_continuation_max_waiters == 0 || backend_continuation_max_waiters > 8 {
+                anyhow::bail!("VLLM_BACKEND_CONTINUATION_MAX_WAITERS must be between 1 and 8");
+            }
+            if backend_continuation_max_buffered_bytes == 0
+                || backend_continuation_max_estimated_tokens == 0
+            {
+                anyhow::bail!(
+                    "continuation buffered-byte and estimated-token bounds must be positive"
+                );
             }
         }
         let backend_connect_failover = env_bool("VLLM_BACKEND_CONNECT_FAILOVER");
@@ -873,6 +914,12 @@ impl Config {
             admission_ttft_p95_max_ms,
             admission_backpressure_secs,
             admission_retry_after_secs,
+            backend_continuation_min_input_tokens,
+            backend_continuation_max_age_secs,
+            backend_continuation_max_wait_ms,
+            backend_continuation_max_waiters,
+            backend_continuation_max_buffered_bytes,
+            backend_continuation_max_estimated_tokens,
             backend_connect_failover,
             backend_probe_urls,
             backend_probe_interval_secs,
@@ -1041,6 +1088,18 @@ impl Config {
                 .then(|| std::time::Duration::from_millis(self.admission_ttft_p95_max_ms)),
             backpressure_ttl: std::time::Duration::from_secs(self.admission_backpressure_secs),
             retry_after: std::time::Duration::from_secs(self.admission_retry_after_secs),
+            continuation: (self.backend_continuation_min_input_tokens > 0).then_some(
+                crate::admission::ContinuationConfig {
+                    min_input_tokens: self.backend_continuation_min_input_tokens,
+                    max_age: std::time::Duration::from_secs(self.backend_continuation_max_age_secs),
+                    max_wait: std::time::Duration::from_millis(
+                        self.backend_continuation_max_wait_ms,
+                    ),
+                    max_waiters: self.backend_continuation_max_waiters,
+                    max_buffered_bytes: self.backend_continuation_max_buffered_bytes,
+                    max_estimated_tokens: self.backend_continuation_max_estimated_tokens,
+                },
+            ),
         })
     }
 
@@ -1167,6 +1226,12 @@ mod tests {
             "VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS",
             "VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS",
             "VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS",
+            "VLLM_BACKEND_CONTINUATION_MIN_INPUT_TOKENS",
+            "VLLM_BACKEND_CONTINUATION_MAX_AGE_SECS",
+            "VLLM_BACKEND_CONTINUATION_MAX_WAIT_MS",
+            "VLLM_BACKEND_CONTINUATION_MAX_WAITERS",
+            "VLLM_BACKEND_CONTINUATION_MAX_BUFFERED_BYTES",
+            "VLLM_BACKEND_CONTINUATION_MAX_ESTIMATED_TOKENS",
             "VLLM_BACKEND_CONNECT_FAILOVER",
             "VLLM_BACKEND_PROBE_URLS",
             "VLLM_BACKEND_PROBE_INTERVAL_SECS",
@@ -2111,6 +2176,7 @@ mod tests {
                         ttft_p95_max: Some(std::time::Duration::from_secs(30)),
                         backpressure_ttl: std::time::Duration::from_secs(10),
                         retry_after: std::time::Duration::from_secs(2),
+                        continuation: None,
                     })
                 );
                 assert!(config.backend_connect_failover);
@@ -2184,6 +2250,41 @@ mod tests {
                 env::remove_var("VLLM_BACKEND_PROBE_URLS");
                 env::remove_var("VLLM_BACKEND_URLS");
                 env::remove_var("VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS");
+            },
+        );
+    }
+
+    #[test]
+    fn continuation_admission_requires_affinity_and_enforces_canary_bounds() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                ("VLLM_BACKEND_URLS", "http://b0,http://b1"),
+                ("VLLM_BACKEND_CONVERSATION_AFFINITY", "1"),
+                ("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", "4"),
+                ("VLLM_BACKEND_CONTINUATION_MIN_INPUT_TOKENS", "100000"),
+                ("VLLM_BACKEND_CONTINUATION_MAX_WAIT_MS", "750"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                let continuation = config.admission().unwrap().continuation.unwrap();
+                assert_eq!(continuation.min_input_tokens, 100_000);
+                assert_eq!(continuation.max_age, std::time::Duration::from_secs(180));
+                assert_eq!(continuation.max_wait, std::time::Duration::from_millis(750));
+                assert_eq!(continuation.max_waiters, 8);
+
+                env::set_var("VLLM_BACKEND_CONTINUATION_MAX_WAIT_MS", "5001");
+                assert!(Config::from_env()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("MAX_WAIT_MS"));
+                env::set_var("VLLM_BACKEND_CONTINUATION_MAX_WAIT_MS", "750");
+                env::remove_var("VLLM_BACKEND_CONVERSATION_AFFINITY");
+                assert!(Config::from_env()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("CONVERSATION_AFFINITY"));
             },
         );
     }

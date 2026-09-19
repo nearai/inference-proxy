@@ -6,7 +6,7 @@ use axum::Extension;
 
 use sha2::Digest;
 
-use crate::admission::RejectReason;
+use crate::admission::{AdmissionClass, RejectReason};
 use crate::auth::RequireAuth;
 use crate::backend_pool;
 use crate::encryption::{self, Endpoint};
@@ -88,21 +88,49 @@ pub async fn chat_completions(
     // above the threshold belongs on the long-context backends, and every
     // candidate selection below is restricted to its tier. `None` when the
     // feature is off or that tier has no healthy host (see `context_tier.rs`).
+    let estimate = crate::context_tier::chat_estimate(&request_json);
     let tier = crate::context_tier::decide(
         &state.backend_pool,
         state.config.long_context_above_tokens,
-        || crate::context_tier::chat_estimate(&request_json),
+        || estimate,
     );
-    // Lane admission (gateway mode), first half: the overload and budget
-    // checks, so a request the lane cannot take is refused before any image
-    // is fetched. The slot and the backend placement are taken on the normal
-    // proxy path below, after the special branches, right before dispatch.
-    state.admission.precheck(&state.backend_pool, tier)?;
     // Same conversation digest, applied across independent backends: later
     // turns follow the backend that already holds this conversation's prefix.
     let backend_affinity_key = state
         .backend_affinity
         .key_for_chat_request(&request_json, &state.config.model_name);
+    let admission_class = state
+        .admission
+        .continuation_config()
+        .filter(|config| estimate.tokens() >= config.min_input_tokens)
+        .and_then(|config| {
+            state.backend_affinity.recent_backend(
+                backend_affinity_key?,
+                &state.backend_pool,
+                tier.and_then(|decision| decision.restrict),
+                config.max_age,
+            )
+        })
+        .map_or(AdmissionClass::Cold, |recent| {
+            AdmissionClass::RecentPrefix {
+                preferred_backend: recent.backend,
+                body_bytes: request_body.len() as u64,
+                estimated_tokens: estimate.tokens(),
+            }
+        });
+    metrics::counter!(
+        "continuation_classifications_total",
+        "tier" => tier.map_or("any", |decision| decision.estimated.as_str()),
+        "class" => if admission_class == AdmissionClass::Cold { "cold" } else { "recent" }
+    )
+    .increment(1);
+    // Lane admission (gateway mode), first half: the overload and budget
+    // checks, so a request the lane cannot take is refused before any image
+    // is fetched. The slot and the backend placement are taken on the normal
+    // proxy path below, after the special branches, right before dispatch.
+    state
+        .admission
+        .precheck_for(&state.backend_pool, tier, admission_class)?;
 
     crate::image_validation::reject_invalid_images(&request_json, &state.config.image_validation())
         .await?;
@@ -245,7 +273,10 @@ pub async fn chat_completions(
     // by the per-host share that steers around backends which just rejected
     // at engine admission. Refuses with 429 before anything is sent upstream;
     // disabled deployments get `None`s and plain least-connections.
-    let permit = state.admission.try_admit(&state.backend_pool, tier)?;
+    let permit = state
+        .admission
+        .admit(&state.backend_pool, tier, admission_class)
+        .await?;
     let limits = state.admission.backend_limits(&state.backend_pool);
     let mut restrict = tier.and_then(|tier| tier.restrict);
     let requested_tier = tier.map(|decision| decision.estimated);
@@ -254,7 +285,12 @@ pub async fn chat_completions(
             max_conns: None,
             max_conns_by_backend: limits.as_deref(),
             requested_tier,
-            avoid: &|index| state.admission.backend_saturated(index),
+            avoid: &|index| {
+                state.admission.backend_saturated(index)
+                    || permit
+                        .as_ref()
+                        .is_some_and(|permit| !permit.backend_allowed(index))
+            },
             engine: &|index| state.admission.engine(index),
             tier,
         };
@@ -281,6 +317,9 @@ pub async fn chat_completions(
         placement.ok_or_else(|| AppError::from(state.admission.reject(RejectReason::HostShare)))?;
     if let Some(permit) = permit.as_ref() {
         permit.attach_backend(placement.index);
+        if let Some(key) = backend_affinity_key {
+            permit.track_affinity_completion(state.backend_affinity.clone(), key);
+        }
     }
     let connect_failover = state
         .config

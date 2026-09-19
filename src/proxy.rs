@@ -1072,9 +1072,9 @@ async fn send_upstream(
                 .and_then(|permit| permit.backend_limits(&pool));
             let next = {
                 let avoid = |index: usize| {
-                    opts.admission
-                        .as_ref()
-                        .is_some_and(|permit| permit.backend_saturated(index))
+                    opts.admission.as_ref().is_some_and(|permit| {
+                        permit.backend_saturated(index) || !permit.backend_allowed(index)
+                    })
                 };
                 let engine = |index: usize| opts.admission.as_ref().and_then(|p| p.engine(index));
                 let policy = crate::backend_pool::Policy {
@@ -1660,6 +1660,15 @@ pub async fn proxy_json_request(
     })?;
     let signed_json = serde_json::to_string(&signed).map_err(|e| AppError::Internal(e.into()))?;
     opts.cache.set_chat(&chat_id, &signed_json);
+    if response_data
+        .pointer("/choices/0/finish_reason")
+        .and_then(serde_json::Value::as_str)
+        .is_some()
+    {
+        if let Some(permit) = opts.admission.as_ref() {
+            permit.observe_completion();
+        }
+    }
 
     record_completed_request(
         opts.tracing_ids.as_ref(),
@@ -2612,6 +2621,12 @@ pub async fn proxy_streaming_request(
             &log_org_id,
             &log_workspace_id,
         );
+
+        if completed_cleanly && parser.finish_reason.is_some() {
+            if let Some(permit) = admission.as_ref() {
+                permit.observe_completion();
+            }
+        }
 
         // Only sign and cache for a fully completed stream
         if completed_cleanly {
@@ -5309,6 +5324,7 @@ data: [DONE]
                 ttft_p95_max: Some(std::time::Duration::from_secs(30)),
                 backpressure_ttl: std::time::Duration::from_secs(10),
                 retry_after: std::time::Duration::from_secs(2),
+                continuation: None,
             }),
             1,
             Arc::new(crate::engine_load::EngineLoad::disabled()),

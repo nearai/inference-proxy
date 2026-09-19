@@ -377,60 +377,39 @@ async fn json_passthrough_encrypted(
         (request_body, None, None)
     };
 
-    match url_override {
-        Some(u) => {
-            let opts = ProxyOpts {
-                signing: state.signing.clone(),
-                cache: state.cache.clone(),
-                id_prefix: id_prefix.to_string(),
-                model_name: state.config.model_name.clone(),
-                usage_reporter,
-                usage_type,
-                request_hash: original_request_hash,
-                response_transform,
-                chunk_transform: None,
-                backend_guard: None,
-                stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
-                sse_keepalive_secs: 0,
-                map_queue_full_to_429: false,
-                stream_error_peek_ms: 0,
-                stream_commit_ms: 0,
-                response_shape: ResponseShape::ChatCompletion,
-                tracing_ids: Some(tracing_ids.clone()),
-                upstream_data_parallel_rank: None,
-                admission: None,
-                connect_failover: None,
-            };
-            // Override URL: not a pool member, so no backend bearer.
-            proxy::proxy_json_request(&state.http_client, u, forward_body, opts).await
-        }
+    // Override URLs are not pool members, so they use the plain client and do
+    // not receive the backend bearer.
+    let (client, url, backend_guard) = match url_override {
+        Some(url) => (&state.http_client, url.to_string(), None),
         None => {
             let (url, guard) = state.backend_pool.select_url(pool_path);
-            let opts = ProxyOpts {
-                signing: state.signing.clone(),
-                cache: state.cache.clone(),
-                id_prefix: id_prefix.to_string(),
-                model_name: state.config.model_name.clone(),
-                usage_reporter,
-                usage_type,
-                request_hash: original_request_hash,
-                response_transform,
-                chunk_transform: None,
-                backend_guard: Some(guard),
-                stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
-                sse_keepalive_secs: 0,
-                map_queue_full_to_429: false,
-                stream_error_peek_ms: 0,
-                stream_commit_ms: 0,
-                response_shape: ResponseShape::ChatCompletion,
-                tracing_ids: Some(tracing_ids),
-                upstream_data_parallel_rank: None,
-                admission: None,
-                connect_failover: None,
-            };
-            proxy::proxy_json_request(&state.backend_client, &url, forward_body, opts).await
+            (&state.backend_client, url, Some(guard))
         }
-    }
+    };
+    let opts = ProxyOpts {
+        signing: state.signing.clone(),
+        cache: state.cache.clone(),
+        id_prefix: id_prefix.to_string(),
+        model_name: state.config.model_name.clone(),
+        usage_reporter,
+        usage_type,
+        request_hash: original_request_hash,
+        response_transform,
+        chunk_transform: None,
+        backend_guard,
+        stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
+        sse_keepalive_secs: 0,
+        map_queue_full_to_429: false,
+        stream_error_peek_ms: 0,
+        stream_commit_ms: 0,
+        response_shape: ResponseShape::ChatCompletion,
+        tracing_ids: Some(tracing_ids),
+        upstream_data_parallel_rank: None,
+        admission: None,
+        connect_failover: None,
+    };
+
+    proxy::proxy_json_request(client, &url, forward_body, opts).await
 }
 
 /// Read a multipart field incrementally, checking cumulative size (without hashing).

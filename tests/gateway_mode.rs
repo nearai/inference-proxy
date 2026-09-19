@@ -298,16 +298,10 @@ fn chat_request(body: serde_json::Value) -> Request<Body> {
 }
 
 const COMPLETION_ROUTES: [&str; 2] = [routes::ROUTE_CHAT_COMPLETIONS, routes::ROUTE_COMPLETIONS];
-
-fn completion_request(path: &str) -> Request<Body> {
-    let body = if path == routes::ROUTE_CHAT_COMPLETIONS {
-        hello_body()
-    } else {
-        serde_json::json!({"model": "test-model", "prompt": "hello"})
-    };
-    let mut request = chat_request(body);
-    *request.uri_mut() = path.parse().unwrap();
-    request
+async fn call(app: axum::Router, route: &str) -> axum::response::Response {
+    let mut request = chat_request(serde_json::json!({"messages": [], "prompt": "hello"}));
+    *request.uri_mut() = route.parse().unwrap();
+    app.oneshot(request).await.unwrap()
 }
 
 fn chat_completion_json() -> serde_json::Value {
@@ -1424,17 +1418,16 @@ async fn assert_overloaded(response: axum::response::Response) {
 
 #[tokio::test]
 async fn admission_budget_refuses_with_429_before_dispatch() {
-    for path in COMPLETION_ROUTES {
+    for route in COMPLETION_ROUTES {
         let mock = MockServer::start().await;
-        // The first and third requests dispatch; the refused second does not.
         Mock::given(method("POST"))
-            .and(wiremock::matchers::path(path))
+            .and(path(route))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(chat_completion_json())
                     .set_delay(Duration::from_millis(700)),
             )
-            .expect(2)
+            .expect(2) // the first and third requests; the second never dispatches
             .mount(&mock)
             .await;
         let app = build_gateway(
@@ -1444,23 +1437,14 @@ async fn admission_budget_refuses_with_429_before_dispatch() {
                 ..Default::default()
             },
         );
-        let first = tokio::spawn({
-            let app = app.clone();
-            async move { app.oneshot(completion_request(path)).await.unwrap() }
-        });
+        let first = tokio::spawn(call(app.clone(), route));
         tokio::time::sleep(Duration::from_millis(200)).await;
         let started = std::time::Instant::now();
-        let second = app.clone().oneshot(completion_request(path)).await.unwrap();
+        let second = call(app.clone(), route).await;
         assert!(started.elapsed() < Duration::from_millis(300));
         assert_overloaded(second).await;
         assert_eq!(first.await.unwrap().status(), StatusCode::OK);
-        assert_eq!(
-            app.oneshot(completion_request(path))
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::OK
-        );
+        assert_eq!(call(app, route).await.status(), StatusCode::OK);
         mock.verify().await;
     }
 }
@@ -1532,10 +1516,10 @@ async fn engine_queue_full_on_every_backend_refuses_new_work_without_dispatch() 
 
 #[tokio::test]
 async fn connect_error_fails_over_to_another_backend_when_enabled() {
-    for path in COMPLETION_ROUTES {
+    for route in COMPLETION_ROUTES {
         let mock = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(wiremock::matchers::path(path))
+            .and(path(route))
             .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
             .expect(1)
             .mount(&mock)
@@ -1551,13 +1535,7 @@ async fn connect_error_fails_over_to_another_backend_when_enabled() {
                 ..Default::default()
             },
         );
-        assert_eq!(
-            app.oneshot(completion_request(path))
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::OK
-        );
+        assert_eq!(call(app, route).await.status(), StatusCode::OK);
         mock.verify().await;
     }
 }
@@ -1588,17 +1566,17 @@ async fn connect_error_is_not_retried_without_failover() {
 
 #[tokio::test]
 async fn failover_never_retries_an_engine_rejection() {
-    for path in COMPLETION_ROUTES {
+    for route in COMPLETION_ROUTES {
         let rejected = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(wiremock::matchers::path(path))
+            .and(path(route))
             .respond_with(ResponseTemplate::new(503).set_body_string(QUEUE_FULL_BODY))
             .expect(1)
             .mount(&rejected)
             .await;
         let idle = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(wiremock::matchers::path(path))
+            .and(path(route))
             .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
             .expect(0)
             .mount(&idle)
@@ -1613,10 +1591,7 @@ async fn failover_never_retries_an_engine_rejection() {
             },
         );
         assert_eq!(
-            app.oneshot(completion_request(path))
-                .await
-                .unwrap()
-                .status(),
+            call(app, route).await.status(),
             StatusCode::TOO_MANY_REQUESTS
         );
         rejected.verify().await;

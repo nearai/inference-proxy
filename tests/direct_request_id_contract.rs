@@ -43,6 +43,7 @@ async fn direct_privacy_classify_observable_request_id_contract() {
         TestAppOptions {
             cloud_api_url: Some(cloud_api.uri()),
             dstack_socket_path: None,
+            ..Default::default()
         },
     );
     let valid = app

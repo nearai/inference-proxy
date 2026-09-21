@@ -83,8 +83,8 @@ pub fn build_router() -> Router<AppState> {
         // global 2 MiB `DefaultBodyLimit`, which rejects the body before the
         // handler's own size guard (`max_audio_request_size` / `max_image_request_size`)
         // can run. Disabling the default limit here makes those per-type limits —
-        // enforced incrementally in `read_field_chunks` / `read_field_data` — the
-        // single source of truth. Without this, audio/images > ~2 MiB fail upstream
+        // enforced incrementally in `read_field_chunks` — the single source of
+        // truth. Without this, audio/images > ~2 MiB fail upstream
         // with a 502 (connection reset before the body is consumed).
         .route(
             ROUTE_IMAGES_EDITS,

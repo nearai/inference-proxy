@@ -7645,10 +7645,10 @@ async fn test_encrypted_streaming_completions_ed25519() {
     }
 }
 
-// ---- Multipart: signature covers encrypted response ----
+// ---- Multipart: signature covers raw request and encrypted response ----
 
 #[tokio::test]
-async fn test_encrypted_audio_transcription_signature_covers_transformed() {
+async fn test_encrypted_audio_transcription_signature_hashes_raw_request_and_response() {
     use sha2::{Digest, Sha256};
     use vllm_proxy_rs::encryption;
 
@@ -7753,15 +7753,14 @@ async fn test_encrypted_audio_transcription_signature_covers_transformed() {
     let sig_body = body_to_json(sig_response).await;
     let signed_text = sig_body["text"].as_str().unwrap();
 
-    // Verify response hash in the signature covers the encrypted response
-    let response_sha256 = hex::encode(Sha256::digest(&response_bytes));
-
-    let parts: Vec<&str> = signed_text.split(':').collect();
-    assert_eq!(parts.len(), 3);
-    assert_eq!(parts[0], "test-model");
+    let request_bytes = format!("whisper-1{encrypted_prompt}fakeaudiodata");
     assert_eq!(
-        parts[2], response_sha256,
-        "Multipart signature should cover encrypted response bytes (what client receives)"
+        signed_text,
+        format!(
+            "test-model:{}:{}",
+            hex::encode(Sha256::digest(request_bytes)),
+            hex::encode(Sha256::digest(&response_bytes))
+        )
     );
 }
 

@@ -230,6 +230,7 @@ pub async fn images_edits(
         upstream_data_parallel_rank: None,
         admission: None,
         connect_failover: None,
+        first_token_deadline: None,
     };
 
     // The backend bearer is scoped to pool members; an override URL is a
@@ -324,6 +325,7 @@ pub async fn audio_transcriptions(
         upstream_data_parallel_rank: None,
         admission: None,
         connect_failover: None,
+        first_token_deadline: None,
     };
 
     // The backend bearer is scoped to pool members; an override URL is a
@@ -400,6 +402,7 @@ async fn json_passthrough_encrypted(
                 upstream_data_parallel_rank: None,
                 admission: None,
                 connect_failover: None,
+                first_token_deadline: None,
             };
             // Override URL: not a pool member, so no backend bearer.
             proxy::proxy_json_request(&state.http_client, u, forward_body, opts).await
@@ -427,6 +430,7 @@ async fn json_passthrough_encrypted(
                 upstream_data_parallel_rank: None,
                 admission: None,
                 connect_failover: None,
+                first_token_deadline: None,
             };
             proxy::proxy_json_request(&state.backend_client, &url, forward_body, opts).await
         }

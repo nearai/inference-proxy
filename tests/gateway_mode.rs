@@ -26,6 +26,9 @@ struct GatewayOptions {
     map_queue_full_to_429: bool,
     stream_error_peek_ms: u64,
     stream_commit_ms: u64,
+    first_token_deadline_ms: u64,
+    first_token_deadline_per_1k_tokens_ms: u64,
+    first_token_deadline_max_ms: u64,
     rejected_content_part_types: Vec<String>,
     allowed_org_ids: Vec<String>,
     sse_keepalive_secs: u64,
@@ -140,6 +143,9 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         map_queue_full_to_429: options.map_queue_full_to_429,
         stream_error_peek_ms: options.stream_error_peek_ms,
         stream_commit_ms: options.stream_commit_ms,
+        first_token_deadline_ms: options.first_token_deadline_ms,
+        first_token_deadline_per_1k_tokens_ms: options.first_token_deadline_per_1k_tokens_ms,
+        first_token_deadline_max_ms: options.first_token_deadline_max_ms,
         rejected_content_part_types: options.rejected_content_part_types,
         models_document_url: options.models_document_url.clone(),
         capacity_requests_per_minute: options.capacity_requests_per_minute,
@@ -2501,6 +2507,439 @@ async fn without_a_commit_window_a_slow_upstream_still_decides_the_status() {
         "the handler must wait for the upstream when no window is set"
     );
     handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// First-token deadline
+// ---------------------------------------------------------------------------
+
+/// Backend that never answers inside a test's lifetime, reporting when it
+/// accepts a request and when its handler future is dropped — which here only
+/// happens when the gateway hangs up on the in-flight request.
+struct NeverAnsweringBackend {
+    url: String,
+    arrivals: tokio::sync::mpsc::UnboundedReceiver<()>,
+    hang_ups: tokio::sync::mpsc::UnboundedReceiver<()>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl NeverAnsweringBackend {
+    async fn wait(what: &str, signal: &mut tokio::sync::mpsc::UnboundedReceiver<()>) {
+        tokio::time::timeout(Duration::from_secs(5), signal.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the backend never reported {what}"))
+            .expect("the reporting channel stays open");
+    }
+}
+
+async fn spawn_never_answering_backend() -> NeverAnsweringBackend {
+    use axum::routing::post;
+    let (arrived, arrivals) = tokio::sync::mpsc::unbounded_channel();
+    let (hung_up, hang_ups) = tokio::sync::mpsc::unbounded_channel();
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let arrived = arrived.clone();
+            let hung_up = hung_up.clone();
+            async move {
+                struct ReportOnDrop(tokio::sync::mpsc::UnboundedSender<()>);
+                impl Drop for ReportOnDrop {
+                    fn drop(&mut self) {
+                        let _ = self.0.send(());
+                    }
+                }
+                let _report = ReportOnDrop(hung_up);
+                let _ = arrived.send(());
+                tokio::time::sleep(Duration::from_secs(300)).await;
+                axum::response::Response::builder()
+                    .status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from(ONE_TOKEN_STREAM))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    NeverAnsweringBackend {
+        url: format!("http://{addr}"),
+        arrivals,
+        hang_ups,
+        handle,
+    }
+}
+
+/// Backend that answers its `200 text/event-stream` headers at once and sends
+/// its first SSE event only `delay` later — what an engine that opens the
+/// stream before it has generated anything looks like on the wire (vLLM), and
+/// what defeats a deadline measured on the response headers alone.
+async fn spawn_late_first_event_backend(delay: Duration) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut request = [0_u8; 8192];
+                let _ = socket.read(&mut request).await;
+                // Headers now, body later: the two are separate writes, so the
+                // gateway sees the 200 long before the first event.
+                if socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+                    )
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::time::sleep(delay).await;
+                let chunked = format!(
+                    "{:X}\r\n{}\r\n0\r\n\r\n",
+                    ONE_TOKEN_STREAM.len(),
+                    ONE_TOKEN_STREAM
+                );
+                let _ = socket.write_all(chunked.as_bytes()).await;
+            });
+        }
+    });
+    (format!("http://{addr}"), handle)
+}
+
+/// A prompt long enough to be estimated at about 1,000 tokens (bytes / 4).
+fn long_stream_request() -> Request<Body> {
+    chat_request(serde_json::json!({
+        "model": "test-model",
+        "stream": true,
+        "messages": [{"role": "user", "content": "x".repeat(4_000)}]
+    }))
+}
+
+#[tokio::test]
+async fn a_missed_first_token_deadline_is_a_429_instead_of_a_committed_200() {
+    let (backend, handle) = spawn_delayed_response_backend(
+        Duration::from_millis(2500),
+        200,
+        "text/event-stream",
+        ONE_TOKEN_STREAM,
+    )
+    .await;
+    let app = build_gateway(
+        &backend,
+        GatewayOptions {
+            first_token_deadline_ms: 400,
+            // A request under a deadline is not committed early, so this
+            // window never fires for it.
+            stream_commit_ms: 300,
+            sse_keepalive_secs: 1,
+            stream_error_peek_ms: 1_000,
+            ..Default::default()
+        },
+    );
+
+    let started = std::time::Instant::now();
+    let response = app.oneshot(stream_request()).await.unwrap();
+    let answered = started.elapsed();
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+        Some("2")
+    );
+    // Answered on the deadline, not on the backend.
+    assert!(
+        answered >= Duration::from_millis(350) && answered < Duration::from_millis(1500),
+        "expected a refusal around the deadline, took {answered:?}"
+    );
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["type"], "overloaded");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn a_deadline_refusal_drops_the_upstream_and_releases_the_admission_slot() {
+    let mut backend = spawn_never_answering_backend().await;
+    let app = build_gateway(
+        &backend.url,
+        GatewayOptions {
+            first_token_deadline_ms: 400,
+            admission_max_inflight: 1,
+            ..Default::default()
+        },
+    );
+
+    let response = app.clone().oneshot(stream_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // The engine is not left generating for nobody: the upstream request is
+    // dropped, which closes the connection the backend is serving.
+    NeverAnsweringBackend::wait("the request", &mut backend.arrivals).await;
+    NeverAnsweringBackend::wait("a hang-up", &mut backend.hang_ups).await;
+
+    // And the budget slot came back: with a budget of one, the next request is
+    // admitted and waits for its own deadline instead of being refused on the
+    // spot by admission.
+    let started = std::time::Instant::now();
+    let response = app.oneshot(stream_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        started.elapsed() >= Duration::from_millis(350),
+        "the second request was refused by admission, not by its deadline"
+    );
+    backend.handle.abort();
+}
+
+#[tokio::test]
+async fn a_first_token_inside_the_deadline_streams_as_usual() {
+    let (backend, handle) = spawn_delayed_response_backend(
+        Duration::from_millis(100),
+        200,
+        "text/event-stream",
+        ONE_TOKEN_STREAM,
+    )
+    .await;
+    let app = build_gateway(
+        &backend,
+        GatewayOptions {
+            first_token_deadline_ms: 2_000,
+            stream_error_peek_ms: 1_000,
+            ..Default::default()
+        },
+    );
+
+    let response = app.oneshot(stream_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let joined = stream_frames(response).await.concat();
+    assert!(joined.contains("\"content\":\"hi\""), "{joined}");
+    assert!(joined.ends_with("data: [DONE]\n\n"), "{joined}");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn the_deadline_grows_with_the_estimated_prompt() {
+    // The long-context tier is off here, so this also covers the estimate
+    // being computed for the deadline alone.
+    let (backend, handle) = spawn_delayed_response_backend(
+        Duration::from_millis(900),
+        200,
+        "text/event-stream",
+        ONE_TOKEN_STREAM,
+    )
+    .await;
+    let app = build_gateway(
+        &backend,
+        GatewayOptions {
+            first_token_deadline_ms: 300,
+            first_token_deadline_per_1k_tokens_ms: 4_000,
+            ..Default::default()
+        },
+    );
+
+    // A short prompt is refused: 300 ms, and the engine takes 900.
+    let response = app.clone().oneshot(stream_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // The same backend, with a prompt estimated at ~1,000 tokens: 4.3 s.
+    let response = app.oneshot(long_stream_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn a_deadline_above_the_cap_keeps_the_commit_window() {
+    let (backend, handle) = spawn_delayed_response_backend(
+        Duration::from_millis(2500),
+        200,
+        "text/event-stream",
+        ONE_TOKEN_STREAM,
+    )
+    .await;
+    let app = build_gateway(
+        &backend,
+        GatewayOptions {
+            first_token_deadline_ms: 300,
+            first_token_deadline_per_1k_tokens_ms: 4_000,
+            first_token_deadline_max_ms: 2_000,
+            stream_commit_ms: 300,
+            sse_keepalive_secs: 1,
+            ..Default::default()
+        },
+    );
+
+    // The control, same backend: a short prompt stays under the cap, so its
+    // 300 ms deadline applies and the 2.5 s engine misses it.
+    let response = app.clone().oneshot(stream_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // ~1,000 estimated tokens → a 4.3 s deadline, above the cap: no deadline,
+    // so this request is committed on the window and kept alive as before.
+    let started = std::time::Instant::now();
+    let response = app.oneshot(long_stream_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "expected the commit window, not the engine"
+    );
+    let frames = stream_frames(response).await;
+    assert!(frames.iter().any(|f| f == ": keep-alive\n\n"), "{frames:?}");
+    assert!(frames.concat().contains("\"content\":\"hi\""), "{frames:?}");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn early_headers_do_not_satisfy_the_deadline() {
+    // The deadline is about the first generated event, not the status line.
+    for peek_ms in [0, 1_000] {
+        let (backend, handle) = spawn_late_first_event_backend(Duration::from_millis(2500)).await;
+        let app = build_gateway(
+            &backend,
+            GatewayOptions {
+                first_token_deadline_ms: 400,
+                stream_error_peek_ms: peek_ms,
+                ..Default::default()
+            },
+        );
+
+        let started = std::time::Instant::now();
+        let response = app.oneshot(stream_request()).await.unwrap();
+        let answered = started.elapsed();
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "peek {peek_ms}: the 200 headers arrived at once, the event did not"
+        );
+        assert!(
+            answered < Duration::from_millis(1500),
+            "peek {peek_ms}: refused after {answered:?}, expected the deadline"
+        );
+        handle.abort();
+    }
+}
+
+#[tokio::test]
+async fn a_first_event_inside_the_deadline_is_delivered_once() {
+    let (backend, handle) = spawn_late_first_event_backend(Duration::from_millis(200)).await;
+    let app = build_gateway(
+        &backend,
+        GatewayOptions {
+            first_token_deadline_ms: 3_000,
+            ..Default::default()
+        },
+    );
+
+    let response = app.oneshot(stream_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let joined = stream_frames(response).await.concat();
+    // Re-attached exactly once, and the stream is complete.
+    assert_eq!(joined.matches("\"content\":\"hi\"").count(), 1, "{joined}");
+    assert!(joined.ends_with("data: [DONE]\n\n"), "{joined}");
+    handle.abort();
+}
+
+/// Control for the two tests above: without a deadline the headers alone do
+/// end the wait, which is exactly what made them defeat it.
+#[tokio::test]
+async fn without_a_deadline_early_headers_commit_the_stream_at_once() {
+    let (backend, handle) = spawn_late_first_event_backend(Duration::from_millis(2500)).await;
+    let app = build_gateway(&backend, GatewayOptions::default());
+
+    let started = std::time::Instant::now();
+    let response = app.oneshot(stream_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "expected the status on the headers, took {:?}",
+        started.elapsed()
+    );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn a_deadline_spent_before_dispatch_refuses_without_asking_an_engine() {
+    let mock = MockServer::start().await;
+    // Authentication counts against the deadline: a slow cloud-api round trip
+    // can use the whole budget before the request would be dispatched.
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(700))
+                .set_body_json(serde_json::json!({
+                    "valid": true, "organization_id": "org", "workspace_id": "ws", "api_key_id": "k"
+                })),
+        )
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    let app = build_gateway(
+        &mock.uri(),
+        GatewayOptions {
+            cloud_api_url: Some(mock.uri()),
+            first_token_deadline_ms: 300,
+            ..Default::default()
+        },
+    );
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("authorization", "Bearer sk-live-customer")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "test-model",
+                "stream": true,
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    mock.verify().await;
+}
+
+#[tokio::test]
+async fn a_client_that_disconnects_before_the_deadline_is_still_a_disconnect() {
+    let mut backend = spawn_never_answering_backend().await;
+    let app = build_gateway(
+        &backend.url,
+        GatewayOptions {
+            first_token_deadline_ms: 5_000,
+            ..Default::default()
+        },
+    );
+
+    // Wait until the engine actually holds the request, then let the client go
+    // away — still well inside the 5 s deadline. The disconnect ends the
+    // request there and then: the upstream is dropped at once instead of being
+    // held until the deadline would have fired. (Which of the two paths logged
+    // it is not visible from here.)
+    let waiting = tokio::spawn(async move { app.oneshot(stream_request()).await });
+    NeverAnsweringBackend::wait("the request", &mut backend.arrivals).await;
+    waiting.abort();
+
+    let gone = std::time::Instant::now();
+    NeverAnsweringBackend::wait("a hang-up", &mut backend.hang_ups).await;
+    assert!(
+        gone.elapsed() < Duration::from_secs(2),
+        "the upstream outlived the client disconnect"
+    );
+    backend.handle.abort();
 }
 
 // Four real HTTP stubs hold streams until the test explicitly ends them.

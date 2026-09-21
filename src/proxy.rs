@@ -947,6 +947,116 @@ pub struct ProxyOpts {
     /// Retry once on another healthy backend when the connection to the
     /// chosen one fails before anything was sent (`VLLM_BACKEND_CONNECT_FAILOVER`).
     pub connect_failover: Option<ConnectFailover>,
+    /// Deadline for the upstream's first event (gateway mode,
+    /// `VLLM_PROXY_FIRST_TOKEN_DEADLINE_MS`). `Some` replaces the commit
+    /// window for this streaming request: the handler waits for the upstream
+    /// verdict until the deadline and refuses with 429 rather than commit a
+    /// 200 the caller is about to cancel. `None` everywhere else.
+    pub first_token_deadline: Option<FirstTokenDeadline>,
+}
+
+/// A streaming request's first-token deadline, built once per request by the
+/// route (`proxy::first_token_deadline`).
+#[derive(Clone, Copy, Debug)]
+pub struct FirstTokenDeadline {
+    /// Arrival at the proxy, so authentication and pre-dispatch validation
+    /// count against the deadline (`RequestStart`). A connection fail-over
+    /// does not restart it: the caller's clock does not restart either.
+    pub started_at: std::time::Instant,
+    /// The computed budget: base + slope × estimated prompt tokens.
+    pub budget: std::time::Duration,
+    /// The estimate the budget was computed from, for the refusal log line.
+    pub estimated_tokens: u64,
+    /// `Retry-After` value on the refusal.
+    pub retry_after_secs: u64,
+}
+
+impl FirstTokenDeadline {
+    /// What is left of the budget, or `None` once it has passed.
+    fn remaining(&self) -> Option<std::time::Duration> {
+        self.budget.checked_sub(self.started_at.elapsed())
+    }
+
+    fn expired(&self) -> bool {
+        self.remaining().is_none()
+    }
+
+    /// The 429 the caller gets instead of a 200 it would have cancelled.
+    fn refusal(&self) -> AppError {
+        metrics::counter!("first_token_deadline_refusals_total").increment(1);
+        info!(
+            deadline_ms = self.budget.as_millis() as u64,
+            waited_ms = self.started_at.elapsed().as_millis() as u64,
+            estimated_tokens = self.estimated_tokens,
+            "First-token deadline passed, refusing"
+        );
+        AppError::Overloaded {
+            reason: "first_token_deadline",
+            retry_after_secs: self.retry_after_secs,
+        }
+    }
+}
+
+/// Settle a first-token deadline that has just passed against a verdict the
+/// streaming task may be handing over at that very moment, and say which one
+/// won: `Some(verdict)` means the upstream did (the task is past its hand-off
+/// and already pumping the stream, so the request is served), `None` means the
+/// request is refused.
+///
+/// The closing of the channel is what makes the election atomic — the timeout
+/// alone is not enough, because the task's `send` can still succeed between
+/// the receiver's last poll and the handler giving up. After `close()` every
+/// `send` fails, and `try_recv` still returns a value sent before it. The flag
+/// is stored first so a failing `send` always observes it: the task then drops
+/// the upstream attempt instead of reading the drop as a client disconnect.
+///
+/// The flag needs its own fence: `close()` publishes with a relaxed store, so
+/// seeing the channel closed is not on its own an acquire of the store above
+/// it. Both sides fence (`deadline_refused` on the task side), which orders
+/// the two in the global `SeqCst` order whatever the target.
+fn elect_over_deadline(
+    start_rx: &mut tokio::sync::oneshot::Receiver<Result<(), AppError>>,
+    refused: &std::sync::atomic::AtomicBool,
+) -> Option<Result<(), AppError>> {
+    refused.store(true, std::sync::atomic::Ordering::SeqCst);
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    start_rx.close();
+    start_rx.try_recv().ok()
+}
+
+/// Whether the handler gave up on this request's first-token deadline. The
+/// fence is the other half of `elect_over_deadline`'s.
+fn deadline_refused(refused: &std::sync::atomic::AtomicBool) -> bool {
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    refused.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The first-token deadline for a chat/completions request, or `None` when it
+/// does not get one: the feature is off, the request is not a stream, or its
+/// computed deadline is above the cap (those keep the commit window and the
+/// keep-alives). `estimate` is the request's input estimate, already computed
+/// for the tier decision.
+pub fn first_token_deadline(
+    state: &AppState,
+    started_at: std::time::Instant,
+    estimate: Option<crate::context_tier::Estimate>,
+    is_stream: bool,
+) -> Option<FirstTokenDeadline> {
+    if !is_stream {
+        return None;
+    }
+    let estimated_tokens = estimate?.tokens();
+    Some(FirstTokenDeadline {
+        started_at,
+        budget: state.config.first_token_deadline(estimated_tokens)?,
+        estimated_tokens,
+        // Same wait the lane's own refusals advertise; the engine's queue
+        // drains in seconds.
+        retry_after_secs: state
+            .admission
+            .config()
+            .map_or(2, |config| config.retry_after.as_secs().max(1)),
+    })
 }
 
 /// Where a chat/completions request may be re-sent when the connection to
@@ -1060,6 +1170,16 @@ async fn send_upstream(
                 )
             };
             mark_backend_unreachable(&pool, failed);
+            // The host is out of rotation either way, but a connection that
+            // failed after the request's first-token deadline is not retried
+            // elsewhere: the handler has refused it, or is about to, so the
+            // retry would only make another engine work for nobody.
+            if opts
+                .first_token_deadline
+                .is_some_and(|deadline| deadline.expired())
+            {
+                return Err(terminal_transport_error(error, opts.admission.as_ref()));
+            }
             // The failed host may have been its tier's last one: re-resolve
             // the restriction now that it is out of the rotation, so the
             // request falls back to the other tier instead of being refused.
@@ -2125,13 +2245,39 @@ impl ChoiceAssembler {
     }
 }
 
+/// How long to wait for the upstream's first SSE event before handing the
+/// stream over, when to wait at all.
+enum FirstEvent {
+    /// The bounded error peek (`VLLM_PROXY_STREAM_ERROR_PEEK_MS`). A first
+    /// token slower than this just times out and the stream goes on.
+    Peek(std::time::Duration),
+    /// Until it arrives: the request carries a first-token deadline, and this
+    /// event is what that deadline is about. The response headers are not
+    /// enough — an engine can send its 200 before it has generated anything
+    /// (vLLM does), which would satisfy a deadline with silence. Unbounded on
+    /// purpose: the handler ends this wait by dropping the future when the
+    /// deadline passes.
+    Deadline,
+}
+
+impl FirstEvent {
+    fn wait_for(opts: &ProxyOpts) -> Option<Self> {
+        if opts.first_token_deadline.is_some() {
+            return Some(Self::Deadline);
+        }
+        (opts.stream_error_peek_ms > 0)
+            .then(|| Self::Peek(std::time::Duration::from_millis(opts.stream_error_peek_ms)))
+    }
+}
+
 /// Open the upstream stream, or produce the error that must decide the
-/// response. The bounded first-event peek lives here (opt-in): an engine that
-/// rejects at admission (queue full, priority abort) still answers HTTP 200 and
-/// puts `data: {"error": …}` first; surfacing that as a real error status lets
-/// clients retry elsewhere instead of consuming a 200 that fails mid-stream. A
-/// slow first token simply times the peek out and the stream proceeds
-/// unchanged. Dropping this future drops the upstream connection with it.
+/// response. The wait for the first event lives here (see `FirstEvent`): an
+/// engine that rejects at admission (queue full, priority abort) still answers
+/// HTTP 200 and puts `data: {"error": …}` first; surfacing that as a real error
+/// status lets clients retry elsewhere instead of consuming a 200 that fails
+/// mid-stream. A slow first token simply times the peek out and the stream
+/// proceeds unchanged. Dropping this future drops the upstream connection with
+/// it.
 async fn open_upstream_stream(
     client: &reqwest::Client,
     url: &mut String,
@@ -2160,14 +2306,13 @@ async fn open_upstream_stream(
 
     let mut byte_stream = response.bytes_stream();
     let mut first_chunk: Option<Bytes> = None;
-    if opts.stream_error_peek_ms > 0 {
+    if let Some(wait) = FirstEvent::wait_for(opts) {
         use futures_util::StreamExt;
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(opts.stream_error_peek_ms),
-            byte_stream.next(),
-        )
-        .await
-        {
+        let first_event = match wait {
+            FirstEvent::Peek(bound) => tokio::time::timeout(bound, byte_stream.next()).await,
+            FirstEvent::Deadline => Ok(byte_stream.next().await),
+        };
+        match first_event {
             Ok(Some(Ok(chunk))) => {
                 if let Some(err) = first_sse_error_event(&chunk) {
                     let code = err
@@ -2281,12 +2426,29 @@ pub async fn proxy_streaming_request(
     request_body: Vec<u8>,
     mut opts: ProxyOpts,
 ) -> Result<Response, AppError> {
+    // A request under a first-token deadline is never committed early: it is
+    // either answered by the upstream within the deadline or refused, and the
+    // caller's own deadline is not extended by keep-alives anyway.
+    let deadline = opts.first_token_deadline;
+    if let Some(deadline) = deadline {
+        if deadline.expired() {
+            // Authentication and pre-dispatch validation already spent the
+            // budget: refuse without touching an engine. Dropping `opts` here
+            // releases the backend guard and the (undispatched) permit.
+            return Err(deadline.refusal());
+        }
+    }
+
     let request_sha256 = opts
         .request_hash
         .take()
         .unwrap_or_else(|| hex::encode(Sha256::digest(&request_body)));
 
-    let commit_after = opts.stream_commit_ms;
+    let commit_after = if deadline.is_some() {
+        0
+    } else {
+        opts.stream_commit_ms
+    };
     let keepalive_secs = opts.sse_keepalive_secs;
     let client = client.clone();
     let mut url = url.to_string();
@@ -2295,7 +2457,13 @@ pub async fn proxy_streaming_request(
     // Carries the upstream's verdict back while it can still become a status
     // code. Dropping the receiver is the "already committed" signal the task
     // below watches for.
-    let (start_tx, start_rx) = tokio::sync::oneshot::channel::<Result<(), AppError>>();
+    let (start_tx, mut start_rx) = tokio::sync::oneshot::channel::<Result<(), AppError>>();
+    // Set by the handler when it gives up on the first-token deadline, always
+    // before `start_rx` is dropped: the task must then drop the upstream
+    // attempt instead of reading that drop as "the response was committed"
+    // (and the dropped body channel as a client disconnect).
+    let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let task_refused = refused.clone();
 
     // Consume upstream and forward chunks. Uses select! on tx.closed() to
     // detect client disconnect while waiting for upstream data, preventing
@@ -2322,7 +2490,16 @@ pub async fn proxy_streaming_request(
             keepalive.tick().await;
             loop {
                 tokio::select! {
-                    opened = &mut open => break opened,
+                    // Biased so that a handler that is already gone is seen
+                    // before `open` is polled: a request refused on its
+                    // deadline before this task's first poll never reaches an
+                    // engine at all. The arm disables itself once committed,
+                    // so it cannot starve the others. The order settles every
+                    // tie deterministically, feature on or off: handler gone,
+                    // upstream verdict, client disconnect, keep-alive — a tick
+                    // that is ready at the same instant as a disconnect can no
+                    // longer swallow its log line and counter.
+                    biased;
                     _ = async {
                         start_tx
                             .as_mut()
@@ -2330,8 +2507,23 @@ pub async fn proxy_streaming_request(
                             .closed()
                             .await
                     }, if !committed => {
+                        if deadline_refused(&task_refused) {
+                            // The handler answered 429 on the first-token
+                            // deadline. Dropping `open` here aborts the
+                            // upstream request so the engine stops working on
+                            // it, and returning releases the backend guard
+                            // and the admission permit with `opts`. Not a
+                            // client disconnect: nothing is logged or counted.
+                            return;
+                        }
                         committed = true;
                         keepalive.reset();
+                    }
+                    opened = &mut open => break opened,
+                    _ = tx.closed(), if committed => {
+                        info!("Client disconnected before the upstream answered");
+                        metrics::counter!("stream_client_disconnects_total").increment(1);
+                        return;
                     }
                     _ = keepalive.tick(), if committed && keepalive_secs > 0 => {
                         if tx
@@ -2343,19 +2535,30 @@ pub async fn proxy_streaming_request(
                         }
                         metrics::counter!("sse_keepalive_comments_total").increment(1);
                     }
-                    _ = tx.closed(), if committed => {
-                        info!("Client disconnected before the upstream answered");
-                        metrics::counter!("stream_client_disconnects_total").increment(1);
-                        return;
-                    }
                 }
             }
         };
 
+        // The deadline can pass while the upstream is being opened, and the
+        // hand-off below is the election (see `elect_over_deadline`): a send
+        // that fails can only have failed on the channel the handler closed
+        // after setting the flag, so the load then sees it and this request is
+        // refused; a send that succeeds is picked up by the handler's own
+        // `try_recv` and the stream is served. Nothing is reported for a
+        // refused request — no usage, no late error, no disconnect. This first
+        // check is only an early exit; a return here leaves nothing sent, so
+        // the handler refuses.
+        if deadline_refused(&task_refused) {
+            return;
+        }
+
         let byte_stream = match opened {
             Ok(stream) => {
-                if let Some(sender) = start_tx.take() {
-                    let _ = sender.send(Ok(()));
+                let delivered = start_tx
+                    .take()
+                    .is_some_and(|sender| sender.send(Ok(())).is_ok());
+                if !delivered && deadline_refused(&task_refused) {
+                    return;
                 }
                 stream
             }
@@ -2368,6 +2571,9 @@ pub async fn proxy_streaming_request(
                     None => Some(err),
                 };
                 if let Some(err) = undelivered {
+                    if deadline_refused(&task_refused) {
+                        return;
+                    }
                     // Too late for a status line: the client already has a 200.
                     metrics::counter!("stream_late_upstream_errors_total").increment(1);
                     let _ = tx.send(Ok(late_error_event(err).await)).await;
@@ -2666,7 +2872,18 @@ pub async fn proxy_streaming_request(
 
     // The upstream gets `commit_after` to prove itself; past that the response
     // is committed and any failure becomes a stream event instead of a status.
-    let verdict = if commit_after > 0 {
+    // Under a first-token deadline the wait is bounded by the deadline
+    // instead: the caller's own timer is already running, and a 200 it cancels
+    // is booked against us as a timeout while a 429 is not.
+    let verdict = if let Some(deadline) = deadline {
+        match tokio::time::timeout(deadline.remaining().unwrap_or_default(), &mut start_rx).await {
+            Ok(received) => Some(received),
+            Err(_elapsed) => match elect_over_deadline(&mut start_rx, &refused) {
+                Some(verdict) => Some(Ok(verdict)),
+                None => return Err(deadline.refusal()),
+            },
+        }
+    } else if commit_after > 0 {
         match tokio::time::timeout(std::time::Duration::from_millis(commit_after), start_rx).await {
             Ok(received) => Some(received),
             Err(_elapsed) => {
@@ -3846,6 +4063,67 @@ mod tests {
         }
     }
 
+    /// The election has to be decided by the channel, not by the timer: a
+    /// verdict handed over before the close is served, anything later is not.
+    #[test]
+    fn a_verdict_sent_before_the_deadline_election_wins_it() {
+        let (start_tx, mut start_rx) = tokio::sync::oneshot::channel::<Result<(), AppError>>();
+        let refused = std::sync::atomic::AtomicBool::new(false);
+        start_tx.send(Ok(())).expect("the receiver is alive");
+
+        assert!(matches!(
+            elect_over_deadline(&mut start_rx, &refused),
+            Some(Ok(()))
+        ));
+        // The flag is set eagerly; the task only acts on it when its hand-off
+        // failed, which this one did not.
+        assert!(refused.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_refused_deadline_election_fails_every_later_hand_off() {
+        let (start_tx, mut start_rx) = tokio::sync::oneshot::channel::<Result<(), AppError>>();
+        let refused = std::sync::atomic::AtomicBool::new(false);
+
+        assert!(elect_over_deadline(&mut start_rx, &refused).is_none());
+        // Whatever the task does next it cannot deliver a verdict, and the
+        // failure is exactly where it reads the refusal.
+        assert!(start_tx.send(Ok(())).is_err());
+        assert!(refused.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn first_token_deadline_refusal_is_a_counted_429() {
+        let deadline = FirstTokenDeadline {
+            started_at: std::time::Instant::now(),
+            budget: std::time::Duration::from_millis(8_500),
+            estimated_tokens: 1_234,
+            retry_after_secs: 2,
+        };
+        assert!(deadline.remaining().is_some());
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let refusal = metrics::with_local_recorder(&recorder, || deadline.refusal());
+        assert!(
+            handle
+                .render()
+                .contains("first_token_deadline_refusals_total 1"),
+            "{}",
+            handle.render()
+        );
+
+        let response = axum::response::IntoResponse::into_response(refusal);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("2")
+        );
+    }
+
     #[test]
     fn test_build_usage_body_privacy_classify_sums_nested_input_tokens() {
         let resp = serde_json::json!({
@@ -3920,6 +4198,7 @@ mod tests {
             upstream_data_parallel_rank: None,
             admission: None,
             connect_failover: None,
+            first_token_deadline: None,
         }
     }
 

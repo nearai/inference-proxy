@@ -1009,13 +1009,26 @@ impl FirstTokenDeadline {
 /// `send` fails, and `try_recv` still returns a value sent before it. The flag
 /// is stored first so a failing `send` always observes it: the task then drops
 /// the upstream attempt instead of reading the drop as a client disconnect.
+///
+/// The flag needs its own fence: `close()` publishes with a relaxed store, so
+/// seeing the channel closed is not on its own an acquire of the store above
+/// it. Both sides fence (`deadline_refused` on the task side), which orders
+/// the two in the global `SeqCst` order whatever the target.
 fn elect_over_deadline(
     start_rx: &mut tokio::sync::oneshot::Receiver<Result<(), AppError>>,
     refused: &std::sync::atomic::AtomicBool,
 ) -> Option<Result<(), AppError>> {
     refused.store(true, std::sync::atomic::Ordering::SeqCst);
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
     start_rx.close();
     start_rx.try_recv().ok()
+}
+
+/// Whether the handler gave up on this request's first-token deadline. The
+/// fence is the other half of `elect_over_deadline`'s.
+fn deadline_refused(refused: &std::sync::atomic::AtomicBool) -> bool {
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    refused.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// The first-token deadline for a chat/completions request, or `None` when it
@@ -1145,16 +1158,7 @@ async fn send_upstream(
         .await;
     let response = match first {
         Ok(response) => response,
-        // A connection that failed after the request's first-token deadline is
-        // not retried elsewhere: the handler has refused it, or is about to,
-        // so the retry would only make another engine work for nobody.
-        Err(error)
-            if error.is_connect()
-                && opts.connect_failover.is_some()
-                && !opts
-                    .first_token_deadline
-                    .is_some_and(|deadline| deadline.expired()) =>
-        {
+        Err(error) if error.is_connect() && opts.connect_failover.is_some() => {
             let (pool, path, failed, tier, affinity) = {
                 let failover = opts.connect_failover.as_ref().expect("checked above");
                 (
@@ -1166,6 +1170,16 @@ async fn send_upstream(
                 )
             };
             mark_backend_unreachable(&pool, failed);
+            // The host is out of rotation either way, but a connection that
+            // failed after the request's first-token deadline is not retried
+            // elsewhere: the handler has refused it, or is about to, so the
+            // retry would only make another engine work for nobody.
+            if opts
+                .first_token_deadline
+                .is_some_and(|deadline| deadline.expired())
+            {
+                return Err(terminal_transport_error(error, opts.admission.as_ref()));
+            }
             // The failed host may have been its tier's last one: re-resolve
             // the restriction now that it is out of the rotation, so the
             // request falls back to the other tier instead of being refused.
@@ -2231,13 +2245,39 @@ impl ChoiceAssembler {
     }
 }
 
+/// How long to wait for the upstream's first SSE event before handing the
+/// stream over, when to wait at all.
+enum FirstEvent {
+    /// The bounded error peek (`VLLM_PROXY_STREAM_ERROR_PEEK_MS`). A first
+    /// token slower than this just times out and the stream goes on.
+    Peek(std::time::Duration),
+    /// Until it arrives: the request carries a first-token deadline, and this
+    /// event is what that deadline is about. The response headers are not
+    /// enough — an engine can send its 200 before it has generated anything
+    /// (vLLM does), which would satisfy a deadline with silence. Unbounded on
+    /// purpose: the handler ends this wait by dropping the future when the
+    /// deadline passes.
+    Deadline,
+}
+
+impl FirstEvent {
+    fn wait_for(opts: &ProxyOpts) -> Option<Self> {
+        if opts.first_token_deadline.is_some() {
+            return Some(Self::Deadline);
+        }
+        (opts.stream_error_peek_ms > 0)
+            .then(|| Self::Peek(std::time::Duration::from_millis(opts.stream_error_peek_ms)))
+    }
+}
+
 /// Open the upstream stream, or produce the error that must decide the
-/// response. The bounded first-event peek lives here (opt-in): an engine that
-/// rejects at admission (queue full, priority abort) still answers HTTP 200 and
-/// puts `data: {"error": …}` first; surfacing that as a real error status lets
-/// clients retry elsewhere instead of consuming a 200 that fails mid-stream. A
-/// slow first token simply times the peek out and the stream proceeds
-/// unchanged. Dropping this future drops the upstream connection with it.
+/// response. The wait for the first event lives here (see `FirstEvent`): an
+/// engine that rejects at admission (queue full, priority abort) still answers
+/// HTTP 200 and puts `data: {"error": …}` first; surfacing that as a real error
+/// status lets clients retry elsewhere instead of consuming a 200 that fails
+/// mid-stream. A slow first token simply times the peek out and the stream
+/// proceeds unchanged. Dropping this future drops the upstream connection with
+/// it.
 async fn open_upstream_stream(
     client: &reqwest::Client,
     url: &mut String,
@@ -2266,14 +2306,13 @@ async fn open_upstream_stream(
 
     let mut byte_stream = response.bytes_stream();
     let mut first_chunk: Option<Bytes> = None;
-    if opts.stream_error_peek_ms > 0 {
+    if let Some(wait) = FirstEvent::wait_for(opts) {
         use futures_util::StreamExt;
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(opts.stream_error_peek_ms),
-            byte_stream.next(),
-        )
-        .await
-        {
+        let first_event = match wait {
+            FirstEvent::Peek(bound) => tokio::time::timeout(bound, byte_stream.next()).await,
+            FirstEvent::Deadline => Ok(byte_stream.next().await),
+        };
+        match first_event {
             Ok(Some(Ok(chunk))) => {
                 if let Some(err) = first_sse_error_event(&chunk) {
                     let code = err
@@ -2455,7 +2494,11 @@ pub async fn proxy_streaming_request(
                     // before `open` is polled: a request refused on its
                     // deadline before this task's first poll never reaches an
                     // engine at all. The arm disables itself once committed,
-                    // so it cannot starve the others.
+                    // so it cannot starve the others. The order settles every
+                    // tie deterministically, feature on or off: handler gone,
+                    // upstream verdict, client disconnect, keep-alive — a tick
+                    // that is ready at the same instant as a disconnect can no
+                    // longer swallow its log line and counter.
                     biased;
                     _ = async {
                         start_tx
@@ -2464,7 +2507,7 @@ pub async fn proxy_streaming_request(
                             .closed()
                             .await
                     }, if !committed => {
-                        if task_refused.load(std::sync::atomic::Ordering::SeqCst) {
+                        if deadline_refused(&task_refused) {
                             // The handler answered 429 on the first-token
                             // deadline. Dropping `open` here aborts the
                             // upstream request so the engine stops working on
@@ -2477,6 +2520,11 @@ pub async fn proxy_streaming_request(
                         keepalive.reset();
                     }
                     opened = &mut open => break opened,
+                    _ = tx.closed(), if committed => {
+                        info!("Client disconnected before the upstream answered");
+                        metrics::counter!("stream_client_disconnects_total").increment(1);
+                        return;
+                    }
                     _ = keepalive.tick(), if committed && keepalive_secs > 0 => {
                         if tx
                             .send(Ok(Bytes::from_static(SSE_KEEPALIVE_COMMENT)))
@@ -2486,11 +2534,6 @@ pub async fn proxy_streaming_request(
                             return;
                         }
                         metrics::counter!("sse_keepalive_comments_total").increment(1);
-                    }
-                    _ = tx.closed(), if committed => {
-                        info!("Client disconnected before the upstream answered");
-                        metrics::counter!("stream_client_disconnects_total").increment(1);
-                        return;
                     }
                 }
             }
@@ -2505,7 +2548,7 @@ pub async fn proxy_streaming_request(
         // refused request — no usage, no late error, no disconnect. This first
         // check is only an early exit; a return here leaves nothing sent, so
         // the handler refuses.
-        if task_refused.load(std::sync::atomic::Ordering::SeqCst) {
+        if deadline_refused(&task_refused) {
             return;
         }
 
@@ -2514,7 +2557,7 @@ pub async fn proxy_streaming_request(
                 let delivered = start_tx
                     .take()
                     .is_some_and(|sender| sender.send(Ok(())).is_ok());
-                if !delivered && task_refused.load(std::sync::atomic::Ordering::SeqCst) {
+                if !delivered && deadline_refused(&task_refused) {
                     return;
                 }
                 stream
@@ -2528,7 +2571,7 @@ pub async fn proxy_streaming_request(
                     None => Some(err),
                 };
                 if let Some(err) = undelivered {
-                    if task_refused.load(std::sync::atomic::Ordering::SeqCst) {
+                    if deadline_refused(&task_refused) {
                         return;
                     }
                     // Too late for a status line: the client already has a 200.

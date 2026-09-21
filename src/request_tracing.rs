@@ -157,8 +157,10 @@ pub struct RequestStart(pub std::time::Instant);
 
 impl RequestStart {
     /// The arrival instant a handler extracted, or now when the extension is
-    /// missing: a router mounted without this middleware still serves its
-    /// requests, it just has no earlier clock origin to offer them.
+    /// missing. The fallback is taken at dispatch, so the only thing it
+    /// guarantees is that a missing start instant cannot shorten a budget
+    /// measured from it — it does not make a route work without this
+    /// middleware, which the handlers still need for their tracing IDs.
     pub fn or_now(extracted: Option<axum::Extension<Self>>) -> std::time::Instant {
         extracted.map_or_else(std::time::Instant::now, |axum::Extension(start)| start.0)
     }

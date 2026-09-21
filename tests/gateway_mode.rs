@@ -2572,6 +2572,46 @@ async fn spawn_never_answering_backend() -> NeverAnsweringBackend {
     }
 }
 
+/// Backend that answers its `200 text/event-stream` headers at once and sends
+/// its first SSE event only `delay` later — what an engine that opens the
+/// stream before it has generated anything looks like on the wire (vLLM), and
+/// what defeats a deadline measured on the response headers alone.
+async fn spawn_late_first_event_backend(delay: Duration) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut request = [0_u8; 8192];
+                let _ = socket.read(&mut request).await;
+                // Headers now, body later: the two are separate writes, so the
+                // gateway sees the 200 long before the first event.
+                if socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+                    )
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::time::sleep(delay).await;
+                let chunked = format!(
+                    "{:X}\r\n{}\r\n0\r\n\r\n",
+                    ONE_TOKEN_STREAM.len(),
+                    ONE_TOKEN_STREAM
+                );
+                let _ = socket.write_all(chunked.as_bytes()).await;
+            });
+        }
+    });
+    (format!("http://{addr}"), handle)
+}
+
 /// A prompt long enough to be estimated at about 1,000 tokens (bytes / 4).
 fn long_stream_request() -> Request<Body> {
     chat_request(serde_json::json!({
@@ -2752,6 +2792,74 @@ async fn a_deadline_above_the_cap_keeps_the_commit_window() {
     let frames = stream_frames(response).await;
     assert!(frames.iter().any(|f| f == ": keep-alive\n\n"), "{frames:?}");
     assert!(frames.concat().contains("\"content\":\"hi\""), "{frames:?}");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn early_headers_do_not_satisfy_the_deadline() {
+    // The deadline is about the first generated event, not the status line.
+    for peek_ms in [0, 1_000] {
+        let (backend, handle) = spawn_late_first_event_backend(Duration::from_millis(2500)).await;
+        let app = build_gateway(
+            &backend,
+            GatewayOptions {
+                first_token_deadline_ms: 400,
+                stream_error_peek_ms: peek_ms,
+                ..Default::default()
+            },
+        );
+
+        let started = std::time::Instant::now();
+        let response = app.oneshot(stream_request()).await.unwrap();
+        let answered = started.elapsed();
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "peek {peek_ms}: the 200 headers arrived at once, the event did not"
+        );
+        assert!(
+            answered < Duration::from_millis(1500),
+            "peek {peek_ms}: refused after {answered:?}, expected the deadline"
+        );
+        handle.abort();
+    }
+}
+
+#[tokio::test]
+async fn a_first_event_inside_the_deadline_is_delivered_once() {
+    let (backend, handle) = spawn_late_first_event_backend(Duration::from_millis(200)).await;
+    let app = build_gateway(
+        &backend,
+        GatewayOptions {
+            first_token_deadline_ms: 3_000,
+            ..Default::default()
+        },
+    );
+
+    let response = app.oneshot(stream_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let joined = stream_frames(response).await.concat();
+    // Re-attached exactly once, and the stream is complete.
+    assert_eq!(joined.matches("\"content\":\"hi\"").count(), 1, "{joined}");
+    assert!(joined.ends_with("data: [DONE]\n\n"), "{joined}");
+    handle.abort();
+}
+
+/// Control for the two tests above: without a deadline the headers alone do
+/// end the wait, which is exactly what made them defeat it.
+#[tokio::test]
+async fn without_a_deadline_early_headers_commit_the_stream_at_once() {
+    let (backend, handle) = spawn_late_first_event_backend(Duration::from_millis(2500)).await;
+    let app = build_gateway(&backend, GatewayOptions::default());
+
+    let started = std::time::Instant::now();
+    let response = app.oneshot(stream_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "expected the status on the headers, took {:?}",
+        started.elapsed()
+    );
     handle.abort();
 }
 

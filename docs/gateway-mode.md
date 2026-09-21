@@ -230,12 +230,17 @@ Details worth knowing:
   request covered by a deadline can never be one of the slow samples that trip
   the admission breaker (it still counts as a sample): past that point the
   breaker only reacts to the requests the cap exempts.
-- What is being timed is the upstream's *verdict* — its response headers plus
-  the bounded first-event peek — which is the first generated chunk only
-  because engines send the headers together with that event. A hop between the
-  gateway and the engine that commits a 200 of its own before the engine has
-  answered (an in-CVM proxy with its own `VLLM_PROXY_STREAM_COMMIT_MS`) would
-  satisfy the verdict immediately and make the deadline unreachable.
+- What is timed is the upstream's first SSE *event*, not its status line. A
+  request under a deadline waits for that event whatever
+  `VLLM_PROXY_STREAM_ERROR_PEEK_MS` says, including when it is unset: an engine
+  can send its `200` before it has generated anything (vLLM does), and the
+  headers alone would then satisfy the deadline with silence. A side effect is
+  that these requests always get the first-event error check, peek or no peek.
+  What can still satisfy a deadline without a token is a hop that writes
+  something of its own first — an in-CVM proxy that both commits early and
+  sends `: keep-alive` comments, since a comment is an event on the wire. Leave
+  `VLLM_PROXY_SSE_KEEPALIVE_SECS` off on the hosts behind a gateway, as CVMs do
+  by default.
 - The deadline reads the same input estimate as the long-context tier
   (`context_tier.rs`), and that estimate is computed even when the tier is off.
 - Counter `first_token_deadline_refusals_total`, plus one info line per refusal

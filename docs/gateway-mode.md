@@ -86,6 +86,9 @@ to the current in-CVM behavior.
 | `VLLM_PROXY_MAP_QUEUE_FULL_TO_429` | `1` | The engine's admission rejection (queue full, or a queued request displaced by a higher-priority one) becomes 429 with `Retry-After: 2` and type `overloaded`, the same shape as the gateway's own refusals: back-pressure, not an outage. Off in CVMs: cloud-api's peer fallback keys on the 503. |
 | `VLLM_PROXY_STREAM_ERROR_PEEK_MS` | `1000` | Streams wait up to 1 s for the first upstream event; an admission-time `data: {"error":…}` becomes a real 429/5xx instead of a 200 that fails mid-stream. A slow first token just times the peek out. |
 | `VLLM_PROXY_STREAM_COMMIT_MS` | `5000` | Commit the stream's `200 text/event-stream` after 5 s even if the engine has not answered, so the keep-alives above actually reach the client during a long prefill (see below). |
+| `VLLM_PROXY_FIRST_TOKEN_DEADLINE_MS` | `8500` | Refuse a streaming request with 429 + `Retry-After` when the engine has not produced its first event this long after the request arrived, instead of committing a 200 the caller is about to cancel (see below). `0`/unset = off. |
+| `VLLM_PROXY_FIRST_TOKEN_DEADLINE_PER_1K_TOKENS_MS` | `800` | Added to that deadline per 1,000 estimated prompt tokens, because the caller's own deadline grows with the prompt too. Same estimate as the long-context tier. |
+| `VLLM_PROXY_FIRST_TOKEN_DEADLINE_MAX_MS` | `30000` | Requests whose computed deadline is above this are exempt: they keep the commit window and the keep-alives. `0`/unset = no cap, every streaming request gets a deadline. |
 | `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` / `_START_INFLIGHT` | `48` / `48` | The lane's in-flight budget: refuse with 429 + `Retry-After` before dispatch instead of queueing (see below). Set start equal to maximum for separately reviewed rollout stages; optional ramp settings remain available. |
 | `VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS` | `30000` | Refuse new work while, over the last minute, at least 20 lane requests reached the engine and 5 % of them (at least two) waited longer than this for their first generation event. |
 | `VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS` | `10` | A backend that rejected at engine admission within this window is steered around; when every healthy backend did, new work is refused. |
@@ -173,6 +176,64 @@ it follows the tokenization of a very large prompt: a context-length 400 on a
 actually produces, and keep it at `0` (the default, and every in-CVM
 deployment) where the status must always come from the upstream. Counter
 `stream_committed_before_upstream_total` says how often the window fires.
+
+### First-token deadline
+
+Committing the 200 keeps the connection, but it does not buy unlimited time: an
+aggregator in front of the gateway runs its own deadline on the provider's first
+token and cancels when it passes. Measured on the production lane on 2026-09-21
+(header-only capture on the gateway's loopback port, 67 cancelled requests,
+robust fit, 62 of them within ±1.5 s of the line):
+
+```text
+cancelled after ≈ 9.75 s + 0.242 s per KiB of request body   (≈ 10 s + 1 ms per prompt token)
+```
+
+Three things came out of the same capture. The deadline follows the prompt's
+*token* count, not its bytes: bodies that were large only because of a base64
+image were cancelled at 12-13 s, not at the minutes their size would imply. The
+keep-alive comments do not extend it — every cancelled request that had already
+received `: keep-alive` comments was cancelled on the same line (8 of 8). And
+the cancel is expensive for us: on our side it is a `200` with a zero-byte body
+(committed on the window, client gone before the first upstream event, logged as
+"Client disconnected before the upstream answered"), while the aggregator books
+it as a gateway timeout against the provider. Those cancels were ~97 % of what
+it reported as our 5xx over 24 h (3,735 of 3,838), a period in which the gateway
+and the TLS terminator in front of it returned no 502 or 504 at all.
+
+A 429 is not counted against a provider the way a timeout is, and the
+aggregator's own guidance is to "return early 429s if under load, rather than
+queueing". So `VLLM_PROXY_FIRST_TOKEN_DEADLINE_MS` (plus
+`_PER_1K_TOKENS_MS` × the estimated prompt) sets a deadline just under the
+caller's, and a streaming request whose engine has not said anything by then
+gets `429` + `Retry-After` and type `overloaded` instead of a committed 200.
+The end user loses nothing: the aggregator fails over to another provider
+immediately rather than one or two seconds later.
+
+Details worth knowing:
+
+- The clock starts when the request *arrives*, not when it is dispatched:
+  authentication (a cloud-api round trip, sometimes retried) and pre-dispatch
+  validation count against it. A request whose budget is already spent when it
+  reaches dispatch is refused without asking an engine.
+- A request under a deadline is never committed early — `VLLM_PROXY_STREAM_COMMIT_MS`
+  does not apply to it, and no keep-alives are sent before the engine answers,
+  since they would not move the caller's deadline anyway. Requests exempted by
+  `_MAX_MS` keep the commit window and the keep-alives exactly as above.
+- On a refusal the in-flight upstream request is dropped, so the CVM proxy and
+  the engine abort it instead of generating for a client that is gone; the
+  backend connection count and the admission slot are released with it, and the
+  wait is recorded as a censored time-to-first-token sample. A client that
+  disconnects on its own before the deadline is still handled as a disconnect.
+- The deadline reads the same input estimate as the long-context tier
+  (`context_tier.rs`), and that estimate is computed even when the tier is off.
+- Counter `first_token_deadline_refusals_total`, plus one info line per refusal
+  ("First-token deadline passed, refusing") with the deadline, the wait and the
+  estimated prompt size — numbers only.
+
+Why first tokens are late in the first place is an engine-side scheduling
+question (short requests queued behind a long chunked prefill on the same
+replica); the deadline only decides what the caller is told meanwhile.
 
 ## Admission budget
 

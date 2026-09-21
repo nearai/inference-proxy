@@ -15,13 +15,14 @@ use crate::proxy::{
     self, make_usage_reporter, ConnectFailover, ProxyOpts, ResponseShape, UsageType,
 };
 use crate::{agent_loop, fusion};
-use crate::{AppState, TracingIds};
+use crate::{AppState, RequestStart, TracingIds};
 
 /// POST /v1/chat/completions
 pub async fn chat_completions(
     State(state): State<AppState>,
     auth: RequireAuth,
     Extension(tracing_ids): Extension<TracingIds>,
+    Extension(request_start): Extension<RequestStart>,
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
@@ -84,6 +85,11 @@ pub async fn chat_completions(
         &request_json,
         &state.config.rejected_content_part_types,
     )?;
+    // The input estimate, walked once: the long-context tier and the
+    // first-token deadline both read it, and either can be on alone.
+    let estimate = (state.config.long_context_above_tokens > 0
+        || state.config.first_token_deadline_ms > 0)
+        .then(|| crate::context_tier::chat_estimate(&request_json));
     // Long-context tier (gateway mode): a request whose estimated input is
     // above the threshold belongs on the long-context backends, and every
     // candidate selection below is restricted to its tier. `None` when the
@@ -91,7 +97,7 @@ pub async fn chat_completions(
     let tier = crate::context_tier::decide(
         &state.backend_pool,
         state.config.long_context_above_tokens,
-        || crate::context_tier::chat_estimate(&request_json),
+        || estimate.expect("estimated whenever the tier decision is on"),
     );
     // Lane admission (gateway mode), first half: the overload and budget
     // checks, so a request the lane cannot take is refused before any image
@@ -314,6 +320,15 @@ pub async fn chat_completions(
         upstream_data_parallel_rank,
         admission: permit,
         connect_failover,
+        // Gateway mode: refuse instead of committing a 200 the caller is
+        // about to cancel. The clock started when the request arrived, so
+        // authentication and the validation above count against it.
+        first_token_deadline: proxy::first_token_deadline(
+            &state,
+            request_start.0,
+            estimate,
+            is_stream,
+        ),
     };
 
     if is_stream {

@@ -312,6 +312,21 @@ pub struct Config {
     /// the commit is delivered as a terminal SSE `error` event instead of a
     /// status code, so set this above the slowest error a deployment produces.
     pub stream_commit_ms: u64,
+    /// Refuse a streaming request with 429 + `Retry-After` when the upstream
+    /// has not answered this many milliseconds after the request arrived
+    /// (`VLLM_PROXY_FIRST_TOKEN_DEADLINE_MS`, 0 = off, the default). An
+    /// aggregator in front of the gateway cancels a silent provider on its own
+    /// deadline and books the cancel as our timeout; a 429 just under that
+    /// deadline is back-pressure instead, and it fails over just as fast.
+    pub first_token_deadline_ms: u64,
+    /// Added to the deadline per 1,000 estimated prompt tokens
+    /// (`VLLM_PROXY_FIRST_TOKEN_DEADLINE_PER_1K_TOKENS_MS`, default 0): the
+    /// aggregator's deadline grows with the prompt, so ours has to as well.
+    pub first_token_deadline_per_1k_tokens_ms: u64,
+    /// Requests whose computed deadline is above this are not subject to one
+    /// and keep the commit window and keep-alives
+    /// (`VLLM_PROXY_FIRST_TOKEN_DEADLINE_MAX_MS`, 0 = no cap).
+    pub first_token_deadline_max_ms: u64,
     /// Chat content part `type`s refused with 400 before dispatch
     /// (`VLLM_PROXY_REJECTED_CONTENT_PART_TYPES`, e.g. `video_url,input_audio,file`).
     pub rejected_content_part_types: Vec<String>,
@@ -776,6 +791,28 @@ impl Config {
             );
         }
 
+        // First-token deadline: the slope and the cap only mean something
+        // together with the base, and a cap below the base would exempt every
+        // request.
+        let first_token_deadline_ms: u64 = env_parse("VLLM_PROXY_FIRST_TOKEN_DEADLINE_MS", 0)?;
+        let first_token_deadline_per_1k_tokens_ms: u64 =
+            env_parse("VLLM_PROXY_FIRST_TOKEN_DEADLINE_PER_1K_TOKENS_MS", 0)?;
+        let first_token_deadline_max_ms: u64 =
+            env_parse("VLLM_PROXY_FIRST_TOKEN_DEADLINE_MAX_MS", 0)?;
+        if first_token_deadline_ms == 0
+            && (first_token_deadline_per_1k_tokens_ms > 0 || first_token_deadline_max_ms > 0)
+        {
+            anyhow::bail!(
+                "VLLM_PROXY_FIRST_TOKEN_DEADLINE_PER_1K_TOKENS_MS and VLLM_PROXY_FIRST_TOKEN_DEADLINE_MAX_MS require VLLM_PROXY_FIRST_TOKEN_DEADLINE_MS"
+            );
+        }
+        if first_token_deadline_max_ms > 0 && first_token_deadline_max_ms < first_token_deadline_ms
+        {
+            anyhow::bail!(
+                "VLLM_PROXY_FIRST_TOKEN_DEADLINE_MAX_MS must be at least VLLM_PROXY_FIRST_TOKEN_DEADLINE_MS, or no request would ever have a deadline"
+            );
+        }
+
         let config = Config {
             model_name,
             tokens,
@@ -858,6 +895,9 @@ impl Config {
             map_queue_full_to_429: env_bool("VLLM_PROXY_MAP_QUEUE_FULL_TO_429"),
             stream_error_peek_ms: env_int("VLLM_PROXY_STREAM_ERROR_PEEK_MS", 0) as u64,
             stream_commit_ms: env_int("VLLM_PROXY_STREAM_COMMIT_MS", 0) as u64,
+            first_token_deadline_ms,
+            first_token_deadline_per_1k_tokens_ms,
+            first_token_deadline_max_ms,
             rejected_content_part_types,
             models_document_url,
             capacity_requests_per_minute,
@@ -1044,6 +1084,28 @@ impl Config {
         })
     }
 
+    /// How long a streaming request of this estimated prompt size may go
+    /// without an upstream answer before it is refused. `None` when the
+    /// feature is off, and when the computed deadline is above
+    /// `first_token_deadline_max_ms`: those requests keep the commit window.
+    pub fn first_token_deadline(
+        &self,
+        estimated_prompt_tokens: u64,
+    ) -> Option<std::time::Duration> {
+        if self.first_token_deadline_ms == 0 {
+            return None;
+        }
+        let deadline_ms = self.first_token_deadline_ms.saturating_add(
+            self.first_token_deadline_per_1k_tokens_ms
+                .saturating_mul(estimated_prompt_tokens)
+                / 1_000,
+        );
+        if self.first_token_deadline_max_ms > 0 && deadline_ms > self.first_token_deadline_max_ms {
+            return None;
+        }
+        Some(std::time::Duration::from_millis(deadline_ms))
+    }
+
     /// Build the runtime config for pre-dispatch image validation.
     pub fn image_validation(&self) -> crate::image_validation::ImageValidationConfig {
         crate::image_validation::ImageValidationConfig {
@@ -1158,6 +1220,9 @@ mod tests {
             "VLLM_PROXY_REJECTED_CONTENT_PART_TYPES",
             "VLLM_PROXY_ALLOWED_ORG_IDS",
             "VLLM_PROXY_SSE_KEEPALIVE_SECS",
+            "VLLM_PROXY_FIRST_TOKEN_DEADLINE_MS",
+            "VLLM_PROXY_FIRST_TOKEN_DEADLINE_PER_1K_TOKENS_MS",
+            "VLLM_PROXY_FIRST_TOKEN_DEADLINE_MAX_MS",
             "VLLM_PROXY_ADMISSION_TIER_BORROWING",
             "VLLM_PROXY_ADMISSION_LONG_MAX_INFLIGHT_PER_HOST",
             "VLLM_PROXY_ADMISSION_MAX_INFLIGHT",
@@ -1192,6 +1257,8 @@ mod tests {
             assert!(!config.map_queue_full_to_429);
             assert_eq!(config.stream_error_peek_ms, 0);
             assert_eq!(config.stream_commit_ms, 0);
+            assert_eq!(config.first_token_deadline_ms, 0);
+            assert!(config.first_token_deadline(1_000).is_none());
             assert!(config.rejected_content_part_types.is_empty());
             assert!(config.allowed_org_ids.is_empty());
             assert_eq!(config.sse_keepalive_secs, 0);
@@ -1204,6 +1271,66 @@ mod tests {
             assert!(config.pool_probe_urls().is_empty());
             assert_eq!(config.long_context_above_tokens, 0);
             assert_eq!(config.backend_urls, vec!["http://localhost:8000"]);
+        });
+    }
+
+    #[test]
+    fn test_first_token_deadline_grows_with_the_prompt_and_exempts_above_the_cap() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            gateway_env_cleanup();
+            env::set_var("VLLM_PROXY_FIRST_TOKEN_DEADLINE_MS", "8500");
+            // Base only: every request gets the same deadline.
+            let config = Config::from_env().unwrap();
+            let ms = |tokens| config.first_token_deadline(tokens).map(|d| d.as_millis());
+            assert_eq!(ms(0), Some(8_500));
+            assert_eq!(ms(200_000), Some(8_500));
+
+            // With the slope: 0.8 ms per estimated prompt token.
+            env::set_var("VLLM_PROXY_FIRST_TOKEN_DEADLINE_PER_1K_TOKENS_MS", "800");
+            let config = Config::from_env().unwrap();
+            let ms = |tokens| config.first_token_deadline(tokens).map(|d| d.as_millis());
+            assert_eq!(ms(0), Some(8_500));
+            assert_eq!(ms(1_000), Some(9_300));
+            assert_eq!(ms(26_875), Some(30_000));
+            // No cap: a 200k-token prompt still gets a deadline, a long one.
+            assert_eq!(ms(200_000), Some(168_500));
+
+            // With the cap: above it a request keeps today's behavior.
+            env::set_var("VLLM_PROXY_FIRST_TOKEN_DEADLINE_MAX_MS", "30000");
+            let config = Config::from_env().unwrap();
+            let ms = |tokens| config.first_token_deadline(tokens).map(|d| d.as_millis());
+            assert_eq!(ms(26_875), Some(30_000), "exactly the cap still counts");
+            assert_eq!(ms(40_000), None);
+            assert_eq!(ms(200_000), None);
+            gateway_env_cleanup();
+        });
+    }
+
+    #[test]
+    fn test_first_token_deadline_slope_and_cap_are_validated() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            gateway_env_cleanup();
+            // A slope or a cap on its own would do nothing.
+            for orphan in [
+                "VLLM_PROXY_FIRST_TOKEN_DEADLINE_PER_1K_TOKENS_MS",
+                "VLLM_PROXY_FIRST_TOKEN_DEADLINE_MAX_MS",
+            ] {
+                env::set_var(orphan, "800");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("VLLM_PROXY_FIRST_TOKEN_DEADLINE_MS"), "{err}");
+                env::remove_var(orphan);
+            }
+            // A cap below the base would exempt every request.
+            env::set_var("VLLM_PROXY_FIRST_TOKEN_DEADLINE_MS", "8500");
+            env::set_var("VLLM_PROXY_FIRST_TOKEN_DEADLINE_MAX_MS", "8000");
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(
+                err.contains("VLLM_PROXY_FIRST_TOKEN_DEADLINE_MAX_MS"),
+                "{err}"
+            );
+            env::set_var("VLLM_PROXY_FIRST_TOKEN_DEADLINE_MAX_MS", "8500");
+            assert!(Config::from_env().is_ok());
+            gateway_env_cleanup();
         });
     }
 

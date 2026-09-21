@@ -1515,6 +1515,7 @@ async fn finish_response(
         upstream_data_parallel_rank: None,
         admission: None,
         connect_failover: None,
+        first_token_deadline: None,
     };
 
     if ctx.is_stream {

@@ -947,6 +947,78 @@ pub struct ProxyOpts {
     /// Retry once on another healthy backend when the connection to the
     /// chosen one fails before anything was sent (`VLLM_BACKEND_CONNECT_FAILOVER`).
     pub connect_failover: Option<ConnectFailover>,
+    /// Deadline for the upstream's first event (gateway mode,
+    /// `VLLM_PROXY_FIRST_TOKEN_DEADLINE_MS`). `Some` replaces the commit
+    /// window for this streaming request: the handler waits for the upstream
+    /// verdict until the deadline and refuses with 429 rather than commit a
+    /// 200 the caller is about to cancel. `None` everywhere else.
+    pub first_token_deadline: Option<FirstTokenDeadline>,
+}
+
+/// A streaming request's first-token deadline, built once per request by the
+/// route (`proxy::first_token_deadline`).
+#[derive(Clone, Copy, Debug)]
+pub struct FirstTokenDeadline {
+    /// Arrival at the proxy, so authentication and pre-dispatch validation
+    /// count against the deadline (`RequestStart`). A connection fail-over
+    /// does not restart it: the caller's clock does not restart either.
+    pub started_at: std::time::Instant,
+    /// The computed budget: base + slope × estimated prompt tokens.
+    pub budget: std::time::Duration,
+    /// The estimate the budget was computed from, for the refusal log line.
+    pub estimated_tokens: u64,
+    /// `Retry-After` value on the refusal.
+    pub retry_after_secs: u64,
+}
+
+impl FirstTokenDeadline {
+    /// What is left of the budget, or `None` once it has passed.
+    fn remaining(&self) -> Option<std::time::Duration> {
+        self.budget.checked_sub(self.started_at.elapsed())
+    }
+
+    /// The 429 the caller gets instead of a 200 it would have cancelled.
+    fn refusal(&self) -> AppError {
+        metrics::counter!("first_token_deadline_refusals_total").increment(1);
+        info!(
+            deadline_ms = self.budget.as_millis() as u64,
+            waited_ms = self.started_at.elapsed().as_millis() as u64,
+            estimated_tokens = self.estimated_tokens,
+            "First-token deadline passed, refusing"
+        );
+        AppError::Overloaded {
+            reason: "first_token_deadline",
+            retry_after_secs: self.retry_after_secs,
+        }
+    }
+}
+
+/// The first-token deadline for a chat/completions request, or `None` when it
+/// does not get one: the feature is off, the request is not a stream, or its
+/// computed deadline is above the cap (those keep the commit window and the
+/// keep-alives). `estimate` is the request's input estimate, already computed
+/// for the tier decision.
+pub fn first_token_deadline(
+    state: &AppState,
+    started_at: std::time::Instant,
+    estimate: Option<crate::context_tier::Estimate>,
+    is_stream: bool,
+) -> Option<FirstTokenDeadline> {
+    if !is_stream {
+        return None;
+    }
+    let estimated_tokens = estimate?.tokens();
+    Some(FirstTokenDeadline {
+        started_at,
+        budget: state.config.first_token_deadline(estimated_tokens)?,
+        estimated_tokens,
+        // Same wait the lane's own refusals advertise; the engine's queue
+        // drains in seconds.
+        retry_after_secs: state
+            .admission
+            .config()
+            .map_or(2, |config| config.retry_after.as_secs().max(1)),
+    })
 }
 
 /// Where a chat/completions request may be re-sent when the connection to
@@ -2281,12 +2353,29 @@ pub async fn proxy_streaming_request(
     request_body: Vec<u8>,
     mut opts: ProxyOpts,
 ) -> Result<Response, AppError> {
+    // A request under a first-token deadline is never committed early: it is
+    // either answered by the upstream within the deadline or refused, and the
+    // caller's own deadline is not extended by keep-alives anyway.
+    let deadline = opts.first_token_deadline;
+    if let Some(deadline) = deadline {
+        if deadline.remaining().is_none() {
+            // Authentication and pre-dispatch validation already spent the
+            // budget: refuse without touching an engine. Dropping `opts` here
+            // releases the backend guard and the (undispatched) permit.
+            return Err(deadline.refusal());
+        }
+    }
+
     let request_sha256 = opts
         .request_hash
         .take()
         .unwrap_or_else(|| hex::encode(Sha256::digest(&request_body)));
 
-    let commit_after = opts.stream_commit_ms;
+    let commit_after = if deadline.is_some() {
+        0
+    } else {
+        opts.stream_commit_ms
+    };
     let keepalive_secs = opts.sse_keepalive_secs;
     let client = client.clone();
     let mut url = url.to_string();
@@ -2295,7 +2384,13 @@ pub async fn proxy_streaming_request(
     // Carries the upstream's verdict back while it can still become a status
     // code. Dropping the receiver is the "already committed" signal the task
     // below watches for.
-    let (start_tx, start_rx) = tokio::sync::oneshot::channel::<Result<(), AppError>>();
+    let (start_tx, mut start_rx) = tokio::sync::oneshot::channel::<Result<(), AppError>>();
+    // Set by the handler when it gives up on the first-token deadline, always
+    // before `start_rx` is dropped: the task must then drop the upstream
+    // attempt instead of reading that drop as "the response was committed"
+    // (and the dropped body channel as a client disconnect).
+    let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let task_refused = refused.clone();
 
     // Consume upstream and forward chunks. Uses select! on tx.closed() to
     // detect client disconnect while waiting for upstream data, preventing
@@ -2330,6 +2425,15 @@ pub async fn proxy_streaming_request(
                             .closed()
                             .await
                     }, if !committed => {
+                        if task_refused.load(std::sync::atomic::Ordering::SeqCst) {
+                            // The handler answered 429 on the first-token
+                            // deadline. Dropping `open` here aborts the
+                            // upstream request so the engine stops working on
+                            // it, and returning releases the backend guard
+                            // and the admission permit with `opts`. Not a
+                            // client disconnect: nothing is logged or counted.
+                            return;
+                        }
                         committed = true;
                         keepalive.reset();
                     }
@@ -2351,6 +2455,12 @@ pub async fn proxy_streaming_request(
                 }
             }
         };
+
+        // The deadline may have passed while the upstream was answering:
+        // whatever it said, the client already has its 429.
+        if task_refused.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
 
         let byte_stream = match opened {
             Ok(stream) => {
@@ -2666,7 +2776,21 @@ pub async fn proxy_streaming_request(
 
     // The upstream gets `commit_after` to prove itself; past that the response
     // is committed and any failure becomes a stream event instead of a status.
-    let verdict = if commit_after > 0 {
+    // Under a first-token deadline the wait is bounded by the deadline
+    // instead: the caller's own timer is already running, and a 200 it cancels
+    // is booked against us as a timeout while a 429 is not.
+    let verdict = if let Some(deadline) = deadline {
+        match tokio::time::timeout(deadline.remaining().unwrap_or_default(), &mut start_rx).await {
+            Ok(received) => Some(received),
+            Err(_elapsed) => {
+                // Order matters: the task reads the flag when the receiver it
+                // is watching goes away, which is what `drop` below does.
+                refused.store(true, std::sync::atomic::Ordering::SeqCst);
+                drop(start_rx);
+                return Err(deadline.refusal());
+            }
+        }
+    } else if commit_after > 0 {
         match tokio::time::timeout(std::time::Duration::from_millis(commit_after), start_rx).await {
             Ok(received) => Some(received),
             Err(_elapsed) => {
@@ -3847,6 +3971,38 @@ mod tests {
     }
 
     #[test]
+    fn first_token_deadline_refusal_is_a_counted_429() {
+        let deadline = FirstTokenDeadline {
+            started_at: std::time::Instant::now(),
+            budget: std::time::Duration::from_millis(8_500),
+            estimated_tokens: 1_234,
+            retry_after_secs: 2,
+        };
+        assert!(deadline.remaining().is_some());
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let refusal = metrics::with_local_recorder(&recorder, || deadline.refusal());
+        assert!(
+            handle
+                .render()
+                .contains("first_token_deadline_refusals_total 1"),
+            "{}",
+            handle.render()
+        );
+
+        let response = axum::response::IntoResponse::into_response(refusal);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("2")
+        );
+    }
+
+    #[test]
     fn test_build_usage_body_privacy_classify_sums_nested_input_tokens() {
         let resp = serde_json::json!({
             "data": [
@@ -3920,6 +4076,7 @@ mod tests {
             upstream_data_parallel_rank: None,
             admission: None,
             connect_failover: None,
+            first_token_deadline: None,
         }
     }
 

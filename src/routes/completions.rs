@@ -13,13 +13,14 @@ use crate::proxy::{
     self, make_usage_reporter, ConnectFailover, ProxyOpts, ResponseShape, UsageType,
 };
 use crate::routes::chat::{read_body_with_limit, resolve_request_hash_for_signing};
-use crate::{AppState, TracingIds};
+use crate::{AppState, RequestStart, TracingIds};
 
 /// POST /v1/completions
 pub async fn completions(
     State(state): State<AppState>,
     auth: RequireAuth,
     Extension(tracing_ids): Extension<TracingIds>,
+    Extension(request_start): Extension<RequestStart>,
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
@@ -98,10 +99,14 @@ pub async fn completions(
 
     // Long-context tier and lane admission (gateway mode), see the chat
     // route. Token ids in `prompt` are counted exactly; text is estimated.
+    // The estimate is walked once and also sizes the first-token deadline.
+    let estimate = (state.config.long_context_above_tokens > 0
+        || state.config.first_token_deadline_ms > 0)
+        .then(|| crate::context_tier::completion_estimate(&request_json));
     let tier = crate::context_tier::decide(
         &state.backend_pool,
         state.config.long_context_above_tokens,
-        || crate::context_tier::completion_estimate(&request_json),
+        || estimate.expect("estimated whenever the tier decision is on"),
     );
     let permit = state.admission.try_admit(&state.backend_pool, tier)?;
     let limits = state.admission.backend_limits(&state.backend_pool);
@@ -169,6 +174,13 @@ pub async fn completions(
         upstream_data_parallel_rank: None,
         admission: permit,
         connect_failover,
+        // See the chat route: the clock started when the request arrived.
+        first_token_deadline: proxy::first_token_deadline(
+            &state,
+            request_start.0,
+            estimate,
+            is_stream,
+        ),
     };
 
     if is_stream {

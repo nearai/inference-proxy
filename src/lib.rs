@@ -31,7 +31,7 @@ pub mod tool_calls;
 pub mod types;
 pub mod vllm_dp_affinity;
 
-pub use request_tracing::{request_id_middleware, TracingIds};
+pub use request_tracing::{request_id_middleware, RequestStart, TracingIds};
 
 /// Shared application state available to all handlers.
 #[derive(Clone)]

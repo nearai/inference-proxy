@@ -148,11 +148,22 @@ impl TracingIds {
     }
 }
 
-/// Request ID middleware: parses tracing correlation headers, stores them in
-/// the request extensions for handlers, attaches them to the tracing span so
-/// every log line carries them, and echoes `X-Request-Id` back to the caller.
+/// When the request reached the proxy, put in the request extensions by
+/// `request_id_middleware`. A deadline that has to cover authentication (a
+/// cloud-api round trip, sometimes retried) and pre-dispatch validation reads
+/// its clock origin here instead of starting it in the route handler.
+#[derive(Clone, Copy, Debug)]
+pub struct RequestStart(pub std::time::Instant);
+
+/// Request ID middleware: parses tracing correlation headers, stores them and
+/// the arrival instant in the request extensions for handlers, attaches the
+/// IDs to the tracing span so every log line carries them, and echoes
+/// `X-Request-Id` back to the caller.
 pub async fn request_id_middleware(mut request: Request<axum::body::Body>, next: Next) -> Response {
     let tracing_ids = TracingIds::from_headers(request.headers());
+    request
+        .extensions_mut()
+        .insert(RequestStart(std::time::Instant::now()));
 
     let method = request.method().to_string();
     let path = request.uri().path().to_string();

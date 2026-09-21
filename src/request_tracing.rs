@@ -155,6 +155,15 @@ impl TracingIds {
 #[derive(Clone, Copy, Debug)]
 pub struct RequestStart(pub std::time::Instant);
 
+impl RequestStart {
+    /// The arrival instant a handler extracted, or now when the extension is
+    /// missing: a router mounted without this middleware still serves its
+    /// requests, it just has no earlier clock origin to offer them.
+    pub fn or_now(extracted: Option<axum::Extension<Self>>) -> std::time::Instant {
+        extracted.map_or_else(std::time::Instant::now, |axum::Extension(start)| start.0)
+    }
+}
+
 /// Request ID middleware: parses tracing correlation headers, stores them and
 /// the arrival instant in the request extensions for handlers, attaches the
 /// IDs to the tracing span so every log line carries them, and echoes

@@ -977,6 +977,10 @@ impl FirstTokenDeadline {
         self.budget.checked_sub(self.started_at.elapsed())
     }
 
+    fn expired(&self) -> bool {
+        self.remaining().is_none()
+    }
+
     /// The 429 the caller gets instead of a 200 it would have cancelled.
     fn refusal(&self) -> AppError {
         metrics::counter!("first_token_deadline_refusals_total").increment(1);
@@ -991,6 +995,27 @@ impl FirstTokenDeadline {
             retry_after_secs: self.retry_after_secs,
         }
     }
+}
+
+/// Settle a first-token deadline that has just passed against a verdict the
+/// streaming task may be handing over at that very moment, and say which one
+/// won: `Some(verdict)` means the upstream did (the task is past its hand-off
+/// and already pumping the stream, so the request is served), `None` means the
+/// request is refused.
+///
+/// The closing of the channel is what makes the election atomic — the timeout
+/// alone is not enough, because the task's `send` can still succeed between
+/// the receiver's last poll and the handler giving up. After `close()` every
+/// `send` fails, and `try_recv` still returns a value sent before it. The flag
+/// is stored first so a failing `send` always observes it: the task then drops
+/// the upstream attempt instead of reading the drop as a client disconnect.
+fn elect_over_deadline(
+    start_rx: &mut tokio::sync::oneshot::Receiver<Result<(), AppError>>,
+    refused: &std::sync::atomic::AtomicBool,
+) -> Option<Result<(), AppError>> {
+    refused.store(true, std::sync::atomic::Ordering::SeqCst);
+    start_rx.close();
+    start_rx.try_recv().ok()
 }
 
 /// The first-token deadline for a chat/completions request, or `None` when it
@@ -1120,7 +1145,16 @@ async fn send_upstream(
         .await;
     let response = match first {
         Ok(response) => response,
-        Err(error) if error.is_connect() && opts.connect_failover.is_some() => {
+        // A connection that failed after the request's first-token deadline is
+        // not retried elsewhere: the handler has refused it, or is about to,
+        // so the retry would only make another engine work for nobody.
+        Err(error)
+            if error.is_connect()
+                && opts.connect_failover.is_some()
+                && !opts
+                    .first_token_deadline
+                    .is_some_and(|deadline| deadline.expired()) =>
+        {
             let (pool, path, failed, tier, affinity) = {
                 let failover = opts.connect_failover.as_ref().expect("checked above");
                 (
@@ -2358,7 +2392,7 @@ pub async fn proxy_streaming_request(
     // caller's own deadline is not extended by keep-alives anyway.
     let deadline = opts.first_token_deadline;
     if let Some(deadline) = deadline {
-        if deadline.remaining().is_none() {
+        if deadline.expired() {
             // Authentication and pre-dispatch validation already spent the
             // budget: refuse without touching an engine. Dropping `opts` here
             // releases the backend guard and the (undispatched) permit.
@@ -2417,7 +2451,12 @@ pub async fn proxy_streaming_request(
             keepalive.tick().await;
             loop {
                 tokio::select! {
-                    opened = &mut open => break opened,
+                    // Biased so that a handler that is already gone is seen
+                    // before `open` is polled: a request refused on its
+                    // deadline before this task's first poll never reaches an
+                    // engine at all. The arm disables itself once committed,
+                    // so it cannot starve the others.
+                    biased;
                     _ = async {
                         start_tx
                             .as_mut()
@@ -2437,6 +2476,7 @@ pub async fn proxy_streaming_request(
                         committed = true;
                         keepalive.reset();
                     }
+                    opened = &mut open => break opened,
                     _ = keepalive.tick(), if committed && keepalive_secs > 0 => {
                         if tx
                             .send(Ok(Bytes::from_static(SSE_KEEPALIVE_COMMENT)))
@@ -2456,16 +2496,26 @@ pub async fn proxy_streaming_request(
             }
         };
 
-        // The deadline may have passed while the upstream was answering:
-        // whatever it said, the client already has its 429.
+        // The deadline can pass while the upstream is being opened, and the
+        // hand-off below is the election (see `elect_over_deadline`): a send
+        // that fails can only have failed on the channel the handler closed
+        // after setting the flag, so the load then sees it and this request is
+        // refused; a send that succeeds is picked up by the handler's own
+        // `try_recv` and the stream is served. Nothing is reported for a
+        // refused request — no usage, no late error, no disconnect. This first
+        // check is only an early exit; a return here leaves nothing sent, so
+        // the handler refuses.
         if task_refused.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
 
         let byte_stream = match opened {
             Ok(stream) => {
-                if let Some(sender) = start_tx.take() {
-                    let _ = sender.send(Ok(()));
+                let delivered = start_tx
+                    .take()
+                    .is_some_and(|sender| sender.send(Ok(())).is_ok());
+                if !delivered && task_refused.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
                 }
                 stream
             }
@@ -2478,6 +2528,9 @@ pub async fn proxy_streaming_request(
                     None => Some(err),
                 };
                 if let Some(err) = undelivered {
+                    if task_refused.load(std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
                     // Too late for a status line: the client already has a 200.
                     metrics::counter!("stream_late_upstream_errors_total").increment(1);
                     let _ = tx.send(Ok(late_error_event(err).await)).await;
@@ -2782,13 +2835,10 @@ pub async fn proxy_streaming_request(
     let verdict = if let Some(deadline) = deadline {
         match tokio::time::timeout(deadline.remaining().unwrap_or_default(), &mut start_rx).await {
             Ok(received) => Some(received),
-            Err(_elapsed) => {
-                // Order matters: the task reads the flag when the receiver it
-                // is watching goes away, which is what `drop` below does.
-                refused.store(true, std::sync::atomic::Ordering::SeqCst);
-                drop(start_rx);
-                return Err(deadline.refusal());
-            }
+            Err(_elapsed) => match elect_over_deadline(&mut start_rx, &refused) {
+                Some(verdict) => Some(Ok(verdict)),
+                None => return Err(deadline.refusal()),
+            },
         }
     } else if commit_after > 0 {
         match tokio::time::timeout(std::time::Duration::from_millis(commit_after), start_rx).await {
@@ -3968,6 +4018,35 @@ mod tests {
             );
             assert_eq!(body["id"], "id-3");
         }
+    }
+
+    /// The election has to be decided by the channel, not by the timer: a
+    /// verdict handed over before the close is served, anything later is not.
+    #[test]
+    fn a_verdict_sent_before_the_deadline_election_wins_it() {
+        let (start_tx, mut start_rx) = tokio::sync::oneshot::channel::<Result<(), AppError>>();
+        let refused = std::sync::atomic::AtomicBool::new(false);
+        start_tx.send(Ok(())).expect("the receiver is alive");
+
+        assert!(matches!(
+            elect_over_deadline(&mut start_rx, &refused),
+            Some(Ok(()))
+        ));
+        // The flag is set eagerly; the task only acts on it when its hand-off
+        // failed, which this one did not.
+        assert!(refused.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_refused_deadline_election_fails_every_later_hand_off() {
+        let (start_tx, mut start_rx) = tokio::sync::oneshot::channel::<Result<(), AppError>>();
+        let refused = std::sync::atomic::AtomicBool::new(false);
+
+        assert!(elect_over_deadline(&mut start_rx, &refused).is_none());
+        // Whatever the task does next it cannot deliver a verdict, and the
+        // failure is exactly where it reads the refusal.
+        assert!(start_tx.send(Ok(())).is_err());
+        assert!(refused.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

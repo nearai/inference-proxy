@@ -2513,19 +2513,33 @@ async fn without_a_commit_window_a_slow_upstream_still_decides_the_status() {
 // First-token deadline
 // ---------------------------------------------------------------------------
 
-/// Backend that never answers inside a test's lifetime and reports when its
-/// handler future is dropped — which here only happens when the gateway hangs
-/// up on the in-flight request.
-async fn spawn_never_answering_backend() -> (
-    String,
-    tokio::sync::mpsc::UnboundedReceiver<()>,
-    tokio::task::JoinHandle<()>,
-) {
+/// Backend that never answers inside a test's lifetime, reporting when it
+/// accepts a request and when its handler future is dropped — which here only
+/// happens when the gateway hangs up on the in-flight request.
+struct NeverAnsweringBackend {
+    url: String,
+    arrivals: tokio::sync::mpsc::UnboundedReceiver<()>,
+    hang_ups: tokio::sync::mpsc::UnboundedReceiver<()>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl NeverAnsweringBackend {
+    async fn wait(what: &str, signal: &mut tokio::sync::mpsc::UnboundedReceiver<()>) {
+        tokio::time::timeout(Duration::from_secs(5), signal.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the backend never reported {what}"))
+            .expect("the reporting channel stays open");
+    }
+}
+
+async fn spawn_never_answering_backend() -> NeverAnsweringBackend {
     use axum::routing::post;
+    let (arrived, arrivals) = tokio::sync::mpsc::unbounded_channel();
     let (hung_up, hang_ups) = tokio::sync::mpsc::unbounded_channel();
     let app = axum::Router::new().route(
         "/v1/chat/completions",
         post(move || {
+            let arrived = arrived.clone();
             let hung_up = hung_up.clone();
             async move {
                 struct ReportOnDrop(tokio::sync::mpsc::UnboundedSender<()>);
@@ -2535,6 +2549,7 @@ async fn spawn_never_answering_backend() -> (
                     }
                 }
                 let _report = ReportOnDrop(hung_up);
+                let _ = arrived.send(());
                 tokio::time::sleep(Duration::from_secs(300)).await;
                 axum::response::Response::builder()
                     .status(200)
@@ -2549,7 +2564,12 @@ async fn spawn_never_answering_backend() -> (
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    (format!("http://{addr}"), hang_ups, handle)
+    NeverAnsweringBackend {
+        url: format!("http://{addr}"),
+        arrivals,
+        hang_ups,
+        handle,
+    }
 }
 
 /// A prompt long enough to be estimated at about 1,000 tokens (bytes / 4).
@@ -2578,6 +2598,7 @@ async fn a_missed_first_token_deadline_is_a_429_instead_of_a_committed_200() {
             // window never fires for it.
             stream_commit_ms: 300,
             sse_keepalive_secs: 1,
+            stream_error_peek_ms: 1_000,
             ..Default::default()
         },
     );
@@ -2606,9 +2627,9 @@ async fn a_missed_first_token_deadline_is_a_429_instead_of_a_committed_200() {
 
 #[tokio::test]
 async fn a_deadline_refusal_drops_the_upstream_and_releases_the_admission_slot() {
-    let (backend, mut hang_ups, handle) = spawn_never_answering_backend().await;
+    let mut backend = spawn_never_answering_backend().await;
     let app = build_gateway(
-        &backend,
+        &backend.url,
         GatewayOptions {
             first_token_deadline_ms: 400,
             admission_max_inflight: 1,
@@ -2621,10 +2642,8 @@ async fn a_deadline_refusal_drops_the_upstream_and_releases_the_admission_slot()
 
     // The engine is not left generating for nobody: the upstream request is
     // dropped, which closes the connection the backend is serving.
-    tokio::time::timeout(Duration::from_secs(5), hang_ups.recv())
-        .await
-        .expect("the backend should see the gateway hang up")
-        .expect("the reporting channel stays open");
+    NeverAnsweringBackend::wait("the request", &mut backend.arrivals).await;
+    NeverAnsweringBackend::wait("a hang-up", &mut backend.hang_ups).await;
 
     // And the budget slot came back: with a budget of one, the next request is
     // admitted and waits for its own deadline instead of being refused on the
@@ -2636,7 +2655,7 @@ async fn a_deadline_refusal_drops_the_upstream_and_releases_the_admission_slot()
         started.elapsed() >= Duration::from_millis(350),
         "the second request was refused by admission, not by its deadline"
     );
-    handle.abort();
+    backend.handle.abort();
 }
 
 #[tokio::test]
@@ -2652,6 +2671,7 @@ async fn a_first_token_inside_the_deadline_streams_as_usual() {
         &backend,
         GatewayOptions {
             first_token_deadline_ms: 2_000,
+            stream_error_peek_ms: 1_000,
             ..Default::default()
         },
     );
@@ -2714,6 +2734,11 @@ async fn a_deadline_above_the_cap_keeps_the_commit_window() {
             ..Default::default()
         },
     );
+
+    // The control, same backend: a short prompt stays under the cap, so its
+    // 300 ms deadline applies and the 2.5 s engine misses it.
+    let response = app.clone().oneshot(stream_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
 
     // ~1,000 estimated tokens → a 4.3 s deadline, above the cap: no deadline,
     // so this request is committed on the window and kept alive as before.
@@ -2782,35 +2807,31 @@ async fn a_deadline_spent_before_dispatch_refuses_without_asking_an_engine() {
 
 #[tokio::test]
 async fn a_client_that_disconnects_before_the_deadline_is_still_a_disconnect() {
-    let (backend, mut hang_ups, handle) = spawn_never_answering_backend().await;
+    let mut backend = spawn_never_answering_backend().await;
     let app = build_gateway(
-        &backend,
+        &backend.url,
         GatewayOptions {
             first_token_deadline_ms: 5_000,
             ..Default::default()
         },
     );
 
-    // The client goes away while the request is still well inside its
-    // deadline. The disconnect ends the request there and then — the upstream
-    // is dropped immediately, not held until the deadline would have fired.
-    // (Which of the two paths logged it is not visible from here.)
-    let waiting = tokio::time::timeout(Duration::from_millis(300), app.oneshot(stream_request()));
-    assert!(
-        waiting.await.is_err(),
-        "the request should still be waiting"
-    );
+    // Wait until the engine actually holds the request, then let the client go
+    // away — still well inside the 5 s deadline. The disconnect ends the
+    // request there and then: the upstream is dropped at once instead of being
+    // held until the deadline would have fired. (Which of the two paths logged
+    // it is not visible from here.)
+    let waiting = tokio::spawn(async move { app.oneshot(stream_request()).await });
+    NeverAnsweringBackend::wait("the request", &mut backend.arrivals).await;
+    waiting.abort();
 
     let gone = std::time::Instant::now();
-    tokio::time::timeout(Duration::from_secs(2), hang_ups.recv())
-        .await
-        .expect("the backend should see the gateway hang up")
-        .expect("the reporting channel stays open");
+    NeverAnsweringBackend::wait("a hang-up", &mut backend.hang_ups).await;
     assert!(
         gone.elapsed() < Duration::from_secs(2),
         "the upstream outlived the client disconnect"
     );
-    handle.abort();
+    backend.handle.abort();
 }
 
 // Four real HTTP stubs hold streams until the test explicitly ends them.

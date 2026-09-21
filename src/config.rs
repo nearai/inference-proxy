@@ -1095,11 +1095,16 @@ impl Config {
         if self.first_token_deadline_ms == 0 {
             return None;
         }
-        let deadline_ms = self.first_token_deadline_ms.saturating_add(
-            self.first_token_deadline_per_1k_tokens_ms
-                .saturating_mul(estimated_prompt_tokens)
-                / 1_000,
-        );
+        // In u128 so the slope is divided before anything can saturate: a
+        // saturating multiply would flatten every large prompt onto the same
+        // deadline.
+        let deadline_ms = u64::try_from(
+            u128::from(self.first_token_deadline_ms)
+                + u128::from(self.first_token_deadline_per_1k_tokens_ms)
+                    * u128::from(estimated_prompt_tokens)
+                    / 1_000,
+        )
+        .unwrap_or(u64::MAX);
         if self.first_token_deadline_max_ms > 0 && deadline_ms > self.first_token_deadline_max_ms {
             return None;
         }
@@ -1294,6 +1299,17 @@ mod tests {
             assert_eq!(ms(26_875), Some(30_000));
             // No cap: a 200k-token prompt still gets a deadline, a long one.
             assert_eq!(ms(200_000), Some(168_500));
+
+            // The slope is applied before anything can overflow, so even an
+            // absurd one keeps ordering prompts by size instead of flattening
+            // them onto the same deadline.
+            env::set_var(
+                "VLLM_PROXY_FIRST_TOKEN_DEADLINE_PER_1K_TOKENS_MS",
+                u64::MAX.to_string(),
+            );
+            let config = Config::from_env().unwrap();
+            assert!(config.first_token_deadline(1) < config.first_token_deadline(2));
+            env::set_var("VLLM_PROXY_FIRST_TOKEN_DEADLINE_PER_1K_TOKENS_MS", "800");
 
             // With the cap: above it a request keeps today's behavior.
             env::set_var("VLLM_PROXY_FIRST_TOKEN_DEADLINE_MAX_MS", "30000");

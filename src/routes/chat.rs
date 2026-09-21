@@ -22,7 +22,7 @@ pub async fn chat_completions(
     State(state): State<AppState>,
     auth: RequireAuth,
     Extension(tracing_ids): Extension<TracingIds>,
-    Extension(request_start): Extension<RequestStart>,
+    request_start: Option<Extension<RequestStart>>,
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
@@ -85,10 +85,14 @@ pub async fn chat_completions(
         &request_json,
         &state.config.rejected_content_part_types,
     )?;
-    // The input estimate, walked once: the long-context tier and the
-    // first-token deadline both read it, and either can be on alone.
-    let estimate = (state.config.long_context_above_tokens > 0
-        || state.config.first_token_deadline_ms > 0)
+    let is_stream = request_json
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // The input estimate the long-context tier routes on. Not free — it
+    // re-serializes the tool definitions and the tool calls in the history —
+    // so it is walked at most once per request and only where it is read.
+    let estimate = (state.config.long_context_above_tokens > 0)
         .then(|| crate::context_tier::chat_estimate(&request_json));
     // Long-context tier (gateway mode): a request whose estimated input is
     // above the threshold belongs on the long-context backends, and every
@@ -97,7 +101,7 @@ pub async fn chat_completions(
     let tier = crate::context_tier::decide(
         &state.backend_pool,
         state.config.long_context_above_tokens,
-        || estimate.expect("estimated whenever the tier decision is on"),
+        || estimate.unwrap_or_else(|| crate::context_tier::chat_estimate(&request_json)),
     );
     // Lane admission (gateway mode), first half: the overload and budget
     // checks, so a request the lane cannot take is refused before any image
@@ -112,11 +116,6 @@ pub async fn chat_completions(
 
     crate::image_validation::reject_invalid_images(&request_json, &state.config.image_validation())
         .await?;
-
-    let is_stream = request_json
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
 
     if state.config.fusion_enabled && fusion::has_fusion_tool(&request_json) {
         let depth = fusion::trusted_request_depth(&headers, &state);
@@ -222,6 +221,14 @@ pub async fn chat_completions(
         request_json["stream_options"] = serde_json::Value::Object(stream_opts);
     }
 
+    // The first-token deadline is sized by the same estimate, and needs it
+    // only here: on the normal proxy path, for streams, when the feature is
+    // on. Fusion and the agent loop returned above without paying for it.
+    let estimate = estimate.or_else(|| {
+        (is_stream && state.config.first_token_deadline_ms > 0)
+            .then(|| crate::context_tier::chat_estimate(&request_json))
+    });
+
     let upstream_data_parallel_rank = state
         .vllm_dp_affinity
         .rank_for_chat_request(&request_json, &state.config.model_name);
@@ -325,7 +332,7 @@ pub async fn chat_completions(
         // authentication and the validation above count against it.
         first_token_deadline: proxy::first_token_deadline(
             &state,
-            request_start.0,
+            RequestStart::or_now(request_start),
             estimate,
             is_stream,
         ),

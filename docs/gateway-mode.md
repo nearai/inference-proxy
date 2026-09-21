@@ -225,6 +225,17 @@ Details worth knowing:
   backend connection count and the admission slot are released with it, and the
   wait is recorded as a censored time-to-first-token sample. A client that
   disconnects on its own before the deadline is still handled as a disconnect.
+- That censored sample is by construction shorter than the request's deadline,
+  so with `_MAX_MS` at or below `VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS` a
+  request covered by a deadline can never be one of the slow samples that trip
+  the admission breaker (it still counts as a sample): past that point the
+  breaker only reacts to the requests the cap exempts.
+- What is being timed is the upstream's *verdict* — its response headers plus
+  the bounded first-event peek — which is the first generated chunk only
+  because engines send the headers together with that event. A hop between the
+  gateway and the engine that commits a 200 of its own before the engine has
+  answered (an in-CVM proxy with its own `VLLM_PROXY_STREAM_COMMIT_MS`) would
+  satisfy the verdict immediately and make the deadline unreachable.
 - The deadline reads the same input estimate as the long-context tier
   (`context_tier.rs`), and that estimate is computed even when the tier is off.
 - Counter `first_token_deadline_refusals_total`, plus one info line per refusal

@@ -40,8 +40,10 @@ pub enum AppError {
     #[error("rate limit exceeded")]
     RateLimited,
 
-    /// Refused at lane admission (`admission.rs`): 429 with `Retry-After`,
-    /// before anything was sent upstream.
+    /// Refused rather than queued: 429 with `Retry-After`. Lane admission
+    /// (`admission.rs`) refuses before anything is sent upstream; a missed
+    /// first-token deadline (`proxy.rs`) refuses a request that was already
+    /// dispatched, dropping the upstream attempt with it.
     #[error("overloaded ({reason})")]
     Overloaded {
         reason: &'static str,

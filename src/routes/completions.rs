@@ -20,7 +20,7 @@ pub async fn completions(
     State(state): State<AppState>,
     auth: RequireAuth,
     Extension(tracing_ids): Extension<TracingIds>,
-    Extension(request_start): Extension<RequestStart>,
+    request_start: Option<Extension<RequestStart>>,
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
@@ -99,14 +99,15 @@ pub async fn completions(
 
     // Long-context tier and lane admission (gateway mode), see the chat
     // route. Token ids in `prompt` are counted exactly; text is estimated.
-    // The estimate is walked once and also sizes the first-token deadline.
+    // The estimate is walked at most once and also sizes the first-token
+    // deadline, which only streaming requests get.
     let estimate = (state.config.long_context_above_tokens > 0
-        || state.config.first_token_deadline_ms > 0)
+        || (is_stream && state.config.first_token_deadline_ms > 0))
         .then(|| crate::context_tier::completion_estimate(&request_json));
     let tier = crate::context_tier::decide(
         &state.backend_pool,
         state.config.long_context_above_tokens,
-        || estimate.expect("estimated whenever the tier decision is on"),
+        || estimate.unwrap_or_else(|| crate::context_tier::completion_estimate(&request_json)),
     );
     let permit = state.admission.try_admit(&state.backend_pool, tier)?;
     let limits = state.admission.backend_limits(&state.backend_pool);
@@ -177,7 +178,7 @@ pub async fn completions(
         // See the chat route: the clock started when the request arrived.
         first_token_deadline: proxy::first_token_deadline(
             &state,
-            request_start.0,
+            RequestStart::or_now(request_start),
             estimate,
             is_stream,
         ),

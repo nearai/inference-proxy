@@ -1,5 +1,6 @@
 pub mod attestation;
 pub mod chat;
+mod completion_placement;
 pub mod completions;
 pub mod health;
 pub mod internal;

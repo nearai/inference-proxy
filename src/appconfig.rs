@@ -327,9 +327,23 @@ async fn reconcile_once(
     });
     metrics::gauge!("appconfig_active_max_inflight").set(f64::from(fetched.policy.max_inflight));
     match outcome {
-        crate::admission::PolicyApplyOutcome::Unchanged
-        | crate::admission::PolicyApplyOutcome::MetadataUpdated => {
+        crate::admission::PolicyApplyOutcome::Unchanged => {
             metrics::counter!("appconfig_fetch_total", "outcome" => "unchanged").increment(1);
+        }
+        crate::admission::PolicyApplyOutcome::MetadataUpdated => {
+            metrics::counter!("appconfig_fetch_total", "outcome" => "unchanged").increment(1);
+            info!(
+                application = %source.settings.application,
+                environment = %source.settings.environment,
+                profile = %source.settings.profile,
+                target = %source.settings.target,
+                configuration_version = %fetched.configuration_version,
+                content_sha256 = %digest_hex,
+                max_inflight = fetched.policy.max_inflight,
+                backpressure_secs = fetched.policy.backpressure_ttl.as_secs(),
+                retry_after_secs = fetched.policy.retry_after.as_secs(),
+                "Advanced AppConfig admission policy source metadata"
+            );
         }
         crate::admission::PolicyApplyOutcome::Applied => {
             metrics::counter!("appconfig_fetch_total", "outcome" => "applied").increment(1);

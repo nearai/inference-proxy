@@ -1,0 +1,57 @@
+services:
+  appconfig-agent:
+    image: public.ecr.aws/aws-appconfig/aws-appconfig-agent@sha256:532da31adf639752ac919f703c6e0de3d82142132422e348624680b6156c1769
+    environment:
+      LOCAL_DEVELOPMENT_DIRECTORY: /configs
+      HTTP_HOST: all
+      POLL_INTERVAL: 1
+      PREFETCH_LIST: test-application:test-environment:test-profile
+    volumes:
+      - ./configs:/configs:ro
+
+  mock-engine:
+    image: python:3.13-slim
+    command: ["python3", "/test/mock_engine.py"]
+    volumes:
+      - ./:/test:ro
+    ports:
+      - "127.0.0.1:18001:8001"
+
+  proxy:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    environment:
+      DEV: "1"
+      GPU_NO_HW_MODE: "1"
+      NON_TEE_DEPLOYMENT: "1"
+      MODEL_NAME: test-model
+      TOKEN: test-token
+      VLLM_BASE_URL: http://mock-engine:8001
+      VLLM_BACKEND_URLS: http://mock-engine:8001
+      VLLM_PROXY_MODELS_DOCUMENT_URL: http://mock-engine:8001/v1/models
+      VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE: "150"
+      VLLM_PROXY_ADMISSION_MAX_INFLIGHT: "1"
+      VLLM_PROXY_ADMISSION_START_INFLIGHT: "1"
+      VLLM_PROXY_ADMISSION_RAMP_STEP: "1"
+      VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS: "3600"
+      VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS: "0"
+      VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS: "10"
+      VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS: "2"
+      AWS_APPCONFIG_APPLICATION: test-application
+      AWS_APPCONFIG_ENVIRONMENT: test-environment
+      AWS_APPCONFIG_PROFILE: test-profile
+      AWS_APPCONFIG_TARGET: test-target
+      AWS_APPCONFIG_AGENT_URL: http://appconfig-agent:2772
+      AWS_APPCONFIG_REFRESH_SECS: "1"
+      LISTEN_ADDR: 0.0.0.0
+      LISTEN_PORT: "8000"
+      LOG_FORMAT: json
+      RUST_LOG: info
+    depends_on:
+      appconfig-agent:
+        condition: service_started
+      mock-engine:
+        condition: service_started
+    ports:
+      - "127.0.0.1:18000:8000"

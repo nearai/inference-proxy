@@ -13,6 +13,20 @@
 //! `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` is placed on the long-context
 //! backends, everything else on the base ones.
 //!
+//! By default an empty tier is not a hard failure: `restriction` and
+//! `recheck_restriction` lift the restriction and the request runs on the
+//! other tier instead, since both run the same engine with the same context
+//! length. `VLLM_BACKEND_TIER_STRICT` (bool, default off) turns that off for
+//! deployments that isolate the tiers on purpose — the OpenRouter lane keeps
+//! a 300k-token prefill off the base fleet's short-request hosts, and keeps
+//! short requests off the long host when the base fleet is down, rather than
+//! trading one kind of head-of-line blocking for the other. Strict mode pins
+//! the restriction even once the tier is empty; callers refuse the request
+//! instead (`RejectReason::TierUnavailable` in `admission.rs`, or a 503 with
+//! `error_type: "tier_unavailable"` when admission is off). Only meaningful
+//! with a long-context tier configured; set without one, it is ignored (a
+//! startup warning says so).
+//!
 //! The estimate mirrors the one cloud-api routes with,
 //! `inference_provider_pool::context_routing::estimate_input` plus the
 //! `required` computation in `inference_provider_pool/mod.rs`:
@@ -194,16 +208,19 @@ pub struct TierDecision {
     /// the prefill takes tens of seconds on either tier.
     pub estimated: ContextTier,
     /// The tier candidate selection is restricted to — placement, connection
-    /// fail-over and the fleet-wide saturation checks — or `None` once that
-    /// tier has no healthy backend.
+    /// fail-over and the fleet-wide saturation checks. `None` once that tier
+    /// has no healthy backend and restriction lifts (non-strict); in strict
+    /// mode this is always `Some(estimated)`, even on an empty tier, and the
+    /// caller refuses the request instead of widening the search.
     pub restrict: Option<ContextTier>,
 }
 
 /// Decide a request's tier. `None` when the feature is off; nothing is
-/// estimated then.
+/// estimated then. `strict` is `Config::backend_tier_strict`.
 pub fn decide(
     pool: &BackendPool,
     above_tokens: u64,
+    strict: bool,
     estimate: impl FnOnce() -> Estimate,
 ) -> Option<TierDecision> {
     if above_tokens == 0 {
@@ -211,18 +228,26 @@ pub fn decide(
     }
     let estimate = estimate();
     let estimated = estimate.tier(above_tokens);
-    let restrict = restriction(pool, estimated);
+    let restrict = restriction(pool, estimated, strict);
+    // `restrict` alone cannot tell empty from full any more once strict mode
+    // pins it either way, so the metric is computed straight off the pool.
+    let empty = pool.healthy_count_in(Some(estimated)) == 0;
+    let outcome = match (empty, strict) {
+        (false, _) => "routed",
+        (true, true) => "refused",
+        (true, false) => "fallback",
+    };
     metrics::histogram!("request_estimated_prompt_tokens").record(estimate.tokens() as f64);
     metrics::counter!(
         "backend_tier_requests_total",
         "tier" => estimated.as_str(),
-        "outcome" => if restrict.is_some() { "routed" } else { "fallback" }
+        "outcome" => outcome
     )
     .increment(1);
     debug!(
         estimated_tokens = estimate.tokens(),
         tier = estimated.as_str(),
-        fallback = restrict.is_none(),
+        outcome,
         "Context tier decided"
     );
     Some(TierDecision {
@@ -233,18 +258,31 @@ pub fn decide(
 
 /// The restriction to apply: `tier` while it still has a healthy backend,
 /// `None` once it has none — an empty tier falls back to the other one rather
-/// than refusing, since both run the same engine.
-pub fn restriction(pool: &BackendPool, tier: ContextTier) -> Option<ContextTier> {
+/// than refusing, since both run the same engine. In strict mode the
+/// restriction never lifts: always `Some(tier)`, whether or not it currently
+/// has a healthy backend, so an empty tier is a refusal rather than a spill
+/// onto the other one (see the module docs).
+pub fn restriction(pool: &BackendPool, tier: ContextTier, strict: bool) -> Option<ContextTier> {
+    if strict {
+        return Some(tier);
+    }
     (pool.healthy_count_in(Some(tier)) > 0).then_some(tier)
 }
 
 /// The same, re-resolved after the pool may have changed under a request that
 /// was already routed: a connection fail-over marks a host unreachable, or a
-/// placement loses the race with one. A tier that emptied in the meantime is
-/// counted as `fallback_late`, apart from the one outcome `decide` records
-/// per request.
-pub fn recheck_restriction(pool: &BackendPool, tier: ContextTier) -> Option<ContextTier> {
-    let restrict = restriction(pool, tier);
+/// placement loses the race with one. Non-strict: a tier that emptied in the
+/// meantime is counted as `fallback_late`, apart from the one outcome
+/// `decide` records per request, and the restriction lifts. Strict: the
+/// restriction never lifts, so this never fires and the caller (placement,
+/// connection fail-over) is left to refuse once it finds the pinned tier has
+/// no eligible backend.
+pub fn recheck_restriction(
+    pool: &BackendPool,
+    tier: ContextTier,
+    strict: bool,
+) -> Option<ContextTier> {
+    let restrict = restriction(pool, tier, strict);
     if restrict.is_none() {
         metrics::counter!(
             "backend_tier_requests_total",
@@ -375,7 +413,7 @@ mod tests {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
-            decide(&pool, 100_000, || Estimate {
+            decide(&pool, 100_000, false, || Estimate {
                 text: 1_000_000,
                 ..Estimate::default()
             })
@@ -412,24 +450,86 @@ mod tests {
                 restrict,
             })
         };
-        assert_eq!(decide(&pool, 0, || panic!("not estimated when off")), None);
         assert_eq!(
-            decide(&pool, 100_000, huge),
+            decide(&pool, 0, false, || panic!("not estimated when off")),
+            None
+        );
+        assert_eq!(
+            decide(&pool, 100_000, false, huge),
             decided(ContextTier::Long, Some(ContextTier::Long))
         );
         // The long tier is down: place it on the base fleet rather than
         // refuse, but the request stays a long one for the breaker.
         health(1, false);
         assert_eq!(
-            decide(&pool, 100_000, huge),
+            decide(&pool, 100_000, false, huge),
             decided(ContextTier::Long, None)
         );
         // And the other way around.
         health(1, true);
         health(0, false);
         assert_eq!(
-            decide(&pool, 100_000, Estimate::default),
+            decide(&pool, 100_000, false, Estimate::default),
             decided(ContextTier::Base, None)
         );
+    }
+
+    #[test]
+    fn strict_mode_never_lifts_the_restriction_and_counts_refused() {
+        let pool = BackendPool::with_long_context(
+            vec!["http://base:8000".to_string()],
+            vec!["http://long:8000".to_string()],
+        );
+        pool.backends()[1]
+            .healthy
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let huge = || Estimate {
+            text: 1_000_000,
+            ..Estimate::default()
+        };
+        // Non-strict would lift this to `None` (see `the_empty_tier_fallback_is_counted`);
+        // strict keeps the request pinned to its empty tier so the caller
+        // refuses it instead of spilling onto the base fleet.
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let decision =
+            metrics::with_local_recorder(&recorder, || decide(&pool, 100_000, true, huge));
+        assert_eq!(
+            decision,
+            Some(TierDecision {
+                estimated: ContextTier::Long,
+                restrict: Some(ContextTier::Long),
+            })
+        );
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("backend_tier_requests_total{tier=\"long\",outcome=\"refused\"} 1"),
+            "{rendered}"
+        );
+        // A tier that does have a healthy backend is unaffected by strict mode.
+        pool.backends()[1]
+            .healthy
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            decide(&pool, 100_000, true, huge),
+            Some(TierDecision {
+                estimated: ContextTier::Long,
+                restrict: Some(ContextTier::Long),
+            })
+        );
+        // `restriction`/`recheck_restriction` never lift in strict mode, even
+        // for a tier that never had a backend at all.
+        pool.backends()[1]
+            .healthy
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            restriction(&pool, ContextTier::Long, true),
+            Some(ContextTier::Long)
+        );
+        assert_eq!(
+            recheck_restriction(&pool, ContextTier::Long, true),
+            Some(ContextTier::Long)
+        );
+        assert_eq!(restriction(&pool, ContextTier::Long, false), None);
     }
 }

@@ -192,6 +192,21 @@ impl From<crate::admission::Rejected> for AppError {
     }
 }
 
+impl AppError {
+    /// Strict context tiers (`VLLM_BACKEND_TIER_STRICT`, `context_tier.rs`)
+    /// with admission disabled: the request's tier has no healthy backend at
+    /// all, and there is no `Permit` to build the 429 `Overloaded` shape
+    /// from. A 503 keeps it distinct from `upstream_unreachable` (a transport
+    /// failure) and from a 4xx (nothing was wrong with the request).
+    pub fn tier_unavailable() -> Self {
+        AppError::UpstreamParsed {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "No healthy backend in the requested context tier".to_string(),
+            error_type: "tier_unavailable".to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

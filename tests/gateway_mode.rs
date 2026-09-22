@@ -48,6 +48,9 @@ struct GatewayOptions {
     backend_long_context_urls: Vec<String>,
     backend_long_context_probe_urls: Vec<String>,
     long_context_above_tokens: u64,
+    /// `VLLM_BACKEND_TIER_STRICT`: refuse a request whose tier has no
+    /// healthy backend instead of falling back to the other one.
+    backend_tier_strict: bool,
     /// Source of the models document (a mock cloud-api `/v1/models`).
     models_document_url: Option<String>,
     capacity_requests_per_minute: u64,
@@ -166,6 +169,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         backend_long_context_urls: options.backend_long_context_urls.clone(),
         backend_long_context_probe_urls: options.backend_long_context_probe_urls.clone(),
         long_context_above_tokens: options.long_context_above_tokens,
+        backend_tier_strict: options.backend_tier_strict,
         dstack_socket_path: "/nonexistent/dstack.sock".to_string(),
         gpu_evidence_delegate_url: None,
         gpu_evidence_delegate_timeout_secs: 30,
@@ -1970,6 +1974,91 @@ async fn a_tier_without_a_healthy_backend_falls_back_to_the_other_one() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
+    live.verify().await;
+}
+
+#[tokio::test]
+async fn strict_mode_refuses_instead_of_falling_back_across_the_tiers() {
+    let live = MockServer::start().await;
+    let dead = unreachable_backend_url();
+    // The long tier's only host is unreachable; strict mode pins the
+    // restriction through the connect fail-over instead of widening the
+    // search, so the oversized request is refused rather than landing its
+    // 300k-token prefill on a base host.
+    let app = build_gateway(
+        &live.uri(),
+        GatewayOptions {
+            backend_urls: vec![live.uri()],
+            backend_long_context_urls: vec![dead],
+            long_context_above_tokens: ABOVE_TOKENS,
+            backend_connect_failover: true,
+            backend_tier_strict: true,
+            admission_max_inflight: 4,
+            ..Default::default()
+        },
+    );
+    let response = app
+        .clone()
+        .oneshot(chat_request(sized_body(4_000)))
+        .await
+        .unwrap();
+    assert_overloaded(response).await;
+    // A short request is unaffected: it never touches the long tier.
+    mount_chat(&live, 1).await;
+    let response = app.oneshot(chat_request(sized_body(400))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    live.verify().await;
+    live.reset().await;
+
+    // And the other way around: with the base fleet gone, a short request is
+    // refused rather than served by the idle long-context host.
+    let dead = unreachable_backend_url();
+    let app = build_gateway(
+        &live.uri(),
+        GatewayOptions {
+            backend_urls: vec![dead],
+            backend_long_context_urls: vec![live.uri()],
+            long_context_above_tokens: ABOVE_TOKENS,
+            backend_connect_failover: true,
+            backend_tier_strict: true,
+            admission_max_inflight: 4,
+            ..Default::default()
+        },
+    );
+    let response = app
+        .clone()
+        .oneshot(chat_request(sized_body(400)))
+        .await
+        .unwrap();
+    assert_overloaded(response).await;
+    mount_chat(&live, 1).await;
+    let response = app.oneshot(chat_request(sized_body(4_000))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    live.verify().await;
+}
+
+#[tokio::test]
+async fn strict_mode_returns_503_when_admission_is_disabled() {
+    let live = MockServer::start().await;
+    let dead = unreachable_backend_url();
+    // No `admission_max_inflight`: admission is off, so the refusal has no
+    // `Permit` to build the 429 `Overloaded` shape from and falls back to a
+    // plain 503 with `error_type: "tier_unavailable"`.
+    let app = build_gateway(
+        &live.uri(),
+        GatewayOptions {
+            backend_urls: vec![live.uri()],
+            backend_long_context_urls: vec![dead],
+            long_context_above_tokens: ABOVE_TOKENS,
+            backend_connect_failover: true,
+            backend_tier_strict: true,
+            ..Default::default()
+        },
+    );
+    let response = app.oneshot(chat_request(sized_body(4_000))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let json = json_body(response).await;
+    assert_eq!(json["error"]["type"], "tier_unavailable");
     live.verify().await;
 }
 

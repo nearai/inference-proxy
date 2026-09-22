@@ -959,6 +959,10 @@ pub struct ConnectFailover {
     /// Context tier the replacement must belong to (`None` = the whole pool,
     /// see `context_tier.rs`).
     pub tier: Option<crate::context_tier::ContextTier>,
+    /// `Config::backend_tier_strict`: whether `tier` is re-resolved
+    /// (`context_tier::recheck_restriction`) to `None` once it empties, or
+    /// stays pinned so an empty tier is refused instead.
+    pub strict: bool,
     /// Conversation to re-pin onto the replacement backend once it answers.
     pub affinity: Option<(
         Arc<crate::backend_affinity::BackendConversationAffinity>,
@@ -1048,21 +1052,25 @@ async fn send_upstream(
     let response = match first {
         Ok(response) => response,
         Err(error) if error.is_connect() && opts.connect_failover.is_some() => {
-            let (pool, path, failed, tier, affinity) = {
+            let (pool, path, failed, tier, strict, affinity) = {
                 let failover = opts.connect_failover.as_ref().expect("checked above");
                 (
                     failover.pool.clone(),
                     failover.path,
                     failover.index,
                     failover.tier,
+                    failover.strict,
                     failover.affinity.clone(),
                 )
             };
             mark_backend_unreachable(&pool, failed);
             // The failed host may have been its tier's last one: re-resolve
             // the restriction now that it is out of the rotation, so the
-            // request falls back to the other tier instead of being refused.
-            let tier = tier.and_then(|tier| crate::context_tier::recheck_restriction(&pool, tier));
+            // request falls back to the other tier instead of being refused
+            // (non-strict). Strict mode never lifts it (see
+            // `recheck_restriction`); the check below refuses instead.
+            let tier =
+                tier.and_then(|tier| crate::context_tier::recheck_restriction(&pool, tier, strict));
             // Re-resolve destination limits after failure. Borrowing keeps
             // configured host counts; legacy mode follows healthy counts.
             let limits = opts
@@ -1087,6 +1095,27 @@ async fn send_upstream(
                 pool.select_excluding(failed, &policy)
             };
             let Some(next) = next else {
+                // Strict mode kept `tier` pinned above even though it is now
+                // empty: a healthy host elsewhere in the pool is not
+                // somewhere this request may go. Refuse deterministically
+                // rather than falling through to the generic host-share or
+                // exhausted cases below, which would either misreport the
+                // reason or (admission off) return a 502 that counts against
+                // upstream uptime the way a 429/503 does not.
+                if tier.is_some_and(|t| pool.healthy_count_in(Some(t)) == 0) {
+                    warn!(
+                        tier = tier.map_or("none", crate::context_tier::ContextTier::as_str),
+                        backend = %sanitized_upstream_url_for_logs(url),
+                        "Context tier has no healthy backend after fail-over, refusing"
+                    );
+                    return Err(match opts.admission.as_ref() {
+                        Some(permit) => {
+                            permit.abandon();
+                            AppError::from(permit.reject_tier_unavailable())
+                        }
+                        None => AppError::tier_unavailable(),
+                    });
+                }
                 if pool.has_healthy_other_than(failed) {
                     if let Some(permit) = opts.admission.as_ref() {
                         // Somewhere to go, but every candidate is at its share

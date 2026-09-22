@@ -99,6 +99,10 @@ pub enum RejectReason {
     BackendQueue,
     /// The lane's own time-to-first-generation is above the bound.
     Ttft,
+    /// Strict context tiers (`VLLM_BACKEND_TIER_STRICT`): the request's tier
+    /// has no healthy backend at all, and strict mode refuses rather than
+    /// placing it on the other tier. See `context_tier.rs`.
+    TierUnavailable,
 }
 
 impl RejectReason {
@@ -108,6 +112,7 @@ impl RejectReason {
             RejectReason::HostShare => "host_share",
             RejectReason::BackendQueue => "backend_queue",
             RejectReason::Ttft => "ttft",
+            RejectReason::TierUnavailable => "tier_unavailable",
         }
     }
 }
@@ -653,6 +658,13 @@ impl Permit {
     /// A refusal because no backend has room under its share.
     pub fn reject_host_share(&self) -> Rejected {
         self.controller.reject(RejectReason::HostShare)
+    }
+
+    /// A refusal because strict mode's tier has no healthy backend at all
+    /// (`context_tier.rs`), distinct from `reject_host_share`'s "backends
+    /// exist but are full or steered around".
+    pub fn reject_tier_unavailable(&self) -> Rejected {
+        self.controller.reject(RejectReason::TierUnavailable)
     }
 
     /// The engine accepted the request; the clock now runs against the
@@ -1417,6 +1429,27 @@ mod tests {
         let long = tier(ContextTier::Long, Some(ContextTier::Long));
         assert!(c.try_admit_at(&p, long, t1).is_ok());
         assert!(c.try_admit_at(&p, None, t1).is_ok());
+    }
+
+    #[test]
+    fn a_strict_empty_tier_is_admitted_here_and_left_to_placement_to_refuse() {
+        // Strict mode (`context_tier::restriction`) never lifts the
+        // restriction, so a long request whose only backend is down still
+        // carries `restrict: Some(Long)` here. Admission must not treat that
+        // as "every backend queued": zero *healthy* backends in the tier is
+        // nothing to declare queued, and the long-tier TTFT exemption applies
+        // regardless. The eventual refusal is `tier_unavailable`, raised by
+        // placement once it finds no eligible backend in the pinned tier —
+        // this call is admitted, not rejected with `backend_queue`.
+        let c = controller(config(), 2);
+        let p = BackendPool::with_long_context(
+            vec!["http://b0:8000".to_string()],
+            vec!["http://long:8000".to_string()],
+        );
+        p.backends()[1].healthy.store(false, Ordering::Relaxed);
+        let t0 = Instant::now();
+        let long = tier(ContextTier::Long, Some(ContextTier::Long));
+        assert!(c.try_admit_at(&p, long, t0).is_ok());
     }
 
     #[test]

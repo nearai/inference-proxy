@@ -366,6 +366,11 @@ pub struct Config {
     /// How long an engine admission rejection counts against its backend
     /// (`VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS`, default 10).
     pub admission_backpressure_secs: u64,
+    /// Engine-reported queue depth at or above which a backend counts as
+    /// saturated for placement and admission
+    /// (`VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT`, default 1: a queue of at
+    /// least one request).
+    pub admission_queue_saturated_at: u32,
     /// `Retry-After` on refusals (`VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS`,
     /// default 2).
     pub admission_retry_after_secs: u64,
@@ -685,6 +690,8 @@ impl Config {
             env_parse("VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS", 30_000)?;
         let admission_backpressure_secs: u64 =
             env_parse("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS", 10)?;
+        let admission_queue_saturated_at: u32 =
+            env_parse("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT", 1)?;
         let admission_retry_after_secs: u64 =
             env_parse("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS", 2)?;
         if admission_max_inflight > 0 {
@@ -703,6 +710,9 @@ impl Config {
             }
             if admission_backpressure_secs == 0 {
                 anyhow::bail!("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS must be at least 1");
+            }
+            if admission_queue_saturated_at == 0 {
+                anyhow::bail!("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT must be at least 1");
             }
             if admission_retry_after_secs == 0 {
                 anyhow::bail!("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS must be at least 1");
@@ -872,6 +882,7 @@ impl Config {
             admission_ramp_interval_secs,
             admission_ttft_p95_max_ms,
             admission_backpressure_secs,
+            admission_queue_saturated_at,
             admission_retry_after_secs,
             backend_connect_failover,
             backend_probe_urls,
@@ -1040,6 +1051,7 @@ impl Config {
             ttft_p95_max: (self.admission_ttft_p95_max_ms > 0)
                 .then(|| std::time::Duration::from_millis(self.admission_ttft_p95_max_ms)),
             backpressure_ttl: std::time::Duration::from_secs(self.admission_backpressure_secs),
+            queue_saturated_at: self.admission_queue_saturated_at,
             retry_after: std::time::Duration::from_secs(self.admission_retry_after_secs),
         })
     }
@@ -1166,6 +1178,7 @@ mod tests {
             "VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS",
             "VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS",
             "VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS",
+            "VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT",
             "VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS",
             "VLLM_BACKEND_CONNECT_FAILOVER",
             "VLLM_BACKEND_PROBE_URLS",
@@ -2094,6 +2107,7 @@ mod tests {
                 ("VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS", "1800"),
                 ("VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS", "30000"),
                 ("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS", "10"),
+                ("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT", "4"),
                 ("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS", "2"),
                 ("VLLM_BACKEND_CONNECT_FAILOVER", "1"),
             ],
@@ -2110,18 +2124,22 @@ mod tests {
                         ramp_interval: std::time::Duration::from_secs(1800),
                         ttft_p95_max: Some(std::time::Duration::from_secs(30)),
                         backpressure_ttl: std::time::Duration::from_secs(10),
+                        queue_saturated_at: 4,
                         retry_after: std::time::Duration::from_secs(2),
                     })
                 );
                 assert!(config.backend_connect_failover);
 
-                // No TTFT check when the bound is 0; no ramp when start is omitted.
+                // No TTFT check when the bound is 0; no ramp when start is omitted;
+                // unset queue threshold falls back to 1 (today's behaviour).
                 env::set_var("VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS", "0");
                 env::remove_var("VLLM_PROXY_ADMISSION_START_INFLIGHT");
+                env::remove_var("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT");
                 let config = Config::from_env().unwrap();
                 let admission = config.admission().unwrap();
                 assert_eq!(admission.ttft_p95_max, None);
                 assert_eq!(admission.start_inflight, 48);
+                assert_eq!(admission.queue_saturated_at, 1);
 
                 // Validation.
                 env::set_var("VLLM_PROXY_ADMISSION_START_INFLIGHT", "64");
@@ -2143,6 +2161,13 @@ mod tests {
                     "{err}"
                 );
                 env::remove_var("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS");
+                env::set_var("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT", "0");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT"),
+                    "{err}"
+                );
+                env::remove_var("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT");
                 env::set_var("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS", "0");
                 let err = Config::from_env().unwrap_err().to_string();
                 assert!(

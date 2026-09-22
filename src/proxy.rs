@@ -5068,6 +5068,7 @@ data: [DONE]
                 ramp_interval: std::time::Duration::from_secs(60),
                 ttft_p95_max: Some(std::time::Duration::from_secs(30)),
                 backpressure_ttl: std::time::Duration::from_secs(10),
+                queue_saturated_at: 1,
                 retry_after: std::time::Duration::from_secs(2),
             }),
             1,

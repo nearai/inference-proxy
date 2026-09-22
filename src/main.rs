@@ -243,6 +243,7 @@ async fn main() -> anyhow::Result<()> {
             ramp_interval_secs = settings.ramp_interval.as_secs(),
             ttft_p95_max_ms = settings.ttft_p95_max.map_or(0, |d| d.as_millis()),
             backpressure_secs = settings.backpressure_ttl.as_secs(),
+            queue_saturated_at = settings.queue_saturated_at,
             retry_after_secs = settings.retry_after.as_secs(),
             "Lane admission enabled"
         );

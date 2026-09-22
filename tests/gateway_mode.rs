@@ -40,6 +40,7 @@ struct GatewayOptions {
     admission_start_inflight: Option<u32>,
     admission_ttft_p95_max_ms: Option<u64>,
     admission_backpressure_secs: Option<u64>,
+    admission_queue_saturated_at: Option<u32>,
     backend_connect_failover: bool,
     /// Engine metrics probe base URLs, one per backend (polled every 100 ms here).
     backend_probe_urls: Vec<String>,
@@ -159,6 +160,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         admission_ramp_interval_secs: 1800,
         admission_ttft_p95_max_ms: options.admission_ttft_p95_max_ms.unwrap_or(30_000),
         admission_backpressure_secs: options.admission_backpressure_secs.unwrap_or(10),
+        admission_queue_saturated_at: options.admission_queue_saturated_at.unwrap_or(1),
         admission_retry_after_secs: 2,
         backend_connect_failover: options.backend_connect_failover,
         backend_probe_urls: options.backend_probe_urls.clone(),
@@ -1779,6 +1781,51 @@ async fn a_queueing_engine_is_steered_around_and_a_fleet_wide_queue_refuses() {
     let response = app.oneshot(chat_request(hello_body())).await.unwrap();
     assert_overloaded(response).await;
     idle.verify().await;
+}
+
+#[tokio::test]
+async fn a_configured_queue_threshold_gates_admission() {
+    let backend_a = MockServer::start().await;
+    let backend_b = MockServer::start().await;
+    // Symmetric loads: least-connections ties break on index, so backend_a
+    // (first in the pool) is the one dispatched to below the threshold.
+    mount_engine(&backend_a, 0, 2, 1).await;
+    mount_engine(&backend_b, 0, 2, 0).await;
+    let app = build_gateway(
+        &backend_a.uri(),
+        GatewayOptions {
+            backend_urls: vec![backend_a.uri(), backend_b.uri()],
+            backend_probe_urls: vec![backend_a.uri(), backend_b.uri()],
+            admission_max_inflight: 8,
+            admission_queue_saturated_at: Some(4),
+            ..Default::default()
+        },
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await; // a few polls
+
+    // queued=2 on every backend is below the configured threshold of 4:
+    // neither backend is saturated, so the request is admitted.
+    let response = app
+        .clone()
+        .oneshot(chat_request(hello_body()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    backend_a.verify().await;
+    backend_b.verify().await;
+
+    // Now every backend queues at the threshold: fleet-wide refusal. (Which
+    // refusal it was lives in the log line and in
+    // `admission_rejections_total{reason="backend_queue"}`, neither
+    // observable from here — this test file's `metrics_handle` is never
+    // installed as the global recorder, so `/metrics` always renders empty.)
+    backend_a.reset().await;
+    backend_b.reset().await;
+    mount_engine(&backend_a, 0, 4, 0).await;
+    mount_engine(&backend_b, 0, 4, 0).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let response = app.oneshot(chat_request(hello_body())).await.unwrap();
+    assert_overloaded(response).await;
 }
 
 // ---------------------------------------------------------------------------

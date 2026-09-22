@@ -963,6 +963,10 @@ pub struct ConnectFailover {
     /// (`context_tier::recheck_restriction`) to `None` once it empties, or
     /// stays pinned so an empty tier is refused instead.
     pub strict: bool,
+    /// `Config::admission_retry_after_secs`: `Retry-After` for the 503
+    /// `AppError::tier_unavailable` refusal below, when admission is off and
+    /// there is no `Permit` to carry it instead.
+    pub retry_after_secs: u64,
     /// Conversation to re-pin onto the replacement backend once it answers.
     pub affinity: Option<(
         Arc<crate::backend_affinity::BackendConversationAffinity>,
@@ -1052,7 +1056,7 @@ async fn send_upstream(
     let response = match first {
         Ok(response) => response,
         Err(error) if error.is_connect() && opts.connect_failover.is_some() => {
-            let (pool, path, failed, tier, strict, affinity) = {
+            let (pool, path, failed, tier, strict, retry_after_secs, affinity) = {
                 let failover = opts.connect_failover.as_ref().expect("checked above");
                 (
                     failover.pool.clone(),
@@ -1060,6 +1064,7 @@ async fn send_upstream(
                     failover.index,
                     failover.tier,
                     failover.strict,
+                    failover.retry_after_secs,
                     failover.affinity.clone(),
                 )
             };
@@ -1102,7 +1107,18 @@ async fn send_upstream(
                 // exhausted cases below, which would either misreport the
                 // reason or (admission off) return a 502 that counts against
                 // upstream uptime the way a 429/503 does not.
-                if tier.is_some_and(|t| pool.healthy_count_in(Some(t)) == 0) {
+                //
+                // Gated on `strict` explicitly, not just on `tier` being
+                // `Some`: non-strict already lifts `tier` to `None` above
+                // whenever `recheck_restriction` saw the tier empty, but a
+                // concurrent request can empty it again between that check
+                // and `select_excluding` above, which would otherwise trip
+                // this block in non-strict mode too and refuse instead of
+                // falling through to the pre-existing host-share/exhausted
+                // handling below.
+                if strict && tier.is_some_and(|t| pool.healthy_count_in(Some(t)) == 0) {
+                    metrics::counter!("backend_failover_total", "outcome" => "refused")
+                        .increment(1);
                     warn!(
                         tier = tier.map_or("none", crate::context_tier::ContextTier::as_str),
                         backend = %sanitized_upstream_url_for_logs(url),
@@ -1113,7 +1129,7 @@ async fn send_upstream(
                             permit.abandon();
                             AppError::from(permit.reject_tier_unavailable())
                         }
-                        None => AppError::tier_unavailable(),
+                        None => AppError::tier_unavailable(retry_after_secs),
                     });
                 }
                 if pool.has_healthy_other_than(failed) {

@@ -274,22 +274,34 @@ pub fn restriction(pool: &BackendPool, tier: ContextTier, strict: bool) -> Optio
 /// placement loses the race with one. Non-strict: a tier that emptied in the
 /// meantime is counted as `fallback_late`, apart from the one outcome
 /// `decide` records per request, and the restriction lifts. Strict: the
-/// restriction never lifts, so this never fires and the caller (placement,
-/// connection fail-over) is left to refuse once it finds the pinned tier has
-/// no eligible backend.
+/// restriction never lifts, so `restrict` stays `Some` even on an empty tier
+/// — counted `refused_late` instead — and the caller (placement, connection
+/// fail-over) is left to refuse once it finds the pinned tier has no
+/// eligible backend.
 pub fn recheck_restriction(
     pool: &BackendPool,
     tier: ContextTier,
     strict: bool,
 ) -> Option<ContextTier> {
     let restrict = restriction(pool, tier, strict);
-    if restrict.is_none() {
-        metrics::counter!(
-            "backend_tier_requests_total",
-            "tier" => tier.as_str(),
-            "outcome" => "fallback_late"
-        )
-        .increment(1);
+    match restrict {
+        None => {
+            metrics::counter!(
+                "backend_tier_requests_total",
+                "tier" => tier.as_str(),
+                "outcome" => "fallback_late"
+            )
+            .increment(1);
+        }
+        Some(_) if strict && pool.healthy_count_in(Some(tier)) == 0 => {
+            metrics::counter!(
+                "backend_tier_requests_total",
+                "tier" => tier.as_str(),
+                "outcome" => "refused_late"
+            )
+            .increment(1);
+        }
+        Some(_) => {}
     }
     restrict
 }
@@ -531,5 +543,48 @@ mod tests {
             Some(ContextTier::Long)
         );
         assert_eq!(restriction(&pool, ContextTier::Long, false), None);
+    }
+
+    #[test]
+    fn strict_mode_recheck_restriction_counts_refused_late_while_the_tier_stays_empty() {
+        // Mirrors `fallback_late` (non-strict): a request already routed to a
+        // tier that then emptied under it. Strict mode's `recheck_restriction`
+        // still returns `Some(tier)` (never lifts), so the empty-vs-full
+        // distinction has to come from a separate metric rather than the
+        // return value.
+        let pool = BackendPool::with_long_context(
+            vec!["http://base:8000".to_string()],
+            vec!["http://long:8000".to_string()],
+        );
+        pool.backends()[1]
+            .healthy
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let restrict = metrics::with_local_recorder(&recorder, || {
+            recheck_restriction(&pool, ContextTier::Long, true)
+        });
+        assert_eq!(restrict, Some(ContextTier::Long));
+        let rendered = handle.render();
+        assert!(
+            rendered
+                .contains("backend_tier_requests_total{tier=\"long\",outcome=\"refused_late\"} 1"),
+            "{rendered}"
+        );
+        // A tier that still has a healthy backend records nothing: the
+        // metric only fires when the pinned tier is actually empty.
+        pool.backends()[1]
+            .healthy
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            recheck_restriction(&pool, ContextTier::Long, true)
+        });
+        assert!(
+            !handle.render().contains("refused_late"),
+            "{}",
+            handle.render()
+        );
     }
 }

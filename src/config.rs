@@ -54,6 +54,18 @@ fn env_bool_optional(name: &str) -> Option<bool> {
     env::var(name).ok().map(|v| parse_bool(&v))
 }
 
+/// Whether `VLLM_BACKEND_TIER_STRICT` has an actual long-context tier to
+/// isolate: hosts configured *and* the threshold armed. Config validation
+/// keeps these two in lock step (`VLLM_BACKEND_LONG_CONTEXT_URLS` and
+/// `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` each require the other, checked
+/// just above where this is called), but `context_tier::decide`'s own
+/// off-switch is `above_tokens == 0` — checked directly here too, rather than
+/// leaning on that separate invariant, so strict mode's warning stays
+/// correct even if the two ever come apart.
+fn tier_strict_has_something_to_isolate(long_context_urls: &[String], above_tokens: u64) -> bool {
+    !long_context_urls.is_empty() && above_tokens != 0
+}
+
 fn is_gemma4_model_name(model_name: &str) -> bool {
     let name = model_name.to_ascii_lowercase();
     ["gemma-4", "gemma4"].iter().any(|needle| {
@@ -782,13 +794,23 @@ impl Config {
             );
         }
         let backend_tier_strict = env_bool("VLLM_BACKEND_TIER_STRICT");
-        if backend_tier_strict && backend_long_context_urls.is_empty() {
+        if backend_tier_strict
+            && !tier_strict_has_something_to_isolate(
+                &backend_long_context_urls,
+                long_context_above_tokens,
+            )
+        {
             warn!(
-                "VLLM_BACKEND_TIER_STRICT is set but no long-context tier is configured \
-                 (VLLM_BACKEND_LONG_CONTEXT_URLS is empty); ignoring it, there is nothing to isolate"
+                "VLLM_BACKEND_TIER_STRICT is set but the long-context tier is not effectively \
+                 configured (VLLM_BACKEND_LONG_CONTEXT_URLS is empty or \
+                 VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS is 0); ignoring it, there is nothing to isolate"
             );
         }
-        let backend_tier_strict = backend_tier_strict && !backend_long_context_urls.is_empty();
+        let backend_tier_strict = backend_tier_strict
+            && tier_strict_has_something_to_isolate(
+                &backend_long_context_urls,
+                long_context_above_tokens,
+            );
 
         let config = Config {
             model_name,
@@ -1440,6 +1462,24 @@ mod tests {
             assert!(!Config::from_env().unwrap().backend_tier_strict);
             gateway_env_cleanup();
         });
+    }
+
+    #[test]
+    fn test_tier_strict_is_inert_without_a_long_tier_or_a_zero_threshold() {
+        // `Config::from_env`'s own bail!()s keep "urls empty" and
+        // "above_tokens == 0" in lock step for any config that actually
+        // loads, so this exercises `tier_strict_has_something_to_isolate`
+        // directly: it must not rely on that invariant holding forever, since
+        // `context_tier::decide`'s real off-switch is `above_tokens == 0`.
+        assert!(!tier_strict_has_something_to_isolate(&[], 100_000));
+        assert!(!tier_strict_has_something_to_isolate(
+            &["https://m-long-b1.test".to_string()],
+            0
+        ));
+        assert!(tier_strict_has_something_to_isolate(
+            &["https://m-long-b1.test".to_string()],
+            100_000
+        ));
     }
 
     #[test]

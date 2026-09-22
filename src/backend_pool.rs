@@ -330,9 +330,10 @@ impl BackendPool {
         self.healthy_count_in(None)
     }
 
-    /// Number of healthy backends in `tier` (`None` = the whole pool). A tier
-    /// with none is why a request falls back to the other one instead of
-    /// waiting for a host that is not there.
+    /// Number of healthy backends in `tier` (`None` = the whole pool). By
+    /// default a tier with none is why a request falls back to the other one
+    /// instead of waiting for a host that is not there; with
+    /// `VLLM_BACKEND_TIER_STRICT` it is refused instead (`context_tier.rs`).
     pub fn healthy_count_in(&self, tier: Option<ContextTier>) -> usize {
         self.backends
             .iter()

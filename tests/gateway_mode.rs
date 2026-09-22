@@ -1977,6 +1977,24 @@ async fn a_tier_without_a_healthy_backend_falls_back_to_the_other_one() {
     live.verify().await;
 }
 
+/// The 429 body only ever carries the generic `overloaded` type (`error.rs`
+/// maps every `RejectReason` to the same shape): the specific reason is only
+/// in the log line and `admission_rejections_total{reason}`. Captured with a
+/// local recorder scoped around the request — safe here because
+/// `#[tokio::test]` defaults to the single-threaded flavor, so nothing this
+/// request touches runs on another OS thread outside the guard's scope.
+async fn oneshot_with_rejection_reason_metric(
+    app: axum::Router,
+    request: Request<Body>,
+) -> (axum::response::Response, String) {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let guard = metrics::set_default_local_recorder(&recorder);
+    let response = app.oneshot(request).await.unwrap();
+    drop(guard);
+    (response, handle.render())
+}
+
 #[tokio::test]
 async fn strict_mode_refuses_instead_of_falling_back_across_the_tiers() {
     let live = MockServer::start().await;
@@ -1997,12 +2015,13 @@ async fn strict_mode_refuses_instead_of_falling_back_across_the_tiers() {
             ..Default::default()
         },
     );
-    let response = app
-        .clone()
-        .oneshot(chat_request(sized_body(4_000)))
-        .await
-        .unwrap();
+    let (response, rendered_metrics) =
+        oneshot_with_rejection_reason_metric(app.clone(), chat_request(sized_body(4_000))).await;
     assert_overloaded(response).await;
+    assert!(
+        rendered_metrics.contains("admission_rejections_total{reason=\"tier_unavailable\"} 1"),
+        "{rendered_metrics}"
+    );
     // A short request is unaffected: it never touches the long tier.
     mount_chat(&live, 1).await;
     let response = app.oneshot(chat_request(sized_body(400))).await.unwrap();
@@ -2025,16 +2044,49 @@ async fn strict_mode_refuses_instead_of_falling_back_across_the_tiers() {
             ..Default::default()
         },
     );
-    let response = app
-        .clone()
-        .oneshot(chat_request(sized_body(400)))
-        .await
-        .unwrap();
+    let (response, rendered_metrics) =
+        oneshot_with_rejection_reason_metric(app.clone(), chat_request(sized_body(400))).await;
     assert_overloaded(response).await;
+    assert!(
+        rendered_metrics.contains("admission_rejections_total{reason=\"tier_unavailable\"} 1"),
+        "{rendered_metrics}"
+    );
     mount_chat(&live, 1).await;
     let response = app.oneshot(chat_request(sized_body(4_000))).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     live.verify().await;
+}
+
+#[tokio::test]
+async fn strict_mode_tier_already_empty_before_placement_refuses_with_tier_unavailable() {
+    let live = MockServer::start().await;
+    let dead = unreachable_backend_url();
+    // Unlike `strict_mode_refuses_instead_of_falling_back_across_the_tiers`,
+    // the long tier's only backend is marked unhealthy up front rather than
+    // failing a live connect attempt: placement (`completion_placement.rs`)
+    // finds it already empty and refuses directly, so the connect fail-over
+    // path in `proxy.rs` is never reached for this request.
+    let (app, state) = build_gateway_with_state(
+        &live.uri(),
+        GatewayOptions {
+            backend_urls: vec![live.uri()],
+            backend_long_context_urls: vec![dead],
+            long_context_above_tokens: ABOVE_TOKENS,
+            backend_tier_strict: true,
+            admission_max_inflight: 4,
+            ..Default::default()
+        },
+    );
+    state.backend_pool.backends()[1]
+        .healthy
+        .store(false, std::sync::atomic::Ordering::Release);
+    let (response, rendered_metrics) =
+        oneshot_with_rejection_reason_metric(app, chat_request(sized_body(4_000))).await;
+    assert_overloaded(response).await;
+    assert!(
+        rendered_metrics.contains("admission_rejections_total{reason=\"tier_unavailable\"} 1"),
+        "{rendered_metrics}"
+    );
 }
 
 #[tokio::test]

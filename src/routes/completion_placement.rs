@@ -66,12 +66,22 @@ pub(super) fn place_completion(
             // deterministically instead of the generic host-share rejection,
             // which is for backends that exist but are full or steered
             // around, not for a tier with none at all.
-            if let Some(tier) = restrict {
-                if state.backend_pool.healthy_count_in(Some(tier)) == 0 {
-                    return Err(match admission.as_ref() {
-                        Some(permit) => AppError::from(permit.reject_tier_unavailable()),
-                        None => AppError::tier_unavailable(),
-                    });
+            //
+            // Gated on `strict` explicitly rather than leaning on `restrict`
+            // alone: a concurrent request can empty the tier between the
+            // widening check above and here even in non-strict mode, and
+            // this block must not fire for that race — non-strict behavior
+            // must stay exactly what it was before strict mode existed.
+            if strict {
+                if let Some(tier) = restrict {
+                    if state.backend_pool.healthy_count_in(Some(tier)) == 0 {
+                        return Err(match admission.as_ref() {
+                            Some(permit) => AppError::from(permit.reject_tier_unavailable()),
+                            None => {
+                                AppError::tier_unavailable(state.config.admission_retry_after_secs)
+                            }
+                        });
+                    }
                 }
             }
             return Err(AppError::from(
@@ -91,6 +101,7 @@ pub(super) fn place_completion(
             index: placement.index,
             tier: restrict,
             strict,
+            retry_after_secs: state.config.admission_retry_after_secs,
             affinity: affinity_key.map(|key| (state.backend_affinity.clone(), key)),
         });
 

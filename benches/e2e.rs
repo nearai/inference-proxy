@@ -635,9 +635,12 @@ fn bench_streaming_sse_processing(c: &mut Criterion) {
 fn bench_auth_token_comparison(c: &mut Criterion) {
     use subtle::ConstantTimeEq;
 
-    let token = "rr9w3S91rog35JM6Sgr2YqwbMvKrbnLA95hQoiwip+4=";
-    let matching = "rr9w3S91rog35JM6Sgr2YqwbMvKrbnLA95hQoiwip+4=";
-    let non_matching = "xx9w3S91rog35JM6Sgr2YqwbMvKrbnLA95hQoiwip+4=";
+    // Fake, fixed-length (44-byte, base64-shaped) placeholders — this benchmark
+    // only measures constant-time byte comparison, so the values themselves
+    // are irrelevant as long as their length/shape matches a real token.
+    let token = "dGVzdC10b2tlbi1mb3ItYmVuY2htYXJrcy1vbmx5AA==";
+    let matching = "dGVzdC10b2tlbi1mb3ItYmVuY2htYXJrcy1vbmx5AA==";
+    let non_matching = "xxVzdC10b2tlbi1mb3ItYmVuY2htYXJrcy1vbmx5AA==";
 
     let mut group = c.benchmark_group("auth_token");
 

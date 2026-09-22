@@ -8,6 +8,26 @@ use vllm_proxy_rs::*;
 pub(crate) struct TestAppOptions {
     pub(crate) cloud_api_url: Option<String>,
     pub(crate) dstack_socket_path: Option<String>,
+    pub(crate) backend_token: Option<String>,
+    pub(crate) images_edits_url_override: Option<String>,
+    pub(crate) transcriptions_url_override: Option<String>,
+    pub(crate) rerank_url_override: Option<String>,
+}
+
+pub(crate) fn test_signing_pair() -> signing::SigningPair {
+    let ecdsa_key: [u8; 32] = [
+        0xac, 0x09, 0x74, 0xbe, 0xc3, 0x9a, 0x17, 0xe3, 0x6b, 0xa4, 0xa6, 0xb4, 0xd2, 0x38, 0xff,
+        0x94, 0x4b, 0xac, 0xb3, 0x5e, 0x5d, 0xc4, 0xaf, 0x0f, 0x33, 0x47, 0xe5, 0x87, 0x31, 0x79,
+        0x67, 0x0f,
+    ];
+    let ed25519_key: [u8; 32] = [
+        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
+        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
+        0x7f, 0x60,
+    ];
+    let ecdsa = signing::EcdsaContext::from_key_bytes(&ecdsa_key).unwrap();
+    let ed25519 = signing::Ed25519Context::from_key_bytes(&ed25519_key).unwrap();
+    signing::SigningPair { ecdsa, ed25519 }
 }
 
 pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::Router {
@@ -70,14 +90,14 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         health_check_max_failures: 3,
         health_check_timeout_secs: 3,
         images_url_override: None,
-        images_edits_url_override: None,
-        transcriptions_url_override: None,
-        rerank_url_override: None,
+        images_edits_url_override: options.images_edits_url_override,
+        transcriptions_url_override: options.transcriptions_url_override,
+        rerank_url_override: options.rerank_url_override,
         score_url_override: None,
         ohttp_enabled: false,
         listen_port: 8000,
         listen_addr: "127.0.0.1".to_string(),
-        backend_token: None,
+        backend_token: options.backend_token,
         backend_priority: None,
         backend_health_path: "/health".to_string(),
         non_tee_deployment: false,
@@ -98,6 +118,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         admission_ramp_interval_secs: 1800,
         admission_ttft_p95_max_ms: 30_000,
         admission_backpressure_secs: 10,
+        admission_queue_saturated_at: 1,
         admission_retry_after_secs: 2,
         appconfig: None,
         backend_connect_failover: false,
@@ -105,6 +126,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         backend_long_context_urls: Vec::new(),
         backend_long_context_probe_urls: Vec::new(),
         long_context_above_tokens: 0,
+        backend_tier_strict: false,
         backend_probe_interval_secs: 2,
         dstack_socket_path: options
             .dstack_socket_path
@@ -128,23 +150,25 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         fusion_internal_retry_initial_backoff_ms: 1,
     };
 
-    let ecdsa_key: [u8; 32] = [
-        0xac, 0x09, 0x74, 0xbe, 0xc3, 0x9a, 0x17, 0xe3, 0x6b, 0xa4, 0xa6, 0xb4, 0xd2, 0x38, 0xff,
-        0x94, 0x4b, 0xac, 0xb3, 0x5e, 0x5d, 0xc4, 0xaf, 0x0f, 0x33, 0x47, 0xe5, 0x87, 0x31, 0x79,
-        0x67, 0x0f,
-    ];
-    let ed25519_key: [u8; 32] = [
-        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
-        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
-        0x7f, 0x60,
-    ];
-    let ecdsa = signing::EcdsaContext::from_key_bytes(&ecdsa_key).unwrap();
-    let ed25519 = signing::Ed25519Context::from_key_bytes(&ed25519_key).unwrap();
-    let signing_pair = signing::SigningPair { ecdsa, ed25519 };
+    let signing_pair = test_signing_pair();
     let chat_cache = cache::ChatCache::new("test-model", 1200);
     let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
         .build_recorder()
         .handle();
+    let http_client = reqwest::Client::new();
+    let backend_client = if let Some(token) = &config.backend_token {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let mut authorization =
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).unwrap();
+        authorization.set_sensitive(true);
+        headers.insert(reqwest::header::AUTHORIZATION, authorization);
+        reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap()
+    } else {
+        http_client.clone()
+    };
     let backend_pool = Arc::new(vllm_proxy_rs::backend_pool::BackendPool::new(vec![
         mock_url.to_string(),
     ]));
@@ -154,8 +178,8 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),
         attestation_cache: Arc::new(vllm_proxy_rs::attestation::AttestationCache::new(300)),
-        http_client: reqwest::Client::new(),
-        backend_client: reqwest::Client::new(),
+        http_client,
+        backend_client,
         metrics_handle,
         tls_cert_fingerprint: Arc::new(
             vllm_proxy_rs::attestation::TlsCertTracker::new(None).expect("tracker for None path"),

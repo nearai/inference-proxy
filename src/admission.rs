@@ -82,6 +82,10 @@ pub struct AdmissionStaticConfig {
     /// Refuse new work while enough of the window waited longer than this for
     /// the first generation event (`None` = no TTFT check).
     pub ttft_p95_max: Option<Duration>,
+    /// Engine-reported queue depth at or above which a backend counts as
+    /// saturated (`VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT`, default 1: a
+    /// queue of at least one request).
+    pub queue_saturated_at: u32,
 }
 
 /// The policy fields that may be changed while the controller is running.
@@ -157,6 +161,10 @@ pub enum RejectReason {
     BackendQueue,
     /// The lane's own time-to-first-generation is above the bound.
     Ttft,
+    /// Strict context tiers (`VLLM_BACKEND_TIER_STRICT`): the request's tier
+    /// has no healthy backend at all, and strict mode refuses rather than
+    /// placing it on the other tier. See `context_tier.rs`.
+    TierUnavailable,
 }
 
 impl RejectReason {
@@ -166,6 +174,7 @@ impl RejectReason {
             RejectReason::HostShare => "host_share",
             RejectReason::BackendQueue => "backend_queue",
             RejectReason::Ttft => "ttft",
+            RejectReason::TierUnavailable => "tier_unavailable",
         }
     }
 }
@@ -421,9 +430,9 @@ impl AdmissionController {
     }
 
     /// Whether backend `index` is saturated right now — its engine reports a
-    /// non-empty queue, or it rejected a lane request at engine admission
-    /// within the TTL — i.e. selection should steer around it while other
-    /// hosts have room.
+    /// queue of at least `queue_saturated_at` requests, or it rejected a lane
+    /// request at engine admission within the TTL — i.e. selection should
+    /// steer around it while other hosts have room.
     pub fn backend_saturated(&self, index: usize) -> bool {
         self.backend_saturated_at(index, Instant::now())
     }
@@ -442,7 +451,19 @@ impl AdmissionController {
         now: Instant,
         backpressure_ttl: Duration,
     ) -> bool {
-        if self.engine.get_at(index, now).is_some_and(|s| s.queued > 0) {
+        // The engine sample is checked before the static config `None` return:
+        // a gateway that sets `VLLM_BACKEND_PROBE_URLS` without admission still
+        // steers placement around a queueing backend (threshold 1, same as
+        // admission's own default).
+        let threshold = self
+            .static_config
+            .as_ref()
+            .map_or(1, |config| config.queue_saturated_at);
+        if self
+            .engine
+            .get_at(index, now)
+            .is_some_and(|s| s.queued >= threshold)
+        {
             return true;
         }
         let Some(_) = &self.static_config else {
@@ -740,8 +761,9 @@ impl AdmissionController {
         self.mark_dirty();
     }
 
-    /// Every healthy backend of the request's tier rejected at engine
-    /// admission within the TTL.
+    /// Every healthy backend of the request's tier is saturated: its engine
+    /// queue is at or above `queue_saturated_at`, or it rejected a lane
+    /// request at engine admission within the TTL.
     fn every_backend_queued(
         &self,
         backpressure_ttl: Duration,
@@ -771,8 +793,12 @@ impl AdmissionController {
                 warn!(
                     tier,
                     healthy_backends = healthy,
+                    queue_saturated_at = self
+                        .static_config
+                        .as_ref()
+                        .map_or(1, |config| config.queue_saturated_at),
                     ttl_secs = backpressure_ttl.as_secs(),
-                    "Every backend rejected at engine admission recently, refusing new work"
+                    "Every backend's engine queue is at or above the saturation threshold, or it rejected a lane request at engine admission recently; refusing new work"
                 );
             } else {
                 info!(tier, "A backend accepts lane work again");
@@ -843,6 +869,13 @@ impl Permit {
     /// A refusal because no backend has room under its share.
     pub fn reject_host_share(&self) -> Rejected {
         self.controller.reject(RejectReason::HostShare)
+    }
+
+    /// A refusal because strict mode's tier has no healthy backend at all
+    /// (`context_tier.rs`), distinct from `reject_host_share`'s "backends
+    /// exist but are full or steered around".
+    pub fn reject_tier_unavailable(&self) -> Rejected {
+        self.controller.reject(RejectReason::TierUnavailable)
     }
 
     /// The engine accepted the request; the clock now runs against the
@@ -966,6 +999,7 @@ mod tests {
                 ramp_step: 2,
                 ramp_interval: Duration::from_secs(60),
                 ttft_p95_max: Some(Duration::from_secs(10)),
+                queue_saturated_at: 1,
             },
             AdmissionPolicy {
                 max_inflight: 8,
@@ -1007,6 +1041,11 @@ mod tests {
             estimated,
             restrict,
         })
+    }
+
+    /// An engine reading with the given running/queued counts.
+    fn engine_sample(running: u32, queued: u32) -> crate::engine_load::Sample {
+        crate::engine_load::Sample { running, queued }
     }
 
     /// Admit at `t0` and record a first-generation sample `ttft` later.
@@ -1688,14 +1727,8 @@ mod tests {
         let c = Arc::new(AdmissionController::new(Some(config()), 2, engine.clone()));
         let p = pool(2);
         let t0 = Instant::now();
-        let busy = crate::engine_load::Sample {
-            running: 30,
-            queued: 2,
-        };
-        let idle = crate::engine_load::Sample {
-            running: 3,
-            queued: 0,
-        };
+        let busy = engine_sample(30, 2);
+        let idle = engine_sample(3, 0);
         engine.record_at(0, busy, t0);
         engine.record_at(1, idle, t0);
         assert!(c.backend_saturated_at(0, t0 + Duration::from_secs(1)));
@@ -1715,6 +1748,86 @@ mod tests {
         assert!(c
             .try_admit_at(&p, None, t0 + Duration::from_secs(10))
             .is_ok());
+    }
+
+    #[test]
+    fn queue_saturated_at_raises_the_engine_queue_threshold() {
+        let engine = Arc::new(EngineLoad::new(1, Duration::from_secs(6)));
+        let c = Arc::new(AdmissionController::new(
+            Some((
+                AdmissionStaticConfig {
+                    queue_saturated_at: 4,
+                    ..config().0
+                },
+                config().1,
+            )),
+            1,
+            engine.clone(),
+        ));
+        let t0 = Instant::now();
+        engine.record_at(
+            0,
+            crate::engine_load::Sample {
+                running: 10,
+                queued: 3,
+            },
+            t0,
+        );
+        assert!(!c.backend_saturated_at(0, t0));
+        engine.record_at(
+            0,
+            crate::engine_load::Sample {
+                running: 10,
+                queued: 4,
+            },
+            t0,
+        );
+        assert!(c.backend_saturated_at(0, t0));
+    }
+
+    #[test]
+    fn backend_saturated_uses_the_engine_sample_even_with_admission_disabled() {
+        // A gateway that sets `VLLM_BACKEND_PROBE_URLS` without admission
+        // (`config: None`) must still steer placement around a queueing
+        // backend, at the same default threshold (1) admission itself uses.
+        let engine = Arc::new(EngineLoad::new(1, Duration::from_secs(6)));
+        let c = Arc::new(AdmissionController::new(None, 1, engine.clone()));
+        let t0 = Instant::now();
+        engine.record_at(0, engine_sample(10, 0), t0);
+        assert!(!c.backend_saturated_at(0, t0));
+        engine.record_at(0, engine_sample(10, 1), t0);
+        assert!(c.backend_saturated_at(0, t0));
+    }
+
+    #[test]
+    fn every_backend_queued_respects_the_configured_threshold() {
+        let engine = Arc::new(EngineLoad::new(2, Duration::from_secs(6)));
+        let c = Arc::new(AdmissionController::new(
+            Some((
+                AdmissionStaticConfig {
+                    queue_saturated_at: 4,
+                    ..config().0
+                },
+                config().1,
+            )),
+            2,
+            engine.clone(),
+        ));
+        let p = pool(2);
+        let t0 = Instant::now();
+        let lightly_queued = engine_sample(10, 2);
+        engine.record_at(0, lightly_queued, t0);
+        engine.record_at(1, lightly_queued, t0);
+        // Below the threshold on every backend: not treated as saturated.
+        assert!(!c.backend_saturated_at(0, t0));
+        assert!(!c.backend_saturated_at(1, t0));
+        assert!(c.try_admit_at(&p, None, t0).is_ok());
+        // At the threshold on every backend: refuse before dispatch.
+        let at_threshold = engine_sample(10, 4);
+        engine.record_at(0, at_threshold, t0);
+        engine.record_at(1, at_threshold, t0);
+        let rejected = c.try_admit_at(&p, None, t0).unwrap_err();
+        assert_eq!(rejected.reason, RejectReason::BackendQueue);
     }
 
     #[test]
@@ -1821,6 +1934,27 @@ mod tests {
         let long = tier(ContextTier::Long, Some(ContextTier::Long));
         assert!(c.try_admit_at(&p, long, t1).is_ok());
         assert!(c.try_admit_at(&p, None, t1).is_ok());
+    }
+
+    #[test]
+    fn a_strict_empty_tier_is_admitted_here_and_left_to_placement_to_refuse() {
+        // Strict mode (`context_tier::restriction`) never lifts the
+        // restriction, so a long request whose only backend is down still
+        // carries `restrict: Some(Long)` here. Admission must not treat that
+        // as "every backend queued": zero *healthy* backends in the tier is
+        // nothing to declare queued, and the long-tier TTFT exemption applies
+        // regardless. The eventual refusal is `tier_unavailable`, raised by
+        // placement once it finds no eligible backend in the pinned tier —
+        // this call is admitted, not rejected with `backend_queue`.
+        let c = controller(config(), 2);
+        let p = BackendPool::with_long_context(
+            vec!["http://b0:8000".to_string()],
+            vec!["http://long:8000".to_string()],
+        );
+        p.backends()[1].healthy.store(false, Ordering::Relaxed);
+        let t0 = Instant::now();
+        let long = tier(ContextTier::Long, Some(ContextTier::Long));
+        assert!(c.try_admit_at(&p, long, t0).is_ok());
     }
 
     #[test]

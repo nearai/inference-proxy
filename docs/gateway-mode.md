@@ -92,11 +92,13 @@ to the current in-CVM behavior.
 | `AWS_APPCONFIG_APPLICATION` / `AWS_APPCONFIG_ENVIRONMENT` / `AWS_APPCONFIG_PROFILE` / `AWS_APPCONFIG_TARGET` | one identity per independently operated model, role, tier, and rollout lane | Enables hot updates of the admission maximum, backend-rejection cooldown, and `Retry-After`. All four are required together. Ordinary replicas in one group share a profile; canary and stable lanes may use different profiles. |
 | `AWS_APPCONFIG_AGENT_URL` / `AWS_APPCONFIG_REFRESH_SECS` | local sidecar URL / `5` | Reads the Agent's local cache in the background. Environment admission values always form the bootstrap policy; an unreachable or invalid Agent never prevents startup or request serving and never clears the last valid policy. |
 | `AWS_APPCONFIG_AGENT_ACCESS_TOKEN` | deployment secret when Agent access protection is enabled | Optional bearer used only for the private Agent endpoint and never logged. AWS credentials belong to the Agent sidecar, not inference-proxy. |
+| `VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT` | `1` | Engine-reported queue depth at or above which a backend counts as saturated for placement and the fleet-wide queue refusal below; the OpenRouter lane runs `4` for engines that run chunked prefill, where a shallow queue is normal while slots are still free. |
 | `VLLM_BACKEND_CONNECT_FAILOVER` | `1` | A backend that refuses the connection (host down, proxy restarting) costs the request nothing: it is re-sent once to another healthy backend, the dead one leaves the rotation until a probe succeeds, and a pinned conversation follows. Never on an HTTP error. |
 | `VLLM_BACKEND_PROBE_URLS` / `_INTERVAL_SECS` | `http://<host-ip>:8000,…` / `2` | The engines' live running/queued counts, read from each host's plain metrics port (the same route model-proxy samples; reachable from the model-proxy hosts, no token). One reading covers the replica the host would route to, so a queue in it means no replica is free. Drives placement and the fleet-wide queue refusal below. |
 | `VLLM_BACKEND_LONG_CONTEXT_URLS` | the `-long-b<handle>` URLs | The hosts of the long-context tier, listed as their handle URLs under the model's `-long` model-proxy domain (see below). Appended to the pool after `VLLM_BACKEND_URLS`, so the base backends keep their indexes. Empty = one flat pool, as today. |
 | `VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS` | `http://<host-ip>:8000,…` | One engine-load probe per long-context backend, same order. Required when `VLLM_BACKEND_PROBE_URLS` is set, and empty when it is not; internally the two lists are concatenated in pool order. |
 | `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` | `100000` | Estimated input tokens above which a request is placed on that tier. `0`/unset switches the whole feature off, and nothing is even estimated. |
+| `VLLM_BACKEND_TIER_STRICT` | `1` | Isolate the tiers in both directions: a request whose tier has no healthy backend is refused (429 + `Retry-After`, or a 503 with `error_type: "tier_unavailable"` when admission is off) instead of placed on the other tier. Off by default (see below). Only meaningful with `VLLM_BACKEND_LONG_CONTEXT_URLS` and a nonzero `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS`; without either it is ignored (a startup warning says so). |
 | `NON_TEE_DEPLOYMENT` | `1` | No dstack socket outside a CVM: `/healthz` reports `"dstack":"skipped"`, no attestation refresh, and `/v1/attestation/report`, `/v1/signature/{id}`, `/internal/gpu_evidence` answer 404 so nothing unverifiable is advertised. |
 | `DEV` / `GPU_NO_HW_MODE` | `1` / `1` | Non-TEE: random signing keys, no hardware evidence. |
 | `LISTEN_ADDR` / `LISTEN_PORT` | `127.0.0.1` / `31700` | Bind behind the local TLS terminator. |
@@ -210,7 +212,8 @@ upstream:
 
 1. **Observed overload.** The engines' own queues first: with
    `VLLM_BACKEND_PROBE_URLS` each host's running and queued request counts are
-   polled every two seconds; a host with a non-empty queue is steered around,
+   polled every two seconds; a host whose queue is at or above
+   `VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT` (default 1) is steered around,
    and once every healthy host queues, new work is refused (reason
    `backend_queue`). Then two signals the gateway measures on its own traffic.
    Time to first generation, measured from the moment the request is sent
@@ -266,7 +269,8 @@ back-pressure for the next admission decision
 `admission_backpressure_total{backend}`, `backend_failover_total{outcome}`,
 `upstream_stream_error_events_total{phase}`, `backend_engine_running{backend}`,
 `backend_engine_queued{backend}`, `backend_engine_probe_failures_total{backend}`,
-`backend_tier_requests_total{tier,outcome=routed|fallback|fallback_late}`,
+`backend_tier_requests_total{tier,outcome=routed|fallback|fallback_late|refused|refused_late}`
+(the `refused*` outcomes only occur with `VLLM_BACKEND_TIER_STRICT`),
 `request_estimated_prompt_tokens`,
 plus the existing usage-report and upstream metrics.
 
@@ -322,14 +326,27 @@ queueing" refusal. The consequences are deliberate:
   around (engine queue, recent engine rejection) means `429` + `Retry-After`
   for the next oversized request — keeping those prefills off the base fleet is
   the whole point, and a fast refusal lets the aggregator route elsewhere.
-- **A tier with no healthy backend falls back.** If the wanted tier is down
-  entirely the request is placed in the other one rather than refused
-  (`backend_tier_requests_total{outcome="fallback"}`), including when its last
-  host goes unreachable mid-request: both the placement and the connection
-  fail-over re-resolve the restriction after taking that host out of the
-  rotation and cross over, counted `fallback_late` — so each request adds
-  exactly one `routed` or `fallback`, plus a `fallback_late` if its tier died
-  under it.
+- **A tier with no healthy backend falls back — by default.** If the wanted
+  tier is down entirely the request is placed in the other one rather than
+  refused (`backend_tier_requests_total{outcome="fallback"}`), including when
+  its last host goes unreachable mid-request: both the placement and the
+  connection fail-over re-resolve the restriction after taking that host out
+  of the rotation and cross over, counted `fallback_late` — so each request
+  adds exactly one `routed` or `fallback`, plus a `fallback_late` if its tier
+  died under it. `VLLM_BACKEND_TIER_STRICT` turns this off for deployments
+  that isolate the tiers on purpose: the restriction never lifts, so an empty
+  tier is refused instead of spilling onto the other one — `429` +
+  `Retry-After` when admission is enabled
+  (`admission_rejections_total{reason="tier_unavailable"}`), a plain `503`
+  with `error_type: "tier_unavailable"` when it is not — counted
+  `refused`/`refused_late` in place of `fallback`/`fallback_late`. A live
+  request's connect failure marks its backend unreachable immediately, with
+  no debounce; the pool health checker's own probe needs
+  `HEALTH_CHECK_MAX_FAILURES` (default `3`) consecutive failures on its
+  `HEALTH_CHECK_INTERVAL_SECS` (default `5` s) cadence to mark one down, but
+  only one success to bring it back — so in strict mode a single failed
+  connect can leave a one-host tier refusing everything for up to one
+  interval before the next successful probe recovers it.
 - **Conversation affinity crosses tiers.** A conversation pinned on a base host
   that grows past the threshold is placed fresh in the long tier and re-pinned
   there — the same re-prefill cloud-api pays at the boundary.

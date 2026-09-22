@@ -6,14 +6,12 @@ use axum::Extension;
 
 use sha2::Digest;
 
-use crate::admission::RejectReason;
 use crate::auth::RequireAuth;
-use crate::backend_pool;
 use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
-use crate::proxy::{
-    self, make_usage_reporter, ConnectFailover, ProxyOpts, ResponseShape, UsageType,
-};
+use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageType};
+use crate::routes::completion_placement::place_completion;
+use crate::routes::ROUTE_CHAT_COMPLETIONS;
 use crate::{agent_loop, fusion};
 use crate::{AppState, TracingIds};
 
@@ -86,11 +84,16 @@ pub async fn chat_completions(
     )?;
     // Long-context tier (gateway mode): a request whose estimated input is
     // above the threshold belongs on the long-context backends, and every
-    // candidate selection below is restricted to its tier. `None` when the
-    // feature is off or that tier has no healthy host (see `context_tier.rs`).
+    // candidate selection below is restricted to its tier. `tier` is `None`
+    // only when the feature itself is off (`long_context_above_tokens == 0`).
+    // An empty tier is folded into `TierDecision.restrict` instead: lifted to
+    // `None` there so the request falls back to the other tier (default), or
+    // pinned `Some` so it is refused later (`VLLM_BACKEND_TIER_STRICT`). See
+    // `context_tier.rs`.
     let tier = crate::context_tier::decide(
         &state.backend_pool,
         state.config.long_context_above_tokens,
+        state.config.backend_tier_strict,
         || crate::context_tier::chat_estimate(&request_json),
     );
     // Lane admission (gateway mode), first half: the overload and budget
@@ -241,58 +244,9 @@ pub async fn chat_completions(
         (None, None)
     };
 
-    // Lane admission, second half: one budget slot, then a placement bounded
-    // by the per-host share that steers around backends which just rejected
-    // at engine admission. Refuses with 429 before anything is sent upstream;
-    // disabled deployments get `None`s and plain least-connections.
-    let permit = state.admission.try_admit(&state.backend_pool, tier)?;
-    let limits = state.admission.backend_limits(&state.backend_pool);
-    let mut restrict = tier.and_then(|tier| tier.restrict);
-    let requested_tier = tier.map(|decision| decision.estimated);
-    let place = |tier| {
-        let policy = backend_pool::Policy {
-            max_conns: None,
-            max_conns_by_backend: limits.as_deref(),
-            requested_tier,
-            avoid: &|index| state.admission.backend_saturated(index),
-            engine: &|index| state.admission.engine(index),
-            tier,
-        };
-        state.backend_affinity.place(
-            &state.backend_pool,
-            backend_affinity_key,
-            "/v1/chat/completions",
-            &policy,
-        )
-    };
-    let mut placement = place(restrict);
-    // The tier may have emptied since the decision (a fail-over just marked
-    // its last host unreachable): fall back, do not refuse. `restrict` then
-    // follows the placement, so a connection fail-over uses the same one.
-    if placement.is_none()
-        && restrict.is_some_and(|tier| {
-            crate::context_tier::recheck_restriction(&state.backend_pool, tier).is_none()
-        })
-    {
-        restrict = None;
-        placement = place(None);
-    }
-    let placement =
-        placement.ok_or_else(|| AppError::from(state.admission.reject(RejectReason::HostShare)))?;
-    if let Some(permit) = permit.as_ref() {
-        permit.attach_backend(placement.index);
-    }
-    let connect_failover = state
-        .config
-        .backend_connect_failover
-        .then(|| ConnectFailover {
-            pool: state.backend_pool.clone(),
-            path: "/v1/chat/completions",
-            index: placement.index,
-            tier: restrict,
-            affinity: backend_affinity_key.map(|key| (state.backend_affinity.clone(), key)),
-        });
-    let url = placement.url;
+    // Lane admission, per-host placement and connection fail-over policy are
+    // shared with text completions. Chat retains its conversation affinity.
+    let placed = place_completion(&state, ROUTE_CHAT_COMPLETIONS, tier, backend_affinity_key)?;
     let opts = ProxyOpts {
         signing: state.signing.clone(),
         cache: state.cache.clone(),
@@ -303,7 +257,7 @@ pub async fn chat_completions(
         request_hash: Some(request_hash),
         response_transform,
         chunk_transform,
-        backend_guard: Some(placement.guard),
+        backend_guard: Some(placed.backend_guard),
         stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
         sse_keepalive_secs: state.config.sse_keepalive_secs,
         map_queue_full_to_429: state.config.map_queue_full_to_429,
@@ -312,14 +266,15 @@ pub async fn chat_completions(
         response_shape: ResponseShape::ChatCompletion,
         tracing_ids: Some(tracing_ids),
         upstream_data_parallel_rank,
-        admission: permit,
-        connect_failover,
+        admission: placed.admission,
+        connect_failover: placed.connect_failover,
     };
 
     if is_stream {
-        proxy::proxy_streaming_request(&state.backend_client, &url, modified_body, opts).await
+        proxy::proxy_streaming_request(&state.backend_client, &placed.url, modified_body, opts)
+            .await
     } else {
-        proxy::proxy_json_request(&state.backend_client, &url, modified_body, opts).await
+        proxy::proxy_json_request(&state.backend_client, &placed.url, modified_body, opts).await
     }
 }
 

@@ -90,9 +90,12 @@ impl fmt::Debug for AppConfigSource {
 }
 
 impl AppConfigSource {
-    /// Construct a source using the process's normal HTTP client.
-    pub fn new(settings: AppConfigSettings, client: reqwest::Client) -> Self {
-        Self { settings, client }
+    /// Construct a source whose bearer token can never follow a redirect.
+    pub fn new(settings: AppConfigSettings) -> Result<Self, reqwest::Error> {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        Ok(Self { settings, client })
     }
 
     pub fn settings(&self) -> &AppConfigSettings {
@@ -414,6 +417,7 @@ mod tests {
                     ramp_step: 1,
                     ramp_interval: Duration::from_secs(60),
                     ttft_p95_max: None,
+                    queue_saturated_at: 1,
                 },
                 AdmissionPolicy {
                     max_inflight: 8,
@@ -443,7 +447,7 @@ mod tests {
             .respond_with(response)
             .mount(&server)
             .await;
-        let source = AppConfigSource::new(settings(&server), reqwest::Client::new());
+        let source = AppConfigSource::new(settings(&server)).unwrap();
         (server, source)
     }
 
@@ -502,7 +506,7 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let source = AppConfigSource::new(settings(&server), reqwest::Client::new());
+        let source = AppConfigSource::new(settings(&server)).unwrap();
         assert!(matches!(
             source.fetch().await,
             Err(AppConfigFetchError::Invalid(_))
@@ -512,7 +516,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_non_success_and_recovers_after_response_changes() {
         let server = MockServer::start().await;
-        let source = AppConfigSource::new(settings(&server), reqwest::Client::new());
+        let source = AppConfigSource::new(settings(&server)).unwrap();
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(503))
             .mount(&server)
@@ -536,6 +540,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn does_not_follow_agent_redirects_with_a_bearer_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(header("authorization", "Bearer do-not-forward"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/redirect-target", server.uri())),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/redirect-target"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let mut settings = settings(&server);
+        settings.access_token = Some(crate::config::SensitiveString::new(
+            "do-not-forward".to_string(),
+        ));
+
+        let source = AppConfigSource::new(settings).unwrap();
+        assert!(matches!(
+            source.fetch().await,
+            Err(AppConfigFetchError::HttpStatus { status }) if status.as_u16() == 302
+        ));
+    }
+
+    #[tokio::test]
     async fn timeout_is_a_transport_error() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -547,7 +580,7 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let source = AppConfigSource::new(settings(&server), reqwest::Client::new());
+        let source = AppConfigSource::new(settings(&server)).unwrap();
         assert!(matches!(
             source.fetch().await,
             Err(AppConfigFetchError::Transport(_))
@@ -571,7 +604,7 @@ mod tests {
         settings.access_token = Some(crate::config::SensitiveString::new(
             "actual-agent-secret".to_string(),
         ));
-        let source = AppConfigSource::new(settings, reqwest::Client::new());
+        let source = AppConfigSource::new(settings).unwrap();
         assert!(!format!("{source:?}").contains("actual-agent-secret"));
         source.fetch().await.unwrap();
         server.verify().await;
@@ -580,7 +613,7 @@ mod tests {
     #[tokio::test]
     async fn reconciler_updates_metadata_for_new_version_with_identical_content() {
         let server = MockServer::start().await;
-        let source = AppConfigSource::new(settings(&server), reqwest::Client::new());
+        let source = AppConfigSource::new(settings(&server)).unwrap();
         let admission = controller();
         let mut active = None;
         for version in ["v1", "v2"] {
@@ -608,7 +641,7 @@ mod tests {
     #[tokio::test]
     async fn reconciler_rejects_changed_content_under_the_active_version() {
         let server = MockServer::start().await;
-        let source = AppConfigSource::new(settings(&server), reqwest::Client::new());
+        let source = AppConfigSource::new(settings(&server)).unwrap();
         let admission = controller();
         let mut active = None;
         Mock::given(method("GET"))
@@ -652,7 +685,7 @@ mod tests {
             )),
         };
         assert!(!format!("{settings:?}").contains("actual-agent-secret"));
-        let source = AppConfigSource::new(settings, reqwest::Client::new());
+        let source = AppConfigSource::new(settings).unwrap();
         assert!(!format!("{source:?}").contains("actual-agent-secret"));
     }
 }

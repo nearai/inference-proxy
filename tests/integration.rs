@@ -257,6 +257,7 @@ fn build_test_app_inner_with_pool(
         admission_ramp_interval_secs: 1800,
         admission_ttft_p95_max_ms: 30_000,
         admission_backpressure_secs: 10,
+        admission_queue_saturated_at: 1,
         admission_retry_after_secs: 2,
         appconfig: None,
         backend_connect_failover: false,
@@ -264,6 +265,7 @@ fn build_test_app_inner_with_pool(
         backend_long_context_urls: Vec::new(),
         backend_long_context_probe_urls: Vec::new(),
         long_context_above_tokens: 0,
+        backend_tier_strict: false,
         backend_probe_interval_secs: 2,
         dstack_socket_path: options.dstack_socket_path,
         gpu_evidence_delegate_url: None,
@@ -5437,6 +5439,7 @@ fn build_test_app_with_cloud_api_retries(
         admission_ramp_interval_secs: 1800,
         admission_ttft_p95_max_ms: 30_000,
         admission_backpressure_secs: 10,
+        admission_queue_saturated_at: 1,
         admission_retry_after_secs: 2,
         appconfig: None,
         backend_connect_failover: false,
@@ -5444,6 +5447,7 @@ fn build_test_app_with_cloud_api_retries(
         backend_long_context_urls: Vec::new(),
         backend_long_context_probe_urls: Vec::new(),
         long_context_above_tokens: 0,
+        backend_tier_strict: false,
         backend_probe_interval_secs: 2,
         dstack_socket_path: "/var/run/dstack.sock".to_string(),
         gpu_evidence_delegate_url: None,
@@ -7647,10 +7651,10 @@ async fn test_encrypted_streaming_completions_ed25519() {
     }
 }
 
-// ---- Multipart: signature covers encrypted response ----
+// ---- Multipart: signature covers raw request and encrypted response ----
 
 #[tokio::test]
-async fn test_encrypted_audio_transcription_signature_covers_transformed() {
+async fn test_encrypted_audio_transcription_signature_hashes_raw_request_and_response() {
     use sha2::{Digest, Sha256};
     use vllm_proxy_rs::encryption;
 
@@ -7755,15 +7759,14 @@ async fn test_encrypted_audio_transcription_signature_covers_transformed() {
     let sig_body = body_to_json(sig_response).await;
     let signed_text = sig_body["text"].as_str().unwrap();
 
-    // Verify response hash in the signature covers the encrypted response
-    let response_sha256 = hex::encode(Sha256::digest(&response_bytes));
-
-    let parts: Vec<&str> = signed_text.split(':').collect();
-    assert_eq!(parts.len(), 3);
-    assert_eq!(parts[0], "test-model");
+    let request_bytes = format!("whisper-1{encrypted_prompt}fakeaudiodata");
     assert_eq!(
-        parts[2], response_sha256,
-        "Multipart signature should cover encrypted response bytes (what client receives)"
+        signed_text,
+        format!(
+            "test-model:{}:{}",
+            hex::encode(Sha256::digest(request_bytes)),
+            hex::encode(Sha256::digest(&response_bytes))
+        )
     );
 }
 
@@ -8069,6 +8072,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         admission_ramp_interval_secs: 1800,
         admission_ttft_p95_max_ms: 30_000,
         admission_backpressure_secs: 10,
+        admission_queue_saturated_at: 1,
         admission_retry_after_secs: 2,
         appconfig: None,
         backend_connect_failover: false,
@@ -8076,6 +8080,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         backend_long_context_urls: Vec::new(),
         backend_long_context_probe_urls: Vec::new(),
         long_context_above_tokens: 0,
+        backend_tier_strict: false,
         backend_probe_interval_secs: 2,
         dstack_socket_path: "/var/run/dstack.sock".to_string(),
         gpu_evidence_delegate_url: None,
@@ -8526,6 +8531,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         admission_ramp_interval_secs: 1800,
         admission_ttft_p95_max_ms: 30_000,
         admission_backpressure_secs: 10,
+        admission_queue_saturated_at: 1,
         admission_retry_after_secs: 2,
         appconfig: None,
         backend_connect_failover: false,
@@ -8533,6 +8539,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         backend_long_context_urls: Vec::new(),
         backend_long_context_probe_urls: Vec::new(),
         long_context_above_tokens: 0,
+        backend_tier_strict: false,
         backend_probe_interval_secs: 2,
         dstack_socket_path: "/var/run/dstack.sock".to_string(),
         gpu_evidence_delegate_url: None,

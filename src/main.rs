@@ -244,6 +244,7 @@ async fn main() -> anyhow::Result<()> {
             ramp_interval_secs = settings.ramp_interval.as_secs(),
             ttft_p95_max_ms = settings.ttft_p95_max.map_or(0, |d| d.as_millis()),
             backpressure_secs = applied.policy.backpressure_ttl.as_secs(),
+            queue_saturated_at = settings.queue_saturated_at,
             retry_after_secs = applied.policy.retry_after.as_secs(),
             "Lane admission enabled"
         );
@@ -285,7 +286,7 @@ async fn main() -> anyhow::Result<()> {
             refresh_secs = settings.refresh_interval.as_secs(),
             "AWS AppConfig admission-policy refresh enabled"
         );
-        let source = appconfig::AppConfigSource::new(settings, state.http_client.clone());
+        let source = appconfig::AppConfigSource::new(settings)?;
         appconfig::spawn_admission_policy_refresh(source, state.admission.clone());
     }
 

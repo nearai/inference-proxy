@@ -44,6 +44,7 @@ struct GatewayOptions {
     admission_start_inflight: Option<u32>,
     admission_ttft_p95_max_ms: Option<u64>,
     admission_backpressure_secs: Option<u64>,
+    admission_queue_saturated_at: Option<u32>,
     backend_connect_failover: bool,
     /// Engine metrics probe base URLs, one per backend (polled every 100 ms here).
     backend_probe_urls: Vec<String>,
@@ -52,6 +53,9 @@ struct GatewayOptions {
     backend_long_context_urls: Vec<String>,
     backend_long_context_probe_urls: Vec<String>,
     long_context_above_tokens: u64,
+    /// `VLLM_BACKEND_TIER_STRICT`: refuse a request whose tier has no
+    /// healthy backend instead of falling back to the other one.
+    backend_tier_strict: bool,
     /// Source of the models document (a mock cloud-api `/v1/models`).
     models_document_url: Option<String>,
     capacity_requests_per_minute: u64,
@@ -165,6 +169,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         admission_ramp_interval_secs: 1800,
         admission_ttft_p95_max_ms: options.admission_ttft_p95_max_ms.unwrap_or(30_000),
         admission_backpressure_secs: options.admission_backpressure_secs.unwrap_or(10),
+        admission_queue_saturated_at: options.admission_queue_saturated_at.unwrap_or(1),
         admission_retry_after_secs: 2,
         appconfig: options
             .appconfig_agent_url
@@ -184,6 +189,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         backend_long_context_urls: options.backend_long_context_urls.clone(),
         backend_long_context_probe_urls: options.backend_long_context_probe_urls.clone(),
         long_context_above_tokens: options.long_context_above_tokens,
+        backend_tier_strict: options.backend_tier_strict,
         dstack_socket_path: "/nonexistent/dstack.sock".to_string(),
         gpu_evidence_delegate_url: None,
         gpu_evidence_delegate_timeout_secs: 30,
@@ -315,6 +321,12 @@ fn chat_request(body: serde_json::Value) -> Request<Body> {
         .unwrap()
 }
 
+const COMPLETION_ROUTES: [&str; 2] = [routes::ROUTE_CHAT_COMPLETIONS, routes::ROUTE_COMPLETIONS];
+async fn call(app: axum::Router, route: &str) -> axum::response::Response {
+    let mut request = chat_request(serde_json::json!({"messages": [], "prompt": "hello"}));
+    *request.uri_mut() = route.parse().unwrap();
+    app.oneshot(request).await.unwrap()
+}
 fn chat_completion_json() -> serde_json::Value {
     serde_json::json!({
         "id": "chatcmpl-gw-1",
@@ -530,7 +542,7 @@ fn admission_document(max_inflight: u32) -> serde_json::Value {
 }
 
 fn appconfig_source(settings: config::AppConfigSettings) -> appconfig::AppConfigSource {
-    appconfig::AppConfigSource::new(settings, reqwest::Client::new())
+    appconfig::AppConfigSource::new(settings).expect("build AppConfig HTTP client")
 }
 
 async fn wait_for_budget(state: &AppState, expected: u32) {
@@ -1641,50 +1653,40 @@ async fn assert_overloaded(response: axum::response::Response) {
     let json = json_body(response).await;
     assert_eq!(json["error"]["type"], "overloaded");
 }
-
 #[tokio::test]
 async fn admission_budget_refuses_with_429_before_dispatch() {
-    let mock = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(chat_completion_json())
-                .set_delay(Duration::from_millis(700)),
-        )
-        .expect(2) // the first and the third request; the second never dispatches
-        .mount(&mock)
-        .await;
-    let app = build_gateway(
-        &mock.uri(),
-        GatewayOptions {
-            admission_max_inflight: 1,
-            ..Default::default()
-        },
-    );
-
-    let first = tokio::spawn({
-        let app = app.clone();
-        async move { app.oneshot(chat_request(hello_body())).await.unwrap() }
-    });
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let started = std::time::Instant::now();
-    let second = app
-        .clone()
-        .oneshot(chat_request(hello_body()))
-        .await
-        .unwrap();
-    assert!(
-        started.elapsed() < Duration::from_millis(300),
-        "refusal must not wait for the in-flight request"
-    );
-    assert_overloaded(second).await;
-
-    assert_eq!(first.await.unwrap().status(), StatusCode::OK);
-    // The slot was released with the response.
-    let third = app.oneshot(chat_request(hello_body())).await.unwrap();
-    assert_eq!(third.status(), StatusCode::OK);
-    mock.verify().await;
+    for route in COMPLETION_ROUTES {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(chat_completion_json())
+                    .set_delay(Duration::from_millis(700)),
+            )
+            .expect(2) // the first and third requests; the second never dispatches
+            .mount(&mock)
+            .await;
+        let app = build_gateway(
+            &mock.uri(),
+            GatewayOptions {
+                admission_max_inflight: 1,
+                ..Default::default()
+            },
+        );
+        let first = tokio::spawn(call(app.clone(), route));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let started = std::time::Instant::now();
+        let second = call(app.clone(), route).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "refusal must not wait for the in-flight request"
+        );
+        assert_overloaded(second).await;
+        assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(call(app, route).await.status(), StatusCode::OK);
+        mock.verify().await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1976,27 +1978,28 @@ async fn engine_queue_full_on_every_backend_refuses_new_work_without_dispatch() 
 
 #[tokio::test]
 async fn connect_error_fails_over_to_another_backend_when_enabled() {
-    let mock = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
-        .expect(1)
-        .mount(&mock)
-        .await;
-    // Least-connections picks the first (dead) backend for the first request.
-    let dead = unreachable_backend_url();
-    let app = build_gateway(
-        &mock.uri(),
-        GatewayOptions {
-            backend_urls: vec![dead, mock.uri()],
-            backend_connect_failover: true,
-            admission_max_inflight: 4,
-            ..Default::default()
-        },
-    );
-    let response = app.oneshot(chat_request(hello_body())).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    mock.verify().await;
+    for route in COMPLETION_ROUTES {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        // Least-connections picks the first (dead) backend.
+        let dead = unreachable_backend_url();
+        let app = build_gateway(
+            &mock.uri(),
+            GatewayOptions {
+                backend_urls: vec![dead, mock.uri()],
+                backend_connect_failover: true,
+                admission_max_inflight: 4,
+                ..Default::default()
+            },
+        );
+        assert_eq!(call(app, route).await.status(), StatusCode::OK);
+        mock.verify().await;
+    }
 }
 
 #[tokio::test]
@@ -2025,33 +2028,37 @@ async fn connect_error_is_not_retried_without_failover() {
 
 #[tokio::test]
 async fn failover_never_retries_an_engine_rejection() {
-    let saturated = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(503).set_body_string(QUEUE_FULL_BODY))
-        .expect(1)
-        .mount(&saturated)
-        .await;
-    let idle = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
-        .expect(0)
-        .mount(&idle)
-        .await;
-    let app = build_gateway(
-        &saturated.uri(),
-        GatewayOptions {
-            backend_urls: vec![saturated.uri(), idle.uri()],
-            backend_connect_failover: true,
-            map_queue_full_to_429: true,
-            ..Default::default()
-        },
-    );
-    let response = app.oneshot(chat_request(hello_body())).await.unwrap();
-    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-    saturated.verify().await;
-    idle.verify().await;
+    for route in COMPLETION_ROUTES {
+        let rejected = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(503).set_body_string(QUEUE_FULL_BODY))
+            .expect(1)
+            .mount(&rejected)
+            .await;
+        let idle = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+            .expect(0)
+            .mount(&idle)
+            .await;
+        let app = build_gateway(
+            &rejected.uri(),
+            GatewayOptions {
+                backend_urls: vec![rejected.uri(), idle.uri()],
+                backend_connect_failover: true,
+                map_queue_full_to_429: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            call(app, route).await.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        rejected.verify().await;
+        idle.verify().await;
+    }
 }
 
 #[tokio::test]
@@ -2234,6 +2241,51 @@ async fn a_queueing_engine_is_steered_around_and_a_fleet_wide_queue_refuses() {
     let response = app.oneshot(chat_request(hello_body())).await.unwrap();
     assert_overloaded(response).await;
     idle.verify().await;
+}
+
+#[tokio::test]
+async fn a_configured_queue_threshold_gates_admission() {
+    let backend_a = MockServer::start().await;
+    let backend_b = MockServer::start().await;
+    // Symmetric loads: least-connections ties break on index, so backend_a
+    // (first in the pool) is the one dispatched to below the threshold.
+    mount_engine(&backend_a, 0, 2, 1).await;
+    mount_engine(&backend_b, 0, 2, 0).await;
+    let app = build_gateway(
+        &backend_a.uri(),
+        GatewayOptions {
+            backend_urls: vec![backend_a.uri(), backend_b.uri()],
+            backend_probe_urls: vec![backend_a.uri(), backend_b.uri()],
+            admission_max_inflight: 8,
+            admission_queue_saturated_at: Some(4),
+            ..Default::default()
+        },
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await; // a few polls
+
+    // queued=2 on every backend is below the configured threshold of 4:
+    // neither backend is saturated, so the request is admitted.
+    let response = app
+        .clone()
+        .oneshot(chat_request(hello_body()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    backend_a.verify().await;
+    backend_b.verify().await;
+
+    // Now every backend queues at the threshold: fleet-wide refusal. (Which
+    // refusal it was lives in the log line and in
+    // `admission_rejections_total{reason="backend_queue"}`, neither
+    // observable from here — this test file's `metrics_handle` is never
+    // installed as the global recorder, so `/metrics` always renders empty.)
+    backend_a.reset().await;
+    backend_b.reset().await;
+    mount_engine(&backend_a, 0, 4, 0).await;
+    mount_engine(&backend_b, 0, 4, 0).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let response = app.oneshot(chat_request(hello_body())).await.unwrap();
+    assert_overloaded(response).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -2425,6 +2477,143 @@ async fn a_tier_without_a_healthy_backend_falls_back_to_the_other_one() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
+    live.verify().await;
+}
+
+/// The 429 body only ever carries the generic `overloaded` type (`error.rs`
+/// maps every `RejectReason` to the same shape): the specific reason is only
+/// in the log line and `admission_rejections_total{reason}`. Captured with a
+/// local recorder scoped around the request — safe here because
+/// `#[tokio::test]` defaults to the single-threaded flavor, so nothing this
+/// request touches runs on another OS thread outside the guard's scope.
+async fn oneshot_with_rejection_reason_metric(
+    app: axum::Router,
+    request: Request<Body>,
+) -> (axum::response::Response, String) {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let guard = metrics::set_default_local_recorder(&recorder);
+    let response = app.oneshot(request).await.unwrap();
+    drop(guard);
+    (response, handle.render())
+}
+
+#[tokio::test]
+async fn strict_mode_refuses_instead_of_falling_back_across_the_tiers() {
+    let live = MockServer::start().await;
+    let dead = unreachable_backend_url();
+    // The long tier's only host is unreachable; strict mode pins the
+    // restriction through the connect fail-over instead of widening the
+    // search, so the oversized request is refused rather than landing its
+    // 300k-token prefill on a base host.
+    let app = build_gateway(
+        &live.uri(),
+        GatewayOptions {
+            backend_urls: vec![live.uri()],
+            backend_long_context_urls: vec![dead],
+            long_context_above_tokens: ABOVE_TOKENS,
+            backend_connect_failover: true,
+            backend_tier_strict: true,
+            admission_max_inflight: 4,
+            ..Default::default()
+        },
+    );
+    let (response, rendered_metrics) =
+        oneshot_with_rejection_reason_metric(app.clone(), chat_request(sized_body(4_000))).await;
+    assert_overloaded(response).await;
+    assert!(
+        rendered_metrics.contains("admission_rejections_total{reason=\"tier_unavailable\"} 1"),
+        "{rendered_metrics}"
+    );
+    // A short request is unaffected: it never touches the long tier.
+    mount_chat(&live, 1).await;
+    let response = app.oneshot(chat_request(sized_body(400))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    live.verify().await;
+    live.reset().await;
+
+    // And the other way around: with the base fleet gone, a short request is
+    // refused rather than served by the idle long-context host.
+    let dead = unreachable_backend_url();
+    let app = build_gateway(
+        &live.uri(),
+        GatewayOptions {
+            backend_urls: vec![dead],
+            backend_long_context_urls: vec![live.uri()],
+            long_context_above_tokens: ABOVE_TOKENS,
+            backend_connect_failover: true,
+            backend_tier_strict: true,
+            admission_max_inflight: 4,
+            ..Default::default()
+        },
+    );
+    let (response, rendered_metrics) =
+        oneshot_with_rejection_reason_metric(app.clone(), chat_request(sized_body(400))).await;
+    assert_overloaded(response).await;
+    assert!(
+        rendered_metrics.contains("admission_rejections_total{reason=\"tier_unavailable\"} 1"),
+        "{rendered_metrics}"
+    );
+    mount_chat(&live, 1).await;
+    let response = app.oneshot(chat_request(sized_body(4_000))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    live.verify().await;
+}
+
+#[tokio::test]
+async fn strict_mode_tier_already_empty_before_placement_refuses_with_tier_unavailable() {
+    let live = MockServer::start().await;
+    let dead = unreachable_backend_url();
+    // Unlike `strict_mode_refuses_instead_of_falling_back_across_the_tiers`,
+    // the long tier's only backend is marked unhealthy up front rather than
+    // failing a live connect attempt: placement (`completion_placement.rs`)
+    // finds it already empty and refuses directly, so the connect fail-over
+    // path in `proxy.rs` is never reached for this request.
+    let (app, state) = build_gateway_with_state(
+        &live.uri(),
+        GatewayOptions {
+            backend_urls: vec![live.uri()],
+            backend_long_context_urls: vec![dead],
+            long_context_above_tokens: ABOVE_TOKENS,
+            backend_tier_strict: true,
+            admission_max_inflight: 4,
+            ..Default::default()
+        },
+    );
+    state.backend_pool.backends()[1]
+        .healthy
+        .store(false, std::sync::atomic::Ordering::Release);
+    let (response, rendered_metrics) =
+        oneshot_with_rejection_reason_metric(app, chat_request(sized_body(4_000))).await;
+    assert_overloaded(response).await;
+    assert!(
+        rendered_metrics.contains("admission_rejections_total{reason=\"tier_unavailable\"} 1"),
+        "{rendered_metrics}"
+    );
+}
+
+#[tokio::test]
+async fn strict_mode_returns_503_when_admission_is_disabled() {
+    let live = MockServer::start().await;
+    let dead = unreachable_backend_url();
+    // No `admission_max_inflight`: admission is off, so the refusal has no
+    // `Permit` to build the 429 `Overloaded` shape from and falls back to a
+    // plain 503 with `error_type: "tier_unavailable"`.
+    let app = build_gateway(
+        &live.uri(),
+        GatewayOptions {
+            backend_urls: vec![live.uri()],
+            backend_long_context_urls: vec![dead],
+            long_context_above_tokens: ABOVE_TOKENS,
+            backend_connect_failover: true,
+            backend_tier_strict: true,
+            ..Default::default()
+        },
+    );
+    let response = app.oneshot(chat_request(sized_body(4_000))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let json = json_body(response).await;
+    assert_eq!(json["error"]["type"], "tier_unavailable");
     live.verify().await;
 }
 

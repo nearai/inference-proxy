@@ -48,6 +48,17 @@ pub enum AppError {
         retry_after_secs: u64,
     },
 
+    /// Strict context tiers (`VLLM_BACKEND_TIER_STRICT`, `context_tier.rs`)
+    /// with admission disabled: the request's tier has no healthy backend at
+    /// all, and there is no `Permit` to build the 429 `Overloaded` shape
+    /// from. A 503 keeps it distinct from `upstream_unreachable` (a transport
+    /// failure) and from a 4xx (nothing was wrong with the request); a
+    /// dedicated variant (rather than reusing `UpstreamParsed`) keeps
+    /// `http_errors_total{error_type}` at `"tier_unavailable"` instead of the
+    /// generic `"upstream"` every `UpstreamParsed` response is labelled with.
+    #[error("no healthy backend in the requested context tier")]
+    TierUnavailable { retry_after_secs: u64 },
+
     #[error("{0}")]
     Internal(#[from] anyhow::Error),
 }
@@ -147,6 +158,11 @@ impl IntoResponse for AppError {
                 "The endpoint is at capacity. Please retry later.".to_string(),
                 "overloaded",
             ),
+            AppError::TierUnavailable { .. } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No healthy backend in the requested context tier".to_string(),
+                "tier_unavailable",
+            ),
             AppError::Internal(ref e) => {
                 error!(error = %e, "Internal server error");
                 (
@@ -169,10 +185,14 @@ impl IntoResponse for AppError {
         });
 
         let mut response = (status, axum::Json(body)).into_response();
-        if let AppError::Overloaded {
-            retry_after_secs, ..
-        } = self
-        {
+        let retry_after_secs = match self {
+            AppError::Overloaded {
+                retry_after_secs, ..
+            }
+            | AppError::TierUnavailable { retry_after_secs } => Some(retry_after_secs),
+            _ => None,
+        };
+        if let Some(retry_after_secs) = retry_after_secs {
             if let Ok(value) = axum::http::HeaderValue::from_str(&retry_after_secs.to_string()) {
                 response
                     .headers_mut()
@@ -189,6 +209,16 @@ impl From<crate::admission::Rejected> for AppError {
             reason: rejected.reason.as_str(),
             retry_after_secs: rejected.retry_after.as_secs().max(1),
         }
+    }
+}
+
+impl AppError {
+    /// See `AppError::TierUnavailable`. `retry_after_secs` should be the same
+    /// value the admission path's own 429 would carry
+    /// (`Config::admission_retry_after_secs`) so a caller sees one consistent
+    /// number for this deployment regardless of which refusal it hits.
+    pub fn tier_unavailable(retry_after_secs: u64) -> Self {
+        AppError::TierUnavailable { retry_after_secs }
     }
 }
 
@@ -236,6 +266,25 @@ mod tests {
         let (status, json) = response_to_json(response).await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(json["error"]["type"], "overloaded");
+    }
+
+    #[tokio::test]
+    async fn test_tier_unavailable_error_carries_retry_after_and_distinct_type() {
+        let err = AppError::tier_unavailable(2);
+        let response = err.into_response();
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("2")
+        );
+        let (status, json) = response_to_json(response).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        // Distinct from `UpstreamParsed`/`Upstream`, which both label
+        // `http_errors_total{error_type="upstream"}` regardless of the
+        // parsed type — this refusal must be countable on its own.
+        assert_eq!(json["error"]["type"], "tier_unavailable");
     }
 
     #[tokio::test]

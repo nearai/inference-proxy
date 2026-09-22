@@ -689,10 +689,9 @@ pub(crate) fn report_chat_usage_if_present(
 /// already produced. The caller keeps signing/caching gated on clean completion;
 /// a partial response cannot be verified, but it was still billed.
 ///
-/// Shared by `proxy_streaming_request` and `proxy_streaming_response` so both
-/// streaming paths bill identically. The reporter only exists for direct `sk-`
-/// requests (`RequireAuth.cloud_api_key`); cloud-api's own `InterceptStream` is
-/// not in that path, so this is the sole biller and there is no double-billing.
+/// The reporter only exists for direct `sk-` requests
+/// (`RequireAuth.cloud_api_key`); cloud-api's own `InterceptStream` is not in
+/// that path, so this is the sole biller and there is no double-billing.
 fn report_stream_usage_on_finalize(
     usage_reporter: &Option<UsageReporter>,
     usage: Option<((i64, i64), Option<i64>)>,
@@ -960,6 +959,14 @@ pub struct ConnectFailover {
     /// Context tier the replacement must belong to (`None` = the whole pool,
     /// see `context_tier.rs`).
     pub tier: Option<crate::context_tier::ContextTier>,
+    /// `Config::backend_tier_strict`: whether `tier` is re-resolved
+    /// (`context_tier::recheck_restriction`) to `None` once it empties, or
+    /// stays pinned so an empty tier is refused instead.
+    pub strict: bool,
+    /// `Config::admission_retry_after_secs`: `Retry-After` for the 503
+    /// `AppError::tier_unavailable` refusal below, when admission is off and
+    /// there is no `Permit` to carry it instead.
+    pub retry_after_secs: u64,
     /// Conversation to re-pin onto the replacement backend once it answers.
     pub affinity: Option<(
         Arc<crate::backend_affinity::BackendConversationAffinity>,
@@ -1049,21 +1056,26 @@ async fn send_upstream(
     let response = match first {
         Ok(response) => response,
         Err(error) if error.is_connect() && opts.connect_failover.is_some() => {
-            let (pool, path, failed, tier, affinity) = {
+            let (pool, path, failed, tier, strict, retry_after_secs, affinity) = {
                 let failover = opts.connect_failover.as_ref().expect("checked above");
                 (
                     failover.pool.clone(),
                     failover.path,
                     failover.index,
                     failover.tier,
+                    failover.strict,
+                    failover.retry_after_secs,
                     failover.affinity.clone(),
                 )
             };
             mark_backend_unreachable(&pool, failed);
             // The failed host may have been its tier's last one: re-resolve
             // the restriction now that it is out of the rotation, so the
-            // request falls back to the other tier instead of being refused.
-            let tier = tier.and_then(|tier| crate::context_tier::recheck_restriction(&pool, tier));
+            // request falls back to the other tier instead of being refused
+            // (non-strict). Strict mode never lifts it (see
+            // `recheck_restriction`); the check below refuses instead.
+            let tier =
+                tier.and_then(|tier| crate::context_tier::recheck_restriction(&pool, tier, strict));
             // Re-resolve destination limits after failure. Borrowing keeps
             // configured host counts; legacy mode follows healthy counts.
             let limits = opts
@@ -1088,6 +1100,38 @@ async fn send_upstream(
                 pool.select_excluding(failed, &policy)
             };
             let Some(next) = next else {
+                // Strict mode kept `tier` pinned above even though it is now
+                // empty: a healthy host elsewhere in the pool is not
+                // somewhere this request may go. Refuse deterministically
+                // rather than falling through to the generic host-share or
+                // exhausted cases below, which would either misreport the
+                // reason or (admission off) return a 502 that counts against
+                // upstream uptime the way a 429/503 does not.
+                //
+                // Gated on `strict` explicitly, not just on `tier` being
+                // `Some`: non-strict already lifts `tier` to `None` above
+                // whenever `recheck_restriction` saw the tier empty, but a
+                // concurrent request can empty it again between that check
+                // and `select_excluding` above, which would otherwise trip
+                // this block in non-strict mode too and refuse instead of
+                // falling through to the pre-existing host-share/exhausted
+                // handling below.
+                if strict && tier.is_some_and(|t| pool.healthy_count_in(Some(t)) == 0) {
+                    metrics::counter!("backend_failover_total", "outcome" => "refused")
+                        .increment(1);
+                    warn!(
+                        tier = tier.map_or("none", crate::context_tier::ContextTier::as_str),
+                        backend = %sanitized_upstream_url_for_logs(url),
+                        "Context tier has no healthy backend after fail-over, refusing"
+                    );
+                    return Err(match opts.admission.as_ref() {
+                        Some(permit) => {
+                            permit.abandon();
+                            AppError::from(permit.reject_tier_unavailable())
+                        }
+                        None => AppError::tier_unavailable(retry_after_secs),
+                    });
+                }
                 if pool.has_healthy_other_than(failed) {
                     if let Some(permit) = opts.admission.as_ref() {
                         // Somewhere to go, but every candidate is at its share
@@ -2989,7 +3033,7 @@ pub(crate) struct CompletionContext {
 }
 
 /// Sign already-fetched JSON response bytes, cache the signature, and return a JSON response.
-/// Used by catch-all and Fusion when content-type is already known to be JSON.
+/// Used by Fusion and privacy classification after they assemble the upstream body.
 pub(crate) async fn sign_and_cache_json_response(
     response_bytes: &[u8],
     request_sha256: &str,
@@ -3071,260 +3115,6 @@ pub(crate) async fn sign_and_cache_json_response(
         .status(status)
         .header("content-type", "application/json")
         .body(Body::from(final_body))
-        .unwrap())
-}
-
-/// Proxy an already-received streaming SSE response. Hashes all chunks, signs at end, caches.
-/// Used by catch-all when content-type is already known to be SSE.
-pub async fn proxy_streaming_response(
-    response: reqwest::Response,
-    request_sha256: &str,
-    opts: ProxyOpts,
-    status: StatusCode,
-    request_started_at: std::time::Instant,
-) -> Result<Response, AppError> {
-    // Capture log fields before any partial moves from opts.
-    let (log_request_id, log_org_id, log_workspace_id) = log_ids_or_empty(&opts.tracing_ids);
-    let completion_tracing_ids = opts.tracing_ids.clone();
-
-    let signing = opts.signing.clone();
-    let cache = opts.cache.clone();
-    let usage_reporter = opts.usage_reporter.clone();
-    let model_name = opts.model_name.clone();
-    let chunk_transform = opts.chunk_transform;
-    let backend_guard = opts.backend_guard;
-    let stream_idle_timeout_secs = opts.stream_idle_timeout_secs;
-    let request_sha256 = request_sha256.to_string();
-
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
-
-    let byte_stream = response.bytes_stream();
-    tokio::spawn(async move {
-        use futures_util::StreamExt;
-
-        let _guard = StreamingGuard::new();
-        let _backend_guard = backend_guard;
-
-        let mut byte_stream = std::pin::pin!(byte_stream);
-        let mut hasher = Sha256::new();
-        let mut parser = SseParser::new();
-        let mut upstream_error = false;
-        let mut downstream_closed = false;
-        let mut incomplete_reason = None;
-        let mut received_upstream_progress = false;
-        let mut transformer = SseTransformer::new(chunk_transform);
-
-        loop {
-            tokio::select! {
-                chunk = byte_stream.next() => {
-                    match chunk {
-                        Some(Ok(chunk)) => {
-                            received_upstream_progress |= parser.process_chunk(&chunk);
-
-                            // Normalize (and encrypt, if active) the chunk, then hash
-                            // what the client actually receives for signatures.
-                            let to_send = match transformer.process_chunk(&chunk) {
-                                Ok(transformed) => transformed,
-                                Err(e) => {
-                                    error!(error = %e, "Stream transform failed");
-                                    let _ = tx.send(Err(std::io::Error::other(
-                                        "Stream transform failed",
-                                    ))).await;
-                                    upstream_error = true;
-                                    incomplete_reason = Some("transform_error");
-                                    break;
-                                }
-                            };
-
-                            hasher.update(&to_send);
-
-                            if tx.send(Ok(to_send)).await.is_err() {
-                                downstream_closed = true;
-                                break;
-                            }
-                        }
-                        Some(Err(e)) => {
-                            error!(error = %e, "Error reading upstream stream");
-                            upstream_error = true;
-                            incomplete_reason = Some("upstream_read_error");
-                            let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
-                            break;
-                        }
-                        None => break, // stream ended
-                    }
-                }
-                _ = tx.closed() => {
-                    info!("Client disconnected, aborting upstream stream processing");
-                    downstream_closed = true;
-                    break;
-                }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(
-                    stream_idle_timeout_secs,
-                )), if stream_idle_timeout_secs > 0 && received_upstream_progress => {
-                    warn!(
-                        request_id = %log_request_id,
-                        org_id = %log_org_id,
-                        workspace_id = %log_workspace_id,
-                        model = %model_name.to_lowercase(),
-                        timeout_secs = stream_idle_timeout_secs,
-                        "Upstream SSE stream exceeded the idle timeout"
-                    );
-                    upstream_error = true;
-                    incomplete_reason = Some("idle_timeout");
-                    let _ = tx.send(Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "Upstream response stream timed out",
-                    ))).await;
-                    break;
-                }
-            }
-        }
-
-        parser.finish();
-
-        // Flush any remaining buffered content in the transformer
-        if !upstream_error && !downstream_closed {
-            match transformer.flush() {
-                Ok(flushed) if !flushed.is_empty() => {
-                    hasher.update(&flushed);
-                    if tx.send(Ok(flushed)).await.is_err() {
-                        downstream_closed = true;
-                    }
-                }
-                Err(e) => {
-                    error!(error = %e, "Stream transform flush failed");
-                    let _ = tx
-                        .send(Err(std::io::Error::other("Stream transform failed")))
-                        .await;
-                    upstream_error = true;
-                    incomplete_reason = Some("transform_error");
-                }
-                _ => {}
-            }
-        }
-
-        if stream_idle_timeout_secs > 0
-            && !upstream_error
-            && !downstream_closed
-            && !parser.seen_done
-        {
-            incomplete_reason = Some("missing_done");
-            let _ = tx
-                .send(Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "Upstream response stream ended before [DONE]",
-                )))
-                .await;
-        }
-
-        let completed_cleanly = !upstream_error && !downstream_closed && parser.seen_done;
-        if !completed_cleanly && !downstream_closed {
-            let reason = incomplete_reason.unwrap_or("missing_done");
-            metrics::counter!(
-                "upstream_stream_incomplete_total",
-                "reason" => reason,
-                "mode" => "streaming_response",
-                "tenant_context" => tenant_context_label(opts.tracing_ids.as_ref())
-            )
-            .increment(1);
-            warn!(
-                request_id = %log_request_id,
-                org_id = %log_org_id,
-                workspace_id = %log_workspace_id,
-                chat_id = parser.chat_id.as_deref().unwrap_or(""),
-                model = %model_name.to_lowercase(),
-                reason,
-                mode = "streaming_response",
-                "Upstream stream did not complete"
-            );
-        } else if completed_cleanly && parser.finish_reason.is_none() {
-            metrics::counter!(
-                "upstream_stream_incomplete_total",
-                "reason" => "missing_finish_reason",
-                "mode" => "streaming_response",
-                "tenant_context" => tenant_context_label(opts.tracing_ids.as_ref())
-            )
-            .increment(1);
-            warn!(
-                request_id = %log_request_id,
-                org_id = %log_org_id,
-                workspace_id = %log_workspace_id,
-                chat_id = parser.chat_id.as_deref().unwrap_or(""),
-                model = %model_name.to_lowercase(),
-                mode = "streaming_response",
-                "Upstream stream terminated without declaring a finish reason"
-            );
-        }
-
-        // Bill for tokens already produced even on an interrupted stream
-        // (nearai/infra#98). Shared with proxy_streaming_request so both
-        // streaming proxy paths have identical billing semantics. This path is
-        // reachable from the authenticated catch-all SSE proxy. Signing/caching
-        // stays gated on a clean [DONE] below.
-        report_stream_usage_on_finalize(
-            &usage_reporter,
-            parser.usage.map(|usage| (usage, parser.cached_tokens)),
-            parser.chat_id.as_deref(),
-            completed_cleanly,
-            &log_request_id,
-            &log_org_id,
-            &log_workspace_id,
-        );
-
-        if completed_cleanly {
-            let response_sha256 = hex::encode(hasher.finalize());
-            if let Some(ref id) = parser.chat_id {
-                let text = format!("{model_name}:{request_sha256}:{response_sha256}");
-                let signature_cached = match signing.sign_chat(&text) {
-                    Ok(signed) => match serde_json::to_string(&signed) {
-                        Ok(signed_json) => {
-                            cache.set_chat(id, &signed_json);
-                            true
-                        }
-                        Err(e) => {
-                            error!(error = %e, "Failed to serialize streaming signature");
-                            false
-                        }
-                    },
-                    Err(e) => {
-                        error!(error = %e, "Signing failed for streaming response");
-                        false
-                    }
-                };
-
-                if signature_cached {
-                    let (input_tokens, output_tokens) = parser.usage.unwrap_or((0, 0));
-                    record_completed_request(
-                        completion_tracing_ids.as_ref(),
-                        &model_name,
-                        id,
-                        input_tokens,
-                        output_tokens,
-                        request_started_at.elapsed(),
-                        "streaming_response",
-                    );
-                }
-            } else {
-                error!("Chat id could not be extracted from the completed streaming response");
-            }
-        } else {
-            info!(
-                upstream_error,
-                downstream_closed,
-                seen_done = parser.seen_done,
-                "Skipping streaming signature cache: stream did not complete cleanly"
-            );
-        }
-    });
-
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    let body = Body::from_stream(stream);
-
-    Ok(Response::builder()
-        .status(status)
-        .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
-        .body(body)
         .unwrap())
 }
 
@@ -4111,49 +3901,78 @@ mod tests {
         );
     }
 
-    async fn raw_sse_response(body: Option<&'static str>, hold_open: bool) -> reqwest::Response {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn assert_streaming_post(socket: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+
+        let mut request = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0_u8; 1024];
+            let read = socket.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "client closed before sending request headers");
+            request.extend_from_slice(&chunk[..read]);
+            assert!(request.len() <= 16 * 1024, "test request headers too large");
+            if let Some(offset) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break offset + 4;
+            }
+        };
+
+        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+        assert!(headers.starts_with("POST / HTTP/1.1\r\n"));
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .expect("native proxy request must include content-length");
+        while request.len() < header_end + content_length {
+            let mut chunk = [0_u8; 1024];
+            let read = socket.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "client closed before sending request body");
+            request.extend_from_slice(&chunk[..read]);
+        }
+        let body: serde_json::Value =
+            serde_json::from_slice(&request[header_end..header_end + content_length]).unwrap();
+        assert_eq!(
+            body.get("model").and_then(|value| value.as_str()),
+            Some("test-model")
+        );
+        assert_eq!(body.get("stream"), Some(&serde_json::Value::Bool(true)));
+    }
+
+    async fn raw_sse_server_url(body: &'static str) -> String {
+        use tokio::io::AsyncWriteExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 2048];
-            let _ = socket.read(&mut request).await;
+            assert_streaming_post(&mut socket).await;
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
                 )
                 .await
                 .unwrap();
-            if let Some(body) = body {
-                let encoded = format!("{:X}\r\n{}\r\n0\r\n\r\n", body.len(), body);
-                socket.write_all(encoded.as_bytes()).await.unwrap();
-            }
-            if hold_open {
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            }
+            let encoded = format!("{:X}\r\n{}\r\n0\r\n\r\n", body.len(), body);
+            socket.write_all(encoded.as_bytes()).await.unwrap();
         });
 
-        reqwest::Client::new()
-            .get(format!("http://{address}"))
-            .send()
-            .await
-            .unwrap()
+        format!("http://{address}")
     }
 
     async fn delayed_sse_server_url(
         body: &'static str,
         initial_delay: std::time::Duration,
     ) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 2048];
-            let _ = socket.read(&mut request).await;
+            assert_streaming_post(&mut socket).await;
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
@@ -4168,29 +3987,17 @@ mod tests {
         format!("http://{address}")
     }
 
-    async fn delayed_sse_response(
-        body: &'static str,
-        initial_delay: std::time::Duration,
-    ) -> reqwest::Response {
-        reqwest::Client::new()
-            .get(delayed_sse_server_url(body, initial_delay).await)
-            .send()
-            .await
-            .unwrap()
-    }
-
-    async fn sse_response_then_stall(
+    async fn sse_server_url_then_stall(
         body: &'static str,
         stall_duration: std::time::Duration,
-    ) -> reqwest::Response {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    ) -> String {
+        use tokio::io::AsyncWriteExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 2048];
-            let _ = socket.read(&mut request).await;
+            assert_streaming_post(&mut socket).await;
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
@@ -4202,11 +4009,7 @@ mod tests {
             tokio::time::sleep(stall_duration).await;
         });
 
-        reqwest::Client::new()
-            .get(format!("http://{address}"))
-            .send()
-            .await
-            .unwrap()
+        format!("http://{address}")
     }
 
     async fn sse_server_url_with_delayed_tail(
@@ -4214,14 +4017,13 @@ mod tests {
         tail: &'static str,
         delay: std::time::Duration,
     ) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 2048];
-            let _ = socket.read(&mut request).await;
+            assert_streaming_post(&mut socket).await;
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
@@ -4240,19 +4042,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_idle_watchdog_does_not_limit_time_to_first_chunk() {
-        let upstream = delayed_sse_response(
+        let url = delayed_sse_server_url(
             "data: {\"id\":\"chat-slow-prefill\",\"choices\":[]}\n\ndata: [DONE]\n\n",
             std::time::Duration::from_secs(2),
         )
         .await;
         let mut opts = test_proxy_opts();
         opts.stream_idle_timeout_secs = 1;
-        let response = proxy_streaming_response(
-            upstream,
-            "request-sha256",
+        opts.request_hash = Some("request-sha256".into());
+        let response = proxy_streaming_request(
+            &reqwest::Client::new(),
+            &url,
+            br#"{"model":"test-model","stream":true}"#.to_vec(),
             opts,
-            StatusCode::OK,
-            std::time::Instant::now(),
         )
         .await
         .unwrap();
@@ -4339,22 +4141,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_streaming_response_watchdog_ignores_role_only_hidden_reasoning_gap() {
+    async fn test_fixed_hash_streaming_watchdog_ignores_role_only_hidden_reasoning_gap() {
         let url = sse_server_url_with_delayed_tail(
             ROLE_ONLY_CHAT_SSE,
             FINISH_CHAT_SSE,
             std::time::Duration::from_secs(2),
         )
         .await;
-        let upstream = reqwest::Client::new().get(url).send().await.unwrap();
         let mut opts = test_proxy_opts();
         opts.stream_idle_timeout_secs = 1;
-        let response = proxy_streaming_response(
-            upstream,
-            "request-sha256",
+        opts.request_hash = Some("request-sha256".into());
+        let cache = opts.cache.clone();
+        let response = proxy_streaming_request(
+            &reqwest::Client::new(),
+            &url,
+            br#"{"model":"test-model","stream":true}"#.to_vec(),
             opts,
-            StatusCode::OK,
-            std::time::Instant::now(),
         )
         .await
         .unwrap();
@@ -4367,6 +4169,13 @@ mod tests {
         .expect("hidden reasoning should finish after the idle threshold")
         .expect("role-only metadata must not arm the idle watchdog");
         assert!(body.ends_with(b"data: [DONE]\n\n"));
+        let signed: crate::types::SignedChat = serde_json::from_str(
+            &cache
+                .get_chat("chat-hidden-reasoning")
+                .expect("completed stream must cache its signature"),
+        )
+        .unwrap();
+        assert!(signed.text.starts_with("test-model:request-sha256:"));
     }
 
     #[tokio::test]
@@ -4455,19 +4264,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_idle_watchdog_fails_after_first_chunk() {
-        let upstream = sse_response_then_stall(
+        let url = sse_server_url_then_stall(
             "data: {\"id\":\"chat-stalled\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
             std::time::Duration::from_secs(3),
         )
         .await;
         let mut opts = test_proxy_opts();
         opts.stream_idle_timeout_secs = 1;
-        let response = proxy_streaming_response(
-            upstream,
-            "request-sha256",
+        opts.request_hash = Some("request-sha256".into());
+        let response = proxy_streaming_request(
+            &reqwest::Client::new(),
+            &url,
+            br#"{"model":"test-model","stream":true}"#.to_vec(),
             opts,
-            StatusCode::OK,
-            std::time::Instant::now(),
         )
         .await
         .unwrap();
@@ -4486,16 +4295,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_missing_done_fails_downstream_body_when_watchdog_enabled() {
-        let upstream =
-            raw_sse_response(Some("data: {\"id\":\"chat-1\",\"choices\":[]}\n\n"), false).await;
+        let url = raw_sse_server_url("data: {\"id\":\"chat-1\",\"choices\":[]}\n\n").await;
         let mut opts = test_proxy_opts();
         opts.stream_idle_timeout_secs = 1;
-        let response = proxy_streaming_response(
-            upstream,
-            "request-sha256",
+        opts.request_hash = Some("request-sha256".into());
+        let response = proxy_streaming_request(
+            &reqwest::Client::new(),
+            &url,
+            br#"{"model":"test-model","stream":true}"#.to_vec(),
             opts,
-            StatusCode::OK,
-            std::time::Instant::now(),
         )
         .await
         .unwrap();
@@ -4509,19 +4317,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_done_without_trailing_newline_completes_cleanly() {
-        let upstream = raw_sse_response(
-            Some("data: {\"id\":\"chat-1\",\"choices\":[]}\n\ndata: [DONE]"),
-            false,
-        )
-        .await;
+        let url =
+            raw_sse_server_url("data: {\"id\":\"chat-1\",\"choices\":[]}\n\ndata: [DONE]").await;
         let mut opts = test_proxy_opts();
         opts.stream_idle_timeout_secs = 1;
-        let response = proxy_streaming_response(
-            upstream,
-            "request-sha256",
+        opts.request_hash = Some("request-sha256".into());
+        let response = proxy_streaming_request(
+            &reqwest::Client::new(),
+            &url,
+            br#"{"model":"test-model","stream":true}"#.to_vec(),
             opts,
-            StatusCode::OK,
-            std::time::Instant::now(),
         )
         .await
         .unwrap();
@@ -5307,6 +5112,7 @@ data: [DONE]
                     ramp_step: 1,
                     ramp_interval: std::time::Duration::from_secs(60),
                     ttft_p95_max: Some(std::time::Duration::from_secs(30)),
+                    queue_saturated_at: 1,
                 },
                 crate::admission::AdmissionPolicy {
                     max_inflight: 4,

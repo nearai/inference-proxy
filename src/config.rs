@@ -1,8 +1,40 @@
 use std::env;
+use std::fmt;
+use std::time::Duration;
 use tracing::warn;
 
 const FUSION_INTERNAL_MAX_ATTEMPTS_LIMIT: usize = 5;
 const DEFAULT_GEMMA4_ALLOWED_MEDIA_DOMAIN: &str = "prod-files-secure.s3.us-west-2.amazonaws.com";
+
+#[derive(Clone)]
+pub struct SensitiveString(String);
+
+impl SensitiveString {
+    pub(crate) fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SensitiveString {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AppConfigSettings {
+    pub application: String,
+    pub environment: String,
+    pub profile: String,
+    pub target: String,
+    pub agent_url: reqwest::Url,
+    pub refresh_interval: Duration,
+    pub access_token: Option<SensitiveString>,
+}
 
 fn env_or(name: &str, default: &str) -> String {
     env::var(name).unwrap_or_else(|_| default.to_string())
@@ -369,6 +401,9 @@ pub struct Config {
     /// `Retry-After` on refusals (`VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS`,
     /// default 2).
     pub admission_retry_after_secs: u64,
+    /// Optional AWS AppConfig Agent source for hot admission-policy updates.
+    /// Environment admission values remain the bootstrap and failure fallback.
+    pub appconfig: Option<AppConfigSettings>,
     /// Retry a chat/completions request once on another healthy backend when
     /// the connection to the chosen one fails before anything was sent
     /// (`VLLM_BACKEND_CONNECT_FAILOVER`). HTTP errors, queue-full included,
@@ -708,6 +743,73 @@ impl Config {
                 anyhow::bail!("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS must be at least 1");
             }
         }
+        let appconfig_identity = [
+            "AWS_APPCONFIG_APPLICATION",
+            "AWS_APPCONFIG_ENVIRONMENT",
+            "AWS_APPCONFIG_PROFILE",
+            "AWS_APPCONFIG_TARGET",
+        ]
+        .map(|name| {
+            env::var(name)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        });
+        let configured_identity_fields = appconfig_identity.iter().filter(|v| v.is_some()).count();
+        let appconfig = match configured_identity_fields {
+            0 => None,
+            4 => {
+                if admission_max_inflight == 0 {
+                    anyhow::bail!(
+                        "AWS AppConfig requires VLLM_PROXY_ADMISSION_MAX_INFLIGHT to enable admission"
+                    );
+                }
+                if admission_start_inflight != admission_max_inflight {
+                    anyhow::bail!(
+                        "AWS AppConfig requires VLLM_PROXY_ADMISSION_START_INFLIGHT to equal VLLM_PROXY_ADMISSION_MAX_INFLIGHT"
+                    );
+                }
+                let agent_url = env_or(
+                    "AWS_APPCONFIG_AGENT_URL",
+                    "http://127.0.0.1:2772",
+                );
+                let agent_url = reqwest::Url::parse(agent_url.trim()).map_err(|error| {
+                    anyhow::anyhow!("AWS_APPCONFIG_AGENT_URL must be an absolute URL: {error}")
+                })?;
+                if !matches!(agent_url.scheme(), "http" | "https") {
+                    anyhow::bail!("AWS_APPCONFIG_AGENT_URL must use http or https");
+                }
+                if !agent_url.username().is_empty()
+                    || agent_url.password().is_some()
+                    || agent_url.query().is_some()
+                    || agent_url.fragment().is_some()
+                {
+                    anyhow::bail!(
+                        "AWS_APPCONFIG_AGENT_URL must not contain credentials, a query, or a fragment"
+                    );
+                }
+                let refresh_secs: u64 = env_parse("AWS_APPCONFIG_REFRESH_SECS", 5)?;
+                if refresh_secs == 0 {
+                    anyhow::bail!("AWS_APPCONFIG_REFRESH_SECS must be at least 1");
+                }
+                Some(AppConfigSettings {
+                    application: appconfig_identity[0].clone().unwrap(),
+                    environment: appconfig_identity[1].clone().unwrap(),
+                    profile: appconfig_identity[2].clone().unwrap(),
+                    target: appconfig_identity[3].clone().unwrap(),
+                    agent_url,
+                    refresh_interval: Duration::from_secs(refresh_secs),
+                    access_token: env::var("AWS_APPCONFIG_AGENT_ACCESS_TOKEN")
+                        .ok()
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                        .map(SensitiveString::new),
+                })
+            }
+            _ => anyhow::bail!(
+                "AWS_APPCONFIG_APPLICATION, AWS_APPCONFIG_ENVIRONMENT, AWS_APPCONFIG_PROFILE, and AWS_APPCONFIG_TARGET must be set together"
+            ),
+        };
         let backend_connect_failover = env_bool("VLLM_BACKEND_CONNECT_FAILOVER");
         let backend_probe_urls = url_list("VLLM_BACKEND_PROBE_URLS");
         if !backend_probe_urls.is_empty() && backend_probe_urls.len() != backend_urls.len() {
@@ -873,6 +975,7 @@ impl Config {
             admission_ttft_p95_max_ms,
             admission_backpressure_secs,
             admission_retry_after_secs,
+            appconfig,
             backend_connect_failover,
             backend_probe_urls,
             backend_probe_interval_secs,
@@ -1025,23 +1128,33 @@ impl Config {
             .collect()
     }
 
-    /// Lane admission settings, `None` unless `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` is set.
-    pub fn admission(&self) -> Option<crate::admission::AdmissionConfig> {
+    /// Static and hot bootstrap admission settings. Environment values remain
+    /// the fallback; once built, the controller owns the active policy.
+    pub fn admission(
+        &self,
+    ) -> Option<(
+        crate::admission::AdmissionStaticConfig,
+        crate::admission::AdmissionPolicy,
+    )> {
         if self.admission_max_inflight == 0 {
             return None;
         }
-        Some(crate::admission::AdmissionConfig {
-            max_inflight: self.admission_max_inflight,
-            tier_borrowing: self.admission_tier_borrowing,
-            long_max_inflight_per_host: self.admission_long_max_inflight_per_host,
-            start_inflight: self.admission_start_inflight,
-            ramp_step: self.admission_ramp_step,
-            ramp_interval: std::time::Duration::from_secs(self.admission_ramp_interval_secs),
-            ttft_p95_max: (self.admission_ttft_p95_max_ms > 0)
-                .then(|| std::time::Duration::from_millis(self.admission_ttft_p95_max_ms)),
-            backpressure_ttl: std::time::Duration::from_secs(self.admission_backpressure_secs),
-            retry_after: std::time::Duration::from_secs(self.admission_retry_after_secs),
-        })
+        Some((
+            crate::admission::AdmissionStaticConfig {
+                tier_borrowing: self.admission_tier_borrowing,
+                long_max_inflight_per_host: self.admission_long_max_inflight_per_host,
+                start_inflight: self.admission_start_inflight,
+                ramp_step: self.admission_ramp_step,
+                ramp_interval: Duration::from_secs(self.admission_ramp_interval_secs),
+                ttft_p95_max: (self.admission_ttft_p95_max_ms > 0)
+                    .then(|| Duration::from_millis(self.admission_ttft_p95_max_ms)),
+            },
+            crate::admission::AdmissionPolicy {
+                max_inflight: self.admission_max_inflight,
+                backpressure_ttl: Duration::from_secs(self.admission_backpressure_secs),
+                retry_after: Duration::from_secs(self.admission_retry_after_secs),
+            },
+        ))
     }
 
     /// Build the runtime config for pre-dispatch image validation.
@@ -1167,6 +1280,13 @@ mod tests {
             "VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS",
             "VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS",
             "VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS",
+            "AWS_APPCONFIG_APPLICATION",
+            "AWS_APPCONFIG_ENVIRONMENT",
+            "AWS_APPCONFIG_PROFILE",
+            "AWS_APPCONFIG_TARGET",
+            "AWS_APPCONFIG_AGENT_URL",
+            "AWS_APPCONFIG_REFRESH_SECS",
+            "AWS_APPCONFIG_AGENT_ACCESS_TOKEN",
             "VLLM_BACKEND_CONNECT_FAILOVER",
             "VLLM_BACKEND_PROBE_URLS",
             "VLLM_BACKEND_PROBE_INTERVAL_SECS",
@@ -2058,7 +2178,7 @@ mod tests {
             ],
             || {
                 let c = Config::from_env().unwrap();
-                assert!(c.admission().unwrap().tier_borrowing);
+                assert!(c.admission().unwrap().0.tier_borrowing);
                 assert_eq!(c.admission_long_max_inflight_per_host, 12);
                 env::set_var("VLLM_PROXY_ADMISSION_LONG_MAX_INFLIGHT_PER_HOST", "0");
                 assert!(Config::from_env()
@@ -2101,17 +2221,21 @@ mod tests {
                 let config = Config::from_env().unwrap();
                 assert_eq!(
                     config.admission(),
-                    Some(crate::admission::AdmissionConfig {
-                        max_inflight: 48,
-                        tier_borrowing: false,
-                        long_max_inflight_per_host: 0,
-                        start_inflight: 32,
-                        ramp_step: 8,
-                        ramp_interval: std::time::Duration::from_secs(1800),
-                        ttft_p95_max: Some(std::time::Duration::from_secs(30)),
-                        backpressure_ttl: std::time::Duration::from_secs(10),
-                        retry_after: std::time::Duration::from_secs(2),
-                    })
+                    Some((
+                        crate::admission::AdmissionStaticConfig {
+                            tier_borrowing: false,
+                            long_max_inflight_per_host: 0,
+                            start_inflight: 32,
+                            ramp_step: 8,
+                            ramp_interval: Duration::from_secs(1800),
+                            ttft_p95_max: Some(Duration::from_secs(30)),
+                        },
+                        crate::admission::AdmissionPolicy {
+                            max_inflight: 48,
+                            backpressure_ttl: Duration::from_secs(10),
+                            retry_after: Duration::from_secs(2),
+                        },
+                    ))
                 );
                 assert!(config.backend_connect_failover);
 
@@ -2120,8 +2244,8 @@ mod tests {
                 env::remove_var("VLLM_PROXY_ADMISSION_START_INFLIGHT");
                 let config = Config::from_env().unwrap();
                 let admission = config.admission().unwrap();
-                assert_eq!(admission.ttft_p95_max, None);
-                assert_eq!(admission.start_inflight, 48);
+                assert_eq!(admission.0.ttft_p95_max, None);
+                assert_eq!(admission.0.start_inflight, 48);
 
                 // Validation.
                 env::set_var("VLLM_PROXY_ADMISSION_START_INFLIGHT", "64");
@@ -2186,5 +2310,64 @@ mod tests {
                 env::remove_var("VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS");
             },
         );
+    }
+
+    #[test]
+    fn appconfig_is_optional_and_validates_identity_as_a_unit() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            gateway_env_cleanup();
+            assert!(Config::from_env().unwrap().appconfig.is_none());
+
+            env::set_var("AWS_APPCONFIG_APPLICATION", "inference-proxy");
+            let error = Config::from_env().unwrap_err().to_string();
+            assert!(error.contains("must be set together"), "{error}");
+            gateway_env_cleanup();
+        });
+    }
+
+    #[test]
+    fn appconfig_requires_fixed_enabled_bootstrap_admission() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            gateway_env_cleanup();
+            for (name, value) in [
+                ("AWS_APPCONFIG_APPLICATION", "inference-proxy"),
+                ("AWS_APPCONFIG_ENVIRONMENT", "prod-glm53"),
+                ("AWS_APPCONFIG_PROFILE", "glm53-admission"),
+                ("AWS_APPCONFIG_TARGET", "glm53-gateway"),
+            ] {
+                env::set_var(name, value);
+            }
+
+            let error = Config::from_env().unwrap_err().to_string();
+            assert!(error.contains("requires VLLM_PROXY_ADMISSION_MAX_INFLIGHT"));
+
+            env::set_var("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", "48");
+            env::set_var("VLLM_PROXY_ADMISSION_START_INFLIGHT", "32");
+            let error = Config::from_env().unwrap_err().to_string();
+            assert!(error.contains("START_INFLIGHT"), "{error}");
+
+            env::set_var("VLLM_PROXY_ADMISSION_START_INFLIGHT", "48");
+            env::set_var(
+                "AWS_APPCONFIG_AGENT_URL",
+                "http://secret@127.0.0.1:2772?token=also-secret",
+            );
+            let error = Config::from_env().unwrap_err().to_string();
+            assert!(error.contains("must not contain credentials"), "{error}");
+            env::remove_var("AWS_APPCONFIG_AGENT_URL");
+            env::set_var("AWS_APPCONFIG_REFRESH_SECS", "7");
+            env::set_var("AWS_APPCONFIG_AGENT_ACCESS_TOKEN", "do-not-log-me");
+            let settings = Config::from_env().unwrap().appconfig.unwrap();
+            assert_eq!(settings.application, "inference-proxy");
+            assert_eq!(settings.environment, "prod-glm53");
+            assert_eq!(settings.profile, "glm53-admission");
+            assert_eq!(settings.target, "glm53-gateway");
+            assert_eq!(settings.agent_url.as_str(), "http://127.0.0.1:2772/");
+            assert_eq!(settings.refresh_interval, Duration::from_secs(7));
+            assert_eq!(
+                format!("{:?}", settings.access_token.unwrap()),
+                "[REDACTED]"
+            );
+            gateway_env_cleanup();
+        });
     }
 }

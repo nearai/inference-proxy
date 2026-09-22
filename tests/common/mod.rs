@@ -99,6 +99,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         admission_ttft_p95_max_ms: 30_000,
         admission_backpressure_secs: 10,
         admission_retry_after_secs: 2,
+        appconfig: None,
         backend_connect_failover: false,
         backend_probe_urls: Vec::new(),
         backend_long_context_urls: Vec::new(),

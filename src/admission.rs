@@ -84,6 +84,10 @@ pub struct AdmissionConfig {
     pub ttft_p95_max: Option<Duration>,
     /// How long an engine admission rejection counts against its backend.
     pub backpressure_ttl: Duration,
+    /// Engine-reported queue depth at or above which a backend counts as
+    /// saturated (`VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT`, default 1: a
+    /// queue of at least one request).
+    pub queue_saturated_at: u32,
     /// `Retry-After` value on every refusal.
     pub retry_after: Duration,
 }
@@ -274,20 +278,24 @@ impl AdmissionController {
     }
 
     /// Whether backend `index` is saturated right now — its engine reports a
-    /// non-empty queue, or it rejected a lane request at engine admission
-    /// within the TTL — i.e. selection should steer around it while other
-    /// hosts have room.
+    /// queue of at least `queue_saturated_at` requests, or it rejected a lane
+    /// request at engine admission within the TTL — i.e. selection should
+    /// steer around it while other hosts have room.
     pub fn backend_saturated(&self, index: usize) -> bool {
         self.backend_saturated_at(index, Instant::now())
     }
 
     pub(crate) fn backend_saturated_at(&self, index: usize, now: Instant) -> bool {
-        if self.engine.get_at(index, now).is_some_and(|s| s.queued > 0) {
-            return true;
-        }
         let Some(config) = &self.config else {
             return false;
         };
+        if self
+            .engine
+            .get_at(index, now)
+            .is_some_and(|s| s.queued >= config.queue_saturated_at)
+        {
+            return true;
+        }
         let stamp = self
             .backpressure
             .get(index)
@@ -777,6 +785,7 @@ mod tests {
             ramp_interval: Duration::from_secs(60),
             ttft_p95_max: Some(Duration::from_secs(10)),
             backpressure_ttl: Duration::from_secs(10),
+            queue_saturated_at: 1,
             retry_after: Duration::from_secs(3),
         }
     }
@@ -1311,6 +1320,63 @@ mod tests {
         assert!(c
             .try_admit_at(&p, None, t0 + Duration::from_secs(10))
             .is_ok());
+    }
+
+    #[test]
+    fn queue_saturated_at_raises_the_engine_queue_threshold() {
+        let engine = Arc::new(EngineLoad::new(1, Duration::from_secs(6)));
+        let c = Arc::new(AdmissionController::new(
+            Some(AdmissionConfig {
+                queue_saturated_at: 4,
+                ..config()
+            }),
+            1,
+            engine.clone(),
+        ));
+        let t0 = Instant::now();
+        engine.record_at(
+            0,
+            crate::engine_load::Sample {
+                running: 10,
+                queued: 3,
+            },
+            t0,
+        );
+        assert!(!c.backend_saturated_at(0, t0));
+        engine.record_at(
+            0,
+            crate::engine_load::Sample {
+                running: 10,
+                queued: 4,
+            },
+            t0,
+        );
+        assert!(c.backend_saturated_at(0, t0));
+    }
+
+    #[test]
+    fn every_backend_queued_respects_the_configured_threshold() {
+        let engine = Arc::new(EngineLoad::new(2, Duration::from_secs(6)));
+        let c = Arc::new(AdmissionController::new(
+            Some(AdmissionConfig {
+                queue_saturated_at: 4,
+                ..config()
+            }),
+            2,
+            engine.clone(),
+        ));
+        let p = pool(2);
+        let t0 = Instant::now();
+        let lightly_queued = crate::engine_load::Sample {
+            running: 10,
+            queued: 2,
+        };
+        engine.record_at(0, lightly_queued, t0);
+        engine.record_at(1, lightly_queued, t0);
+        // Below the threshold on every backend: not treated as saturated.
+        assert!(!c.backend_saturated_at(0, t0));
+        assert!(!c.backend_saturated_at(1, t0));
+        assert!(c.try_admit_at(&p, None, t0).is_ok());
     }
 
     #[test]

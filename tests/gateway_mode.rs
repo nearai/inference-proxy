@@ -159,6 +159,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         admission_ramp_interval_secs: 1800,
         admission_ttft_p95_max_ms: options.admission_ttft_p95_max_ms.unwrap_or(30_000),
         admission_backpressure_secs: options.admission_backpressure_secs.unwrap_or(10),
+        admission_queue_saturated_at: 1,
         admission_retry_after_secs: 2,
         backend_connect_failover: options.backend_connect_failover,
         backend_probe_urls: options.backend_probe_urls.clone(),

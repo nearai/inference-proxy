@@ -124,6 +124,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
         admission_ramp_interval_secs: 1800,
         admission_ttft_p95_max_ms: 30_000,
         admission_backpressure_secs: 10,
+        admission_queue_saturated_at: 1,
         admission_retry_after_secs: 2,
         backend_connect_failover: false,
         backend_probe_urls: Vec::new(),

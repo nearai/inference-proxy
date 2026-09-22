@@ -54,6 +54,18 @@ fn env_bool_optional(name: &str) -> Option<bool> {
     env::var(name).ok().map(|v| parse_bool(&v))
 }
 
+/// Whether `VLLM_BACKEND_TIER_STRICT` has an actual long-context tier to
+/// isolate: hosts configured *and* the threshold armed. Config validation
+/// keeps these two in lock step (`VLLM_BACKEND_LONG_CONTEXT_URLS` and
+/// `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` each require the other, checked
+/// just above where this is called), but `context_tier::decide`'s own
+/// off-switch is `above_tokens == 0` — checked directly here too, rather than
+/// leaning on that separate invariant, so strict mode's warning stays
+/// correct even if the two ever come apart.
+fn tier_strict_has_something_to_isolate(long_context_urls: &[String], above_tokens: u64) -> bool {
+    !long_context_urls.is_empty() && above_tokens != 0
+}
+
 fn is_gemma4_model_name(model_name: &str) -> bool {
     let name = model_name.to_ascii_lowercase();
     ["gemma-4", "gemma4"].iter().any(|needle| {
@@ -400,6 +412,12 @@ pub struct Config {
     /// long-context tier (`VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS`, 0 = off,
     /// the default). See `context_tier.rs` for the estimate.
     pub long_context_above_tokens: u64,
+    /// Isolate the context tiers in both directions: a request whose tier
+    /// has no healthy backend is refused instead of placed on the other tier
+    /// (`VLLM_BACKEND_TIER_STRICT`, bool, default `false`). Only meaningful
+    /// with `backend_long_context_urls` set; without one it is ignored (a
+    /// startup warning says so). See `context_tier.rs`.
+    pub backend_tier_strict: bool,
 
     // Endpoint URL overrides (Some = explicitly set, bypasses backend pool)
     pub images_url_override: Option<String>,
@@ -785,6 +803,24 @@ impl Config {
                 "VLLM_BACKEND_LONG_CONTEXT_URLS and VLLM_DATA_PARALLEL_SIZE are mutually exclusive; data-parallel affinity serves one backend"
             );
         }
+        let backend_tier_strict = env_bool("VLLM_BACKEND_TIER_STRICT");
+        if backend_tier_strict
+            && !tier_strict_has_something_to_isolate(
+                &backend_long_context_urls,
+                long_context_above_tokens,
+            )
+        {
+            warn!(
+                "VLLM_BACKEND_TIER_STRICT is set but the long-context tier is not effectively \
+                 configured (VLLM_BACKEND_LONG_CONTEXT_URLS is empty or \
+                 VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS is 0); ignoring it, there is nothing to isolate"
+            );
+        }
+        let backend_tier_strict = backend_tier_strict
+            && tier_strict_has_something_to_isolate(
+                &backend_long_context_urls,
+                long_context_above_tokens,
+            );
 
         let config = Config {
             model_name,
@@ -890,6 +926,7 @@ impl Config {
             backend_long_context_urls,
             backend_long_context_probe_urls,
             long_context_above_tokens,
+            backend_tier_strict,
             images_url_override,
             images_edits_url_override,
             transcriptions_url_override,
@@ -1186,6 +1223,7 @@ mod tests {
             "VLLM_BACKEND_LONG_CONTEXT_URLS",
             "VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS",
             "VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS",
+            "VLLM_BACKEND_TIER_STRICT",
             "LISTEN_ADDR",
         ] {
             env::remove_var(key);
@@ -1216,6 +1254,7 @@ mod tests {
             assert!(config.backend_long_context_urls.is_empty());
             assert!(config.pool_probe_urls().is_empty());
             assert_eq!(config.long_context_above_tokens, 0);
+            assert!(!config.backend_tier_strict);
             assert_eq!(config.backend_urls, vec!["http://localhost:8000"]);
         });
     }
@@ -1415,6 +1454,45 @@ mod tests {
             env::remove_var("FUSION_INTERNAL_BEARER_TOKEN");
             gateway_env_cleanup();
         });
+    }
+
+    #[test]
+    fn test_tier_strict_requires_a_long_tier_or_is_ignored() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            gateway_env_cleanup();
+            // Set without a long tier: not an error, just ignored (a startup
+            // warning is logged, not asserted here).
+            env::set_var("VLLM_BACKEND_TIER_STRICT", "1");
+            assert!(!Config::from_env().unwrap().backend_tier_strict);
+            // With a long tier configured, it takes effect.
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_URLS", "https://m-long-b1.test");
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS", "100000");
+            assert!(Config::from_env().unwrap().backend_tier_strict);
+            // Unset (the default) leaves today's fallback behavior.
+            env::set_var("VLLM_BACKEND_TIER_STRICT", "0");
+            assert!(!Config::from_env().unwrap().backend_tier_strict);
+            env::remove_var("VLLM_BACKEND_TIER_STRICT");
+            assert!(!Config::from_env().unwrap().backend_tier_strict);
+            gateway_env_cleanup();
+        });
+    }
+
+    #[test]
+    fn test_tier_strict_is_inert_without_a_long_tier_or_a_zero_threshold() {
+        // `Config::from_env`'s own bail!()s keep "urls empty" and
+        // "above_tokens == 0" in lock step for any config that actually
+        // loads, so this exercises `tier_strict_has_something_to_isolate`
+        // directly: it must not rely on that invariant holding forever, since
+        // `context_tier::decide`'s real off-switch is `above_tokens == 0`.
+        assert!(!tier_strict_has_something_to_isolate(&[], 100_000));
+        assert!(!tier_strict_has_something_to_isolate(
+            &["https://m-long-b1.test".to_string()],
+            0
+        ));
+        assert!(tier_strict_has_something_to_isolate(
+            &["https://m-long-b1.test".to_string()],
+            100_000
+        ));
     }
 
     #[test]

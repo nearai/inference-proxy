@@ -84,11 +84,16 @@ pub async fn chat_completions(
     )?;
     // Long-context tier (gateway mode): a request whose estimated input is
     // above the threshold belongs on the long-context backends, and every
-    // candidate selection below is restricted to its tier. `None` when the
-    // feature is off or that tier has no healthy host (see `context_tier.rs`).
+    // candidate selection below is restricted to its tier. `tier` is `None`
+    // only when the feature itself is off (`long_context_above_tokens == 0`).
+    // An empty tier is folded into `TierDecision.restrict` instead: lifted to
+    // `None` there so the request falls back to the other tier (default), or
+    // pinned `Some` so it is refused later (`VLLM_BACKEND_TIER_STRICT`). See
+    // `context_tier.rs`.
     let tier = crate::context_tier::decide(
         &state.backend_pool,
         state.config.long_context_above_tokens,
+        state.config.backend_tier_strict,
         || crate::context_tier::chat_estimate(&request_json),
     );
     // Lane admission (gateway mode), first half: the overload and budget

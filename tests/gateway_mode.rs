@@ -49,6 +49,9 @@ struct GatewayOptions {
     backend_long_context_urls: Vec<String>,
     backend_long_context_probe_urls: Vec<String>,
     long_context_above_tokens: u64,
+    /// `VLLM_BACKEND_TIER_STRICT`: refuse a request whose tier has no
+    /// healthy backend instead of falling back to the other one.
+    backend_tier_strict: bool,
     /// Source of the models document (a mock cloud-api `/v1/models`).
     models_document_url: Option<String>,
     capacity_requests_per_minute: u64,
@@ -168,6 +171,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         backend_long_context_urls: options.backend_long_context_urls.clone(),
         backend_long_context_probe_urls: options.backend_long_context_probe_urls.clone(),
         long_context_above_tokens: options.long_context_above_tokens,
+        backend_tier_strict: options.backend_tier_strict,
         dstack_socket_path: "/nonexistent/dstack.sock".to_string(),
         gpu_evidence_delegate_url: None,
         gpu_evidence_delegate_timeout_secs: 30,
@@ -2017,6 +2021,143 @@ async fn a_tier_without_a_healthy_backend_falls_back_to_the_other_one() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
+    live.verify().await;
+}
+
+/// The 429 body only ever carries the generic `overloaded` type (`error.rs`
+/// maps every `RejectReason` to the same shape): the specific reason is only
+/// in the log line and `admission_rejections_total{reason}`. Captured with a
+/// local recorder scoped around the request — safe here because
+/// `#[tokio::test]` defaults to the single-threaded flavor, so nothing this
+/// request touches runs on another OS thread outside the guard's scope.
+async fn oneshot_with_rejection_reason_metric(
+    app: axum::Router,
+    request: Request<Body>,
+) -> (axum::response::Response, String) {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let guard = metrics::set_default_local_recorder(&recorder);
+    let response = app.oneshot(request).await.unwrap();
+    drop(guard);
+    (response, handle.render())
+}
+
+#[tokio::test]
+async fn strict_mode_refuses_instead_of_falling_back_across_the_tiers() {
+    let live = MockServer::start().await;
+    let dead = unreachable_backend_url();
+    // The long tier's only host is unreachable; strict mode pins the
+    // restriction through the connect fail-over instead of widening the
+    // search, so the oversized request is refused rather than landing its
+    // 300k-token prefill on a base host.
+    let app = build_gateway(
+        &live.uri(),
+        GatewayOptions {
+            backend_urls: vec![live.uri()],
+            backend_long_context_urls: vec![dead],
+            long_context_above_tokens: ABOVE_TOKENS,
+            backend_connect_failover: true,
+            backend_tier_strict: true,
+            admission_max_inflight: 4,
+            ..Default::default()
+        },
+    );
+    let (response, rendered_metrics) =
+        oneshot_with_rejection_reason_metric(app.clone(), chat_request(sized_body(4_000))).await;
+    assert_overloaded(response).await;
+    assert!(
+        rendered_metrics.contains("admission_rejections_total{reason=\"tier_unavailable\"} 1"),
+        "{rendered_metrics}"
+    );
+    // A short request is unaffected: it never touches the long tier.
+    mount_chat(&live, 1).await;
+    let response = app.oneshot(chat_request(sized_body(400))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    live.verify().await;
+    live.reset().await;
+
+    // And the other way around: with the base fleet gone, a short request is
+    // refused rather than served by the idle long-context host.
+    let dead = unreachable_backend_url();
+    let app = build_gateway(
+        &live.uri(),
+        GatewayOptions {
+            backend_urls: vec![dead],
+            backend_long_context_urls: vec![live.uri()],
+            long_context_above_tokens: ABOVE_TOKENS,
+            backend_connect_failover: true,
+            backend_tier_strict: true,
+            admission_max_inflight: 4,
+            ..Default::default()
+        },
+    );
+    let (response, rendered_metrics) =
+        oneshot_with_rejection_reason_metric(app.clone(), chat_request(sized_body(400))).await;
+    assert_overloaded(response).await;
+    assert!(
+        rendered_metrics.contains("admission_rejections_total{reason=\"tier_unavailable\"} 1"),
+        "{rendered_metrics}"
+    );
+    mount_chat(&live, 1).await;
+    let response = app.oneshot(chat_request(sized_body(4_000))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    live.verify().await;
+}
+
+#[tokio::test]
+async fn strict_mode_tier_already_empty_before_placement_refuses_with_tier_unavailable() {
+    let live = MockServer::start().await;
+    let dead = unreachable_backend_url();
+    // Unlike `strict_mode_refuses_instead_of_falling_back_across_the_tiers`,
+    // the long tier's only backend is marked unhealthy up front rather than
+    // failing a live connect attempt: placement (`completion_placement.rs`)
+    // finds it already empty and refuses directly, so the connect fail-over
+    // path in `proxy.rs` is never reached for this request.
+    let (app, state) = build_gateway_with_state(
+        &live.uri(),
+        GatewayOptions {
+            backend_urls: vec![live.uri()],
+            backend_long_context_urls: vec![dead],
+            long_context_above_tokens: ABOVE_TOKENS,
+            backend_tier_strict: true,
+            admission_max_inflight: 4,
+            ..Default::default()
+        },
+    );
+    state.backend_pool.backends()[1]
+        .healthy
+        .store(false, std::sync::atomic::Ordering::Release);
+    let (response, rendered_metrics) =
+        oneshot_with_rejection_reason_metric(app, chat_request(sized_body(4_000))).await;
+    assert_overloaded(response).await;
+    assert!(
+        rendered_metrics.contains("admission_rejections_total{reason=\"tier_unavailable\"} 1"),
+        "{rendered_metrics}"
+    );
+}
+
+#[tokio::test]
+async fn strict_mode_returns_503_when_admission_is_disabled() {
+    let live = MockServer::start().await;
+    let dead = unreachable_backend_url();
+    // No `admission_max_inflight`: admission is off, so the refusal has no
+    // `Permit` to build the 429 `Overloaded` shape from and falls back to a
+    // plain 503 with `error_type: "tier_unavailable"`.
+    let app = build_gateway(
+        &live.uri(),
+        GatewayOptions {
+            backend_urls: vec![live.uri()],
+            backend_long_context_urls: vec![dead],
+            long_context_above_tokens: ABOVE_TOKENS,
+            backend_connect_failover: true,
+            backend_tier_strict: true,
+            ..Default::default()
+        },
+    );
+    let response = app.oneshot(chat_request(sized_body(4_000))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let json = json_body(response).await;
+    assert_eq!(json["error"]["type"], "tier_unavailable");
     live.verify().await;
 }
 

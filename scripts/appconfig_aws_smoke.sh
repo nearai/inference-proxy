@@ -120,6 +120,7 @@ AGENT_STARTED=0
 PROXY_STARTED=0
 HOSTED_VERSIONS=()
 DEPLOYMENTS=()
+DEPLOYED_NUMBER=""
 
 cleanup_deployment() {
     local deployment_number="$1"
@@ -358,15 +359,17 @@ wait_for_policy() {
 wait_for_wrong_target_retention() {
     local version="$1"
     local maximum="$2"
+    local warning_count_before="$3"
     local deadline=$((SECONDS + TIMEOUT_SECS))
-    local metric current_version logs
+    local metric current_version logs warning_count
     while (( SECONDS < deadline )); do
         metric="$(metric_value)"
         current_version="$(agent_version)"
         logs="$(docker logs "$PROXY_NAME" 2>&1 || true)"
+        warning_count="$(grep -Fc 'AppConfig admission policy read failed; retaining last-known-good policy' <<<"$logs" || true)"
         if [[ "$current_version" == "$version" ]] \
             && [[ "$metric" == "$maximum" || "$metric" == "$maximum.0" ]] \
-            && grep -Fq 'AppConfig admission policy read failed; retaining last-known-good policy' <<<"$logs"; then
+            && (( warning_count > warning_count_before )); then
             printf 'appconfig smoke: wrong-target version=%s retained last-known-good active_max_inflight=%s\n' "$version" "$metric"
             return 0
         fi
@@ -402,6 +405,7 @@ deploy_version() {
     deployment_number="$(jq -r '.DeploymentNumber // empty' <<<"$response")"
     [[ -n "$deployment_number" ]] || die "AppConfig deployment returned no deployment number"
     DEPLOYMENTS+=("$deployment_number")
+    DEPLOYED_NUMBER="$deployment_number"
     printf 'appconfig smoke: timestamp=%s deployment=%s version=%s\n' "$(utc_timestamp)" "$deployment_number" "$version"
     wait_for_deployment "$deployment_number"
 }
@@ -414,7 +418,9 @@ create_hosted_version() {
         --configuration-profile-id "$PROFILE_ID" --content "fileb://$file" \
         --content-type application/json --description "Protected smoke ${label}" \
         --version-label "$label" --query VersionNumber --output text \
+        "$TMP_DIR/hosted-${label}.response" \
         2>"$TMP_DIR/hosted-${label}.error.log")"; then
+        cat "$TMP_DIR/hosted-${label}.error.log" >&2
         return 1
     fi
     [[ "$version" != None && -n "$version" ]] || return 1
@@ -432,7 +438,8 @@ printf 'appconfig smoke: proxy container=%s started_at=%s\n' \
 create_hosted_version "$TMP_DIR/v1.json" "smoke-v1-${RUN_ID}"
 V1="$CREATED_VERSION"
 deploy_version "$V1" "Protected smoke baseline v1"
-wait_for_policy "$V1" 1
+V1_DEPLOYMENT="$DEPLOYED_NUMBER"
+wait_for_policy "$V1_DEPLOYMENT" 1
 
 run_request() {
     local output="$1"
@@ -504,17 +511,19 @@ if create_hosted_version "$TMP_DIR/invalid.json" "smoke-invalid-${RUN_ID}"; then
 else
     printf 'appconfig smoke: timestamp=%s invalid hosted version rejected while creating hosted version\n' "$(utc_timestamp)"
 fi
-wait_for_policy "$V1" 1
+wait_for_policy "$V1_DEPLOYMENT" 1
 
 create_hosted_version "$TMP_DIR/v2.json" "smoke-v2-${RUN_ID}"
 V2="$CREATED_VERSION"
 deploy_version "$V2" "Protected smoke hot increase to v2"
-wait_for_policy "$V2" 2
+V2_DEPLOYMENT="$DEPLOYED_NUMBER"
+wait_for_policy "$V2_DEPLOYMENT" 2
 
 start_parallel_requests increase 12000
 sleep 1
 deploy_version "$V1" "Protected smoke rollback to v1"
-wait_for_policy "$V1" 1
+ROLLBACK_DEPLOYMENT="$DEPLOYED_NUMBER"
+wait_for_policy "$ROLLBACK_DEPLOYMENT" 1
 rollback_status_file="$TMP_DIR/rollback-new.status"
 run_request "$rollback_status_file" 0
 rollback_new_status="$(<"$rollback_status_file")"
@@ -528,11 +537,15 @@ printf 'appconfig smoke: rollback v2->v1 retained active requests and refused ne
 
 create_hosted_version "$TMP_DIR/wrong-target.json" "smoke-wrong-target-${RUN_ID}"
 WRONG="$CREATED_VERSION"
+WRONG_TARGET_WARNING_COUNT_BEFORE="$(docker logs "$PROXY_NAME" 2>&1 \
+    | grep -Fc 'AppConfig admission policy read failed; retaining last-known-good policy' || true)"
 deploy_version "$WRONG" "Protected smoke semantically wrong target"
-wait_for_wrong_target_retention "$WRONG" 1
+WRONG_TARGET_DEPLOYMENT="$DEPLOYED_NUMBER"
+wait_for_wrong_target_retention "$WRONG_TARGET_DEPLOYMENT" 1 "$WRONG_TARGET_WARNING_COUNT_BEFORE"
 printf 'appconfig smoke: wrong-target deployment retained v1 policy; reverting immediately\n'
 deploy_version "$V1" "Protected smoke immediate revert after wrong target"
-wait_for_policy "$V1" 1
+REVERT_DEPLOYMENT="$DEPLOYED_NUMBER"
+wait_for_policy "$REVERT_DEPLOYMENT" 1
 
 proxy_started_at="$(docker inspect "$PROXY_NAME" --format '{{.State.StartedAt}}')"
 proxy_container_id="$(docker inspect "$PROXY_NAME" --format '{{.Id}}')"

@@ -20,6 +20,9 @@ FIXTURES = ROOT / "fixtures"
 PROXY = "http://127.0.0.1:18000"
 ENGINE = "http://127.0.0.1:18001"
 COMPOSE = ["docker", "compose", "-f", str(ROOT / "compose.yaml")]
+CONTROL_PLANE_TIMEOUT = 5.0
+CHAT_TIMEOUT = 30.0
+HELD_CHAT_TIMEOUT = 60.0
 
 
 def request(
@@ -27,10 +30,11 @@ def request(
     url: str,
     body: bytes | None = None,
     headers: dict[str, str] | None = None,
+    timeout: float = CONTROL_PLANE_TIMEOUT,
 ) -> tuple[int, dict[str, str], bytes]:
     req = urllib.request.Request(url, data=body, headers=headers or {}, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=5) as response:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
             return (
                 response.status,
                 {name.lower(): value for name, value in response.headers.items()},
@@ -49,11 +53,14 @@ def json_request(
     url: str,
     payload: Any = None,
     headers: dict[str, str] | None = None,
+    timeout: float = CONTROL_PLANE_TIMEOUT,
 ) -> tuple[int, dict[str, str], Any]:
     body = None if payload is None else json.dumps(payload).encode()
     request_headers = {} if body is None else {"Content-Type": "application/json"}
     request_headers.update(headers or {})
-    status, response_headers, response_body = request(method, url, body, request_headers)
+    status, response_headers, response_body = request(
+        method, url, body, request_headers, timeout=timeout
+    )
     try:
         decoded = json.loads(response_body)
     except json.JSONDecodeError:
@@ -112,7 +119,7 @@ def engine_stats() -> dict[str, Any]:
     return body
 
 
-def chat_request() -> tuple[int, dict[str, str], Any]:
+def chat_request(timeout: float = CHAT_TIMEOUT) -> tuple[int, dict[str, str], Any]:
     return json_request(
         "POST",
         f"{PROXY}/v1/chat/completions",
@@ -121,6 +128,7 @@ def chat_request() -> tuple[int, dict[str, str], Any]:
             "messages": [{"role": "user", "content": "hello"}],
         },
         headers={"Authorization": "Bearer test-token"},
+        timeout=timeout,
     )
 
 
@@ -129,7 +137,7 @@ def start_chat() -> tuple[threading.Thread, dict[str, Any]]:
 
     def run() -> None:
         try:
-            result["value"] = chat_request()
+            result["value"] = chat_request(timeout=HELD_CHAT_TIMEOUT)
         except Exception as error:  # surfaced below with the thread result
             result["error"] = error
 
@@ -147,7 +155,7 @@ def wait_for_engine_active(expected: int) -> None:
 
 def finish_threads(threads: list[tuple[threading.Thread, dict[str, Any]]]) -> None:
     for thread, result in threads:
-        thread.join(timeout=10)
+        thread.join(timeout=HELD_CHAT_TIMEOUT + CONTROL_PLANE_TIMEOUT)
         check(not thread.is_alive(), "held chat request did not finish after release")
         check("error" not in result, f"chat request failed: {result.get('error')}")
         status, _, body = result["value"]

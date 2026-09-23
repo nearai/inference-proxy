@@ -519,7 +519,7 @@ deploy_version "$V2" "Protected smoke hot increase to v2"
 V2_DEPLOYMENT="$DEPLOYED_NUMBER"
 wait_for_policy "$V2_DEPLOYMENT" 2
 
-start_parallel_requests increase 12000
+start_parallel_requests increase 25000
 sleep 1
 deploy_version "$V1" "Protected smoke rollback to v1"
 ROLLBACK_DEPLOYMENT="$DEPLOYED_NUMBER"

@@ -353,10 +353,20 @@ struct AgentReply {
     body: Vec<u8>,
 }
 
-async fn fake_agent_response(
-    AxumState(reply): AxumState<Arc<tokio::sync::RwLock<AgentReply>>>,
-) -> Response {
-    let reply = reply.read().await.clone();
+async fn fake_agent_response(AxumState(state): AxumState<Arc<MutableAgentState>>) -> Response {
+    let (reply, transport_failure) = {
+        let reply = state.reply.read().await;
+        state.requests.fetch_add(1, Ordering::Release);
+        state.requests_changed.notify_waiters();
+        let transport_failure = state.transport_failure.swap(false, Ordering::AcqRel);
+        (reply.clone(), transport_failure)
+    };
+    if transport_failure {
+        // Dropping the connection without an HTTP response makes reqwest
+        // report a transport error, while the request counter proves that the
+        // refresh loop reached this failure deterministically.
+        panic!("injected AppConfig Agent transport failure");
+    }
     let mut response = Response::builder().status(reply.status);
     if let Some(version) = reply.version {
         response = response.header("Configuration-Version", version);
@@ -364,12 +374,19 @@ async fn fake_agent_response(
     response.body(Body::from(reply.body)).unwrap()
 }
 
+struct MutableAgentState {
+    reply: tokio::sync::RwLock<AgentReply>,
+    requests: AtomicUsize,
+    requests_changed: tokio::sync::Notify,
+    transport_failure: std::sync::atomic::AtomicBool,
+}
+
 /// A local AppConfig Agent endpoint whose document can be replaced while the
 /// proxy's refresh task is running. A shared response state avoids remounting
 /// routes while a fetch is in flight, so transitions are deterministic.
 struct MutableAgent {
     url: String,
-    reply: Arc<tokio::sync::RwLock<AgentReply>>,
+    state: Arc<MutableAgentState>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -379,18 +396,23 @@ impl MutableAgent {
             .await
             .expect("bind fake AppConfig Agent");
         let url = format!("http://{}", listener.local_addr().unwrap());
-        let reply = Arc::new(tokio::sync::RwLock::new(AgentReply {
-            status: StatusCode::OK,
-            version: None,
-            body: Vec::new(),
-        }));
+        let state = Arc::new(MutableAgentState {
+            reply: tokio::sync::RwLock::new(AgentReply {
+                status: StatusCode::OK,
+                version: None,
+                body: Vec::new(),
+            }),
+            requests: AtomicUsize::new(0),
+            requests_changed: tokio::sync::Notify::new(),
+            transport_failure: std::sync::atomic::AtomicBool::new(false),
+        });
         let router = axum::Router::new()
             .route(APPCONFIG_PATH, get(fake_agent_response))
-            .with_state(reply.clone());
+            .with_state(state.clone());
         let task = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
-        let agent = Self { url, reply, task };
+        let agent = Self { url, state, task };
         agent.set_document(version, document).await;
         agent
     }
@@ -399,27 +421,47 @@ impl MutableAgent {
         self.url.clone()
     }
 
-    async fn set_document(&self, version: &str, document: serde_json::Value) {
-        *self.reply.write().await = AgentReply {
+    async fn set_document(&self, version: &str, document: serde_json::Value) -> usize {
+        let mut reply = self.state.reply.write().await;
+        *reply = AgentReply {
             status: StatusCode::OK,
             version: Some(version.to_string()),
             body: serde_json::to_vec(&document).unwrap(),
         };
+        self.state.requests.load(Ordering::Acquire)
     }
 
-    async fn set_raw_document(&self, version: &str, body: &str) {
-        *self.reply.write().await = AgentReply {
+    async fn set_raw_document(&self, version: &str, body: &str) -> usize {
+        let mut reply = self.state.reply.write().await;
+        *reply = AgentReply {
             status: StatusCode::OK,
             version: Some(version.to_string()),
             body: body.as_bytes().to_vec(),
         };
+        self.state.requests.load(Ordering::Acquire)
     }
 
-    fn set_transport_failure(&self) {
-        // Stop listening so reqwest classifies the next refresh as a real
-        // transport error (connection refused/reset), rather than an HTTP
-        // document-validation failure.
-        self.task.abort();
+    async fn set_transport_failure(&self) -> usize {
+        let _reply = self.state.reply.write().await;
+        let requests = self.state.requests.load(Ordering::Acquire);
+        self.state.transport_failure.store(true, Ordering::Release);
+        requests
+    }
+
+    async fn wait_for_request_after(&self, previous: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let changed = self.state.requests_changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if self.state.requests.load(Ordering::Acquire) > previous {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("AppConfig Agent did not receive another request");
     }
 }
 
@@ -508,6 +550,8 @@ impl HeldBackend {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let changed = self.state.calls_changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
                 if self.state.calls.load(Ordering::Acquire) >= expected {
                     return;
                 }
@@ -556,6 +600,28 @@ async fn wait_for_budget(state: &AppState, expected: u32) {
     })
     .await
     .unwrap_or_else(|_| panic!("admission budget did not become {expected}"));
+}
+
+async fn wait_for_adopted_version(state: &AppState, expected: &str) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let adopted = state.admission.current_policy().is_some_and(|policy| {
+                matches!(
+                    policy.source,
+                    admission::PolicySource::AppConfig {
+                        ref configuration_version,
+                        ..
+                    } if configuration_version == expected
+                )
+            });
+            if adopted {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("AppConfig version {expected} was not adopted"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1744,9 +1810,9 @@ async fn appconfig_update_changes_admission_without_rebuilding_router_or_control
             ..Default::default()
         },
     );
-    let controller = Arc::as_ptr(&state.admission);
+    let controller = state.admission.clone();
     let refresh = spawn_appconfig_refresh(agent.url(), &state);
-    wait_for_budget(&state, 1).await;
+    wait_for_adopted_version(&state, "v1").await;
 
     let first = tokio::spawn({
         let app = app.clone();
@@ -1757,7 +1823,7 @@ async fn appconfig_update_changes_admission_without_rebuilding_router_or_control
 
     agent.set_document("v2", admission_document(2)).await;
     wait_for_budget(&state, 2).await;
-    assert_eq!(Arc::as_ptr(&state.admission), controller);
+    assert!(Arc::ptr_eq(&state.admission, &controller));
 
     // The existing router and controller now admit a second request while the
     // first permit is still held by the delayed backend response.
@@ -1839,14 +1905,19 @@ async fn invalid_document_and_transport_failure_keep_last_known_good_policy() {
     agent.set_document("v2", admission_document(2)).await;
     wait_for_budget(&state, 2).await;
 
-    agent
+    let invalid_request_count = agent
         .set_raw_document("v3", "{\"schema_version\":1,\"target\":\"wrong\"}")
         .await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    agent.wait_for_request_after(invalid_request_count).await;
     assert_eq!(state.admission.budget(), 2);
-    agent.set_transport_failure();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(state.admission.budget(), 2);
+
+    agent.set_document("v4", admission_document(3)).await;
+    wait_for_adopted_version(&state, "v4").await;
+    assert_eq!(state.admission.budget(), 3);
+
+    let transport_request_count = agent.set_transport_failure().await;
+    agent.wait_for_request_after(transport_request_count).await;
+    assert_eq!(state.admission.budget(), 3);
 
     // The known-good maximum remains effective after both failures.
     let first = tokio::spawn({
@@ -1877,7 +1948,7 @@ async fn chat_and_legacy_completions_share_the_hot_policy() {
         },
     );
     let refresh = spawn_appconfig_refresh(agent.url(), &state);
-    wait_for_budget(&state, 1).await;
+    wait_for_adopted_version(&state, "v1").await;
     let chat = tokio::spawn({
         let app = app.clone();
         async move { app.oneshot(chat_request(hello_body())).await.unwrap() }

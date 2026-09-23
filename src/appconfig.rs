@@ -24,6 +24,8 @@ use crate::config::AppConfigSettings;
 const MAX_DOCUMENT_BYTES: usize = 64 * 1024;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 const CONFIGURATION_VERSION_HEADER: &str = "Configuration-Version";
+const MAX_INFLIGHT: u32 = 10_000;
+const MAX_POLICY_DURATION_SECS: u64 = 86_400;
 
 /// A validated policy returned by the Agent, including the immutable source
 /// identity used for reconciliation and rollback.
@@ -209,15 +211,30 @@ fn validate_document(
             "admission.max_inflight must be positive",
         ));
     }
+    if document.admission.max_inflight > MAX_INFLIGHT {
+        return Err(AppConfigFetchError::invalid(format!(
+            "admission.max_inflight must not exceed {MAX_INFLIGHT}"
+        )));
+    }
     if document.admission.backpressure_secs == 0 {
         return Err(AppConfigFetchError::invalid(
             "admission.backpressure_secs must be positive",
         ));
     }
+    if document.admission.backpressure_secs > MAX_POLICY_DURATION_SECS {
+        return Err(AppConfigFetchError::invalid(format!(
+            "admission.backpressure_secs must not exceed {MAX_POLICY_DURATION_SECS}"
+        )));
+    }
     if document.admission.retry_after_secs == 0 {
         return Err(AppConfigFetchError::invalid(
             "admission.retry_after_secs must be positive",
         ));
+    }
+    if document.admission.retry_after_secs > MAX_POLICY_DURATION_SECS {
+        return Err(AppConfigFetchError::invalid(format!(
+            "admission.retry_after_secs must not exceed {MAX_POLICY_DURATION_SECS}"
+        )));
     }
 
     Ok(AdmissionPolicy {
@@ -241,6 +258,7 @@ pub fn spawn_admission_policy_refresh(
     tokio::spawn(async move {
         let mut active = None;
         let mut interval = tokio::time::interval(source.settings.refresh_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
             reconcile_once(&source, &admission, &mut active).await;
@@ -409,8 +427,8 @@ mod tests {
 
     fn controller() -> AdmissionController {
         AdmissionController::new(
-            Some((
-                crate::admission::AdmissionStaticConfig {
+            Some(crate::admission::AdmissionBootstrap {
+                static_config: crate::admission::AdmissionStaticConfig {
                     tier_borrowing: false,
                     long_max_inflight_per_host: 0,
                     start_inflight: 8,
@@ -419,12 +437,12 @@ mod tests {
                     ttft_p95_max: None,
                     queue_saturated_at: 1,
                 },
-                AdmissionPolicy {
+                policy: AdmissionPolicy {
                     max_inflight: 8,
                     backpressure_ttl: Duration::from_secs(10),
                     retry_after: Duration::from_secs(2),
                 },
-            )),
+            }),
             1,
             Arc::new(crate::engine_load::EngineLoad::disabled()),
         )
@@ -492,6 +510,63 @@ mod tests {
                 source.fetch().await,
                 Err(AppConfigFetchError::Invalid(_))
             ));
+        }
+    }
+
+    #[test]
+    fn accepts_schema_limit_boundaries() {
+        let document = AdmissionDocument {
+            schema_version: 1,
+            target: "gateway-a".to_string(),
+            admission: AdmissionDocumentValues {
+                max_inflight: MAX_INFLIGHT,
+                backpressure_secs: MAX_POLICY_DURATION_SECS,
+                retry_after_secs: MAX_POLICY_DURATION_SECS,
+            },
+        };
+
+        let policy = validate_document(document, "gateway-a").unwrap();
+        assert_eq!(policy.max_inflight, MAX_INFLIGHT);
+        assert_eq!(
+            policy.backpressure_ttl,
+            Duration::from_secs(MAX_POLICY_DURATION_SECS)
+        );
+        assert_eq!(
+            policy.retry_after,
+            Duration::from_secs(MAX_POLICY_DURATION_SECS)
+        );
+    }
+
+    #[test]
+    fn rejects_values_above_schema_limits() {
+        let cases = [
+            AdmissionDocumentValues {
+                max_inflight: MAX_INFLIGHT + 1,
+                backpressure_secs: 1,
+                retry_after_secs: 1,
+            },
+            AdmissionDocumentValues {
+                max_inflight: 1,
+                backpressure_secs: MAX_POLICY_DURATION_SECS + 1,
+                retry_after_secs: 1,
+            },
+            AdmissionDocumentValues {
+                max_inflight: 1,
+                backpressure_secs: 1,
+                retry_after_secs: MAX_POLICY_DURATION_SECS + 1,
+            },
+        ];
+
+        for admission in cases {
+            let result = validate_document(
+                AdmissionDocument {
+                    schema_version: 1,
+                    target: "gateway-a".to_string(),
+                    admission,
+                },
+                "gateway-a",
+            );
+            assert!(matches!(result, Err(AppConfigFetchError::Invalid(_))));
         }
     }
 

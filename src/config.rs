@@ -1178,17 +1178,12 @@ impl Config {
 
     /// Static and hot bootstrap admission settings. Environment values remain
     /// the fallback; once built, the controller owns the active policy.
-    pub fn admission(
-        &self,
-    ) -> Option<(
-        crate::admission::AdmissionStaticConfig,
-        crate::admission::AdmissionPolicy,
-    )> {
+    pub fn admission(&self) -> Option<crate::admission::AdmissionBootstrap> {
         if self.admission_max_inflight == 0 {
             return None;
         }
-        Some((
-            crate::admission::AdmissionStaticConfig {
+        Some(crate::admission::AdmissionBootstrap {
+            static_config: crate::admission::AdmissionStaticConfig {
                 tier_borrowing: self.admission_tier_borrowing,
                 long_max_inflight_per_host: self.admission_long_max_inflight_per_host,
                 start_inflight: self.admission_start_inflight,
@@ -1198,12 +1193,12 @@ impl Config {
                     .then(|| Duration::from_millis(self.admission_ttft_p95_max_ms)),
                 queue_saturated_at: self.admission_queue_saturated_at,
             },
-            crate::admission::AdmissionPolicy {
+            policy: crate::admission::AdmissionPolicy {
                 max_inflight: self.admission_max_inflight,
                 backpressure_ttl: Duration::from_secs(self.admission_backpressure_secs),
                 retry_after: Duration::from_secs(self.admission_retry_after_secs),
             },
-        ))
+        })
     }
 
     /// Build the runtime config for pre-dispatch image validation.
@@ -2269,7 +2264,7 @@ mod tests {
             ],
             || {
                 let c = Config::from_env().unwrap();
-                assert!(c.admission().unwrap().0.tier_borrowing);
+                assert!(c.admission().unwrap().static_config.tier_borrowing);
                 assert_eq!(c.admission_long_max_inflight_per_host, 12);
                 env::set_var("VLLM_PROXY_ADMISSION_LONG_MAX_INFLIGHT_PER_HOST", "0");
                 assert!(Config::from_env()
@@ -2313,8 +2308,8 @@ mod tests {
                 let config = Config::from_env().unwrap();
                 assert_eq!(
                     config.admission(),
-                    Some((
-                        crate::admission::AdmissionStaticConfig {
+                    Some(crate::admission::AdmissionBootstrap {
+                        static_config: crate::admission::AdmissionStaticConfig {
                             tier_borrowing: false,
                             long_max_inflight_per_host: 0,
                             start_inflight: 32,
@@ -2323,12 +2318,12 @@ mod tests {
                             ttft_p95_max: Some(Duration::from_secs(30)),
                             queue_saturated_at: 4,
                         },
-                        crate::admission::AdmissionPolicy {
+                        policy: crate::admission::AdmissionPolicy {
                             max_inflight: 48,
                             backpressure_ttl: Duration::from_secs(10),
                             retry_after: Duration::from_secs(2),
                         },
-                    ))
+                    })
                 );
                 assert!(config.backend_connect_failover);
 
@@ -2339,9 +2334,9 @@ mod tests {
                 env::remove_var("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT");
                 let config = Config::from_env().unwrap();
                 let admission = config.admission().unwrap();
-                assert_eq!(admission.0.ttft_p95_max, None);
-                assert_eq!(admission.0.start_inflight, 48);
-                assert_eq!(admission.0.queue_saturated_at, 1);
+                assert_eq!(admission.static_config.ttft_p95_max, None);
+                assert_eq!(admission.static_config.start_inflight, 48);
+                assert_eq!(admission.static_config.queue_saturated_at, 1);
 
                 // Validation.
                 env::set_var("VLLM_PROXY_ADMISSION_START_INFLIGHT", "64");

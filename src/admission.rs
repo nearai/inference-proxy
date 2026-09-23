@@ -99,6 +99,13 @@ pub struct AdmissionPolicy {
     pub retry_after: Duration,
 }
 
+/// Complete environment bootstrap for an enabled admission controller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmissionBootstrap {
+    pub static_config: AdmissionStaticConfig,
+    pub policy: AdmissionPolicy,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PolicySource {
     Environment,
@@ -132,6 +139,8 @@ pub enum PolicyApplyError {
     ConflictingContent { configuration_version: String },
     /// Runtime admission cannot be enabled with a zero effective budget.
     InvalidMaxInflight,
+    /// Runtime policy updates require admission to have been enabled at startup.
+    AdmissionDisabled,
 }
 
 impl std::fmt::Display for PolicyApplyError {
@@ -144,6 +153,9 @@ impl std::fmt::Display for PolicyApplyError {
                 "AppConfig version {configuration_version:?} was reused with different content"
             ),
             Self::InvalidMaxInflight => f.write_str("admission max_inflight must be positive"),
+            Self::AdmissionDisabled => {
+                f.write_str("cannot apply admission policy because admission is disabled")
+            }
         }
     }
 }
@@ -234,17 +246,17 @@ impl AdmissionController {
     /// `backend_count` sizes the per-backend back-pressure slots; it must be
     /// the pool size (backend indexes are stable for the process lifetime).
     pub fn new(
-        bootstrap: Option<(AdmissionStaticConfig, AdmissionPolicy)>,
+        bootstrap: Option<AdmissionBootstrap>,
         backend_count: usize,
         engine: Arc<EngineLoad>,
     ) -> Self {
         let now = Instant::now();
         let (static_config, bootstrap_policy) = bootstrap
-            .map(|(static_config, policy)| {
+            .map(|bootstrap| {
                 (
-                    Some(static_config),
+                    Some(bootstrap.static_config),
                     Some(AppliedPolicy {
-                        policy,
+                        policy: bootstrap.policy,
                         source: PolicySource::Environment,
                     }),
                 )
@@ -321,7 +333,7 @@ impl AdmissionController {
 
         let mut active = self.policy_write();
         let Some(current) = active.as_ref() else {
-            return Err(PolicyApplyError::InvalidMaxInflight);
+            return Err(PolicyApplyError::AdmissionDisabled);
         };
         let appconfig_relation = if let (
             PolicySource::AppConfig {
@@ -1017,11 +1029,23 @@ mod tests {
         config: (AdmissionStaticConfig, AdmissionPolicy),
         backends: usize,
     ) -> Arc<AdmissionController> {
+        let (static_config, policy) = config;
         Arc::new(AdmissionController::new(
-            Some(config),
+            Some(AdmissionBootstrap {
+                static_config,
+                policy,
+            }),
             backends,
             Arc::new(EngineLoad::disabled()),
         ))
+    }
+
+    fn bootstrap(config: (AdmissionStaticConfig, AdmissionPolicy)) -> AdmissionBootstrap {
+        let (static_config, policy) = config;
+        AdmissionBootstrap {
+            static_config,
+            policy,
+        }
     }
 
     fn appconfig(policy: AdmissionPolicy, version: &str, digest: u8) -> AppliedPolicy {
@@ -1338,6 +1362,28 @@ mod tests {
         );
         assert_eq!(c.current_policy(), Some(original));
         assert_eq!(c.budget(), original_budget);
+    }
+
+    #[test]
+    fn zero_max_inflight_is_rejected_as_invalid() {
+        let c = controller(config(), 1);
+        let mut policy = config().1;
+        policy.max_inflight = 0;
+
+        assert_eq!(
+            c.apply_policy(appconfig(policy, "v1", 1)),
+            Err(PolicyApplyError::InvalidMaxInflight)
+        );
+    }
+
+    #[test]
+    fn policy_update_is_rejected_when_admission_is_disabled() {
+        let c = AdmissionController::disabled();
+
+        assert_eq!(
+            c.apply_policy(appconfig(config().1, "v1", 1)),
+            Err(PolicyApplyError::AdmissionDisabled)
+        );
     }
 
     #[test]
@@ -1724,7 +1770,11 @@ mod tests {
     #[test]
     fn a_queueing_engine_counts_as_saturated_until_the_sample_ages() {
         let engine = Arc::new(EngineLoad::new(2, Duration::from_secs(6)));
-        let c = Arc::new(AdmissionController::new(Some(config()), 2, engine.clone()));
+        let c = Arc::new(AdmissionController::new(
+            Some(bootstrap(config())),
+            2,
+            engine.clone(),
+        ));
         let p = pool(2);
         let t0 = Instant::now();
         let busy = engine_sample(30, 2);
@@ -1754,13 +1804,13 @@ mod tests {
     fn queue_saturated_at_raises_the_engine_queue_threshold() {
         let engine = Arc::new(EngineLoad::new(1, Duration::from_secs(6)));
         let c = Arc::new(AdmissionController::new(
-            Some((
-                AdmissionStaticConfig {
+            Some(AdmissionBootstrap {
+                static_config: AdmissionStaticConfig {
                     queue_saturated_at: 4,
                     ..config().0
                 },
-                config().1,
-            )),
+                policy: config().1,
+            }),
             1,
             engine.clone(),
         ));
@@ -1803,13 +1853,13 @@ mod tests {
     fn every_backend_queued_respects_the_configured_threshold() {
         let engine = Arc::new(EngineLoad::new(2, Duration::from_secs(6)));
         let c = Arc::new(AdmissionController::new(
-            Some((
-                AdmissionStaticConfig {
+            Some(AdmissionBootstrap {
+                static_config: AdmissionStaticConfig {
                     queue_saturated_at: 4,
                     ..config().0
                 },
-                config().1,
-            )),
+                policy: config().1,
+            }),
             2,
             engine.clone(),
         ));

@@ -133,11 +133,16 @@ class Handler(BaseHTTPRequestHandler):
                 "total_tokens": 2,
             },
         }
-        self.send_json(200, payload)
-        with STATE.condition:
-            STATE.active -= 1
-            STATE.completed += 1
-            STATE.condition.notify_all()
+        sent = False
+        try:
+            self.send_json(200, payload)
+            sent = True
+        finally:
+            with STATE.condition:
+                STATE.active -= 1
+                if sent:
+                    STATE.completed += 1
+                STATE.condition.notify_all()
 
 
 if __name__ == "__main__":

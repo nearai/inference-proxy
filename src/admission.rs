@@ -35,7 +35,7 @@
 //! module is inert and the in-CVM behavior is unchanged.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
@@ -66,11 +66,11 @@ const DISPATCHED: u8 = 1;
 const GENERATED: u8 = 2;
 const ABANDONED: u8 = 3;
 
-/// Operator settings, parsed and validated by `Config::from_env`.
+/// Operator settings that remain fixed for the lifetime of an admission
+/// controller. These values describe the admission algorithm and its
+/// historical state, rather than the remotely adjustable budget.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AdmissionConfig {
-    /// Hard ceiling on lane requests in flight across the fleet.
-    pub max_inflight: u32,
+pub struct AdmissionStaticConfig {
     pub tier_borrowing: bool,
     pub long_max_inflight_per_host: u32,
     /// Budget at start-up; ramps toward `max_inflight`.
@@ -82,15 +82,85 @@ pub struct AdmissionConfig {
     /// Refuse new work while enough of the window waited longer than this for
     /// the first generation event (`None` = no TTFT check).
     pub ttft_p95_max: Option<Duration>,
-    /// How long an engine admission rejection counts against its backend.
-    pub backpressure_ttl: Duration,
     /// Engine-reported queue depth at or above which a backend counts as
     /// saturated (`VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT`, default 1: a
     /// queue of at least one request).
     pub queue_saturated_at: u32,
+}
+
+/// The policy fields that may be changed while the controller is running.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmissionPolicy {
+    /// Hard ceiling on lane requests in flight across the fleet.
+    pub max_inflight: u32,
+    /// How long an engine admission rejection counts against its backend.
+    pub backpressure_ttl: Duration,
     /// `Retry-After` value on every refusal.
     pub retry_after: Duration,
 }
+
+/// Complete environment bootstrap for an enabled admission controller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmissionBootstrap {
+    pub static_config: AdmissionStaticConfig,
+    pub policy: AdmissionPolicy,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PolicySource {
+    Environment,
+    AppConfig {
+        configuration_version: String,
+        content_sha256: [u8; 32],
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppliedPolicy {
+    pub policy: AdmissionPolicy,
+    pub source: PolicySource,
+}
+
+/// Result of reconciling a candidate policy with the active policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyApplyOutcome {
+    /// The policy values and source metadata changed.
+    Applied,
+    /// The candidate has the same version and content as the active policy.
+    Unchanged,
+    /// The source version changed, while the policy content stayed the same.
+    MetadataUpdated,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PolicyApplyError {
+    /// AppConfig versions are immutable. Reusing an active version with a
+    /// different body is rejected rather than silently replacing policy.
+    ConflictingContent { configuration_version: String },
+    /// Runtime admission cannot be enabled with a zero effective budget.
+    InvalidMaxInflight,
+    /// Runtime policy updates require admission to have been enabled at startup.
+    AdmissionDisabled,
+}
+
+impl std::fmt::Display for PolicyApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConflictingContent {
+                configuration_version,
+            } => write!(
+                f,
+                "AppConfig version {configuration_version:?} was reused with different content"
+            ),
+            Self::InvalidMaxInflight => f.write_str("admission max_inflight must be positive"),
+            Self::AdmissionDisabled => {
+                f.write_str("cannot apply admission policy because admission is disabled")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PolicyApplyError {}
 
 /// Why a request was refused. The label of `admission_rejections_total`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,7 +222,8 @@ const TTFT_BUCKETS: usize = TTFT_WINDOW.as_secs() as usize;
 
 /// Fleet-wide admission state shared by every request (`AppState.admission`).
 pub struct AdmissionController {
-    config: Option<AdmissionConfig>,
+    static_config: Option<AdmissionStaticConfig>,
+    policy: RwLock<Option<AppliedPolicy>>,
     inflight: AtomicU32,
     budget: AtomicU32,
     ramp: Mutex<Ramp>,
@@ -175,19 +246,33 @@ impl AdmissionController {
     /// `backend_count` sizes the per-backend back-pressure slots; it must be
     /// the pool size (backend indexes are stable for the process lifetime).
     pub fn new(
-        config: Option<AdmissionConfig>,
+        bootstrap: Option<AdmissionBootstrap>,
         backend_count: usize,
         engine: Arc<EngineLoad>,
     ) -> Self {
         let now = Instant::now();
-        let budget = config.as_ref().map_or(0, |c| c.start_inflight);
-        if let Some(config) = &config {
+        let (static_config, bootstrap_policy) = bootstrap
+            .map(|bootstrap| {
+                (
+                    Some(bootstrap.static_config),
+                    Some(AppliedPolicy {
+                        policy: bootstrap.policy,
+                        source: PolicySource::Environment,
+                    }),
+                )
+            })
+            .unwrap_or((None, None));
+        let budget = static_config.as_ref().map_or(0, |c| c.start_inflight);
+        if let Some(config) = &static_config {
             metrics::gauge!("admission_budget").set(f64::from(budget));
             metrics::gauge!("admission_inflight").set(0.0);
-            debug_assert!(config.start_inflight <= config.max_inflight);
+            debug_assert!(bootstrap_policy
+                .as_ref()
+                .is_none_or(|p| config.start_inflight <= p.policy.max_inflight));
         }
         Self {
-            config,
+            static_config,
+            policy: RwLock::new(bootstrap_policy),
             inflight: AtomicU32::new(0),
             budget: AtomicU32::new(budget),
             ramp: Mutex::new(Ramp {
@@ -217,11 +302,85 @@ impl AdmissionController {
     }
 
     pub fn is_enabled(&self) -> bool {
-        self.config.is_some()
+        self.static_config.is_some()
     }
 
-    pub fn config(&self) -> Option<&AdmissionConfig> {
-        self.config.as_ref()
+    pub fn static_config(&self) -> Option<&AdmissionStaticConfig> {
+        self.static_config.as_ref()
+    }
+
+    fn policy_read(&self) -> RwLockReadGuard<'_, Option<AppliedPolicy>> {
+        self.policy.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn policy_write(&self) -> RwLockWriteGuard<'_, Option<AppliedPolicy>> {
+        self.policy.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Return the active policy and its source metadata as a coherent snapshot.
+    pub fn current_policy(&self) -> Option<AppliedPolicy> {
+        self.policy_read().clone()
+    }
+
+    /// Atomically reconcile and, when needed, adopt a complete policy.
+    pub fn apply_policy(
+        &self,
+        candidate: AppliedPolicy,
+    ) -> Result<PolicyApplyOutcome, PolicyApplyError> {
+        if candidate.policy.max_inflight == 0 {
+            return Err(PolicyApplyError::InvalidMaxInflight);
+        }
+
+        let mut active = self.policy_write();
+        let Some(current) = active.as_ref() else {
+            return Err(PolicyApplyError::AdmissionDisabled);
+        };
+        let appconfig_relation = if let (
+            PolicySource::AppConfig {
+                configuration_version: current_version,
+                content_sha256: current_digest,
+            },
+            PolicySource::AppConfig {
+                configuration_version: candidate_version,
+                content_sha256: candidate_digest,
+            },
+        ) = (&current.source, &candidate.source)
+        {
+            if current_version == candidate_version && current_digest != candidate_digest {
+                return Err(PolicyApplyError::ConflictingContent {
+                    configuration_version: candidate_version.clone(),
+                });
+            }
+            Some((
+                current_version == candidate_version,
+                current_digest == candidate_digest,
+            ))
+        } else {
+            None
+        };
+
+        let outcome = if appconfig_relation == Some((true, true)) || current == &candidate {
+            PolicyApplyOutcome::Unchanged
+        } else if appconfig_relation == Some((false, true)) || current.policy == candidate.policy {
+            PolicyApplyOutcome::MetadataUpdated
+        } else {
+            PolicyApplyOutcome::Applied
+        };
+        if outcome != PolicyApplyOutcome::Unchanged {
+            let applied_policy = if appconfig_relation == Some((false, true)) {
+                AppliedPolicy {
+                    policy: current.policy.clone(),
+                    source: candidate.source,
+                }
+            } else {
+                candidate
+            };
+            self.budget
+                .store(applied_policy.policy.max_inflight, Ordering::Release);
+            metrics::gauge!("admission_budget").set(f64::from(applied_policy.policy.max_inflight));
+            *active = Some(applied_policy);
+        }
+        Ok(outcome)
     }
 
     /// Current effective budget (0 when disabled).
@@ -238,7 +397,7 @@ impl AdmissionController {
     /// admission is disabled. With no healthy backend the share is computed
     /// as for one, so the (degraded) selection still has a bound to apply.
     pub fn host_share(&self, healthy_backends: usize) -> Option<u32> {
-        self.config.as_ref()?;
+        self.policy_read().as_ref()?;
         let budget = self.budget.load(Ordering::Relaxed).max(1);
         let hosts = u32::try_from(healthy_backends.max(1)).unwrap_or(u32::MAX);
         Some(budget.div_ceil(hosts))
@@ -247,7 +406,7 @@ impl AdmissionController {
     /// Snapshot limits by destination backend, shared by placement and failover.
     /// Configured counts deliberately prevent load concentration on host loss.
     pub fn backend_limits(&self, pool: &BackendPool) -> Option<Vec<u32>> {
-        let config = self.config.as_ref()?;
+        let config = self.static_config.as_ref()?;
         let budget = self.budget().max(1);
         if !config.tier_borrowing {
             return Some(vec![self.host_share(pool.healthy_count())?; pool.len()]);
@@ -291,11 +450,27 @@ impl AdmissionController {
     }
 
     pub(crate) fn backend_saturated_at(&self, index: usize, now: Instant) -> bool {
-        // The engine sample is checked before the config `None` return: a
-        // gateway that sets `VLLM_BACKEND_PROBE_URLS` without admission still
+        let ttl = self
+            .policy_read()
+            .as_ref()
+            .map_or(Duration::ZERO, |p| p.policy.backpressure_ttl);
+        self.backend_saturated_at_with_ttl(index, now, ttl)
+    }
+
+    fn backend_saturated_at_with_ttl(
+        &self,
+        index: usize,
+        now: Instant,
+        backpressure_ttl: Duration,
+    ) -> bool {
+        // The engine sample is checked before the static config `None` return:
+        // a gateway that sets `VLLM_BACKEND_PROBE_URLS` without admission still
         // steers placement around a queueing backend (threshold 1, same as
         // admission's own default).
-        let threshold = self.config.as_ref().map_or(1, |c| c.queue_saturated_at);
+        let threshold = self
+            .static_config
+            .as_ref()
+            .map_or(1, |config| config.queue_saturated_at);
         if self
             .engine
             .get_at(index, now)
@@ -303,7 +478,7 @@ impl AdmissionController {
         {
             return true;
         }
-        let Some(config) = &self.config else {
+        let Some(_) = &self.static_config else {
             return false;
         };
         let stamp = self
@@ -314,11 +489,19 @@ impl AdmissionController {
             return false;
         }
         let at = self.epoch + Duration::from_millis(stamp - 1);
-        now.saturating_duration_since(at) <= config.backpressure_ttl
+        now.saturating_duration_since(at) <= backpressure_ttl
     }
 
     /// Build (and count) a refusal for `reason`.
     pub fn reject(&self, reason: RejectReason) -> Rejected {
+        let retry_after = self
+            .policy_read()
+            .as_ref()
+            .map_or(Duration::from_secs(1), |p| p.policy.retry_after);
+        self.reject_with_retry_after(reason, retry_after)
+    }
+
+    fn reject_with_retry_after(&self, reason: RejectReason, retry_after: Duration) -> Rejected {
         metrics::counter!("admission_rejections_total", "reason" => reason.as_str()).increment(1);
         debug!(
             reason = reason.as_str(),
@@ -326,10 +509,7 @@ impl AdmissionController {
         );
         Rejected {
             reason,
-            retry_after: self
-                .config
-                .as_ref()
-                .map_or(Duration::from_secs(1), |c| c.retry_after),
+            retry_after,
         }
     }
 
@@ -348,7 +528,21 @@ impl AdmissionController {
         tier: Option<TierDecision>,
         now: Instant,
     ) -> Result<(), Rejected> {
-        let Some(config) = &self.config else {
+        let policy = self.policy_read();
+        let Some(applied) = policy.as_ref() else {
+            return Ok(());
+        };
+        self.precheck_with_policy(pool, tier, now, applied)
+    }
+
+    fn precheck_with_policy(
+        &self,
+        pool: &BackendPool,
+        tier: Option<TierDecision>,
+        now: Instant,
+        applied: &AppliedPolicy,
+    ) -> Result<(), Rejected> {
+        let Some(config) = &self.static_config else {
             return Ok(());
         };
         // Overload first, so a signal that just arrived cannot be preceded by
@@ -359,14 +553,24 @@ impl AdmissionController {
         // fleet, which is the fleet the breaker just declared overloaded.
         let on_long_tier = tier.is_some_and(|tier| tier.restrict == Some(ContextTier::Long));
         if !on_long_tier && self.ttft_over_bound(config, now) {
-            return Err(self.reject(RejectReason::Ttft));
+            return Err(
+                self.reject_with_retry_after(RejectReason::Ttft, applied.policy.retry_after)
+            );
         }
-        if self.every_backend_queued(config, pool, tier.and_then(|tier| tier.restrict), now) {
-            return Err(self.reject(RejectReason::BackendQueue));
+        if self.every_backend_queued(
+            applied.policy.backpressure_ttl,
+            pool,
+            tier.and_then(|tier| tier.restrict),
+            now,
+        ) {
+            return Err(self
+                .reject_with_retry_after(RejectReason::BackendQueue, applied.policy.retry_after));
         }
-        self.tick_ramp(config, now);
+        self.tick_ramp(config, applied.policy.max_inflight, now);
         if self.inflight.load(Ordering::Acquire) >= self.budget.load(Ordering::Relaxed) {
-            return Err(self.reject(RejectReason::Budget));
+            return Err(
+                self.reject_with_retry_after(RejectReason::Budget, applied.policy.retry_after)
+            );
         }
         Ok(())
     }
@@ -390,14 +594,17 @@ impl AdmissionController {
         tier: Option<TierDecision>,
         now: Instant,
     ) -> Result<Option<Permit>, Rejected> {
-        if self.config.is_none() {
+        let policy = self.policy_read();
+        let Some(applied) = policy.as_ref() else {
             return Ok(None);
-        }
-        self.precheck_at(pool, tier, now)?;
+        };
+        self.precheck_with_policy(pool, tier, now, applied)?;
         let mut current = self.inflight.load(Ordering::Acquire);
         loop {
             if current >= self.budget.load(Ordering::Relaxed) {
-                return Err(self.reject(RejectReason::Budget));
+                return Err(
+                    self.reject_with_retry_after(RejectReason::Budget, applied.policy.retry_after)
+                );
             }
             match self.inflight.compare_exchange_weak(
                 current,
@@ -434,7 +641,7 @@ impl AdmissionController {
 
     /// Grow the budget by one step when a whole interval passed without an
     /// overload signal; a dirty interval just restarts the clock.
-    fn tick_ramp(&self, config: &AdmissionConfig, now: Instant) {
+    fn tick_ramp(&self, config: &AdmissionStaticConfig, max_inflight: u32, now: Instant) {
         let mut ramp = self.ramp();
         if now.saturating_duration_since(ramp.interval_started) < config.ramp_interval {
             return;
@@ -445,25 +652,23 @@ impl AdmissionController {
         drop(ramp);
 
         let budget = self.budget.load(Ordering::Relaxed);
-        if budget >= config.max_inflight {
+        if budget >= max_inflight {
             return;
         }
         if clean {
-            let next = budget
-                .saturating_add(config.ramp_step)
-                .min(config.max_inflight);
+            let next = budget.saturating_add(config.ramp_step).min(max_inflight);
             self.budget.store(next, Ordering::Relaxed);
             metrics::gauge!("admission_budget").set(f64::from(next));
             info!(
                 from = budget,
                 to = next,
-                max = config.max_inflight,
+                max = max_inflight,
                 "Admission budget ramped up"
             );
         } else {
             info!(
                 budget,
-                max = config.max_inflight,
+                max = max_inflight,
                 "Admission budget held: overload signals during the last interval"
             );
         }
@@ -477,7 +682,7 @@ impl AdmissionController {
     /// request ended without a generation event after waiting `ttft`).
     fn record_ttft(&self, now: Instant, ttft: Duration) {
         metrics::histogram!("admission_ttft_seconds").record(ttft.as_secs_f64());
-        let Some(max) = self.config.as_ref().and_then(|c| c.ttft_p95_max) else {
+        let Some(max) = self.static_config.as_ref().and_then(|c| c.ttft_p95_max) else {
             return;
         };
         let breach = ttft > max;
@@ -521,7 +726,7 @@ impl AdmissionController {
         (samples >= TTFT_MIN_SAMPLES).then_some((samples, breaches))
     }
 
-    fn ttft_over_bound(&self, config: &AdmissionConfig, now: Instant) -> bool {
+    fn ttft_over_bound(&self, config: &AdmissionStaticConfig, now: Instant) -> bool {
         let Some(max) = config.ttft_p95_max else {
             return false;
         };
@@ -573,7 +778,7 @@ impl AdmissionController {
     /// request at engine admission within the TTL.
     fn every_backend_queued(
         &self,
-        config: &AdmissionConfig,
+        backpressure_ttl: Duration,
         pool: &BackendPool,
         tier: Option<ContextTier>,
         now: Instant,
@@ -587,7 +792,7 @@ impl AdmissionController {
                 continue;
             }
             healthy += 1;
-            if !self.backend_saturated_at(index, now) {
+            if !self.backend_saturated_at_with_ttl(index, now, backpressure_ttl) {
                 all_queued = false;
                 break;
             }
@@ -600,8 +805,11 @@ impl AdmissionController {
                 warn!(
                     tier,
                     healthy_backends = healthy,
-                    queue_saturated_at = config.queue_saturated_at,
-                    ttl_secs = config.backpressure_ttl.as_secs(),
+                    queue_saturated_at = self
+                        .static_config
+                        .as_ref()
+                        .map_or(1, |config| config.queue_saturated_at),
+                    ttl_secs = backpressure_ttl.as_secs(),
                     "Every backend's engine queue is at or above the saturation threshold, or it rejected a lane request at engine admission recently; refusing new work"
                 );
             } else {
@@ -794,31 +1002,60 @@ impl Drop for Permit {
 mod tests {
     use super::*;
 
-    fn config() -> AdmissionConfig {
-        AdmissionConfig {
-            max_inflight: 8,
-            tier_borrowing: false,
-            long_max_inflight_per_host: 0,
-            start_inflight: 2,
-            ramp_step: 2,
-            ramp_interval: Duration::from_secs(60),
-            ttft_p95_max: Some(Duration::from_secs(10)),
-            backpressure_ttl: Duration::from_secs(10),
-            queue_saturated_at: 1,
-            retry_after: Duration::from_secs(3),
-        }
+    fn config() -> (AdmissionStaticConfig, AdmissionPolicy) {
+        (
+            AdmissionStaticConfig {
+                tier_borrowing: false,
+                long_max_inflight_per_host: 0,
+                start_inflight: 2,
+                ramp_step: 2,
+                ramp_interval: Duration::from_secs(60),
+                ttft_p95_max: Some(Duration::from_secs(10)),
+                queue_saturated_at: 1,
+            },
+            AdmissionPolicy {
+                max_inflight: 8,
+                backpressure_ttl: Duration::from_secs(10),
+                retry_after: Duration::from_secs(3),
+            },
+        )
     }
 
     fn pool(n: usize) -> BackendPool {
         BackendPool::new((0..n).map(|i| format!("http://b{i}:8000")).collect())
     }
 
-    fn controller(config: AdmissionConfig, backends: usize) -> Arc<AdmissionController> {
+    fn controller(
+        config: (AdmissionStaticConfig, AdmissionPolicy),
+        backends: usize,
+    ) -> Arc<AdmissionController> {
+        let (static_config, policy) = config;
         Arc::new(AdmissionController::new(
-            Some(config),
+            Some(AdmissionBootstrap {
+                static_config,
+                policy,
+            }),
             backends,
             Arc::new(EngineLoad::disabled()),
         ))
+    }
+
+    fn bootstrap(config: (AdmissionStaticConfig, AdmissionPolicy)) -> AdmissionBootstrap {
+        let (static_config, policy) = config;
+        AdmissionBootstrap {
+            static_config,
+            policy,
+        }
+    }
+
+    fn appconfig(policy: AdmissionPolicy, version: &str, digest: u8) -> AppliedPolicy {
+        AppliedPolicy {
+            policy,
+            source: PolicySource::AppConfig {
+                configuration_version: version.to_string(),
+                content_sha256: [digest; 32],
+            },
+        }
     }
 
     /// A tier decision for a request estimated onto `estimated` that may use
@@ -849,13 +1086,18 @@ mod tests {
             vec!["long".into()],
         );
         let c = controller(
-            AdmissionConfig {
-                max_inflight: 64,
-                start_inflight: 32,
-                tier_borrowing: true,
-                long_max_inflight_per_host: 12,
-                ..config()
-            },
+            (
+                AdmissionStaticConfig {
+                    start_inflight: 32,
+                    tier_borrowing: true,
+                    long_max_inflight_per_host: 12,
+                    ..config().0
+                },
+                AdmissionPolicy {
+                    max_inflight: 64,
+                    ..config().1
+                },
+            ),
             4,
         );
         for (budget, expected) in [
@@ -872,11 +1114,16 @@ mod tests {
             p.backends()[0].healthy.store(true, Ordering::Relaxed);
         }
         let legacy = controller(
-            AdmissionConfig {
-                max_inflight: 48,
-                start_inflight: 48,
-                ..config()
-            },
+            (
+                AdmissionStaticConfig {
+                    start_inflight: 48,
+                    ..config().0
+                },
+                AdmissionPolicy {
+                    max_inflight: 48,
+                    ..config().1
+                },
+            ),
             4,
         );
         assert_eq!(legacy.backend_limits(&p).unwrap(), vec![12; 4]);
@@ -894,13 +1141,18 @@ mod tests {
             vec!["long".into()],
         ));
         let c = controller(
-            AdmissionConfig {
-                max_inflight: 48,
-                start_inflight: 48,
-                tier_borrowing: true,
-                long_max_inflight_per_host: 12,
-                ..config()
-            },
+            (
+                AdmissionStaticConfig {
+                    start_inflight: 48,
+                    tier_borrowing: true,
+                    long_max_inflight_per_host: 12,
+                    ..config().0
+                },
+                AdmissionPolicy {
+                    max_inflight: 48,
+                    ..config().1
+                },
+            ),
             4,
         );
         let limits = c.backend_limits(&p).unwrap();
@@ -1018,6 +1270,207 @@ mod tests {
         let _c2 = c.try_admit(&p, None).unwrap().unwrap();
         drop(b);
         assert_eq!(c.inflight(), 1);
+    }
+
+    #[test]
+    fn applying_a_larger_policy_increases_admission_without_rebuilding_state() {
+        let c = controller(
+            (
+                AdmissionStaticConfig {
+                    start_inflight: 2,
+                    ..config().0
+                },
+                AdmissionPolicy {
+                    max_inflight: 2,
+                    ..config().1
+                },
+            ),
+            1,
+        );
+        let p = pool(1);
+        let first = c.try_admit(&p, None).unwrap().unwrap();
+        let second = c.try_admit(&p, None).unwrap().unwrap();
+        assert_eq!(c.inflight(), 2);
+
+        let mut next = config().1;
+        next.max_inflight = 4;
+        assert_eq!(
+            c.apply_policy(appconfig(next, "v2", 2)).unwrap(),
+            PolicyApplyOutcome::Applied
+        );
+        assert_eq!(c.budget(), 4);
+        let third = c.try_admit(&p, None).unwrap().unwrap();
+        assert_eq!(c.inflight(), 3);
+        drop((first, second, third));
+        assert_eq!(c.inflight(), 0);
+    }
+
+    #[test]
+    fn lowering_policy_below_inflight_preserves_permits_until_they_release() {
+        let c = controller(
+            (
+                AdmissionStaticConfig {
+                    start_inflight: 3,
+                    ..config().0
+                },
+                AdmissionPolicy {
+                    max_inflight: 3,
+                    ..config().1
+                },
+            ),
+            1,
+        );
+        let p = pool(1);
+        let held: Vec<_> = (0..3)
+            .map(|_| c.try_admit(&p, None).unwrap().unwrap())
+            .collect();
+
+        let mut next = config().1;
+        next.max_inflight = 1;
+        assert_eq!(
+            c.apply_policy(appconfig(next, "v2", 2)).unwrap(),
+            PolicyApplyOutcome::Applied
+        );
+        assert_eq!(c.budget(), 1);
+        assert_eq!(c.inflight(), 3);
+        assert_eq!(
+            c.try_admit(&p, None).unwrap_err().reason,
+            RejectReason::Budget
+        );
+
+        drop(held);
+        assert_eq!(c.inflight(), 0);
+        assert!(c.try_admit(&p, None).is_ok());
+    }
+
+    #[test]
+    fn same_version_with_different_content_is_rejected_without_mutation() {
+        let c = controller(config(), 1);
+        let original_policy = config().1;
+        c.apply_policy(appconfig(original_policy.clone(), "v1", 1))
+            .unwrap();
+        let original = c.current_policy().unwrap();
+        let original_budget = c.budget();
+        let mut changed = original_policy;
+        changed.retry_after += Duration::from_secs(1);
+        let error = c.apply_policy(appconfig(changed, "v1", 2)).unwrap_err();
+        assert_eq!(
+            error,
+            PolicyApplyError::ConflictingContent {
+                configuration_version: "v1".to_string()
+            }
+        );
+        assert_eq!(c.current_policy(), Some(original));
+        assert_eq!(c.budget(), original_budget);
+    }
+
+    #[test]
+    fn zero_max_inflight_is_rejected_as_invalid() {
+        let c = controller(config(), 1);
+        let mut policy = config().1;
+        policy.max_inflight = 0;
+
+        assert_eq!(
+            c.apply_policy(appconfig(policy, "v1", 1)),
+            Err(PolicyApplyError::InvalidMaxInflight)
+        );
+    }
+
+    #[test]
+    fn policy_update_is_rejected_when_admission_is_disabled() {
+        let c = AdmissionController::disabled();
+
+        assert_eq!(
+            c.apply_policy(appconfig(config().1, "v1", 1)),
+            Err(PolicyApplyError::AdmissionDisabled)
+        );
+    }
+
+    #[test]
+    fn same_version_and_content_is_a_policy_noop() {
+        let c = controller(config(), 1);
+        let mut first = config().1;
+        first.max_inflight = 4;
+        let candidate = appconfig(first.clone(), "v1", 1);
+        assert_eq!(
+            c.apply_policy(candidate.clone()).unwrap(),
+            PolicyApplyOutcome::Applied
+        );
+        let mut conflicting_struct = first;
+        conflicting_struct.max_inflight = 7;
+        assert_eq!(
+            c.apply_policy(appconfig(conflicting_struct, "v1", 1))
+                .unwrap(),
+            PolicyApplyOutcome::Unchanged
+        );
+        assert_eq!(c.current_policy(), Some(candidate));
+        assert_eq!(c.budget(), 4);
+    }
+
+    #[test]
+    fn new_version_with_same_content_updates_only_source_metadata() {
+        let c = controller(config(), 1);
+        let mut first = config().1;
+        first.max_inflight = 4;
+        assert_eq!(
+            c.apply_policy(appconfig(first.clone(), "v1", 1)).unwrap(),
+            PolicyApplyOutcome::Applied
+        );
+        assert_eq!(
+            c.apply_policy(appconfig(first, "v2", 1)).unwrap(),
+            PolicyApplyOutcome::MetadataUpdated
+        );
+        assert_eq!(c.budget(), 4);
+        assert_eq!(
+            c.current_policy().unwrap().source,
+            PolicySource::AppConfig {
+                configuration_version: "v2".to_string(),
+                content_sha256: [1; 32],
+            }
+        );
+    }
+
+    #[test]
+    fn rollback_to_an_older_version_applies_normally() {
+        let c = controller(config(), 1);
+        let mut newer = config().1;
+        newer.max_inflight = 4;
+        c.apply_policy(appconfig(newer, "v2", 2)).unwrap();
+
+        let mut older = config().1;
+        older.max_inflight = 2;
+        assert_eq!(
+            c.apply_policy(appconfig(older, "v1", 1)).unwrap(),
+            PolicyApplyOutcome::Applied
+        );
+        assert_eq!(c.budget(), 2);
+        assert_eq!(
+            c.current_policy().unwrap().source,
+            PolicySource::AppConfig {
+                configuration_version: "v1".to_string(),
+                content_sha256: [1; 32],
+            }
+        );
+    }
+
+    #[test]
+    fn policy_application_preserves_ttft_and_backpressure_history() {
+        let c = controller(config(), 1);
+        let p = pool(1);
+        let t0 = Instant::now();
+        sample(&c, &p, t0, Duration::from_secs(2));
+        let permit = c.try_admit_at(&p, None, t0).unwrap().unwrap();
+        permit.attach_backend(0);
+        permit.observe_backpressure_at(t0 + Duration::from_secs(1));
+        drop(permit);
+        assert_eq!(c.ttft_totals(t0 + Duration::from_secs(2)), (1, 0));
+        assert!(c.backend_saturated_at(0, t0 + Duration::from_secs(2)));
+
+        let mut next = config().1;
+        next.max_inflight = 4;
+        c.apply_policy(appconfig(next, "v2", 2)).unwrap();
+        assert_eq!(c.ttft_totals(t0 + Duration::from_secs(2)), (1, 0));
+        assert!(c.backend_saturated_at(0, t0 + Duration::from_secs(2)));
     }
 
     #[test]
@@ -1209,10 +1662,13 @@ mod tests {
     #[test]
     fn ttft_check_is_off_without_a_bound() {
         let c = controller(
-            AdmissionConfig {
-                ttft_p95_max: None,
-                ..config()
-            },
+            (
+                AdmissionStaticConfig {
+                    ttft_p95_max: None,
+                    ..config().0
+                },
+                config().1,
+            ),
             1,
         );
         let p = pool(1);
@@ -1314,7 +1770,11 @@ mod tests {
     #[test]
     fn a_queueing_engine_counts_as_saturated_until_the_sample_ages() {
         let engine = Arc::new(EngineLoad::new(2, Duration::from_secs(6)));
-        let c = Arc::new(AdmissionController::new(Some(config()), 2, engine.clone()));
+        let c = Arc::new(AdmissionController::new(
+            Some(bootstrap(config())),
+            2,
+            engine.clone(),
+        ));
         let p = pool(2);
         let t0 = Instant::now();
         let busy = engine_sample(30, 2);
@@ -1344,9 +1804,12 @@ mod tests {
     fn queue_saturated_at_raises_the_engine_queue_threshold() {
         let engine = Arc::new(EngineLoad::new(1, Duration::from_secs(6)));
         let c = Arc::new(AdmissionController::new(
-            Some(AdmissionConfig {
-                queue_saturated_at: 4,
-                ..config()
+            Some(AdmissionBootstrap {
+                static_config: AdmissionStaticConfig {
+                    queue_saturated_at: 4,
+                    ..config().0
+                },
+                policy: config().1,
             }),
             1,
             engine.clone(),
@@ -1390,9 +1853,12 @@ mod tests {
     fn every_backend_queued_respects_the_configured_threshold() {
         let engine = Arc::new(EngineLoad::new(2, Duration::from_secs(6)));
         let c = Arc::new(AdmissionController::new(
-            Some(AdmissionConfig {
-                queue_saturated_at: 4,
-                ..config()
+            Some(AdmissionBootstrap {
+                static_config: AdmissionStaticConfig {
+                    queue_saturated_at: 4,
+                    ..config().0
+                },
+                policy: config().1,
             }),
             2,
             engine.clone(),

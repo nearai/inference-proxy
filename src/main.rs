@@ -6,8 +6,8 @@ use tokio::net::TcpListener;
 use tracing::info;
 use vllm_proxy_rs::ohttp_gateway::OhttpGateway;
 use vllm_proxy_rs::{
-    admission, attestation, backend_affinity, backend_pool, cache, config, engine_load, fusion,
-    metrics_middleware, rate_limit, request_id_middleware, routes, signing, startup_checks,
+    admission, appconfig, attestation, backend_affinity, backend_pool, cache, config, engine_load,
+    fusion, metrics_middleware, rate_limit, request_id_middleware, routes, signing, startup_checks,
     vllm_dp_affinity, AppState,
 };
 
@@ -235,16 +235,17 @@ async fn main() -> anyhow::Result<()> {
         backend_pool.len(),
         engine_load,
     ));
-    if let Some(settings) = admission.config() {
+    if let (Some(settings), Some(applied)) = (admission.static_config(), admission.current_policy())
+    {
         info!(
-            max_inflight = settings.max_inflight,
+            max_inflight = applied.policy.max_inflight,
             start_inflight = settings.start_inflight,
             ramp_step = settings.ramp_step,
             ramp_interval_secs = settings.ramp_interval.as_secs(),
             ttft_p95_max_ms = settings.ttft_p95_max.map_or(0, |d| d.as_millis()),
-            backpressure_secs = settings.backpressure_ttl.as_secs(),
+            backpressure_secs = applied.policy.backpressure_ttl.as_secs(),
             queue_saturated_at = settings.queue_saturated_at,
-            retry_after_secs = settings.retry_after.as_secs(),
+            retry_after_secs = applied.policy.retry_after.as_secs(),
             "Lane admission enabled"
         );
     }
@@ -271,6 +272,23 @@ async fn main() -> anyhow::Result<()> {
         backend_affinity,
         admission,
     };
+
+    // Environment admission values are always the bootstrap policy. The
+    // optional Agent is reconciled only after the controller exists, and its
+    // fetch loop never gates startup or request serving.
+    if let Some(settings) = state.config.appconfig.clone() {
+        info!(
+            application = %settings.application,
+            environment = %settings.environment,
+            profile = %settings.profile,
+            target = %settings.target,
+            agent_url = %settings.agent_url,
+            refresh_secs = settings.refresh_interval.as_secs(),
+            "AWS AppConfig admission-policy refresh enabled"
+        );
+        let source = appconfig::AppConfigSource::new(settings)?;
+        appconfig::spawn_admission_policy_refresh(source, state.admission.clone());
+    }
 
     // Spawn background attestation cache refresh task.
     // Refresh interval is half the TTL to ensure the cache never goes stale.

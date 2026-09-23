@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 pub mod admission;
 pub mod agent_loop;
+pub mod appconfig;
 pub mod attestation;
 pub mod attestation_sdk;
 pub mod auth;

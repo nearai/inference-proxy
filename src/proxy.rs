@@ -5104,17 +5104,21 @@ data: [DONE]
         });
 
         let controller = Arc::new(crate::admission::AdmissionController::new(
-            Some(crate::admission::AdmissionConfig {
-                max_inflight: 4,
-                tier_borrowing: false,
-                long_max_inflight_per_host: 0,
-                start_inflight: 4,
-                ramp_step: 1,
-                ramp_interval: std::time::Duration::from_secs(60),
-                ttft_p95_max: Some(std::time::Duration::from_secs(30)),
-                backpressure_ttl: std::time::Duration::from_secs(10),
-                queue_saturated_at: 1,
-                retry_after: std::time::Duration::from_secs(2),
+            Some(crate::admission::AdmissionBootstrap {
+                static_config: crate::admission::AdmissionStaticConfig {
+                    tier_borrowing: false,
+                    long_max_inflight_per_host: 0,
+                    start_inflight: 4,
+                    ramp_step: 1,
+                    ramp_interval: std::time::Duration::from_secs(60),
+                    ttft_p95_max: Some(std::time::Duration::from_secs(30)),
+                    queue_saturated_at: 1,
+                },
+                policy: crate::admission::AdmissionPolicy {
+                    max_inflight: 4,
+                    backpressure_ttl: std::time::Duration::from_secs(10),
+                    retry_after: std::time::Duration::from_secs(2),
+                },
             }),
             1,
             Arc::new(crate::engine_load::EngineLoad::disabled()),

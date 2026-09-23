@@ -88,7 +88,7 @@ async fn fetch_models_document(state: &AppState, source: &str) -> anyhow::Result
     if entries.is_empty() {
         anyhow::bail!("model {model_name} is not in the source document");
     }
-    let capacity = capacity_entries(&state.config);
+    let capacity = capacity_entries(&state.config, &state.admission);
     if !capacity.is_empty() {
         for entry in entries.iter_mut() {
             if let Some(entry) = entry.as_object_mut() {
@@ -103,13 +103,16 @@ const MODELS_DOCUMENT_TIMEOUT_SECS: u64 = 5;
 
 /// The lane's declared capacity, in the aggregator's schema: concurrency from
 /// the admission budget's ceiling, a per-minute request rate when configured.
-pub fn capacity_entries(config: &crate::config::Config) -> Vec<Value> {
+pub fn capacity_entries(
+    config: &crate::config::Config,
+    admission: &crate::admission::AdmissionController,
+) -> Vec<Value> {
     let mut entries = Vec::new();
-    if config.admission_max_inflight > 0 {
+    if let Some(policy) = admission.current_policy() {
         entries.push(serde_json::json!({
             "type": "concurrency",
             "unit": "request",
-            "value": config.admission_max_inflight,
+            "value": policy.policy.max_inflight,
         }));
     }
     if config.capacity_requests_per_minute > 0 {

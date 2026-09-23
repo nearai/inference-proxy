@@ -2,12 +2,16 @@
 //! (a backend-only bearer, modality policy, non-TEE route hiding, queue-full
 //! back-pressure, the first-event peek, keep-alives).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
+use axum::extract::State as AxumState;
 use axum::http::{Request, StatusCode};
 use axum::middleware;
+use axum::response::Response;
+use axum::routing::{get, post};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 use wiremock::matchers::{header, method, path};
@@ -57,6 +61,8 @@ struct GatewayOptions {
     capacity_requests_per_minute: u64,
     /// `VLLM_PROXY_REASONING_OFF_EFFORT` (default `none`).
     reasoning_off_effort: Option<String>,
+    /// AppConfig Agent base URL for runtime-policy process tests.
+    appconfig_agent_url: Option<String>,
 }
 
 fn build_gateway(mock_url: &str, options: GatewayOptions) -> axum::Router {
@@ -165,6 +171,18 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         admission_backpressure_secs: options.admission_backpressure_secs.unwrap_or(10),
         admission_queue_saturated_at: options.admission_queue_saturated_at.unwrap_or(1),
         admission_retry_after_secs: 2,
+        appconfig: options
+            .appconfig_agent_url
+            .clone()
+            .map(|agent_url| config::AppConfigSettings {
+                application: "test-application".to_string(),
+                environment: "test-environment".to_string(),
+                profile: "test-profile".to_string(),
+                target: "test-target".to_string(),
+                agent_url: url::Url::parse(&agent_url).expect("valid test Agent URL"),
+                refresh_interval: Duration::from_millis(20),
+                access_token: None,
+            }),
         backend_connect_failover: options.backend_connect_failover,
         backend_probe_urls: options.backend_probe_urls.clone(),
         backend_probe_interval_secs: 2,
@@ -323,6 +341,287 @@ async fn json_body(response: axum::response::Response) -> serde_json::Value {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes)
         .unwrap_or_else(|_| panic!("non-JSON body: {}", String::from_utf8_lossy(&bytes)))
+}
+
+const APPCONFIG_PATH: &str =
+    "/applications/test-application/environments/test-environment/configurations/test-profile";
+
+#[derive(Clone)]
+struct AgentReply {
+    status: StatusCode,
+    version: Option<String>,
+    body: Vec<u8>,
+}
+
+async fn fake_agent_response(AxumState(state): AxumState<Arc<MutableAgentState>>) -> Response {
+    let (reply, transport_failure) = {
+        let reply = state.reply.read().await;
+        state.requests.fetch_add(1, Ordering::Release);
+        state.requests_changed.notify_waiters();
+        let transport_failure = state.transport_failure.swap(false, Ordering::AcqRel);
+        (reply.clone(), transport_failure)
+    };
+    if transport_failure {
+        // Dropping the connection without an HTTP response makes reqwest
+        // report a transport error, while the request counter proves that the
+        // refresh loop reached this failure deterministically.
+        panic!("injected AppConfig Agent transport failure");
+    }
+    let mut response = Response::builder().status(reply.status);
+    if let Some(version) = reply.version {
+        response = response.header("Configuration-Version", version);
+    }
+    response.body(Body::from(reply.body)).unwrap()
+}
+
+struct MutableAgentState {
+    reply: tokio::sync::RwLock<AgentReply>,
+    requests: AtomicUsize,
+    requests_changed: tokio::sync::Notify,
+    transport_failure: std::sync::atomic::AtomicBool,
+}
+
+/// A local AppConfig Agent endpoint whose document can be replaced while the
+/// proxy's refresh task is running. A shared response state avoids remounting
+/// routes while a fetch is in flight, so transitions are deterministic.
+struct MutableAgent {
+    url: String,
+    state: Arc<MutableAgentState>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl MutableAgent {
+    async fn start(version: &str, document: serde_json::Value) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake AppConfig Agent");
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let state = Arc::new(MutableAgentState {
+            reply: tokio::sync::RwLock::new(AgentReply {
+                status: StatusCode::OK,
+                version: None,
+                body: Vec::new(),
+            }),
+            requests: AtomicUsize::new(0),
+            requests_changed: tokio::sync::Notify::new(),
+            transport_failure: std::sync::atomic::AtomicBool::new(false),
+        });
+        let router = axum::Router::new()
+            .route(APPCONFIG_PATH, get(fake_agent_response))
+            .with_state(state.clone());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let agent = Self { url, state, task };
+        agent.set_document(version, document).await;
+        agent
+    }
+
+    fn url(&self) -> String {
+        self.url.clone()
+    }
+
+    async fn set_document(&self, version: &str, document: serde_json::Value) -> usize {
+        let mut reply = self.state.reply.write().await;
+        *reply = AgentReply {
+            status: StatusCode::OK,
+            version: Some(version.to_string()),
+            body: serde_json::to_vec(&document).unwrap(),
+        };
+        self.state.requests.load(Ordering::Acquire)
+    }
+
+    async fn set_raw_document(&self, version: &str, body: &str) -> usize {
+        let mut reply = self.state.reply.write().await;
+        *reply = AgentReply {
+            status: StatusCode::OK,
+            version: Some(version.to_string()),
+            body: body.as_bytes().to_vec(),
+        };
+        self.state.requests.load(Ordering::Acquire)
+    }
+
+    async fn set_transport_failure(&self) -> usize {
+        let _reply = self.state.reply.write().await;
+        let requests = self.state.requests.load(Ordering::Acquire);
+        self.state.transport_failure.store(true, Ordering::Release);
+        requests
+    }
+
+    async fn wait_for_request_after(&self, previous: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let changed = self.state.requests_changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if self.state.requests.load(Ordering::Acquire) > previous {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("AppConfig Agent did not receive another request");
+    }
+}
+
+impl Drop for MutableAgent {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[derive(Clone)]
+struct HeldBackendState {
+    release: tokio::sync::watch::Sender<bool>,
+    calls: Arc<AtomicUsize>,
+    calls_changed: Arc<tokio::sync::Notify>,
+}
+
+struct HeldBackend {
+    url: String,
+    state: HeldBackendState,
+    task: tokio::task::JoinHandle<()>,
+}
+
+async fn wait_for_release(state: &HeldBackendState) {
+    let mut release = state.release.subscribe();
+    while !*release.borrow() {
+        if release.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn held_chat(AxumState(state): AxumState<HeldBackendState>) -> Response {
+    state.calls.fetch_add(1, Ordering::Release);
+    state.calls_changed.notify_waiters();
+    wait_for_release(&state).await;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&chat_completion_json()).unwrap(),
+        ))
+        .unwrap()
+}
+
+async fn held_completion(AxumState(state): AxumState<HeldBackendState>) -> Response {
+    state.calls.fetch_add(1, Ordering::Release);
+    state.calls_changed.notify_waiters();
+    wait_for_release(&state).await;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "id": "cmpl-gw-1", "object": "text_completion", "model": "test-model",
+                "choices": [{"index": 0, "text": "hi", "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            }))
+            .unwrap(),
+        ))
+        .unwrap()
+}
+
+impl HeldBackend {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind held backend");
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (release, _) = tokio::sync::watch::channel(false);
+        let state = HeldBackendState {
+            release,
+            calls: Arc::new(AtomicUsize::new(0)),
+            calls_changed: Arc::new(tokio::sync::Notify::new()),
+        };
+        let router = axum::Router::new()
+            .route("/v1/chat/completions", post(held_chat))
+            .route("/v1/completions", post(held_completion))
+            .with_state(state.clone());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        Self { url, state, task }
+    }
+
+    async fn wait_for_calls(&self, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let changed = self.state.calls_changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if self.state.calls.load(Ordering::Acquire) >= expected {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("held backend did not receive {expected} calls"));
+    }
+
+    fn release(&self) {
+        self.state.release.send(true).unwrap();
+    }
+}
+
+impl Drop for HeldBackend {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn admission_document(max_inflight: u32) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "target": "test-target",
+        "admission": {
+            "max_inflight": max_inflight,
+            "backpressure_secs": 10,
+            "retry_after_secs": 2
+        }
+    })
+}
+
+fn appconfig_source(settings: config::AppConfigSettings) -> appconfig::AppConfigSource {
+    appconfig::AppConfigSource::new(settings).expect("build AppConfig HTTP client")
+}
+
+async fn wait_for_budget(state: &AppState, expected: u32) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if state.admission.budget() == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("admission budget did not become {expected}"));
+}
+
+async fn wait_for_adopted_version(state: &AppState, expected: &str) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let adopted = state.admission.current_policy().is_some_and(|policy| {
+                matches!(
+                    policy.source,
+                    admission::PolicySource::AppConfig {
+                        ref configuration_version,
+                        ..
+                    } if configuration_version == expected
+                )
+            });
+            if adopted {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("AppConfig version {expected} was not adopted"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1455,6 +1754,234 @@ async fn admission_budget_refuses_with_429_before_dispatch() {
         mock.verify().await;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Runtime admission policy: bootstrap, hot adoption, rollback, and Agent
+// failures. These tests deliberately keep one router and one AppState alive
+// while the mutable Agent changes its response.
+// ---------------------------------------------------------------------------
+
+fn spawn_appconfig_refresh(agent_url: String, state: &AppState) -> tokio::task::JoinHandle<()> {
+    let mut settings = state
+        .config
+        .appconfig
+        .clone()
+        .expect("AppConfig settings enabled for this test");
+    settings.agent_url = url::Url::parse(&agent_url).expect("valid test Agent URL");
+    appconfig::spawn_admission_policy_refresh(appconfig_source(settings), state.admission.clone())
+}
+
+#[tokio::test]
+async fn appconfig_agent_unreachable_keeps_environment_bootstrap_serving() {
+    let backend = HeldBackend::start().await;
+
+    let agent_url = unreachable_backend_url();
+    let (app, state) = build_gateway_with_state(
+        &backend.url,
+        GatewayOptions {
+            admission_max_inflight: 1,
+            appconfig_agent_url: Some(agent_url.clone()),
+            ..Default::default()
+        },
+    );
+    // This is the environment/bootstrap policy. The Agent is unavailable
+    // from the first refresh attempt, but it must not gate startup or serving.
+    let refresh = spawn_appconfig_refresh(agent_url, &state);
+    let first = tokio::spawn({
+        let app = app.clone();
+        async move { app.oneshot(chat_request(hello_body())).await.unwrap() }
+    });
+    backend.wait_for_calls(1).await;
+    assert_overloaded(app.oneshot(chat_request(hello_body())).await.unwrap()).await;
+    backend.release();
+    assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+    refresh.abort();
+}
+
+#[tokio::test]
+async fn appconfig_update_changes_admission_without_rebuilding_router_or_controller() {
+    let backend = HeldBackend::start().await;
+    let agent = MutableAgent::start("v1", admission_document(1)).await;
+    let (app, state) = build_gateway_with_state(
+        &backend.url,
+        GatewayOptions {
+            admission_max_inflight: 1,
+            appconfig_agent_url: Some(agent.url()),
+            ..Default::default()
+        },
+    );
+    let controller = state.admission.clone();
+    let refresh = spawn_appconfig_refresh(agent.url(), &state);
+    wait_for_adopted_version(&state, "v1").await;
+
+    let first = tokio::spawn({
+        let app = app.clone();
+        async move { app.oneshot(chat_request(hello_body())).await.unwrap() }
+    });
+    backend.wait_for_calls(1).await;
+    assert_eq!(state.admission.inflight(), 1);
+
+    agent.set_document("v2", admission_document(2)).await;
+    wait_for_budget(&state, 2).await;
+    assert!(Arc::ptr_eq(&state.admission, &controller));
+
+    // The existing router and controller now admit a second request while the
+    // first permit is still held by the delayed backend response.
+    let second = tokio::spawn({
+        let app = app.clone();
+        async move { app.oneshot(chat_request(hello_body())).await.unwrap() }
+    });
+    backend.wait_for_calls(2).await;
+    backend.release();
+    assert_eq!(second.await.unwrap().status(), StatusCode::OK);
+    assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+    refresh.abort();
+}
+
+#[tokio::test]
+async fn appconfig_decrease_preserves_active_permits_until_drain() {
+    let backend = HeldBackend::start().await;
+    let agent = MutableAgent::start("v1", admission_document(2)).await;
+    let (app, state) = build_gateway_with_state(
+        &backend.url,
+        GatewayOptions {
+            admission_max_inflight: 2,
+            appconfig_agent_url: Some(agent.url()),
+            ..Default::default()
+        },
+    );
+    let refresh = spawn_appconfig_refresh(agent.url(), &state);
+    wait_for_budget(&state, 2).await;
+    let first = tokio::spawn({
+        let app = app.clone();
+        async move { app.oneshot(chat_request(hello_body())).await.unwrap() }
+    });
+    let second = tokio::spawn({
+        let app = app.clone();
+        async move { app.oneshot(chat_request(hello_body())).await.unwrap() }
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if state.admission.inflight() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both permits should be active before lowering the limit");
+
+    agent.set_document("v2", admission_document(1)).await;
+    wait_for_budget(&state, 1).await;
+    assert_eq!(state.admission.inflight(), 2);
+    assert_overloaded(
+        app.clone()
+            .oneshot(chat_request(hello_body()))
+            .await
+            .unwrap(),
+    )
+    .await;
+    backend.release();
+    assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+    assert_eq!(second.await.unwrap().status(), StatusCode::OK);
+    assert_eq!(state.admission.inflight(), 0);
+    refresh.abort();
+}
+
+#[tokio::test]
+async fn invalid_document_and_transport_failure_keep_last_known_good_policy() {
+    let backend = HeldBackend::start().await;
+    let agent = MutableAgent::start("v1", admission_document(1)).await;
+    let (app, state) = build_gateway_with_state(
+        &backend.url,
+        GatewayOptions {
+            admission_max_inflight: 1,
+            appconfig_agent_url: Some(agent.url()),
+            ..Default::default()
+        },
+    );
+    let refresh = spawn_appconfig_refresh(agent.url(), &state);
+    wait_for_budget(&state, 1).await;
+    agent.set_document("v2", admission_document(2)).await;
+    wait_for_budget(&state, 2).await;
+
+    let invalid_request_count = agent
+        .set_raw_document("v3", "{\"schema_version\":1,\"target\":\"wrong\"}")
+        .await;
+    agent.wait_for_request_after(invalid_request_count).await;
+    assert_eq!(state.admission.budget(), 2);
+
+    agent.set_document("v4", admission_document(3)).await;
+    wait_for_adopted_version(&state, "v4").await;
+    assert_eq!(state.admission.budget(), 3);
+
+    let transport_request_count = agent.set_transport_failure().await;
+    agent.wait_for_request_after(transport_request_count).await;
+    assert_eq!(state.admission.budget(), 3);
+
+    // The known-good maximum remains effective after both failures.
+    let first = tokio::spawn({
+        let app = app.clone();
+        async move { app.oneshot(chat_request(hello_body())).await.unwrap() }
+    });
+    let second = tokio::spawn({
+        let app = app.clone();
+        async move { app.oneshot(chat_request(hello_body())).await.unwrap() }
+    });
+    backend.wait_for_calls(2).await;
+    backend.release();
+    assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+    assert_eq!(second.await.unwrap().status(), StatusCode::OK);
+    refresh.abort();
+}
+
+#[tokio::test]
+async fn chat_and_legacy_completions_share_the_hot_policy() {
+    let backend = HeldBackend::start().await;
+    let agent = MutableAgent::start("v1", admission_document(1)).await;
+    let (app, state) = build_gateway_with_state(
+        &backend.url,
+        GatewayOptions {
+            admission_max_inflight: 1,
+            appconfig_agent_url: Some(agent.url()),
+            ..Default::default()
+        },
+    );
+    let refresh = spawn_appconfig_refresh(agent.url(), &state);
+    wait_for_adopted_version(&state, "v1").await;
+    let chat = tokio::spawn({
+        let app = app.clone();
+        async move { app.oneshot(chat_request(hello_body())).await.unwrap() }
+    });
+    backend.wait_for_calls(1).await;
+    assert_eq!(state.admission.inflight(), 1);
+    agent.set_document("v2", admission_document(2)).await;
+    wait_for_budget(&state, 2).await;
+
+    let completion = Request::builder()
+        .method("POST")
+        .uri("/v1/completions")
+        .header("authorization", "Bearer test-token")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "test-model", "prompt": "hello"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let completion = tokio::spawn({
+        let app = app.clone();
+        async move { app.oneshot(completion).await.unwrap() }
+    });
+    backend.wait_for_calls(2).await;
+    backend.release();
+    let completion_response = completion.await.unwrap();
+    assert_eq!(completion_response.status(), StatusCode::OK);
+    assert_eq!(chat.await.unwrap().status(), StatusCode::OK);
+    refresh.abort();
+}
+
 #[tokio::test]
 async fn admission_is_inert_when_not_configured() {
     let mock = MockServer::start().await;
@@ -2398,6 +2925,44 @@ async fn models_document_falls_back_to_the_engine_list_when_the_source_fails() {
     let (status, body) = get_models(app).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"][0]["owned_by"], "sglang");
+}
+
+#[tokio::test]
+async fn models_document_reads_the_active_runtime_admission_maximum() {
+    let engine = MockServer::start().await;
+    let source = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "test-model", "name": "Test Model"}]
+        })))
+        .expect(1)
+        .mount(&source)
+        .await;
+    let agent = MutableAgent::start("v1", admission_document(1)).await;
+    let (app, state) = build_gateway_with_state(
+        &engine.uri(),
+        GatewayOptions {
+            models_document_url: Some(format!("{}/v1/models", source.uri())),
+            admission_max_inflight: 1,
+            appconfig_agent_url: Some(agent.url()),
+            ..Default::default()
+        },
+    );
+    let refresh = spawn_appconfig_refresh(agent.url(), &state);
+    wait_for_budget(&state, 1).await;
+    agent.set_document("v2", admission_document(3)).await;
+    wait_for_budget(&state, 3).await;
+
+    let (status, body) = get_models(app).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["data"][0]["capacity"],
+        serde_json::json!([{"type": "concurrency", "unit": "request", "value": 3}])
+    );
+    refresh.abort();
+    source.verify().await;
 }
 
 // ---- Reasoning switch ----

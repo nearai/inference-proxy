@@ -307,13 +307,13 @@ gh api /repos/nearai/inference-proxy/attestations/sha256:<hex> \
 Two things set the rebuild time: the builder stage (Ubuntu packages, Rust
 toolchain, cargo build) and the size of the runtime base image, which is
 downloaded, unpacked and exported in full. With the vLLM-based runtime image
-(September 2026), a rebuild with no cached layers took about 5 minutes on a
-24-thread x86_64 machine with a 10 Gbit/s link. Downloading and unpacking the
-12.5 GB base took about 1.5 minutes, in parallel with the builder stage, and
-writing the 12.5 GB archive about 1.3 minutes. Slow package mirrors add
-minutes, and shared, busy CI hosts have needed close to 30 minutes. The
-verifier-parity job below reports the time of every rebuild in its run summary
-and warns above 30 minutes.
+(September 2026), a rebuild with no cached layers took 4 to 5 minutes on a
+24-thread x86_64 machine with a 10 Gbit/s link, and about 7 minutes on our CI
+hosts. Downloading and unpacking the 12.5 GB base took about 1.5 minutes, in
+parallel with the builder stage, and writing the 12.5 GB archive 1.3 to 2
+minutes. Slow package mirrors add minutes, and shared, busy hosts have needed
+close to 30 minutes. The verifier-parity job below reports the time of every
+rebuild in its run summary and warns above 30 minutes.
 
 ### How CI checks it
 

@@ -392,6 +392,7 @@ jobs:
           REGISTRY_NAMESPACE: ${{ vars.DOCKER_REGISTRY_USER }}
         run: |
           set -euo pipefail
+          trap 'echo "::error::Finding the published digest failed at line ${LINENO}: ${BASH_COMMAND}"' ERR
           deadline=$(( $(date +%s) + 20 * 60 ))
           while :; do
             runs=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/build.yml/runs?head_sha=${GITHUB_SHA}&per_page=100")
@@ -411,7 +412,10 @@ jobs:
           : > published.tsv
           for run in $(jq -r '.workflow_runs[] | select(.conclusion == "success") | .id' <<<"$runs"); do
             for job in $(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run}/jobs" --jq '.jobs[].id'); do
-              gh api "repos/${GITHUB_REPOSITORY}/actions/jobs/${job}/logs" > job.log
+              # curl, not `gh api`: newer gh refuses to print a response with
+              # terminal escape sequences, and job logs are full of them.
+              curl -fsSL --retry 3 -o job.log -H "Authorization: Bearer ${GH_TOKEN}" \
+                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/jobs/${job}/logs"
               # Lines GitHub prints for the attestation input, the step env and
               # the build summary.
               found=$(grep -E -- '(subject-digest: |IMAGE_DIGEST: |- digest: )' job.log \

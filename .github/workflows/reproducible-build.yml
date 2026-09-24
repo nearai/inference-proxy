@@ -1,86 +1,238 @@
 name: Reproducible Build
 
-# Builds the same commit twice and diffs the OCI archive — the image must be
-# bit-for-bit reproducible. Per-build drift IS caught here because the two
-# builds run minutes apart: e.g. the pip `.pyc` build-timestamp issue (#148)
-# and the apt/dpkg/ldconfig log artifacts (#151) each made every build differ.
+# The published image must be rebuildable bit for bit: external verifiers rebuild
+# the source commit of every deployed image and compare digests (see
+# "Reproducible build & verification" in README.md). This workflow checks that
+# from several angles:
 #
-# `build.yml` only builds & pushes once, so reproducibility was never verified.
+#   cross-machine    two builds in parallel, normally on two different hosts.
+#                    Instance 1 also loads the image into Docker (LOAD_IMAGE=1)
+#                    to run the pins guard, so the pair also shows that loading
+#                    does not change the digest.
+#   sequential       two builds one after the other on one host, archives
+#                    compared byte for byte. Catches per-build drift, e.g. the
+#                    pip .pyc build timestamps (#148) and the apt/dpkg/ldconfig
+#                    logs (#151).
+#   verifier-parity  what an external verifier does: a fresh `git clone` of the
+#                    commit (umask 022), `bash build-image.sh` with nothing but
+#                    the contract environment, under their 60-minute limit, and
+#                    the digest read from index.json.
+#   verify           every digest above must be identical and must equal the
+#                    digest build.yml published for the same commit.
 #
-# SECURITY: this is a public repo and the build runs on a self-hosted `infra`
-# runner executing PR-controlled code (build-image.sh / Dockerfile). Running
-# untrusted PR code there would be an infra-compromise risk, so this does NOT
-# trigger on `pull_request` (matching build.yml). It runs on push to main
-# (post-merge, trusted) and on manual workflow_dispatch — a maintainer can
-# dispatch it against a PR branch (`--ref <branch>`) to verify reproducibility
-# before merging.
+# Triggers: merges that touch a build input, a weekly run on main (drift in the
+# package archives and registries the build reads shows up between merges), and
+# manual dispatch.
+#
+# SECURITY: this is a public repo and the builds run on self-hosted `infra`
+# runners, which are production hosts, executing PR-controlled code
+# (build-image.sh / Dockerfile). Running untrusted PR code there would be an
+# infra-compromise risk, so this does NOT trigger on `pull_request` (matching
+# build.yml). It runs on push to main (post-merge, trusted), on the schedule and
+# on manual workflow_dispatch: a maintainer can dispatch it against a PR branch
+# (`--ref <branch>`) to verify reproducibility before merging. Dispatch build.yml
+# on the branch first to also get the published-digest comparison.
+#
+# Never add `docker system prune` / `docker builder prune` here: a global prune
+# on these hosts deletes images and volumes of other services. build-image.sh
+# builds with --no-cache in a builder of its own, so no build reuses another's
+# layers anyway.
 on:
   push:
     branches: [main]
     # Every input that can affect oci.tar — keep in sync with the Dockerfile's
     # COPY/bind sources (Cargo manifests, src/, benches/, gpu_evidence_worker.py,
-    # attestation-constraints.txt, pinned-packages-builder.txt) plus the build
-    # script and .dockerignore (build context). A merge touching any of these
-    # must re-run the check, or a reproducibility regression introduced via
-    # e.g. a new dependency could slip past the gate.
+    # attestation-constraints.txt, pinned-packages-*.txt) plus the build script,
+    # the Makefile that wraps it, and .dockerignore (build context). A merge
+    # touching any of these must re-run the check, or a reproducibility
+    # regression introduced via e.g. a new dependency could slip past the gate.
     paths:
       - "Dockerfile"
       - ".dockerignore"
       - "build-image.sh"
+      - "Makefile"
       - "Cargo.toml"
       - "Cargo.lock"
       - "src/**"
       - "benches/**"
       - "gpu_evidence_worker.py"
       - "attestation-constraints.txt"
-      - "pinned-packages-builder.txt"
+      - "pinned-packages-*.txt"
       - ".github/workflows/reproducible-build.yml"
+  schedule:
+    # Mondays 03:00 UTC, on main.
+    - cron: "0 3 * * 1"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  verify-reproducibility:
-    name: Verify reproducibility
+  cross-machine:
+    name: Cross-machine build ${{ matrix.instance }}
     runs-on: [self-hosted, infra]
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        instance: [1, 2]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
 
       - name: Install build dependencies
         run: |
-          sudo apt-get update
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update || true
+            sudo apt-get install -y jq
+          fi
+
+      # The environment external verifiers build with.
+      - name: Build
+        env:
+          ENABLE_NV_ATTESTATION_SDK: "1"
+          SOURCE_DATE_EPOCH: "0"
+          LOAD_IMAGE: ${{ matrix.instance == 1 && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          ./build-image.sh
+          seconds=$(( $(date +%s) - start ))
+          digest=$(tar -xOf oci.tar index.json | jq -r '.manifests[0].digest')
+          echo "Image digest: ${digest} (${seconds} s on ${RUNNER_NAME}, LOAD_IMAGE=${LOAD_IMAGE})"
+          jq -n --arg label "Cross-machine ${{ matrix.instance }} (LOAD_IMAGE=${LOAD_IMAGE})" \
+            --argjson order "${{ matrix.instance }}" --arg digest "$digest" \
+            --arg runner "$RUNNER_NAME" --argjson seconds "$seconds" \
+            '{order: $order, label: $label, digest: $digest, runner: $runner, seconds: $seconds}' \
+            > "digest-cross-machine-${{ matrix.instance }}.json"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digest-cross-machine-${{ matrix.instance }}
+          path: digest-cross-machine-${{ matrix.instance }}.json
+          retention-days: 7
+
+      # Once is enough: the pins come from dated snapshots, not from the host.
+      # Guards every committed pinned-packages-*.txt that build-image.sh
+      # produced a resolved counterpart for (the builder list today; the
+      # runtime list as soon as one is committed).
+      - name: Guard - committed pins match resolved pins
+        if: matrix.instance == 1
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          status=0
+          committed=()
+          for f in pinned-packages-*.txt; do
+            case "$f" in *.resolved.txt) ;; *) committed+=("$f") ;; esac
+          done
+          if [ "${#committed[@]}" -eq 0 ]; then
+            echo "::error::No pinned-packages-*.txt is committed"
+            exit 1
+          fi
+          for pins in "${committed[@]}"; do
+            resolved="${pins%.txt}.resolved.txt"
+            if [ ! -s "$resolved" ]; then
+              echo "::error file=${pins}::build-image.sh (LOAD_IMAGE=1) did not produce ${resolved}"
+              status=1
+            elif diff -u "$pins" "$resolved"; then
+              echo "${pins}: matches the $(wc -l < "$pins") packages the build resolved"
+            else
+              echo "::error file=${pins}::${pins} does not match the packages the build resolved (diff above). Regenerate it as described in README.md, Reproducible build & verification."
+              status=1
+            fi
+          done
+          for resolved in pinned-packages-*.resolved.txt; do
+            if [ ! -f "${resolved%.resolved.txt}.txt" ]; then
+              echo "::notice::${resolved} ($(wc -l < "$resolved") packages) has no committed counterpart, so it is not guarded"
+            fi
+          done
+          exit "$status"
+
+      # build-image.sh removes its builder and temporary image on exit; the
+      # second half removes what a killed run left on this shared host (the
+      # names start with their creation time; nothing older than 3 h is live).
+      - name: Clean up build artifacts
+        if: always()
+        run: |
+          rm -f oci*.tar
+          cutoff=$(( $(date +%s) - 3 * 3600 ))
+          for ref in $(docker image ls --format '{{.Repository}}:{{.Tag}}' vllm-proxy-rs-temp); do
+            created=${ref#*:}; created=${created%%-*}
+            if [[ "$created" =~ ^[0-9]+$ ]] && [ "$created" -lt "$cutoff" ]; then
+              docker image rm "$ref" >/dev/null 2>&1 && echo "Removed stale image ${ref}"
+            fi
+          done
+          for name in $(docker buildx ls | awk '{print $1}' | grep -E '^vllm-proxy-rs-build-[0-9]+-' || true); do
+            created=${name#vllm-proxy-rs-build-}; created=${created%%-*}
+            if [ "$created" -lt "$cutoff" ]; then
+              docker buildx rm "$name" >/dev/null 2>&1 && echo "Removed stale builder ${name}"
+            fi
+          done
+          true
+
+  sequential:
+    name: Sequential builds
+    runs-on: [self-hosted, infra]
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update || true
           sudo apt-get install -y skopeo jq
 
-      # Build with the same flag the production image ships with
-      # (ENABLE_NV_ATTESTATION_SDK=1) so we verify the artifact that is
-      # actually deployed, including the libnvat apt layer.
       - name: First build
         id: first
         env:
           ENABLE_NV_ATTESTATION_SDK: "1"
+          SOURCE_DATE_EPOCH: "0"
         run: |
+          set -euo pipefail
+          start=$(date +%s)
           ./build-image.sh
+          seconds=$(( $(date +%s) - start ))
           mv oci.tar oci1.tar
           echo "sha=$(sha256sum oci1.tar | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          digest=$(tar -xOf oci1.tar index.json | jq -r '.manifests[0].digest')
+          jq -n --arg digest "$digest" --arg runner "$RUNNER_NAME" --argjson seconds "$seconds" \
+            '{order: 3, label: "Sequential 1", digest: $digest, runner: $runner, seconds: $seconds}' \
+            > digest-sequential-1.json
 
       - name: Second build
         id: second
         env:
           ENABLE_NV_ATTESTATION_SDK: "1"
+          SOURCE_DATE_EPOCH: "0"
         run: |
+          set -euo pipefail
+          start=$(date +%s)
           ./build-image.sh
+          seconds=$(( $(date +%s) - start ))
           mv oci.tar oci2.tar
           echo "sha=$(sha256sum oci2.tar | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          digest=$(tar -xOf oci2.tar index.json | jq -r '.manifests[0].digest')
+          jq -n --arg digest "$digest" --arg runner "$RUNNER_NAME" --argjson seconds "$seconds" \
+            '{order: 4, label: "Sequential 2", digest: $digest, runner: $runner, seconds: $seconds}' \
+            > digest-sequential-2.json
+
+      - name: Upload digests
+        uses: actions/upload-artifact@v7
+        with:
+          name: digest-sequential
+          path: digest-sequential-*.json
+          retention-days: 7
 
       - name: Compare builds
         run: |
           if [ "${{ steps.first.outputs.sha }}" = "${{ steps.second.outputs.sha }}" ]; then
             {
-              echo "## Reproducible build"
+              echo "## Sequential builds"
               echo ""
-              echo "- OCI sha256 (both builds): \`${{ steps.first.outputs.sha }}\`"
+              echo "- OCI archive sha256 (both builds): \`${{ steps.first.outputs.sha }}\`"
               echo "- ENABLE_NV_ATTESTATION_SDK: \`1\`"
             } >> "$GITHUB_STEP_SUMMARY"
             exit 0
@@ -113,3 +265,272 @@ jobs:
               | grep -E '^[<>]' | awk '{print $1, $3}' | head -60
           done
           exit 1
+
+      # See the cross-machine job.
+      - name: Clean up build artifacts
+        if: always()
+        run: |
+          rm -rf oci*.tar d1 d2 x1 x2 L1 L2
+          cutoff=$(( $(date +%s) - 3 * 3600 ))
+          for ref in $(docker image ls --format '{{.Repository}}:{{.Tag}}' vllm-proxy-rs-temp); do
+            created=${ref#*:}; created=${created%%-*}
+            if [[ "$created" =~ ^[0-9]+$ ]] && [ "$created" -lt "$cutoff" ]; then
+              docker image rm "$ref" >/dev/null 2>&1 && echo "Removed stale image ${ref}"
+            fi
+          done
+          for name in $(docker buildx ls | awk '{print $1}' | grep -E '^vllm-proxy-rs-build-[0-9]+-' || true); do
+            created=${name#vllm-proxy-rs-build-}; created=${created%%-*}
+            if [ "$created" -lt "$cutoff" ]; then
+              docker buildx rm "$name" >/dev/null 2>&1 && echo "Removed stale builder ${name}"
+            fi
+          done
+          true
+
+  verifier-parity:
+    name: Verifier-parity rebuild
+    runs-on: [self-hosted, infra]
+    # External verifiers give each image rebuild 60 minutes.
+    timeout-minutes: 60
+    steps:
+      - name: Install build dependencies
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update || true
+            sudo apt-get install -y jq
+          fi
+
+      # Deliberately not actions/checkout: a plain clone of the public repo,
+      # checked out at the commit, built with an environment that holds only
+      # PATH, HOME and the two contract variables.
+      - name: Rebuild a fresh clone with only the contract environment
+        run: |
+          set -euo pipefail
+          # Checkout umask decides the mode of files the Dockerfile copies
+          # without --chmod, and so the digest. CI checks out with 022.
+          umask 022
+          work="${RUNNER_TEMP}/verifier-parity"
+          rm -rf "$work"
+          mkdir -p "$work"
+          git clone --quiet "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" "$work/repo"
+          cd "$work/repo"
+          git -c advice.detachedHead=false checkout --quiet "$GITHUB_SHA"
+          echo "Rebuilding $(git rev-parse HEAD) on ${RUNNER_NAME}"
+          start=$(date +%s)
+          env -i PATH="$PATH" HOME="$HOME" ENABLE_NV_ATTESTATION_SDK=1 SOURCE_DATE_EPOCH=0 \
+            bash build-image.sh
+          seconds=$(( $(date +%s) - start ))
+          digest=$(tar -xOf oci.tar index.json | jq -r '.manifests[0].digest')
+          echo "Verifier-parity digest: ${digest} (rebuild took ${seconds} s)"
+          if [ "$seconds" -gt 1800 ]; then
+            echo "::warning::The verifier-parity rebuild took ${seconds} s, more than half of the 3600 s external verifiers allow"
+          fi
+          jq -n --arg digest "$digest" --arg runner "$RUNNER_NAME" --argjson seconds "$seconds" \
+            '{order: 5, label: "Verifier parity (fresh clone, contract env only)", digest: $digest, runner: $runner, seconds: $seconds}' \
+            > "${RUNNER_TEMP}/digest-verifier-parity.json"
+          {
+            echo "## Verifier-parity rebuild"
+            echo ""
+            echo "- digest: \`${digest}\`"
+            echo "- rebuild time: ${seconds} s (limit 3600 s) on ${RUNNER_NAME}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digest-verifier-parity
+          path: ${{ runner.temp }}/digest-verifier-parity.json
+          retention-days: 7
+
+      # See the cross-machine job.
+      - name: Clean up build artifacts
+        if: always()
+        run: |
+          rm -rf "${RUNNER_TEMP}/verifier-parity" "${RUNNER_TEMP}/digest-verifier-parity.json"
+          cutoff=$(( $(date +%s) - 3 * 3600 ))
+          for ref in $(docker image ls --format '{{.Repository}}:{{.Tag}}' vllm-proxy-rs-temp); do
+            created=${ref#*:}; created=${created%%-*}
+            if [[ "$created" =~ ^[0-9]+$ ]] && [ "$created" -lt "$cutoff" ]; then
+              docker image rm "$ref" >/dev/null 2>&1 && echo "Removed stale image ${ref}"
+            fi
+          done
+          for name in $(docker buildx ls | awk '{print $1}' | grep -E '^vllm-proxy-rs-build-[0-9]+-' || true); do
+            created=${name#vllm-proxy-rs-build-}; created=${created%%-*}
+            if [ "$created" -lt "$cutoff" ]; then
+              docker buildx rm "$name" >/dev/null 2>&1 && echo "Removed stale builder ${name}"
+            fi
+          done
+          true
+
+  # Runs on a GitHub-hosted runner: it only reads the API, and waiting for
+  # build.yml must not hold one of the self-hosted builders.
+  verify:
+    name: Compare digests
+    needs: [cross-machine, sequential, verifier-parity]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+
+      # The digest build.yml attested, signed and pushed for this commit: from
+      # the logs of its successful runs and, for main, from the immutable
+      # staging-<date>-<sha> tag on Docker Hub. Waits up to 20 minutes for
+      # running build.yml runs to finish.
+      - name: Find the digest build.yml published for this commit
+        id: published
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_NAMESPACE: ${{ vars.DOCKER_REGISTRY_USER }}
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + 20 * 60 ))
+          while :; do
+            runs=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/build.yml/runs?head_sha=${GITHUB_SHA}&per_page=100")
+            total=$(jq '.workflow_runs | length' <<<"$runs")
+            pending=$(jq '[.workflow_runs[] | select(.status != "completed")] | length' <<<"$runs")
+            if [ "$total" -eq 0 ] || [ "$pending" -eq 0 ]; then
+              break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::${pending} build.yml run(s) for ${GITHUB_SHA} did not finish within 20 minutes"
+              exit 1
+            fi
+            echo "Waiting for ${pending} build.yml run(s) for ${GITHUB_SHA}..."
+            sleep 30
+          done
+
+          : > published.tsv
+          for run in $(jq -r '.workflow_runs[] | select(.conclusion == "success") | .id' <<<"$runs"); do
+            for job in $(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run}/jobs" --jq '.jobs[].id'); do
+              gh api "repos/${GITHUB_REPOSITORY}/actions/jobs/${job}/logs" > job.log
+              # Lines GitHub prints for the attestation input, the step env and
+              # the build summary.
+              found=$(grep -E -- '(subject-digest: |IMAGE_DIGEST: |- digest: )' job.log \
+                | grep -oE 'sha256:[0-9a-f]{64}' | sort -u || true)
+              case "$(printf '%s' "$found" | grep -c . || true)" in
+                1) printf 'build.yml run %s\t%s\n' "$run" "$found" >> published.tsv ;;
+                0) echo "::error::No published digest found in the log of build.yml run ${run} (job ${job})"; exit 1 ;;
+                *) echo "::error::build.yml run ${run} reports several digests: ${found//$'\n'/ }"; exit 1 ;;
+              esac
+            done
+          done
+          if [ "$total" -gt 0 ] && [ ! -s published.tsv ]; then
+            echo "::warning::No build.yml run for ${GITHUB_SHA} succeeded, so nothing was published to compare with"
+          fi
+
+          if [ -n "${REGISTRY_NAMESPACE}" ]; then
+            short="${GITHUB_SHA:0:7}"
+            if tags=$(curl -fsS --max-time 30 --retry 3 \
+                "https://hub.docker.com/v2/namespaces/${REGISTRY_NAMESPACE}/repositories/vllm-proxy-rs/tags?page_size=100&name=${short}"); then
+              jq -r --arg re "^staging-[0-9]{8}-${short}$" \
+                '.results[] | select(.name | test($re)) | "Docker Hub \(.name)\t\(.digest)"' <<<"$tags" >> published.tsv
+            else
+              echo "::warning::Could not list Docker Hub tags for ${short}"
+            fi
+          fi
+
+          if [ -s published.tsv ]; then
+            cat published.tsv
+          else
+            echo "::notice::build.yml published no image for ${GITHUB_SHA} (dispatch it on the same ref to compare); only the rebuilds are compared"
+          fi
+          echo "published=$(jq -Rsc 'split("\n") | map(select(length > 0) | split("\t") | {source: .[0], digest: .[1]})' published.tsv)" >> "$GITHUB_OUTPUT"
+
+      - name: Compare digests
+        if: always()
+        env:
+          PUBLISHED: ${{ steps.published.outputs.published }}
+          PUBLISHED_OUTCOME: ${{ steps.published.outcome }}
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          files=(digests/*.json)
+          if [ "${#files[@]}" -gt 0 ]; then
+            builds=$(jq -s 'sort_by(.order)' "${files[@]}")
+          else
+            builds='[]'
+          fi
+          published=${PUBLISHED:-[]}
+          reference=$(jq -r 'map(.digest) | unique | if length == 1 then .[0] else "" end' <<<"$builds")
+          failed=false
+          if [ "$(jq length <<<"$builds")" -ne 5 ]; then
+            echo "::error::Expected 5 build digests, got $(jq length <<<"$builds") (see the failed build jobs)"
+            failed=true
+          fi
+          if [ -z "$reference" ]; then
+            echo "::error::The builds did not all produce the same digest"
+            failed=true
+          fi
+          if [ "$PUBLISHED_OUTCOME" != "success" ]; then
+            echo "::error::Could not determine the published digest (step outcome: ${PUBLISHED_OUTCOME})"
+            failed=true
+          fi
+          if [ -n "$reference" ] && [ "$(jq --arg r "$reference" 'map(select(.digest != $r)) | length' <<<"$published")" -ne 0 ]; then
+            echo "::error::The rebuilt digest ${reference} differs from what build.yml published"
+            failed=true
+          fi
+
+          {
+            echo "## Reproducible build verification"
+            echo ""
+            echo "Commit \`${GITHUB_SHA}\`, rebuilt with \`ENABLE_NV_ATTESTATION_SDK=1 SOURCE_DATE_EPOCH=0\`."
+            echo ""
+            echo "| Build | Runner | Time | Digest |"
+            echo "|---|---|---|---|"
+            jq -r '.[] | "| \(.label) | \(.runner) | \(.seconds) s | `\(.digest)` |"' <<<"$builds"
+            jq -r '.[] | "| Published: \(.source) | | | `\(.digest)` |"' <<<"$published"
+            echo ""
+            if [ "$(jq length <<<"$published")" -eq 0 ]; then
+              echo "No published digest for this commit (no successful build.yml run), so only the rebuilds were compared."
+              echo ""
+            fi
+            if [ "$failed" = true ]; then
+              echo "### Result: NOT VERIFIED"
+            else
+              echo "### Result: REPRODUCIBLE"
+              echo ""
+              echo "All builds produced \`${reference}\`$( [ "$(jq length <<<"$published")" -gt 0 ] && echo ', the published digest' )."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          [ "$failed" = false ]
+
+  # Post to #cvm-alerts when a check on main fails (merge or weekly run). A
+  # failed dispatch on another branch is visible to whoever dispatched it.
+  # No-op when SLACK_BOT_TOKEN is not configured for the repository.
+  notify-slack:
+    name: Notify Slack on failure
+    needs: [cross-machine, sequential, verifier-parity, verify]
+    if: ${{ !cancelled() && contains(needs.*.result, 'failure') && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Send Slack notification
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+        run: |
+          if [ -z "${SLACK_BOT_TOKEN}" ]; then
+            echo "::warning::SLACK_BOT_TOKEN is not configured for this repository; no Slack alert sent"
+            exit 0
+          fi
+
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          MSG=":red_circle: *Reproducible build check failed* on \`${{ github.repository }}\` (${{ github.event_name }})
+          Branch: \`${{ github.ref_name }}\` · Commit: \`${GITHUB_SHA:0:7}\`
+          Jobs — cross-machine: \`${{ needs.cross-machine.result }}\` · sequential: \`${{ needs.sequential.result }}\` · verifier-parity: \`${{ needs.verifier-parity.result }}\` · verify: \`${{ needs.verify.result }}\`
+
+          <${RUN_URL}|GitHub Actions run>"
+
+          curl -s -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg channel "C09EQ848HHC" --arg text "$MSG" '{channel: $channel, text: $text, unfurl_links: false}')"

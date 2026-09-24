@@ -71,11 +71,15 @@ jobs:
         run: |
           ./build-image.sh --push "${{ env.IMAGE_REFERENCE }}"
 
+      # Read the digest from the archive's index.json, the way external
+      # verifiers do. build-image.sh guarantees a single manifest, so this is
+      # the value `skopeo inspect oci-archive:` reports, without unpacking the
+      # whole archive into a temporary directory.
       - name: Get image digest
         run: |
-          DIGEST=$(skopeo inspect oci-archive:./oci.tar | jq -r '.Digest')
-          if [ -z "${DIGEST}" ]; then
-            echo "Failed to get image digest from OCI archive" >&2
+          DIGEST=$(tar -xOf oci.tar index.json | jq -r '.manifests[0].digest')
+          if [[ ! "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Failed to get image digest from OCI archive (got '${DIGEST}')" >&2
             exit 1
           fi
           echo "IMAGE_DIGEST=${DIGEST}" >> "$GITHUB_ENV"

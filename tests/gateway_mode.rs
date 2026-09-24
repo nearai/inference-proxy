@@ -2473,6 +2473,85 @@ async fn models_document_carries_no_discount_when_unset() {
     assert!(body["data"][0].get("discount_to_user").is_none(), "{body}");
 }
 
+#[tokio::test]
+async fn models_document_fallback_carries_the_discount() {
+    // The source is down, but usage reports still carry the discount: the
+    // engine list served in its place must publish it too.
+    let engine = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "test-model", "object": "model", "owned_by": "sglang"},
+                {"id": "test-model-lora", "object": "model", "owned_by": "sglang"}
+            ]
+        })))
+        .expect(1)
+        .mount(&engine)
+        .await;
+    let source = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&source)
+        .await;
+    let app = build_gateway(
+        &engine.uri(),
+        GatewayOptions {
+            models_document_url: Some(format!("{}/v1/models", source.uri())),
+            discount_to_user: Some(0.15),
+            ..Default::default()
+        },
+    );
+    let (status, body) = get_models(app).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["object"], "list");
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2, "{body}");
+    for entry in data {
+        assert_eq!(entry["owned_by"], "sglang", "{body}");
+        assert!(entry["discount_to_user"].is_f64(), "{body}");
+        assert_eq!(entry["discount_to_user"].as_f64(), Some(0.15));
+    }
+    assert_eq!(data[0]["id"], "test-model");
+}
+
+#[tokio::test]
+async fn models_document_fallback_refuses_an_engine_answer_it_cannot_discount() {
+    // An engine answer that is not a model list cannot carry the discount, so
+    // it is not served without it.
+    let source = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&source)
+        .await;
+    for engine_answer in [
+        ResponseTemplate::new(200).set_body_string("ok"),
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({"object": "list"})),
+    ] {
+        let engine = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(engine_answer)
+            .expect(1)
+            .mount(&engine)
+            .await;
+        let app = build_gateway(
+            &engine.uri(),
+            GatewayOptions {
+                models_document_url: Some(format!("{}/v1/models", source.uri())),
+                discount_to_user: Some(0.15),
+                ..Default::default()
+            },
+        );
+        let (status, body) = get_models(app).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["error"]["type"], "upstream_invalid_response");
+    }
+}
+
 /// The first usage report the gateway posted. Reports are fire-and-forget,
 /// so poll for it.
 async fn usage_report(cloud_api: &MockServer) -> serde_json::Value {

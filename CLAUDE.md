@@ -95,9 +95,10 @@ event, not a status),
 `NON_TEE_DEPLOYMENT` (404s the attestation, signature and GPU-evidence routes),
 `VLLM_BACKEND_HEALTH_PATH`, `LISTEN_ADDR`, `VLLM_PROXY_MODELS_DOCUMENT_URL` +
 `VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE` (`/v1/models` = cloud-api's entry for
-`MODEL_NAME` plus declared `capacity`), `VLLM_PROXY_DISCOUNT_TO_USER` (one
-fraction published as that entry's `discount_to_user` and sent on every usage
-report, so the listed and the billed price cannot drift), the lane admission budget
+`MODEL_NAME` plus declared `capacity`), `VLLM_PROXY_DISCOUNT_TO_USER` (requires
+the document URL; one fraction published as that entry's `discount_to_user`, also
+on the engine-list fallback, and sent on every usage report, so the listed and
+the billed price cannot drift), the lane admission budget
 (`VLLM_PROXY_ADMISSION_*`, `admission.rs`: in-flight budget with a ramp, per-host
 share, refusal on observed TTFT/engine back-pressure — 429 + `Retry-After` before
 dispatch), the long-context tier (`VLLM_BACKEND_LONG_CONTEXT_URLS` +

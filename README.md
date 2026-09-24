@@ -241,6 +241,8 @@ The server listens on `0.0.0.0:8000` by default (configurable via `LISTEN_PORT`)
 
 ## Building
 
+The Docker image (`./build-image.sh`) is a slim Ubuntu 22.04 runtime with no vLLM or CUDA; its apt and pip inputs are pinned in `pinned-packages-builder.txt`, `pinned-packages-runtime.txt` and `attestation-constraints.txt` (see the Dockerfile header). To build only the binary:
+
 ```bash
 cargo build --release
 ```

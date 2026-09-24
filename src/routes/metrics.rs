@@ -67,7 +67,8 @@ pub async fn models(
 }
 
 /// Read the source document, keep only this deployment's model and attach
-/// the declared capacity. Any failure falls back to the engine list.
+/// the declared capacity and, when configured, the lane's discount. Any
+/// failure falls back to the engine list.
 async fn fetch_models_document(state: &AppState, source: &str) -> anyhow::Result<Value> {
     let response = state
         .http_client
@@ -89,10 +90,22 @@ async fn fetch_models_document(state: &AppState, source: &str) -> anyhow::Result
         anyhow::bail!("model {model_name} is not in the source document");
     }
     let capacity = capacity_entries(&state.config);
-    if !capacity.is_empty() {
-        for entry in entries.iter_mut() {
-            if let Some(entry) = entry.as_object_mut() {
-                entry.insert("capacity".to_string(), Value::Array(capacity.clone()));
+    for entry in entries.iter_mut() {
+        let Some(entry) = entry.as_object_mut() else {
+            continue;
+        };
+        if !capacity.is_empty() {
+            entry.insert("capacity".to_string(), Value::Array(capacity.clone()));
+        }
+        // The discount is the one usage reports carry (`UsageReporter`), so the
+        // published and the billed price come from the same setting. A value
+        // already in the source is dropped: this lane bills only its own.
+        match state.config.discount_to_user {
+            Some(discount) => {
+                entry.insert("discount_to_user".to_string(), Value::from(discount));
+            }
+            None => {
+                entry.remove("discount_to_user");
             }
         }
     }

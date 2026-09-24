@@ -66,6 +66,33 @@ fn tier_strict_has_something_to_isolate(long_context_urls: &[String], above_toke
     !long_context_urls.is_empty() && above_tokens != 0
 }
 
+/// `VLLM_PROXY_DISCOUNT_TO_USER`: the lane's discount off the list price, as
+/// a fraction. Empty or zero means none. Anything else must be a finite
+/// number in `[0, 1)` with at most four decimal places (cloud-api bills in
+/// basis points), or startup fails: this value changes what customers are
+/// shown and charged, so a typo must not be guessed at.
+fn parse_discount_to_user(raw: &str) -> anyhow::Result<Option<f64>> {
+    const NAME: &str = "VLLM_PROXY_DISCOUNT_TO_USER";
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let discount: f64 = raw
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{NAME} must be a number in [0, 1), got {raw:?}"))?;
+    if !discount.is_finite() || !(0.0..1.0).contains(&discount) {
+        anyhow::bail!("{NAME} must be a number in [0, 1), got {raw:?}");
+    }
+    // Exact, no tolerance: a value with at most four decimal places parses to
+    // the f64 nearest to `basis_points / 10_000`, so the round trip gives it
+    // back (0.1 passes although it has no exact binary form); 0.12345 does not.
+    let basis_points = (discount * 10_000.0).round();
+    if basis_points / 10_000.0 != discount {
+        anyhow::bail!("{NAME} must have at most four decimal places, got {raw:?}");
+    }
+    Ok((basis_points > 0.0).then_some(discount))
+}
+
 fn is_gemma4_model_name(model_name: &str) -> bool {
     let name = model_name.to_ascii_lowercase();
     ["gemma-4", "gemma4"].iter().any(|needle| {
@@ -336,6 +363,15 @@ pub struct Config {
     /// (`VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE`, 0 = not declared). The
     /// concurrency entry comes from `VLLM_PROXY_ADMISSION_MAX_INFLIGHT`.
     pub capacity_requests_per_minute: u64,
+    /// Gateway mode: the lane's discount off the list price, a fraction in
+    /// `[0, 1)` with at most four decimal places
+    /// (`VLLM_PROXY_DISCOUNT_TO_USER`; unset, empty or `0` = `None`, list
+    /// price). One setting drives both surfaces so the advertised and the
+    /// billed price cannot drift: it is published as `discount_to_user` on the
+    /// models document entry and sent as `discount_to_user` on every usage
+    /// report, where cloud-api applies it after catalog pricing. Requires
+    /// `VLLM_PROXY_MODELS_DOCUMENT_URL`.
+    pub discount_to_user: Option<f64>,
     /// Gateway mode: the `reasoning_effort` that stands for "as little
     /// reasoning as possible" on the served model
     /// (`VLLM_PROXY_REASONING_OFF_EFFORT`, default `none`). Applied to an
@@ -627,6 +663,21 @@ impl Config {
             .filter(|s| !s.is_empty());
         let capacity_requests_per_minute: u64 =
             env_parse("VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE", 0)?;
+        let discount_to_user = match env::var("VLLM_PROXY_DISCOUNT_TO_USER") {
+            Ok(raw) => parse_discount_to_user(&raw)?,
+            Err(env::VarError::NotPresent) => None,
+            Err(env::VarError::NotUnicode(_)) => {
+                anyhow::bail!("VLLM_PROXY_DISCOUNT_TO_USER must be valid UTF-8")
+            }
+        };
+        // Every usage report is billed at the discount, so the listing has to
+        // publish it, and only the models document can: without it `/v1/models`
+        // would pass the engine's list through at list price.
+        if discount_to_user.is_some() && models_document_url.is_none() {
+            anyhow::bail!(
+                "VLLM_PROXY_DISCOUNT_TO_USER requires VLLM_PROXY_MODELS_DOCUMENT_URL: usage is billed at the discount, so the models document must publish it"
+            );
+        }
         let reasoning_off_effort = env_or("VLLM_PROXY_REASONING_OFF_EFFORT", "none")
             .trim()
             .to_string();
@@ -907,6 +958,7 @@ impl Config {
             rejected_content_part_types,
             models_document_url,
             capacity_requests_per_minute,
+            discount_to_user,
             reasoning_off_effort,
             allowed_org_ids,
             sse_keepalive_secs: env_int("VLLM_PROXY_SSE_KEEPALIVE_SECS", 0) as u64,
@@ -1205,6 +1257,8 @@ mod tests {
             "VLLM_PROXY_MAP_QUEUE_FULL_TO_429",
             "VLLM_PROXY_STREAM_ERROR_PEEK_MS",
             "VLLM_PROXY_REJECTED_CONTENT_PART_TYPES",
+            "VLLM_PROXY_MODELS_DOCUMENT_URL",
+            "VLLM_PROXY_DISCOUNT_TO_USER",
             "VLLM_PROXY_ALLOWED_ORG_IDS",
             "VLLM_PROXY_SSE_KEEPALIVE_SECS",
             "VLLM_PROXY_ADMISSION_TIER_BORROWING",
@@ -1244,6 +1298,7 @@ mod tests {
             assert_eq!(config.stream_error_peek_ms, 0);
             assert_eq!(config.stream_commit_ms, 0);
             assert!(config.rejected_content_part_types.is_empty());
+            assert!(config.discount_to_user.is_none());
             assert!(config.allowed_org_ids.is_empty());
             assert_eq!(config.sse_keepalive_secs, 0);
             assert_eq!(config.admission_max_inflight, 0);
@@ -1320,6 +1375,96 @@ mod tests {
                 gateway_env_cleanup();
             },
         );
+    }
+
+    #[test]
+    fn test_discount_to_user_parses_and_validates() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            gateway_env_cleanup();
+            env::set_var(
+                "VLLM_PROXY_MODELS_DOCUMENT_URL",
+                "https://cloud-api.test/v1/models",
+            );
+            let discount = |raw: &str| {
+                env::set_var("VLLM_PROXY_DISCOUNT_TO_USER", raw);
+                Config::from_env().map(|config| config.discount_to_user)
+            };
+            // Unset, empty and zero all mean list price: nothing to publish
+            // or report.
+            assert_eq!(Config::from_env().unwrap().discount_to_user, None);
+            for none in ["", "  ", "0", "0.0", "0.0000"] {
+                assert_eq!(discount(none).unwrap(), None, "{none:?}");
+            }
+            for (raw, expected) in [
+                ("0.2", 0.2),
+                (" 0.15 ", 0.15),
+                ("0.1500", 0.15),
+                ("0.0001", 0.0001),
+                ("0.1234", 0.1234),
+                ("0.9999", 0.9999),
+            ] {
+                assert_eq!(discount(raw).unwrap(), Some(expected), "{raw:?}");
+            }
+            // Anything else fails startup instead of changing what customers
+            // are shown and charged.
+            for bad in [
+                "1", "1.0", "1.5", "-0.1", "0.12345", "0.99999", "NaN", "inf", "abc", "20%",
+            ] {
+                let err = discount(bad).unwrap_err().to_string();
+                assert!(err.contains("VLLM_PROXY_DISCOUNT_TO_USER"), "{bad}: {err}");
+            }
+            let err = discount("0.12345").unwrap_err().to_string();
+            assert!(err.contains("at most four decimal places"), "{err}");
+            let err = discount("1").unwrap_err().to_string();
+            assert!(err.contains("[0, 1)"), "{err}");
+            gateway_env_cleanup();
+        });
+    }
+
+    #[test]
+    fn test_discount_to_user_requires_the_models_document() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            gateway_env_cleanup();
+            // A discount billed on every usage report but never published
+            // (the engine's list is served at list price) fails startup.
+            env::set_var("VLLM_PROXY_DISCOUNT_TO_USER", "0.2");
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(
+                err.contains("VLLM_PROXY_DISCOUNT_TO_USER requires VLLM_PROXY_MODELS_DOCUMENT_URL"),
+                "{err}"
+            );
+            env::set_var("VLLM_PROXY_MODELS_DOCUMENT_URL", "  ");
+            assert!(Config::from_env().is_err(), "a blank URL is no URL");
+            env::set_var(
+                "VLLM_PROXY_MODELS_DOCUMENT_URL",
+                "https://cloud-api.test/v1/models",
+            );
+            assert_eq!(Config::from_env().unwrap().discount_to_user, Some(0.2));
+            // No discount, nothing to publish: no document needed.
+            env::remove_var("VLLM_PROXY_MODELS_DOCUMENT_URL");
+            env::set_var("VLLM_PROXY_DISCOUNT_TO_USER", "0");
+            assert_eq!(Config::from_env().unwrap().discount_to_user, None);
+            gateway_env_cleanup();
+        });
+    }
+
+    #[test]
+    fn test_discount_to_user_round_trip_is_exact() {
+        // Every four-decimal value in range is accepted as the f64 the same
+        // literal gives, so the models document and the usage report carry
+        // exactly the number the operator wrote.
+        for basis_points in 1..10_000_u32 {
+            let raw = format!("0.{basis_points:04}");
+            let expected: f64 = raw.parse().unwrap();
+            assert_eq!(
+                parse_discount_to_user(&raw).unwrap(),
+                Some(expected),
+                "{raw}"
+            );
+            // One more decimal place that is not a trailing zero is refused.
+            let finer = format!("{raw}5");
+            assert!(parse_discount_to_user(&finer).is_err(), "{finer}");
+        }
     }
 
     #[test]

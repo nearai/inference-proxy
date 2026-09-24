@@ -55,6 +55,10 @@ struct GatewayOptions {
     /// Source of the models document (a mock cloud-api `/v1/models`).
     models_document_url: Option<String>,
     capacity_requests_per_minute: u64,
+    /// `VLLM_PROXY_DISCOUNT_TO_USER`, already validated.
+    discount_to_user: Option<f64>,
+    /// `CLOUD_API_USAGE_TOKEN`: without it usage reports are skipped.
+    cloud_api_usage_token: Option<String>,
     /// `VLLM_PROXY_REASONING_OFF_EFFORT` (default `none`).
     reasoning_off_effort: Option<String>,
 }
@@ -110,7 +114,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         cloud_api_auth_max_attempts: 1,
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
-        cloud_api_usage_token: None,
+        cloud_api_usage_token: options.cloud_api_usage_token.clone(),
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,
@@ -147,6 +151,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         rejected_content_part_types: options.rejected_content_part_types,
         models_document_url: options.models_document_url.clone(),
         capacity_requests_per_minute: options.capacity_requests_per_minute,
+        discount_to_user: options.discount_to_user,
         reasoning_off_effort: options
             .reasoning_off_effort
             .clone()
@@ -2398,6 +2403,239 @@ async fn models_document_falls_back_to_the_engine_list_when_the_source_fails() {
     let (status, body) = get_models(app).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"][0]["owned_by"], "sglang");
+}
+
+#[tokio::test]
+async fn models_document_publishes_the_configured_discount_as_a_number() {
+    let engine = MockServer::start().await;
+    let source = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "other-model", "name": "Other"},
+                {"id": "test-model", "name": "Test Model",
+                 "pricing": {"prompt": "0.00000015", "completion": "0.0000006"}}
+            ]
+        })))
+        .expect(1)
+        .mount(&source)
+        .await;
+    let app = build_gateway(
+        &engine.uri(),
+        GatewayOptions {
+            models_document_url: Some(format!("{}/v1/models", source.uri())),
+            admission_max_inflight: 48,
+            discount_to_user: Some(0.15),
+            ..Default::default()
+        },
+    );
+    let (status, body) = get_models(app).await;
+    assert_eq!(status, StatusCode::OK);
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 1, "{body}");
+    // A JSON number, not a string, on the model's entry.
+    assert!(data[0]["discount_to_user"].is_f64(), "{body}");
+    assert_eq!(data[0]["discount_to_user"].as_f64(), Some(0.15));
+    // The prices stay the catalog's list prices: the aggregator applies the
+    // discount itself. The capacity is still declared next to it.
+    assert_eq!(data[0]["pricing"]["prompt"], "0.00000015");
+    assert_eq!(data[0]["pricing"]["completion"], "0.0000006");
+    assert_eq!(data[0]["capacity"][0]["value"], 48);
+}
+
+#[tokio::test]
+async fn models_document_carries_no_discount_when_unset() {
+    let engine = MockServer::start().await;
+    let source = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list",
+            // A discount already in the source is not this lane's: its usage
+            // reports would not carry it, so it is not published either.
+            "data": [{"id": "test-model", "name": "Test Model", "discount_to_user": 0.3}]
+        })))
+        .expect(1)
+        .mount(&source)
+        .await;
+    let app = build_gateway(
+        &engine.uri(),
+        GatewayOptions {
+            models_document_url: Some(format!("{}/v1/models", source.uri())),
+            ..Default::default()
+        },
+    );
+    let (status, body) = get_models(app).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"][0]["name"], "Test Model");
+    assert!(body["data"][0].get("discount_to_user").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn models_document_fallback_carries_the_discount() {
+    // The source is down, but usage reports still carry the discount: the
+    // engine list served in its place must publish it too.
+    let engine = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "test-model", "object": "model", "owned_by": "sglang"},
+                {"id": "test-model-lora", "object": "model", "owned_by": "sglang"}
+            ]
+        })))
+        .expect(1)
+        .mount(&engine)
+        .await;
+    let source = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&source)
+        .await;
+    let app = build_gateway(
+        &engine.uri(),
+        GatewayOptions {
+            models_document_url: Some(format!("{}/v1/models", source.uri())),
+            discount_to_user: Some(0.15),
+            ..Default::default()
+        },
+    );
+    let (status, body) = get_models(app).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["object"], "list");
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2, "{body}");
+    for entry in data {
+        assert_eq!(entry["owned_by"], "sglang", "{body}");
+        assert!(entry["discount_to_user"].is_f64(), "{body}");
+        assert_eq!(entry["discount_to_user"].as_f64(), Some(0.15));
+    }
+    assert_eq!(data[0]["id"], "test-model");
+}
+
+#[tokio::test]
+async fn models_document_fallback_refuses_an_engine_answer_it_cannot_discount() {
+    // An engine answer that is not a model list cannot carry the discount, so
+    // it is not served without it.
+    let source = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&source)
+        .await;
+    for engine_answer in [
+        ResponseTemplate::new(200).set_body_string("ok"),
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({"object": "list"})),
+    ] {
+        let engine = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(engine_answer)
+            .expect(1)
+            .mount(&engine)
+            .await;
+        let app = build_gateway(
+            &engine.uri(),
+            GatewayOptions {
+                models_document_url: Some(format!("{}/v1/models", source.uri())),
+                discount_to_user: Some(0.15),
+                ..Default::default()
+            },
+        );
+        let (status, body) = get_models(app).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["error"]["type"], "upstream_invalid_response");
+    }
+}
+
+/// The first usage report the gateway posted. Reports are fire-and-forget,
+/// so poll for it.
+async fn usage_report(cloud_api: &MockServer) -> serde_json::Value {
+    for _ in 0..100 {
+        let requests = cloud_api.received_requests().await.unwrap_or_default();
+        if let Some(report) = requests
+            .iter()
+            .find(|request| request.url.path() == "/v1/internal/usage")
+        {
+            return serde_json::from_slice(&report.body).unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("no usage report was posted");
+}
+
+#[tokio::test]
+async fn usage_reports_carry_the_discount_the_models_document_publishes() {
+    for discount in [Some(0.15), None] {
+        // One mock plays the engine and cloud-api: the key check, the usage
+        // intake and the catalog the models document is read from.
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        mount_key_check(&mock, "sk-live-partner", Some("org-partner")).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/internal/usage"))
+            .and(header("authorization", "Bearer usage-secret"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [{"id": "test-model", "name": "Test Model"}]
+            })))
+            .mount(&mock)
+            .await;
+        let app = build_gateway(
+            &mock.uri(),
+            GatewayOptions {
+                cloud_api_url: Some(mock.uri()),
+                cloud_api_usage_token: Some("usage-secret".to_string()),
+                models_document_url: Some(format!("{}/v1/models", mock.uri())),
+                discount_to_user: discount,
+                ..Default::default()
+            },
+        );
+
+        let (status, models) = get_models(app.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        let response = app
+            .oneshot(chat_request_with("sk-live-partner", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        json_body(response).await;
+
+        let report = usage_report(&mock).await;
+        assert_eq!(report["organization_id"], "org-partner");
+        assert_eq!(report["workspace_id"], "ws");
+        assert_eq!(report["api_key_id"], "k");
+        assert_eq!(report["input_tokens"], 3);
+        assert_eq!(report["output_tokens"], 1);
+        let published = &models["data"][0];
+        match discount {
+            Some(discount) => {
+                assert_eq!(published["discount_to_user"].as_f64(), Some(discount));
+                assert!(report["discount_to_user"].is_f64(), "{report}");
+                assert_eq!(report["discount_to_user"], published["discount_to_user"]);
+            }
+            None => {
+                assert!(published.get("discount_to_user").is_none(), "{models}");
+                assert!(report.get("discount_to_user").is_none(), "{report}");
+            }
+        }
+        mock.verify().await;
+    }
 }
 
 // ---- Reasoning switch ----

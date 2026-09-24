@@ -329,6 +329,10 @@ pub struct UsageReporter {
     pub org_id: Option<String>,
     pub workspace_id: Option<String>,
     pub api_key_id: Option<String>,
+    /// The deployment's `discount_to_user` (`VLLM_PROXY_DISCOUNT_TO_USER`),
+    /// sent on every report so cloud-api bills the price the models document
+    /// publishes. `None` = list price, and the field is not sent.
+    pub discount_to_user: Option<f64>,
     /// Safe correlation context for logs and the Cloud API request. None of
     /// these values are emitted as metric labels.
     pub request_id: Option<String>,
@@ -497,6 +501,7 @@ pub fn make_usage_reporter(
         org_id: auth.org_id.clone(),
         workspace_id: auth.workspace_id.clone(),
         api_key_id: auth.api_key_id.clone(),
+        discount_to_user: state.config.discount_to_user,
         request_id: auth.request_id.clone(),
         request_source: auth.request_source,
     })
@@ -737,6 +742,45 @@ fn report_stream_usage_on_finalize(
     }
 }
 
+/// Complete a usage event for cloud-api's `/v1/internal/usage`: the subject
+/// identity it attributes the usage to (`organization_id`, `workspace_id`,
+/// `api_key_id`) and, when the deployment has one, the top-level
+/// `discount_to_user` it bills at, the same value `/v1/models` publishes.
+/// Pure (no I/O) so it can be unit-tested. `spawn_usage_report` calls it only
+/// after `service_path_unavailable_reason` confirmed all three identity fields
+/// are present. A body that is not a JSON object is left untouched and its
+/// JSON kind returned, so the caller can drop it.
+fn complete_usage_body(
+    reporter: &UsageReporter,
+    body: &mut serde_json::Value,
+) -> Result<(), &'static str> {
+    let map = match body {
+        serde_json::Value::Object(map) => map,
+        serde_json::Value::Null => return Err("null"),
+        serde_json::Value::Bool(_) => return Err("bool"),
+        serde_json::Value::Number(_) => return Err("number"),
+        serde_json::Value::String(_) => return Err("string"),
+        serde_json::Value::Array(_) => return Err("array"),
+    };
+    let identity = [
+        ("organization_id", &reporter.org_id),
+        ("workspace_id", &reporter.workspace_id),
+        ("api_key_id", &reporter.api_key_id),
+    ];
+    for (field, value) in identity {
+        if let Some(value) = value {
+            map.insert(field.to_string(), serde_json::Value::String(value.clone()));
+        }
+    }
+    if let Some(discount) = reporter.discount_to_user {
+        map.insert(
+            "discount_to_user".to_string(),
+            serde_json::Value::from(discount),
+        );
+    }
+    Ok(())
+}
+
 /// Fire-and-forget POST of a usage event to cloud-api's `/v1/internal/usage`
 /// (service-token authenticated). The legacy `sk-`-authenticated `/v1/usage`
 /// endpoint has been removed from cloud-api, so when the service-token path is
@@ -767,52 +811,27 @@ pub(crate) fn spawn_usage_report(reporter: &UsageReporter, mut body: serde_json:
         return;
     }
 
-    // Inject subject identity into the body. Cloud-api's `/v1/internal/usage`
-    // handler reads these to attribute the usage.
-    match &mut body {
-        serde_json::Value::Object(map) => {
-            // `unwrap` is fine — all three `Option`s are checked by
-            // `can_use_service_token_path` above.
-            map.insert(
-                "organization_id".to_string(),
-                serde_json::Value::String(reporter.org_id.clone().unwrap()),
-            );
-            map.insert(
-                "workspace_id".to_string(),
-                serde_json::Value::String(reporter.workspace_id.clone().unwrap()),
-            );
-            map.insert(
-                "api_key_id".to_string(),
-                serde_json::Value::String(reporter.api_key_id.clone().unwrap()),
-            );
-        }
-        other => {
-            record_usage_report_outcome(reporter, UsageReportOutcome::InvalidBody, None);
-            // Today every call site builds the body via `serde_json::json!({…})`
-            // so it's always an object. Guard against a future caller passing
-            // something else: drop the report rather than send un-attributable
-            // bytes to cloud-api, which would silently fail to write a usage row.
-            warn!(
-                body_kind = %match other {
-                    serde_json::Value::Null => "null",
-                    serde_json::Value::Bool(_) => "bool",
-                    serde_json::Value::Number(_) => "number",
-                    serde_json::Value::String(_) => "string",
-                    serde_json::Value::Array(_) => "array",
-                    serde_json::Value::Object(_) => unreachable!(),
-                },
-                request_id = %reporter.request_id.as_deref().unwrap_or(""),
-                org_id = %reporter.org_id.as_deref().unwrap_or(""),
-                workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
-                api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
-                model = %reporter.model_name,
-                auth_path = reporter.request_source.auth_path.as_label(),
-                ingress_route = reporter.request_source.ingress_route.as_label(),
-                "Skipping usage report: body is not a JSON object — identity fields \
-                 can't be injected, refusing to send unattributable report"
-            );
-            return;
-        }
+    // Add the subject identity cloud-api's `/v1/internal/usage` handler
+    // attributes the usage to, and the configured discount.
+    if let Err(body_kind) = complete_usage_body(reporter, &mut body) {
+        record_usage_report_outcome(reporter, UsageReportOutcome::InvalidBody, None);
+        // Today every call site builds the body via `serde_json::json!({…})`
+        // so it's always an object. Guard against a future caller passing
+        // something else: drop the report rather than send un-attributable
+        // bytes to cloud-api, which would silently fail to write a usage row.
+        warn!(
+            body_kind = %body_kind,
+            request_id = %reporter.request_id.as_deref().unwrap_or(""),
+            org_id = %reporter.org_id.as_deref().unwrap_or(""),
+            workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
+            api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
+            model = %reporter.model_name,
+            auth_path = reporter.request_source.auth_path.as_label(),
+            ingress_route = reporter.request_source.ingress_route.as_label(),
+            "Skipping usage report: body is not a JSON object — identity fields \
+             can't be injected, refusing to send unattributable report"
+        );
+        return;
     }
 
     let client = reporter.http_client.clone();
@@ -3504,6 +3523,7 @@ mod tests {
             org_id: org_id.map(String::from),
             workspace_id: workspace_id.map(String::from),
             api_key_id: api_key_id.map(String::from),
+            discount_to_user: None,
             request_id: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
             request_source: RequestSource {
                 auth_path: AuthPath::CloudApiKey,
@@ -3543,6 +3563,65 @@ mod tests {
 
         // Nothing configured: reporting is skipped.
         assert!(!reporter_with(None, None, None, None).can_use_service_token_path());
+    }
+
+    #[test]
+    fn complete_usage_body_adds_identity_and_the_configured_discount() {
+        let usage = || {
+            build_usage_body(
+                &UsageType::ChatCompletion,
+                &serde_json::json!({"usage": {"prompt_tokens": 12, "completion_tokens": 7}}),
+                "test-model",
+                "chatcmpl-1",
+            )
+            .unwrap()
+        };
+        let mut reporter = reporter_with(Some("tok"), Some("org"), Some("ws"), Some("key"));
+
+        // No discount configured: identity only, no `discount_to_user` at all.
+        let mut body = usage();
+        complete_usage_body(&reporter, &mut body).unwrap();
+        assert_eq!(body["organization_id"], "org");
+        assert_eq!(body["workspace_id"], "ws");
+        assert_eq!(body["api_key_id"], "key");
+        assert!(body.get("discount_to_user").is_none(), "{body}");
+
+        // Configured: a top-level JSON number next to the identity, and the
+        // usage itself untouched (cloud-api applies it after pricing).
+        reporter.discount_to_user = Some(0.15);
+        let mut body = usage();
+        complete_usage_body(&reporter, &mut body).unwrap();
+        assert_eq!(body["organization_id"], "org");
+        assert_eq!(body["workspace_id"], "ws");
+        assert_eq!(body["api_key_id"], "key");
+        assert!(body["discount_to_user"].is_f64(), "{body}");
+        assert_eq!(body["discount_to_user"].as_f64(), Some(0.15));
+        assert_eq!(body["input_tokens"], 12);
+        assert_eq!(body["output_tokens"], 7);
+        assert_eq!(body["id"], "chatcmpl-1");
+        assert!(
+            serde_json::to_string(&body)
+                .unwrap()
+                .contains(r#""discount_to_user":0.15"#),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn complete_usage_body_refuses_a_body_that_is_not_an_object() {
+        let mut reporter = reporter_with(Some("tok"), Some("org"), Some("ws"), Some("key"));
+        reporter.discount_to_user = Some(0.15);
+        for (mut body, kind) in [
+            (serde_json::Value::Null, "null"),
+            (serde_json::json!(true), "bool"),
+            (serde_json::json!(1), "number"),
+            (serde_json::json!("usage"), "string"),
+            (serde_json::json!([]), "array"),
+        ] {
+            let before = body.clone();
+            assert_eq!(complete_usage_body(&reporter, &mut body), Err(kind));
+            assert_eq!(body, before, "a refused body is left untouched");
+        }
     }
 
     #[test]

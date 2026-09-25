@@ -2,46 +2,48 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Each in-CVM host proxy samples its engine replicas every 250–500 ms and publishes one signed, normalized `ReplicaReport` v1 frame per replica to Redis (a TTL key for the latest state, plus a capped stream as a recorder). Opt-in, off by default, no change to request handling.
+**Goal:** Each in-CVM host proxy reads its SGLang replicas' `/v1/loads` every 500 ms and writes one signed, normalized `ReplicaReport` v1 frame per replica to Redis: a 5 s TTL key for the latest state, plus a capped per-host stream as a short buffer. It is opt-in, off by default, and changes nothing on the request path.
 
-**Architecture:** A new `replica_state` module owns the whole feature. An `EngineAdapter` trait (Adapter pattern) turns SGLang `/v1/loads` or vLLM `/metrics` into one engine-neutral `ReplicaLoad`. A `ReplicaStatePublisher` runs one tick per interval: sample every replica concurrently, build frames (`boot_id`, monotonic `seq`, lifecycle), sign them with a per-boot Ed25519 report key (domain-separated), and hand them to a `StateSink` (Strategy: `RedisSink` in production, `MemorySink` in tests). The report key's public half is recorded in the dstack event log (`emit_event`), which the TDX quote covers, so `report_data` stays unchanged for existing verifiers.
+**Architecture:** A new, self-contained `replica_state` module:
+- `parse_sglang_loads` is a pure normalizing function (Adapter). It turns SGLang's `/v1/loads` into one engine-neutral `ReplicaLoad`.
+- `Publisher::tick` reads every replica concurrently and builds one frame per replica. All frames in a tick share one `seq`. Each frame is signed with a per-boot Ed25519 report key, domain-separated.
+- A concrete `RedisSink` writes the frames in one pipeline.
+- `spawn_replica_state_publisher` (Facade) is the only entry point `main.rs` calls.
+- The report key's public half is recorded in the dstack event log (`emit_event`), which the TDX quote covers. `report_data` stays unchanged.
 
-**Tech Stack:** Rust (tokio, axum, reqwest, serde_json, ed25519-dalek), new dependency `redis` (BSD-3-Clause) with `tokio-comp`, `tokio-rustls-comp`, `connection-manager`, `streams`; tests with `wiremock`.
+**Tech Stack:** Rust (tokio, reqwest, serde_json, ed25519-dalek, base64, sha2, uuid, rand, all already dependencies). New: `redis` 1.x (BSD-3-Clause, `default-features = false`, features `tokio-comp`, `tokio-rustls-comp`, `connection-manager`), plus `rustls` as a direct dependency (already in the lock) to install the crypto provider. Tests use `wiremock` (already a dev dependency).
 
-**Spec:** Design doc "Inference Placement Map" (https://claude.ai/artifact/T3WkANwFetyUYsHhMBNheo), sections "Latest recommendation" (stage 1), "Replica lifecycle and state reporting" §2 (engine signals), §4 (state-report contract, Redis transport, who can trust a frame, staleness), and the gated stage 1 exit criteria in "Baseline".
+**Spec:** Design doc "Inference Placement Map" (https://claude.ai/artifact/T3WkANwFetyUYsHhMBNheo): "Latest recommendation" (stage 1); "Replica lifecycle and state reporting" §2 and §4 (state contract, Redis transport, who can trust a frame, staleness); gated stage 1 in "Baseline". This plan was revised after a principal-engineer review (see "Review changes" at the end).
 
 ## Global Constraints
 
-- Feature is **off unless `REPLICA_STATE_REDIS_URL` is set**. With it unset, behaviour, startup and tests are byte-for-byte unchanged.
-- Frames carry **IDs and numbers only**: no prompts, no org IDs, no affinity keys, no content-derived hashes. Never log frame contents above `debug`.
-- **An unknown value is `null`, never `0`.** A value SGLang omits from `/v1/loads` because it is zero (`omit_defaults`) is a known `0`; a failed read makes every load field `null`.
-- Signature: `ed25519(report_key, b"nearai-replica-report-v1\n" ++ canonical_frame_bytes)`, base64 (standard, padded). `canonical_frame_bytes` = `serde_json::to_vec(&frame)` with struct field order as declared below.
-- Today's attestation `report_data` layout (`attestation.rs::build_report_data`) must not change.
-- Reproducible build: no new required build env vars or args (see `CLAUDE.md` "Deployment"). `cargo deny check` must pass.
-- **Non-intrusive:** existing code changes are limited to `src/lib.rs` (one `pub mod replica_state;` line) and `src/main.rs` (one guarded spawn block). No changes to `Config`, `AppState`, request routes, `proxy.rs`, `attestation.rs`, `backend_pool.rs` or the integration-test helpers. The feature reads `BackendPool` through its existing public `backends()` accessor only.
-- Run `cargo fmt` before each commit.
-
-## Review Focus
-
-1. **Engine unreachable or slow** → the replica's frame still goes out, with `lifecycle_state: "unhealthy"` after 3 consecutive failed reads (`"warming"` before the first success) and every load field `null`; the tick never blocks longer than one interval. (Task 6 test.)
-2. **Redis down or slow at boot or mid-run** → the proxy starts and serves normally; the publisher logs, counts `replica_state_publish_failures_total`, and retries next tick. (Task 5 and Task 6 tests.)
-3. **SGLang omits zero fields** (`omit_defaults`) → absent `num_waiting_reqs` parses as `0`, not `null`. (Task 3 test.)
-4. **Proxy restart** → new `boot_id`, `seq` restarts at 1, new report key and a new event-log entry; readers can tell this apart from a regression. (Task 4 and Task 6 tests.)
-5. **Metrics double-counting** (priority buckets, TP ranks) → the vLLM path reuses `engine_load::metric_sum`, which already prefers the empty-`priority` aggregate. (Task 3 test.)
-
+- **Off unless `REPLICA_STATE_REDIS_URL` is set.** Unset means behaviour, startup and tests are unchanged.
+- **Non-intrusive.** Existing code edits are limited to `src/lib.rs` (one `pub mod` line), `src/main.rs` (one `match` block), `Cargo.toml`/`Cargo.lock`, and docs. `Config`, `AppState`, routes, `proxy.rs`, `attestation.rs`, `backend_pool.rs` and the integration-test helpers are not touched. `BackendPool` is read only through its public `backends()`.
+- **Bad configuration never stops the proxy.** An invalid `REPLICA_STATE_*` value logs an error and disables the feature.
+- **IDs and numbers only** in frames: no prompts, org IDs, affinity keys, or content-derived hashes.
+- **Never log the Redis URL** (it may hold a password), a connection error formatted with it, or any key material. Frame contents only at `debug`.
+- **Unknown is `null`, never `0`.** A core field missing from `/v1/loads` JSON is `null`. A failed read makes every load field `null`.
+- **Signing:** `sig = base64(ed25519(report_key, b"nearai-replica-report-v1\n" ++ frame_bytes))`, where `frame_bytes` is the exact UTF-8 of the `frame` string in the envelope. Readers verify the bytes they received, then parse. Nothing re-serializes.
+- **`seq` is per tick:** one value shared by every frame of that tick, starting at 1 per boot.
+- **Attestation `report_data` layout is not changed.**
+- Reproducible build: no new required build env vars or arguments. `cargo deny check` must pass. Run `cargo fmt` before each commit.
 
 ## Design patterns (refactoring.guru catalog)
 
-Chosen for what this feature actually varies on; nothing added for its own sake.
-
 | Pattern | Where | Why |
 |---|---|---|
-| **Adapter** | `EngineAdapter` with `SglangAdapter` / `VllmAdapter` | Two incompatible engine interfaces (`/v1/loads` JSON vs Prometheus text) become one `ReplicaLoad`. New engines add an adapter; nothing else changes. |
-| **Strategy** | `StateSink` with `RedisSink` / `MemorySink` | Where frames go is interchangeable: Redis in production, memory in tests. The publisher doesn't know which. |
-| **Template Method** (as a fixed pipeline in `tick`) | `ReplicaStatePublisher::tick` | The invariant steps (read → normalize → lifecycle → frame → seal → publish) are fixed in one place; the variable steps are the adapter and the sink. |
-| **Facade** | `replica_state::spawn_replica_state_publisher` | The only entry point `main.rs` calls. Keys, detection, retries and metrics stay hidden in the module. |
+| **Adapter** | `parse_sglang_loads(&Value) -> Option<ReplicaLoad>` | Converts SGLang's engine-specific load snapshot into the engine-neutral view readers use. It's a pure function: one engine today. When vLLM arrives it becomes a `match` on a closed `Engine` enum, not a trait. |
+| **Facade** | `replica_state::spawn_replica_state_publisher` | The single entry point from `main.rs`. It hides the key, the binding, reads, retries, Redis and metrics. |
 
-Not used on purpose: Observer (nothing subscribes to frames inside the proxy), Decorator (no layered behaviour needed), and Singleton (state lives in the spawned task).
+Deliberately not used: Strategy or trait objects for sinks or engines (one implementation each; `tick()` returning frames is the test seam), Template Method (a plain function is clearer), Observer, Decorator, Singleton.
+
+## Review Focus
+
+1. **A wedged scheduler** serves a stale snapshot from shared memory. `engine_sampled_at_ms` comes from the engine's own `timestamp`, so the frame shows its age. (Task 3 and Task 5 tests.)
+2. **An engine that is unreachable or slow:** the tick finishes within the interval. That replica's frame keeps its last successful sample time, has all load fields `null`, and moves `warming → ready → unhealthy` after 3 consecutive failures. (Task 5 tests.)
+3. **Redis down at boot or mid-run:** the proxy serves normally. The publisher retries the connection every 5 s, counts failures and never panics. That includes `rediss://` with two rustls providers in the lock. (Task 4 and Task 5 tests.)
+4. **Several DP ranks in `/v1/loads`:** counts and throughput are summed, while ratios are computed, never summed. (Task 3 test.)
+5. **A typo in a `REPLICA_STATE_*` variable:** the proxy starts, logs one error and publishes nothing. (Task 1 and Task 5 tests.)
 
 ---
 
@@ -49,149 +51,107 @@ Not used on purpose: Observer (nothing subscribes to frames inside the proxy), D
 
 | File | Responsibility |
 |---|---|
-| `src/replica_state/mod.rs` | Module root; `spawn_replica_state_publisher(...)` wiring entry point |
-| `src/replica_state/report.rs` | `ReplicaReport` v1 types, `Envelope`, canonical bytes, `sign_frame`/`verify_envelope` |
-| `src/replica_state/engine.rs` | `EngineAdapter` trait, `SglangAdapter`, `VllmAdapter`, `ReplicaLoad`, engine auto-detection |
-| `src/replica_state/report_key.rs` | Per-boot `ReportKey` (Ed25519), `key_id`, dstack event-log binding |
-| `src/replica_state/sink.rs` | `StateSink` trait, `RedisSink`, `MemorySink` |
-| `src/replica_state/publisher.rs` | `ReplicaStatePublisher` tick loop: sample → frame → sign → sink |
-| `src/replica_state/config.rs` | `ReplicaStateConfig::from_env(backend_urls)`: parsed only by this module; `None` when disabled |
-| `src/main.rs`, `src/lib.rs` | One `pub mod` line; one guarded spawn block (the only edits to existing code) |
-| `docs/replica-state.md` | Operator doc: env vars, frame schema, Redis layout |
-
-Out of scope for this plan (follow-up plan "stage 1b"): `x-nearai-replica` strict hint and served-replica echo, queue-full → 429 conversion, per-token trust levels. They touch the request path; this plan does not.
+| `src/replica_state/mod.rs` | Submodule declarations; `spawn_replica_state_publisher` (Facade) |
+| `src/replica_state/config.rs` | `ReplicaStateConfig::from_lookup(get, backend_count)`; `from_env` wrapper; manual `Debug` |
+| `src/replica_state/report.rs` | `ReplicaReport` v1, `Envelope` (frame as string), `seal`, `verify` |
+| `src/replica_state/sglang.rs` | `parse_sglang_loads` (Adapter), `read_replica` (HTTP + timeout) |
+| `src/replica_state/report_key.rs` | Per-boot `ReportKey`; `bind_to_attestation` (dstack `emit_event`) |
+| `src/replica_state/redis_sink.rs` | Concrete `RedisSink`: connect (rustls provider, timeouts), `publish` pipeline |
+| `src/replica_state/publisher.rs` | `Publisher` with `Vec<ReplicaSlot>`; `tick` |
+| `src/lib.rs`, `src/main.rs` | One `pub mod` line; one `match` block to spawn |
+| `docs/replica-state.md` | Operator doc |
 
 ---
 
 ### Task 1: Configuration (inside the new module)
 
 **Files:**
-- Create: `src/replica_state/config.rs`, `src/replica_state/mod.rs` (declares submodules)
+- Create: `src/replica_state/mod.rs` (submodule declarations), `src/replica_state/config.rs`
 - Modify: `src/lib.rs` (`pub mod replica_state;`)
-
-`Config` is not modified. The module parses its own environment, so existing tests and helpers are untouched.
 
 **Interfaces:**
 - Produces:
 ```rust
-#[derive(Clone, Debug, PartialEq)]
-pub enum EngineKind { Auto, Sglang, Vllm }
-
-#[derive(Clone, Debug)]
+pub const DEFAULT_INTERVAL_MS: u64 = 500;
 pub struct ReplicaStateConfig {
-    pub redis_url: String,            // REPLICA_STATE_REDIS_URL (required to enable)
-    pub host_id: String,              // REPLICA_STATE_HOST_ID (required when enabled)
-    pub replica_ids: Vec<String>,     // VLLM_BACKEND_REPLICA_IDS, default r1..rN
-    pub interval: std::time::Duration,// REPLICA_STATE_INTERVAL_MS, default 500, range 100..=5000
-    pub key_ttl_secs: u64,            // REPLICA_STATE_KEY_TTL_SECS, default 5
-    pub stream: String,               // REPLICA_STATE_STREAM, default "replica-frames"
-    pub stream_maxlen: usize,         // REPLICA_STATE_STREAM_MAXLEN, default 200000
-    pub engine: EngineKind,           // REPLICA_STATE_ENGINE, default auto
-    pub pool: Option<String>,         // REPLICA_STATE_POOL
-    pub tier: Option<String>,         // REPLICA_STATE_TIER
+    pub redis_url: String,           // REPLICA_STATE_REDIS_URL (enables the feature)
+    pub host_id: String,             // REPLICA_STATE_HOST_ID (required)
+    pub replica_ids: Vec<String>,    // REPLICA_STATE_REPLICA_IDS (required; one per VLLM_BACKEND_URLS entry, same order)
+    pub interval: std::time::Duration, // REPLICA_STATE_INTERVAL_MS (optional, 200..=2000, default 500)
 }
 impl ReplicaStateConfig {
-    /// `Ok(None)` when `REPLICA_STATE_REDIS_URL` is unset. `backend_urls` = `Config::backend_urls` (for replica-ID defaults and count checks).
-    pub fn from_env(backend_urls: &[String]) -> anyhow::Result<Option<Self>>;
+    /// Ok(None) when REPLICA_STATE_REDIS_URL is unset or blank.
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>, backend_count: usize) -> anyhow::Result<Option<Self>>;
+    pub fn from_env(backend_count: usize) -> anyhow::Result<Option<Self>> { Self::from_lookup(|k| std::env::var(k).ok(), backend_count) }
+    /// Host part of the URL only, for logs (never credentials).
+    pub fn redis_host_for_logs(&self) -> String;
 }
+impl std::fmt::Debug for ReplicaStateConfig { /* prints host_id, replica_ids, interval, redis_host_for_logs(); never redis_url */ }
 ```
 
-- [ ] **Step 1: Write failing tests** in `replica_state/config.rs` `mod tests`. Serialize env-mutating tests with a module-local `static ENV_LOCK: std::sync::Mutex<()>` and a small guard that sets and restores variables:
+- [ ] **Step 1: Write failing tests** in `config.rs`. They use a `HashMap` lookup, so no environment is mutated:
 
 ```rust
-#[test]
-fn replica_state_is_off_without_redis_url() {
-    let _g = EnvGuard::new(&[("REPLICA_STATE_REDIS_URL", None), ("REPLICA_STATE_HOST_ID", Some("h1"))]);
-    assert!(ReplicaStateConfig::from_env(&["http://a:8000".into()]).unwrap().is_none());
-}
-
-#[test]
-fn replica_state_requires_host_id() {
-    let _g = EnvGuard::new(&[("REPLICA_STATE_REDIS_URL", Some("redis://r:6379")), ("REPLICA_STATE_HOST_ID", None)]);
-    assert!(ReplicaStateConfig::from_env(&["http://a:8000".into()]).unwrap_err().to_string().contains("REPLICA_STATE_HOST_ID"));
-}
-
-#[test]
-fn replica_ids_default_and_must_match_backends() {
-    let _g = EnvGuard::new(&[
-        ("REPLICA_STATE_REDIS_URL", Some("redis://r:6379")),
-        ("REPLICA_STATE_HOST_ID", Some("glm53-gpu03")),
-        ("VLLM_BACKEND_REPLICA_IDS", None),
-    ]);
-    let rs = ReplicaStateConfig::from_env(&["http://a:8000".into(), "http://b:8000".into()]).unwrap().unwrap();
-    assert_eq!(rs.replica_ids, vec!["r1", "r2"]);
-    assert_eq!(rs.interval, std::time::Duration::from_millis(500));
-    assert_eq!(rs.engine, EngineKind::Auto);
-}
-
-#[test]
-fn replica_ids_count_mismatch_is_an_error() {
-    let _g = EnvGuard::new(&[
-        ("REPLICA_STATE_REDIS_URL", Some("redis://r:6379")),
-        ("REPLICA_STATE_HOST_ID", Some("h")),
-        ("VLLM_BACKEND_REPLICA_IDS", Some("r1")),
-    ]);
-    assert!(ReplicaStateConfig::from_env(&["http://a:8000".into(), "http://b:8000".into()]).is_err());
-}
-
-#[test]
-fn interval_out_of_range_is_an_error() {
-    let _g = EnvGuard::new(&[
-        ("REPLICA_STATE_REDIS_URL", Some("redis://r:6379")),
-        ("REPLICA_STATE_HOST_ID", Some("h")),
-        ("REPLICA_STATE_INTERVAL_MS", Some("50")),
-    ]);
-    assert!(ReplicaStateConfig::from_env(&["http://a:8000".into()]).is_err());
-}
-```
-
-- [ ] **Step 2: Run** `cargo test --lib replica_state::config` → FAIL (types don't exist).
-
-- [ ] **Step 3: Implement** `ReplicaStateConfig::from_env` with small local helpers (`env_parse`, `env_or` equivalents; the ones in `config.rs` are private and stay untouched):
-
-```rust
-let replica_state = match env::var("REPLICA_STATE_REDIS_URL").ok().filter(|v| !v.trim().is_empty()) {
-    None => None,
-    Some(redis_url) => {
-        let host_id = env::var("REPLICA_STATE_HOST_ID").ok().filter(|v| !v.trim().is_empty())
-            .ok_or_else(|| anyhow::anyhow!("REPLICA_STATE_HOST_ID is required when REPLICA_STATE_REDIS_URL is set"))?;
-        let replica_ids: Vec<String> = match env::var("VLLM_BACKEND_REPLICA_IDS") {
-            Ok(v) if !v.trim().is_empty() => v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
-            _ => (1..=backend_urls.len()).map(|i| format!("r{i}")).collect(),
-        };
-        if replica_ids.len() != backend_urls.len() {
-            anyhow::bail!("VLLM_BACKEND_REPLICA_IDS must list one ID per VLLM_BACKEND_URLS entry, in the same order");
-        }
-        let interval_ms: u64 = env_parse("REPLICA_STATE_INTERVAL_MS", 500)?;
-        if !(100..=5000).contains(&interval_ms) {
-            anyhow::bail!("REPLICA_STATE_INTERVAL_MS must be between 100 and 5000");
-        }
-        let engine = match env_or("REPLICA_STATE_ENGINE", "auto").as_str() {
-            "auto" => EngineKind::Auto, "sglang" => EngineKind::Sglang, "vllm" => EngineKind::Vllm,
-            other => anyhow::bail!("REPLICA_STATE_ENGINE must be auto, sglang or vllm (got {other})"),
-        };
-        let opt = |n: &str| env::var(n).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
-        Some(ReplicaStateConfig {
-            redis_url, host_id: host_id.trim().to_string(), replica_ids,
-            interval: std::time::Duration::from_millis(interval_ms),
-            key_ttl_secs: env_parse("REPLICA_STATE_KEY_TTL_SECS", 5)?,
-            stream: env_or("REPLICA_STATE_STREAM", "replica-frames"),
-            stream_maxlen: env_parse("REPLICA_STATE_STREAM_MAXLEN", 200_000)?,
-            engine, pool: opt("REPLICA_STATE_POOL"), tier: opt("REPLICA_STATE_TIER"),
-        })
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    fn look(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let m: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        move |k| m.get(k).cloned()
     }
-};
+
+    #[test]
+    fn off_without_redis_url() {
+        assert!(ReplicaStateConfig::from_lookup(look(&[("REPLICA_STATE_HOST_ID", "h")]), 1).unwrap().is_none());
+        assert!(ReplicaStateConfig::from_lookup(look(&[("REPLICA_STATE_REDIS_URL", "  ")]), 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn requires_host_id_and_replica_ids() {
+        let e = ReplicaStateConfig::from_lookup(look(&[("REPLICA_STATE_REDIS_URL", "redis://r:6379"), ("REPLICA_STATE_REPLICA_IDS", "r1")]), 1).unwrap_err();
+        assert!(e.to_string().contains("REPLICA_STATE_HOST_ID"));
+        let e = ReplicaStateConfig::from_lookup(look(&[("REPLICA_STATE_REDIS_URL", "redis://r:6379"), ("REPLICA_STATE_HOST_ID", "h")]), 1).unwrap_err();
+        assert!(e.to_string().contains("REPLICA_STATE_REPLICA_IDS"));
+    }
+
+    #[test]
+    fn replica_ids_must_match_backend_count_and_be_unique() {
+        let base = [("REPLICA_STATE_REDIS_URL", "redis://r:6379"), ("REPLICA_STATE_HOST_ID", "h")];
+        let mk = |ids: &str| { let mut v = base.to_vec(); v.push(("REPLICA_STATE_REPLICA_IDS", ids)); v };
+        assert!(ReplicaStateConfig::from_lookup(look(&mk("r1")), 2).is_err());
+        assert!(ReplicaStateConfig::from_lookup(look(&mk("r1,r1")), 2).is_err());
+        let ok = ReplicaStateConfig::from_lookup(look(&mk(" r1 , r2 ")), 2).unwrap().unwrap();
+        assert_eq!(ok.replica_ids, vec!["r1", "r2"]);
+        assert_eq!(ok.interval, std::time::Duration::from_millis(DEFAULT_INTERVAL_MS));
+    }
+
+    #[test]
+    fn interval_bounds() {
+        let mk = |ms: &str| look(&[("REPLICA_STATE_REDIS_URL", "redis://r:6379"), ("REPLICA_STATE_HOST_ID", "h"), ("REPLICA_STATE_REPLICA_IDS", "r1"), ("REPLICA_STATE_INTERVAL_MS", ms)]);
+        assert!(ReplicaStateConfig::from_lookup(mk("100"), 1).is_err());
+        assert!(ReplicaStateConfig::from_lookup(mk("abc"), 1).is_err());
+        assert_eq!(ReplicaStateConfig::from_lookup(mk("250"), 1).unwrap().unwrap().interval.as_millis(), 250);
+    }
+
+    #[test]
+    fn debug_and_log_host_never_show_credentials() {
+        let c = ReplicaStateConfig::from_lookup(look(&[("REPLICA_STATE_REDIS_URL", "rediss://user:s3cret@redis.internal:6380/0"), ("REPLICA_STATE_HOST_ID", "h"), ("REPLICA_STATE_REPLICA_IDS", "r1")]), 1).unwrap().unwrap();
+        let d = format!("{c:?}");
+        assert!(!d.contains("s3cret") && !d.contains("user:"));
+        assert_eq!(c.redis_host_for_logs(), "redis.internal:6380");
+    }
+}
 ```
 
-Return `Ok(replica_state)`. Nothing else in the crate changes in this task except the `pub mod replica_state;` line in `lib.rs`.
-
-- [ ] **Step 4: Run** `cargo test --lib replica_state::config` and `cargo test` (full suite unchanged) → PASS.
-
+- [ ] **Step 2: Run** `cargo test --lib replica_state::config` → FAIL.
+- [ ] **Step 3: Implement** `from_lookup` with the checks the tests imply. Trim values, and treat blank as unset. Parse `redis_host_for_logs` with `url::Url` if `url` is already a dependency; otherwise take the substring after the last `@` and up to the next `/`. Add `pub mod replica_state;` to `lib.rs`, and in `mod.rs` declare only `pub mod config;` for now.
+- [ ] **Step 4: Run** `cargo test --lib replica_state::config && cargo test` → PASS (full suite unchanged).
 - [ ] **Step 5: Commit** `feat(replica-state): opt-in config for per-replica state publishing`
 
 ---
 
-### Task 2: ReplicaReport v1 and signing envelope
+### Task 2: ReplicaReport v1 and the signing envelope
 
 **Files:**
 - Create: `src/replica_state/report.rs`
@@ -200,449 +160,409 @@ Return `Ok(replica_state)`. Nothing else in the crate changes in this task excep
 - Produces:
 ```rust
 pub const SIGNING_DOMAIN: &[u8] = b"nearai-replica-report-v1\n";
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum Lifecycle { Warming, Ready, Degraded, Unhealthy, Draining, Drained }
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum Engine { Sglang, Vllm }
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)] #[serde(rename_all = "lowercase")]
+pub enum Lifecycle { Warming, Ready, Degraded, Unhealthy, Draining, Drained } // v1 writer emits Warming/Ready/Unhealthy
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)] #[serde(rename_all = "lowercase")]
+pub enum Engine { Sglang }
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-pub struct Limits { pub max_running: Option<u32>, pub max_queued: Option<u32>, pub max_context: Option<u64> }
+pub struct Limits { pub max_running: Option<u32> }
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Load {
-    pub running: Option<u32>, pub queued: Option<u32>,
-    pub prefill_backlog_tokens: Option<u64>, pub prefill_running_tokens: Option<u64>,
-    pub kv_usage: Option<f64>, pub gen_tps: Option<f64>, pub prefill_tps: Option<f64>,
-    pub itl_p50_ms: Option<f64>, pub cached_token_ratio: Option<f64>,
+    pub running: Option<u32>, pub queued: Option<u32>, pub prefill_backlog_tokens: Option<u64>,
+    pub kv_usage: Option<f64>, pub gen_tps: Option<f64>, pub cached_token_ratio: Option<f64>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct ProxyLoad { pub inflight: u32 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ReplicaReport {
     pub schema: u8, pub host_id: String, pub replica_id: String, pub boot_id: String, pub seq: u64,
     pub engine_sampled_at_ms: u64, pub reported_at_ms: u64, pub lifecycle_state: Lifecycle,
-    pub model: String, pub pool: Option<String>, pub tier: Option<String>,
-    pub engine: Option<Engine>, pub engine_version: Option<String>,
-    pub limits: Limits, pub load: Load, pub proxy: ProxyLoad, pub report_key_id: String,
+    pub model: String, pub engine: Engine, pub engine_version: Option<String>,
+    pub limits: Limits, pub load: Load, pub proxy_inflight: u32, pub report_key_id: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct Envelope { pub frame: ReplicaReport, pub sig: String }
-
-pub fn canonical_bytes(frame: &ReplicaReport) -> Vec<u8>;
-pub fn signing_message(frame: &ReplicaReport) -> Vec<u8>;             // SIGNING_DOMAIN ++ canonical_bytes
-pub fn seal(frame: ReplicaReport, key: &ed25519_dalek::SigningKey) -> Envelope;
-pub fn verify(env: &Envelope, key: &ed25519_dalek::VerifyingKey) -> bool;
+pub struct Envelope { pub frame: String, pub sig: String }
+pub fn seal(report: &ReplicaReport, key: &ed25519_dalek::SigningKey) -> Envelope;
+/// Verify, then parse. None on a bad signature or bad JSON.
+pub fn open(env: &Envelope, key: &ed25519_dalek::VerifyingKey) -> Option<ReplicaReport>;
 ```
-`prefill_tps` is an addition to the design doc's v1 draft (derived from SGLang's cumulative prefill counters). It is additive and nullable.
 
-- [ ] **Step 1: Write failing tests** in `report.rs`:
+- [ ] **Step 1: Write failing tests:**
 
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::SigningKey;
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer, SigningKey};
 
-    fn frame() -> ReplicaReport {
+    fn report() -> ReplicaReport {
         ReplicaReport {
             schema: 1, host_id: "glm53-gpu03".into(), replica_id: "r1".into(),
             boot_id: "00000000-0000-4000-8000-000000000001".into(), seq: 7,
             engine_sampled_at_ms: 1_790_000_000_011, reported_at_ms: 1_790_000_000_123,
             lifecycle_state: Lifecycle::Ready, model: "z-ai/glm-5.3-flash".into(),
-            pool: Some("glm53-base".into()), tier: None, engine: Some(Engine::Sglang), engine_version: None,
-            limits: Limits { max_running: Some(32), max_queued: None, max_context: None },
+            engine: Engine::Sglang, engine_version: None,
+            limits: Limits { max_running: Some(32) },
             load: Load { running: Some(14), queued: Some(0), prefill_backlog_tokens: Some(51200), ..Default::default() },
-            proxy: ProxyLoad { inflight: 16 }, report_key_id: "k1".into(),
+            proxy_inflight: 16, report_key_id: "0123456789abcdef".into(),
         }
     }
 
     #[test]
-    fn canonical_bytes_are_stable_and_keep_nulls() {
-        let s = String::from_utf8(canonical_bytes(&frame())).unwrap();
-        assert!(s.starts_with(r#"{"schema":1,"host_id":"glm53-gpu03","replica_id":"r1""#));
-        assert!(s.contains(r#""tier":null"#));
-        assert!(s.contains(r#""kv_usage":null"#));
-        assert!(!s.contains(' '));
+    fn seal_open_roundtrip_through_json() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let wire = serde_json::to_string(&seal(&report(), &sk)).unwrap();
+        let env: Envelope = serde_json::from_str(&wire).unwrap();
+        assert_eq!(open(&env, &sk.verifying_key()), Some(report()));
     }
 
     #[test]
-    fn seal_then_verify_roundtrips_and_detects_tampering() {
-        let sk = SigningKey::from_bytes(&[7u8; 32]);
-        let env = seal(frame(), &sk);
-        assert!(verify(&env, &sk.verifying_key()));
-        let mut tampered = env.clone();
-        tampered.frame.load.queued = Some(99);
-        assert!(!verify(&tampered, &sk.verifying_key()));
+    fn frame_keeps_nulls_and_is_compact() {
+        let env = seal(&report(), &SigningKey::from_bytes(&[7u8; 32]));
+        assert!(env.frame.starts_with(r#"{"schema":1,"host_id":"glm53-gpu03""#));
+        assert!(env.frame.contains(r#""kv_usage":null"#));
+        assert!(!env.frame.contains(": "));
     }
 
     #[test]
-    fn signature_is_domain_separated() {
-        use ed25519_dalek::Signer;
+    fn tampered_frame_or_wrong_key_fails() {
         let sk = SigningKey::from_bytes(&[7u8; 32]);
-        let bare = sk.sign(&canonical_bytes(&frame()));
-        let env = Envelope { frame: frame(), sig: base64::engine::general_purpose::STANDARD.encode(bare.to_bytes()) };
-        assert!(!verify(&env, &sk.verifying_key()));
+        let mut env = seal(&report(), &sk);
+        env.frame = env.frame.replace(r#""running":14"#, r#""running":0"#);
+        assert!(open(&env, &sk.verifying_key()).is_none());
+        let env = seal(&report(), &sk);
+        assert!(open(&env, &SigningKey::from_bytes(&[8u8; 32]).verifying_key()).is_none());
     }
 
     #[test]
-    fn envelope_json_roundtrip() {
+    fn signature_without_domain_prefix_is_rejected() {
         let sk = SigningKey::from_bytes(&[7u8; 32]);
-        let env = seal(frame(), &sk);
-        let back: Envelope = serde_json::from_str(&serde_json::to_string(&env).unwrap()).unwrap();
-        assert!(verify(&back, &sk.verifying_key()));
+        let frame = serde_json::to_string(&report()).unwrap();
+        let sig = base64::engine::general_purpose::STANDARD.encode(sk.sign(frame.as_bytes()).to_bytes());
+        assert!(open(&Envelope { frame, sig }, &sk.verifying_key()).is_none());
     }
 }
 ```
 
 - [ ] **Step 2: Run** `cargo test --lib replica_state::report` → FAIL.
-
-- [ ] **Step 3: Implement.** Types exactly as above (no `skip_serializing_if`: nulls must be present), then:
+- [ ] **Step 3: Implement:**
 
 ```rust
 use base64::Engine as _;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
-pub fn canonical_bytes(frame: &ReplicaReport) -> Vec<u8> {
-    serde_json::to_vec(frame).expect("ReplicaReport always serializes")
+fn message(frame: &str) -> Vec<u8> { let mut m = SIGNING_DOMAIN.to_vec(); m.extend_from_slice(frame.as_bytes()); m }
+
+pub fn seal(report: &ReplicaReport, key: &SigningKey) -> Envelope {
+    let frame = serde_json::to_string(report).expect("ReplicaReport always serializes");
+    let sig = base64::engine::general_purpose::STANDARD.encode(key.sign(&message(&frame)).to_bytes());
+    Envelope { frame, sig }
 }
-pub fn signing_message(frame: &ReplicaReport) -> Vec<u8> {
-    let mut m = SIGNING_DOMAIN.to_vec();
-    m.extend_from_slice(&canonical_bytes(frame));
-    m
-}
-pub fn seal(frame: ReplicaReport, key: &SigningKey) -> Envelope {
-    let sig = key.sign(&signing_message(&frame));
-    Envelope { frame, sig: base64::engine::general_purpose::STANDARD.encode(sig.to_bytes()) }
-}
-pub fn verify(env: &Envelope, key: &VerifyingKey) -> bool {
-    let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(&env.sig) else { return false };
-    let Ok(bytes) = <[u8; 64]>::try_from(raw.as_slice()) else { return false };
-    key.verify(&signing_message(&env.frame), &Signature::from_bytes(&bytes)).is_ok()
+
+pub fn open(env: &Envelope, key: &VerifyingKey) -> Option<ReplicaReport> {
+    let raw = base64::engine::general_purpose::STANDARD.decode(&env.sig).ok()?;
+    let sig = Signature::from_bytes(&<[u8; 64]>::try_from(raw.as_slice()).ok()?);
+    key.verify(&message(&env.frame), &sig).ok()?;
+    serde_json::from_str(&env.frame).ok()
 }
 ```
-
-- [ ] **Step 4: Run** `cargo test --lib replica_state::report` → PASS.
-
-- [ ] **Step 5: Commit** `feat(replica-state): ReplicaReport v1 schema and domain-separated signing envelope`
+Register `pub mod report;` in `mod.rs`.
+- [ ] **Step 4: Run** → PASS.
+- [ ] **Step 5: Commit** `feat(replica-state): ReplicaReport v1 and signed envelope (frame as signed string)`
 
 ---
 
-### Task 3: Engine adapters (SGLang, vLLM)
+### Task 3: SGLang adapter
 
 **Files:**
-- Create: `src/replica_state/engine.rs`
+- Create: `src/replica_state/sglang.rs`
 
 **Interfaces:**
-- Consumes: `report::{Engine, Load, Limits}`; `crate::engine_load::metric_sum`.
+- Consumes: `report::{Load, Limits}`.
 - Produces:
 ```rust
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct ReplicaLoad { pub load: Load, pub limits: Limits, pub engine_version: Option<String> }
-
-/// Per-replica state an adapter keeps between reads (cumulative counters).
-#[derive(Clone, Debug, Default)]
-pub struct AdapterMemory { pub prev_prefill: Option<(u64 /*uncached tokens*/, u64 /*busy us*/)>, pub prev_gen: Option<(f64 /*tokens*/, std::time::Instant)> }
-
-#[async_trait::async_trait]
-pub trait EngineAdapter: Send + Sync {
-    fn engine(&self) -> Engine;
-    async fn read(&self, client: &reqwest::Client, base_url: &str, timeout: std::time::Duration, mem: &mut AdapterMemory) -> anyhow::Result<ReplicaLoad>;
-}
-pub struct SglangAdapter; pub struct VllmAdapter;
-pub fn parse_sglang_loads(json: &serde_json::Value, mem: &mut AdapterMemory) -> Option<ReplicaLoad>;
-pub fn parse_vllm_metrics(body: &str, mem: &mut AdapterMemory, now: std::time::Instant) -> Option<ReplicaLoad>;
-pub async fn detect(client: &reqwest::Client, base_url: &str, timeout: std::time::Duration) -> Option<Engine>;
-```
-If `async-trait` is not already a dependency, use `fn read(...) -> Pin<Box<dyn Future<Output = ...> + Send + 'a>>` instead of adding it. Check `Cargo.toml` first.
-
-Mapping (from design doc §2 and SGLang `load_snapshot.py`):
-- **SGLang** `GET {base}/v1/loads?include=core,queues` → `loads[0]` (sum across `loads[]` if there are several DP ranks). A field missing from the object is `0` (`omit_defaults`).
-  - `running` = `num_running_reqs`
-  - `queued` = `num_waiting_reqs`
-  - `prefill_backlog_tokens` = `num_waiting_uncached_tokens`
-  - `kv_usage` = `token_usage`
-  - `gen_tps` = `gen_throughput`
-  - `cached_token_ratio` = `cache_hit_rate`
-  - `max_running` = `max_running_requests` (null if 0)
-  - `prefill_tps` = Δ`total_prefill_uncached_tokens` ÷ (Δ`total_prefill_busy_us` / 1e6) against the previous read. Null on the first read, and when Δbusy = 0.
-  - `engine_version` = top-level `version`.
-  - `prefill_running_tokens` and `itl_p50_ms`: `null` in v1.
-- **vLLM** `GET {base}/metrics`:
-  - `running` = `metric_sum(["vllm:num_requests_running"])`
-  - `queued` = `metric_sum(["vllm:num_requests_waiting"])`
-  - `kv_usage` = the value of `vllm:kv_cache_usage_perc` or `vllm:gpu_cache_usage_perc`. It is already 0–1: parse it as f64 directly, not via `metric_sum`, which rounds to u32.
-  - `gen_tps` = Δ`vllm:generation_tokens_total` / Δt against the previous read.
-  - `cached_token_ratio` = `vllm:prefix_cache_hits_total` / `vllm:prefix_cache_queries_total` (cumulative ratio; null if queries is 0).
-  - `prefill_backlog_tokens`, `prefill_tps`: `null`. vLLM has no equivalent; the design doc lists this as a known gap.
-- **detect**: `GET /v1/loads` 200 with a JSON `loads` array → Sglang. Otherwise `GET /metrics` containing `vllm:` → Vllm. Otherwise `None`.
-
-- [ ] **Step 1: Write failing tests** with fixed inputs:
-
-```rust
-#[test]
-fn sglang_loads_maps_fields_and_treats_omitted_as_zero() {
-    let json = serde_json::json!({"version":"0.5.x","loads":[{"num_running_reqs":14,"num_waiting_uncached_tokens":51200,
-        "token_usage":0.63,"gen_throughput":910.0,"cache_hit_rate":0.71,"max_running_requests":32,
-        "total_prefill_uncached_tokens":1000,"total_prefill_busy_us":500000}]});
-    let mut mem = AdapterMemory::default();
-    let r = parse_sglang_loads(&json, &mut mem).unwrap();
-    assert_eq!(r.load.running, Some(14));
-    assert_eq!(r.load.queued, Some(0)); // omitted => 0
-    assert_eq!(r.load.prefill_backlog_tokens, Some(51200));
-    assert_eq!(r.load.kv_usage, Some(0.63));
-    assert_eq!(r.limits.max_running, Some(32));
-    assert_eq!(r.load.prefill_tps, None); // first read
-    assert_eq!(r.engine_version.as_deref(), Some("0.5.x"));
-}
-
-#[test]
-fn sglang_prefill_tps_from_counter_deltas() {
-    let mut mem = AdapterMemory::default();
-    let a = serde_json::json!({"loads":[{"total_prefill_uncached_tokens":1000,"total_prefill_busy_us":500000}]});
-    let b = serde_json::json!({"loads":[{"total_prefill_uncached_tokens":8000,"total_prefill_busy_us":1500000}]});
-    parse_sglang_loads(&a, &mut mem).unwrap();
-    let r = parse_sglang_loads(&b, &mut mem).unwrap();
-    assert_eq!(r.load.prefill_tps, Some(7000.0)); // 7000 tokens / 1.0 s busy
-}
-
-#[test]
-fn sglang_malformed_is_none() {
-    assert!(parse_sglang_loads(&serde_json::json!({"nope":1}), &mut AdapterMemory::default()).is_none());
-}
-
-#[test]
-fn vllm_metrics_map_and_rates() {
-    let t0 = std::time::Instant::now();
-    let body0 = "vllm:num_requests_running{model_name=\"m\"} 5\nvllm:num_requests_waiting{model_name=\"m\"} 2\nvllm:kv_cache_usage_perc{model_name=\"m\"} 0.42\nvllm:generation_tokens_total{model_name=\"m\"} 1000\nvllm:prefix_cache_hits_total{model_name=\"m\"} 30\nvllm:prefix_cache_queries_total{model_name=\"m\"} 100\n";
-    let body1 = body0.replace("generation_tokens_total{model_name=\"m\"} 1000", "generation_tokens_total{model_name=\"m\"} 1500");
-    let mut mem = AdapterMemory::default();
-    let r0 = parse_vllm_metrics(body0, &mut mem, t0).unwrap();
-    assert_eq!((r0.load.running, r0.load.queued, r0.load.kv_usage), (Some(5), Some(2), Some(0.42)));
-    assert_eq!(r0.load.gen_tps, None);
-    assert_eq!(r0.load.cached_token_ratio, Some(0.3));
-    assert_eq!(r0.load.prefill_backlog_tokens, None);
-    let r1 = parse_vllm_metrics(&body1, &mut mem, t0 + std::time::Duration::from_secs(1)).unwrap();
-    assert_eq!(r1.load.gen_tps, Some(500.0));
-}
-
-#[test]
-fn vllm_without_running_gauge_is_none() {
-    assert!(parse_vllm_metrics("foo 1\n", &mut AdapterMemory::default(), std::time::Instant::now()).is_none());
-}
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReplicaLoad { pub load: Load, pub limits: Limits, pub engine_version: Option<String>, pub sampled_at_ms: u64 }
+/// Pure normalization of a `/v1/loads?include=core` body. None if it has no `loads` array or no rank with a timestamp.
+pub fn parse_sglang_loads(body: &serde_json::Value) -> Option<ReplicaLoad>;
+/// GET {base}/v1/loads?include=core with a timeout, then parse.
+pub async fn read_replica(client: &reqwest::Client, base_url: &str, timeout: std::time::Duration) -> Option<ReplicaLoad>;
 ```
 
-Add one `wiremock` test for `detect` (a `/v1/loads` route → Sglang; only `/metrics` with `vllm:` → Vllm; neither → None), and one for `SglangAdapter::read` against a mocked `/v1/loads`.
-
-- [ ] **Step 2: Run** `cargo test --lib replica_state::engine` → FAIL.
-- [ ] **Step 3: Implement** the parsers and adapters as specified. Round f64 fields with no special handling; clamp `kv_usage` and `cached_token_ratio` to 0.0..=1.0.
-- [ ] **Step 4: Run** `cargo test --lib replica_state::engine` → PASS.
-- [ ] **Step 5: Commit** `feat(replica-state): SGLang and vLLM engine adapters to a neutral load view`
-
----
-
-### Task 4: Per-boot report key and attestation binding
-
-**Files:**
-- Create: `src/replica_state/report_key.rs`
-
-**Interfaces:**
-- Produces:
-```rust
-pub const REPORT_KEY_EVENT: &str = "nearai-replica-report-key-v1";
-pub struct ReportKey { pub signing: ed25519_dalek::SigningKey, pub key_id: String, pub boot_id: String }
-impl ReportKey {
-    pub fn generate() -> Self;                         // random key, key_id = hex(sha256(pub))[..16], boot_id = uuid v4
-    pub fn public_hex(&self) -> String;
-    pub fn event_payload(&self) -> Vec<u8>;           // UTF-8 JSON {"key_id","public_key_hex","boot_id"}
-}
-/// Record the public key in the dstack event log (RTMR3). Returns Ok(false) when skipped (dev or non-TEE).
-pub async fn bind_to_attestation(key: &ReportKey, dev_mode: bool, non_tee: bool) -> anyhow::Result<bool>;
-```
+Mapping, from SGLang `LoadSnapshot.to_dict()`. Every core key is present in the JSON; a missing key is treated as unknown (`null`):
+- **Summed across `loads[]` (DP ranks):** `running` = Σ`num_running_reqs`, `queued` = Σ`num_waiting_reqs`, `prefill_backlog_tokens` = Σ`num_waiting_uncached_tokens`, `gen_tps` = Σ`gen_throughput`, `limits.max_running` = Σ`max_running_requests` (null if the sum is 0).
+- **Computed ratio:** `kv_usage` = Σ`num_used_tokens` / Σ`max_total_num_tokens`. Null if the denominator is 0 or either field is missing. Clamped to 0..=1.
+- **Cached tokens:** `cached_token_ratio` = `cache_hit_rate` with exactly one rank; null with more than one rank.
+- **Sample time:** `sampled_at_ms` = min over ranks of `timestamp` (float seconds) × 1000, truncated. This is the scheduler's own clock.
+- **Version:** `engine_version` = top-level `version` (string), if present.
+- If any rank lacks a field used in a sum, that output field is `null`.
 
 - [ ] **Step 1: Write failing tests:**
 
 ```rust
 #[test]
-fn generated_keys_differ_per_boot_and_ids_are_derived() {
-    let a = ReportKey::generate(); let b = ReportKey::generate();
-    assert_ne!(a.public_hex(), b.public_hex());
-    assert_ne!(a.boot_id, b.boot_id);
-    assert_eq!(a.key_id.len(), 16);
-    let expect = &hex::encode(sha2::Sha256::digest(a.signing.verifying_key().to_bytes()))[..16];
-    assert_eq!(a.key_id, expect);
+fn single_rank_maps_fields() {
+    let v = serde_json::json!({"version":"0.5.9","loads":[{"timestamp":1790000000.5,"num_running_reqs":14,"num_waiting_reqs":2,
+        "num_waiting_uncached_tokens":51200,"num_used_tokens":630,"max_total_num_tokens":1000,"gen_throughput":910.0,
+        "cache_hit_rate":0.71,"max_running_requests":32}]});
+    let r = parse_sglang_loads(&v).unwrap();
+    assert_eq!((r.load.running, r.load.queued, r.load.prefill_backlog_tokens), (Some(14), Some(2), Some(51200)));
+    assert_eq!(r.load.kv_usage, Some(0.63));
+    assert_eq!(r.load.gen_tps, Some(910.0));
+    assert_eq!(r.load.cached_token_ratio, Some(0.71));
+    assert_eq!(r.limits.max_running, Some(32));
+    assert_eq!(r.sampled_at_ms, 1_790_000_000_500);
+    assert_eq!(r.engine_version.as_deref(), Some("0.5.9"));
 }
 
 #[test]
-fn event_payload_carries_ids_and_public_key_only() {
+fn two_ranks_sum_counts_and_compute_ratios() {
+    let v = serde_json::json!({"loads":[
+        {"timestamp":1790000001.0,"num_running_reqs":3,"num_waiting_reqs":1,"num_waiting_uncached_tokens":100,"num_used_tokens":100,"max_total_num_tokens":1000,"gen_throughput":10.0,"cache_hit_rate":0.9,"max_running_requests":16},
+        {"timestamp":1790000000.0,"num_running_reqs":5,"num_waiting_reqs":0,"num_waiting_uncached_tokens":50,"num_used_tokens":300,"max_total_num_tokens":1000,"gen_throughput":20.0,"cache_hit_rate":0.1,"max_running_requests":16}]});
+    let r = parse_sglang_loads(&v).unwrap();
+    assert_eq!((r.load.running, r.load.queued, r.load.prefill_backlog_tokens), (Some(8), Some(1), Some(150)));
+    assert_eq!(r.load.kv_usage, Some(0.2));
+    assert_eq!(r.load.gen_tps, Some(30.0));
+    assert_eq!(r.load.cached_token_ratio, None);
+    assert_eq!(r.limits.max_running, Some(32));
+    assert_eq!(r.sampled_at_ms, 1_790_000_000_000); // oldest rank
+}
+
+#[test]
+fn missing_field_is_null_not_zero() {
+    let v = serde_json::json!({"loads":[{"timestamp":1790000000.0,"num_running_reqs":4}]});
+    let r = parse_sglang_loads(&v).unwrap();
+    assert_eq!(r.load.running, Some(4));
+    assert_eq!(r.load.queued, None);
+    assert_eq!(r.load.kv_usage, None);
+}
+
+#[test]
+fn malformed_is_none() {
+    assert!(parse_sglang_loads(&serde_json::json!({"nope":1})).is_none());
+    assert!(parse_sglang_loads(&serde_json::json!({"loads":[]})).is_none());
+    assert!(parse_sglang_loads(&serde_json::json!({"loads":[{"num_running_reqs":1}]})).is_none()); // no timestamp
+}
+
+#[tokio::test]
+async fn read_replica_uses_timeout_and_parses() {
+    // wiremock GET /v1/loads?include=core -> single-rank body => Some
+    // wiremock with 2 s delay, timeout 200 ms => None within ~300 ms
+    // 500 status => None
+}
+```
+
+- [ ] **Step 2: Run** `cargo test --lib replica_state::sglang` → FAIL.
+- [ ] **Step 3: Implement** with small helpers: `sum_u64(ranks, key) -> Option<u64>` (None if any rank lacks the key or it isn't a non-negative integer), `sum_f64`, and `ts_ms`. `read_replica` does `client.get(format!("{}/v1/loads?include=core", base_url.trim_end_matches('/'))).timeout(timeout).send()`, requires a success status, then `json::<Value>()`. Any error → `None`, logged at `debug` with the replica index only (never the body). Register `pub mod sglang;`.
+- [ ] **Step 4: Run** → PASS.
+- [ ] **Step 5: Commit** `feat(replica-state): SGLang /v1/loads adapter to a neutral load view`
+
+---
+
+### Task 4: Report key, attestation binding and the Redis sink
+
+**Files:**
+- Create: `src/replica_state/report_key.rs`, `src/replica_state/redis_sink.rs`
+- Modify: `Cargo.toml` (`redis = { version = "1", default-features = false, features = ["tokio-comp", "tokio-rustls-comp", "connection-manager"] }`; add `rustls` as a direct dependency with the version the lock already resolves, default features off, feature `ring`)
+
+**Interfaces:**
+- Produces:
+```rust
+// report_key.rs
+pub const REPORT_KEY_EVENT: &str = "nearai-replica-report-key-v1";
+pub struct ReportKey { signing: ed25519_dalek::SigningKey, pub key_id: String, pub boot_id: String }
+impl ReportKey {
+    pub fn generate() -> Self;                              // random key; key_id = hex(sha256(pub))[..16]; boot_id = uuid v4
+    pub fn signing_key(&self) -> &ed25519_dalek::SigningKey;
+    pub fn public_hex(&self) -> String;
+    pub fn event_payload(&self) -> Vec<u8>;                 // JSON {"key_id","public_key_hex","boot_id"}
+}
+impl std::fmt::Debug for ReportKey { /* key_id and boot_id only */ }
+/// Ok(true) if recorded in the dstack event log; Ok(false) if skipped (dev mode or non-TEE).
+pub async fn bind_to_attestation(key: &ReportKey, skip: bool) -> anyhow::Result<bool>;
+
+// redis_sink.rs
+pub const KEY_TTL_SECS: u64 = 5;
+pub const STREAM_MAXLEN: usize = 20_000;                    // ~80 min at 2 replicas x 2 Hz; a buffer, not the recorder
+pub fn state_key(host_id: &str, replica_id: &str) -> String;    // "replica:{host_id}:{replica_id}"
+pub fn stream_key(host_id: &str) -> String;                    // "replica:{host_id}:frames"
+pub struct RedisSink { conn: redis::aio::ConnectionManager, stream: String }
+impl RedisSink {
+    pub async fn connect(url: &str, host_id: &str) -> anyhow::Result<Self>;
+    /// One pipeline: SET state_key json EX 5 for each frame, then XADD stream MAXLEN ~ 20000 * env json.
+    pub async fn publish(&mut self, frames: &[(String /*replica_id*/, super::report::Envelope)]) -> anyhow::Result<()>;
+}
+```
+
+- [ ] **Step 1: Write failing tests:**
+
+```rust
+// report_key.rs
+#[test]
+fn keys_and_ids_differ_per_boot_and_derive_correctly() {
+    let a = ReportKey::generate(); let b = ReportKey::generate();
+    assert_ne!(a.public_hex(), b.public_hex()); assert_ne!(a.boot_id, b.boot_id);
+    use sha2::Digest;
+    assert_eq!(a.key_id, hex::encode(sha2::Sha256::digest(a.signing_key().verifying_key().to_bytes()))[..16].to_string());
+}
+#[test]
+fn event_payload_and_debug_expose_no_secret() {
     let k = ReportKey::generate();
     let v: serde_json::Value = serde_json::from_slice(&k.event_payload()).unwrap();
-    assert_eq!(v["key_id"], k.key_id);
-    assert_eq!(v["public_key_hex"], k.public_hex());
-    assert_eq!(v["boot_id"], k.boot_id);
     assert_eq!(v.as_object().unwrap().len(), 3);
+    assert_eq!(v["public_key_hex"], k.public_hex());
+    assert!(!format!("{k:?}").contains(&hex::encode(k.signing_key().to_bytes())));
 }
-
 #[tokio::test]
-async fn binding_is_skipped_in_dev_mode() {
-    assert!(!bind_to_attestation(&ReportKey::generate(), true, false).await.unwrap());
-}
-```
+async fn binding_is_skipped_when_asked() { assert!(!bind_to_attestation(&ReportKey::generate(), true).await.unwrap()); }
 
-- [ ] **Step 2: Run** `cargo test --lib replica_state::report_key` → FAIL.
-- [ ] **Step 3: Implement.** Use `rand` (already a dependency) for 32 random bytes, `uuid::Uuid::new_v4()`, `sha2`. In `bind_to_attestation`: if `dev_mode || non_tee`, log `info!(key_id, "Replica report key not bound: not in a TEE")` and return `Ok(false)`. Otherwise call `dstack_sdk::dstack_client::DstackClient::new(None).emit_event(REPORT_KEY_EVENT.into(), key.event_payload()).await?` and return `Ok(true)`. Log only `key_id` and `boot_id`; never the private key.
-- [ ] **Step 4: Run** → PASS.
-- [ ] **Step 5: Commit** `feat(replica-state): per-boot report key bound via dstack event log`
-
----
-
-### Task 5: State sinks (Redis, memory)
-
-**Files:**
-- Create: `src/replica_state/sink.rs`
-- Modify: `Cargo.toml` (add `redis = { version = "0.32", default-features = false, features = ["tokio-comp", "tokio-rustls-comp", "connection-manager", "streams"] }`; use the latest 0.x that resolves with the existing tokio/rustls versions)
-
-**Interfaces:**
-- Consumes: `report::Envelope`.
-- Produces:
-```rust
-#[async_trait::async_trait]   // or boxed futures, matching Task 3's choice
-pub trait StateSink: Send + Sync {
-    async fn publish(&self, frames: &[Envelope]) -> anyhow::Result<()>;
-}
-pub struct RedisSink { /* ConnectionManager, key_ttl_secs, stream, stream_maxlen */ }
-impl RedisSink { pub async fn connect(url: &str, key_ttl_secs: u64, stream: String, stream_maxlen: usize) -> anyhow::Result<Self>; }
-pub fn replica_key(host_id: &str, replica_id: &str) -> String;   // "replica:{host_id}:{replica_id}"
-#[derive(Default)] pub struct MemorySink { pub published: std::sync::Mutex<Vec<Envelope>> }
-```
-
-Redis layout per publish (one pipeline, one round trip):
-- `SET replica:{host_id}:{replica_id} <envelope json> EX key_ttl_secs` for each frame.
-- `XADD {stream} MAXLEN ~ {stream_maxlen} * env <envelope json>` for each frame.
-- `PUBLISH replica-frames <envelope json>` is **not** included in v1: readers poll keys, and the design says not to rely on pub/sub.
-
-- [ ] **Step 1: Write failing tests:**
-
-```rust
+// redis_sink.rs
 #[test]
-fn key_layout() { assert_eq!(replica_key("glm53-gpu03", "r1"), "replica:glm53-gpu03:r1"); }
-
-#[tokio::test]
-async fn memory_sink_records_frames_in_order() { /* publish 2 envelopes, assert published == them */ }
-
-/// Real Redis: runs only when REPLICA_STATE_TEST_REDIS_URL is set (CI/dev), otherwise returns early.
-#[tokio::test]
-async fn redis_sink_sets_ttl_key_and_appends_stream() {
-    let Ok(url) = std::env::var("REPLICA_STATE_TEST_REDIS_URL") else { return };
-    let sink = RedisSink::connect(&url, 5, "replica-frames-test".into(), 1000).await.unwrap();
-    // publish one envelope; then with a plain client: GET key == json, TTL in 1..=5, XLEN >= 1
+fn key_layout_is_per_host() {
+    assert_eq!(state_key("glm53-gpu03", "r1"), "replica:glm53-gpu03:r1");
+    assert_eq!(stream_key("glm53-gpu03"), "replica:glm53-gpu03:frames");
 }
-
 #[tokio::test]
-async fn redis_connect_to_unreachable_host_errors_quickly() {
-    let started = std::time::Instant::now();
-    assert!(RedisSink::connect("redis://127.0.0.1:1", 5, "s".into(), 10).await.is_err());
-    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+async fn unreachable_redis_fails_fast() {
+    let t = std::time::Instant::now();
+    assert!(RedisSink::connect("redis://127.0.0.1:1", "h").await.is_err());
+    assert!(t.elapsed() < std::time::Duration::from_secs(5));
+}
+#[tokio::test]
+async fn tls_url_does_not_panic_with_two_rustls_providers() {
+    // Must return Err (nothing listening), not panic inside rustls ClientConfig::builder().
+    assert!(RedisSink::connect("rediss://127.0.0.1:1", "h").await.is_err());
+}
+/// Real Redis, only when REPLICA_STATE_TEST_REDIS_URL is set.
+#[tokio::test]
+async fn publish_sets_ttl_keys_and_appends_stream() {
+    let Ok(url) = std::env::var("REPLICA_STATE_TEST_REDIS_URL") else { return };
+    // connect with host "test-host"; publish 2 frames; with a plain redis client assert:
+    // GET replica:test-host:r1 == envelope json; TTL in 1..=5; XLEN replica:test-host:frames >= 2
 }
 ```
 
-- [ ] **Step 2: Run** `cargo test --lib replica_state::sink` → FAIL.
-- [ ] **Step 3: Implement.** `RedisSink::connect` builds a `redis::Client` and a `ConnectionManager` with a 2 s connection timeout and 1 s response timeout (`ConnectionManagerConfig`). `publish` builds one `redis::pipe()` with the commands above, and on error returns it (the caller counts it). Never log envelope JSON above `debug`.
-- [ ] **Step 4: Run** tests, `cargo deny check licenses bans`, `cargo build --release` → PASS.
-- [ ] **Step 5: Commit** `feat(replica-state): Redis sink (TTL key + capped stream) and memory sink`
+- [ ] **Step 2: Run** `cargo test --lib replica_state::report_key replica_state::redis_sink` → FAIL.
+- [ ] **Step 3: Implement.**
+  - **`bind_to_attestation`:** if `skip`, log `info!(key_id=%key.key_id, "Replica report key not bound: not in a TEE")` and return `Ok(false)`. Otherwise `dstack_sdk::dstack_client::DstackClient::new(None).emit_event(REPORT_KEY_EVENT.to_string(), key.event_payload()).await?` and return `Ok(true)`.
+  - **`RedisSink::connect`:**
+    - First `let _ = rustls::crypto::ring::default_provider().install_default();`. It's idempotent: an `Err` means already installed.
+    - Then `redis::Client::open(url)` and `ConnectionManager::new_with_config(client, ConnectionManagerConfig::new().set_connection_timeout(Some(Duration::from_secs(2))).set_response_timeout(Some(Duration::from_secs(1))).set_number_of_retries(1))`.
+    - Map errors to `anyhow!("redis connect failed: {kind}")` using `err.kind()`, never `err.to_string()`, which can echo the URL.
+  - **`publish`:** `redis::pipe()`, with `.cmd("SET").arg(state_key).arg(&json).arg("EX").arg(KEY_TTL_SECS).ignore()` for each frame, then `.cmd("XADD").arg(&self.stream).arg("MAXLEN").arg("~").arg(STREAM_MAXLEN).arg("*").arg("env").arg(&json).ignore()`. Finish with `.query_async::<()>(&mut self.conn)`.
+  - Register both modules.
+- [ ] **Step 4: Run** tests, `cargo deny check licenses bans`, `cargo build --release` → PASS. Only warnings allowed are multiple versions.
+- [ ] **Step 5: Commit** `feat(replica-state): per-boot report key bound via dstack event log; Redis sink`
 
 ---
 
-### Task 6: Publisher loop and wiring
+### Task 5: Publisher and wiring
 
 **Files:**
 - Create: `src/replica_state/publisher.rs`
-- Modify: `src/replica_state/mod.rs` (`spawn_replica_state_publisher`), `src/main.rs` (spawn after `backend_pool` is built, ~line 200)
+- Modify: `src/replica_state/mod.rs` (`spawn_replica_state_publisher`), `src/main.rs` (one `match` block after `backend_pool` is created)
 
 **Interfaces:**
-- Consumes: everything above; `backend_pool::BackendPool::backends()` (`Arc<Backend>` with `base_url` and `active_conns`).
+- Consumes: all of the above; `BackendPool::backends()` (index `i` = `VLLM_BACKEND_URLS[i]`; base backends first).
 - Produces:
 ```rust
-pub struct ReplicaStatePublisher {
-    host_id: String, model: String, pool: Option<String>, tier: Option<String>,
-    replicas: Vec<(String /*replica_id*/, String /*base_url*/)>,
-    adapters: Vec<Option<Arc<dyn EngineAdapter>>>,  // None until detected (Auto)
-    memory: Vec<AdapterMemory>, failures: Vec<u32>, ever_ok: Vec<bool>,
-    key: ReportKey, seq: u64, client: reqwest::Client, interval: Duration,
+pub const UNHEALTHY_AFTER_FAILURES: u32 = 3;
+struct ReplicaSlot { id: String, base_url: String, last: Option<ReplicaLoad>, failures: u32, lifecycle: Lifecycle }
+pub struct Publisher { host_id: String, model: String, key: ReportKey, slots: Vec<ReplicaSlot>, seq: u64, client: reqwest::Client, read_timeout: Duration }
+impl Publisher {
+    pub fn new(host_id: String, model: String, key: ReportKey, replicas: Vec<(String, String)>, client: reqwest::Client, interval: Duration) -> Self; // read_timeout = interval * 4/5
+    /// Read every replica concurrently, then build one frame per replica sharing one seq.
+    pub async fn tick(&mut self, inflight: impl Fn(usize) -> u32, now_ms: u64) -> Vec<(String, Envelope)>;
 }
-impl ReplicaStatePublisher {
-    pub fn new(cfg: &ReplicaStateConfig, model: &str, backend_urls: &[String], key: ReportKey, client: reqwest::Client, forced: Option<Engine>) -> Self;
-    /// One tick: read every replica concurrently (timeout = interval * 0.8), build and sign one frame per replica.
-    pub async fn tick(&mut self, inflight: &dyn Fn(usize) -> u32, now_ms: u64) -> Vec<Envelope>;
-}
-pub fn spawn_replica_state_publisher(cfg: ReplicaStateConfig, model: String, pool: Arc<BackendPool>, client: reqwest::Client, dev_mode: bool, non_tee: bool);
+pub fn spawn_replica_state_publisher(cfg: ReplicaStateConfig, model: String, pool: Arc<BackendPool>, client: reqwest::Client, skip_binding: bool);
 ```
-Lifecycle rules for v1: no successful read yet → `warming`; a successful read → `ready` and reset failures; 3 or more consecutive failures after any success → `unhealthy`; otherwise keep the last state. On a failed read, `load = Load::default()` (all null) and `limits` keep their last known values. `engine_sampled_at_ms` = time the read completed; `reported_at_ms` = time the frame was built. `seq` increments once per frame, starting at 1.
+Per-replica rules in `tick`:
+- **Successful read:** set `last = Some(read)`, `failures = 0`, `lifecycle = Ready`. The frame gets `load`, `limits` and `engine_version` from the read, and `engine_sampled_at_ms = read.sampled_at_ms`.
+- **Failed read:** `failures += 1`. The frame gets `load = Load::default()` (all null), `limits` and `engine_version` from `last` if any, and `engine_sampled_at_ms = last.sampled_at_ms` (or 0). Lifecycle: if never succeeded, `Warming`; else if `failures >= 3`, `Unhealthy`; else unchanged.
+- **Every frame:** `schema = 1`, `seq = self.seq` (incremented once per tick, before building), `reported_at_ms = now_ms`, `boot_id` and `report_key_id` from the key, `proxy_inflight = inflight(i)`.
 
-- [ ] **Step 1: Write failing tests** (tokio + wiremock + `MemorySink`):
+- [ ] **Step 1: Write failing tests** (tokio + wiremock). Verify with `report::open` and `key.signing_key().verifying_key()`:
 
 ```rust
 #[tokio::test]
-async fn tick_emits_one_signed_frame_per_replica_with_monotonic_seq() {
-    // two wiremock servers serving /v1/loads JSON; forced engine = Sglang
-    // tick twice; assert 2 frames per tick, replica ids r1/r2, seq 1..=4, all verify with key.verifying_key(),
-    // lifecycle Ready, same boot_id, report_key_id == key.key_id
+async fn one_signed_frame_per_replica_sharing_one_seq_per_tick() {
+    // two mocks serving single-rank /v1/loads; tick twice
+    // tick 1: 2 frames, replica ids r1,r2, both seq == 1, both open() == Some, lifecycle Ready, same boot_id
+    // tick 2: both seq == 2
 }
-
 #[tokio::test]
-async fn unreachable_engine_goes_warming_then_unhealthy_with_null_load() {
-    // replica r1 base_url = "http://127.0.0.1:1"; tick 4 times
-    // frames for r1: warming (never succeeded) and load all None
-    // then point at a working mock, tick => Ready; then break it, tick x3 => Unhealthy
+async fn engine_timestamp_passes_through_even_when_stale() {
+    // mock returns timestamp = 1000.0 (ancient); frame.engine_sampled_at_ms == 1_000_000 while reported_at_ms == now_ms
 }
-
+#[tokio::test]
+async fn failed_read_keeps_last_sample_time_and_nulls_load() {
+    // tick OK (sampled 1790000000.0) -> switch mock to 500 -> tick
+    // frame: load all None, engine_sampled_at_ms == 1_790_000_000_000, limits kept, lifecycle Ready (1 failure)
+    // two more failing ticks -> lifecycle Unhealthy; then success -> Ready
+}
+#[tokio::test]
+async fn never_reachable_replica_is_warming_with_zero_sample_time() {
+    // base_url http://127.0.0.1:1 -> lifecycle Warming after 5 ticks, engine_sampled_at_ms == 0
+}
 #[tokio::test]
 async fn tick_is_bounded_by_interval() {
-    // mock that delays 5 s; interval 200 ms; assert tick() returns in < 400 ms with that replica's load null
-}
-
-#[tokio::test]
-async fn frames_contain_no_request_content() {
-    // serialize a tick's envelopes; assert keys are exactly the ReplicaReport field set (no extra fields)
+    // mock delays 5 s; interval 200 ms; tick returns in < 400 ms; that replica's load is null
 }
 ```
 
 - [ ] **Step 2: Run** `cargo test --lib replica_state::publisher` → FAIL.
-- [ ] **Step 3: Implement** `tick` with `futures_util::future::join_all` over replicas, each read wrapped in `tokio::time::timeout(interval.mul_f32(0.8), …)`. Detect the engine lazily for `Auto`. `spawn_replica_state_publisher`:
-  1. `let key = ReportKey::generate()`, then `bind_to_attestation(&key, dev_mode, non_tee).await` (log and continue on error: reports are still produced, but readers won't find an attested key and will reject them, so log at `warn!`).
-  2. `RedisSink::connect` with retry every 5 s until it succeeds; don't block startup (spawned task).
-  3. Loop on `tokio::time::interval(cfg.interval)` with `MissedTickBehavior::Skip`: `frames = publisher.tick(...)`, then `sink.publish(&frames)`. Emit `replica_state_frames_total` (counter), `replica_state_publish_failures_total` (counter) and `replica_state_tick_seconds` (histogram) via the `metrics` crate used in `engine_load.rs`.
+- [ ] **Step 3: Implement.**
+  - **`tick`:** `futures_util::future::join_all` over the slots, calling `sglang::read_replica(&client, &slot.base_url, read_timeout)`.
+  - **`spawn_replica_state_publisher`** spawns one task that:
+    1. Builds `ReportKey::generate()` and runs `bind_to_attestation(&key, skip_binding)`. On `Err`, it logs `warn!` and continues: readers will reject frames whose key isn't attested, which is visible.
+    2. Loops on `RedisSink::connect(&cfg.redis_url, &cfg.host_id)` with a 5 s sleep between attempts, logging `warn!(redis = %cfg.redis_host_for_logs(), "…")`.
+    3. Then runs `tokio::time::interval(cfg.interval)` with `MissedTickBehavior::Skip`:
+       - `frames = publisher.tick(|i| pool.backends()[i].active_conns.load(Relaxed), now_ms())`, where `now_ms()` is `SystemTime::now()` since `UNIX_EPOCH`, in ms.
+       - `sink.publish(&frames)`; on error, increment `replica_state_publish_failures_total` and `warn!` with the error kind only.
+       - Record `replica_state_frames_total` and a `replica_state_tick_seconds` histogram via the `metrics` crate, as `engine_load.rs` does.
+    4. The Redis connection manager reconnects by itself after the first connect.
+  - **`main.rs`**, right after `backend_pool` is created, using the backend client and the existing non-TEE flag (search `NON_TEE_DEPLOYMENT` for the field name):
 
-  `inflight(i)` = `pool.backends()[i].active_conns.load(Relaxed)`.
-
-  In `main.rs`, after `backend_pool` is created:
 ```rust
-if let Some(rs) = replica_state::ReplicaStateConfig::from_env(&config.backend_urls)? {
-    info!(host_id = %rs.host_id, replicas = rs.replica_ids.len(), interval_ms = rs.interval.as_millis() as u64, "Publishing replica state to Redis");
-    replica_state::spawn_replica_state_publisher(rs, config.model_name.clone(), backend_pool.clone(), http_client.clone(), config.dev_mode, config.non_tee_deployment);
+match replica_state::config::ReplicaStateConfig::from_env(config.backend_urls.len()) {
+    Ok(Some(rs)) => {
+        info!(host_id = %rs.host_id, replicas = rs.replica_ids.len(), interval_ms = rs.interval.as_millis() as u64, redis = %rs.redis_host_for_logs(), "Publishing replica state to Redis");
+        replica_state::spawn_replica_state_publisher(rs, config.model_name.clone(), backend_pool.clone(), backend_client.clone(), config.dev_mode || config.non_tee_deployment);
+    }
+    Ok(None) => {}
+    Err(e) => error!(error = %e, "Replica state publishing disabled: invalid REPLICA_STATE_* configuration"),
 }
 ```
-  Use the actual field name for non-TEE in `Config` (search for `NON_TEE_DEPLOYMENT`).
-- [ ] **Step 4: Run** `cargo test` (full suite) → PASS; `cargo fmt --check`.
-- [ ] **Step 5: Commit** `feat(replica-state): publisher loop sampling replicas and writing signed frames`
+  If the backend client is created after `backend_pool` in `main.rs`, place this block right after the backend client instead.
+- [ ] **Step 4: Run** `cargo test`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` → PASS.
+- [ ] **Step 5: Commit** `feat(replica-state): publisher tick and opt-in wiring`
 
 ---
 
-### Task 7: Operator documentation
+### Task 6: Operator documentation
 
 **Files:**
 - Create: `docs/replica-state.md`
-- Modify: `README.md` (env var table), `CLAUDE.md` (module map: one line for `replica_state/`)
+- Modify: `README.md` (env vars), `CLAUDE.md` (one line in the module map)
 
-- [ ] **Step 1:** Write `docs/replica-state.md`:
-  - purpose (stage 1 of the placement plan, a link to the design doc);
-  - env vars with defaults (Task 1);
-  - frame schema (Task 2 JSON example) and its signing rule;
-  - the SGLang/vLLM field mapping (Task 3);
-  - Redis layout (Task 5);
-  - lifecycle rules (Task 6);
-  - how readers verify: find the `nearai-replica-report-key-v1` entry in the attested event log, match `key_id`, verify the signature, check `seq`/`boot_id` monotonic and `engine_sampled_at_ms` freshness;
-  - privacy: IDs and numbers only.
-- [ ] **Step 2:** Add the env vars to README, and the module line to CLAUDE.md.
+- [ ] **Step 1:** Write `docs/replica-state.md` with the following sections:
+  - **Purpose:** stage 1 of the placement plan, with a link to the design doc.
+  - **Env vars:** `REPLICA_STATE_REDIS_URL`, `REPLICA_STATE_HOST_ID`, `REPLICA_STATE_REPLICA_IDS`, `REPLICA_STATE_INTERVAL_MS`.
+  - **Frame schema:** the Task 2 example and the signing rule.
+  - **SGLang mapping** (Task 3).
+  - **Redis layout**, per-host keys and stream, and the ACL pattern `~replica:{host_id}:*`.
+  - **Lifecycle rules** (Task 5).
+  - **How readers verify:**
+    1. Find the `nearai-replica-report-key-v1` event in the attested event log and match `key_id`.
+    2. Verify the signature over the frame string, then parse it.
+    3. Require `seq` and `boot_id` to be monotonic, and `engine_sampled_at_ms` to be fresh by the reader's clock.
+  - **Caveats:**
+    - The capped stream is a ~80-minute buffer. The week-long recorder in the stage 1 exit needs a separate drain to object storage, not in this change.
+    - `boot_id` is the proxy's boot, not the engine's.
+    - Each proxy restart appends another event to RTMR3.
+    - Nonce-less attestation reports are cached for up to `ATTESTATION_CACHE_TTL` (default 300 s), so the key event may be missing from cached reports for up to one TTL after boot.
+  - **Privacy:** IDs and numbers only.
+- [ ] **Step 2:** Update the README env table and the CLAUDE.md module map.
 - [ ] **Step 3: Commit** `docs(replica-state): operator guide and schema`
 
 ---
@@ -650,5 +570,32 @@ if let Some(rs) = replica_state::ReplicaStateConfig::from_env(&config.backend_ur
 ## Verification before hand-off
 
 - `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test && cargo deny check`
-- Manual smoke test (local, no CVM): run a local Redis, a mock SGLang (`python -m http.server` is not enough; use the wiremock-based test or a tiny script serving `/v1/loads`), and the proxy with `REPLICA_STATE_REDIS_URL=redis://127.0.0.1:6379 REPLICA_STATE_HOST_ID=local DEV=1`. Then check `redis-cli GET replica:local:r1`, `TTL`, and `XLEN replica-frames`.
-- A real-CVM check (stage 1 exit criteria) is a separate step, per `docs/testing-on-cvm.md`.
+- Local: run Redis locally, run the proxy against a mock SGLang with `REPLICA_STATE_*` set and `DEV=1`, then check `redis-cli GET replica:local:r1`, `TTL`, and `XLEN replica:local:frames`.
+- On a real CVM, before merge (per `docs/testing-on-cvm.md`):
+  - `emit_event` succeeds on the deployed dstack version, and the key event appears in `/v1/attestation/report`'s `event_log`.
+  - cloud-api's attestation verifier and a customer verifier still pass with the extra event.
+  - Frames arrive with `engine_sampled_at_ms` close to wall-clock.
+
+## Review changes (principal review, 25 Sep 2026)
+
+- **Correctness fixes:**
+  - the scheduler timestamp is used as the sample time;
+  - a missing field is `null`, not 0;
+  - DP ranks: counts summed, ratios computed;
+  - a rustls provider is installed, fixing a panic on `rediss://`;
+  - redis is pinned to 1.x with explicit timeouts and 1 retry;
+  - the envelope carries the frame as the signed string;
+  - `seq` is per tick;
+  - a bad config never aborts startup;
+  - the backend client is used;
+  - the Redis URL is never logged.
+- **Cut for stage 1:**
+  - the vLLM adapter, engine detection and the `ENGINE` knob;
+  - `prefill_tps` and cumulative-counter state;
+  - `async-trait` and the sink/engine traits;
+  - `MemorySink`;
+  - the TTL, stream, maxlen, pool and tier knobs, plus `pool`/`tier` in the frame (the registry owns them).
+- **Changed:**
+  - replica IDs are required config (stable registry names);
+  - Redis keys and the stream are per host, so one ACL pattern covers them;
+  - the stream is documented as a buffer, not the recorder.

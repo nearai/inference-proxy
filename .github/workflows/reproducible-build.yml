@@ -40,25 +40,11 @@ name: Reproducible Build
 on:
   push:
     branches: [main]
-    # Every input that can affect oci.tar — keep in sync with the Dockerfile's
-    # COPY/bind sources (Cargo manifests, src/, benches/, gpu_evidence_worker.py,
-    # attestation-constraints.txt, pinned-packages-*.txt) plus the build script,
-    # the Makefile that wraps it, and .dockerignore (build context). A merge
-    # touching any of these must re-run the check, or a reproducibility
-    # regression introduced via e.g. a new dependency could slip past the gate.
-    paths:
-      - "Dockerfile"
-      - ".dockerignore"
-      - "build-image.sh"
-      - "Makefile"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "src/**"
-      - "benches/**"
-      - "gpu_evidence_worker.py"
-      - "attestation-constraints.txt"
-      - "pinned-packages-*.txt"
-      - ".github/workflows/reproducible-build.yml"
+    tags: ["v*"]
+    # No path filter, on purpose: build-image.sh bakes the commit hash into the
+    # image (/etc/.GIT_REV), so every push that build.yml publishes is a new
+    # digest and needs the verifier-parity check, not only pushes that touch
+    # the build inputs. Keep this trigger aligned with build.yml's.
   schedule:
     # Mondays 03:00 UTC, on main.
     - cron: "0 3 * * 1"
@@ -368,7 +354,7 @@ jobs:
     needs: [cross-machine, sequential, verifier-parity]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 75
     permissions:
       contents: read
       actions: read
@@ -383,8 +369,10 @@ jobs:
 
       # The digest build.yml attested, signed and pushed for this commit: from
       # the logs of its successful runs and, for main, from the immutable
-      # staging-<date>-<sha> tag on Docker Hub. Waits up to 20 minutes for
-      # running build.yml runs to finish.
+      # staging-<date>-<sha> tag on Docker Hub. Waits up to 50 minutes for
+      # running build.yml runs to finish (a build normally takes 4-7 minutes,
+      # but it can queue behind this workflow's own builds on the shared
+      # runners, and builds on a busy host have taken close to 30 minutes).
       - name: Find the digest build.yml published for this commit
         id: published
         env:
@@ -393,7 +381,7 @@ jobs:
         run: |
           set -euo pipefail
           trap 'echo "::error::Finding the published digest failed at line ${LINENO}: ${BASH_COMMAND}"' ERR
-          deadline=$(( $(date +%s) + 20 * 60 ))
+          deadline=$(( $(date +%s) + 50 * 60 ))
           while :; do
             runs=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/build.yml/runs?head_sha=${GITHUB_SHA}&per_page=100")
             total=$(jq '.workflow_runs | length' <<<"$runs")
@@ -402,7 +390,7 @@ jobs:
               break
             fi
             if [ "$(date +%s)" -ge "$deadline" ]; then
-              echo "::error::${pending} build.yml run(s) for ${GITHUB_SHA} did not finish within 20 minutes"
+              echo "::error::${pending} build.yml run(s) for ${GITHUB_SHA} did not finish within 50 minutes"
               exit 1
             fi
             echo "Waiting for ${pending} build.yml run(s) for ${GITHUB_SHA}..."
@@ -534,7 +522,17 @@ jobs:
 
           <${RUN_URL}|GitHub Actions run>"
 
-          curl -s -X POST https://slack.com/api/chat.postMessage \
+          # Slack reports method errors as JSON {"ok": false, "error": ...} with
+          # HTTP 200, so check the body, not only the HTTP status: a rejected
+          # alert (bot not in the channel, missing scope, bad token) must fail
+          # this job instead of looking delivered.
+          set -euo pipefail
+          RESP=$(curl -sS --fail-with-body -X POST https://slack.com/api/chat.postMessage \
             -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
             -H "Content-Type: application/json" \
-            -d "$(jq -n --arg channel "C09EQ848HHC" --arg text "$MSG" '{channel: $channel, text: $text, unfurl_links: false}')"
+            -d "$(jq -n --arg channel "C09EQ848HHC" --arg text "$MSG" '{channel: $channel, text: $text, unfurl_links: false}')")
+          if ! jq -e '.ok == true' <<<"$RESP" >/dev/null 2>&1; then
+            echo "::error::Slack rejected the alert: $(jq -r '.error // "unparseable response"' <<<"$RESP" 2>/dev/null | head -c 200)"
+            exit 1
+          fi
+          echo "Slack alert delivered"

@@ -94,6 +94,7 @@ pub async fn chat_completions(
         &state.backend_pool,
         state.config.long_context_above_tokens,
         state.config.backend_tier_strict,
+        state.config.context_tier_policy(),
         || crate::context_tier::chat_estimate(&request_json),
     );
     // Lane admission (gateway mode), first half: the overload and budget

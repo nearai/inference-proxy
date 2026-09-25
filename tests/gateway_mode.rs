@@ -49,6 +49,10 @@ struct GatewayOptions {
     backend_long_context_urls: Vec<String>,
     backend_long_context_probe_urls: Vec<String>,
     long_context_above_tokens: u64,
+    /// `VLLM_BACKEND_LONG_CONTEXT_SAFETY_FACTOR`; `None` = the default `1.2`.
+    long_context_safety_factor: Option<f64>,
+    /// `VLLM_BACKEND_LONG_CONTEXT_COUNT_OUTPUT_RESERVE`, default `false`.
+    long_context_count_output_reserve: bool,
     /// `VLLM_BACKEND_TIER_STRICT`: refuse a request whose tier has no
     /// healthy backend instead of falling back to the other one.
     backend_tier_strict: bool,
@@ -176,6 +180,8 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         backend_long_context_urls: options.backend_long_context_urls.clone(),
         backend_long_context_probe_urls: options.backend_long_context_probe_urls.clone(),
         long_context_above_tokens: options.long_context_above_tokens,
+        long_context_safety_factor: options.long_context_safety_factor.unwrap_or(1.2),
+        long_context_count_output_reserve: options.long_context_count_output_reserve,
         backend_tier_strict: options.backend_tier_strict,
         dstack_socket_path: "/nonexistent/dstack.sock".to_string(),
         gpu_evidence_delegate_url: None,

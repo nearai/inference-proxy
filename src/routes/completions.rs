@@ -100,6 +100,7 @@ pub async fn completions(
         &state.backend_pool,
         state.config.long_context_above_tokens,
         state.config.backend_tier_strict,
+        state.config.context_tier_policy(),
         || crate::context_tier::completion_estimate(&request_json),
     );
     let placed = place_completion(&state, ROUTE_COMPLETIONS, tier, None)?;

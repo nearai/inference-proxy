@@ -96,6 +96,8 @@ to the current in-CVM behavior.
 | `VLLM_BACKEND_LONG_CONTEXT_URLS` | the `-long-b<handle>` URLs | The hosts of the long-context tier, listed as their handle URLs under the model's `-long` model-proxy domain (see below). Appended to the pool after `VLLM_BACKEND_URLS`, so the base backends keep their indexes. Empty = one flat pool, as today. |
 | `VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS` | `http://<host-ip>:8000,…` | One engine-load probe per long-context backend, same order. Required when `VLLM_BACKEND_PROBE_URLS` is set, and empty when it is not; internally the two lists are concatenated in pool order. |
 | `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` | `100000` | Estimated input tokens above which a request is placed on that tier. `0`/unset switches the whole feature off, and nothing is even estimated. |
+| `VLLM_BACKEND_LONG_CONTEXT_SAFETY_FACTOR` | `1.2` (default) | Multiplies the byte-estimated text portion of the estimate below. Kept at cloud-api's own value by default: an over-estimate here only costs a prefill on the long tier instead of the base one. Must be a positive, finite number. |
+| `VLLM_BACKEND_LONG_CONTEXT_COUNT_OUTPUT_RESERVE` | `0` (default) | Whether `max_tokens` / `max_completion_tokens` counts toward the tier decision. Off by default — both tiers run the same engine, so the output window has no bearing on prefill cost. `1` reproduces cloud-api's own behaviour (the rollback). |
 | `VLLM_BACKEND_TIER_STRICT` | `1` | Isolate the tiers in both directions: a request whose tier has no healthy backend is refused (429 + `Retry-After`, or a 503 with `error_type: "tier_unavailable"` when admission is off) instead of placed on the other tier. Off by default (see below). Only meaningful with `VLLM_BACKEND_LONG_CONTEXT_URLS` and a nonzero `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS`; without either it is ignored (a startup warning says so). |
 | `NON_TEE_DEPLOYMENT` | `1` | No dstack socket outside a CVM: `/healthz` reports `"dstack":"skipped"`, no attestation refresh, and `/v1/attestation/report`, `/v1/signature/{id}`, `/internal/gpu_evidence` answer 404 so nothing unverifiable is advertised. |
 | `DEV` / `GPU_NO_HW_MODE` | `1` / `1` | Non-TEE: random signing keys, no hardware evidence. |
@@ -288,24 +290,40 @@ cloud-api routes to the tier from the model row's `long_context`
 providerConfig; the gateway bypasses cloud-api, so it makes the same decision
 itself and mirrors the estimate cloud-api routes with
 (`inference_provider_pool::context_routing::estimate_input` plus the `required`
-computation next to it):
+computation next to it), configurably diverging from it in two ways:
 
 ```text
 countable = (message text + serialized tool_calls + serialized tools) / 4
 uncounted = media parts × 1024 + messages × 4
-required  = ceil(countable × 1.2) + uncounted + max_tokens reserve
+required  = ceil(countable × safety_factor) + uncounted
+            + (max_tokens reserve, only if counted)
 ```
 
 `required` strictly above `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` means the
-long tier. The 1.2 safety factor covers the byte estimate only — media parts,
-template overhead, the reserved output window and `/v1/completions` token ids
-are already token counts. Tool definitions and tool-call arguments are counted
-because the lane's traffic is agentic, where they are most of the prompt.
-cloud-api additionally refines the decision near the boundary with an exact
-`POST /v1/tokenize`; the gateway deliberately does not — a tokenizer dependency
-and an extra upstream round trip are not worth it for a placement that is a
-preference rather than a correctness rule. Both tiers run the same engine with
-the same context length, so a request on the "wrong" tier still succeeds.
+long tier. `safety_factor` (`VLLM_BACKEND_LONG_CONTEXT_SAFETY_FACTOR`, default
+`1.2`) covers the byte estimate only — media parts, template overhead, the
+reserved output window and `/v1/completions` token ids are already token
+counts — and stays at cloud-api's own value by default deliberately: an
+over-estimate here only costs a prefill on the long tier instead of the base
+one, and both run the same engine with the same 1M context, so guessing high
+is cheap. Whether the reserved output window counts at all
+(`VLLM_BACKEND_LONG_CONTEXT_COUNT_OUTPUT_RESERVE`, default off) is where the
+gateway deliberately diverges from cloud-api: cloud-api counts it because it
+guards a real per-tier capacity limit there, but on this lane both tiers are
+the same engine, so the output window has no bearing on prefill cost, and
+counting it by default was placing small-prompt, large-`max_tokens` requests
+on the long tier for no reason — measured on 2026-09-25, 58% of gpu02's hourly
+gateway traffic (873 of 1,508 requests) had under 71k actual input tokens but
+landed on the long tier by `max_tokens` alone. Setting
+`VLLM_BACKEND_LONG_CONTEXT_COUNT_OUTPUT_RESERVE=1` reproduces the old
+behaviour exactly, since the safety factor's default was never changed.
+Tool definitions and tool-call arguments are counted because the lane's
+traffic is agentic, where they are most of the prompt. cloud-api additionally
+refines the decision near the boundary with an exact `POST /v1/tokenize`; the
+gateway deliberately does not — a tokenizer dependency and an extra upstream
+round trip are not worth it for a placement that is a preference rather than a
+correctness rule. Both tiers run the same engine with the same context length,
+so a request on the "wrong" tier still succeeds.
 
 Everything downstream of the decision is restricted to the request's tier:
 placement, the connection fail-over, and the fleet-wide "every backend is

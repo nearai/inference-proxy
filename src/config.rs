@@ -93,6 +93,23 @@ fn parse_discount_to_user(raw: &str) -> anyhow::Result<Option<f64>> {
     Ok((basis_points > 0.0).then_some(discount))
 }
 
+/// `VLLM_BACKEND_LONG_CONTEXT_SAFETY_FACTOR`: multiplies the byte-estimated
+/// text portion of the long-context tier estimate (`context_tier.rs`). Must
+/// be a positive, finite number — `0`, a negative value, `NaN` and `inf` all
+/// fail startup rather than silently switching the estimate off or
+/// unbounding it.
+fn parse_long_context_safety_factor(raw: &str) -> anyhow::Result<f64> {
+    const NAME: &str = "VLLM_BACKEND_LONG_CONTEXT_SAFETY_FACTOR";
+    let factor: f64 = raw
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{NAME} must be a positive finite number, got {raw:?}"))?;
+    if !factor.is_finite() || factor <= 0.0 {
+        anyhow::bail!("{NAME} must be a positive finite number, got {raw:?}");
+    }
+    Ok(factor)
+}
+
 fn is_gemma4_model_name(model_name: &str) -> bool {
     let name = model_name.to_ascii_lowercase();
     ["gemma-4", "gemma4"].iter().any(|needle| {
@@ -448,6 +465,21 @@ pub struct Config {
     /// long-context tier (`VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS`, 0 = off,
     /// the default). See `context_tier.rs` for the estimate.
     pub long_context_above_tokens: u64,
+    /// Multiplies the byte-estimated part of the long-context tier estimate
+    /// (`VLLM_BACKEND_LONG_CONTEXT_SAFETY_FACTOR`, default `1.2` — cloud-api's
+    /// own factor, kept deliberately: an over-estimate here only means a
+    /// request prefills on the long tier instead of the base one, both of
+    /// which run the same engine with the same context length). Must be a
+    /// positive, finite number. See `context_tier.rs`.
+    pub long_context_safety_factor: f64,
+    /// Whether the caller's reserved output window (`max_completion_tokens` /
+    /// `max_tokens`) counts toward the long-context tier decision
+    /// (`VLLM_BACKEND_LONG_CONTEXT_COUNT_OUTPUT_RESERVE`, bool, default
+    /// `false` — only the prompt decides the tier; both tiers run the same
+    /// engine, so the output window has no bearing on prefill cost). `1`
+    /// reproduces cloud-api's own behaviour, where it guards a real capacity
+    /// limit. See `context_tier.rs`.
+    pub long_context_count_output_reserve: bool,
     /// Isolate the context tiers in both directions: a request whose tier
     /// has no healthy backend is refused instead of placed on the other tier
     /// (`VLLM_BACKEND_TIER_STRICT`, bool, default `false`). Only meaningful
@@ -815,6 +847,13 @@ impl Config {
                 "VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS requires VLLM_BACKEND_LONG_CONTEXT_URLS"
             );
         }
+        let long_context_safety_factor: f64 =
+            match env::var("VLLM_BACKEND_LONG_CONTEXT_SAFETY_FACTOR") {
+                Ok(raw) if !raw.trim().is_empty() => parse_long_context_safety_factor(&raw)?,
+                _ => 1.2,
+            };
+        let long_context_count_output_reserve =
+            env_bool("VLLM_BACKEND_LONG_CONTEXT_COUNT_OUTPUT_RESERVE");
         if admission_tier_borrowing
             && (admission_max_inflight == 0
                 || backend_urls.is_empty()
@@ -978,6 +1017,8 @@ impl Config {
             backend_long_context_urls,
             backend_long_context_probe_urls,
             long_context_above_tokens,
+            long_context_safety_factor,
+            long_context_count_output_reserve,
             backend_tier_strict,
             images_url_override,
             images_edits_url_override,
@@ -1123,6 +1164,15 @@ impl Config {
             .chain(&self.backend_long_context_probe_urls)
             .cloned()
             .collect()
+    }
+
+    /// The estimate policy `context_tier::decide` applies: the safety factor
+    /// and whether the output reserve counts. See `context_tier.rs`.
+    pub fn context_tier_policy(&self) -> crate::context_tier::EstimatePolicy {
+        crate::context_tier::EstimatePolicy {
+            safety_factor: self.long_context_safety_factor,
+            count_output_reserve: self.long_context_count_output_reserve,
+        }
     }
 
     /// Lane admission settings, `None` unless `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` is set.
@@ -1277,6 +1327,8 @@ mod tests {
             "VLLM_BACKEND_LONG_CONTEXT_URLS",
             "VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS",
             "VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS",
+            "VLLM_BACKEND_LONG_CONTEXT_SAFETY_FACTOR",
+            "VLLM_BACKEND_LONG_CONTEXT_COUNT_OUTPUT_RESERVE",
             "VLLM_BACKEND_TIER_STRICT",
             "LISTEN_ADDR",
         ] {
@@ -1309,6 +1361,8 @@ mod tests {
             assert!(config.backend_long_context_urls.is_empty());
             assert!(config.pool_probe_urls().is_empty());
             assert_eq!(config.long_context_above_tokens, 0);
+            assert_eq!(config.long_context_safety_factor, 1.2);
+            assert!(!config.long_context_count_output_reserve);
             assert!(!config.backend_tier_strict);
             assert_eq!(config.backend_urls, vec!["http://localhost:8000"]);
         });
@@ -1597,6 +1651,51 @@ mod tests {
             assert!(err().contains("FUSION_ENABLED"), "{}", err());
             env::remove_var("FUSION_ENABLED");
             env::remove_var("FUSION_INTERNAL_BEARER_TOKEN");
+            gateway_env_cleanup();
+        });
+    }
+
+    #[test]
+    fn test_long_context_safety_factor_and_count_output_reserve_parse_and_validate() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            gateway_env_cleanup();
+            // Unset: today's defaults (1.2, reserve not counted).
+            let config = Config::from_env().unwrap();
+            assert_eq!(config.long_context_safety_factor, 1.2);
+            assert!(!config.long_context_count_output_reserve);
+
+            for (raw, expected) in [("1", 1.0), (" 1.5 ", 1.5), ("0.0001", 0.0001)] {
+                env::set_var("VLLM_BACKEND_LONG_CONTEXT_SAFETY_FACTOR", raw);
+                assert_eq!(
+                    Config::from_env().unwrap().long_context_safety_factor,
+                    expected,
+                    "{raw:?}"
+                );
+            }
+            for bad in ["0", "-1", "abc", "NaN", "inf", "-inf"] {
+                env::set_var("VLLM_BACKEND_LONG_CONTEXT_SAFETY_FACTOR", bad);
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("VLLM_BACKEND_LONG_CONTEXT_SAFETY_FACTOR"),
+                    "{bad}: {err}"
+                );
+            }
+            env::remove_var("VLLM_BACKEND_LONG_CONTEXT_SAFETY_FACTOR");
+
+            // The rollback: setting this alone (the factor's default is
+            // already cloud-api's 1.2) reproduces cloud-api's old behaviour.
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_COUNT_OUTPUT_RESERVE", "1");
+            assert!(
+                Config::from_env()
+                    .unwrap()
+                    .long_context_count_output_reserve
+            );
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_COUNT_OUTPUT_RESERVE", "0");
+            assert!(
+                !Config::from_env()
+                    .unwrap()
+                    .long_context_count_output_reserve
+            );
             gateway_env_cleanup();
         });
     }

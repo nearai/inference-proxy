@@ -73,6 +73,7 @@ This is a Rust rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-pro
 ## Deployment
 
 - Docker image: `nearaidev/vllm-proxy-rs` (published with digest-pinned refs in cvm-conf)
+- The image build is reproducible and externally verified: `ENABLE_NV_ATTESTATION_SDK=1 SOURCE_DATE_EPOCH=0 bash build-image.sh` on a fresh clone must produce the digest CI published, and `reproducible-build.yml` checks exactly that. Never add a required build env var or argument without coordinating with external verifiers first. See README "Reproducible build & verification" for the contract, the pinned inputs and how to bump them.
 - Deployed via compose files in [nearai/cvm-compose-files](https://github.com/nearai/cvm-compose-files)
 - Each proxy instance needs: `MODEL_NAME`, `TOKEN`, `VLLM_BASE_URL`, `TLS_CERT_PATH`
 - Optional: `CLOUD_API_URL` (enables usage reporting + `sk-` API key auth via cloud-api), `LOG_FORMAT=json` (structured JSON logs)

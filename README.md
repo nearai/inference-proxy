@@ -248,6 +248,148 @@ The Docker image (`./build-image.sh`) is a slim Ubuntu 22.04 runtime with no vLL
 cargo build --release
 ```
 
+The Docker image is built with `./build-image.sh` (or `make build`, which also
+loads it into the local Docker daemon as `vllm-proxy-rs:latest`); see
+[Reproducible build & verification](#reproducible-build--verification).
+
+## Reproducible build & verification
+
+The published image, `nearaidev/vllm-proxy-rs`, is reproducible: rebuilding a
+commit gives the same image digest, bit for bit. External verifiers rely on this
+to check that a deployed proxy runs the source it claims to run.
+
+### What external verifiers do
+
+Every deployment pins the proxy image by digest, so each served model runs one
+image built from one commit of this repository. For each model, a verifier
+records that source commit and then:
+
+1. Checks the image's build provenance. `build.yml` publishes a GitHub artifact
+   attestation and a keyless cosign signature for every image it pushes, and
+   both name the source commit.
+2. Rebuilds the commit from a fresh clone. The only inputs it sets are two
+   environment variables, and each image rebuild gets 60 minutes:
+
+   ```bash
+   git clone https://github.com/nearai/inference-proxy && cd inference-proxy
+   git checkout <commit>
+   ENABLE_NV_ATTESTATION_SDK=1 SOURCE_DATE_EPOCH=0 bash build-image.sh
+   tar -xOf oci.tar index.json | jq -r '.manifests[0].digest'   # must equal the deployed digest
+   ```
+
+To find the commit behind a published digest:
+
+```bash
+gh api /repos/nearai/inference-proxy/attestations/sha256:<hex> \
+  --jq '.attestations[0].bundle.dsseEnvelope.payload' | base64 -d \
+  | jq -r '.predicate.buildDefinition.resolvedDependencies[0].digest.gitCommit'
+```
+
+### The contract
+
+- The command above, run on a fresh clone of a published commit, must produce
+  the published digest: today, and when the commit is rebuilt months later.
+- **Never add a required build environment variable or argument without
+  coordinating with external verifiers first.** Their build environment is
+  fixed. A new Dockerfile build arg must default to the value CI builds with.
+- `build-image.sh` writes `./oci.tar`, which holds exactly one image manifest,
+  and prints its digest. Its default path needs `docker` with buildx, `git`,
+  `jq` and `tar`. It must not depend on `skopeo`, which only `--push` uses
+  (some verifier environments replace it with a stub). `LOAD_IMAGE=1` also
+  loads the image into the local Docker daemon; the digest is the same.
+- Check out with umask 022, the default for CI runners and root. A file the
+  Dockerfile copies without `--chmod` keeps its checkout mode in the image, so
+  a clone made with umask 0002 (the default for many interactive Ubuntu
+  accounts) can give a different digest.
+
+### Expected rebuild time
+
+Two things set the rebuild time: the builder stage (Ubuntu packages, Rust
+toolchain, cargo build) and the size of the runtime base image, which is
+downloaded, unpacked and exported in full. With the vLLM-based runtime image
+(September 2026), a rebuild with no cached layers took 4 to 5 minutes on a
+24-thread x86_64 machine with a 10 Gbit/s link, and about 7 minutes on our CI
+hosts. Downloading and unpacking the 12.5 GB base took about 1.5 minutes, in
+parallel with the builder stage, and writing the 12.5 GB archive 1.3 to 2
+minutes. Slow package mirrors add minutes, and shared, busy hosts have needed
+close to 30 minutes. The verifier-parity job below reports the time of every
+rebuild in its run summary and warns above 30 minutes.
+
+### How CI checks it
+
+`reproducible-build.yml` runs on every merge to `main` that touches a build
+input, weekly on `main` (Mondays 03:00 UTC, to catch drift in the archives and
+registries the build reads), and on manual dispatch:
+
+- two builds in parallel, normally on two different hosts, and two in a row on
+  one host, whose archives must be identical byte for byte;
+- a verifier-parity rebuild: a fresh `git clone` of the commit under umask 022,
+  `env -i PATH=… HOME=… ENABLE_NV_ATTESTATION_SDK=1 SOURCE_DATE_EPOCH=0 bash build-image.sh`
+  with a 60-minute limit, digest read from `index.json`;
+- every digest must match the others and the digest `build.yml` published for
+  the same commit (read from the `build.yml` run, and for `main` also from the
+  `staging-<date>-<sha>` tag on Docker Hub);
+- a pins guard: one build runs with `LOAD_IMAGE=1`, and every committed
+  `pinned-packages-*.txt` must equal the package list that build installed.
+
+Failures on `main` post an alert to Slack. To check a branch before merging,
+dispatch `build.yml` on it first (so there is a published digest to compare
+with), then `reproducible-build.yml`:
+
+```bash
+gh workflow run build.yml --ref <branch> -R nearai/inference-proxy
+gh workflow run reproducible-build.yml --ref <branch> -R nearai/inference-proxy
+```
+
+### Hermetic inputs and how to bump them
+
+Everything the build downloads is pinned; the Dockerfile header describes each
+pin. Every bump changes the image digest, which is expected: bump in a pull
+request and dispatch `reproducible-build.yml` on its branch.
+
+| Input | Pinned in | How to bump |
+|---|---|---|
+| Base images | `FROM …@sha256:` lines in `Dockerfile` | Replace the digest (`docker buildx imagetools inspect <image>:<tag>`), then regenerate the pin files. |
+| Ubuntu packages | `UBUNTU_SNAPSHOT` in `Dockerfile`, plus the pin files | Pick a snapshot timestamp in the past (`YYYYMMDDTHHMMSSZ`; the service also answers for future timestamps, whose content is not frozen yet), check that `https://snapshot.ubuntu.com/ubuntu/<timestamp>/dists/<suite>/InRelease` exists for every suite the Dockerfile uses, then regenerate the pin files. |
+| Pin files | `pinned-packages-*.txt`, one per stage that installs Ubuntu packages | Empty them (`: > pinned-packages-builder.txt`), run `LOAD_IMAGE=1 ENABLE_NV_ATTESTATION_SDK=1 ./build-image.sh`, copy each `pinned-packages-*.resolved.txt` over its committed file, rebuild, and check that `diff -u` between each pair is empty (the CI pins guard runs the same diff). Always use `ENABLE_NV_ATTESTATION_SDK=1`: its package set includes the other one. |
+| libnvat | `LIBNVAT_VERSION` in `Dockerfile` | Pick a version listed in NVIDIA's `ubuntu2204` repository index, then regenerate the pin files. |
+| rustup | `RUSTUP_VERSION`, `RUSTUP_INIT_SHA256` in `Dockerfile` | Take the version from `https://static.rust-lang.org/rustup/release-stable.toml`, download `rustup-init` for it, hash it yourself and compare with the published `rustup-init.sha256`. |
+| Rust toolchain | `--default-toolchain` in `Dockerfile` | Change the version. Published toolchain releases never change. |
+| NVIDIA apt keyring | `CUDA_KEYRING_SHA256` in `Dockerfile` | `sha256sum` of the new `cuda-keyring` .deb. |
+| Python packages | `NV_ATTESTATION_SDK_VERSION`, `NV_PPCIE_VERIFIER_VERSION` in `Dockerfile`, `attestation-constraints.txt` | Regenerate the constraints with the recipe in the file header. |
+| Rust crates | `Cargo.lock` (with checksums) | `cargo update`. |
+| BuildKit | `BUILDKIT_IMAGE` in `build-image.sh` (tag and digest) | BuildKit versions serialize layers differently, so a new version also changes the digest. |
+
+### What the Ubuntu snapshot pin guarantees
+
+- The snapshot service keeps each dated archive immutable:
+  `https://snapshot.ubuntu.com/ubuntu/<timestamp>` serves the Ubuntu archive
+  as it was at that time, and apt checks every package it downloads against
+  that snapshot's indexes, which are signed with Ubuntu's archive key.
+  Installing from the same timestamp gives the same versions and the same files.
+- The committed exact versions are the second check. apt holds every package at
+  the version listed in `pinned-packages-*.txt` (pin priority 1001): it installs
+  that version or fails, never another one, and the CI pins guard compares what
+  was installed with the committed list.
+
+What it does not guarantee:
+
+- Availability. If the snapshot service stops serving a timestamp, commits that
+  use it can no longer be rebuilt. The build fails; it does not silently
+  produce a different image. The same holds for the base images on Docker Hub,
+  crates.io, the Rust release server, NVIDIA's repository and PyPI.
+- Byte identity beyond the archive signatures. The pin files record versions,
+  not package hashes: we trust the snapshot service to keep serving the same
+  signed indexes for a timestamp, and the rebuilt digest is the final check.
+- Inputs outside the snapshot. NVIDIA's apt repository has no snapshot service
+  (libnvat is pinned to an exact version; if NVIDIA dropped it, older commits
+  would stop building). Python packages are pinned by version, not by hash, and
+  a project can add files to an existing version. The throwaway `ca-bootstrap`
+  stage installs `ca-certificates` from the live Ubuntu archive, but only its CA
+  bundle is used, to reach the snapshot over TLS, and nothing from that stage
+  reaches the image. Any stage that still installs from the live archive is
+  called out in the Dockerfile header.
+
 ## Testing
 
 ```bash

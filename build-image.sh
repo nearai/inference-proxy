@@ -92,6 +92,23 @@ else
     echo ""
 fi
 
+# Extract the package list the builder stage resolved (shipped in the image at
+# /app/pinned-packages-builder.txt) so it can be compared with, or when bumping
+# copied over, the committed pinned-packages-builder.txt. Only non-push builds
+# load the image into the Docker daemon.
+if [ "$PUSH" = false ]; then
+    if docker run --rm --entrypoint cat "$TEMP_TAG" /app/pinned-packages-builder.txt > pinned-packages-builder.resolved.txt; then
+        echo "Builder package list extracted to pinned-packages-builder.resolved.txt ($(wc -l < pinned-packages-builder.resolved.txt) packages)"
+        if ! cmp -s pinned-packages-builder.txt pinned-packages-builder.resolved.txt; then
+            echo "Warning: pinned-packages-builder.resolved.txt differs from pinned-packages-builder.txt (see the Dockerfile header)"
+        fi
+    else
+        echo "Warning: could not extract /app/pinned-packages-builder.txt from $TEMP_TAG" >&2
+        rm -f pinned-packages-builder.resolved.txt
+    fi
+    echo ""
+fi
+
 # Clean up the temporary image from Docker daemon
 docker rmi "$TEMP_TAG" 2>/dev/null || true
 

@@ -59,6 +59,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
 
+# Replica state publishing (opt-in)
+redis = { version = "0.32", default-features = false, features = ["tokio-comp", "tokio-rustls-comp", "connection-manager"] }
+# Direct dep only to install the ring provider as the process default: the lock enables
+# both ring and aws-lc-rs, so rustls cannot pick one and redis's TLS setup would panic.
+rustls = { version = "0.23.45", default-features = false, features = ["ring"] }
+
 [dependencies.nv-attestation-sdk]
 git = "https://github.com/NVIDIA/attestation-sdk.git"
 tag = "2026.06.09"

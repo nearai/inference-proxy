@@ -39,11 +39,26 @@ pub fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// Builds a client for `url`. With `ca_pem`, TLS trusts only that CA (PEM)
+/// instead of the system store, for a Redis serving a private-CA certificate.
+pub fn client(url: &str, ca_pem: Option<&str>) -> redis::RedisResult<redis::Client> {
+    match ca_pem {
+        Some(pem) => redis::Client::build_with_tls(
+            url,
+            redis::TlsCertificates {
+                client_tls: None,
+                root_cert: Some(pem.as_bytes().to_vec()),
+            },
+        ),
+        None => redis::Client::open(url),
+    }
+}
+
 impl RedisSink {
     /// Requires [`install_crypto_provider`] to have run for `rediss://` URLs.
-    pub async fn connect(url: &str, host_id: &str) -> anyhow::Result<Self> {
-        let client = redis::Client::open(url)
-            .map_err(|e| anyhow!("redis connect failed: {:?}", e.kind()))?;
+    pub async fn connect(url: &str, ca_pem: Option<&str>, host_id: &str) -> anyhow::Result<Self> {
+        let client =
+            client(url, ca_pem).map_err(|e| anyhow!("redis connect failed: {:?}", e.kind()))?;
         let config = ConnectionManagerConfig::new()
             .set_connection_timeout(Duration::from_secs(2))
             .set_response_timeout(Duration::from_secs(1))
@@ -107,7 +122,7 @@ mod tests {
     #[tokio::test]
     async fn unreachable_redis_fails_fast() {
         let t = std::time::Instant::now();
-        assert!(RedisSink::connect("redis://127.0.0.1:1", "h")
+        assert!(RedisSink::connect("redis://127.0.0.1:1", None, "h")
             .await
             .is_err());
         assert!(t.elapsed() < std::time::Duration::from_secs(5));
@@ -117,7 +132,7 @@ mod tests {
     async fn tls_url_does_not_panic_with_two_rustls_providers() {
         // Must return Err (nothing listening), not panic inside rustls ClientConfig::builder().
         install_crypto_provider();
-        assert!(RedisSink::connect("rediss://127.0.0.1:1", "h")
+        assert!(RedisSink::connect("rediss://127.0.0.1:1", None, "h")
             .await
             .is_err());
     }
@@ -128,8 +143,12 @@ mod tests {
     async fn publish_sets_ttl_keys_and_appends_stream() {
         let url = std::env::var("REPLICA_STATE_TEST_REDIS_URL")
             .expect("REPLICA_STATE_TEST_REDIS_URL must point at a disposable Redis");
+        install_crypto_provider();
         let host = format!("test-{}", uuid::Uuid::new_v4());
-        let mut sink = RedisSink::connect(&url, &host).await.unwrap();
+        let ca = std::env::var("REPLICA_STATE_TEST_REDIS_CA_CERT").ok();
+        let mut sink = RedisSink::connect(&url, ca.as_deref(), &host)
+            .await
+            .unwrap();
         let env = |n: u32| Envelope {
             frame: format!("{{\"seq\":{n}}}"),
             sig: format!("sig{n}"),
@@ -140,7 +159,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut plain = redis::Client::open(url.as_str())
+        let mut plain = client(&url, ca.as_deref())
             .unwrap()
             .get_multiplexed_async_connection()
             .await

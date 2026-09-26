@@ -22,6 +22,7 @@ only publishes the frames; nothing reads them yet.
 | `REPLICA_STATE_REDIS_URL` | No | unset (feature off) | Redis connection URL (`redis://` or `rediss://`). Presence (non-blank) is what turns the feature on. Never logged; only the host:port is (see Privacy below). |
 | `REPLICA_STATE_HOST_ID` | Yes, if the URL is set | — | This proxy's host identifier. Used as the Redis key namespace (`replica:{host_id}:*`) and in every frame's `host_id` field. |
 | `REPLICA_STATE_REPLICA_IDS` | Yes, if the URL is set | — | Comma-separated, one stable replica ID per backend, in pool order (see below). Must be unique and match the backend count exactly, or the feature disables itself. |
+| `REPLICA_STATE_REDIS_CA_CERT` | No | unset | PEM CA certificate the Redis server certificate chains to, for a Redis with a private CA (e.g. the staging Valkey). `rediss://` only; replaces the system trust store for the Redis connection only, so outbound HTTPS is unaffected. Literal `\n` sequences are accepted so the PEM fits in one env line. Public, not a secret. |
 | `REPLICA_STATE_INTERVAL_MS` | No | `500` | Publish interval in ms; must be within `200..=2000` (otherwise the feature is disabled with an error). Reads for a tick are bounded to 4/5 of the interval so a slow replica never overruns its slot. |
 
 ### Pool order for `REPLICA_STATE_REPLICA_IDS`

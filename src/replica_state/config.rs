@@ -15,6 +15,10 @@ pub struct ReplicaStateConfig {
     /// `REPLICA_STATE_REDIS_URL`. Presence (non-blank) is what enables the
     /// feature. Never logged or included in `Debug` output.
     pub redis_url: String,
+    /// `REPLICA_STATE_REDIS_CA_CERT` (optional, `rediss://` only): PEM CA the
+    /// Redis certificate chains to; replaces the system trust store for Redis
+    /// only. Literal `\n` sequences are accepted for single-line env values.
+    pub redis_ca_cert: Option<String>,
     /// `REPLICA_STATE_HOST_ID` (required once the feature is enabled).
     pub host_id: String,
     /// `REPLICA_STATE_REPLICA_IDS` (required; one per `VLLM_BACKEND_URLS`
@@ -46,6 +50,20 @@ impl ReplicaStateConfig {
             anyhow::bail!(
                 "REPLICA_STATE_REDIS_URL is not a valid redis:// or rediss:// URL (value not shown)"
             );
+        }
+        let redis_ca_cert = match get("REPLICA_STATE_REDIS_CA_CERT") {
+            Some(v) if !v.trim().is_empty() => Some(v.trim().replace("\\n", "\n")),
+            _ => None,
+        };
+        if let Some(pem) = &redis_ca_cert {
+            if !redis_url.starts_with("rediss://") {
+                anyhow::bail!("REPLICA_STATE_REDIS_CA_CERT requires a rediss:// URL");
+            }
+            if !pem.contains("-----BEGIN CERTIFICATE-----")
+                || super::redis_sink::client(&redis_url, Some(pem)).is_err()
+            {
+                anyhow::bail!("REPLICA_STATE_REDIS_CA_CERT is not a valid PEM certificate");
+            }
         }
 
         let host_id = match get("REPLICA_STATE_HOST_ID") {
@@ -95,6 +113,7 @@ impl ReplicaStateConfig {
 
         Ok(Some(Self {
             redis_url,
+            redis_ca_cert,
             host_id,
             replica_ids,
             interval: Duration::from_millis(interval_ms),
@@ -128,6 +147,7 @@ impl std::fmt::Debug for ReplicaStateConfig {
             .field("replica_ids", &self.replica_ids)
             .field("interval", &self.interval)
             .field("redis_host", &self.redis_host_for_logs())
+            .field("redis_ca_cert", &self.redis_ca_cert.is_some())
             .finish()
     }
 }
@@ -270,5 +290,43 @@ mod tests {
         let d = format!("{c:?}");
         assert!(!d.contains("s3cret") && !d.contains("user:"));
         assert_eq!(c.redis_host_for_logs(), "redis.internal:6380");
+    }
+
+    /// Public test CA certificate (no key), used only to exercise PEM parsing.
+    const TEST_CA: &str = "-----BEGIN CERTIFICATE-----\nMIIBmDCCAT2gAwIBAgIUBO8axf+bI+fy6nCWKxvbDQK8Vh8wCgYIKoZIzj0EAwIw\nIDEeMBwGA1UEAwwVcmVwbGljYS1zdGF0ZS10ZXN0LWNhMCAXDTI2MDkyNjA0MDQx\nOVoYDzIxMjYwOTAyMDQwNDE5WjAgMR4wHAYDVQQDDBVyZXBsaWNhLXN0YXRlLXRl\nc3QtY2EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQvZoRSR2lpnIRoOtWMg4/A\nC8waZ+M5FKrVPKnTbEQ9Rg8FsgLbiGo98qj8xMiCnDLBtZWu2kIS8aUkYKBTi9i/\no1MwUTAdBgNVHQ4EFgQU0sUHDnN4gedUYXUcbPvjGM8z6A8wHwYDVR0jBBgwFoAU\n0sUHDnN4gedUYXUcbPvjGM8z6A8wDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQD\nAgNJADBGAiEAmhuVv3kXXoW/L/c1OLtbstq6AbI/PA/9VQpxzr0tDoECIQDDyvF8\n2A0KtuzhoAcZZVU2L0OjHlMqrr0f57OEw5SfEQ==\n-----END CERTIFICATE-----";
+
+    fn with_ca(url: &str, ca: &str) -> anyhow::Result<Option<ReplicaStateConfig>> {
+        ReplicaStateConfig::from_lookup(
+            look(&[
+                ("REPLICA_STATE_REDIS_URL", url),
+                ("REPLICA_STATE_REDIS_CA_CERT", ca),
+                ("REPLICA_STATE_HOST_ID", "h"),
+                ("REPLICA_STATE_REPLICA_IDS", "r1"),
+            ]),
+            1,
+        )
+    }
+
+    #[test]
+    fn redis_ca_cert_accepts_pem_and_escaped_newlines() {
+        let cfg = with_ca("rediss://r:6379", TEST_CA).unwrap().unwrap();
+        assert_eq!(cfg.redis_ca_cert.as_deref(), Some(TEST_CA));
+        let escaped = TEST_CA.replace('\n', "\\n");
+        let cfg = with_ca("rediss://r:6379", &escaped).unwrap().unwrap();
+        assert_eq!(cfg.redis_ca_cert.as_deref(), Some(TEST_CA));
+        assert!(format!("{cfg:?}").contains("redis_ca_cert: true"));
+    }
+
+    #[test]
+    fn redis_ca_cert_rejects_plain_redis_and_bad_pem() {
+        let e = with_ca("redis://r:6379", TEST_CA).unwrap_err();
+        assert!(e.to_string().contains("rediss://"));
+        for bad in [
+            "not a pem",
+            "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----",
+        ] {
+            let e = with_ca("rediss://r:6379", bad).unwrap_err();
+            assert!(e.to_string().contains("not a valid PEM"), "{bad}");
+        }
     }
 }

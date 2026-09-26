@@ -80,7 +80,9 @@ pub fn spawn_replica_state_publisher(
 
         let mut last_warn: Option<Instant> = None;
         let mut sink = loop {
-            match RedisSink::connect(&cfg.redis_url, &cfg.host_id).await {
+            match RedisSink::connect(&cfg.redis_url, cfg.redis_ca_cert.as_deref(), &cfg.host_id)
+                .await
+            {
                 Ok(sink) => break sink,
                 Err(_) => {
                     if last_warn.is_none_or(|t| t.elapsed() >= CONNECT_WARN_EVERY) {

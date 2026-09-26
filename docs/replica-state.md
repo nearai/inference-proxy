@@ -19,10 +19,10 @@ only publishes the frames; nothing reads them yet.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `REPLICA_STATE_REDIS_URL` | No | unset (feature off) | Redis connection URL. Presence (non-blank) is what turns the feature on. Never logged; only the host:port is (see Privacy below). |
+| `REPLICA_STATE_REDIS_URL` | No | unset (feature off) | Redis connection URL (`redis://` or `rediss://`). Presence (non-blank) is what turns the feature on. Never logged; only the host:port is (see Privacy below). |
 | `REPLICA_STATE_HOST_ID` | Yes, if the URL is set | — | This proxy's host identifier. Used as the Redis key namespace (`replica:{host_id}:*`) and in every frame's `host_id` field. |
 | `REPLICA_STATE_REPLICA_IDS` | Yes, if the URL is set | — | Comma-separated, one stable replica ID per backend, in pool order (see below). Must be unique and match the backend count exactly, or the feature disables itself. |
-| `REPLICA_STATE_INTERVAL_MS` | No | `500` | Publish interval, clamped to `200..=2000`. Reads for a tick are bounded to 4/5 of the interval so a slow replica never overruns its slot. |
+| `REPLICA_STATE_INTERVAL_MS` | No | `500` | Publish interval in ms; must be within `200..=2000` (otherwise the feature is disabled with an error). Reads for a tick are bounded to 4/5 of the interval so a slow replica never overruns its slot. |
 
 ### Pool order for `REPLICA_STATE_REPLICA_IDS`
 
@@ -43,8 +43,9 @@ REPLICA_STATE_REPLICA_IDS=r1,r2,r3   # r1=host-a, r2=host-b, r3=host-a-long
 
 ### Bad configuration never stops the proxy
 
-Any invalid `REPLICA_STATE_*` value (missing `REPLICA_STATE_HOST_ID`, a
-replica-count mismatch, a duplicate ID, an out-of-range interval) is logged as
+Any invalid `REPLICA_STATE_*` value (a Redis URL that doesn't parse or isn't
+`redis://`/`rediss://`, missing `REPLICA_STATE_HOST_ID`, a replica-count
+mismatch, a duplicate ID, an out-of-range interval) is logged as
 an error and the feature is disabled for that boot. Startup, routing and every
 other proxy behavior continue unaffected.
 
@@ -61,7 +62,7 @@ Each tick produces one `ReplicaReport` per replica, JSON-serialized compactly
   "boot_id": "00000000-0000-4000-8000-000000000001",
   "seq": 7,
   "engine_sampled_at_ms": 1790000000011,
-  "reported_at_ms": 1790000000123,
+  "reported_at_ms": 1790000000312,
   "lifecycle_state": "ready",
   "model": "z-ai/glm-5.3-flash",
   "engine": "sglang",
@@ -98,15 +99,13 @@ Notes:
 - `boot_id` is a random UUID v4 generated once per proxy process start — it
   identifies this proxy's boot, not the engine's (see Caveats).
 - `engine_sampled_at_ms` is the engine's own scheduler timestamp (SGLang's
-  `timestamp`, the oldest rank's when the engine has more than one). It can
-  be stale (a failed read repeats the last known value; a never-reachable
-  replica reports `0`); readers should judge freshness from it.
-- `reported_at_ms` is intended to be the wall-clock time the frame was
-  sealed, taken after this tick's engine reads complete. As currently wired,
-  `main.rs` captures it before the reads run (`now_ms()` is evaluated as a
-  `tick()` argument, ahead of the read); this is a known gap being fixed in
-  a later wave. Treat `reported_at_ms` as "close to when this tick started,"
-  not a tight bound on read latency, until that lands.
+  `timestamp`, the oldest rank's when the engine has more than one), or
+  `null` when unknown. A never-reachable replica reports `null`; a failed read
+  after a success repeats the last known value, so it can be stale. Readers
+  should treat `null` or a too-old value as unknown load.
+- `reported_at_ms` is the proxy's wall-clock time when the frame was sealed,
+  taken once per tick after every replica's read has completed (all frames of
+  a tick share it). It is what readers use for frame freshness.
 - `report_key_id` identifies the per-boot signing key (see Signing below).
 
 ### Signing
@@ -115,18 +114,41 @@ Notes:
 sig = base64(ed25519(report_key, b"nearai-replica-report-v1\n" ++ frame_bytes))
 ```
 
-`frame_bytes` is the exact UTF-8 bytes of the `frame` string above — the
-signed envelope on the wire is `{"frame": "<json string>", "sig": "<base64>"}`.
-Readers must verify the signature over the received `frame` bytes first, and
-only then parse them; nothing on the writing or reading side re-serializes
-the JSON before verifying.
+`frame_bytes` is the exact UTF-8 bytes of the `frame` string above. The
+envelope on the wire is:
+
+```json
+{
+  "frame": "{\"schema\":1,\"host_id\":\"gpu01\",...,\"report_key_id\":\"0123456789abcdef\"}",
+  "sig": "<base64 ed25519 signature>",
+  "key_id": "0123456789abcdef"
+}
+```
+
+`key_id` is **not** signed; it is only a hint telling the reader which key to
+verify with. The signed `report_key_id` inside `frame` must equal it, or the
+frame is rejected. Readers must verify the signature over the received
+`frame` bytes first, and only then parse them; nothing on the writing or
+reading side re-serializes the JSON before verifying.
 
 The report key is a fresh random Ed25519 key generated once per proxy boot
 (never persisted). Its public half and `key_id` (first 16 hex chars of
 `sha256(public_key)`) are recorded in the dstack attested event log under the
-event name `nearai-replica-report-key-v1`, with payload `{"key_id",
-"public_key_hex", "boot_id"}`. That binds the key to the CVM's TDX quote
-without changing `report_data`.
+event name `nearai-replica-report-key-v1`, together with the host and the
+replicas the key may report for:
+
+```json
+{
+  "key_id": "0123456789abcdef",
+  "public_key_hex": "<64 hex chars>",
+  "boot_id": "00000000-0000-4000-8000-000000000001",
+  "host_id": "gpu01",
+  "model": "z-ai/glm-5.3-flash",
+  "replica_ids": ["r1", "r2"]
+}
+```
+
+That binds the key to the CVM's TDX quote without changing `report_data`.
 
 ## SGLang mapping
 
@@ -135,21 +157,21 @@ replica, normalized by `parse_sglang_loads`:
 
 | Frame field | Derived from SGLang `/v1/loads` (summed across ranks unless noted) |
 |---|---|
-| `load.running` | `num_running_reqs` |
-| `load.queued` | `num_waiting_reqs` |
+| `load.running` | `num_running_reqs` (`null` if the sum doesn't fit a `u32`) |
+| `load.queued` | `num_waiting_reqs` (`null` if the sum doesn't fit a `u32`) |
 | `load.prefill_backlog_tokens` | `num_waiting_uncached_tokens` |
 | `load.gen_tps` | `gen_throughput` |
 | `load.kv_usage` | `num_used_tokens / max_total_num_tokens`, clamped to `[0, 1]`; `null` if either is missing or the total is `0` |
 | `load.cached_token_ratio` | `cache_hit_rate`, single-rank replicas only (`null` for multi-rank, since a hit ratio isn't meaningfully summed) |
 | `limits.max_running` | `max_running_requests`, summed; `null` if the sum is `0` |
-| `engine_version` | top-level `version` |
+| `engine_version` | top-level `version` (`null` if absent) |
 | `engine_sampled_at_ms` | the oldest rank's `timestamp` (float seconds), converted to milliseconds |
 
 A read is discarded entirely (treated as a failure) if the response is
 unreachable, times out, returns a non-success status, isn't JSON, has no
 `loads` array, has an empty `loads` array, or any rank is missing a numeric
-`timestamp`. A field missing from one rank makes that summed field `null` for
-the whole replica, not `0`.
+`timestamp`. A field missing from one rank, or a sum that overflows, makes
+that summed field `null` for the whole replica, not `0`.
 
 ## Redis layout
 
@@ -187,17 +209,22 @@ a BSL-1.0 dependency that `cargo deny` rejects — so this stays pinned to
 
 ## How readers verify a frame
 
-1. Find the `nearai-replica-report-key-v1` event in the proxy's attested
-   event log (`/v1/attestation/report`'s `event_log`) and match `key_id`
-   against the frame's `report_key_id` to get the trusted `public_key_hex`.
-2. Verify `sig` over the exact `frame` bytes received (domain-separated with
-   `b"nearai-replica-report-v1\n"`), then parse the JSON — never the other
-   order.
-3. Require `seq` to be monotonic per `boot_id`, and `boot_id` itself to be
-   monotonic across a proxy's restarts (a reader that has seen a later
-   `boot_id` should reject frames from an earlier one). Judge freshness by
-   `engine_sampled_at_ms` against the reader's own clock, not by
-   `reported_at_ms` alone.
+1. Verify the TDX quote and replay the event log against RTMR3 (the existing
+   attestation verification).
+2. Collect this host's `nearai-replica-report-key-v1` events; check
+   `hex(sha256(public_key))[..16] == key_id` and that the event's `host_id`
+   matches. Only the **last** such event in the log is current; frames signed
+   by earlier keys are rejected.
+3. Use the envelope `key_id` hint to pick the key; verify the sig over the
+   frame string, then parse; require signed `report_key_id == key_id`, signed
+   `host_id`/`replica_id` == the Redis key they came from, and
+   `replica_id ∈` the event's `replica_ids`.
+4. Within one key, `seq` strictly increases. `boot_id` is a random
+   per-process id (not ordered) — ordering across restarts comes from the
+   event log.
+5. Freshness: reject if `now − reported_at_ms > 3 × interval`; treat
+   `engine_sampled_at_ms` null or older than the reader's staleness bound as
+   unknown load.
 
 ## Caveats
 
@@ -208,13 +235,28 @@ a BSL-1.0 dependency that `cargo deny` rejects — so this stays pinned to
   change.
 - `boot_id` identifies the proxy's boot, not the engine's. An engine restart
   behind an unrestarted proxy does not change `boot_id`.
+- In-CVM mode only — in gateway mode VLLM_BACKEND_URLS point at other
+  proxies, so replicas stay `warming`.
 - Each proxy restart appends another `nearai-replica-report-key-v1` event to
   the attested event log (RTMR3 grows monotonically); this is expected and
-  by design, not a leak or a bug to clean up.
+  by design, not a leak or a bug to clean up. Pre-merge gate: confirm
+  cloud-api's attestation verifier and the public verifier accept an unknown
+  runtime event before enabling on a production host.
 - Nonce-less attestation reports are cached for up to `ATTESTATION_CACHE_TTL`
   (default 300 s). A reader that fetches `/v1/attestation/report` right after
   a proxy restart may get a cached report from before the new key event was
   recorded, and so not find `key_id` yet — retry within one TTL.
+
+## Metrics
+
+- `replica_state_key_bound` (gauge): `1` once the report key is recorded in
+  the event log; `0` if binding was skipped (dev/non-TEE), failed, or timed
+  out. At `0`, readers will reject every frame from this boot.
+- `replica_state_frames_total` (counter): frames written to Redis.
+- `replica_state_publish_failures_total` (counter): ticks whose Redis
+  pipeline failed.
+- `replica_state_tick_seconds` (histogram): wall time of each tick (reads,
+  signing and publish).
 
 ## Privacy
 

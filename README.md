@@ -158,7 +158,7 @@ All configuration is via environment variables:
 | `REPLICA_STATE_REDIS_URL` | No | unset (feature off) | Redis URL for opt-in signed per-replica state publishing; see [docs/replica-state.md](docs/replica-state.md) |
 | `REPLICA_STATE_HOST_ID` | Yes, if the URL is set | — | Host identifier used in Redis keys and every published frame |
 | `REPLICA_STATE_REPLICA_IDS` | Yes, if the URL is set | — | Comma-separated replica IDs, one per backend (base then long-context), in pool order |
-| `REPLICA_STATE_INTERVAL_MS` | No | `500` | Publish interval in ms, clamped to `200..=2000` |
+| `REPLICA_STATE_INTERVAL_MS` | No | `500` | Publish interval in ms; must be within `200..=2000` (otherwise the feature is disabled with an error) |
 
 ### Fusion
 

@@ -139,11 +139,11 @@ replicas the key may report for:
 
 ```json
 {
-  "key_id": "0123456789abcdef",
-  "public_key_hex": "<64 hex chars>",
   "boot_id": "00000000-0000-4000-8000-000000000001",
   "host_id": "gpu01",
+  "key_id": "0123456789abcdef",
   "model": "z-ai/glm-5.3-flash",
+  "public_key_hex": "<64 hex chars>",
   "replica_ids": ["r1", "r2"]
 }
 ```
@@ -235,7 +235,7 @@ a BSL-1.0 dependency that `cargo deny` rejects — so this stays pinned to
   change.
 - `boot_id` identifies the proxy's boot, not the engine's. An engine restart
   behind an unrestarted proxy does not change `boot_id`.
-- In-CVM mode only — in gateway mode VLLM_BACKEND_URLS point at other
+- In-CVM mode only — in gateway mode `VLLM_BACKEND_URLS` point at other
   proxies, so replicas stay `warming`.
 - Each proxy restart appends another `nearai-replica-report-key-v1` event to
   the attested event log (RTMR3 grows monotonically); this is expected and

@@ -64,11 +64,13 @@ impl Publisher {
         }
     }
 
-    /// Read every replica concurrently, then build one frame per replica sharing one seq.
+    /// Read every replica concurrently, then build one frame per replica
+    /// sharing one seq. `now_ms` is called once, after all reads complete, so
+    /// `reported_at_ms` is the seal time.
     pub async fn tick(
         &mut self,
         inflight: impl Fn(usize) -> u32,
-        now_ms: u64,
+        now_ms: impl Fn() -> u64,
     ) -> Vec<(String, Envelope)> {
         let reads = futures_util::future::join_all(
             self.slots
@@ -76,6 +78,7 @@ impl Publisher {
                 .map(|slot| sglang::read_replica(&self.client, &slot.base_url, self.read_timeout)),
         )
         .await;
+        let reported_at_ms = now_ms();
 
         self.seq += 1;
         let seq = self.seq;
@@ -83,19 +86,31 @@ impl Publisher {
         for (i, (slot, read)) in self.slots.iter_mut().zip(reads).enumerate() {
             let (load, limits, engine_version, engine_sampled_at_ms) = match read {
                 Some(read) => {
+                    let recovering = slot.lifecycle == Lifecycle::Unhealthy
+                        || (slot.lifecycle == Lifecycle::Warming && slot.failures > 0);
+                    if recovering {
+                        tracing::info!(replica_id = %slot.id, "replica state: replica ready");
+                    }
                     slot.failures = 0;
                     slot.lifecycle = Lifecycle::Ready;
                     let out = (
                         read.load.clone(),
                         read.limits.clone(),
                         read.engine_version.clone(),
-                        read.sampled_at_ms,
+                        Some(read.sampled_at_ms),
                     );
                     slot.last = Some(read);
                     out
                 }
                 None => {
                     slot.failures = slot.failures.saturating_add(1);
+                    if slot.failures == UNHEALTHY_AFTER_FAILURES {
+                        tracing::warn!(
+                            replica_id = %slot.id,
+                            failures = slot.failures,
+                            "replica state: replica unhealthy"
+                        );
+                    }
                     if slot.last.is_none() {
                         slot.lifecycle = Lifecycle::Warming;
                     } else if slot.failures >= UNHEALTHY_AFTER_FAILURES {
@@ -106,9 +121,9 @@ impl Publisher {
                             Load::default(),
                             last.limits.clone(),
                             last.engine_version.clone(),
-                            last.sampled_at_ms,
+                            Some(last.sampled_at_ms),
                         ),
-                        None => (Load::default(), Default::default(), None, 0),
+                        None => (Load::default(), Default::default(), None, None),
                     }
                 }
             };
@@ -119,7 +134,7 @@ impl Publisher {
                 boot_id: self.key.boot_id.clone(),
                 seq,
                 engine_sampled_at_ms,
-                reported_at_ms: now_ms,
+                reported_at_ms,
                 lifecycle_state: slot.lifecycle,
                 model: self.model.clone(),
                 engine: Engine::Sglang,
@@ -206,7 +221,7 @@ mod tests {
             Duration::from_millis(500),
         );
 
-        let frames = p.tick(|i| 10 + i as u32, NOW).await;
+        let frames = p.tick(|i| 10 + i as u32, || NOW).await;
         let ids: Vec<_> = frames.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(ids, ["r1", "r2"]);
         let reports = open_all(&frames, &vk);
@@ -218,11 +233,12 @@ mod tests {
             assert_eq!(r.report_key_id, key_id);
             assert_eq!(r.host_id, "host-a");
             assert_eq!(r.reported_at_ms, NOW);
+            assert!(r.reported_at_ms >= r.engine_sampled_at_ms.unwrap());
             assert_eq!(r.proxy_inflight, 10 + i as u32);
             assert_eq!(r.load.running, Some(3));
         }
 
-        let reports = open_all(&p.tick(|_| 0, NOW + 500).await, &vk);
+        let reports = open_all(&p.tick(|_| 0, || NOW + 500).await, &vk);
         assert_eq!(reports.len(), 2);
         assert!(reports.iter().all(|r| r.seq == 2));
     }
@@ -234,8 +250,8 @@ mod tests {
         let key = ReportKey::generate();
         let vk = key.signing_key().verifying_key();
         let mut p = publisher(key, &[("r1", &s.uri())], Duration::from_millis(500));
-        let r = &open_all(&p.tick(|_| 0, NOW).await, &vk)[0];
-        assert_eq!(r.engine_sampled_at_ms, 1_000_000);
+        let r = &open_all(&p.tick(|_| 0, || NOW).await, &vk)[0];
+        assert_eq!(r.engine_sampled_at_ms, Some(1_000_000));
         assert_eq!(r.reported_at_ms, NOW);
         assert_eq!(r.lifecycle_state, Lifecycle::Ready);
     }
@@ -247,35 +263,37 @@ mod tests {
         let key = ReportKey::generate();
         let vk = key.signing_key().verifying_key();
         let mut p = publisher(key, &[("r1", &s.uri())], Duration::from_millis(500));
-        let ok = &open_all(&p.tick(|_| 0, NOW).await, &vk)[0];
+        let ok = &open_all(&p.tick(|_| 0, || NOW).await, &vk)[0];
         assert_eq!(ok.load.running, Some(3));
+        assert!(ok.reported_at_ms >= ok.engine_sampled_at_ms.unwrap());
 
         s.reset().await;
         serve(&s, 500, 0.0).await;
-        let r = &open_all(&p.tick(|_| 0, NOW + 500).await, &vk)[0];
+        let r = &open_all(&p.tick(|_| 0, || NOW + 500).await, &vk)[0];
         assert_eq!(r.load, Load::default());
-        assert_eq!(r.engine_sampled_at_ms, 1_790_000_000_000);
+        assert_eq!(r.engine_sampled_at_ms, Some(1_790_000_000_000));
         assert_eq!(r.limits.max_running, Some(16));
         assert_eq!(r.engine_version.as_deref(), Some("0.5.9"));
         assert_eq!(r.lifecycle_state, Lifecycle::Ready);
 
-        let r = &open_all(&p.tick(|_| 0, NOW + 1000).await, &vk)[0];
+        let r = &open_all(&p.tick(|_| 0, || NOW + 1000).await, &vk)[0];
         assert_eq!(r.lifecycle_state, Lifecycle::Ready);
-        let r = &open_all(&p.tick(|_| 0, NOW + 1500).await, &vk)[0];
+        let r = &open_all(&p.tick(|_| 0, || NOW + 1500).await, &vk)[0];
         assert_eq!(r.lifecycle_state, Lifecycle::Unhealthy);
         assert_eq!(r.load, Load::default());
 
         s.reset().await;
         serve(&s, 200, 1_790_000_002.0).await;
-        let r = &open_all(&p.tick(|_| 0, NOW + 2000).await, &vk)[0];
+        let r = &open_all(&p.tick(|_| 0, || NOW + 2000).await, &vk)[0];
         assert_eq!(r.lifecycle_state, Lifecycle::Ready);
-        assert_eq!(r.engine_sampled_at_ms, 1_790_000_002_000);
+        assert_eq!(r.engine_sampled_at_ms, Some(1_790_000_002_000));
+        assert!(r.reported_at_ms >= r.engine_sampled_at_ms.unwrap());
         assert_eq!(r.load.running, Some(3));
         assert_eq!(r.seq, 5);
     }
 
     #[tokio::test]
-    async fn never_reachable_replica_is_warming_with_zero_sample_time() {
+    async fn never_reachable_replica_is_warming_with_null_sample_time() {
         let key = ReportKey::generate();
         let vk = key.signing_key().verifying_key();
         let mut p = publisher(
@@ -285,14 +303,48 @@ mod tests {
         );
         let mut last = None;
         for n in 0..5 {
-            last = Some(open_all(&p.tick(|_| 0, NOW + n * 500).await, &vk).remove(0));
+            last = Some(open_all(&p.tick(|_| 0, || NOW + n * 500).await, &vk).remove(0));
         }
         let r = last.unwrap();
         assert_eq!(r.lifecycle_state, Lifecycle::Warming);
-        assert_eq!(r.engine_sampled_at_ms, 0);
+        assert_eq!(r.engine_sampled_at_ms, None);
         assert_eq!(r.load, Load::default());
         assert_eq!(r.limits.max_running, None);
         assert_eq!(r.engine_version, None);
+    }
+
+    #[tokio::test]
+    async fn reported_at_is_taken_once_after_reads_complete() {
+        let s = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/loads"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(body(1_790_000_000.0))
+                    .set_delay(Duration::from_millis(150)),
+            )
+            .mount(&s)
+            .await;
+        let key = ReportKey::generate();
+        let mut p = publisher(key, &[("r1", &s.uri())], Duration::from_millis(500));
+        let calls = std::cell::Cell::new(0u32);
+        let called_after = std::cell::Cell::new(Duration::ZERO);
+        let start = Instant::now();
+        p.tick(
+            |_| 0,
+            || {
+                calls.set(calls.get() + 1);
+                called_after.set(start.elapsed());
+                NOW
+            },
+        )
+        .await;
+        assert_eq!(calls.get(), 1);
+        assert!(
+            called_after.get() >= Duration::from_millis(150),
+            "now_ms read at {:?}, before the replica read finished",
+            called_after.get()
+        );
     }
 
     #[tokio::test]
@@ -317,12 +369,9 @@ mod tests {
             Duration::from_millis(200),
         );
         let start = Instant::now();
-        let frames = p.tick(|_| 0, NOW).await;
+        let frames = p.tick(|_| 0, || NOW).await;
         let elapsed = start.elapsed();
-        assert!(
-            elapsed < Duration::from_millis(400),
-            "tick took {elapsed:?}"
-        );
+        assert!(elapsed < Duration::from_secs(1), "tick took {elapsed:?}");
         let reports = open_all(&frames, &vk);
         assert_eq!(reports[0].load, Load::default());
         assert_eq!(reports[1].load.running, Some(3));

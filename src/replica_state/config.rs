@@ -20,8 +20,9 @@ pub struct ReplicaStateConfig {
     /// `REPLICA_STATE_REPLICA_IDS` (required; one per `VLLM_BACKEND_URLS`
     /// entry, same order).
     pub replica_ids: Vec<String>,
-    /// `REPLICA_STATE_INTERVAL_MS` (optional, clamped to 200..=2000,
-    /// default [`DEFAULT_INTERVAL_MS`]).
+    /// `REPLICA_STATE_INTERVAL_MS` (optional, must be within 200..=2000
+    /// (otherwise the feature is disabled with an error), default
+    /// [`DEFAULT_INTERVAL_MS`]).
     pub interval: Duration,
 }
 
@@ -38,6 +39,14 @@ impl ReplicaStateConfig {
             Some(v) if !v.trim().is_empty() => v.trim().to_string(),
             _ => return Ok(None),
         };
+        // Neither message may include the URL: it can carry a password.
+        let scheme_ok =
+            url::Url::parse(&redis_url).is_ok_and(|u| matches!(u.scheme(), "redis" | "rediss"));
+        if !scheme_ok || redis::Client::open(redis_url.as_str()).is_err() {
+            anyhow::bail!(
+                "REPLICA_STATE_REDIS_URL is not a valid redis:// or rediss:// URL (value not shown)"
+            );
+        }
 
         let host_id = match get("REPLICA_STATE_HOST_ID") {
             Some(v) if !v.trim().is_empty() => v.trim().to_string(),
@@ -106,20 +115,8 @@ impl ReplicaStateConfig {
                 (Some(host), None) => host.to_string(),
                 _ => "<unknown>".to_string(),
             },
-            Err(_) => {
-                // Fall back to a manual best-effort parse: substring after
-                // the last '@' (strips credentials) up to the next '/'.
-                let after_at = self
-                    .redis_url
-                    .rsplit_once('@')
-                    .map(|(_, rest)| rest)
-                    .unwrap_or(&self.redis_url);
-                after_at
-                    .split('/')
-                    .next()
-                    .unwrap_or("<unknown>")
-                    .to_string()
-            }
+            // Unreachable in practice: `from_lookup` rejects unparseable URLs.
+            Err(_) => "<unparseable>".to_string(),
         }
     }
 }
@@ -226,6 +223,33 @@ mod tests {
                 .as_millis(),
             250
         );
+    }
+
+    #[test]
+    fn redis_url_must_parse_with_a_redis_scheme_and_error_hides_it() {
+        let mk = |url: &'static str| {
+            look(&[
+                ("REPLICA_STATE_REDIS_URL", url),
+                ("REPLICA_STATE_HOST_ID", "h"),
+                ("REPLICA_STATE_REPLICA_IDS", "r1"),
+            ])
+        };
+        for bad in [
+            "not a url s3cret",
+            "http://user:s3cret@redis.internal:6379",
+            "unix:///tmp/s3cret.sock",
+            "redis://user:s3cret@[::1",
+        ] {
+            let e = ReplicaStateConfig::from_lookup(mk(bad), 1).unwrap_err();
+            let msg = format!("{e:#}");
+            assert!(msg.contains("REPLICA_STATE_REDIS_URL"), "{msg}");
+            assert!(!msg.contains("s3cret"), "error leaked the URL: {msg}");
+        }
+        for good in ["redis://r:6379", "rediss://user:pw@r:6380/0"] {
+            assert!(ReplicaStateConfig::from_lookup(mk(good), 1)
+                .unwrap()
+                .is_some());
+        }
     }
 
     #[test]

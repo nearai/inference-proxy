@@ -30,13 +30,18 @@ pub struct RedisSink {
     stream: String,
 }
 
-impl RedisSink {
-    pub async fn connect(url: &str, host_id: &str) -> anyhow::Result<Self> {
-        // The lock enables both ring and aws-lc-rs, so rustls has no implicit
-        // process default and redis's `ClientConfig::builder()` would panic on
-        // `rediss://`. Err here just means a provider is already installed.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+/// Installs ring as the process-wide rustls provider. Call once before any
+/// `rediss://` connect.
+pub fn install_crypto_provider() {
+    // The lock enables both ring and aws-lc-rs, so rustls has no implicit
+    // process default and redis's `ClientConfig::builder()` would panic on
+    // `rediss://`. Err here just means a provider is already installed.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
 
+impl RedisSink {
+    /// Requires [`install_crypto_provider`] to have run for `rediss://` URLs.
+    pub async fn connect(url: &str, host_id: &str) -> anyhow::Result<Self> {
         let client = redis::Client::open(url)
             .map_err(|e| anyhow!("redis connect failed: {:?}", e.kind()))?;
         let config = ConnectionManagerConfig::new()
@@ -111,21 +116,24 @@ mod tests {
     #[tokio::test]
     async fn tls_url_does_not_panic_with_two_rustls_providers() {
         // Must return Err (nothing listening), not panic inside rustls ClientConfig::builder().
+        install_crypto_provider();
         assert!(RedisSink::connect("rediss://127.0.0.1:1", "h")
             .await
             .is_err());
     }
 
-    /// Real Redis, only when REPLICA_STATE_TEST_REDIS_URL is set.
+    /// Real Redis: `REPLICA_STATE_TEST_REDIS_URL=redis://127.0.0.1:6379 cargo test -- --ignored`.
     #[tokio::test]
+    #[ignore = "needs REPLICA_STATE_TEST_REDIS_URL"]
     async fn publish_sets_ttl_keys_and_appends_stream() {
-        let Ok(url) = std::env::var("REPLICA_STATE_TEST_REDIS_URL") else {
-            return;
-        };
-        let mut sink = RedisSink::connect(&url, "test-host").await.unwrap();
+        let url = std::env::var("REPLICA_STATE_TEST_REDIS_URL")
+            .expect("REPLICA_STATE_TEST_REDIS_URL must point at a disposable Redis");
+        let host = format!("test-{}", uuid::Uuid::new_v4());
+        let mut sink = RedisSink::connect(&url, &host).await.unwrap();
         let env = |n: u32| Envelope {
             frame: format!("{{\"seq\":{n}}}"),
             sig: format!("sig{n}"),
+            key_id: "0123456789abcdef".to_string(),
         };
         let (e1, e2) = (env(1), env(2));
         sink.publish(&[("r1".to_string(), e1.clone()), ("r2".to_string(), e2)])
@@ -138,22 +146,22 @@ mod tests {
             .await
             .unwrap();
         let got: String = redis::cmd("GET")
-            .arg("replica:test-host:r1")
+            .arg(state_key(&host, "r1"))
             .query_async(&mut plain)
             .await
             .unwrap();
         assert_eq!(got, serde_json::to_string(&e1).unwrap());
         let ttl: i64 = redis::cmd("TTL")
-            .arg("replica:test-host:r1")
+            .arg(state_key(&host, "r1"))
             .query_async(&mut plain)
             .await
             .unwrap();
         assert!((1..=5).contains(&ttl), "ttl={ttl}");
         let len: u64 = redis::cmd("XLEN")
-            .arg("replica:test-host:frames")
+            .arg(stream_key(&host))
             .query_async(&mut plain)
             .await
             .unwrap();
-        assert!(len >= 2, "xlen={len}");
+        assert_eq!(len, 2, "xlen={len}");
     }
 }

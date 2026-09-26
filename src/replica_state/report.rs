@@ -3,7 +3,9 @@
 //! The envelope carries the report as the exact signed JSON string (`frame`)
 //! so that readers in any language can verify the received bytes before
 //! parsing them. [`open`] never re-serializes `frame`; it verifies the bytes
-//! as received, then parses them.
+//! as received, then parses them. The envelope's `key_id` is an unsigned
+//! lookup hint for picking the verifying key; the signed `report_key_id`
+//! inside `frame` must equal it.
 
 use base64::Engine as _;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -51,7 +53,9 @@ pub struct ReplicaReport {
     pub replica_id: String,
     pub boot_id: String,
     pub seq: u64,
-    pub engine_sampled_at_ms: u64,
+    /// Engine's own sample time; `None` until the replica has been read once.
+    pub engine_sampled_at_ms: Option<u64>,
+    /// Wall-clock time the frame was sealed, after this tick's reads.
     pub reported_at_ms: u64,
     pub lifecycle_state: Lifecycle,
     pub model: String,
@@ -67,6 +71,8 @@ pub struct ReplicaReport {
 pub struct Envelope {
     pub frame: String,
     pub sig: String,
+    /// Unsigned hint naming the key that signed `frame`; not trusted on its own.
+    pub key_id: String,
 }
 
 fn message(frame: &str) -> Vec<u8> {
@@ -79,17 +85,23 @@ pub fn seal(report: &ReplicaReport, key: &SigningKey) -> Envelope {
     let frame = serde_json::to_string(report).expect("ReplicaReport always serializes");
     let sig =
         base64::engine::general_purpose::STANDARD.encode(key.sign(&message(&frame)).to_bytes());
-    Envelope { frame, sig }
+    Envelope {
+        frame,
+        sig,
+        key_id: report.report_key_id.clone(),
+    }
 }
 
-/// Verify, then parse. None on a bad signature or bad JSON.
+/// Verify, then parse. None on a bad signature, bad JSON, or when the signed
+/// `report_key_id` disagrees with the envelope's `key_id` hint.
 pub fn open(env: &Envelope, key: &VerifyingKey) -> Option<ReplicaReport> {
     let raw = base64::engine::general_purpose::STANDARD
         .decode(&env.sig)
         .ok()?;
     let sig = Signature::from_bytes(&<[u8; 64]>::try_from(raw.as_slice()).ok()?);
     key.verify(&message(&env.frame), &sig).ok()?;
-    serde_json::from_str(&env.frame).ok()
+    let report: ReplicaReport = serde_json::from_str(&env.frame).ok()?;
+    (report.report_key_id == env.key_id).then_some(report)
 }
 
 #[cfg(test)]
@@ -104,7 +116,7 @@ mod tests {
             replica_id: "r1".into(),
             boot_id: "00000000-0000-4000-8000-000000000001".into(),
             seq: 7,
-            engine_sampled_at_ms: 1_790_000_000_011,
+            engine_sampled_at_ms: Some(1_790_000_000_011),
             reported_at_ms: 1_790_000_000_123,
             lifecycle_state: Lifecycle::Ready,
             model: "z-ai/glm-5.3-flash".into(),
@@ -153,11 +165,37 @@ mod tests {
     }
 
     #[test]
+    fn envelope_carries_unsigned_key_hint_that_must_match_signed_key_id() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let env = seal(&report(), &sk);
+        assert_eq!(env.key_id, "0123456789abcdef");
+        let wire: serde_json::Value = serde_json::to_value(&env).unwrap();
+        assert_eq!(wire.as_object().unwrap().len(), 3);
+
+        let swapped = Envelope {
+            key_id: "fedcba9876543210".into(),
+            ..env
+        };
+        assert!(open(&swapped, &sk.verifying_key()).is_none());
+    }
+
+    #[test]
+    fn unknown_sample_time_serializes_as_null() {
+        let r = ReplicaReport {
+            engine_sampled_at_ms: None,
+            ..report()
+        };
+        let env = seal(&r, &SigningKey::from_bytes(&[7u8; 32]));
+        assert!(env.frame.contains(r#""engine_sampled_at_ms":null"#));
+    }
+
+    #[test]
     fn signature_without_domain_prefix_is_rejected() {
         let sk = SigningKey::from_bytes(&[7u8; 32]);
         let frame = serde_json::to_string(&report()).unwrap();
         let sig =
             base64::engine::general_purpose::STANDARD.encode(sk.sign(frame.as_bytes()).to_bytes());
-        assert!(open(&Envelope { frame, sig }, &sk.verifying_key()).is_none());
+        let key_id = report().report_key_id;
+        assert!(open(&Envelope { frame, sig, key_id }, &sk.verifying_key()).is_none());
     }
 }

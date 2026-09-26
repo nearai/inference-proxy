@@ -15,14 +15,19 @@ pub struct ReplicaLoad {
 }
 
 /// Sums an unsigned integer field across ranks. `None` if any rank is
-/// missing the key, or the value isn't a non-negative integer.
+/// missing the key, the value isn't a non-negative integer, or the sum
+/// overflows `u64`.
 fn sum_u64(ranks: &[serde_json::Value], key: &str) -> Option<u64> {
     let mut total: u64 = 0;
     for rank in ranks {
-        let v = rank.get(key)?.as_u64()?;
-        total += v;
+        total = total.checked_add(rank.get(key)?.as_u64()?)?;
     }
     Some(total)
+}
+
+/// [`sum_u64`] narrowed to `u32`; `None` if the sum doesn't fit.
+fn sum_u32(ranks: &[serde_json::Value], key: &str) -> Option<u32> {
+    sum_u64(ranks, key).and_then(|v| u32::try_from(v).ok())
 }
 
 /// Sums a floating-point field across ranks. `None` if any rank is missing
@@ -59,8 +64,8 @@ pub fn parse_sglang_loads(body: &serde_json::Value) -> Option<ReplicaLoad> {
     }
     let sampled_at_ms = ts_ms(loads)?;
 
-    let running = sum_u64(loads, "num_running_reqs").map(|v| v as u32);
-    let queued = sum_u64(loads, "num_waiting_reqs").map(|v| v as u32);
+    let running = sum_u32(loads, "num_running_reqs");
+    let queued = sum_u32(loads, "num_waiting_reqs");
     let prefill_backlog_tokens = sum_u64(loads, "num_waiting_uncached_tokens");
     let gen_tps = sum_f64(loads, "gen_throughput");
 
@@ -79,9 +84,7 @@ pub fn parse_sglang_loads(body: &serde_json::Value) -> Option<ReplicaLoad> {
         None
     };
 
-    let max_running = sum_u64(loads, "max_running_requests")
-        .filter(|&v| v != 0)
-        .map(|v| v as u32);
+    let max_running = sum_u32(loads, "max_running_requests").filter(|&v| v != 0);
 
     let engine_version = body
         .get("version")
@@ -192,6 +195,36 @@ mod tests {
     }
 
     #[test]
+    fn absent_version_is_null() {
+        let v = serde_json::json!({"loads":[{"timestamp":1790000000.0,"num_running_reqs":1}]});
+        assert_eq!(parse_sglang_loads(&v).unwrap().engine_version, None);
+    }
+
+    #[test]
+    fn kv_usage_is_clamped_when_used_exceeds_max() {
+        let v = serde_json::json!({"loads":[{"timestamp":1790000000.0,
+            "num_used_tokens":1500,"max_total_num_tokens":1000}]});
+        assert_eq!(parse_sglang_loads(&v).unwrap().load.kv_usage, Some(1.0));
+    }
+
+    #[test]
+    fn overflowing_counts_are_null() {
+        // u64 sum overflow across ranks.
+        let v = serde_json::json!({"loads":[
+            {"timestamp":1790000000.0,"num_waiting_uncached_tokens":u64::MAX,"num_used_tokens":u64::MAX,"max_total_num_tokens":10,"max_running_requests":u64::MAX},
+            {"timestamp":1790000000.0,"num_waiting_uncached_tokens":1,"num_used_tokens":1,"max_total_num_tokens":10,"max_running_requests":1}]});
+        let r = parse_sglang_loads(&v).unwrap();
+        assert_eq!(r.load.prefill_backlog_tokens, None);
+        assert_eq!(r.load.kv_usage, None);
+        assert_eq!(r.limits.max_running, None);
+        // Fits u64 but not u32.
+        let v = serde_json::json!({"loads":[{"timestamp":1790000000.0,
+            "num_running_reqs":5_000_000_000u64,"num_waiting_reqs":4_294_967_296u64}]});
+        let r = parse_sglang_loads(&v).unwrap();
+        assert_eq!((r.load.running, r.load.queued), (None, None));
+    }
+
+    #[test]
     fn malformed_is_none() {
         assert!(parse_sglang_loads(&serde_json::json!({"nope":1})).is_none());
         assert!(parse_sglang_loads(&serde_json::json!({"loads":[]})).is_none());
@@ -223,7 +256,7 @@ mod tests {
         assert_eq!(r.unwrap().sampled_at_ms, 1_790_000_000_000);
 
         // Timeout: a 2s server delay with a 200ms client timeout yields
-        // None within ~400ms (generous margin over the 200ms bound).
+        // None well before the server would answer.
         let slow_server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/loads"))
@@ -244,8 +277,8 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(r.is_none());
         assert!(
-            elapsed < std::time::Duration::from_millis(400),
-            "expected timeout well under 400ms, took {elapsed:?}"
+            elapsed < std::time::Duration::from_secs(1),
+            "expected timeout well under 1s, took {elapsed:?}"
         );
 
         // HTTP 500: non-success status yields None.

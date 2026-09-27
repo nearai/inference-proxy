@@ -73,7 +73,7 @@ impl RedisSink {
         })
     }
 
-    /// Sends [`build_pipeline`] in one round trip.
+    /// Sends the `build_pipeline` commands in one round trip.
     pub async fn publish(&mut self, frames: &[(String, Envelope)]) -> anyhow::Result<()> {
         if frames.is_empty() {
             return Ok(());

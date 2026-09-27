@@ -11,7 +11,7 @@
 - `spawn_replica_state_publisher` (Facade) is the only entry point `main.rs` calls.
 - The report key's public half is recorded in the dstack event log (`emit_event`), which the TDX quote covers. `report_data` stays unchanged.
 
-**Tech Stack:** Rust (tokio, reqwest, serde_json, ed25519-dalek, base64, sha2, uuid, rand, all already dependencies). New: `redis` 1.x (BSD-3-Clause, `default-features = false`, features `tokio-comp`, `tokio-rustls-comp`, `connection-manager`), plus `rustls` as a direct dependency (already in the lock) to install the crypto provider. Tests use `wiremock` (already a dev dependency).
+**Tech Stack:** Rust (tokio, reqwest, serde_json, ed25519-dalek, base64, sha2, uuid, rand, all already dependencies). New: `redis` 0.32.x (1.x pulls in `xxhash-rust`, BSL-1.0, which `cargo deny` rejects; `default-features = false`, features `tokio-comp`, `tokio-rustls-comp`, `connection-manager`), plus `rustls` as a direct dependency (already in the lock) to install the crypto provider. Tests use `wiremock` (already a dev dependency).
 
 **Spec:** Design doc "Inference Placement Map" (https://claude.ai/artifact/T3WkANwFetyUYsHhMBNheo): "Latest recommendation" (stage 1); "Replica lifecycle and state reporting" §2 and §4 (state contract, Redis transport, who can trust a frame, staleness); gated stage 1 in "Baseline". This plan was revised after a principal-engineer review (see "Review changes" at the end).
 
@@ -583,7 +583,7 @@ match replica_state::config::ReplicaStateConfig::from_env(config.backend_urls.le
   - a missing field is `null`, not 0;
   - DP ranks: counts summed, ratios computed;
   - a rustls provider is installed, fixing a panic on `rediss://`;
-  - redis is pinned to 1.x with explicit timeouts and 1 retry;
+  - redis is pinned to 0.32.x (1.x fails `cargo deny`) with explicit timeouts and 1 retry;
   - the envelope carries the frame as the signed string;
   - `seq` is per tick;
   - a bad config never aborts startup;

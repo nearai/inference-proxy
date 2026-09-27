@@ -198,4 +198,14 @@ mod tests {
         let key_id = report().report_key_id;
         assert!(open(&Envelope { frame, sig, key_id }, &sk.verifying_key()).is_none());
     }
+
+    #[test]
+    fn malformed_signatures_are_rejected_without_panicking() {
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let mut env = seal(&report(), &key);
+        env.sig = "not-base64!!".to_string();
+        assert!(open(&env, &key.verifying_key()).is_none());
+        env.sig = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
+        assert!(open(&env, &key.verifying_key()).is_none());
+    }
 }

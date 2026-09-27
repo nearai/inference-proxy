@@ -227,6 +227,15 @@ a BSL-1.0 dependency that `cargo deny` rejects — so this stays pinned to
    `engine_sampled_at_ms` null or older than the reader's staleness bound as
    unknown load.
 
+## Design notes
+
+- **Why not extend `engine_load.rs`.** `engine_load` polls `/v1/metrics` in gateway mode, and its data feeds this proxy's own admission and placement. `replica_state` reads `/v1/loads` in in-CVM mode. It needs fields `/v1/metrics` does not have (`prefill_backlog_tokens`, engine sample time, limits) and publishes signed frames for readers outside this process. The two never run against the same backends, so sharing a loop would couple two modes for no reuse.
+- **Process-wide rustls provider.** The lock enables both `ring` and `aws-lc-rs`, so rustls has no implicit default and `rediss://` would panic. `spawn_replica_state_publisher` installs `ring` once, and only when the feature is enabled. reqwest with `rustls-tls` already uses `ring`, so the provider the rest of the process uses does not change. `tls_url_does_not_panic_with_two_rustls_providers` pins this. If another component needs an explicit provider later, move the install to startup.
+- **Alternatives considered** (design doc linked under Purpose):
+  - Proxies streaming directly to routers: rejected, because there is no shared state for cross-router counters and it needs N×M connections.
+  - Adopting SGLang's gateway or NVIDIA Dynamo: rejected, because they are heavy dependencies in the TEE and their KV-overlap routing is not usable with E2EE traffic.
+  - Redis/Valkey: chosen as the shared, untrusted transport. Frames are signed.
+
 ## Caveats
 
 - The capped stream (`replica:{host_id}:frames`) is roughly an 80-minute
@@ -247,6 +256,7 @@ a BSL-1.0 dependency that `cargo deny` rejects — so this stays pinned to
   (default 300 s). A reader that fetches `/v1/attestation/report` right after
   a proxy restart may get a cached report from before the new key event was
   recorded, and so not find `key_id` yet — retry within one TTL.
+- `prefill_backlog_tokens` comes only from `/v1/loads` (`num_waiting_uncached_tokens`). SGLang does not export it to Prometheus, and nothing called `/v1/loads` in production before this change, so it is **not yet verified live**. First check after enabling on a host (e.g. gpu02): the field is populated and rises and falls with `rate(sglang_prefill_effective_tokens_total[1m])` in Grafana.
 
 ## Metrics
 

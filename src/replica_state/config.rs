@@ -44,8 +44,10 @@ impl ReplicaStateConfig {
             _ => return Ok(None),
         };
         // Neither message may include the URL: it can carry a password.
-        let scheme_ok =
-            url::Url::parse(&redis_url).is_ok_and(|u| matches!(u.scheme(), "redis" | "rediss"));
+        let scheme = url::Url::parse(&redis_url)
+            .ok()
+            .map(|u| u.scheme().to_string());
+        let scheme_ok = matches!(scheme.as_deref(), Some("redis" | "rediss"));
         if !scheme_ok || redis::Client::open(redis_url.as_str()).is_err() {
             anyhow::bail!(
                 "REPLICA_STATE_REDIS_URL is not a valid redis:// or rediss:// URL (value not shown)"
@@ -56,7 +58,7 @@ impl ReplicaStateConfig {
             _ => None,
         };
         if let Some(pem) = &redis_ca_cert {
-            if !redis_url.starts_with("rediss://") {
+            if scheme.as_deref() != Some("rediss") {
                 anyhow::bail!("REPLICA_STATE_REDIS_CA_CERT requires a rediss:// URL");
             }
             if !pem.contains("-----BEGIN CERTIFICATE-----")
@@ -315,6 +317,11 @@ mod tests {
         let cfg = with_ca("rediss://r:6379", &escaped).unwrap().unwrap();
         assert_eq!(cfg.redis_ca_cert.as_deref(), Some(TEST_CA));
         assert!(format!("{cfg:?}").contains("redis_ca_cert: true"));
+    }
+
+    #[test]
+    fn redis_ca_cert_accepts_uppercase_tls_scheme() {
+        assert!(with_ca("REDISS://r:6379", TEST_CA).unwrap().is_some());
     }
 
     #[test]

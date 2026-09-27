@@ -73,45 +73,116 @@ impl RedisSink {
         })
     }
 
-    /// One pipeline: SET state_key json EX 5 for each frame, then
-    /// XADD stream MAXLEN ~ 20000 * env json.
+    /// Sends [`build_pipeline`] in one round trip.
     pub async fn publish(&mut self, frames: &[(String, Envelope)]) -> anyhow::Result<()> {
         if frames.is_empty() {
             return Ok(());
         }
-        let jsons = frames
-            .iter()
-            .map(|(_, env)| serde_json::to_string(env))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut pipe = redis::pipe();
-        for ((replica_id, _), json) in frames.iter().zip(&jsons) {
-            pipe.cmd("SET")
-                .arg(state_key(&self.host_id, replica_id))
-                .arg(json)
-                .arg("EX")
-                .arg(KEY_TTL_SECS)
-                .ignore();
-        }
-        for json in &jsons {
-            pipe.cmd("XADD")
-                .arg(&self.stream)
-                .arg("MAXLEN")
-                .arg("~")
-                .arg(STREAM_MAXLEN)
-                .arg("*")
-                .arg("env")
-                .arg(json)
-                .ignore();
-        }
-        pipe.query_async::<()>(&mut self.conn)
+        build_pipeline(&self.host_id, &self.stream, frames)?
+            .query_async::<()>(&mut self.conn)
             .await
             .map_err(|e| anyhow!("redis publish failed: {:?}", e.kind()))
     }
 }
 
+/// One pipeline: SET state_key json EX 5 for each frame, then
+/// XADD stream MAXLEN ~ 20000 * env json.
+fn build_pipeline(
+    host_id: &str,
+    stream: &str,
+    frames: &[(String, Envelope)],
+) -> anyhow::Result<redis::Pipeline> {
+    let jsons = frames
+        .iter()
+        .map(|(_, env)| serde_json::to_string(env))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut pipe = redis::pipe();
+    for ((replica_id, _), json) in frames.iter().zip(&jsons) {
+        pipe.cmd("SET")
+            .arg(state_key(host_id, replica_id))
+            .arg(json)
+            .arg("EX")
+            .arg(KEY_TTL_SECS)
+            .ignore();
+    }
+    for json in &jsons {
+        pipe.cmd("XADD")
+            .arg(stream)
+            .arg("MAXLEN")
+            .arg("~")
+            .arg(STREAM_MAXLEN)
+            .arg("*")
+            .arg("env")
+            .arg(json)
+            .ignore();
+    }
+    Ok(pipe)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args(cmd: &redis::Cmd) -> Vec<String> {
+        cmd.args_iter()
+            .map(|a| match a {
+                redis::Arg::Simple(b) => String::from_utf8_lossy(b).into_owned(),
+                redis::Arg::Cursor => "<cursor>".to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pipeline_sets_ttl_keys_then_appends_capped_stream() {
+        let env = |n: u32| Envelope {
+            frame: format!("{{\"seq\":{n}}}"),
+            sig: format!("sig{n}"),
+            key_id: "0123456789abcdef".to_string(),
+        };
+        let frames = [("r1".to_string(), env(1)), ("r2".to_string(), env(2))];
+        let pipe = build_pipeline("gpu01", &stream_key("gpu01"), &frames).unwrap();
+        let cmds: Vec<Vec<String>> = pipe.cmd_iter().map(args).collect();
+        let j = |n: u32| serde_json::to_string(&env(n)).unwrap();
+        assert_eq!(
+            cmds,
+            vec![
+                vec![
+                    "SET".into(),
+                    "replica:gpu01:r1".into(),
+                    j(1),
+                    "EX".into(),
+                    "5".into()
+                ],
+                vec![
+                    "SET".into(),
+                    "replica:gpu01:r2".into(),
+                    j(2),
+                    "EX".into(),
+                    "5".into()
+                ],
+                vec![
+                    "XADD".into(),
+                    "replica:gpu01:frames".into(),
+                    "MAXLEN".into(),
+                    "~".into(),
+                    "20000".into(),
+                    "*".into(),
+                    "env".into(),
+                    j(1)
+                ],
+                vec![
+                    "XADD".into(),
+                    "replica:gpu01:frames".into(),
+                    "MAXLEN".into(),
+                    "~".into(),
+                    "20000".into(),
+                    "*".into(),
+                    "env".into(),
+                    j(2)
+                ],
+            ]
+        );
+    }
 
     #[test]
     fn key_layout_is_per_host() {

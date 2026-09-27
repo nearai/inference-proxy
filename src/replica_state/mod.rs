@@ -29,6 +29,21 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Whether a repeated connect failure should be logged again.
+fn should_warn(last: Option<Instant>, now: Instant, every: Duration) -> bool {
+    last.is_none_or(|t| now.duration_since(t) >= every)
+}
+
+/// Value of the `replica_state_key_bound` gauge for a bind outcome: 1 only
+/// when the key was actually recorded in the attested event log.
+fn key_bound_gauge<T>(bound: &Result<anyhow::Result<bool>, T>) -> f64 {
+    if matches!(bound, Ok(Ok(true))) {
+        1.0
+    } else {
+        0.0
+    }
+}
+
 /// `(replica_id, base_url)` pairs: replica `i` is backend `i` of `pool`
 /// (base backends first, then long-context).
 fn replica_targets(ids: &[String], pool: &BackendPool) -> Vec<(String, String)> {
@@ -75,8 +90,7 @@ pub fn spawn_replica_state_publisher(
                 "Replica report key binding timed out; readers will reject its frames"
             ),
         }
-        let key_bound = matches!(bound, Ok(Ok(true)));
-        metrics::gauge!("replica_state_key_bound").set(if key_bound { 1.0 } else { 0.0 });
+        metrics::gauge!("replica_state_key_bound").set(key_bound_gauge(&bound));
 
         let mut last_warn: Option<Instant> = None;
         let mut sink = loop {
@@ -85,7 +99,7 @@ pub fn spawn_replica_state_publisher(
             {
                 Ok(sink) => break sink,
                 Err(_) => {
-                    if last_warn.is_none_or(|t| t.elapsed() >= CONNECT_WARN_EVERY) {
+                    if should_warn(last_warn, Instant::now(), CONNECT_WARN_EVERY) {
                         tracing::warn!(
                             redis = %cfg.redis_host_for_logs(),
                             "Replica state Redis connect failed; retrying"
@@ -160,5 +174,25 @@ mod tests {
                 ("r3".to_string(), "http://a-long:8000".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn connect_warning_repeats_only_after_the_gap() {
+        let t0 = Instant::now();
+        let gap = Duration::from_secs(60);
+        assert!(should_warn(None, t0, gap));
+        assert!(!should_warn(Some(t0), t0 + Duration::from_secs(59), gap));
+        assert!(should_warn(Some(t0), t0 + gap, gap));
+    }
+
+    #[test]
+    fn key_bound_gauge_is_one_only_when_recorded() {
+        assert_eq!(key_bound_gauge::<()>(&Ok(Ok(true))), 1.0);
+        assert_eq!(key_bound_gauge::<()>(&Ok(Ok(false))), 0.0);
+        assert_eq!(
+            key_bound_gauge::<()>(&Ok(Err(anyhow::anyhow!("dstack down")))),
+            0.0
+        );
+        assert_eq!(key_bound_gauge(&Err::<anyhow::Result<bool>, _>(())), 0.0);
     }
 }

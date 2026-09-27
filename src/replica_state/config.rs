@@ -8,9 +8,10 @@ const MAX_INTERVAL_MS: u64 = 2000;
 
 /// Opt-in configuration for publishing signed per-replica load frames to
 /// Redis. The feature is enabled only when `REPLICA_STATE_REDIS_URL` is set
-/// to a non-blank value; callers construct this via [`Self::from_env`] (or
-/// [`Self::from_lookup`] in tests) and treat any error as "log and disable",
-/// never abort the process.
+/// to a non-blank value. `Config::from_env` builds it via [`Self::from_lookup`]
+/// and exposes it as `Config::replica_state()`; any error is logged and only
+/// disables this feature, never aborting the process.
+#[derive(Clone)]
 pub struct ReplicaStateConfig {
     /// `REPLICA_STATE_REDIS_URL`. Presence (non-blank) is what enables the
     /// feature. Never logged or included in `Debug` output.
@@ -120,11 +121,6 @@ impl ReplicaStateConfig {
             replica_ids,
             interval: Duration::from_millis(interval_ms),
         }))
-    }
-
-    /// Builds the config from real process environment variables.
-    pub fn from_env(backend_count: usize) -> anyhow::Result<Option<Self>> {
-        Self::from_lookup(|k| std::env::var(k).ok(), backend_count)
     }
 
     /// Host (and port, if present) of `redis_url`, safe to log. Never

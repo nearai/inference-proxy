@@ -576,6 +576,10 @@ match replica_state::config::ReplicaStateConfig::from_env(config.backend_urls.le
   - cloud-api's attestation verifier and a customer verifier still pass with the extra event.
   - Frames arrive with `engine_sampled_at_ms` close to wall-clock.
 
+## After the approach audit (26 Sep 2026)
+
+- `REPLICA_STATE_*` is now parsed in `Config::from_env` and exposed as `Config::replica_state()` (like `Config::admission()`), per CLAUDE.md ("all env vars loaded at startup"). `ReplicaStateConfig::from_env` and the `main.rs` `match` shown in Task 5 are superseded. An invalid value still only logs and disables the feature.
+
 ## Review changes (principal review, 25 Sep 2026)
 
 - **Correctness fixes:**

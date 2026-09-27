@@ -208,27 +208,21 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Replica state publishing (opt-in): signed per-replica load frames to Redis.
-    match vllm_proxy_rs::replica_state::config::ReplicaStateConfig::from_env(backend_pool.len()) {
-        Ok(Some(rs)) => {
-            info!(
-                host_id = %rs.host_id,
-                replicas = rs.replica_ids.len(),
-                interval_ms = rs.interval.as_millis() as u64,
-                redis = %rs.redis_host_for_logs(),
-                "Publishing replica state to Redis"
-            );
-            vllm_proxy_rs::replica_state::spawn_replica_state_publisher(
-                rs,
-                config.model_name.clone(),
-                backend_pool.clone(),
-                backend_client.clone(),
-                config.dev_mode || config.non_tee_deployment,
-            );
-        }
-        Ok(None) => {}
-        Err(e) => {
-            tracing::error!(error = %e, "Replica state publishing disabled: invalid REPLICA_STATE_* configuration")
-        }
+    if let Some(rs) = config.replica_state() {
+        info!(
+            host_id = %rs.host_id,
+            replicas = rs.replica_ids.len(),
+            interval_ms = rs.interval.as_millis() as u64,
+            redis = %rs.redis_host_for_logs(),
+            "Publishing replica state to Redis"
+        );
+        vllm_proxy_rs::replica_state::spawn_replica_state_publisher(
+            rs.clone(),
+            config.model_name.clone(),
+            backend_pool.clone(),
+            backend_client.clone(),
+            config.dev_mode || config.non_tee_deployment,
+        );
     }
 
     // Live engine load per backend (gateway mode): polled when probe URLs are

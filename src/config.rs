@@ -431,6 +431,10 @@ pub struct Config {
     /// `VLLM_BACKEND_URLS`) whose `/v1/metrics` is polled for the engine's
     /// running and queued request counts (`VLLM_BACKEND_PROBE_URLS`). Empty =
     /// no engine view; placement and admission use the gateway's own counts.
+    /// Replica state publishing (`REPLICA_STATE_*`), `None` when off or
+    /// invalid (an invalid value is logged and disables only this feature).
+    /// See docs/replica-state.md.
+    pub replica_state: Option<crate::replica_state::config::ReplicaStateConfig>,
     pub backend_probe_urls: Vec<String>,
     /// Poll interval for the probes (`VLLM_BACKEND_PROBE_INTERVAL_SECS`,
     /// default 2).
@@ -873,6 +877,20 @@ impl Config {
                 long_context_above_tokens,
             );
 
+        // One replica id per pool backend: base tier first, then long context.
+        let replica_state = match crate::replica_state::config::ReplicaStateConfig::from_lookup(
+            |k| env::var(k).ok(),
+            backend_urls.len() + backend_long_context_urls.len(),
+        ) {
+            Ok(rs) => rs,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "Replica state publishing disabled: invalid REPLICA_STATE_* configuration"
+                );
+                None
+            }
+        };
         let config = Config {
             model_name,
             tokens,
@@ -973,6 +991,7 @@ impl Config {
             admission_queue_saturated_at,
             admission_retry_after_secs,
             backend_connect_failover,
+            replica_state,
             backend_probe_urls,
             backend_probe_interval_secs,
             backend_long_context_urls,
@@ -1123,6 +1142,12 @@ impl Config {
             .chain(&self.backend_long_context_probe_urls)
             .cloned()
             .collect()
+    }
+
+    /// Replica state publishing settings, `None` unless `REPLICA_STATE_REDIS_URL`
+    /// is set to a valid configuration.
+    pub fn replica_state(&self) -> Option<&crate::replica_state::config::ReplicaStateConfig> {
+        self.replica_state.as_ref()
     }
 
     /// Lane admission settings, `None` unless `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` is set.
@@ -1282,6 +1307,35 @@ mod tests {
         ] {
             env::remove_var(key);
         }
+    }
+
+    #[test]
+    fn replica_state_is_parsed_by_config_and_invalid_values_only_disable_it() {
+        let base = [
+            ("MODEL_NAME", "m"),
+            ("TOKEN", "t"),
+            ("VLLM_BACKEND_URLS", "http://a:8000"),
+            ("VLLM_BACKEND_LONG_CONTEXT_URLS", "http://b:8000"),
+            ("VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS", "32000"),
+            ("REPLICA_STATE_REDIS_URL", "redis://r:6379"),
+            ("REPLICA_STATE_HOST_ID", "gpu01"),
+        ];
+        // One id per pool backend, base tier first, then long context.
+        let ok = [&base[..], &[("REPLICA_STATE_REPLICA_IDS", "r1,r2")]].concat();
+        with_env_vars(&ok, || {
+            let config = Config::from_env().unwrap();
+            let rs = config.replica_state().expect("replica state configured");
+            assert_eq!(rs.host_id, "gpu01");
+            assert_eq!(rs.replica_ids, ["r1", "r2"]);
+        });
+        let short = [&base[..], &[("REPLICA_STATE_REPLICA_IDS", "r1")]].concat();
+        with_env_vars(&short, || {
+            let config = Config::from_env().expect("bad REPLICA_STATE_* never fails startup");
+            assert!(config.replica_state().is_none());
+        });
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            assert!(Config::from_env().unwrap().replica_state().is_none());
+        });
     }
 
     #[test]

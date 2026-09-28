@@ -289,4 +289,29 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&seal(&r, &sk).frame).unwrap();
         assert!(v["replicas"][0]["limits"]["max_context_tokens"].is_null());
     }
+
+    /// Cross-repo contract: cloud-api verifies this exact envelope with the
+    /// public key of seed `[7u8; 32]`. Regenerate with `UPDATE_GOLDEN=1`
+    /// only for a deliberate frame change, and update cloud-api's copy too.
+    #[test]
+    fn golden_host_frame_is_stable() {
+        use sha2::Digest as _;
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let mut r = report();
+        r.report_key_id =
+            hex::encode(sha2::Sha256::digest(sk.verifying_key().to_bytes()))[..16].to_string();
+        let env = seal(&r, &sk);
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/replica_state/testdata/host_frame_v1.json"
+        );
+        if std::env::var_os("UPDATE_GOLDEN").is_some() {
+            std::fs::write(path, serde_json::to_string_pretty(&env).unwrap() + "\n").unwrap();
+        }
+        let golden: Envelope =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(golden, env);
+        assert_eq!(golden.key_id, r.report_key_id);
+        assert_eq!(open(&golden, &sk.verifying_key()), Some(r));
+    }
 }

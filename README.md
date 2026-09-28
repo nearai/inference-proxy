@@ -333,8 +333,10 @@ registries the build reads), and on manual dispatch:
   `env -i PATH=… HOME=… ENABLE_NV_ATTESTATION_SDK=1 SOURCE_DATE_EPOCH=0 bash build-image.sh`
   with a 60-minute limit, digest read from `index.json`;
 - every digest must match the others and the digest `build.yml` published for
-  the same commit (read from the `build.yml` run, and for `main` also from the
-  `staging-<date>-<sha>` tag on Docker Hub);
+  the same commit (read from its one successful `Reproducible Docker Image`
+  job, and for `main` also from the `staging-<date>-<sha>` tag on Docker Hub).
+  Auxiliary `Security audit` checks are excluded because they have no
+  downloadable logs;
 - a pins guard: one build runs with `LOAD_IMAGE=1`, and every committed
   `pinned-packages-*.txt` must equal the package list that build installed.
 

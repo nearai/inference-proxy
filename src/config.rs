@@ -433,7 +433,6 @@ pub struct Config {
     /// no engine view; placement and admission use the gateway's own counts.
     /// Replica state publishing (`REPLICA_STATE_*`), `None` when off or
     /// invalid (an invalid value is logged and disables only this feature).
-    /// See docs/replica-state.md.
     pub replica_state: Option<crate::replica_state::config::ReplicaStateConfig>,
     pub backend_probe_urls: Vec<String>,
     /// Poll interval for the probes (`VLLM_BACKEND_PROBE_INTERVAL_SECS`,

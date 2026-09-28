@@ -162,7 +162,7 @@ impl BackendConversationAffinity {
                         }
                         return Some(Placement::new(sel, path));
                     }
-                    sel => {
+                    Some(sel) => {
                         let reason = if !pool.backends()[i].healthy.load(Ordering::Relaxed) {
                             "unhealthy"
                         } else {
@@ -173,6 +173,19 @@ impl BackendConversationAffinity {
                         // Drop the probe selection first so its guard releases
                         // the reservation before the existing path runs.
                         drop(sel);
+                    }
+                    None => {
+                        // Nothing is eligible under `policy` (`pick`'s scan ignores
+                        // `preferred`), and the probe already recorded that refusal;
+                        // the fallback would only refuse and count it again.
+                        let reason = if !pool.backends()[i].healthy.load(Ordering::Relaxed) {
+                            "unhealthy"
+                        } else {
+                            "imbalance"
+                        };
+                        metrics::counter!("placement_hint_overridden_total", "reason" => reason)
+                            .increment(1);
+                        return None;
                     }
                 }
             }
@@ -651,5 +664,19 @@ mod tests {
             .place(&pool, Some(key), ReplicaHint::Absent, "/x", &Policy::NONE)
             .unwrap();
         assert_eq!(next.index, 1);
+    }
+
+    /// A hint on a saturated pool refuses once, without running the fallback.
+    #[test]
+    fn saturated_pool_with_hint_still_refuses_cleanly() {
+        let pool = two_backend_pool();
+        let aff = BackendConversationAffinity::new(false, 2, 8, 60);
+        let policy = Policy {
+            max_conns: Some(0),
+            ..Policy::NONE
+        };
+        assert!(aff
+            .place(&pool, None, ReplicaHint::Index(0), "/x", &policy)
+            .is_none());
     }
 }

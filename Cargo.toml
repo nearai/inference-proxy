@@ -47,7 +47,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 regex = "1"
 hex = "0.4"
-base64 = "0.22"
+base64 = "0.23"
 uuid = { version = "1", features = ["v4"] }
 rand = "0.10"
 percent-encoding = "2"

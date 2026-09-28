@@ -44,6 +44,16 @@ fn key_bound_gauge<T>(bound: &Result<anyhow::Result<bool>, T>) -> f64 {
     }
 }
 
+/// Loggable cause of a failed key binding. With an HTTP dstack endpoint
+/// (simulator) the error is a `reqwest::Error`, whose `Display` includes the
+/// URL; that is stripped so no URL reaches the logs.
+fn bind_error_detail(e: anyhow::Error) -> String {
+    match e.downcast::<reqwest::Error>() {
+        Ok(re) => format!("{:#}", anyhow::Error::from(re.without_url())),
+        Err(e) => format!("{e:#}"),
+    }
+}
+
 /// `(replica_id, base_url)` pairs: replica `i` is backend `i` of `pool`
 /// (base backends first, then long-context).
 fn replica_targets(ids: &[String], pool: &BackendPool) -> Vec<(String, String)> {
@@ -79,10 +89,12 @@ pub fn spawn_replica_state_publisher(
             ),
         )
         .await;
+        metrics::gauge!("replica_state_key_bound").set(key_bound_gauge(&bound));
         match bound {
             Ok(Ok(_)) => {}
-            Ok(Err(_)) => tracing::warn!(
+            Ok(Err(e)) => tracing::warn!(
                 key_id = %key.key_id,
+                error = %bind_error_detail(e),
                 "Replica report key could not be bound to attestation; readers will reject its frames"
             ),
             Err(_) => tracing::warn!(
@@ -90,7 +102,6 @@ pub fn spawn_replica_state_publisher(
                 "Replica report key binding timed out; readers will reject its frames"
             ),
         }
-        metrics::gauge!("replica_state_key_bound").set(key_bound_gauge(&bound));
 
         let mut last_warn: Option<Instant> = None;
         let mut sink = loop {
@@ -98,10 +109,12 @@ pub fn spawn_replica_state_publisher(
                 .await
             {
                 Ok(sink) => break sink,
-                Err(_) => {
+                // RedisSink errors carry only the redis error kind, never the URL.
+                Err(e) => {
                     if should_warn(last_warn, Instant::now(), CONNECT_WARN_EVERY) {
                         tracing::warn!(
                             redis = %cfg.redis_host_for_logs(),
+                            error = %e,
                             "Replica state Redis connect failed; retrying"
                         );
                         last_warn = Some(Instant::now());
@@ -183,6 +196,25 @@ mod tests {
         assert!(should_warn(None, t0, gap));
         assert!(!should_warn(Some(t0), t0 + Duration::from_secs(59), gap));
         assert!(should_warn(Some(t0), t0 + gap, gap));
+    }
+
+    #[tokio::test]
+    async fn bind_error_detail_never_includes_the_url() {
+        // Nothing listens on port 1; the path stands in for anything the
+        // URL could carry.
+        let err = reqwest::Client::new()
+            .post("http://127.0.0.1:1/EmitEvent-url-marker")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("url-marker"));
+        let detail = bind_error_detail(anyhow::Error::from(err));
+        assert!(!detail.contains("url-marker"), "{detail}");
+        assert!(!detail.contains("127.0.0.1"), "{detail}");
+        assert!(!detail.is_empty());
+
+        let other = bind_error_detail(anyhow::anyhow!("dstack socket missing"));
+        assert_eq!(other, "dstack socket missing");
     }
 
     #[test]

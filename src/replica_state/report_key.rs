@@ -40,15 +40,17 @@ impl ReportKey {
     /// `{"key_id","public_key_hex","boot_id","host_id","model","replica_ids"}`.
     /// Binds the key to the host and replicas it may report for. Public data only.
     pub fn event_payload(&self, host_id: &str, model: &str, replica_ids: &[String]) -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({
+        // `Value`'s Display is infallible and compact, so no `expect` needed.
+        serde_json::json!({
             "key_id": self.key_id,
             "public_key_hex": self.public_hex(),
             "boot_id": self.boot_id,
             "host_id": host_id,
             "model": model,
             "replica_ids": replica_ids,
-        }))
-        .expect("static JSON object always serializes")
+        })
+        .to_string()
+        .into_bytes()
     }
 }
 

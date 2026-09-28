@@ -155,6 +155,20 @@ mod tests {
     }
 
     #[test]
+    fn non_finite_floats_seal_as_null_without_panicking() {
+        // serde_json writes NaN/inf as `null`, so the `expect` in `seal`
+        // cannot fire on a load value; readers see `None`.
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let mut r = report();
+        r.load.gen_tps = Some(f64::INFINITY);
+        r.load.kv_usage = Some(f64::NAN);
+        let env = seal(&r, &sk);
+        assert!(env.frame.contains(r#""gen_tps":null"#));
+        let opened = open(&env, &sk.verifying_key()).unwrap();
+        assert_eq!((opened.load.gen_tps, opened.load.kv_usage), (None, None));
+    }
+
+    #[test]
     fn tampered_frame_or_wrong_key_fails() {
         let sk = SigningKey::from_bytes(&[7u8; 32]);
         let mut env = seal(&report(), &sk);

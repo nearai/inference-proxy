@@ -31,14 +31,15 @@ fn sum_u32(ranks: &[serde_json::Value], key: &str) -> Option<u32> {
 }
 
 /// Sums a floating-point field across ranks. `None` if any rank is missing
-/// the key, or the value isn't a number.
+/// the key, the value isn't a number, or the sum overflows to infinity
+/// (mirroring [`sum_u64`]'s overflow handling).
 fn sum_f64(ranks: &[serde_json::Value], key: &str) -> Option<f64> {
     let mut total: f64 = 0.0;
     for rank in ranks {
         let v = rank.get(key)?.as_f64()?;
         total += v;
     }
-    Some(total)
+    total.is_finite().then_some(total)
 }
 
 /// Minimum `timestamp` (float seconds) across ranks, converted to
@@ -222,6 +223,11 @@ mod tests {
             "num_running_reqs":5_000_000_000u64,"num_waiting_reqs":4_294_967_296u64}]});
         let r = parse_sglang_loads(&v).unwrap();
         assert_eq!((r.load.running, r.load.queued), (None, None));
+        // Finite per-rank f64s whose sum overflows to infinity.
+        let v = serde_json::json!({"loads":[
+            {"timestamp":1790000000.0,"gen_throughput":f64::MAX},
+            {"timestamp":1790000000.0,"gen_throughput":f64::MAX}]});
+        assert_eq!(parse_sglang_loads(&v).unwrap().load.gen_tps, None);
     }
 
     #[test]
@@ -291,6 +297,21 @@ mod tests {
         let r = read_replica(
             &client,
             &err_server.uri(),
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        assert!(r.is_none());
+
+        // 2xx with a non-JSON body yields None.
+        let bad_json_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/loads"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&bad_json_server)
+            .await;
+        let r = read_replica(
+            &client,
+            &bad_json_server.uri(),
             std::time::Duration::from_secs(2),
         )
         .await;

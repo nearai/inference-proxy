@@ -207,18 +207,16 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Replica state publishing (opt-in): signed per-replica load frames to Redis.
+    // Replica state publishing (opt-in): one signed host frame per tick to Redis.
     if let Some(rs) = config.replica_state() {
         info!(
             host_id = %rs.host_id,
-            replicas = rs.replica_ids.len(),
             interval_ms = rs.interval.as_millis() as u64,
             redis = %rs.redis_host_for_logs(),
             "Publishing replica state to Redis"
         );
         vllm_proxy_rs::replica_state::spawn_replica_state_publisher(
             rs.clone(),
-            config.model_name.clone(),
             backend_pool.clone(),
             backend_client.clone(),
             config.dev_mode || config.non_tee_deployment,

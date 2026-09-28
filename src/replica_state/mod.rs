@@ -74,19 +74,13 @@ fn bind_error_detail(e: anyhow::Error) -> String {
 /// Records `key` in the attested event log, retrying definite errors with
 /// capped backoff until it succeeds. Runs beside the publish loop, so frames
 /// are published meanwhile; readers reject them until the key is bound.
-async fn bind_key(
-    key: Arc<ReportKey>,
-    host_id: String,
-    model: String,
-    replica_ids: Vec<String>,
-    skip: bool,
-) {
+async fn bind_key(key: Arc<ReportKey>, host_id: String, skip: bool) {
     metrics::gauge!("replica_state_key_bound").set(0.0);
     let mut last_warn: Option<Instant> = None;
     for attempt in 1u32.. {
         let bound = tokio::time::timeout(
             BIND_TIMEOUT,
-            report_key::bind_to_attestation(&key, &host_id, &model, &replica_ids, skip),
+            report_key::bind_to_attestation(&key, &host_id, skip),
         )
         .await;
         metrics::gauge!("replica_state_key_bound").set(key_bound_gauge(&bound));
@@ -122,23 +116,19 @@ async fn bind_key(
     }
 }
 
-/// `(replica_id, base_url)` pairs: replica `i` is backend `i` of `pool`
-/// (base backends first, then long-context).
-fn replica_targets(ids: &[String], pool: &BackendPool) -> Vec<(String, String)> {
-    ids.iter()
-        .cloned()
-        .zip(pool.backends().iter().map(|b| b.base_url.clone()))
-        .collect()
+/// Backend base URLs in publisher order: base backends first, then
+/// long-context. Slot index `i` becomes `ReplicaState.index == i as u32`.
+fn publisher_urls(pool: &BackendPool) -> Vec<String> {
+    pool.backends().iter().map(|b| b.base_url.clone()).collect()
 }
 
-/// Spawns the background task that publishes signed per-replica state to
-/// Redis every `cfg.interval`. Replica `i` of `cfg.replica_ids` is backend `i`
-/// of `pool` (base backends first, then long-context). Never blocks the
-/// caller: key binding runs in its own task and the first Redis connect
-/// happens inside the publish task, so neither delays the other.
+/// Spawns the background task that publishes one signed host frame to Redis
+/// every `cfg.interval`. Replica index `i` is backend `i` of `pool` (base
+/// backends first, then long-context). Never blocks the caller: key binding
+/// runs in its own task and the first Redis connect happens inside the
+/// publish task, so neither delays the other.
 pub fn spawn_replica_state_publisher(
     cfg: ReplicaStateConfig,
-    model: String,
     pool: Arc<BackendPool>,
     client: reqwest::Client,
     skip_binding: bool,
@@ -146,13 +136,7 @@ pub fn spawn_replica_state_publisher(
     // Process-wide rustls default, needed before any `rediss://` connect.
     redis_sink::install_crypto_provider();
     let key = Arc::new(ReportKey::generate());
-    tokio::spawn(bind_key(
-        key.clone(),
-        cfg.host_id.clone(),
-        model.clone(),
-        cfg.replica_ids.clone(),
-        skip_binding,
-    ));
+    tokio::spawn(bind_key(key.clone(), cfg.host_id.clone(), skip_binding));
     tokio::spawn(async move {
         let mut last_warn: Option<Instant> = None;
         let mut sink = loop {
@@ -181,9 +165,8 @@ pub fn spawn_replica_state_publisher(
 
         let mut publisher = Publisher::new(
             cfg.host_id.clone(),
-            model,
             key,
-            replica_targets(&cfg.replica_ids, &pool),
+            publisher_urls(&pool),
             client,
             cfg.interval,
         );
@@ -193,7 +176,7 @@ pub fn spawn_replica_state_publisher(
         loop {
             ticker.tick().await;
             let started = Instant::now();
-            let frames = publisher
+            let env = publisher
                 .tick(
                     |i| {
                         pool.backends()
@@ -204,9 +187,9 @@ pub fn spawn_replica_state_publisher(
                 )
                 .await;
             // RedisSink errors carry only the redis error kind, never the URL.
-            match sink.publish(&frames).await {
+            match sink.publish(&env).await {
                 Ok(()) => {
-                    metrics::counter!("replica_state_frames_total").increment(frames.len() as u64);
+                    metrics::counter!("replica_state_frames_total").increment(1);
                 }
                 Err(e) => {
                     metrics::counter!("replica_state_publish_failures_total").increment(1);
@@ -224,18 +207,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn replica_targets_pair_ids_with_base_then_long_context_backends() {
+    fn publisher_urls_are_base_then_long_context() {
         let pool = BackendPool::with_long_context(
-            vec!["http://a:8000".into(), "http://b:8000".into()],
-            vec!["http://a-long:8000".into()],
+            vec!["http://b0".into(), "http://b1".into()],
+            vec!["http://l0".into()],
         );
-        let ids = vec!["r1".to_string(), "r2".to_string(), "r3".to_string()];
         assert_eq!(
-            replica_targets(&ids, &pool),
+            publisher_urls(&pool),
             vec![
-                ("r1".to_string(), "http://a:8000".to_string()),
-                ("r2".to_string(), "http://b:8000".to_string()),
-                ("r3".to_string(), "http://a-long:8000".to_string()),
+                "http://b0".to_string(),
+                "http://b1".to_string(),
+                "http://l0".to_string(),
             ]
         );
     }

@@ -103,7 +103,10 @@ pub fn parse_sglang_loads(body: &serde_json::Value) -> Option<ReplicaLoad> {
             gen_tps,
             cached_token_ratio,
         },
-        limits: Limits { max_running },
+        limits: Limits {
+            max_running,
+            max_context_tokens: None,
+        },
         engine_version,
         sampled_at_ms,
     })
@@ -147,6 +150,45 @@ pub async fn read_replica(
         }
     };
     parse_sglang_loads(&body)
+}
+
+/// Pure parse of a `GET /v1/models` body: `{"data":[{"id":...,"max_model_len":N}, ...]}`.
+/// Takes the first entry's `max_model_len` if it is a positive integer.
+pub fn parse_max_context(body: &serde_json::Value) -> Option<u64> {
+    body.get("data")?
+        .as_array()?
+        .first()?
+        .get("max_model_len")?
+        .as_u64()
+        .filter(|n| *n > 0)
+}
+
+/// `GET {base}/v1/models` with a timeout, then parse for `max_model_len`. Any
+/// failure (network, timeout, non-success status, bad JSON, or malformed
+/// body) yields `None`. Never logs the response body or the replica's base
+/// URL; the caller adds replica context.
+pub async fn read_max_context(
+    client: &reqwest::Client,
+    base_url: &str,
+    timeout: std::time::Duration,
+) -> Option<u64> {
+    let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
+    let resp = match client.get(url).timeout(timeout).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(timed_out = e.is_timeout(), "replica context read failed");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::debug!(
+            status = resp.status().as_u16(),
+            "replica context read failed"
+        );
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    parse_max_context(&body)
 }
 
 #[cfg(test)]
@@ -356,5 +398,60 @@ mod tests {
         )
         .await;
         assert!(r.is_none());
+    }
+
+    #[test]
+    fn max_context_from_first_model() {
+        let body = serde_json::json!({"object":"list","data":[{"id":"m","max_model_len":131072}]});
+        assert_eq!(parse_max_context(&body), Some(131_072));
+    }
+
+    #[test]
+    fn max_context_missing_or_invalid_is_none() {
+        for body in [
+            serde_json::json!({"data":[]}),
+            serde_json::json!({"data":[{"id":"m"}]}),
+            serde_json::json!({"data":[{"id":"m","max_model_len":0}]}),
+            serde_json::json!({"data":[{"id":"m","max_model_len":-5}]}),
+            serde_json::json!({"data":[{"id":"m","max_model_len":"big"}]}),
+            serde_json::json!({"nope":1}),
+        ] {
+            assert_eq!(parse_max_context(&body), None, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_max_context_handles_success_404_and_timeout() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let ok = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"data":[{"id":"m","max_model_len":1_000_000}]}),
+                ),
+            )
+            .mount(&ok)
+            .await;
+        let client = reqwest::Client::new();
+        let t = std::time::Duration::from_millis(300);
+        assert_eq!(
+            read_max_context(&client, &ok.uri(), t).await,
+            Some(1_000_000)
+        );
+
+        let missing = MockServer::start().await; // no mocks → 404
+        assert_eq!(read_max_context(&client, &missing.uri(), t).await, None);
+
+        let slow = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(2)))
+            .mount(&slow)
+            .await;
+        assert_eq!(read_max_context(&client, &slow.uri(), t).await, None);
     }
 }

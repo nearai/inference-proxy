@@ -35,7 +35,7 @@ This is a Rust rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-pro
 - `attestation.rs` — `AttestationCache`, `generate_attestation()`, GPU evidence collection with retry/serialization, dstack TDX quotes
 - `auth.rs` — `RequireAuth` axum extractor (validates Bearer token)
 - `routes/` — thin handlers that parse request, call proxy helpers
-- `replica_state/` — opt-in signed per-replica state publishing to Redis (`spawn_replica_state_publisher`)
+- `replica_state/` — opt-in publishing of one signed host frame per tick to Redis (`spawn_replica_state_publisher`)
 
 ### Important patterns
 

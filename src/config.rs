@@ -876,20 +876,19 @@ impl Config {
                 long_context_above_tokens,
             );
 
-        // One replica id per pool backend: base tier first, then long context.
-        let replica_state = match crate::replica_state::config::ReplicaStateConfig::from_lookup(
-            |k| env::var(k).ok(),
-            backend_urls.len() + backend_long_context_urls.len(),
-        ) {
-            Ok(rs) => rs,
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    "Replica state publishing disabled: invalid REPLICA_STATE_* configuration"
-                );
-                None
-            }
-        };
+        let replica_state =
+            match crate::replica_state::config::ReplicaStateConfig::from_lookup(|k| {
+                env::var(k).ok()
+            }) {
+                Ok(rs) => rs,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "Replica state publishing disabled: invalid REPLICA_STATE_* configuration"
+                    );
+                    None
+                }
+            };
         let config = Config {
             model_name,
             tokens,
@@ -1319,18 +1318,10 @@ mod tests {
             ("REPLICA_STATE_REDIS_URL", "redis://r:6379"),
             ("REPLICA_STATE_HOST_ID", "gpu01"),
         ];
-        // One id per pool backend, base tier first, then long context.
-        let ok = [&base[..], &[("REPLICA_STATE_REPLICA_IDS", "r1,r2")]].concat();
-        with_env_vars(&ok, || {
+        with_env_vars(&base, || {
             let config = Config::from_env().unwrap();
             let rs = config.replica_state().expect("replica state configured");
             assert_eq!(rs.host_id, "gpu01");
-            assert_eq!(rs.replica_ids, ["r1", "r2"]);
-        });
-        let short = [&base[..], &[("REPLICA_STATE_REPLICA_IDS", "r1")]].concat();
-        with_env_vars(&short, || {
-            let config = Config::from_env().expect("bad REPLICA_STATE_* never fails startup");
-            assert!(config.replica_state().is_none());
         });
         with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
             assert!(Config::from_env().unwrap().replica_state().is_none());

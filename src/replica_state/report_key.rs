@@ -36,18 +36,29 @@ impl ReportKey {
         hex::encode(self.signing.verifying_key().to_bytes())
     }
 
-    /// Event-log payload:
-    /// `{"key_id","public_key_hex","boot_id","host_id","model","replica_ids"}`.
-    /// Binds the key to the host and replicas it may report for. Public data only.
-    pub fn event_payload(&self, host_id: &str, model: &str, replica_ids: &[String]) -> Vec<u8> {
+    /// Deterministic key for tests: fixed `seed` and `boot_id` rather than
+    /// [`Self::generate`]'s random ones.
+    #[cfg(test)]
+    pub fn from_seed(seed: [u8; 32], boot_id: &str) -> Self {
+        let signing = SigningKey::from_bytes(&seed);
+        let key_id =
+            hex::encode(sha2::Sha256::digest(signing.verifying_key().to_bytes()))[..16].to_string();
+        Self {
+            signing,
+            key_id,
+            boot_id: boot_id.to_string(),
+        }
+    }
+
+    /// Event-log payload: `{"key_id","public_key_hex","boot_id","host_id"}`.
+    /// Binds the key to the host it may report for. Public data only.
+    pub fn event_payload(&self, host_id: &str) -> Vec<u8> {
         // `Value`'s Display is infallible and compact, so no `expect` needed.
         serde_json::json!({
             "key_id": self.key_id,
             "public_key_hex": self.public_hex(),
             "boot_id": self.boot_id,
             "host_id": host_id,
-            "model": model,
-            "replica_ids": replica_ids,
         })
         .to_string()
         .into_bytes()
@@ -67,8 +78,6 @@ impl std::fmt::Debug for ReportKey {
 pub async fn bind_to_attestation(
     key: &ReportKey,
     host_id: &str,
-    model: &str,
-    replica_ids: &[String],
     skip: bool,
 ) -> anyhow::Result<bool> {
     if skip {
@@ -76,10 +85,7 @@ pub async fn bind_to_attestation(
         return Ok(false);
     }
     dstack_sdk::dstack_client::DstackClient::new(None)
-        .emit_event(
-            REPORT_KEY_EVENT.to_string(),
-            key.event_payload(host_id, model, replica_ids),
-        )
+        .emit_event(REPORT_KEY_EVENT.to_string(), key.event_payload(host_id))
         .await?;
     Ok(true)
 }
@@ -105,19 +111,17 @@ mod tests {
     }
 
     #[test]
-    fn event_payload_binds_host_and_exposes_no_secret() {
+    fn event_payload_binds_host_only() {
         use sha2::Digest;
         let k = ReportKey::generate();
-        let ids = vec!["r1".to_string(), "r2".to_string()];
-        let v: serde_json::Value =
-            serde_json::from_slice(&k.event_payload("host-a", "m", &ids)).unwrap();
-        assert_eq!(v.as_object().unwrap().len(), 6);
+        let v: serde_json::Value = serde_json::from_slice(&k.event_payload("host-a")).unwrap();
+        assert_eq!(v.as_object().unwrap().len(), 4);
         assert_eq!(v["key_id"], k.key_id);
         assert_eq!(v["public_key_hex"], k.public_hex());
         assert_eq!(v["boot_id"], k.boot_id);
         assert_eq!(v["host_id"], "host-a");
-        assert_eq!(v["model"], "m");
-        assert_eq!(v["replica_ids"], serde_json::json!(["r1", "r2"]));
+        assert!(v.get("model").is_none());
+        assert!(v.get("replica_ids").is_none());
         let pk = hex::decode(v["public_key_hex"].as_str().unwrap()).unwrap();
         assert_eq!(
             v["key_id"].as_str().unwrap(),
@@ -131,11 +135,17 @@ mod tests {
 
     #[tokio::test]
     async fn binding_is_skipped_when_asked() {
-        let ids = vec!["r1".to_string()];
-        assert!(
-            !bind_to_attestation(&ReportKey::generate(), "h", "m", &ids, true)
-                .await
-                .unwrap()
-        );
+        assert!(!bind_to_attestation(&ReportKey::generate(), "h", true)
+            .await
+            .unwrap());
+    }
+
+    #[test]
+    fn from_seed_is_deterministic() {
+        let a = ReportKey::from_seed([9u8; 32], "boot-x");
+        let b = ReportKey::from_seed([9u8; 32], "boot-x");
+        assert_eq!(a.public_hex(), b.public_hex());
+        assert_eq!(a.key_id, b.key_id);
+        assert_eq!(a.boot_id, "boot-x");
     }
 }

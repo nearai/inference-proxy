@@ -1,4 +1,4 @@
-//! Redis sink for signed replica frames: a short-TTL "latest" key per replica
+//! Redis sink for the signed host frame: a short-TTL "latest" key per host
 //! plus a capped per-host stream.
 //!
 //! Never log the Redis URL (it may hold a password) or a redis error's Display
@@ -11,13 +11,14 @@ use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 
 use super::report::Envelope;
 
-/// TTL of each replica's latest-state key.
+/// TTL of the host's latest-state key.
 pub const KEY_TTL_SECS: u64 = 5;
-/// ~80 min at 2 replicas x 2 Hz; a buffer, not the recorder.
-pub const STREAM_MAXLEN: usize = 20_000;
+/// ~40 min at 2 Hz for one host; covers a full host replacement window with
+/// room to spare. A buffer, not the recorder.
+pub const STREAM_MAXLEN: usize = 5_000;
 
-pub fn state_key(host_id: &str, replica_id: &str) -> String {
-    format!("replica:{host_id}:{replica_id}")
+pub fn state_key(host_id: &str) -> String {
+    format!("replica:{host_id}")
 }
 
 pub fn stream_key(host_id: &str) -> String {
@@ -74,48 +75,34 @@ impl RedisSink {
     }
 
     /// Sends the `build_pipeline` commands in one round trip.
-    pub async fn publish(&mut self, frames: &[(String, Envelope)]) -> anyhow::Result<()> {
-        if frames.is_empty() {
-            return Ok(());
-        }
-        build_pipeline(&self.host_id, &self.stream, frames)?
+    pub async fn publish(&mut self, env: &Envelope) -> anyhow::Result<()> {
+        build_pipeline(&self.host_id, &self.stream, env)?
             .query_async::<()>(&mut self.conn)
             .await
             .map_err(|e| anyhow!("redis publish failed: {:?}", e.kind()))
     }
 }
 
-/// One pipeline: SET state_key json EX 5 for each frame, then
-/// XADD stream MAXLEN ~ 20000 * env json.
-fn build_pipeline(
-    host_id: &str,
-    stream: &str,
-    frames: &[(String, Envelope)],
-) -> anyhow::Result<redis::Pipeline> {
-    let jsons = frames
-        .iter()
-        .map(|(_, env)| serde_json::to_string(env))
-        .collect::<Result<Vec<_>, _>>()?;
+/// One pipeline: `SET replica:{host} <json> EX 5`, then
+/// `XADD replica:{host}:frames MAXLEN ~ 5000 * env <json>`.
+fn build_pipeline(host_id: &str, stream: &str, env: &Envelope) -> anyhow::Result<redis::Pipeline> {
+    let json = serde_json::to_string(env)?;
     let mut pipe = redis::pipe();
-    for ((replica_id, _), json) in frames.iter().zip(&jsons) {
-        pipe.cmd("SET")
-            .arg(state_key(host_id, replica_id))
-            .arg(json)
-            .arg("EX")
-            .arg(KEY_TTL_SECS)
-            .ignore();
-    }
-    for json in &jsons {
-        pipe.cmd("XADD")
-            .arg(stream)
-            .arg("MAXLEN")
-            .arg("~")
-            .arg(STREAM_MAXLEN)
-            .arg("*")
-            .arg("env")
-            .arg(json)
-            .ignore();
-    }
+    pipe.cmd("SET")
+        .arg(state_key(host_id))
+        .arg(&json)
+        .arg("EX")
+        .arg(KEY_TTL_SECS)
+        .ignore();
+    pipe.cmd("XADD")
+        .arg(stream)
+        .arg("MAXLEN")
+        .arg("~")
+        .arg(STREAM_MAXLEN)
+        .arg("*")
+        .arg("env")
+        .arg(&json)
+        .ignore();
     Ok(pipe)
 }
 
@@ -132,31 +119,27 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn pipeline_sets_ttl_keys_then_appends_capped_stream() {
-        let env = |n: u32| Envelope {
+    fn env(n: u32) -> Envelope {
+        Envelope {
             frame: format!("{{\"seq\":{n}}}"),
             sig: format!("sig{n}"),
             key_id: "0123456789abcdef".to_string(),
-        };
-        let frames = [("r1".to_string(), env(1)), ("r2".to_string(), env(2))];
-        let pipe = build_pipeline("gpu01", &stream_key("gpu01"), &frames).unwrap();
+        }
+    }
+
+    #[test]
+    fn pipeline_sets_ttl_keys_then_appends_capped_stream() {
+        let e = env(1);
+        let pipe = build_pipeline("gpu01", &stream_key("gpu01"), &e).unwrap();
         let cmds: Vec<Vec<String>> = pipe.cmd_iter().map(args).collect();
-        let j = |n: u32| serde_json::to_string(&env(n)).unwrap();
+        let j = serde_json::to_string(&e).unwrap();
         assert_eq!(
             cmds,
             vec![
                 vec![
                     "SET".into(),
-                    "replica:gpu01:r1".into(),
-                    j(1),
-                    "EX".into(),
-                    "5".into()
-                ],
-                vec![
-                    "SET".into(),
-                    "replica:gpu01:r2".into(),
-                    j(2),
+                    "replica:gpu01".into(),
+                    j.clone(),
                     "EX".into(),
                     "5".into()
                 ],
@@ -165,20 +148,10 @@ mod tests {
                     "replica:gpu01:frames".into(),
                     "MAXLEN".into(),
                     "~".into(),
-                    "20000".into(),
+                    "5000".into(),
                     "*".into(),
                     "env".into(),
-                    j(1)
-                ],
-                vec![
-                    "XADD".into(),
-                    "replica:gpu01:frames".into(),
-                    "MAXLEN".into(),
-                    "~".into(),
-                    "20000".into(),
-                    "*".into(),
-                    "env".into(),
-                    j(2)
+                    j,
                 ],
             ]
         );
@@ -186,8 +159,8 @@ mod tests {
 
     #[test]
     fn key_layout_is_per_host() {
-        assert_eq!(state_key("glm53-gpu03", "r1"), "replica:glm53-gpu03:r1");
-        assert_eq!(stream_key("glm53-gpu03"), "replica:glm53-gpu03:frames");
+        assert_eq!(state_key("h"), "replica:h");
+        assert_eq!(stream_key("h"), "replica:h:frames");
     }
 
     #[tokio::test]
@@ -211,7 +184,7 @@ mod tests {
     /// Real Redis: `REPLICA_STATE_TEST_REDIS_URL=redis://127.0.0.1:6379 cargo test -- --ignored`.
     #[tokio::test]
     #[ignore = "needs REPLICA_STATE_TEST_REDIS_URL"]
-    async fn publish_sets_ttl_keys_and_appends_stream() {
+    async fn publish_sets_ttl_key_and_appends_stream() {
         let url = std::env::var("REPLICA_STATE_TEST_REDIS_URL")
             .expect("REPLICA_STATE_TEST_REDIS_URL must point at a disposable Redis");
         install_crypto_provider();
@@ -220,15 +193,8 @@ mod tests {
         let mut sink = RedisSink::connect(&url, ca.as_deref(), &host)
             .await
             .unwrap();
-        let env = |n: u32| Envelope {
-            frame: format!("{{\"seq\":{n}}}"),
-            sig: format!("sig{n}"),
-            key_id: "0123456789abcdef".to_string(),
-        };
-        let (e1, e2) = (env(1), env(2));
-        sink.publish(&[("r1".to_string(), e1.clone()), ("r2".to_string(), e2)])
-            .await
-            .unwrap();
+        let e = env(1);
+        sink.publish(&e).await.unwrap();
 
         let mut plain = client(&url, ca.as_deref())
             .unwrap()
@@ -236,13 +202,13 @@ mod tests {
             .await
             .unwrap();
         let got: String = redis::cmd("GET")
-            .arg(state_key(&host, "r1"))
+            .arg(state_key(&host))
             .query_async(&mut plain)
             .await
             .unwrap();
-        assert_eq!(got, serde_json::to_string(&e1).unwrap());
+        assert_eq!(got, serde_json::to_string(&e).unwrap());
         let ttl: i64 = redis::cmd("TTL")
-            .arg(state_key(&host, "r1"))
+            .arg(state_key(&host))
             .query_async(&mut plain)
             .await
             .unwrap();
@@ -252,6 +218,6 @@ mod tests {
             .query_async(&mut plain)
             .await
             .unwrap();
-        assert_eq!(len, 2, "xlen={len}");
+        assert_eq!(len, 1, "xlen={len}");
     }
 }

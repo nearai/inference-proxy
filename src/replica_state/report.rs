@@ -1,4 +1,4 @@
-//! ReplicaReport v1 and the signed envelope that carries it over Redis.
+//! HostReport v1 and the signed envelope that carries it over Redis.
 //!
 //! The envelope carries the report as the exact signed JSON string (`frame`)
 //! so that readers in any language can verify the received bytes before
@@ -34,6 +34,8 @@ pub enum Engine {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Limits {
     pub max_running: Option<u32>,
+    /// Engine's max context length (prompt + output tokens), from `/v1/models` `max_model_len`.
+    pub max_context_tokens: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -50,25 +52,33 @@ pub struct Load {
     pub cached_token_ratio: Option<f64>,
 }
 
+/// One replica's state within a [`HostReport`]. Replica identity is the
+/// position (`index`) in `BackendPool::backends()` order (base backends
+/// first, then long-context) — there is no separate replica id string.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct ReplicaReport {
-    pub schema: u8,
-    pub host_id: String,
-    pub replica_id: String,
-    pub boot_id: String,
-    pub seq: u64,
+pub struct ReplicaState {
+    pub index: u32,
     /// Engine's own sample time; `None` until the replica has been read once.
     pub engine_sampled_at_ms: Option<u64>,
-    /// Wall-clock time the frame was sealed, after this tick's reads.
-    pub reported_at_ms: u64,
     pub lifecycle_state: Lifecycle,
-    pub model: String,
-    pub engine: Engine,
     pub engine_version: Option<String>,
     pub limits: Limits,
     pub load: Load,
     pub proxy_inflight: u32,
+}
+
+/// One signed frame per tick, carrying every replica on this host.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct HostReport {
+    pub schema: u8,
+    pub host_id: String,
+    pub boot_id: String,
+    pub seq: u64,
+    /// Wall-clock time the frame was sealed, after this tick's reads.
+    pub reported_at_ms: u64,
+    pub engine: Engine,
     pub report_key_id: String,
+    pub replicas: Vec<ReplicaState>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -85,8 +95,8 @@ fn message(frame: &str) -> Vec<u8> {
     m
 }
 
-pub fn seal(report: &ReplicaReport, key: &SigningKey) -> Envelope {
-    let frame = serde_json::to_string(report).expect("ReplicaReport always serializes");
+pub fn seal(report: &HostReport, key: &SigningKey) -> Envelope {
+    let frame = serde_json::to_string(report).expect("HostReport always serializes");
     let sig =
         base64::engine::general_purpose::STANDARD.encode(key.sign(&message(&frame)).to_bytes());
     Envelope {
@@ -98,13 +108,13 @@ pub fn seal(report: &ReplicaReport, key: &SigningKey) -> Envelope {
 
 /// Verify, then parse. None on a bad signature, bad JSON, or when the signed
 /// `report_key_id` disagrees with the envelope's `key_id` hint.
-pub fn open(env: &Envelope, key: &VerifyingKey) -> Option<ReplicaReport> {
+pub fn open(env: &Envelope, key: &VerifyingKey) -> Option<HostReport> {
     let raw = base64::engine::general_purpose::STANDARD
         .decode(&env.sig)
         .ok()?;
     let sig = Signature::from_bytes(&<[u8; 64]>::try_from(raw.as_slice()).ok()?);
     key.verify(&message(&env.frame), &sig).ok()?;
-    let report: ReplicaReport = serde_json::from_str(&env.frame).ok()?;
+    let report: HostReport = serde_json::from_str(&env.frame).ok()?;
     (report.report_key_id == env.key_id).then_some(report)
 }
 
@@ -113,30 +123,40 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
 
-    fn report() -> ReplicaReport {
-        ReplicaReport {
-            schema: 1,
-            host_id: "glm53-gpu03".into(),
-            replica_id: "r1".into(),
-            boot_id: "00000000-0000-4000-8000-000000000001".into(),
-            seq: 7,
-            engine_sampled_at_ms: Some(1_790_000_000_011),
-            reported_at_ms: 1_790_000_000_123,
+    fn replica(index: u32) -> ReplicaState {
+        ReplicaState {
+            index,
+            engine_sampled_at_ms: Some(1_700_000_000_000),
             lifecycle_state: Lifecycle::Ready,
-            model: "z-ai/glm-5.3-flash".into(),
-            engine: Engine::Sglang,
-            engine_version: None,
+            engine_version: Some("0.5.0".into()),
             limits: Limits {
-                max_running: Some(32),
+                max_running: Some(64),
+                max_context_tokens: Some(131_072),
             },
             load: Load {
-                running: Some(14),
-                queued: Some(0),
-                prefill_backlog_tokens: Some(51200),
-                ..Default::default()
+                running: Some(3),
+                queued: Some(1),
+                prefill_backlog_tokens: Some(4_096),
+                kv_usage: Some(0.25),
+                kv_used_tokens: Some(1_000),
+                kv_capacity_tokens: Some(4_000),
+                gen_tps: Some(120.5),
+                cached_token_ratio: Some(0.5),
             },
-            proxy_inflight: 16,
+            proxy_inflight: 2,
+        }
+    }
+
+    fn report() -> HostReport {
+        HostReport {
+            schema: 1,
+            host_id: "host-a".into(),
+            boot_id: "boot-1".into(),
+            seq: 7,
+            reported_at_ms: 1_700_000_000_500,
+            engine: Engine::Sglang,
             report_key_id: "0123456789abcdef".into(),
+            replicas: vec![replica(0), replica(1)],
         }
     }
 
@@ -150,10 +170,12 @@ mod tests {
 
     #[test]
     fn frame_keeps_nulls_and_is_compact() {
-        let env = seal(&report(), &SigningKey::from_bytes(&[7u8; 32]));
-        assert!(env
-            .frame
-            .starts_with(r#"{"schema":1,"host_id":"glm53-gpu03""#));
+        let mut r = report();
+        r.replicas[0].load.kv_usage = None;
+        r.replicas[0].load.kv_used_tokens = None;
+        r.replicas[0].load.kv_capacity_tokens = None;
+        let env = seal(&r, &SigningKey::from_bytes(&[7u8; 32]));
+        assert!(env.frame.starts_with(r#"{"schema":1,"host_id":"host-a""#));
         assert!(env.frame.contains(r#""kv_usage":null"#));
         assert!(env.frame.contains(r#""kv_used_tokens":null"#));
         assert!(env.frame.contains(r#""kv_capacity_tokens":null"#));
@@ -163,8 +185,8 @@ mod tests {
     #[test]
     fn kv_token_counts_serialize_as_integers() {
         let mut r = report();
-        r.load.kv_used_tokens = Some(630);
-        r.load.kv_capacity_tokens = Some(1000);
+        r.replicas[0].load.kv_used_tokens = Some(630);
+        r.replicas[0].load.kv_capacity_tokens = Some(1000);
         let sk = SigningKey::from_bytes(&[7u8; 32]);
         let env = seal(&r, &sk);
         assert!(env
@@ -179,19 +201,25 @@ mod tests {
         // cannot fire on a load value; readers see `None`.
         let sk = SigningKey::from_bytes(&[7u8; 32]);
         let mut r = report();
-        r.load.gen_tps = Some(f64::INFINITY);
-        r.load.kv_usage = Some(f64::NAN);
+        r.replicas[0].load.gen_tps = Some(f64::INFINITY);
+        r.replicas[0].load.kv_usage = Some(f64::NAN);
         let env = seal(&r, &sk);
         assert!(env.frame.contains(r#""gen_tps":null"#));
         let opened = open(&env, &sk.verifying_key()).unwrap();
-        assert_eq!((opened.load.gen_tps, opened.load.kv_usage), (None, None));
+        assert_eq!(
+            (
+                opened.replicas[0].load.gen_tps,
+                opened.replicas[0].load.kv_usage
+            ),
+            (None, None)
+        );
     }
 
     #[test]
     fn tampered_frame_or_wrong_key_fails() {
         let sk = SigningKey::from_bytes(&[7u8; 32]);
         let mut env = seal(&report(), &sk);
-        env.frame = env.frame.replace(r#""running":14"#, r#""running":0"#);
+        env.frame = env.frame.replace(r#""running":3"#, r#""running":0"#);
         assert!(open(&env, &sk.verifying_key()).is_none());
         let env = seal(&report(), &sk);
         assert!(open(&env, &SigningKey::from_bytes(&[8u8; 32]).verifying_key()).is_none());
@@ -214,10 +242,8 @@ mod tests {
 
     #[test]
     fn unknown_sample_time_serializes_as_null() {
-        let r = ReplicaReport {
-            engine_sampled_at_ms: None,
-            ..report()
-        };
+        let mut r = report();
+        r.replicas[0].engine_sampled_at_ms = None;
         let env = seal(&r, &SigningKey::from_bytes(&[7u8; 32]));
         assert!(env.frame.contains(r#""engine_sampled_at_ms":null"#));
     }
@@ -240,5 +266,27 @@ mod tests {
         assert!(open(&env, &key.verifying_key()).is_none());
         env.sig = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
         assert!(open(&env, &key.verifying_key()).is_none());
+    }
+
+    #[test]
+    fn host_frame_has_no_model_and_indexes_replicas() {
+        let sk = SigningKey::from_bytes(&[3u8; 32]);
+        let env = seal(&report(), &sk);
+        let v: serde_json::Value = serde_json::from_str(&env.frame).unwrap();
+        assert!(v.get("model").is_none());
+        assert!(v.get("replica_id").is_none());
+        assert_eq!(v["replicas"][0]["index"], 0);
+        assert_eq!(v["replicas"][1]["index"], 1);
+        assert_eq!(v["replicas"][0]["limits"]["max_context_tokens"], 131_072);
+        assert!(v["replicas"][0].get("replica_id").is_none());
+    }
+
+    #[test]
+    fn unknown_context_limit_serializes_as_null() {
+        let mut r = report();
+        r.replicas[0].limits.max_context_tokens = None;
+        let sk = SigningKey::from_bytes(&[3u8; 32]);
+        let v: serde_json::Value = serde_json::from_str(&seal(&r, &sk).frame).unwrap();
+        assert!(v["replicas"][0]["limits"]["max_context_tokens"].is_null());
     }
 }

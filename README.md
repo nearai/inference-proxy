@@ -155,9 +155,8 @@ All configuration is via environment variables:
 | `VLLM_TRANSCRIPTIONS_URL` | No | `{base}/v1/audio/transcriptions` | Override transcriptions endpoint |
 | `VLLM_RERANK_URL` | No | `{base}/v1/rerank` | Override rerank endpoint |
 | `VLLM_SCORE_URL` | No | `{base}/v1/score` | Override score endpoint |
-| `REPLICA_STATE_REDIS_URL` | No | unset (feature off) | Redis URL for opt-in signed per-replica state publishing |
+| `REPLICA_STATE_REDIS_URL` | No | unset (feature off) | Redis URL for opt-in signed host-frame state publishing |
 | `REPLICA_STATE_HOST_ID` | Yes, if the URL is set | — | Host identifier used in Redis keys and every published frame |
-| `REPLICA_STATE_REPLICA_IDS` | Yes, if the URL is set | — | Comma-separated replica IDs, one per backend (base then long-context), in pool order |
 | `REPLICA_STATE_REDIS_CA_CERT` | No | unset | PEM CA the Redis TLS certificate chains to (`rediss://` only); used for Redis instead of the system trust store. Literal `\n` accepted |
 | `REPLICA_STATE_INTERVAL_MS` | No | `500` | Publish interval in ms; must be within `200..=2000` (otherwise the feature is disabled with an error) |
 

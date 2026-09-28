@@ -6,7 +6,7 @@ pub const DEFAULT_INTERVAL_MS: u64 = 500;
 const MIN_INTERVAL_MS: u64 = 200;
 const MAX_INTERVAL_MS: u64 = 2000;
 
-/// Opt-in configuration for publishing signed per-replica load frames to
+/// Opt-in configuration for publishing one signed host frame per tick to
 /// Redis. The feature is enabled only when `REPLICA_STATE_REDIS_URL` is set
 /// to a non-blank value. `Config::from_env` builds it via [`Self::from_lookup`]
 /// and exposes it as `Config::replica_state()`; any error is logged and only
@@ -22,9 +22,6 @@ pub struct ReplicaStateConfig {
     pub redis_ca_cert: Option<String>,
     /// `REPLICA_STATE_HOST_ID` (required once the feature is enabled).
     pub host_id: String,
-    /// `REPLICA_STATE_REPLICA_IDS` (required; one per `VLLM_BACKEND_URLS`
-    /// entry, same order).
-    pub replica_ids: Vec<String>,
     /// `REPLICA_STATE_INTERVAL_MS` (optional, must be within 200..=2000
     /// (otherwise the feature is disabled with an error), default
     /// [`DEFAULT_INTERVAL_MS`]).
@@ -36,10 +33,8 @@ impl ReplicaStateConfig {
     /// `Ok(None)` when `REPLICA_STATE_REDIS_URL` is unset or blank (the
     /// feature stays off). Any other missing/invalid value is a hard error
     /// so callers can log and disable rather than run with bad config.
-    pub fn from_lookup(
-        get: impl Fn(&str) -> Option<String>,
-        backend_count: usize,
-    ) -> anyhow::Result<Option<Self>> {
+    /// Replica identity is derived entirely from backend pool order.
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<Option<Self>> {
         let redis_url = match get("REPLICA_STATE_REDIS_URL") {
             Some(v) if !v.trim().is_empty() => v.trim().to_string(),
             _ => return Ok(None),
@@ -76,31 +71,6 @@ impl ReplicaStateConfig {
             ),
         };
 
-        let replica_ids_raw = match get("REPLICA_STATE_REPLICA_IDS") {
-            Some(v) if !v.trim().is_empty() => v,
-            _ => anyhow::bail!(
-                "REPLICA_STATE_REPLICA_IDS is required when REPLICA_STATE_REDIS_URL is set"
-            ),
-        };
-        let replica_ids: Vec<String> = replica_ids_raw
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if replica_ids.len() != backend_count {
-            anyhow::bail!(
-                "REPLICA_STATE_REPLICA_IDS has {} entr{} but there are {backend_count} backend(s); they must match 1:1",
-                replica_ids.len(),
-                if replica_ids.len() == 1 { "y" } else { "ies" }
-            );
-        }
-        let mut seen = std::collections::HashSet::with_capacity(replica_ids.len());
-        for id in &replica_ids {
-            if !seen.insert(id) {
-                anyhow::bail!("REPLICA_STATE_REPLICA_IDS contains a duplicate entry: {id}");
-            }
-        }
-
         let interval_ms = match get("REPLICA_STATE_INTERVAL_MS") {
             Some(v) if !v.trim().is_empty() => v
                 .trim()
@@ -118,7 +88,6 @@ impl ReplicaStateConfig {
             redis_url,
             redis_ca_cert,
             host_id,
-            replica_ids,
             interval: Duration::from_millis(interval_ms),
         }))
     }
@@ -142,7 +111,6 @@ impl std::fmt::Debug for ReplicaStateConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReplicaStateConfig")
             .field("host_id", &self.host_id)
-            .field("replica_ids", &self.replica_ids)
             .field("interval", &self.interval)
             .field("redis_host", &self.redis_host_for_logs())
             .field("redis_ca_cert", &self.redis_ca_cert.is_some())
@@ -165,60 +133,34 @@ mod tests {
     #[test]
     fn off_without_redis_url() {
         assert!(
-            ReplicaStateConfig::from_lookup(look(&[("REPLICA_STATE_HOST_ID", "h")]), 1)
+            ReplicaStateConfig::from_lookup(look(&[("REPLICA_STATE_HOST_ID", "h")]))
                 .unwrap()
                 .is_none()
         );
         assert!(
-            ReplicaStateConfig::from_lookup(look(&[("REPLICA_STATE_REDIS_URL", "  ")]), 1)
+            ReplicaStateConfig::from_lookup(look(&[("REPLICA_STATE_REDIS_URL", "  ")]))
                 .unwrap()
                 .is_none()
         );
     }
 
     #[test]
-    fn requires_host_id_and_replica_ids() {
-        let e = ReplicaStateConfig::from_lookup(
-            look(&[
-                ("REPLICA_STATE_REDIS_URL", "redis://r:6379"),
-                ("REPLICA_STATE_REPLICA_IDS", "r1"),
-            ]),
-            1,
-        )
-        .unwrap_err();
+    fn requires_host_id() {
+        let e =
+            ReplicaStateConfig::from_lookup(look(&[("REPLICA_STATE_REDIS_URL", "redis://r:6379")]))
+                .unwrap_err();
         assert!(e.to_string().contains("REPLICA_STATE_HOST_ID"));
-        let e = ReplicaStateConfig::from_lookup(
-            look(&[
-                ("REPLICA_STATE_REDIS_URL", "redis://r:6379"),
-                ("REPLICA_STATE_HOST_ID", "h"),
-            ]),
-            1,
-        )
-        .unwrap_err();
-        assert!(e.to_string().contains("REPLICA_STATE_REPLICA_IDS"));
     }
 
     #[test]
-    fn replica_ids_must_match_backend_count_and_be_unique() {
-        let base = [
+    fn replica_ids_env_is_ignored() {
+        let cfg = ReplicaStateConfig::from_lookup(look(&[
             ("REPLICA_STATE_REDIS_URL", "redis://r:6379"),
             ("REPLICA_STATE_HOST_ID", "h"),
-        ];
-        let mk = |ids: &'static str| {
-            let mut v = base.to_vec();
-            v.push(("REPLICA_STATE_REPLICA_IDS", ids));
-            v
-        };
-        assert!(ReplicaStateConfig::from_lookup(look(&mk("r1")), 2).is_err());
-        assert!(ReplicaStateConfig::from_lookup(look(&mk("r1,r1")), 2).is_err());
-        let ok = ReplicaStateConfig::from_lookup(look(&mk(" r1 , r2 ")), 2)
-            .unwrap()
-            .unwrap();
-        assert_eq!(ok.replica_ids, vec!["r1", "r2"]);
-        assert_eq!(
-            ok.interval,
-            std::time::Duration::from_millis(DEFAULT_INTERVAL_MS)
-        );
+            ("REPLICA_STATE_REPLICA_IDS", "a,b"),
+        ]))
+        .unwrap();
+        assert!(cfg.is_some());
     }
 
     #[test]
@@ -227,14 +169,13 @@ mod tests {
             look(&[
                 ("REPLICA_STATE_REDIS_URL", "redis://r:6379"),
                 ("REPLICA_STATE_HOST_ID", "h"),
-                ("REPLICA_STATE_REPLICA_IDS", "r1"),
                 ("REPLICA_STATE_INTERVAL_MS", ms),
             ])
         };
-        assert!(ReplicaStateConfig::from_lookup(mk("100"), 1).is_err());
-        assert!(ReplicaStateConfig::from_lookup(mk("abc"), 1).is_err());
+        assert!(ReplicaStateConfig::from_lookup(mk("100")).is_err());
+        assert!(ReplicaStateConfig::from_lookup(mk("abc")).is_err());
         assert_eq!(
-            ReplicaStateConfig::from_lookup(mk("250"), 1)
+            ReplicaStateConfig::from_lookup(mk("250"))
                 .unwrap()
                 .unwrap()
                 .interval
@@ -249,7 +190,6 @@ mod tests {
             look(&[
                 ("REPLICA_STATE_REDIS_URL", url),
                 ("REPLICA_STATE_HOST_ID", "h"),
-                ("REPLICA_STATE_REPLICA_IDS", "r1"),
             ])
         };
         for bad in [
@@ -258,31 +198,25 @@ mod tests {
             "unix:///tmp/s3cret.sock",
             "redis://user:s3cret@[::1",
         ] {
-            let e = ReplicaStateConfig::from_lookup(mk(bad), 1).unwrap_err();
+            let e = ReplicaStateConfig::from_lookup(mk(bad)).unwrap_err();
             let msg = format!("{e:#}");
             assert!(msg.contains("REPLICA_STATE_REDIS_URL"), "{msg}");
             assert!(!msg.contains("s3cret"), "error leaked the URL: {msg}");
         }
         for good in ["redis://r:6379", "rediss://user:pw@r:6380/0"] {
-            assert!(ReplicaStateConfig::from_lookup(mk(good), 1)
-                .unwrap()
-                .is_some());
+            assert!(ReplicaStateConfig::from_lookup(mk(good)).unwrap().is_some());
         }
     }
 
     #[test]
     fn debug_and_log_host_never_show_credentials() {
-        let c = ReplicaStateConfig::from_lookup(
-            look(&[
-                (
-                    "REPLICA_STATE_REDIS_URL",
-                    "rediss://user:s3cret@redis.internal:6380/0",
-                ),
-                ("REPLICA_STATE_HOST_ID", "h"),
-                ("REPLICA_STATE_REPLICA_IDS", "r1"),
-            ]),
-            1,
-        )
+        let c = ReplicaStateConfig::from_lookup(look(&[
+            (
+                "REPLICA_STATE_REDIS_URL",
+                "rediss://user:s3cret@redis.internal:6380/0",
+            ),
+            ("REPLICA_STATE_HOST_ID", "h"),
+        ]))
         .unwrap()
         .unwrap();
         let d = format!("{c:?}");
@@ -294,15 +228,11 @@ mod tests {
     const TEST_CA: &str = "-----BEGIN CERTIFICATE-----\nMIIBmDCCAT2gAwIBAgIUBO8axf+bI+fy6nCWKxvbDQK8Vh8wCgYIKoZIzj0EAwIw\nIDEeMBwGA1UEAwwVcmVwbGljYS1zdGF0ZS10ZXN0LWNhMCAXDTI2MDkyNjA0MDQx\nOVoYDzIxMjYwOTAyMDQwNDE5WjAgMR4wHAYDVQQDDBVyZXBsaWNhLXN0YXRlLXRl\nc3QtY2EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQvZoRSR2lpnIRoOtWMg4/A\nC8waZ+M5FKrVPKnTbEQ9Rg8FsgLbiGo98qj8xMiCnDLBtZWu2kIS8aUkYKBTi9i/\no1MwUTAdBgNVHQ4EFgQU0sUHDnN4gedUYXUcbPvjGM8z6A8wHwYDVR0jBBgwFoAU\n0sUHDnN4gedUYXUcbPvjGM8z6A8wDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQD\nAgNJADBGAiEAmhuVv3kXXoW/L/c1OLtbstq6AbI/PA/9VQpxzr0tDoECIQDDyvF8\n2A0KtuzhoAcZZVU2L0OjHlMqrr0f57OEw5SfEQ==\n-----END CERTIFICATE-----";
 
     fn with_ca(url: &str, ca: &str) -> anyhow::Result<Option<ReplicaStateConfig>> {
-        ReplicaStateConfig::from_lookup(
-            look(&[
-                ("REPLICA_STATE_REDIS_URL", url),
-                ("REPLICA_STATE_REDIS_CA_CERT", ca),
-                ("REPLICA_STATE_HOST_ID", "h"),
-                ("REPLICA_STATE_REPLICA_IDS", "r1"),
-            ]),
-            1,
-        )
+        ReplicaStateConfig::from_lookup(look(&[
+            ("REPLICA_STATE_REDIS_URL", url),
+            ("REPLICA_STATE_REDIS_CA_CERT", ca),
+            ("REPLICA_STATE_HOST_ID", "h"),
+        ]))
     }
 
     #[test]

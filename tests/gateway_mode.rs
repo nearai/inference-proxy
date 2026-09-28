@@ -3177,8 +3177,12 @@ const SGLANG_REASONING_STREAM: &str = concat!(
     "data: [DONE]\n\n",
 );
 
-/// The lane's settings that touch the response path: backend bearer, non-TEE,
-/// first-event peek and commit window.
+/// A gateway configured like the lane. Of these settings only the first-event
+/// peek and the commit window change the (streaming) response path. The backend
+/// bearer is request-path config: it is the upstream `Authorization` header,
+/// which `mount_reasoning_stream` asserts, and it turns on the request-side
+/// reasoning switch in `routes/chat.rs`. Non-TEE only hides the attestation,
+/// signature and GPU-evidence routes.
 fn reasoning_lane(mock: &MockServer) -> axum::Router {
     build_gateway(
         &mock.uri(),
@@ -3193,8 +3197,11 @@ fn reasoning_lane(mock: &MockServer) -> axum::Router {
 }
 
 async fn mount_reasoning_stream(mock: &MockServer) {
+    // Only a request carrying the lane's backend bearer is answered, so a
+    // dropped or wrong bearer fails these tests instead of passing unnoticed.
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
+        .and(header("authorization", "Bearer backend-secret"))
         .respond_with(
             // `set_body_raw`: `set_body_string` would force `text/plain`, and a
             // non-streaming request only reassembles a `text/event-stream` answer.

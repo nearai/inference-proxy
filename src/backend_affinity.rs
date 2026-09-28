@@ -132,6 +132,11 @@ impl BackendConversationAffinity {
     /// view: a pinned conversation whose backend is at the bound or avoided is
     /// moved to the least-loaded eligible backend, and `None` means no backend
     /// has room.
+    ///
+    /// `hint` is honoured under the same guard as a pin: the backend must be
+    /// healthy and eligible (tier, admission, not avoided or queueing), and,
+    /// only when there is no engine view, within `max_imbalance` of the
+    /// least-loaded backend.
     pub fn place(
         &self,
         pool: &BackendPool,
@@ -664,6 +669,46 @@ mod tests {
             .place(&pool, Some(key), ReplicaHint::Absent, "/x", &Policy::NONE)
             .unwrap();
         assert_eq!(next.index, 1);
+    }
+
+    #[test]
+    fn hint_with_engine_view_holds_on_busy_but_not_queueing_backend() {
+        let pool = two_backend_pool();
+        set_lane_conns(&pool, 1, 20);
+        let engine = |_: usize| Some((5, 0));
+        fn not_avoided(_: usize) -> bool {
+            false
+        }
+        let policy = Policy {
+            avoid: &not_avoided,
+            engine: &engine,
+            ..Policy::NONE
+        };
+        let aff = BackendConversationAffinity::new(false, 2, 8, 60);
+        let p = aff
+            .place(&pool, None, ReplicaHint::Index(1), "/x", &policy)
+            .unwrap();
+        assert_eq!(p.index, 1);
+    }
+
+    #[test]
+    fn hint_to_queueing_backend_is_overridden() {
+        let pool = two_backend_pool();
+        set_lane_conns(&pool, 1, 20);
+        let engine = |_: usize| Some((5, 0));
+        fn avoided(index: usize) -> bool {
+            index == 1
+        }
+        let policy = Policy {
+            avoid: &avoided,
+            engine: &engine,
+            ..Policy::NONE
+        };
+        let aff = BackendConversationAffinity::new(false, 2, 8, 60);
+        let p = aff
+            .place(&pool, None, ReplicaHint::Index(1), "/x", &policy)
+            .unwrap();
+        assert_eq!(p.index, 0);
     }
 
     /// A hint on a saturated pool refuses once, without running the fallback.

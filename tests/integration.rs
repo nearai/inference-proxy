@@ -1018,6 +1018,54 @@ async fn test_completions_replica_hint_is_dropped_for_cloud_api_key_auth() {
 }
 
 #[tokio::test]
+async fn test_chat_completions_replica_hint_is_dropped_for_cloud_api_key_auth() {
+    let backend_a = MockServer::start().await;
+    let backend_b = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    mount_chat_ok(&backend_a, "/v1/chat/completions", 1).await;
+    mount_chat_ok(&backend_b, "/v1/chat/completions", 0).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})))
+        .mount(&cloud_api)
+        .await;
+    let (app, pool) = build_test_app_with_backends_and_cloud_api(
+        vec![backend_a.uri(), backend_b.uri()],
+        &cloud_api.uri(),
+    );
+
+    // Load backend_b (the index the hint asks for) so an honored hint would
+    // land there, while a dropped hint keeps least-connections on idle
+    // backend_a — deterministic either way.
+    pool.backends()[1]
+        .active_conns
+        .store(3, std::sync::atomic::Ordering::Relaxed);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .header(backend_affinity::REPLICA_HINT_HEADER, "1")
+                .body(Body::from(
+                    serde_json::to_vec(&affinity_chat_body(0)).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    // An `sk-` (untrusted) caller's hint must not be forwarded: the request
+    // stays on least-connections, landing on the idle backend_a rather than
+    // the hinted, already-loaded backend_b.
+    assert_eq!(requests_seen(&backend_a).await, 1);
+    assert_eq!(requests_seen(&backend_b).await, 0);
+}
+
+#[tokio::test]
 async fn test_chat_completions_image_validation_rejects_bad_image() {
     // Handler-level wiring: with image validation enabled, a request carrying a
     // clearly-bad image (dangerous scheme) is rejected at the proxy with a 400

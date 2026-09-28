@@ -176,7 +176,7 @@ pub fn spawn_replica_state_publisher(
         loop {
             ticker.tick().await;
             let started = Instant::now();
-            let env = publisher
+            let env = match publisher
                 .tick(
                     |i| {
                         pool.backends()
@@ -185,7 +185,15 @@ pub fn spawn_replica_state_publisher(
                     },
                     now_ms,
                 )
-                .await;
+                .await
+            {
+                Ok(env) => env,
+                Err(e) => {
+                    metrics::counter!("replica_state_publish_failures_total").increment(1);
+                    tracing::warn!(error = ?e.classify(), "Replica state tick failed to seal");
+                    continue;
+                }
+            };
             // RedisSink errors carry only the redis error kind, never the URL.
             match sink.publish(&env).await {
                 Ok(()) => {

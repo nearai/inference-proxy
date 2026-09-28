@@ -95,15 +95,15 @@ fn message(frame: &str) -> Vec<u8> {
     m
 }
 
-pub fn seal(report: &HostReport, key: &SigningKey) -> Envelope {
-    let frame = serde_json::to_string(report).expect("HostReport always serializes");
+pub fn seal(report: &HostReport, key: &SigningKey) -> Result<Envelope, serde_json::Error> {
+    let frame = serde_json::to_string(report)?;
     let sig =
         base64::engine::general_purpose::STANDARD.encode(key.sign(&message(&frame)).to_bytes());
-    Envelope {
+    Ok(Envelope {
         frame,
         sig,
         key_id: report.report_key_id.clone(),
-    }
+    })
 }
 
 /// Verify, then parse. None on a bad signature, bad JSON, or when the signed
@@ -163,7 +163,7 @@ mod tests {
     #[test]
     fn seal_open_roundtrip_through_json() {
         let sk = SigningKey::from_bytes(&[7u8; 32]);
-        let wire = serde_json::to_string(&seal(&report(), &sk)).unwrap();
+        let wire = serde_json::to_string(&seal(&report(), &sk).unwrap()).unwrap();
         let env: Envelope = serde_json::from_str(&wire).unwrap();
         assert_eq!(open(&env, &sk.verifying_key()), Some(report()));
     }
@@ -174,7 +174,7 @@ mod tests {
         r.replicas[0].load.kv_usage = None;
         r.replicas[0].load.kv_used_tokens = None;
         r.replicas[0].load.kv_capacity_tokens = None;
-        let env = seal(&r, &SigningKey::from_bytes(&[7u8; 32]));
+        let env = seal(&r, &SigningKey::from_bytes(&[7u8; 32])).unwrap();
         assert!(env.frame.starts_with(r#"{"schema":1,"host_id":"host-a""#));
         assert!(env.frame.contains(r#""kv_usage":null"#));
         assert!(env.frame.contains(r#""kv_used_tokens":null"#));
@@ -188,7 +188,7 @@ mod tests {
         r.replicas[0].load.kv_used_tokens = Some(630);
         r.replicas[0].load.kv_capacity_tokens = Some(1000);
         let sk = SigningKey::from_bytes(&[7u8; 32]);
-        let env = seal(&r, &sk);
+        let env = seal(&r, &sk).unwrap();
         assert!(env
             .frame
             .contains(r#""kv_used_tokens":630,"kv_capacity_tokens":1000"#));
@@ -197,13 +197,13 @@ mod tests {
 
     #[test]
     fn non_finite_floats_seal_as_null_without_panicking() {
-        // serde_json writes NaN/inf as `null`, so the `expect` in `seal`
-        // cannot fire on a load value; readers see `None`.
+        // serde_json writes NaN/inf as `null`, so `seal` never errs on a
+        // load value; readers see `None`.
         let sk = SigningKey::from_bytes(&[7u8; 32]);
         let mut r = report();
         r.replicas[0].load.gen_tps = Some(f64::INFINITY);
         r.replicas[0].load.kv_usage = Some(f64::NAN);
-        let env = seal(&r, &sk);
+        let env = seal(&r, &sk).unwrap();
         assert!(env.frame.contains(r#""gen_tps":null"#));
         let opened = open(&env, &sk.verifying_key()).unwrap();
         assert_eq!(
@@ -218,17 +218,17 @@ mod tests {
     #[test]
     fn tampered_frame_or_wrong_key_fails() {
         let sk = SigningKey::from_bytes(&[7u8; 32]);
-        let mut env = seal(&report(), &sk);
+        let mut env = seal(&report(), &sk).unwrap();
         env.frame = env.frame.replace(r#""running":3"#, r#""running":0"#);
         assert!(open(&env, &sk.verifying_key()).is_none());
-        let env = seal(&report(), &sk);
+        let env = seal(&report(), &sk).unwrap();
         assert!(open(&env, &SigningKey::from_bytes(&[8u8; 32]).verifying_key()).is_none());
     }
 
     #[test]
     fn envelope_carries_unsigned_key_hint_that_must_match_signed_key_id() {
         let sk = SigningKey::from_bytes(&[7u8; 32]);
-        let env = seal(&report(), &sk);
+        let env = seal(&report(), &sk).unwrap();
         assert_eq!(env.key_id, "0123456789abcdef");
         let wire: serde_json::Value = serde_json::to_value(&env).unwrap();
         assert_eq!(wire.as_object().unwrap().len(), 3);
@@ -244,7 +244,7 @@ mod tests {
     fn unknown_sample_time_serializes_as_null() {
         let mut r = report();
         r.replicas[0].engine_sampled_at_ms = None;
-        let env = seal(&r, &SigningKey::from_bytes(&[7u8; 32]));
+        let env = seal(&r, &SigningKey::from_bytes(&[7u8; 32])).unwrap();
         assert!(env.frame.contains(r#""engine_sampled_at_ms":null"#));
     }
 
@@ -261,7 +261,7 @@ mod tests {
     #[test]
     fn malformed_signatures_are_rejected_without_panicking() {
         let key = SigningKey::from_bytes(&[7u8; 32]);
-        let mut env = seal(&report(), &key);
+        let mut env = seal(&report(), &key).unwrap();
         env.sig = "not-base64!!".to_string();
         assert!(open(&env, &key.verifying_key()).is_none());
         env.sig = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
@@ -271,7 +271,7 @@ mod tests {
     #[test]
     fn host_frame_has_no_model_and_indexes_replicas() {
         let sk = SigningKey::from_bytes(&[3u8; 32]);
-        let env = seal(&report(), &sk);
+        let env = seal(&report(), &sk).unwrap();
         let v: serde_json::Value = serde_json::from_str(&env.frame).unwrap();
         assert!(v.get("model").is_none());
         assert!(v.get("replica_id").is_none());
@@ -286,7 +286,7 @@ mod tests {
         let mut r = report();
         r.replicas[0].limits.max_context_tokens = None;
         let sk = SigningKey::from_bytes(&[3u8; 32]);
-        let v: serde_json::Value = serde_json::from_str(&seal(&r, &sk).frame).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&seal(&r, &sk).unwrap().frame).unwrap();
         assert!(v["replicas"][0]["limits"]["max_context_tokens"].is_null());
     }
 
@@ -300,7 +300,7 @@ mod tests {
         let mut r = report();
         r.report_key_id =
             hex::encode(sha2::Sha256::digest(sk.verifying_key().to_bytes()))[..16].to_string();
-        let env = seal(&r, &sk);
+        let env = seal(&r, &sk).unwrap();
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src/replica_state/testdata/host_frame_v1.json"

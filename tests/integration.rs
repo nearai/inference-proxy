@@ -29,6 +29,8 @@ struct TestAppOptions {
     backend_urls: Vec<String>,
     backend_conversation_affinity: bool,
     backend_affinity_max_imbalance: u32,
+    /// `sk-` key validation endpoint; `None` disables cloud_api_key auth.
+    cloud_api_url: Option<String>,
 }
 
 impl Default for TestAppOptions {
@@ -49,6 +51,7 @@ impl Default for TestAppOptions {
             backend_urls: Vec::new(),
             backend_conversation_affinity: false,
             backend_affinity_max_imbalance: 8,
+            cloud_api_url: None,
         }
     }
 }
@@ -154,6 +157,23 @@ fn build_test_app_with_backends(
     )
 }
 
+/// Multi-backend test app authenticated with `sk-` keys against `cloud_api_url`
+/// (untrusted callers), rather than the config-token auth `build_test_app_with_backends` uses.
+fn build_test_app_with_backends_and_cloud_api(
+    backend_urls: Vec<String>,
+    cloud_api_url: &str,
+) -> (axum::Router, Arc<vllm_proxy_rs::backend_pool::BackendPool>) {
+    let mock_url = backend_urls[0].clone();
+    build_test_app_inner_with_pool(
+        &mock_url,
+        TestAppOptions {
+            backend_urls,
+            cloud_api_url: Some(cloud_api_url.to_string()),
+            ..Default::default()
+        },
+    )
+}
+
 fn build_test_app_inner_with_pool(
     mock_url: &str,
     options: TestAppOptions,
@@ -208,7 +228,7 @@ fn build_test_app_inner_with_pool(
         rate_limit_per_second: options.rate_per_second,
         rate_limit_burst_size: options.rate_burst,
         rate_limit_trust_proxy_headers: true,
-        cloud_api_url: None,
+        cloud_api_url: options.cloud_api_url.clone(),
         cloud_api_auth_max_attempts: 1,
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
@@ -701,6 +721,20 @@ async fn mount_chat_ok(server: &MockServer, path_str: &str, expected: u64) {
         .await;
 }
 
+async fn mount_completions_ok(server: &MockServer, expected: u64) {
+    Mock::given(method("POST"))
+        .and(path("/v1/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "cmpl-affinity",
+            "object": "text_completion",
+            "choices": [{"index": 0, "text": "ok", "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11}
+        })))
+        .expect(expected)
+        .mount(server)
+        .await;
+}
+
 async fn post_chat(app: axum::Router, uri: &str, body: &serde_json::Value) -> StatusCode {
     app.oneshot(
         Request::builder()
@@ -906,6 +940,81 @@ async fn test_replica_hint_routes_to_hinted_backend() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(requests_seen(&backend_a).await, 1);
     assert_eq!(requests_seen(&backend_b).await, 1);
+}
+
+#[tokio::test]
+async fn test_completions_replica_hint_routes_to_hinted_backend() {
+    let backend_a = MockServer::start().await;
+    let backend_b = MockServer::start().await;
+    mount_completions_ok(&backend_a, 0).await;
+    mount_completions_ok(&backend_b, 1).await;
+    let (app, _pool) =
+        build_test_app_with_backends(vec![backend_a.uri(), backend_b.uri()], false, 8);
+
+    // Trusted caller (config-token auth, same as the chat test above) hints
+    // pool index 1 (backend_b): honoured, request lands on backend_b.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header(backend_affinity::REPLICA_HINT_HEADER, "1")
+                .body(Body::from(r#"{"prompt":"hello ","stream":false}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(requests_seen(&backend_b).await, 1);
+    assert_eq!(requests_seen(&backend_a).await, 0);
+}
+
+#[tokio::test]
+async fn test_completions_replica_hint_is_dropped_for_cloud_api_key_auth() {
+    let backend_a = MockServer::start().await;
+    let backend_b = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    mount_completions_ok(&backend_a, 1).await;
+    mount_completions_ok(&backend_b, 0).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})))
+        .mount(&cloud_api)
+        .await;
+    let (app, pool) = build_test_app_with_backends_and_cloud_api(
+        vec![backend_a.uri(), backend_b.uri()],
+        &cloud_api.uri(),
+    );
+
+    // Load backend_b (the index the hint asks for) so an honored hint would
+    // land there, while a dropped hint keeps least-connections on idle
+    // backend_a — deterministic either way.
+    pool.backends()[1]
+        .active_conns
+        .store(3, std::sync::atomic::Ordering::Relaxed);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .header(backend_affinity::REPLICA_HINT_HEADER, "1")
+                .body(Body::from(r#"{"prompt":"hello ","stream":false}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    // An `sk-` (untrusted) caller's hint must not be forwarded: the request
+    // stays on least-connections, landing on the idle backend_a rather than
+    // the hinted, already-loaded backend_b.
+    assert_eq!(requests_seen(&backend_a).await, 1);
+    assert_eq!(requests_seen(&backend_b).await, 0);
 }
 
 #[tokio::test]

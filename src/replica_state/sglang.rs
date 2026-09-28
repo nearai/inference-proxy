@@ -43,17 +43,25 @@ fn sum_f64(ranks: &[serde_json::Value], key: &str) -> Option<f64> {
 }
 
 /// Minimum `timestamp` (float seconds) across ranks, converted to
-/// milliseconds. `None` if any rank lacks a numeric `timestamp`.
+/// milliseconds. `None` if any rank lacks a numeric `timestamp`, any
+/// timestamp is negative or non-finite, or the conversion to milliseconds
+/// would overflow `u64`.
 fn ts_ms(ranks: &[serde_json::Value]) -> Option<u64> {
     let mut min_secs: Option<f64> = None;
     for rank in ranks {
         let t = rank.get("timestamp")?.as_f64()?;
+        if !t.is_finite() || t < 0.0 {
+            return None;
+        }
         min_secs = Some(match min_secs {
             Some(cur) if cur <= t => cur,
             _ => t,
         });
     }
-    min_secs.map(|s| (s * 1000.0).trunc() as u64)
+    min_secs.and_then(|s| {
+        let ms = s * 1000.0;
+        (ms < u64::MAX as f64).then(|| ms.trunc() as u64)
+    })
 }
 
 /// Pure normalization of a `/v1/loads?include=core` body. `None` if it has
@@ -310,6 +318,21 @@ mod tests {
             {"timestamp":1790000000.0,"gen_throughput":f64::MAX},
             {"timestamp":1790000000.0,"gen_throughput":f64::MAX}]});
         assert_eq!(parse_sglang_loads(&v).unwrap().load.gen_tps, None);
+    }
+
+    #[test]
+    fn negative_or_huge_timestamp_rejects_the_sample() {
+        // Negative timestamp.
+        let v = serde_json::json!({"loads":[{"timestamp":-1.0,"num_running_reqs":1}]});
+        assert!(parse_sglang_loads(&v).is_none());
+        // Non-finite timestamp.
+        let v = serde_json::json!({"loads":[{"timestamp":f64::NAN,"num_running_reqs":1}]});
+        assert!(parse_sglang_loads(&v).is_none());
+        let v = serde_json::json!({"loads":[{"timestamp":f64::INFINITY,"num_running_reqs":1}]});
+        assert!(parse_sglang_loads(&v).is_none());
+        // Timestamp whose millisecond conversion overflows u64.
+        let v = serde_json::json!({"loads":[{"timestamp":f64::MAX,"num_running_reqs":1}]});
+        assert!(parse_sglang_loads(&v).is_none());
     }
 
     #[test]

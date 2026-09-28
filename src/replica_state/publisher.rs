@@ -15,12 +15,22 @@ use super::sglang::{self, ReplicaLoad};
 /// `Unhealthy`.
 pub const UNHEALTHY_AFTER_FAILURES: u32 = 3;
 
+/// Ticks to back off before retrying a failed context read (~30 s at the
+/// default interval).
+const CONTEXT_RETRY_TICKS: u64 = 60;
+
 struct ReplicaSlot {
     base_url: String,
     last: Option<ReplicaLoad>,
     failures: u32,
     lifecycle: Lifecycle,
     max_context: Option<u64>,
+    /// True when `max_context` needs a re-read once the slot is next Ready:
+    /// set whenever the slot leaves Ready, cleared by a successful read.
+    context_stale: bool,
+    /// Earliest `seq` (as of tick start) at which a failed context read may
+    /// be retried.
+    next_context_seq: u64,
 }
 
 pub struct Publisher {
@@ -52,6 +62,8 @@ impl Publisher {
                 failures: 0,
                 lifecycle: Lifecycle::Warming,
                 max_context: None,
+                context_stale: true,
+                next_context_seq: 0,
             })
             .collect();
         Self {
@@ -65,24 +77,32 @@ impl Publisher {
     }
 
     /// Read every replica concurrently — joined, per slot, with a
-    /// context-length refresh for a slot that just became ready or has never
-    /// resolved one — then build one host frame for the whole tick. Each
-    /// slot's load read and (if needed) context read run as one joined pair,
-    /// so a tick stays bounded by `read_timeout` even while a refresh is
-    /// pending. `now_ms` is called once, after all reads complete, so
-    /// `reported_at_ms` is the seal time.
+    /// context-length refresh for a slot that needs one — then build one
+    /// host frame for the whole tick. Each slot's load read and (if needed)
+    /// context read run as one joined pair, so a tick stays bounded by
+    /// `read_timeout` even while a refresh is pending. `now_ms` is called
+    /// once, after all reads complete, so `reported_at_ms` is the seal time.
+    ///
+    /// A context read fires for slot `i` only when, as of the start of this
+    /// tick: the slot was already `Ready`, its context is missing or stale
+    /// (stale is set whenever the slot leaves `Ready`, so a down replica
+    /// gets one fresh read on its way back), and any prior failed read's
+    /// backoff (`CONTEXT_RETRY_TICKS`) has elapsed. So the first frame after
+    /// startup or recovery carries the previous (or null) context, and the
+    /// next tick refreshes it — never during the outage itself.
     pub async fn tick(
         &mut self,
         inflight: impl Fn(usize) -> u32,
         now_ms: impl Fn() -> u64,
-    ) -> Envelope {
-        // Whether to also fire a context read for slot `i`, decided from
-        // state as of the start of this tick (before any read completes):
-        // no context yet, or the slot wasn't Ready coming into this tick.
+    ) -> Result<Envelope, serde_json::Error> {
         let needs_refresh: Vec<bool> = self
             .slots
             .iter()
-            .map(|slot| slot.max_context.is_none() || slot.lifecycle != Lifecycle::Ready)
+            .map(|slot| {
+                slot.lifecycle == Lifecycle::Ready
+                    && (slot.max_context.is_none() || slot.context_stale)
+                    && self.seq >= slot.next_context_seq
+            })
             .collect();
 
         let results: Vec<(Option<ReplicaLoad>, Option<Option<u64>>)> =
@@ -114,12 +134,20 @@ impl Publisher {
         let seq = self.seq;
         let mut replicas = Vec::with_capacity(self.slots.len());
         for (i, (slot, (read, context_read))) in self.slots.iter_mut().zip(results).enumerate() {
+            let was_ready = slot.lifecycle == Lifecycle::Ready;
+
             // Only apply a context result once we know the load read for
             // this slot succeeded this tick; a failed load read leaves
             // `max_context` (and everything else) at its previous value.
-            if read.is_some() {
-                if let Some(Some(v)) = context_read {
-                    slot.max_context = Some(v);
+            if let Some(ctx) = context_read {
+                match ctx {
+                    Some(v) if read.is_some() => {
+                        slot.max_context = Some(v);
+                        slot.context_stale = false;
+                    }
+                    _ => {
+                        slot.next_context_seq = seq + CONTEXT_RETRY_TICKS;
+                    }
                 }
             }
 
@@ -166,6 +194,13 @@ impl Publisher {
                     }
                 }
             };
+
+            // Leaving Ready means the context may be stale next time we can
+            // read it; force a re-read once the slot is Ready again.
+            if was_ready && slot.lifecycle != Lifecycle::Ready {
+                slot.context_stale = true;
+            }
+
             replicas.push(ReplicaState {
                 index: i as u32,
                 engine_sampled_at_ms,
@@ -257,7 +292,7 @@ mod tests {
         let key_id = key.key_id.clone();
         let mut p = publisher(key, &[&s1.uri(), &s2.uri()], Duration::from_millis(500));
 
-        let host = open_host(&p.tick(|i| 10 + i as u32, || NOW).await, &vk);
+        let host = open_host(&p.tick(|i| 10 + i as u32, || NOW).await.unwrap(), &vk);
         assert_eq!(
             host.replicas.iter().map(|r| r.index).collect::<Vec<_>>(),
             vec![0, 1]
@@ -275,7 +310,7 @@ mod tests {
             assert_eq!(r.load.running, Some(3));
         }
 
-        let host2 = open_host(&p.tick(|_| 0, || NOW + 500).await, &vk);
+        let host2 = open_host(&p.tick(|_| 0, || NOW + 500).await.unwrap(), &vk);
         assert_eq!(host2.replicas.len(), 2);
         assert_eq!(host2.seq, 2);
     }
@@ -288,7 +323,7 @@ mod tests {
         let key = ReportKey::generate();
         let vk = key.signing_key().verifying_key();
         let mut p = publisher(key, &[&s.uri()], Duration::from_millis(500));
-        let host = open_host(&p.tick(|_| 0, || NOW).await, &vk);
+        let host = open_host(&p.tick(|_| 0, || NOW).await.unwrap(), &vk);
         let r = &host.replicas[0];
         assert_eq!(r.engine_sampled_at_ms, Some(1_000_000));
         assert_eq!(host.reported_at_ms, NOW);
@@ -303,14 +338,14 @@ mod tests {
         let key = ReportKey::generate();
         let vk = key.signing_key().verifying_key();
         let mut p = publisher(key, &[&s.uri()], Duration::from_millis(500));
-        let host = open_host(&p.tick(|_| 0, || NOW).await, &vk);
+        let host = open_host(&p.tick(|_| 0, || NOW).await.unwrap(), &vk);
         let ok = &host.replicas[0];
         assert_eq!(ok.load.running, Some(3));
         assert!(host.reported_at_ms >= ok.engine_sampled_at_ms.unwrap());
 
         s.reset().await;
         serve(&s, 500, 0.0).await;
-        let host = open_host(&p.tick(|_| 0, || NOW + 500).await, &vk);
+        let host = open_host(&p.tick(|_| 0, || NOW + 500).await.unwrap(), &vk);
         let r = &host.replicas[0];
         assert_eq!(r.load, Load::default());
         assert_eq!(r.engine_sampled_at_ms, Some(1_790_000_000_000));
@@ -318,15 +353,15 @@ mod tests {
         assert_eq!(r.engine_version.as_deref(), Some("0.5.9"));
         assert_eq!(r.lifecycle_state, Lifecycle::Ready);
 
-        let host = open_host(&p.tick(|_| 0, || NOW + 1000).await, &vk);
+        let host = open_host(&p.tick(|_| 0, || NOW + 1000).await.unwrap(), &vk);
         assert_eq!(host.replicas[0].lifecycle_state, Lifecycle::Ready);
-        let host = open_host(&p.tick(|_| 0, || NOW + 1500).await, &vk);
+        let host = open_host(&p.tick(|_| 0, || NOW + 1500).await.unwrap(), &vk);
         assert_eq!(host.replicas[0].lifecycle_state, Lifecycle::Unhealthy);
         assert_eq!(host.replicas[0].load, Load::default());
 
         s.reset().await;
         serve(&s, 200, 1_790_000_002.0).await;
-        let host = open_host(&p.tick(|_| 0, || NOW + 2000).await, &vk);
+        let host = open_host(&p.tick(|_| 0, || NOW + 2000).await.unwrap(), &vk);
         let r = &host.replicas[0];
         assert_eq!(r.lifecycle_state, Lifecycle::Ready);
         assert_eq!(r.engine_sampled_at_ms, Some(1_790_000_002_000));
@@ -342,7 +377,10 @@ mod tests {
         let mut p = publisher(key, &["http://127.0.0.1:1"], Duration::from_millis(500));
         let mut last = None;
         for n in 0..5 {
-            last = Some(open_host(&p.tick(|_| 0, || NOW + n * 500).await, &vk));
+            last = Some(open_host(
+                &p.tick(|_| 0, || NOW + n * 500).await.unwrap(),
+                &vk,
+            ));
         }
         let host = last.unwrap();
         let r = &host.replicas[0];
@@ -379,7 +417,8 @@ mod tests {
                 NOW
             },
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(calls.get(), 1);
         assert!(
             called_after.get() >= Duration::from_millis(150),
@@ -406,7 +445,7 @@ mod tests {
         let vk = key.signing_key().verifying_key();
         let mut p = publisher(key, &[&slow.uri(), &fast.uri()], Duration::from_millis(200));
         let start = Instant::now();
-        let env = p.tick(|_| 0, || NOW).await;
+        let env = p.tick(|_| 0, || NOW).await.unwrap();
         let elapsed = start.elapsed();
         assert!(elapsed < Duration::from_secs(1), "tick took {elapsed:?}");
         let host = open_host(&env, &vk);
@@ -445,8 +484,13 @@ mod tests {
         let key = ReportKey::generate();
         let vk = key.signing_key().verifying_key();
         let mut p = publisher(key, &[&s.uri()], Duration::from_millis(1000));
+
+        // Priming tick: brings the slot Ready so the context refresh fires
+        // on the next tick (the one this test times).
+        p.tick(|_| 0, || NOW - 1000).await.unwrap();
+
         let start = Instant::now();
-        let env = p.tick(|_| 0, || NOW).await;
+        let env = p.tick(|_| 0, || NOW).await.unwrap();
         let elapsed = start.elapsed();
         assert!(
             elapsed < Duration::from_millis(500),
@@ -467,8 +511,8 @@ mod tests {
             reqwest::Client::new(),
             Duration::from_millis(200),
         );
-        let a = open_host(&p.tick(|_| 0, || 1).await, &vk);
-        let b = open_host(&p.tick(|_| 0, || 2).await, &vk);
+        let a = open_host(&p.tick(|_| 0, || 1).await.unwrap(), &vk);
+        let b = open_host(&p.tick(|_| 0, || 2).await.unwrap(), &vk);
         assert_eq!(a.replicas.len(), 2);
         assert_eq!(b.seq, a.seq + 1);
         assert!(a
@@ -502,13 +546,16 @@ mod tests {
         let vk = key.signing_key().verifying_key();
         let mut p = publisher(key, &[&s.uri()], Duration::from_millis(500));
 
-        let host1 = open_host(&p.tick(|_| 0, || NOW).await, &vk);
+        // Priming tick: brings the slot Ready; the context read fires next tick.
+        open_host(&p.tick(|_| 0, || NOW - 500).await.unwrap(), &vk);
+
+        let host1 = open_host(&p.tick(|_| 0, || NOW).await.unwrap(), &vk);
         assert_eq!(host1.replicas[0].limits.max_context_tokens, Some(131_072));
-        let host2 = open_host(&p.tick(|_| 0, || NOW + 500).await, &vk);
+        let host2 = open_host(&p.tick(|_| 0, || NOW + 500).await.unwrap(), &vk);
         assert_eq!(host2.replicas[0].limits.max_context_tokens, Some(131_072));
 
         // Dropping the server verifies the `.expect(1)` on the /v1/models
-        // mock: exactly one call across both ticks.
+        // mock: exactly one call across all three ticks.
         drop(s);
     }
 
@@ -521,7 +568,7 @@ mod tests {
         let vk = key.signing_key().verifying_key();
         let mut p = publisher(key, &[&s.uri()], Duration::from_millis(500));
 
-        let host = open_host(&p.tick(|_| 0, || NOW).await, &vk);
+        let host = open_host(&p.tick(|_| 0, || NOW).await.unwrap(), &vk);
         assert_eq!(host.replicas[0].lifecycle_state, Lifecycle::Ready);
         assert_eq!(host.replicas[0].limits.max_context_tokens, None);
         // Review Focus 3: load is unaffected by the missing /v1/models endpoint.
@@ -538,14 +585,17 @@ mod tests {
         let vk = key.signing_key().verifying_key();
         let mut p = publisher(key, &[&s.uri()], Duration::from_millis(500));
 
-        let host = open_host(&p.tick(|_| 0, || NOW).await, &vk);
+        // Priming tick: brings the slot Ready; the context read fires next tick.
+        open_host(&p.tick(|_| 0, || NOW - 500).await.unwrap(), &vk);
+
+        let host = open_host(&p.tick(|_| 0, || NOW).await.unwrap(), &vk);
         assert_eq!(host.replicas[0].limits.max_context_tokens, Some(131_072));
 
         // Three failed /v1/loads reads move Ready -> Unhealthy.
         s.reset().await;
         serve(&s, 500, 0.0).await;
         for n in 1..=3 {
-            let host = open_host(&p.tick(|_| 0, || NOW + n * 500).await, &vk);
+            let host = open_host(&p.tick(|_| 0, || NOW + n * 500).await.unwrap(), &vk);
             if n < 3 {
                 assert_eq!(host.replicas[0].lifecycle_state, Lifecycle::Ready);
             } else {
@@ -554,7 +604,9 @@ mod tests {
         }
 
         // Recovery: /v1/loads succeeds again and /v1/models now reports a
-        // different value; the Unhealthy -> Ready transition must re-read it.
+        // different value. The Unhealthy -> Ready tick itself still carries
+        // the prior context (decided before this tick's read completed); the
+        // following tick performs the deferred, now-stale re-read.
         s.reset().await;
         serve(&s, 200, 1_790_000_004.0).await;
         Mock::given(method("GET"))
@@ -566,8 +618,11 @@ mod tests {
             .expect(1)
             .mount(&s)
             .await;
-        let host = open_host(&p.tick(|_| 0, || NOW + 2000).await, &vk);
+        let host = open_host(&p.tick(|_| 0, || NOW + 2000).await.unwrap(), &vk);
         assert_eq!(host.replicas[0].lifecycle_state, Lifecycle::Ready);
+        assert_eq!(host.replicas[0].limits.max_context_tokens, Some(131_072));
+
+        let host = open_host(&p.tick(|_| 0, || NOW + 2500).await.unwrap(), &vk);
         assert_eq!(host.replicas[0].limits.max_context_tokens, Some(262_144));
 
         drop(s);
@@ -582,31 +637,93 @@ mod tests {
         let vk = key.signing_key().verifying_key();
         let mut p = publisher(key, &[&s.uri()], Duration::from_millis(500));
 
-        let host = open_host(&p.tick(|_| 0, || NOW).await, &vk);
+        // Priming tick: brings the slot Ready; the context read fires next tick.
+        open_host(&p.tick(|_| 0, || NOW - 500).await.unwrap(), &vk);
+
+        let host = open_host(&p.tick(|_| 0, || NOW).await.unwrap(), &vk);
         assert_eq!(host.replicas[0].limits.max_context_tokens, Some(131_072));
 
         // Three failed /v1/loads reads move Ready -> Unhealthy.
         s.reset().await;
         serve(&s, 500, 0.0).await;
         for n in 1..=3 {
-            p.tick(|_| 0, || NOW + n * 500).await;
+            p.tick(|_| 0, || NOW + n * 500).await.unwrap();
         }
 
         // Recovery: /v1/loads succeeds again, but /v1/models now fails. The
-        // Unhealthy -> Ready transition must still attempt the re-read
-        // (verified by `.expect(1)`), and the failure must keep the prior
-        // context value rather than clearing it.
+        // Unhealthy -> Ready tick itself carries the prior context untouched
+        // (no read fires yet); the following tick attempts the deferred
+        // re-read (verified by `.expect(1)`), and the failure must keep the
+        // prior context value rather than clearing it.
         s.reset().await;
         serve(&s, 200, 1_790_000_004.0).await;
+        let host = open_host(&p.tick(|_| 0, || NOW + 2000).await.unwrap(), &vk);
+        assert_eq!(host.replicas[0].lifecycle_state, Lifecycle::Ready);
+        assert_eq!(host.replicas[0].limits.max_context_tokens, Some(131_072));
+
         Mock::given(method("GET"))
             .and(path("/v1/models"))
             .respond_with(ResponseTemplate::new(500))
             .expect(1)
             .mount(&s)
             .await;
-        let host = open_host(&p.tick(|_| 0, || NOW + 2000).await, &vk);
+        let host = open_host(&p.tick(|_| 0, || NOW + 2500).await.unwrap(), &vk);
         assert_eq!(host.replicas[0].lifecycle_state, Lifecycle::Ready);
         assert_eq!(host.replicas[0].limits.max_context_tokens, Some(131_072));
+
+        drop(s);
+    }
+
+    #[tokio::test]
+    async fn no_context_reads_while_replica_is_down() {
+        let s = MockServer::start().await;
+        serve(&s, 500, 0.0).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [{"id": "m", "max_model_len": 131_072}],
+            })))
+            .expect(0)
+            .mount(&s)
+            .await;
+        let key = ReportKey::generate();
+        let mut p = publisher(key, &[&s.uri()], Duration::from_millis(500));
+
+        for n in 0..6 {
+            p.tick(|_| 0, || NOW + n * 500).await.unwrap();
+        }
+
+        // Dropping the server verifies the `.expect(0)` on the /v1/models
+        // mock: never called while the replica never became Ready.
+        drop(s);
+    }
+
+    #[tokio::test]
+    async fn failed_context_read_backs_off() {
+        let s = MockServer::start().await;
+        serve(&s, 200, 1_790_000_000.0).await;
+        // No /v1/models mock mounted -> every context read 404s.
+        let key = ReportKey::generate();
+        let vk = key.signing_key().verifying_key();
+        let mut p = publisher(key, &[&s.uri()], Duration::from_millis(500));
+
+        // Priming tick: brings the slot Ready; the context read fires next tick.
+        open_host(&p.tick(|_| 0, || NOW - 500).await.unwrap(), &vk);
+
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&s)
+            .await;
+
+        // The failed read backs off for CONTEXT_RETRY_TICKS ticks, so none
+        // of these following ticks re-attempts it.
+        for n in 0..5 {
+            let host = open_host(&p.tick(|_| 0, || NOW + n * 500).await.unwrap(), &vk);
+            assert_eq!(host.replicas[0].limits.max_context_tokens, None);
+        }
 
         drop(s);
     }

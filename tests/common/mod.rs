@@ -201,7 +201,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         trust_proxy_headers: true,
     };
 
-    routes::build_router(&state.config)
+    routes::build_router()
         .layer(middleware::from_fn(rate_limit::rate_limit_middleware))
         .layer(axum::Extension(rate_limit_state))
         .layer(middleware::from_fn(request_id_middleware))

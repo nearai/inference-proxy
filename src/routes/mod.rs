@@ -10,14 +10,10 @@ pub mod passthrough;
 pub mod privacy;
 pub mod signature;
 
-use axum::extract::{DefaultBodyLimit, Request, State};
-use axum::http::{HeaderName, HeaderValue};
-use axum::middleware::{self, Next};
-use axum::response::Response;
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use axum::Router;
 
-use crate::config::Config;
 use crate::error::AppError;
 use crate::AppState;
 
@@ -53,23 +49,26 @@ async fn unknown_route() -> AppError {
     AppError::NotFound("Endpoint not found".to_string())
 }
 
-/// Response header naming the host that served an inference request, set to
-/// `REPLICA_STATE_HOST_ID` when replica-state publishing is configured. Callers
-/// (cloud-api) use it only as an advisory check that host routing landed where
-/// intended.
-pub const HOST_ID_HEADER: HeaderName = HeaderName::from_static("x-nearai-host-id");
-
-async fn host_id_header(State(host_id): State<HeaderValue>, req: Request, next: Next) -> Response {
-    let mut response = next.run(req).await;
-    response.headers_mut().insert(HOST_ID_HEADER, host_id);
-    response
-}
-
-/// Routes that proxy an inference request to the backend. When replica-state
-/// publishing is configured, every response from them (success, stream, or
-/// error) carries [`HOST_ID_HEADER`].
-fn inference_routes(config: &Config) -> Router<AppState> {
-    let router = Router::new()
+pub fn build_router() -> Router<AppState> {
+    Router::new()
+        // Unauthenticated health endpoints
+        .route(ROUTE_ROOT, get(health::root))
+        .route(ROUTE_VERSION, get(health::version))
+        .route(ROUTE_HEALTHZ, get(health::healthz))
+        // Unauthenticated Prometheus metrics
+        .route(
+            ROUTE_METRICS,
+            get(crate::metrics_middleware::prometheus_metrics_handler),
+        )
+        // Unauthenticated backend metrics/models
+        .route(ROUTE_V1_METRICS, get(metrics::metrics))
+        .route(ROUTE_V1_MODELS, get(metrics::models))
+        // Unauthenticated attestation report
+        .route(
+            ROUTE_ATTESTATION_REPORT,
+            get(attestation::attestation_report),
+        )
+        // Authenticated endpoints
         .route(ROUTE_CHAT_COMPLETIONS, post(chat::chat_completions))
         .route(ROUTE_COMPLETIONS, post(completions::completions))
         .route(ROUTE_TOKENIZE, post(passthrough::tokenize))
@@ -95,42 +94,7 @@ fn inference_routes(config: &Config) -> Router<AppState> {
         .route(
             ROUTE_AUDIO_TRANSCRIPTIONS,
             post(passthrough::audio_transcriptions).layer(DefaultBodyLimit::disable()),
-        );
-    let Some(replica_state) = config.replica_state() else {
-        return router;
-    };
-    match HeaderValue::from_str(&replica_state.host_id) {
-        Ok(host_id) => router.route_layer(middleware::from_fn_with_state(host_id, host_id_header)),
-        Err(_) => {
-            tracing::warn!(
-                "REPLICA_STATE_HOST_ID is not a valid header value; host id header disabled"
-            );
-            router
-        }
-    }
-}
-
-pub fn build_router(config: &Config) -> Router<AppState> {
-    Router::new()
-        // Unauthenticated health endpoints
-        .route(ROUTE_ROOT, get(health::root))
-        .route(ROUTE_VERSION, get(health::version))
-        .route(ROUTE_HEALTHZ, get(health::healthz))
-        // Unauthenticated Prometheus metrics
-        .route(
-            ROUTE_METRICS,
-            get(crate::metrics_middleware::prometheus_metrics_handler),
         )
-        // Unauthenticated backend metrics/models
-        .route(ROUTE_V1_METRICS, get(metrics::metrics))
-        .route(ROUTE_V1_MODELS, get(metrics::models))
-        // Unauthenticated attestation report
-        .route(
-            ROUTE_ATTESTATION_REPORT,
-            get(attestation::attestation_report),
-        )
-        // Authenticated inference endpoints
-        .merge(inference_routes(config))
         .route(ROUTE_SIGNATURE, get(signature::signature))
         // Internal — sibling proxies on the same host call this when
         // configured with GPU_EVIDENCE_DELEGATE_URL pointed at us.

@@ -29,8 +29,6 @@ struct TestAppOptions {
     backend_urls: Vec<String>,
     backend_conversation_affinity: bool,
     backend_affinity_max_imbalance: u32,
-    /// `REPLICA_STATE_HOST_ID`; `Some` enables replica-state publishing config.
-    replica_host_id: Option<String>,
 }
 
 impl Default for TestAppOptions {
@@ -51,7 +49,6 @@ impl Default for TestAppOptions {
             backend_urls: Vec::new(),
             backend_conversation_affinity: false,
             backend_affinity_max_imbalance: 8,
-            replica_host_id: None,
         }
     }
 }
@@ -169,15 +166,7 @@ fn build_test_app_inner_with_pool(
     };
 
     let config = config::Config {
-        replica_state: options.replica_host_id.clone().map(|host_id| {
-            vllm_proxy_rs::replica_state::config::ReplicaStateConfig {
-                redis_url: "redis://127.0.0.1:1".to_string(),
-                redis_ca_cert: None,
-                host_id,
-                replica_ids: vec!["r0".to_string()],
-                interval: std::time::Duration::from_millis(500),
-            }
-        }),
+        replica_state: None,
         model_name: "test-model".to_string(),
         tokens: if options.fusion_enabled {
             vec!["test-token".to_string(), "fusion-token".to_string()]
@@ -367,7 +356,7 @@ fn build_test_app_inner_with_pool(
         trust_proxy_headers: true,
     };
 
-    let router = routes::build_router(&state.config)
+    let router = routes::build_router()
         .layer(middleware::from_fn(rate_limit::rate_limit_middleware))
         .layer(axum::Extension(rate_limit_state))
         .layer(middleware::from_fn(request_id_middleware))
@@ -5535,7 +5524,7 @@ fn build_test_app_with_cloud_api_retries(
         trust_proxy_headers: true,
     };
 
-    routes::build_router(&state.config)
+    routes::build_router()
         .layer(middleware::from_fn(rate_limit::rate_limit_middleware))
         .layer(axum::Extension(rate_limit_state))
         .layer(middleware::from_fn(request_id_middleware))
@@ -8166,7 +8155,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         trust_proxy_headers: true,
     };
 
-    routes::build_router(&state.config)
+    routes::build_router()
         .layer(middleware::from_fn(rate_limit::rate_limit_middleware))
         .layer(axum::Extension(rate_limit_state))
         .layer(middleware::from_fn(request_id_middleware))
@@ -8617,7 +8606,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         trust_proxy_headers: true,
     };
 
-    let app = routes::build_router(&state.config)
+    let app = routes::build_router()
         .layer(middleware::from_fn(rate_limit::rate_limit_middleware))
         .layer(axum::Extension(rate_limit_state))
         .layer(middleware::from_fn(request_id_middleware))
@@ -10087,89 +10076,4 @@ async fn test_tracing_headers_propagated_non_streaming() {
         StatusCode::OK,
         "upstream did not receive tracing headers on non-streaming path"
     );
-}
-
-#[tokio::test]
-async fn host_id_header_present_only_when_configured() {
-    let json_server = MockServer::start().await;
-    let sse_server = MockServer::start().await;
-    let backend_response = serde_json::json!({
-        "id": "chatcmpl-hostid",
-        "object": "chat.completion",
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": "Hello!"},
-            "finish_reason": "stop"
-        }],
-        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
-    });
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&backend_response))
-        .mount(&json_server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(
-                    "data: {\"id\":\"chatcmpl-hostid\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\ndata: [DONE]\n\n",
-                )
-                .insert_header("content-type", "text/event-stream"),
-        )
-        .mount(&sse_server)
-        .await;
-
-    let chat = |stream: bool| {
-        Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("content-type", "application/json")
-            .header(auth_header().0, auth_header().1)
-            .body(Body::from(
-                serde_json::to_vec(&serde_json::json!({
-                    "model": "test-model",
-                    "messages": [{"role": "user", "content": "Hi"}],
-                    "stream": stream
-                }))
-                .unwrap(),
-            ))
-            .unwrap()
-    };
-    let version = || {
-        Request::builder()
-            .uri("/version")
-            .body(Body::empty())
-            .unwrap()
-    };
-
-    for (stream, server) in [(false, &json_server), (true, &sse_server)] {
-        let configured = build_test_app_inner(
-            &server.uri(),
-            TestAppOptions {
-                replica_host_id: Some("gpu02".to_string()),
-                ..Default::default()
-            },
-        );
-        let unconfigured = build_test_app(&server.uri());
-
-        let response = configured.clone().oneshot(chat(stream)).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get("x-nearai-host-id").unwrap(),
-            "gpu02",
-            "stream={stream}"
-        );
-        let body = body_to_bytes(response).await;
-        assert!(String::from_utf8_lossy(&body).contains("chatcmpl-hostid"));
-
-        let response = unconfigured.oneshot(chat(stream)).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(response.headers().get("x-nearai-host-id").is_none());
-
-        // Non-inference routes never carry it.
-        let response = configured.oneshot(version()).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(response.headers().get("x-nearai-host-id").is_none());
-    }
 }

@@ -7,6 +7,7 @@ use axum::Extension;
 use sha2::Digest;
 
 use crate::auth::RequireAuth;
+use crate::backend_affinity::parse_replica_hint;
 use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
 use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageType};
@@ -244,9 +245,25 @@ pub async fn chat_completions(
         (None, None)
     };
 
+    // Placement hint from cloud-api: honoured under the same trust predicate
+    // as `X-NearAI-Priority` (a caller authenticated with the proxy's own
+    // config token, not an `sk-` API key). An untrusted caller's header is
+    // discarded entirely (treated as absent, no metric), same as priority.
+    let hint = if auth.cloud_api_key.is_none() {
+        parse_replica_hint(&headers)
+    } else {
+        crate::backend_affinity::ReplicaHint::Absent
+    };
+
     // Lane admission, per-host placement and connection fail-over policy are
     // shared with text completions. Chat retains its conversation affinity.
-    let placed = place_completion(&state, ROUTE_CHAT_COMPLETIONS, tier, backend_affinity_key)?;
+    let placed = place_completion(
+        &state,
+        ROUTE_CHAT_COMPLETIONS,
+        tier,
+        backend_affinity_key,
+        hint,
+    )?;
     let opts = ProxyOpts {
         signing: state.signing.clone(),
         cache: state.cache.clone(),

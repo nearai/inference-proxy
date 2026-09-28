@@ -856,6 +856,59 @@ async fn test_multiple_backends_without_affinity_stay_least_connections() {
 }
 
 #[tokio::test]
+async fn test_replica_hint_routes_to_hinted_backend() {
+    let backend_a = MockServer::start().await;
+    let backend_b = MockServer::start().await;
+    mount_chat_ok(&backend_a, "/v1/chat/completions", 1).await;
+    mount_chat_ok(&backend_b, "/v1/chat/completions", 1).await;
+    let (app, _pool) =
+        build_test_app_with_backends(vec![backend_a.uri(), backend_b.uri()], false, 8);
+
+    // Trusted caller (config-token auth, same as the priority tests) hints
+    // pool index 1 (backend_b): honoured, request lands on backend_b.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header(backend_affinity::REPLICA_HINT_HEADER, "1")
+                .body(Body::from(
+                    serde_json::to_vec(&affinity_chat_body(0)).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(requests_seen(&backend_b).await, 1);
+    assert_eq!(requests_seen(&backend_a).await, 0);
+
+    // Out-of-range hint: invalid, request still succeeds (falls back to
+    // least-connections, which now favors the still-idle backend_a).
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header(backend_affinity::REPLICA_HINT_HEADER, "7")
+                .body(Body::from(
+                    serde_json::to_vec(&affinity_chat_body(0)).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(requests_seen(&backend_a).await, 1);
+    assert_eq!(requests_seen(&backend_b).await, 1);
+}
+
+#[tokio::test]
 async fn test_chat_completions_image_validation_rejects_bad_image() {
     // Handler-level wiring: with image validation enabled, a request carrying a
     // clearly-bad image (dangerous scheme) is rejected at the proxy with a 400

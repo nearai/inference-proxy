@@ -14,6 +14,7 @@
 //! least-loaded healthy backend, the turn is rebalanced to the least-loaded
 //! backend and the conversation is re-pinned there.
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use moka::sync::Cache;
@@ -23,6 +24,41 @@ use crate::backend_pool::{BackendGuard, BackendPool, Policy, Selection};
 use crate::vllm_dp_affinity::conversation_key;
 
 const MAX_AFFINITY_ASSIGNMENTS: u64 = 100_000;
+
+/// Header carrying cloud-api's placement hint: a decimal pool index of the
+/// backend it wants this request to land on.
+pub const REPLICA_HINT_HEADER: &str = "x-nearai-replica";
+
+/// Parsed `x-nearai-replica` header value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplicaHint {
+    /// No header present.
+    Absent,
+    /// Header present but not a plain, in-range, non-negative integer.
+    Invalid,
+    /// Header parsed to this pool index (not yet validated against the pool).
+    Index(usize),
+}
+
+/// Parse the `x-nearai-replica` header: missing → `Absent`; a value that is
+/// not (after trimming) ASCII digits only, is empty, or overflows `usize` →
+/// `Invalid`; otherwise `Index(n)`.
+pub fn parse_replica_hint(headers: &axum::http::HeaderMap) -> ReplicaHint {
+    let Some(value) = headers.get(REPLICA_HINT_HEADER) else {
+        return ReplicaHint::Absent;
+    };
+    let Ok(value) = value.to_str() else {
+        return ReplicaHint::Invalid;
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return ReplicaHint::Invalid;
+    }
+    match trimmed.parse::<usize>() {
+        Ok(index) => ReplicaHint::Index(index),
+        Err(_) => ReplicaHint::Invalid,
+    }
+}
 
 /// Opaque conversation digest used as the affinity key. Contains no prompt
 /// content (salted SHA-256, see `vllm_dp_affinity::conversation_key`).
@@ -100,9 +136,48 @@ impl BackendConversationAffinity {
         &self,
         pool: &BackendPool,
         key: Option<ConversationKey>,
+        hint: ReplicaHint,
         path: &str,
         policy: &Policy<'_>,
     ) -> Option<Placement> {
+        match hint {
+            ReplicaHint::Absent => {}
+            ReplicaHint::Invalid => {
+                metrics::counter!("placement_hint_overridden_total", "reason" => "invalid")
+                    .increment(1);
+            }
+            ReplicaHint::Index(i) if i >= pool.len() => {
+                metrics::counter!("placement_hint_overridden_total", "reason" => "invalid")
+                    .increment(1);
+            }
+            ReplicaHint::Index(i) => {
+                let sel = pool.select_with_preference_bounded(Some(i), self.max_imbalance, policy);
+                match sel {
+                    Some(sel) if sel.index == i => {
+                        metrics::counter!("placement_hint_honored_total").increment(1);
+                        if let Some(k) = key {
+                            if self.enabled {
+                                self.repin(k, i);
+                            }
+                        }
+                        return Some(Placement::new(sel, path));
+                    }
+                    sel => {
+                        let reason = if !pool.backends()[i].healthy.load(Ordering::Relaxed) {
+                            "unhealthy"
+                        } else {
+                            "imbalance"
+                        };
+                        metrics::counter!("placement_hint_overridden_total", "reason" => reason)
+                            .increment(1);
+                        // Drop the probe selection first so its guard releases
+                        // the reservation before the existing path runs.
+                        drop(sel);
+                    }
+                }
+            }
+        }
+
         let Some(key) = key else {
             let selection = pool.select_with_preference_bounded(None, 0, policy)?;
             return Some(Placement::new(selection, path));
@@ -211,7 +286,13 @@ mod tests {
         // Turn 1: both idle → least-connections picks b1.
         let key = affinity.key_for_chat_request(&turn(0), "model");
         let Placement { url, guard, .. } = affinity
-            .place(&pool, key, "/v1/chat/completions", &Policy::NONE)
+            .place(
+                &pool,
+                key,
+                ReplicaHint::Absent,
+                "/v1/chat/completions",
+                &Policy::NONE,
+            )
             .unwrap();
         assert_eq!(url, "http://b1:8000/v1/chat/completions");
         drop(guard);
@@ -224,7 +305,13 @@ mod tests {
         let Placement {
             url, guard: _guard, ..
         } = affinity
-            .place(&pool, key, "/v1/chat/completions", &Policy::NONE)
+            .place(
+                &pool,
+                key,
+                ReplicaHint::Absent,
+                "/v1/chat/completions",
+                &Policy::NONE,
+            )
             .unwrap();
         assert_eq!(url, "http://b1:8000/v1/chat/completions");
         assert_eq!(affinity.assignment(&key.unwrap()), Some(0));
@@ -243,7 +330,13 @@ mod tests {
         let Placement {
             url, guard: _guard, ..
         } = affinity
-            .place(&pool, key, "/v1/chat/completions", &Policy::NONE)
+            .place(
+                &pool,
+                key,
+                ReplicaHint::Absent,
+                "/v1/chat/completions",
+                &Policy::NONE,
+            )
             .unwrap();
         assert_eq!(url, "http://b2:8000/v1/chat/completions");
         assert_eq!(affinity.assignment(&key.unwrap()), Some(1));
@@ -256,7 +349,13 @@ mod tests {
 
         let key = affinity.key_for_chat_request(&turn(0), "model").unwrap();
         let Placement { url, guard, .. } = affinity
-            .place(&pool, Some(key), "/v1/chat/completions", &Policy::NONE)
+            .place(
+                &pool,
+                Some(key),
+                ReplicaHint::Absent,
+                "/v1/chat/completions",
+                &Policy::NONE,
+            )
             .unwrap();
         assert_eq!(url, "http://b1:8000/v1/chat/completions");
         drop(guard);
@@ -264,7 +363,13 @@ mod tests {
         // b1 has 5 more in-flight requests than b2 (> max_imbalance 4).
         pool.backends()[0].active_conns.store(5, Ordering::Relaxed);
         let Placement { url, guard, .. } = affinity
-            .place(&pool, Some(key), "/v1/chat/completions", &Policy::NONE)
+            .place(
+                &pool,
+                Some(key),
+                ReplicaHint::Absent,
+                "/v1/chat/completions",
+                &Policy::NONE,
+            )
             .unwrap();
         assert_eq!(url, "http://b2:8000/v1/chat/completions");
         assert_eq!(affinity.assignment(&key), Some(1));
@@ -277,7 +382,13 @@ mod tests {
         let Placement {
             url, guard: _guard, ..
         } = affinity
-            .place(&pool, Some(key), "/v1/chat/completions", &Policy::NONE)
+            .place(
+                &pool,
+                Some(key),
+                ReplicaHint::Absent,
+                "/v1/chat/completions",
+                &Policy::NONE,
+            )
             .unwrap();
         assert_eq!(url, "http://b2:8000/v1/chat/completions");
     }
@@ -289,7 +400,13 @@ mod tests {
 
         let key = affinity.key_for_chat_request(&turn(0), "model").unwrap();
         let Placement { url, guard, .. } = affinity
-            .place(&pool, Some(key), "/v1/chat/completions", &Policy::NONE)
+            .place(
+                &pool,
+                Some(key),
+                ReplicaHint::Absent,
+                "/v1/chat/completions",
+                &Policy::NONE,
+            )
             .unwrap();
         assert_eq!(url, "http://b1:8000/v1/chat/completions");
         drop(guard);
@@ -298,7 +415,13 @@ mod tests {
         let Placement {
             url, guard: _guard, ..
         } = affinity
-            .place(&pool, Some(key), "/v1/chat/completions", &Policy::NONE)
+            .place(
+                &pool,
+                Some(key),
+                ReplicaHint::Absent,
+                "/v1/chat/completions",
+                &Policy::NONE,
+            )
             .unwrap();
         assert_eq!(url, "http://b2:8000/v1/chat/completions");
         assert_eq!(affinity.assignment(&key), Some(1));
@@ -321,7 +444,13 @@ mod tests {
 
         let key = affinity.key_for_chat_request(&turn(0), "model").unwrap();
         let Placement { url, guard, .. } = affinity
-            .place(&pool, Some(key), "/v1/chat/completions", &share2())
+            .place(
+                &pool,
+                Some(key),
+                ReplicaHint::Absent,
+                "/v1/chat/completions",
+                &share2(),
+            )
             .unwrap();
         assert_eq!(url, "http://b1:8000/v1/chat/completions");
         drop(guard);
@@ -330,7 +459,13 @@ mod tests {
         // moves to b2 even though the imbalance (2) is within the bound (8).
         set_lane_conns(&pool, 0, 2);
         let placement = affinity
-            .place(&pool, Some(key), "/v1/chat/completions", &share2())
+            .place(
+                &pool,
+                Some(key),
+                ReplicaHint::Absent,
+                "/v1/chat/completions",
+                &share2(),
+            )
             .unwrap();
         assert_eq!(placement.index, 1);
         assert_eq!(affinity.assignment(&key), Some(1));
@@ -339,10 +474,22 @@ mod tests {
         // Both at the share: nothing to place, with or without a key.
         set_lane_conns(&pool, 1, 2);
         assert!(affinity
-            .place(&pool, Some(key), "/v1/chat/completions", &share2())
+            .place(
+                &pool,
+                Some(key),
+                ReplicaHint::Absent,
+                "/v1/chat/completions",
+                &share2()
+            )
             .is_none());
         assert!(affinity
-            .place(&pool, None, "/v1/completions", &share2())
+            .place(
+                &pool,
+                None,
+                ReplicaHint::Absent,
+                "/v1/completions",
+                &share2()
+            )
             .is_none());
     }
 
@@ -352,14 +499,26 @@ mod tests {
         let affinity = BackendConversationAffinity::new(true, 2, 8, 1_200);
         let key = affinity.key_for_chat_request(&turn(0), "model").unwrap();
         let placement = affinity
-            .place(&pool, Some(key), "/v1/chat/completions", &Policy::NONE)
+            .place(
+                &pool,
+                Some(key),
+                ReplicaHint::Absent,
+                "/v1/chat/completions",
+                &Policy::NONE,
+            )
             .unwrap();
         assert_eq!(placement.index, 0);
         drop(placement);
 
         // b1 just rejected at engine admission: steer the next turn to b2.
         let placement = affinity
-            .place(&pool, Some(key), "/v1/chat/completions", &avoid_b1())
+            .place(
+                &pool,
+                Some(key),
+                ReplicaHint::Absent,
+                "/v1/chat/completions",
+                &avoid_b1(),
+            )
             .unwrap();
         assert_eq!(placement.index, 1);
         assert_eq!(affinity.assignment(&key), Some(1));
@@ -378,8 +537,119 @@ mod tests {
         let Placement {
             url, guard: _guard, ..
         } = affinity
-            .place(&pool, None, "/v1/completions", &Policy::NONE)
+            .place(
+                &pool,
+                None,
+                ReplicaHint::Absent,
+                "/v1/completions",
+                &Policy::NONE,
+            )
             .unwrap();
         assert_eq!(url, "http://b2:8000/v1/completions");
+    }
+
+    fn hdr(v: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(REPLICA_HINT_HEADER, v.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn parse_hint_values() {
+        assert_eq!(
+            parse_replica_hint(&axum::http::HeaderMap::new()),
+            ReplicaHint::Absent
+        );
+        assert_eq!(parse_replica_hint(&hdr("2")), ReplicaHint::Index(2));
+        assert_eq!(parse_replica_hint(&hdr(" 2 ")), ReplicaHint::Index(2));
+        for bad in ["", "-1", "x", "1.0", "99999999999999999999999"] {
+            assert_eq!(parse_replica_hint(&hdr(bad)), ReplicaHint::Invalid, "{bad}");
+        }
+    }
+
+    #[test]
+    fn healthy_balanced_hint_is_honoured() {
+        let pool = BackendPool::new(vec![
+            "http://a".into(),
+            "http://b".into(),
+            "http://c".into(),
+        ]);
+        let aff = BackendConversationAffinity::new(false, 3, 8, 60);
+        let p = aff
+            .place(
+                &pool,
+                None,
+                ReplicaHint::Index(2),
+                "/v1/chat/completions",
+                &Policy::NONE,
+            )
+            .unwrap();
+        assert_eq!(p.index, 2);
+    }
+
+    #[test]
+    fn unhealthy_hint_falls_back() {
+        let pool = BackendPool::new(vec!["http://a".into(), "http://b".into()]);
+        pool.backends()[1].healthy.store(false, Ordering::Relaxed);
+        let aff = BackendConversationAffinity::new(false, 2, 8, 60);
+        let p = aff
+            .place(&pool, None, ReplicaHint::Index(1), "/x", &Policy::NONE)
+            .unwrap();
+        assert_eq!(p.index, 0);
+    }
+
+    #[test]
+    fn overloaded_hint_falls_back_to_least_loaded() {
+        let pool = BackendPool::new(vec!["http://a".into(), "http://b".into()]);
+        pool.backends()[1].active_conns.store(20, Ordering::Relaxed);
+        let aff = BackendConversationAffinity::new(false, 2, 8, 60);
+        let p = aff
+            .place(&pool, None, ReplicaHint::Index(1), "/x", &Policy::NONE)
+            .unwrap();
+        assert_eq!(p.index, 0);
+    }
+
+    #[test]
+    fn out_of_range_and_invalid_hints_fall_back() {
+        let pool = BackendPool::new(vec!["http://a".into()]);
+        let aff = BackendConversationAffinity::new(false, 1, 8, 60);
+        for h in [ReplicaHint::Index(5), ReplicaHint::Invalid] {
+            assert_eq!(
+                aff.place(&pool, None, h, "/x", &Policy::NONE)
+                    .unwrap()
+                    .index,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn hint_outside_requested_tier_is_not_honoured() {
+        let pool = BackendPool::with_long_context(vec!["http://b".into()], vec!["http://l".into()]);
+        let aff = BackendConversationAffinity::new(false, 2, 8, 60);
+        let policy = Policy {
+            tier: Some(crate::context_tier::ContextTier::Base),
+            ..Policy::NONE
+        };
+        let p = aff
+            .place(&pool, None, ReplicaHint::Index(1), "/x", &policy)
+            .unwrap();
+        assert_eq!(p.index, 0);
+    }
+
+    #[test]
+    fn honoured_hint_repins_conversation() {
+        let pool = BackendPool::new(vec!["http://a".into(), "http://b".into()]);
+        let aff = BackendConversationAffinity::new(true, 2, 8, 60);
+        let key = [9u8; 32];
+        let first = aff
+            .place(&pool, Some(key), ReplicaHint::Index(1), "/x", &Policy::NONE)
+            .unwrap();
+        assert_eq!(first.index, 1);
+        drop(first);
+        let next = aff
+            .place(&pool, Some(key), ReplicaHint::Absent, "/x", &Policy::NONE)
+            .unwrap();
+        assert_eq!(next.index, 1);
     }
 }

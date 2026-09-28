@@ -98,6 +98,8 @@ pub fn parse_sglang_loads(body: &serde_json::Value) -> Option<ReplicaLoad> {
             queued,
             prefill_backlog_tokens,
             kv_usage,
+            kv_used_tokens: used,
+            kv_capacity_tokens: max_total.filter(|&v| v != 0),
             gen_tps,
             cached_token_ratio,
         },
@@ -162,6 +164,10 @@ mod tests {
             (Some(14), Some(2), Some(51200))
         );
         assert_eq!(r.load.kv_usage, Some(0.63));
+        assert_eq!(
+            (r.load.kv_used_tokens, r.load.kv_capacity_tokens),
+            (Some(630), Some(1000))
+        );
         assert_eq!(r.load.gen_tps, Some(910.0));
         assert_eq!(r.load.cached_token_ratio, Some(0.71));
         assert_eq!(r.limits.max_running, Some(32));
@@ -180,6 +186,10 @@ mod tests {
             (Some(8), Some(1), Some(150))
         );
         assert_eq!(r.load.kv_usage, Some(0.2));
+        assert_eq!(
+            (r.load.kv_used_tokens, r.load.kv_capacity_tokens),
+            (Some(400), Some(2000))
+        );
         assert_eq!(r.load.gen_tps, Some(30.0));
         assert_eq!(r.load.cached_token_ratio, None);
         assert_eq!(r.limits.max_running, Some(32));
@@ -193,6 +203,10 @@ mod tests {
         assert_eq!(r.load.running, Some(4));
         assert_eq!(r.load.queued, None);
         assert_eq!(r.load.kv_usage, None);
+        assert_eq!(
+            (r.load.kv_used_tokens, r.load.kv_capacity_tokens),
+            (None, None)
+        );
     }
 
     #[test]
@@ -209,6 +223,17 @@ mod tests {
     }
 
     #[test]
+    fn zero_kv_capacity_is_null() {
+        let v = serde_json::json!({"loads":[{"timestamp":1790000000.0,
+            "num_used_tokens":0,"max_total_num_tokens":0}]});
+        let load = parse_sglang_loads(&v).unwrap().load;
+        assert_eq!(
+            (load.kv_used_tokens, load.kv_capacity_tokens, load.kv_usage),
+            (Some(0), None, None)
+        );
+    }
+
+    #[test]
     fn overflowing_counts_are_null() {
         // u64 sum overflow across ranks.
         let v = serde_json::json!({"loads":[
@@ -217,7 +242,22 @@ mod tests {
         let r = parse_sglang_loads(&v).unwrap();
         assert_eq!(r.load.prefill_backlog_tokens, None);
         assert_eq!(r.load.kv_usage, None);
+        assert_eq!(r.load.kv_used_tokens, None);
+        assert_eq!(r.load.kv_capacity_tokens, Some(20));
         assert_eq!(r.limits.max_running, None);
+        // Capacity overflow nulls capacity and ratio but keeps the used count.
+        let v = serde_json::json!({"loads":[
+            {"timestamp":1790000000.0,"num_used_tokens":5,"max_total_num_tokens":u64::MAX},
+            {"timestamp":1790000000.0,"num_used_tokens":5,"max_total_num_tokens":1}]});
+        let r = parse_sglang_loads(&v).unwrap();
+        assert_eq!(
+            (
+                r.load.kv_used_tokens,
+                r.load.kv_capacity_tokens,
+                r.load.kv_usage
+            ),
+            (Some(10), None, None)
+        );
         // Fits u64 but not u32.
         let v = serde_json::json!({"loads":[{"timestamp":1790000000.0,
             "num_running_reqs":5_000_000_000u64,"num_waiting_reqs":4_294_967_296u64}]});

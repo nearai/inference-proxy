@@ -74,6 +74,8 @@ Each tick produces one `ReplicaReport` per replica, JSON-serialized compactly
     "queued": 0,
     "prefill_backlog_tokens": 51200,
     "kv_usage": 0.63,
+    "kv_used_tokens": 630000,
+    "kv_capacity_tokens": 1000000,
     "gen_tps": 910.0,
     "cached_token_ratio": 0.71
   },
@@ -107,6 +109,11 @@ Notes:
 - `reported_at_ms` is the proxy's wall-clock time when the frame was sealed,
   taken once per tick after every replica's read has completed (all frames of
   a tick share it). It is what readers use for frame freshness.
+- `load.kv_used_tokens` / `load.kv_capacity_tokens` are the absolute KV
+  cache counts behind `kv_usage` (non-evictable used tokens and total
+  capacity, summed across ranks), so readers can compare replicas with
+  different KV pool sizes. Both are `null` when unknown, never `0` for
+  unknown; added to schema `1` as additive fields.
 - `report_key_id` identifies the per-boot signing key (see Signing below).
 
 ### Signing
@@ -174,6 +181,8 @@ replica, normalized by `parse_sglang_loads`:
 | `load.prefill_backlog_tokens` | `num_waiting_uncached_tokens` |
 | `load.gen_tps` | `gen_throughput` |
 | `load.kv_usage` | `num_used_tokens / max_total_num_tokens`, clamped to `[0, 1]`; `null` if either is missing or the total is `0` |
+| `load.kv_used_tokens` | `num_used_tokens`: KV tokens held by requests, excluding evictable (freeable) prefix cache — SGLang's `used + evictable + available = max_total_num_tokens` |
+| `load.kv_capacity_tokens` | `max_total_num_tokens`: total KV cache capacity in tokens; `null` if the sum is `0` |
 | `load.cached_token_ratio` | `cache_hit_rate`, single-rank replicas only (`null` for multi-rank, since a hit ratio isn't meaningfully summed) |
 | `limits.max_running` | `max_running_requests`, summed; `null` if the sum is `0` |
 | `engine_version` | top-level `version` (`null` if absent) |

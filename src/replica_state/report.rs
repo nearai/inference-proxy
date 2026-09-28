@@ -42,6 +42,10 @@ pub struct Load {
     pub queued: Option<u32>,
     pub prefill_backlog_tokens: Option<u64>,
     pub kv_usage: Option<f64>,
+    /// Non-evictable KV tokens in use, summed across ranks.
+    pub kv_used_tokens: Option<u64>,
+    /// Total KV cache capacity in tokens, summed across ranks.
+    pub kv_capacity_tokens: Option<u64>,
     pub gen_tps: Option<f64>,
     pub cached_token_ratio: Option<f64>,
 }
@@ -151,7 +155,22 @@ mod tests {
             .frame
             .starts_with(r#"{"schema":1,"host_id":"glm53-gpu03""#));
         assert!(env.frame.contains(r#""kv_usage":null"#));
+        assert!(env.frame.contains(r#""kv_used_tokens":null"#));
+        assert!(env.frame.contains(r#""kv_capacity_tokens":null"#));
         assert!(!env.frame.contains(": "));
+    }
+
+    #[test]
+    fn kv_token_counts_serialize_as_integers() {
+        let mut r = report();
+        r.load.kv_used_tokens = Some(630);
+        r.load.kv_capacity_tokens = Some(1000);
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let env = seal(&r, &sk);
+        assert!(env
+            .frame
+            .contains(r#""kv_used_tokens":630,"kv_capacity_tokens":1000"#));
+        assert_eq!(open(&env, &sk.verifying_key()), Some(r));
     }
 
     #[test]

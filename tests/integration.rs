@@ -4521,6 +4521,313 @@ async fn test_streaming_signature_cached_and_verifiable() {
     assert_eq!(sig_hex.len(), 132); // 65 bytes hex + "0x"
 }
 
+// ---- Reasoning usage: usage.reasoning_tokens mirrored into completion_tokens_details ----
+
+/// SGLang's usage object: the reasoning count at the top level of `usage` and
+/// no `completion_tokens_details`.
+fn sglang_reasoning_usage() -> serde_json::Value {
+    serde_json::json!({
+        "prompt_tokens": 12,
+        "total_tokens": 62,
+        "completion_tokens": 50,
+        "prompt_tokens_details": null,
+        "reasoning_tokens": 42
+    })
+}
+
+/// An SGLang chat stream for a reasoning model: `usage: null` on the content
+/// chunks, then a final usage-only chunk shaped by `sglang_reasoning_usage`.
+fn sglang_reasoning_stream(id: &str) -> String {
+    let events = [
+        serde_json::json!({
+            "id": id, "object": "chat.completion.chunk", "created": 1, "model": "test-model",
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": null, "reasoning_content": "2+2"}, "finish_reason": null}],
+            "usage": null
+        }),
+        serde_json::json!({
+            "id": id, "object": "chat.completion.chunk", "created": 1, "model": "test-model",
+            "choices": [{"index": 0, "delta": {"content": "4"}, "finish_reason": "stop"}],
+            "usage": null
+        }),
+        serde_json::json!({
+            "id": id, "object": "chat.completion.chunk", "created": 1, "model": "test-model",
+            "choices": [],
+            "usage": sglang_reasoning_usage()
+        }),
+    ];
+    let mut body = String::new();
+    for event in events {
+        body.push_str("data: ");
+        body.push_str(&event.to_string());
+        body.push_str("\n\n");
+    }
+    body.push_str("data: [DONE]\n\n");
+    body
+}
+
+fn assert_reasoning_usage_mirrored(usage: &serde_json::Value) {
+    let mut expected = sglang_reasoning_usage();
+    expected["completion_tokens_details"] = serde_json::json!({"reasoning_tokens": 42});
+    assert_eq!(usage, &expected);
+}
+
+/// Fetch the ECDSA signature for `chat_id`, check that its text binds the
+/// request bytes and exactly the response bytes the client received, and that
+/// the EIP-191 signature recovers to the advertised signing address.
+async fn assert_ecdsa_signature_covers(
+    app: axum::Router,
+    chat_id: &str,
+    request_bytes: &[u8],
+    response_bytes: &[u8],
+) {
+    use k256::ecdsa::{RecoveryId, VerifyingKey};
+    use sha2::{Digest, Sha256};
+    use sha3::Keccak256;
+
+    let sig_response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/signature/{chat_id}?signing_algo=ecdsa"))
+                .header(auth_header().0, auth_header().1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sig_response.status(), StatusCode::OK);
+    let sig_body = body_to_json(sig_response).await;
+    let text = sig_body["text"].as_str().unwrap();
+    let signature_hex = sig_body["signature"].as_str().unwrap();
+    let signing_address = sig_body["signing_address"].as_str().unwrap();
+
+    let request_hash = hex::encode(Sha256::digest(request_bytes));
+    let response_hash = hex::encode(Sha256::digest(response_bytes));
+    assert_eq!(text, format!("test-model:{request_hash}:{response_hash}"));
+
+    let sig_bytes = hex::decode(&signature_hex[2..]).unwrap();
+    assert_eq!(sig_bytes.len(), 65);
+    let prefix = format!("\x19Ethereum Signed Message:\n{}", text.len());
+    let mut prefixed = prefix.into_bytes();
+    prefixed.extend_from_slice(text.as_bytes());
+    let msg_hash = Keccak256::digest(&prefixed);
+    let signature = k256::ecdsa::Signature::from_slice(&sig_bytes[..64]).unwrap();
+    let recovery_id = RecoveryId::from_byte(sig_bytes[64] - 27).unwrap();
+    let recovered_key =
+        VerifyingKey::recover_from_prehash(&msg_hash[..], &signature, recovery_id).unwrap();
+    let pk_encoded = recovered_key.to_encoded_point(false);
+    let addr_hash = Keccak256::digest(&pk_encoded.as_bytes()[1..]);
+    assert_eq!(
+        format!("0x{}", hex::encode(&addr_hash[12..32])),
+        signing_address
+    );
+}
+
+#[tokio::test]
+async fn test_non_streaming_reasoning_usage_mirrored_and_signed() {
+    // Non-streaming: the proxy streams from the engine internally and
+    // reassembles; the signed body must carry both usage fields. The mock uses
+    // `set_body_raw` because `set_body_string` forces `text/plain`, which would
+    // send the proxy down its plain-JSON branch instead of the reassembly.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            sglang_reasoning_stream("chatcmpl-reasoning-json"),
+            "text/event-stream",
+        ))
+        .mount(&mock_server)
+        .await;
+    let app = build_test_app(&mock_server.uri());
+
+    let request_bytes = serde_json::to_vec(&serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "2+2?"}]
+    }))
+    .unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(request_bytes.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_bytes = body_to_bytes(response).await;
+    let body: serde_json::Value = serde_json::from_slice(&response_bytes).unwrap();
+    assert_eq!(body["id"], "chatcmpl-reasoning-json");
+    assert_eq!(body["choices"][0]["message"]["content"], "4");
+    assert_reasoning_usage_mirrored(&body["usage"]);
+
+    assert_ecdsa_signature_covers(
+        app,
+        "chatcmpl-reasoning-json",
+        &request_bytes,
+        &response_bytes,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_non_streaming_plain_json_reasoning_usage_mirrored_and_signed() {
+    // An engine that ignores the injected `stream: true` and answers with one
+    // JSON object takes the plain-JSON branch; same result.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-reasoning-plain",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "4", "reasoning_content": "2+2"},
+                "finish_reason": "stop"
+            }],
+            "usage": sglang_reasoning_usage()
+        })))
+        .mount(&mock_server)
+        .await;
+    let app = build_test_app(&mock_server.uri());
+
+    let request_bytes = serde_json::to_vec(&serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "2+2?"}]
+    }))
+    .unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(request_bytes.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_bytes = body_to_bytes(response).await;
+    let body: serde_json::Value = serde_json::from_slice(&response_bytes).unwrap();
+    assert_reasoning_usage_mirrored(&body["usage"]);
+
+    assert_ecdsa_signature_covers(
+        app,
+        "chatcmpl-reasoning-plain",
+        &request_bytes,
+        &response_bytes,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_streaming_reasoning_usage_mirrored_and_signed() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            sglang_reasoning_stream("chatcmpl-reasoning-stream"),
+            "text/event-stream",
+        ))
+        .mount(&mock_server)
+        .await;
+    let app = build_test_app(&mock_server.uri());
+
+    let request_bytes = serde_json::to_vec(&serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "2+2?"}],
+        "stream": true,
+        "stream_options": {"include_usage": true}
+    }))
+    .unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(request_bytes.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let stream_bytes = body_to_bytes(response).await;
+    let stream = String::from_utf8(stream_bytes.clone()).unwrap();
+    let events: Vec<serde_json::Value> = stream
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect();
+    assert_eq!(events.len(), 3, "{stream}");
+    // Content chunks keep their `usage: null`.
+    assert_eq!(events[0].get("usage"), Some(&serde_json::Value::Null));
+    assert_eq!(events[1].get("usage"), Some(&serde_json::Value::Null));
+    assert_reasoning_usage_mirrored(&events[2]["usage"]);
+
+    // The background task signs once the stream is consumed.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_ecdsa_signature_covers(
+        app,
+        "chatcmpl-reasoning-stream",
+        &request_bytes,
+        &stream_bytes,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_embeddings_usage_gets_no_completion_tokens_details() {
+    // Only completion usage is mirrored: an embeddings body stays as the engine sent it.
+    let engine_usage = serde_json::json!({
+        "prompt_tokens": 3,
+        "total_tokens": 3,
+        "completion_tokens": 0,
+        "prompt_tokens_details": null,
+        "reasoning_tokens": 0
+    });
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "emb-reasoning",
+            "object": "list",
+            "model": "test-model",
+            "data": [{"object": "embedding", "embedding": [0.1, 0.2], "index": 0}],
+            "usage": engine_usage.clone()
+        })))
+        .mount(&mock_server)
+        .await;
+    let app = build_test_app(&mock_server.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(r#"{"input":"test","model":"test-model"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response).await;
+    assert_eq!(body["usage"], engine_usage);
+}
+
 // ---- Internal endpoints (delegate proxy) ----
 
 #[tokio::test]

@@ -3163,3 +3163,91 @@ async fn borrowing_connect_failover_keeps_destination_cap_and_one_permit() {
         task.abort();
     }
 }
+
+// ---------------------------------------------------------------------------
+// Reasoning usage: the lane's responses carry completion_tokens_details too
+// ---------------------------------------------------------------------------
+
+/// What an SGLang reasoning model streams back: `usage: null` on the content
+/// chunks, then the reasoning count at the top level of the final `usage`.
+const SGLANG_REASONING_STREAM: &str = concat!(
+    "data: {\"id\":\"chatcmpl-r\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"reasoning_content\":\"2+2\"},\"finish_reason\":null}],\"usage\":null}\n\n",
+    "data: {\"id\":\"chatcmpl-r\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"4\"},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+    "data: {\"id\":\"chatcmpl-r\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"total_tokens\":62,\"completion_tokens\":50,\"prompt_tokens_details\":null,\"reasoning_tokens\":42}}\n\n",
+    "data: [DONE]\n\n",
+);
+
+/// The lane's settings that touch the response path: backend bearer, non-TEE,
+/// first-event peek and commit window.
+fn reasoning_lane(mock: &MockServer) -> axum::Router {
+    build_gateway(
+        &mock.uri(),
+        GatewayOptions {
+            backend_token: Some("backend-secret".to_string()),
+            non_tee_deployment: true,
+            stream_error_peek_ms: 1000,
+            stream_commit_ms: 300,
+            ..Default::default()
+        },
+    )
+}
+
+async fn mount_reasoning_stream(mock: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            // `set_body_raw`: `set_body_string` would force `text/plain`, and a
+            // non-streaming request only reassembles a `text/event-stream` answer.
+            ResponseTemplate::new(200).set_body_raw(SGLANG_REASONING_STREAM, "text/event-stream"),
+        )
+        .expect(1)
+        .mount(mock)
+        .await;
+}
+
+#[tokio::test]
+async fn streamed_usage_carries_reasoning_tokens_in_completion_tokens_details() {
+    let mock = MockServer::start().await;
+    mount_reasoning_stream(&mock).await;
+    let response = reasoning_lane(&mock)
+        .oneshot(stream_request())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = stream_frames(response).await.concat();
+    let usage = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str::<serde_json::Value>(data).unwrap())
+        .find_map(|event| event.get("usage").filter(|u| u.is_object()).cloned())
+        .unwrap_or_else(|| panic!("no usage chunk in {body}"));
+    assert_eq!(usage["reasoning_tokens"], 42);
+    assert_eq!(
+        usage["completion_tokens_details"],
+        serde_json::json!({"reasoning_tokens": 42})
+    );
+}
+
+#[tokio::test]
+async fn non_streamed_usage_carries_reasoning_tokens_in_completion_tokens_details() {
+    let mock = MockServer::start().await;
+    mount_reasoning_stream(&mock).await;
+    let response = reasoning_lane(&mock)
+        .oneshot(chat_request(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "2+2?"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = json_body(response).await;
+    assert_eq!(body["choices"][0]["message"]["content"], "4");
+    assert_eq!(body["usage"]["reasoning_tokens"], 42);
+    assert_eq!(
+        body["usage"]["completion_tokens_details"],
+        serde_json::json!({"reasoning_tokens": 42})
+    );
+}

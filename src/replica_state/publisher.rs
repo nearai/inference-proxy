@@ -4,6 +4,7 @@
 //! Frames carry IDs and numbers only. Nothing here logs replica URLs, frame
 //! contents or key material.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::report::{self, Engine, Envelope, Lifecycle, Load, ReplicaReport};
@@ -25,7 +26,7 @@ struct ReplicaSlot {
 pub struct Publisher {
     host_id: String,
     model: String,
-    key: ReportKey,
+    key: Arc<ReportKey>,
     slots: Vec<ReplicaSlot>,
     seq: u64,
     client: reqwest::Client,
@@ -38,7 +39,7 @@ impl Publisher {
     pub fn new(
         host_id: String,
         model: String,
-        key: ReportKey,
+        key: Arc<ReportKey>,
         replicas: Vec<(String, String)>,
         client: reqwest::Client,
         interval: Duration,
@@ -182,7 +183,7 @@ mod tests {
         Publisher::new(
             "host-a".into(),
             "m".into(),
-            key,
+            Arc::new(key),
             replicas
                 .iter()
                 .map(|(id, url)| (id.to_string(), url.to_string()))

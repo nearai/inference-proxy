@@ -17,6 +17,10 @@ use report_key::ReportKey;
 
 /// Upper bound on recording the report key in the dstack event log.
 const BIND_TIMEOUT: Duration = Duration::from_secs(5);
+/// Cap on the pause between key binding retries.
+const BIND_RETRY_MAX: Duration = Duration::from_secs(60);
+/// Minimum gap between repeated "still failing" bind warnings.
+const BIND_WARN_EVERY: Duration = Duration::from_secs(60);
 /// Pause between initial Redis connect attempts.
 const CONNECT_RETRY: Duration = Duration::from_secs(5);
 /// Minimum gap between repeated "still failing" connect warnings.
@@ -29,7 +33,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Whether a repeated connect failure should be logged again.
+/// Whether a repeated failure (Redis connect, key binding) should be logged again.
 fn should_warn(last: Option<Instant>, now: Instant, every: Duration) -> bool {
     last.is_none_or(|t| now.duration_since(t) >= every)
 }
@@ -44,6 +48,19 @@ fn key_bound_gauge<T>(bound: &Result<anyhow::Result<bool>, T>) -> f64 {
     }
 }
 
+/// Only a definite bind error is retried. A timeout is not: the event may
+/// already be recorded, and a retry could append a duplicate
+/// `nearai-replica-report-key-v1` event to RTMR3. A skip (dev/non-TEE) is final.
+fn should_retry_bind<T>(bound: &Result<anyhow::Result<bool>, T>) -> bool {
+    matches!(bound, Ok(Err(_)))
+}
+
+/// Pause after failed bind attempt `attempt` (1-based): 1 s, 2 s, 4 s, ...
+/// capped at [`BIND_RETRY_MAX`].
+fn bind_retry_delay(attempt: u32) -> Duration {
+    Duration::from_secs(1u64 << attempt.saturating_sub(1).min(6)).min(BIND_RETRY_MAX)
+}
+
 /// Loggable cause of a failed key binding. With an HTTP dstack endpoint
 /// (simulator) the error is a `reqwest::Error`, whose `Display` includes the
 /// URL; that is stripped so no URL reaches the logs.
@@ -51,6 +68,57 @@ fn bind_error_detail(e: anyhow::Error) -> String {
     match e.downcast::<reqwest::Error>() {
         Ok(re) => format!("{:#}", anyhow::Error::from(re.without_url())),
         Err(e) => format!("{e:#}"),
+    }
+}
+
+/// Records `key` in the attested event log, retrying definite errors with
+/// capped backoff until it succeeds. Runs beside the publish loop, so frames
+/// are published meanwhile; readers reject them until the key is bound.
+async fn bind_key(
+    key: Arc<ReportKey>,
+    host_id: String,
+    model: String,
+    replica_ids: Vec<String>,
+    skip: bool,
+) {
+    metrics::gauge!("replica_state_key_bound").set(0.0);
+    let mut last_warn: Option<Instant> = None;
+    for attempt in 1u32.. {
+        let bound = tokio::time::timeout(
+            BIND_TIMEOUT,
+            report_key::bind_to_attestation(&key, &host_id, &model, &replica_ids, skip),
+        )
+        .await;
+        metrics::gauge!("replica_state_key_bound").set(key_bound_gauge(&bound));
+        let retry = should_retry_bind(&bound);
+        match bound {
+            Ok(Ok(true)) if attempt > 1 => tracing::info!(
+                key_id = %key.key_id,
+                attempt,
+                "Replica report key bound to attestation after retrying"
+            ),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                if should_warn(last_warn, Instant::now(), BIND_WARN_EVERY) {
+                    tracing::warn!(
+                        key_id = %key.key_id,
+                        attempt,
+                        error = %bind_error_detail(e),
+                        "Replica report key could not be bound to attestation; retrying, readers reject its frames until bound"
+                    );
+                    last_warn = Some(Instant::now());
+                }
+            }
+            Err(_) => tracing::warn!(
+                key_id = %key.key_id,
+                attempt,
+                "Replica report key binding timed out; not retried, readers will reject its frames"
+            ),
+        }
+        if !retry {
+            return;
+        }
+        tokio::time::sleep(bind_retry_delay(attempt)).await;
     }
 }
 
@@ -66,7 +134,8 @@ fn replica_targets(ids: &[String], pool: &BackendPool) -> Vec<(String, String)> 
 /// Spawns the background task that publishes signed per-replica state to
 /// Redis every `cfg.interval`. Replica `i` of `cfg.replica_ids` is backend `i`
 /// of `pool` (base backends first, then long-context). Never blocks the
-/// caller: key binding and the first Redis connect happen inside the task.
+/// caller: key binding runs in its own task and the first Redis connect
+/// happens inside the publish task, so neither delays the other.
 pub fn spawn_replica_state_publisher(
     cfg: ReplicaStateConfig,
     model: String,
@@ -76,33 +145,15 @@ pub fn spawn_replica_state_publisher(
 ) {
     // Process-wide rustls default, needed before any `rediss://` connect.
     redis_sink::install_crypto_provider();
+    let key = Arc::new(ReportKey::generate());
+    tokio::spawn(bind_key(
+        key.clone(),
+        cfg.host_id.clone(),
+        model.clone(),
+        cfg.replica_ids.clone(),
+        skip_binding,
+    ));
     tokio::spawn(async move {
-        let key = ReportKey::generate();
-        let bound = tokio::time::timeout(
-            BIND_TIMEOUT,
-            report_key::bind_to_attestation(
-                &key,
-                &cfg.host_id,
-                &model,
-                &cfg.replica_ids,
-                skip_binding,
-            ),
-        )
-        .await;
-        metrics::gauge!("replica_state_key_bound").set(key_bound_gauge(&bound));
-        match bound {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => tracing::warn!(
-                key_id = %key.key_id,
-                error = %bind_error_detail(e),
-                "Replica report key could not be bound to attestation; readers will reject its frames"
-            ),
-            Err(_) => tracing::warn!(
-                key_id = %key.key_id,
-                "Replica report key binding timed out; readers will reject its frames"
-            ),
-        }
-
         let mut last_warn: Option<Instant> = None;
         let mut sink = loop {
             match RedisSink::connect(&cfg.redis_url, cfg.redis_ca_cert.as_deref(), &cfg.host_id)
@@ -215,6 +266,25 @@ mod tests {
 
         let other = bind_error_detail(anyhow::anyhow!("dstack socket missing"));
         assert_eq!(other, "dstack socket missing");
+    }
+
+    #[test]
+    fn bind_retry_delay_doubles_from_one_second_up_to_the_cap() {
+        let secs: Vec<u64> = (1..=9).map(|a| bind_retry_delay(a).as_secs()).collect();
+        assert_eq!(secs, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
+        assert_eq!(bind_retry_delay(0), Duration::from_secs(1));
+        assert_eq!(bind_retry_delay(u32::MAX), BIND_RETRY_MAX);
+    }
+
+    #[test]
+    fn bind_is_retried_only_on_a_definite_error() {
+        assert!(should_retry_bind::<()>(&Ok(Err(anyhow::anyhow!(
+            "dstack down"
+        )))));
+        assert!(!should_retry_bind::<()>(&Ok(Ok(true))));
+        assert!(!should_retry_bind::<()>(&Ok(Ok(false))));
+        // A timeout may already have recorded the event; never retry it.
+        assert!(!should_retry_bind(&Err::<anyhow::Result<bool>, _>(())));
     }
 
     #[test]

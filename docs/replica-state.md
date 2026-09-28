@@ -151,6 +151,17 @@ replicas the key may report for:
 
 That binds the key to the CVM's TDX quote without changing `report_data`.
 
+Binding runs in its own background task and never delays publishing: frames
+are published from the first tick, and readers reject them until the key
+event is recorded. A definite bind error (e.g. the dstack socket is not
+ready yet) is retried indefinitely with capped exponential backoff (1 s, 2 s,
+4 s, … up to 60 s); the warning is logged on the first failure and then at
+most once a minute, with only the attempt count, `key_id` and a URL-free
+error. A bind that **times out** (5 s) is not retried: the event may already
+have been recorded, and a retry could append a duplicate
+`nearai-replica-report-key-v1` event to RTMR3. A skipped bind (dev/non-TEE)
+is not retried either.
+
 ## SGLang mapping
 
 Frames are built from a `GET {base}/v1/loads?include=core` read of each
@@ -260,9 +271,11 @@ a BSL-1.0 dependency that `cargo deny` rejects — so this stays pinned to
 
 ## Metrics
 
-- `replica_state_key_bound` (gauge): `1` once the report key is recorded in
-  the event log; `0` if binding was skipped (dev/non-TEE), failed, or timed
-  out. At `0`, readers will reject every frame from this boot.
+- `replica_state_key_bound` (gauge): starts at `0`; `1` once the report key
+  is recorded in the event log, including when a retry after a definite error
+  eventually succeeds. Stays `0` while binding keeps failing, and for good if
+  it was skipped (dev/non-TEE) or timed out. At `0`, readers reject every
+  frame from this boot.
 - `replica_state_frames_total` (counter): frames written to Redis.
 - `replica_state_publish_failures_total` (counter): ticks whose Redis
   pipeline failed.

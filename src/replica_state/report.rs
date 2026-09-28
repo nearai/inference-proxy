@@ -1,0 +1,317 @@
+//! HostReport v1 and the signed envelope that carries it over Redis.
+//!
+//! The envelope carries the report as the exact signed JSON string (`frame`)
+//! so that readers in any language can verify the received bytes before
+//! parsing them. [`open`] never re-serializes `frame`; it verifies the bytes
+//! as received, then parses them. The envelope's `key_id` is an unsigned
+//! lookup hint for picking the verifying key; the signed `report_key_id`
+//! inside `frame` must equal it.
+
+use base64::Engine as _;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use serde::{Deserialize, Serialize};
+
+/// Domain-separation prefix prepended to `frame` bytes before signing.
+pub const SIGNING_DOMAIN: &[u8] = b"nearai-replica-report-v1\n";
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Lifecycle {
+    Warming,
+    Ready,
+    Degraded,
+    Unhealthy,
+    Draining,
+    Drained,
+} // v1 writer emits Warming/Ready/Unhealthy
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Engine {
+    Sglang,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Limits {
+    pub max_running: Option<u32>,
+    /// Engine's max context length (prompt + output tokens), from `/v1/models` `max_model_len`.
+    pub max_context_tokens: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Load {
+    pub running: Option<u32>,
+    pub queued: Option<u32>,
+    pub prefill_backlog_tokens: Option<u64>,
+    pub kv_usage: Option<f64>,
+    /// Non-evictable KV tokens in use, summed across ranks.
+    pub kv_used_tokens: Option<u64>,
+    /// Total KV cache capacity in tokens, summed across ranks.
+    pub kv_capacity_tokens: Option<u64>,
+    pub gen_tps: Option<f64>,
+    pub cached_token_ratio: Option<f64>,
+}
+
+/// One replica's state within a [`HostReport`]. Replica identity is the
+/// position (`index`) in `BackendPool::backends()` order (base backends
+/// first, then long-context) — there is no separate replica id string.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ReplicaState {
+    pub index: u32,
+    /// Engine's own sample time; `None` until the replica has been read once.
+    pub engine_sampled_at_ms: Option<u64>,
+    pub lifecycle_state: Lifecycle,
+    pub engine_version: Option<String>,
+    pub limits: Limits,
+    pub load: Load,
+    pub proxy_inflight: u32,
+}
+
+/// One signed frame per tick, carrying every replica on this host.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct HostReport {
+    pub schema: u8,
+    pub host_id: String,
+    pub boot_id: String,
+    pub seq: u64,
+    /// Wall-clock time the frame was sealed, after this tick's reads.
+    pub reported_at_ms: u64,
+    pub engine: Engine,
+    pub report_key_id: String,
+    pub replicas: Vec<ReplicaState>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Envelope {
+    pub frame: String,
+    pub sig: String,
+    /// Unsigned hint naming the key that signed `frame`; not trusted on its own.
+    pub key_id: String,
+}
+
+fn message(frame: &str) -> Vec<u8> {
+    let mut m = SIGNING_DOMAIN.to_vec();
+    m.extend_from_slice(frame.as_bytes());
+    m
+}
+
+pub fn seal(report: &HostReport, key: &SigningKey) -> Result<Envelope, serde_json::Error> {
+    let frame = serde_json::to_string(report)?;
+    let sig =
+        base64::engine::general_purpose::STANDARD.encode(key.sign(&message(&frame)).to_bytes());
+    Ok(Envelope {
+        frame,
+        sig,
+        key_id: report.report_key_id.clone(),
+    })
+}
+
+/// Verify, then parse. None on a bad signature, bad JSON, or when the signed
+/// `report_key_id` disagrees with the envelope's `key_id` hint.
+pub fn open(env: &Envelope, key: &VerifyingKey) -> Option<HostReport> {
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(&env.sig)
+        .ok()?;
+    let sig = Signature::from_bytes(&<[u8; 64]>::try_from(raw.as_slice()).ok()?);
+    key.verify(&message(&env.frame), &sig).ok()?;
+    let report: HostReport = serde_json::from_str(&env.frame).ok()?;
+    (report.report_key_id == env.key_id).then_some(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn replica(index: u32) -> ReplicaState {
+        ReplicaState {
+            index,
+            engine_sampled_at_ms: Some(1_700_000_000_000),
+            lifecycle_state: Lifecycle::Ready,
+            engine_version: Some("0.5.0".into()),
+            limits: Limits {
+                max_running: Some(64),
+                max_context_tokens: Some(131_072),
+            },
+            load: Load {
+                running: Some(3),
+                queued: Some(1),
+                prefill_backlog_tokens: Some(4_096),
+                kv_usage: Some(0.25),
+                kv_used_tokens: Some(1_000),
+                kv_capacity_tokens: Some(4_000),
+                gen_tps: Some(120.5),
+                cached_token_ratio: Some(0.5),
+            },
+            proxy_inflight: 2,
+        }
+    }
+
+    fn report() -> HostReport {
+        HostReport {
+            schema: 1,
+            host_id: "host-a".into(),
+            boot_id: "boot-1".into(),
+            seq: 7,
+            reported_at_ms: 1_700_000_000_500,
+            engine: Engine::Sglang,
+            report_key_id: "0123456789abcdef".into(),
+            replicas: vec![replica(0), replica(1)],
+        }
+    }
+
+    #[test]
+    fn seal_open_roundtrip_through_json() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let wire = serde_json::to_string(&seal(&report(), &sk).unwrap()).unwrap();
+        let env: Envelope = serde_json::from_str(&wire).unwrap();
+        assert_eq!(open(&env, &sk.verifying_key()), Some(report()));
+    }
+
+    #[test]
+    fn frame_keeps_nulls_and_is_compact() {
+        let mut r = report();
+        r.replicas[0].load.kv_usage = None;
+        r.replicas[0].load.kv_used_tokens = None;
+        r.replicas[0].load.kv_capacity_tokens = None;
+        let env = seal(&r, &SigningKey::from_bytes(&[7u8; 32])).unwrap();
+        assert!(env.frame.starts_with(r#"{"schema":1,"host_id":"host-a""#));
+        assert!(env.frame.contains(r#""kv_usage":null"#));
+        assert!(env.frame.contains(r#""kv_used_tokens":null"#));
+        assert!(env.frame.contains(r#""kv_capacity_tokens":null"#));
+        assert!(!env.frame.contains(": "));
+    }
+
+    #[test]
+    fn kv_token_counts_serialize_as_integers() {
+        let mut r = report();
+        r.replicas[0].load.kv_used_tokens = Some(630);
+        r.replicas[0].load.kv_capacity_tokens = Some(1000);
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let env = seal(&r, &sk).unwrap();
+        assert!(env
+            .frame
+            .contains(r#""kv_used_tokens":630,"kv_capacity_tokens":1000"#));
+        assert_eq!(open(&env, &sk.verifying_key()), Some(r));
+    }
+
+    #[test]
+    fn non_finite_floats_seal_as_null_without_panicking() {
+        // serde_json writes NaN/inf as `null`, so `seal` never errs on a
+        // load value; readers see `None`.
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let mut r = report();
+        r.replicas[0].load.gen_tps = Some(f64::INFINITY);
+        r.replicas[0].load.kv_usage = Some(f64::NAN);
+        let env = seal(&r, &sk).unwrap();
+        assert!(env.frame.contains(r#""gen_tps":null"#));
+        let opened = open(&env, &sk.verifying_key()).unwrap();
+        assert_eq!(
+            (
+                opened.replicas[0].load.gen_tps,
+                opened.replicas[0].load.kv_usage
+            ),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn tampered_frame_or_wrong_key_fails() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let mut env = seal(&report(), &sk).unwrap();
+        env.frame = env.frame.replace(r#""running":3"#, r#""running":0"#);
+        assert!(open(&env, &sk.verifying_key()).is_none());
+        let env = seal(&report(), &sk).unwrap();
+        assert!(open(&env, &SigningKey::from_bytes(&[8u8; 32]).verifying_key()).is_none());
+    }
+
+    #[test]
+    fn envelope_carries_unsigned_key_hint_that_must_match_signed_key_id() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let env = seal(&report(), &sk).unwrap();
+        assert_eq!(env.key_id, "0123456789abcdef");
+        let wire: serde_json::Value = serde_json::to_value(&env).unwrap();
+        assert_eq!(wire.as_object().unwrap().len(), 3);
+
+        let swapped = Envelope {
+            key_id: "fedcba9876543210".into(),
+            ..env
+        };
+        assert!(open(&swapped, &sk.verifying_key()).is_none());
+    }
+
+    #[test]
+    fn unknown_sample_time_serializes_as_null() {
+        let mut r = report();
+        r.replicas[0].engine_sampled_at_ms = None;
+        let env = seal(&r, &SigningKey::from_bytes(&[7u8; 32])).unwrap();
+        assert!(env.frame.contains(r#""engine_sampled_at_ms":null"#));
+    }
+
+    #[test]
+    fn signature_without_domain_prefix_is_rejected() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let frame = serde_json::to_string(&report()).unwrap();
+        let sig =
+            base64::engine::general_purpose::STANDARD.encode(sk.sign(frame.as_bytes()).to_bytes());
+        let key_id = report().report_key_id;
+        assert!(open(&Envelope { frame, sig, key_id }, &sk.verifying_key()).is_none());
+    }
+
+    #[test]
+    fn malformed_signatures_are_rejected_without_panicking() {
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let mut env = seal(&report(), &key).unwrap();
+        env.sig = "not-base64!!".to_string();
+        assert!(open(&env, &key.verifying_key()).is_none());
+        env.sig = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
+        assert!(open(&env, &key.verifying_key()).is_none());
+    }
+
+    #[test]
+    fn host_frame_has_no_model_and_indexes_replicas() {
+        let sk = SigningKey::from_bytes(&[3u8; 32]);
+        let env = seal(&report(), &sk).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&env.frame).unwrap();
+        assert!(v.get("model").is_none());
+        assert!(v.get("replica_id").is_none());
+        assert_eq!(v["replicas"][0]["index"], 0);
+        assert_eq!(v["replicas"][1]["index"], 1);
+        assert_eq!(v["replicas"][0]["limits"]["max_context_tokens"], 131_072);
+        assert!(v["replicas"][0].get("replica_id").is_none());
+    }
+
+    #[test]
+    fn unknown_context_limit_serializes_as_null() {
+        let mut r = report();
+        r.replicas[0].limits.max_context_tokens = None;
+        let sk = SigningKey::from_bytes(&[3u8; 32]);
+        let v: serde_json::Value = serde_json::from_str(&seal(&r, &sk).unwrap().frame).unwrap();
+        assert!(v["replicas"][0]["limits"]["max_context_tokens"].is_null());
+    }
+
+    /// Cross-repo contract: cloud-api verifies this exact envelope with the
+    /// public key of seed `[7u8; 32]`. Regenerate with `UPDATE_GOLDEN=1`
+    /// only for a deliberate frame change, and update cloud-api's copy too.
+    #[test]
+    fn golden_host_frame_is_stable() {
+        use sha2::Digest as _;
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let mut r = report();
+        r.report_key_id =
+            hex::encode(sha2::Sha256::digest(sk.verifying_key().to_bytes()))[..16].to_string();
+        let env = seal(&r, &sk).unwrap();
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/replica_state/testdata/host_frame_v1.json"
+        );
+        if std::env::var_os("UPDATE_GOLDEN").is_some() {
+            std::fs::write(path, serde_json::to_string_pretty(&env).unwrap() + "\n").unwrap();
+        }
+        let golden: Envelope =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(golden, env);
+        assert_eq!(golden.key_id, r.report_key_id);
+        assert_eq!(open(&golden, &sk.verifying_key()), Some(r));
+    }
+}

@@ -33,6 +33,7 @@ pub(crate) fn test_signing_pair() -> signing::SigningPair {
 pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::Router {
     let base = mock_url.trim_end_matches('/');
     let config = config::Config {
+        replica_state: None,
         model_name: "test-model".to_string(),
         tokens: vec!["test-token".to_string()],
         vllm_base_url: mock_url.to_string(),

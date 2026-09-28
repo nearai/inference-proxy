@@ -1,5 +1,5 @@
 use crate::admission::{Permit, RejectReason};
-use crate::backend_affinity::ConversationKey;
+use crate::backend_affinity::{ConversationKey, ReplicaHint};
 use crate::backend_pool::{BackendGuard, Policy};
 use crate::context_tier::TierDecision;
 use crate::error::AppError;
@@ -24,6 +24,7 @@ pub(super) fn place_completion(
     path: &'static str,
     tier: Option<TierDecision>,
     affinity_key: Option<ConversationKey>,
+    hint: ReplicaHint,
 ) -> Result<PlacedCompletion, AppError> {
     let strict = state.config.backend_tier_strict;
     let admission = state.admission.try_admit(&state.backend_pool, tier)?;
@@ -41,7 +42,7 @@ pub(super) fn place_completion(
         };
         state
             .backend_affinity
-            .place(&state.backend_pool, affinity_key, path, &policy)
+            .place(&state.backend_pool, affinity_key, hint, path, &policy)
     };
 
     let mut placement = place(restrict);

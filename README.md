@@ -102,7 +102,7 @@ All configuration is via environment variables:
 | `VLLM_BASE_URL` | No | `http://localhost:8000` | Backend base URL |
 | `VLLM_DATA_PARALLEL_SIZE` | No | unset | Number of independent vLLM DP engines in one backend. When set, assigns new chat conversations round-robin and keeps append-only turns on the same rank via `X-data-parallel-rank`, improving local prefix-cache reuse without trusting a client-supplied rank. Requires exactly one backend URL. |
 | `VLLM_BACKEND_CONVERSATION_AFFINITY` | No | `false` | With several `VLLM_BACKEND_URLS`, keep append-only chat conversations on the backend that served their first turn (same salted conversation digest as the DP affinity above) so multi-turn prompts reuse that engine's prefix cache instead of being re-prefilled after every least-connections switch. New conversations still go to the least-loaded healthy backend; an unhealthy pinned backend is skipped. Applies to the exact and alias `/v1/chat/completions` routes; other routes keep least-connections. Mutually exclusive with `VLLM_DATA_PARALLEL_SIZE`. |
-| `VLLM_BACKEND_AFFINITY_MAX_IMBALANCE` | No | `8` | Load-balance guard for the affinity above: when the pinned backend has more than this many extra in-flight requests over the least-loaded healthy backend, the turn goes to the least-loaded backend and the conversation is re-pinned there. |
+| `VLLM_BACKEND_AFFINITY_MAX_IMBALANCE` | No | `8` | Load-balance guard for the affinity above: when the pinned backend has more than this many extra in-flight requests over the least-loaded healthy backend, the turn goes to the least-loaded backend and the conversation is re-pinned there. It also bounds a trusted `x-nearai-replica` hint (see below) when there is no engine view. |
 | `DEV` | No | `false` | Dev mode (random signing keys instead of KMS) |
 | `GPU_NO_HW_MODE` | No | `false` | Use canned GPU evidence |
 | `CHAT_CACHE_EXPIRATION` | No | `1200` | Signature cache TTL in seconds |
@@ -155,6 +155,12 @@ All configuration is via environment variables:
 | `VLLM_TRANSCRIPTIONS_URL` | No | `{base}/v1/audio/transcriptions` | Override transcriptions endpoint |
 | `VLLM_RERANK_URL` | No | `{base}/v1/rerank` | Override rerank endpoint |
 | `VLLM_SCORE_URL` | No | `{base}/v1/score` | Override score endpoint |
+| `REPLICA_STATE_REDIS_URL` | No | unset (feature off) | Redis URL for opt-in signed host-frame state publishing |
+| `REPLICA_STATE_HOST_ID` | Yes, if the URL is set | — | Host identifier used in Redis keys and every published frame |
+| `REPLICA_STATE_REDIS_CA_CERT` | No | unset | PEM CA the Redis TLS certificate chains to (`rediss://` only); used for Redis instead of the system trust store. Literal `\n` accepted |
+| `REPLICA_STATE_INTERVAL_MS` | No | `500` | Publish interval in ms; must be within `200..=2000` (otherwise the feature is disabled with an error) |
+
+`x-nearai-replica: <index>` (the backend's position in `VLLM_BACKEND_URLS`, then the long-context URLs) is honoured only from callers using the proxy's `TOKEN` (same as `X-NearAI-Priority`), under the guard above. It is ignored for API-key callers. Metrics: `placement_hint_honored_total`, `placement_hint_overridden_total{reason}`.
 
 ### Fusion
 

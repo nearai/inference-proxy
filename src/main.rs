@@ -374,7 +374,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Build router
-    let app = routes::build_router()
+    let app = routes::build_router(&state.config)
         .layer(middleware::from_fn(rate_limit::rate_limit_middleware))
         .layer(axum::Extension(rate_limit_state))
         .layer(middleware::from_fn(request_id_middleware))

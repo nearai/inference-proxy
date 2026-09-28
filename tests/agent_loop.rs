@@ -205,7 +205,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
         trust_proxy_headers: true,
     };
 
-    routes::build_router()
+    routes::build_router(&state.config)
         .layer(middleware::from_fn(rate_limit::rate_limit_middleware))
         .layer(axum::Extension(rate_limit_state))
         .layer(middleware::from_fn(request_id_middleware))

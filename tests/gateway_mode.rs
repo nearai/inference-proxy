@@ -291,7 +291,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         limiter: rate_limit::build_rate_limiter(100, 200),
         trust_proxy_headers: true,
     };
-    let router = routes::build_router()
+    let router = routes::build_router(&state.config)
         .layer(middleware::from_fn(rate_limit::rate_limit_middleware))
         .layer(axum::Extension(rate_limit_state))
         .layer(middleware::from_fn(request_id_middleware))

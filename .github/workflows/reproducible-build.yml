@@ -399,7 +399,15 @@ jobs:
 
           : > published.tsv
           for run in $(jq -r '.workflow_runs[] | select(.conclusion == "success") | .id' <<<"$runs"); do
-            for job in $(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run}/jobs" --jq '.jobs[].id'); do
+            publisher_jobs=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run}/jobs" \
+              --jq '[.jobs[] | select(.name == "Reproducible Docker Image" and .conclusion == "success") | .id]')
+            publisher_count=$(jq length <<<"$publisher_jobs")
+            if [ "$publisher_count" -ne 1 ]; then
+              echo "::error::Expected exactly one successful job named 'Reproducible Docker Image' for build.yml run ${run}; found ${publisher_count}"
+              exit 1
+            fi
+            # Auxiliary Security audit checks have no downloadable logs.
+            for job in $(jq -r '.[]' <<<"$publisher_jobs"); do
               # curl, not `gh api`: newer gh refuses to print a response with
               # terminal escape sequences, and job logs are full of them.
               curl -fsSL --retry 3 -o job.log -H "Authorization: Bearer ${GH_TOKEN}" \

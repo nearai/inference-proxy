@@ -17,6 +17,15 @@ client ──sk-key──▶ inference-proxy (gateway, non-TEE) ──backend to
 
 ## What the gateway does per request
 
+For gateway requests, when `response_format.type` is exactly `json_schema` and
+`response_format.json_schema.schema` is an object or boolean and the sibling
+`response_format.json_schema.name` key is absent, the proxy inserts the stable
+output name `response_schema` before dispatch. An explicit `name` value,
+including an empty, null, or otherwise invalid value, is preserved for native
+backend validation. This compatibility rewrite does not alter the schema,
+strictness, description, or other response-format fields.
+Insertions are counted by the `json_schema_names_defaulted_total` metric.
+
 1. `Authorization: Bearer sk-…` → `POST {CLOUD_API_URL}/v1/check_api_key`
    (retries on transport/5xx; 401/402/429 pass through). With
    `VLLM_PROXY_ALLOWED_ORG_IDS` set, a valid key from any other organization
@@ -30,8 +39,9 @@ client ──sk-key──▶ inference-proxy (gateway, non-TEE) ──backend to
 4. Forward with `Authorization: Bearer $VLLM_BACKEND_TOKEN` on the dedicated
    backend client. The CVM proxy treats it as a trusted config token: it does
    **not** re-validate the customer key and does **not** report usage, so
-   exactly one component bills. The body is forwarded verbatim; for streams the
-   gateway forces `stream_options.include_usage` and `continuous_usage_stats`.
+   exactly one component bills. The body is forwarded verbatim apart from the
+   documented compatibility rewrite; for streams the gateway forces
+   `stream_options.include_usage` and `continuous_usage_stats`.
 5. Response streamed back. On client disconnect the upstream connection is
    dropped (the CVM proxy drops its engine connection, the engine aborts) and
    the usage observed so far is reported.

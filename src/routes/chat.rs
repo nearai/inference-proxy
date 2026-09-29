@@ -67,6 +67,10 @@ pub async fn chat_completions(
         )?;
     }
 
+    if state.config.backend_token.is_some() {
+        crate::response_format::default_json_schema_name(&mut request_json);
+    }
+
     // Repair tool-call `arguments` the engine would refuse (empty, missing,
     // double-encoded, non-object): one odd historical turn must not 400 the
     // whole conversation. After decryption, so an encrypted field is judged

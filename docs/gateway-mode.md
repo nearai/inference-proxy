@@ -24,9 +24,12 @@ whichever lane sent the request: the tool-call `arguments` repair
 `response_format.json_schema` repair (`src/response_format.rs`,
 nearai/inference-proxy#279). The latter inserts the required
 `json_schema.name` (`response_schema`) when a wrapper object has none, and
-wraps a bare JSON Schema sent as `json_schema` into
-`{"name", "schema"}`. An explicit `name` of any value is preserved for native
-backend validation; the schema, strictness and other fields are untouched.
+wraps a bare JSON Schema sent as `json_schema` (recognised by a JSON Schema
+keyword at its root, such as `type` or `properties`) into `{"name", "schema"}`.
+Ambiguous objects such as `{}` only get the name, so the engine reports the
+missing schema rather than serving an accept-all grammar. An explicit `name`
+of any value is preserved for native backend validation; the schema,
+strictness and other fields are untouched.
 Repairs are counted by `json_schema_response_format_repaired_total{repair}`.
 
 1. `Authorization: Bearer sk-…` → `POST {CLOUD_API_URL}/v1/check_api_key`

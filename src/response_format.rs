@@ -22,8 +22,14 @@
 //!   all: insert `name: "response_schema"`. The schema, strictness,
 //!   description and any unknown keys are untouched.
 //! * `response_format.type` is `json_schema` and `json_schema` is an object
-//!   with neither `name`, `schema` nor `strict`: it holds the schema itself,
-//!   so it is wrapped as `{"name": "response_schema", "schema": <object>}`.
+//!   with neither `name`, `schema` nor `strict` but with a JSON Schema
+//!   keyword at its root (`type`, `properties`, `$ref`, `anyOf`, ...): it
+//!   holds the schema itself, so it is wrapped as
+//!   `{"name": "response_schema", "schema": <object>}`.
+//! * Anything ambiguous (`{}`, a description-only object, a misspelt
+//!   wrapper key) only gets the name. Wrapping it would hand the engine a
+//!   valid accept-all schema and silently drop whatever the client meant;
+//!   with the name present the engine instead reports the missing schema.
 //!
 //! An explicit `name` of any value (including `""`, `null` or a number) is
 //! preserved so the engine's native validation still applies, and a
@@ -38,6 +44,35 @@ use serde_json::Value;
 /// Name inserted when the client sent none. Matches OpenAI's
 /// `^[a-zA-Z0-9_-]{1,64}$` constraint; SGLang does not use it for decoding.
 pub const DEFAULT_JSON_SCHEMA_NAME: &str = "response_schema";
+
+/// Root keywords that identify an object as a JSON Schema rather than an
+/// (incomplete) `json_schema` wrapper. Positive evidence is required before
+/// wrapping, so an ambiguous object is never turned into an accept-all schema.
+const JSON_SCHEMA_ROOT_KEYWORDS: &[&str] = &[
+    "$schema",
+    "$ref",
+    "$defs",
+    "definitions",
+    "type",
+    "properties",
+    "patternProperties",
+    "additionalProperties",
+    "required",
+    "items",
+    "prefixItems",
+    "enum",
+    "const",
+    "anyOf",
+    "oneOf",
+    "allOf",
+    "not",
+];
+
+fn looks_like_json_schema(object: &serde_json::Map<String, Value>) -> bool {
+    JSON_SCHEMA_ROOT_KEYWORDS
+        .iter()
+        .any(|key| object.contains_key(*key))
+}
 
 /// Counter label for each repair, so the shape a producer keeps sending is
 /// visible in `json_schema_response_format_repaired_total`.
@@ -74,13 +109,14 @@ pub fn repair_json_schema_response_format(request: &mut Value) -> Option<Repair>
     }
 
     let has_wrapper_key = json_schema.contains_key("schema") || json_schema.contains_key("strict");
-    let repair = if has_wrapper_key || !is_json_schema_request {
-        Repair::NameDefaulted
-    } else {
-        let bare_schema = std::mem::take(json_schema);
-        json_schema.insert("schema".to_string(), Value::Object(bare_schema));
-        Repair::BareSchemaWrapped
-    };
+    let repair =
+        if has_wrapper_key || !is_json_schema_request || !looks_like_json_schema(json_schema) {
+            Repair::NameDefaulted
+        } else {
+            let bare_schema = std::mem::take(json_schema);
+            json_schema.insert("schema".to_string(), Value::Object(bare_schema));
+            Repair::BareSchemaWrapped
+        };
     json_schema.insert(
         "name".to_string(),
         Value::String(DEFAULT_JSON_SCHEMA_NAME.to_string()),
@@ -171,19 +207,48 @@ mod tests {
     }
 
     #[test]
-    fn wraps_an_empty_json_schema_object() {
-        // `{}` cannot be told apart from an empty bare schema, and `{}` is a
-        // valid JSON Schema that accepts any value, so the engine serves the
-        // request with an unconstrained JSON grammar instead of a 400.
-        let mut req = request(json!({"type": "json_schema", "json_schema": {}}));
-        assert_eq!(
-            repair_json_schema_response_format(&mut req),
-            Some(Repair::BareSchemaWrapped)
-        );
-        assert_eq!(
-            req["response_format"]["json_schema"],
-            json!({"name": DEFAULT_JSON_SCHEMA_NAME, "schema": {}})
-        );
+    fn names_but_never_wraps_an_ambiguous_object() {
+        // `{}` and a description-only object are valid accept-all schemas,
+        // and a misspelt wrapper key hides a real schema: wrapping any of
+        // them would silently drop the client's constraints. With the name
+        // present the engine reports the missing schema instead.
+        for json_schema in [
+            json!({}),
+            json!({"description": "the answer"}),
+            json!({"schem": {"type": "object", "required": ["a"]}}),
+            json!({"title": "Answer", "x-vendor": true}),
+        ] {
+            let mut req = request(json!({"type": "json_schema", "json_schema": json_schema}));
+            assert_eq!(
+                repair_json_schema_response_format(&mut req),
+                Some(Repair::NameDefaulted)
+            );
+            let mut expected = json_schema.clone();
+            expected["name"] = json!(DEFAULT_JSON_SCHEMA_NAME);
+            assert_eq!(req["response_format"]["json_schema"], expected);
+        }
+    }
+
+    #[test]
+    fn wraps_every_root_keyword_shape() {
+        for json_schema in [
+            json!({"type": "object"}),
+            json!({"properties": {"a": {"type": "string"}}}),
+            json!({"$ref": "#/$defs/x", "$defs": {"x": {"type": "string"}}}),
+            json!({"anyOf": [{"type": "string"}, {"type": "null"}]}),
+            json!({"enum": ["a", "b"]}),
+            json!({"$schema": "https://json-schema.org/draft/2020-12/schema"}),
+        ] {
+            let mut req = request(json!({"type": "json_schema", "json_schema": json_schema}));
+            assert_eq!(
+                repair_json_schema_response_format(&mut req),
+                Some(Repair::BareSchemaWrapped)
+            );
+            assert_eq!(
+                req["response_format"]["json_schema"],
+                json!({"name": DEFAULT_JSON_SCHEMA_NAME, "schema": json_schema})
+            );
+        }
     }
 
     #[test]

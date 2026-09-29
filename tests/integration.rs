@@ -4305,6 +4305,70 @@ async fn test_tool_call_arguments_are_normalized_before_dispatch() {
     // The mock expectation (body_json) verifies the backend received the repaired history
 }
 
+#[tokio::test]
+async fn test_json_schema_response_format_is_repaired_before_dispatch() {
+    use wiremock::matchers::body_json;
+
+    let mock_server = MockServer::start().await;
+
+    // Not gateway-specific: a nameless `json_schema` is a pydantic 400 on
+    // SGLang whichever lane sent it, so the CVM proxy repairs it too.
+    let expected_backend_body = serde_json::json!({
+        "messages": [{"role": "user", "content": "one word"}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "response_schema",
+                "schema": {"type": "object", "properties": {"word": {"type": "string"}}},
+                "strict": true
+            }
+        },
+        "stream": true,
+        "stream_options": {"include_usage": true},
+        "priority": 0
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_json(&expected_backend_body))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-rf",
+            "choices": [{"message": {"content": "{\"word\":\"ok\"}"}, "finish_reason": "stop"}]
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let request_body = serde_json::json!({
+        "messages": [{"role": "user", "content": "one word"}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "schema": {"type": "object", "properties": {"word": {"type": "string"}}},
+                "strict": true
+            }
+        }
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    // The mock expectation (body_json) verifies the backend received the named schema
+}
+
 /// Matches a chat body whose first assistant tool call carries exactly these
 /// plaintext `function.arguments`.
 struct FirstToolCallArguments(&'static str);

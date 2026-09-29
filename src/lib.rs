@@ -25,6 +25,7 @@ pub mod rate_limit;
 pub mod reasoning;
 pub mod replica_state;
 pub mod request_tracing;
+pub mod response_format;
 pub mod routes;
 pub mod signing;
 pub mod startup_checks;

@@ -375,6 +375,128 @@ async fn backend_token_is_attached_to_backend_requests() {
 }
 
 #[tokio::test]
+async fn gateway_defaults_missing_json_schema_name_before_backend_validation() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(wiremock::matchers::body_partial_json(serde_json::json!({
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "schema": {"type": "object"}
+                }
+            }
+        })))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": {"message": "json_schema.name is required"}
+        })))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(wiremock::matchers::body_partial_json(serde_json::json!({
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "response_schema",
+                    "schema": {"type": "object"}
+                }
+            }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+        .with_priority(1)
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let app = build_gateway(
+        &mock.uri(),
+        GatewayOptions {
+            backend_token: Some("backend-secret".to_string()),
+            ..Default::default()
+        },
+    );
+    let response = app
+        .oneshot(chat_request(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"schema": {"type": "object"}}
+            }
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let received = mock.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1);
+    assert_eq!(
+        received[0].headers.get("authorization").unwrap(),
+        "Bearer backend-secret"
+    );
+    let forwarded: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+    assert_eq!(
+        forwarded["response_format"],
+        serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "response_schema",
+                "schema": {"type": "object"}
+            }
+        })
+    );
+}
+
+#[tokio::test]
+async fn gateway_defaults_json_schema_name_on_streaming_requests() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(wiremock::matchers::body_partial_json(serde_json::json!({
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "response_schema",
+                    "schema": {"type": "object"}
+                }
+            }
+        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string("data: {\"id\":\"chatcmpl-stream\"}\n\ndata: [DONE]\n\n"),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let app = build_gateway(
+        &mock.uri(),
+        GatewayOptions {
+            backend_token: Some("backend-secret".to_string()),
+            ..Default::default()
+        },
+    );
+    let response = app
+        .oneshot(chat_request(serde_json::json!({
+            "model": "test-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"schema": {"type": "object"}}
+            }
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(String::from_utf8_lossy(&body).contains("data: [DONE]"));
+}
+
+#[tokio::test]
 async fn without_backend_token_no_authorization_reaches_backend() {
     let mock = MockServer::start().await;
     Mock::given(method("POST"))

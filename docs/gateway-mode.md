@@ -17,6 +17,21 @@ client ──sk-key──▶ inference-proxy (gateway, non-TEE) ──backend to
 
 ## What the gateway does per request
 
+Two compatibility repairs run on every lane (gateway and CVM alike), after
+decryption and before dispatch, because the engine's `400` is the same
+whichever lane sent the request: the tool-call `arguments` repair
+(`src/tool_calls.rs`, nearai/inference-proxy#239) and the
+`response_format.json_schema` repair (`src/response_format.rs`,
+nearai/inference-proxy#279). The latter inserts the required
+`json_schema.name` (`response_schema`) when a wrapper object has none, and
+wraps a bare JSON Schema sent as `json_schema` (recognised by a JSON Schema
+keyword at its root, such as `type` or `properties`) into `{"name", "schema"}`.
+Ambiguous objects such as `{}` only get the name, so the engine reports the
+missing schema rather than serving an accept-all grammar. An explicit `name`
+of any value is preserved for native backend validation; the schema,
+strictness and other fields are untouched.
+Repairs are counted by `json_schema_response_format_repaired_total{repair}`.
+
 1. `Authorization: Bearer sk-…` → `POST {CLOUD_API_URL}/v1/check_api_key`
    (retries on transport/5xx; 401/402/429 pass through). With
    `VLLM_PROXY_ALLOWED_ORG_IDS` set, a valid key from any other organization
@@ -30,8 +45,9 @@ client ──sk-key──▶ inference-proxy (gateway, non-TEE) ──backend to
 4. Forward with `Authorization: Bearer $VLLM_BACKEND_TOKEN` on the dedicated
    backend client. The CVM proxy treats it as a trusted config token: it does
    **not** re-validate the customer key and does **not** report usage, so
-   exactly one component bills. The body is forwarded verbatim; for streams the
-   gateway forces `stream_options.include_usage` and `continuous_usage_stats`.
+   exactly one component bills. The body is forwarded verbatim apart from the
+   compatibility repairs above; for streams the gateway forces
+   `stream_options.include_usage` and `continuous_usage_stats`.
 5. Response streamed back. On client disconnect the upstream connection is
    dropped (the CVM proxy drops its engine connection, the engine aborts) and
    the usage observed so far is reported.

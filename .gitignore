@@ -3,3 +3,4 @@
 oci.tar
 .DS_Store
 *.resolved.txt
+*.log

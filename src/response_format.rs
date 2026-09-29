@@ -172,8 +172,9 @@ mod tests {
 
     #[test]
     fn wraps_an_empty_json_schema_object() {
-        // `{}` cannot be told apart from an empty bare schema; wrapping it
-        // turns the nameless 400 into the engine's explicit schema error.
+        // `{}` cannot be told apart from an empty bare schema, and `{}` is a
+        // valid JSON Schema that accepts any value, so the engine serves the
+        // request with an unconstrained JSON grammar instead of a 400.
         let mut req = request(json!({"type": "json_schema", "json_schema": {}}));
         assert_eq!(
             repair_json_schema_response_format(&mut req),

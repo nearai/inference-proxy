@@ -160,7 +160,7 @@ All configuration is via environment variables:
 | `REPLICA_STATE_REDIS_CA_CERT` | No | unset | PEM CA the Redis TLS certificate chains to (`rediss://` only); used for Redis instead of the system trust store. Literal `\n` accepted |
 | `REPLICA_STATE_INTERVAL_MS` | No | `500` | Publish interval in ms; must be within `200..=2000` (otherwise the feature is disabled with an error) |
 
-`x-nearai-replica: <index>` (the backend's position in `VLLM_BACKEND_URLS`, then the long-context URLs) is honoured only from callers using the proxy's `TOKEN` (same as `X-NearAI-Priority`), under the guard above. It is ignored for API-key callers. Metrics: `placement_hint_honored_total`, `placement_hint_overridden_total{reason}`.
+`x-nearai-replica: <index>` (the backend's position in `VLLM_BACKEND_URLS`, then the long-context URLs) is honoured only from callers using the proxy's `TOKEN` (same as `X-NearAI-Priority`), under the guard above. It is ignored for API-key callers. An optional `x-nearai-replica-host: <host id>` names the host the index was chosen for; it is honoured only when it equals this proxy's `REPLICA_STATE_HOST_ID` (otherwise the hint is dropped with `placement_hint_overridden_total{reason="wrong_host"}`), and a request without it is treated as before. Metrics: `placement_hint_honored_total`, `placement_hint_overridden_total{reason}`.
 
 ### Fusion
 

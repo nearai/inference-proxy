@@ -107,7 +107,10 @@ pub async fn completions(
     // and `X-NearAI-Priority`: honoured only for a caller authenticated with
     // the proxy's own config token, not an `sk-` API key.
     let hint = if auth.cloud_api_key.is_none() {
-        parse_replica_hint(&headers)
+        parse_replica_hint(
+            &headers,
+            state.config.replica_state().map(|c| c.host_id.as_str()),
+        )
     } else {
         ReplicaHint::Absent
     };

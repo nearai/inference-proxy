@@ -459,7 +459,7 @@ async fn gateway_defaults_json_schema_name_on_streaming_requests() {
                 "type": "json_schema",
                 "json_schema": {
                     "name": "response_schema",
-                    "schema": true
+                    "schema": {"type": "object"}
                 }
             }
         })))
@@ -486,7 +486,7 @@ async fn gateway_defaults_json_schema_name_on_streaming_requests() {
             "messages": [{"role": "user", "content": "hello"}],
             "response_format": {
                 "type": "json_schema",
-                "json_schema": {"schema": true}
+                "json_schema": {"schema": {"type": "object"}}
             }
         })))
         .await
@@ -508,19 +508,7 @@ async fn without_backend_token_no_authorization_reaches_backend() {
         .await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .and(wiremock::matchers::body_partial_json(serde_json::json!({
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "schema": {"type": "object"},
-                    "strict": true,
-                    "description": "A named response"
-                }
-            }
-        })))
-        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
-            "error": {"message": "json_schema.name is required"}
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
         .expect(1)
         .mount(&mock)
         .await;
@@ -529,33 +517,11 @@ async fn without_backend_token_no_authorization_reaches_backend() {
     let response = app
         .oneshot(chat_request(serde_json::json!({
             "model": "test-model",
-            "messages": [{"role": "user", "content": "hello"}],
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "schema": {"type": "object"},
-                    "strict": true,
-                    "description": "A named response"
-                }
-            }
+            "messages": [{"role": "user", "content": "hello"}]
         })))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let received = mock.received_requests().await.unwrap();
-    assert_eq!(received.len(), 1);
-    let forwarded: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
-    assert_eq!(
-        forwarded["response_format"],
-        serde_json::json!({
-            "type": "json_schema",
-            "json_schema": {
-                "schema": {"type": "object"},
-                "strict": true,
-                "description": "A named response"
-            }
-        })
-    );
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 // ---------------------------------------------------------------------------

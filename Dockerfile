@@ -141,8 +141,9 @@ ARG CUDA_KEYRING_SHA256=d93190d50b98ad4699ff40f4f7af50f16a76dac3bb8da1eaaf366d47
 # the regular archive serves here never reach the builder or the image.
 # ─────────────────────────────────────────────────────────────────────
 FROM ubuntu:22.04@sha256:4f838adc7181d9039ac795a7d0aba05a9bd9ecd480d294483169c5def983b64d AS ca-bootstrap
-RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates \
+RUN --mount=type=bind,source=apt-retry.sh,target=/run/apt-retry.sh,readonly \
+    sh /run/apt-retry.sh update \
+    && DEBIAN_FRONTEND=noninteractive sh /run/apt-retry.sh install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # ─────────────────────────────────────────────────────────────────────
@@ -184,6 +185,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # ca-certificates installed below (from the snapshot) serves later steps.
 RUN --mount=type=bind,source=pinned-packages-builder.txt,target=/run/pinned-packages-builder.txt \
     --mount=type=bind,from=ca-bootstrap,source=/etc/ssl/certs/ca-certificates.crt,target=/run/bootstrap-ca.crt \
+    --mount=type=bind,source=apt-retry.sh,target=/run/apt-retry.sh,readonly \
     set -e; \
     echo "deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT} jammy main restricted universe multiverse" > /etc/apt/sources.list; \
     echo "deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT} jammy-updates main restricted universe multiverse" >> /etc/apt/sources.list; \
@@ -196,8 +198,8 @@ RUN --mount=type=bind,source=pinned-packages-builder.txt,target=/run/pinned-pack
             printf 'Package: %s\nPin: version %s\nPin-Priority: 1001\n\n' "$pkg" "$ver"; \
         fi; \
     done < /run/pinned-packages-builder.txt > /etc/apt/preferences.d/pinned-packages; \
-    apt-get -o Acquire::https::CAInfo=/run/bootstrap-ca.crt update; \
-    apt-get -o Acquire::https::CAInfo=/run/bootstrap-ca.crt install -y --no-install-recommends \
+    sh /run/apt-retry.sh -o Acquire::https::CAInfo=/run/bootstrap-ca.crt update; \
+    sh /run/apt-retry.sh -o Acquire::https::CAInfo=/run/bootstrap-ca.crt install -y --no-install-recommends \
         ca-certificates curl git pkg-config build-essential gcc \
         libssl-dev; \
     rm -rf /var/lib/apt/lists/*
@@ -219,13 +221,14 @@ ENV PATH=/root/.cargo/bin:$PATH
 # .so) as a versioned dependency, plus libcurl4/libxml2/libxmlsec1-openssl
 # which libnvat dynamically links against. Ubuntu packages still come from
 # the snapshot, and the pins above also cover these packages.
-RUN if [ "$ENABLE_NV_ATTESTATION_SDK" = "1" ]; then \
+RUN --mount=type=bind,source=apt-retry.sh,target=/run/apt-retry.sh,readonly \
+    if [ "$ENABLE_NV_ATTESTATION_SDK" = "1" ]; then \
         set -e && \
-        apt-get update && apt-get install -y --no-install-recommends wget gnupg && \
+        sh /run/apt-retry.sh update && sh /run/apt-retry.sh install -y --no-install-recommends wget gnupg && \
         wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb && \
         echo "${CUDA_KEYRING_SHA256}  cuda-keyring_1.1-1_all.deb" | sha256sum -c - && \
         dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb && \
-        apt-get update && apt-get install -y --no-install-recommends \
+        sh /run/apt-retry.sh update && sh /run/apt-retry.sh install -y --no-install-recommends \
             clang libclang-dev \
             "libnvat-dev=${LIBNVAT_VERSION}" "libnvat=${LIBNVAT_VERSION}" && \
         ldconfig && \
@@ -310,6 +313,7 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 RUN --mount=type=bind,source=pinned-packages-runtime.txt,target=/run/pinned-packages-runtime.txt \
     --mount=type=bind,from=ca-bootstrap,source=/etc/ssl/certs/ca-certificates.crt,target=/run/bootstrap-ca.crt \
     --mount=type=bind,from=cuda-keyring,source=/cuda-keyring_1.1-1_all.deb,target=/run/cuda-keyring.deb \
+    --mount=type=bind,source=apt-retry.sh,target=/run/apt-retry.sh,readonly \
     set -e; \
     echo "deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT} jammy main restricted universe multiverse" > /etc/apt/sources.list; \
     echo "deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT} jammy-updates main restricted universe multiverse" >> /etc/apt/sources.list; \
@@ -327,8 +331,8 @@ RUN --mount=type=bind,source=pinned-packages-runtime.txt,target=/run/pinned-pack
         dpkg -i /run/cuda-keyring.deb; \
         nvat="libnvat=${LIBNVAT_VERSION}"; \
     fi; \
-    apt-get -o Acquire::https::CAInfo=/run/bootstrap-ca.crt update; \
-    DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::https::CAInfo=/run/bootstrap-ca.crt \
+    sh /run/apt-retry.sh -o Acquire::https::CAInfo=/run/bootstrap-ca.crt update; \
+    DEBIAN_FRONTEND=noninteractive sh /run/apt-retry.sh -o Acquire::https::CAInfo=/run/bootstrap-ca.crt \
         install -y --no-install-recommends \
         python3 python3-pip ca-certificates \
         libcurl4 libxml2 libxmlsec1-openssl $nvat; \

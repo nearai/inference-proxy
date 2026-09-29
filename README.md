@@ -380,6 +380,12 @@ request and dispatch `reproducible-build.yml` on its branch.
   that version or fails, never another one, and the CI pins guard compares what
   was installed with the committed list.
 
+All APT stages use up to five command attempts, with 30-, 60-, 120- and
+240-second waits between attempts and 30-second HTTP/HTTPS timeouts, on top of
+APT's own per-file retries, so a snapshot.ubuntu.com outage of a few minutes
+does not fail the build. Exhausted retries, incomplete package indexes, missing
+packages and checksum mismatches still fail the build.
+
 What it does not guarantee:
 
 - Availability. If the snapshot service stops serving a timestamp, commits that

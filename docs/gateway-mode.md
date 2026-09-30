@@ -309,7 +309,7 @@ computation next to it):
 ```text
 countable = (message text + serialized tool_calls + serialized tools) / 4
 uncounted = media parts × 1024 + messages × 4
-required  = ceil(countable × 1.2) + uncounted + max_tokens reserve
+required  = ceil(countable × 1.2) + uncounted + min(max_tokens, 32768)
 ```
 
 `required` strictly above `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` means the
@@ -317,6 +317,11 @@ long tier. The 1.2 safety factor covers the byte estimate only — media parts,
 template overhead, the reserved output window and `/v1/completions` token ids
 are already token counts. Tool definitions and tool-call arguments are counted
 because the lane's traffic is agentic, where they are most of the prompt.
+The `max_tokens` reserve is capped at 32,768 (cloud-api's
+`CONTEXT_ROUTE_OUTPUT_RESERVE_CAP`): it is the output a caller allows, not what it
+will produce, and aggregator clients often send the advertised maximum on
+one-line requests — counted in full, every such request would land on the
+long-context hosts.
 cloud-api additionally refines the decision near the boundary with an exact
 `POST /v1/tokenize`; the gateway deliberately does not — a tokenizer dependency
 and an extra upstream round trip are not worth it for a placement that is a

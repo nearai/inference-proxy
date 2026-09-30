@@ -34,7 +34,7 @@
 //! ```text
 //! countable = (message text + serialized tool_calls + serialized tools) / 4
 //! uncounted = media parts × 1024 + messages × 4
-//! required  = ceil(countable × 1.2) + uncounted + output reserve
+//! required  = ceil(countable × 1.2) + uncounted + min(output reserve, 32768)
 //! ```
 //!
 //! so the 1.2 safety factor applies to the byte-estimated text only —
@@ -68,6 +68,14 @@ const SAFETY_FACTOR: f64 = 1.2;
 const MEDIA_PART_TOKENS: u64 = 1024;
 /// Chat-template overhead cloud-api adds per message.
 const MESSAGE_TOKENS: u64 = 4;
+/// cloud-api's `CONTEXT_ROUTE_OUTPUT_RESERVE_CAP` (default 32768): the most of
+/// a request's `max_tokens` that counts toward its tier. `max_tokens` is the
+/// output a caller allows, not what it will produce -- aggregator clients send
+/// the advertised maximum (up to 1,048,576) on one-line requests, and counting
+/// it in full would route all of them to the long-context hosts, where a full
+/// tier is a refusal. Real outputs are small (GLM-5.3 Flash: 99.98% under 20k
+/// tokens), and both tiers run the same engine with the same context length.
+const OUTPUT_RESERVE_CAP: u64 = 32_768;
 
 /// Which half of the pool a backend belongs to, and which one a request wants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,14 +197,16 @@ fn is_token_id(value: &Value) -> bool {
     value.as_i64().is_some() || value.as_u64().is_some()
 }
 
-/// The output window the caller reserved; cloud-api adds it to the demand
-/// before comparing against a tier's capacity.
+/// The output window the caller reserved, capped at `OUTPUT_RESERVE_CAP`;
+/// cloud-api adds the same capped value to the demand before comparing
+/// against a tier's capacity.
 fn output_reserve(request: &Value) -> u64 {
-    ["max_completion_tokens", "max_tokens"]
+    (["max_completion_tokens", "max_tokens"]
         .iter()
         .find_map(|field| request.get(field).and_then(Value::as_i64))
         .unwrap_or(0)
-        .max(0) as u64
+        .max(0) as u64)
+        .min(OUTPUT_RESERVE_CAP)
 }
 
 /// What the tier decision produced for one request.
@@ -409,6 +419,37 @@ mod tests {
         );
         assert_eq!(
             completion_estimate(&json!({"prompt": [1, 2, 3], "max_tokens": 10})).tier(13),
+            ContextTier::Base
+        );
+    }
+
+    #[test]
+    fn a_huge_output_window_does_not_make_a_short_request_long() {
+        // A one-line request that allows the advertised maximum output stays on
+        // the base tier: only OUTPUT_RESERVE_CAP of it counts.
+        let body = |value: i64| json!({"messages": [{"role": "user", "content": "12345678"}], "max_tokens": value});
+        let input = 3 + MESSAGE_TOKENS; // ceil(2 × 1.2) + one message
+        for max_tokens in [1_048_576, 943_718, 131_073] {
+            let estimate = chat_estimate(&body(max_tokens));
+            assert_eq!(
+                estimate.tier(100_000),
+                ContextTier::Base,
+                "max_tokens {max_tokens}"
+            );
+            assert_eq!(estimate.tier(input + OUTPUT_RESERVE_CAP), ContextTier::Base);
+            assert_eq!(
+                estimate.tier(input + OUTPUT_RESERVE_CAP - 1),
+                ContextTier::Long
+            );
+        }
+        // Below the cap the reserve still counts in full.
+        assert_eq!(
+            chat_estimate(&body(8_000)).tier(input + 8_000 - 1),
+            ContextTier::Long
+        );
+        assert_eq!(
+            completion_estimate(&json!({"prompt": [1, 2, 3], "max_tokens": 1_048_576}))
+                .tier(100_000),
             ContextTier::Base
         );
     }

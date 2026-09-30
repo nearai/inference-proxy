@@ -2385,6 +2385,70 @@ async fn a_token_id_prompt_is_routed_by_its_exact_length() {
     long.verify().await;
 }
 
+/// A short request that allows a huge output (aggregator clients send the
+/// advertised maximum) stays on the base fleet: only `OUTPUT_RESERVE_CAP`
+/// (32,768) of its `max_tokens` counts toward the tier, at the production
+/// threshold. A genuinely oversized prompt still goes to the long tier.
+#[tokio::test]
+async fn a_huge_output_window_on_a_short_request_stays_on_the_base_fleet() {
+    let base = MockServer::start().await;
+    let long = MockServer::start().await;
+    let completion = serde_json::json!({
+        "id": "cmpl-1", "object": "text_completion", "model": "test-model",
+        "choices": [{"index": 0, "text": "hi", "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    });
+    mount_chat(&base, 2).await;
+    mount_chat(&long, 1).await;
+    for (mock, expected) in [(&base, 1), (&long, 0)] {
+        Mock::given(method("POST"))
+            .and(path("/v1/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion.clone()))
+            .expect(expected)
+            .mount(mock)
+            .await;
+    }
+    let app = build_gateway(
+        &base.uri(),
+        GatewayOptions {
+            backend_urls: vec![base.uri()],
+            backend_long_context_urls: vec![long.uri()],
+            long_context_above_tokens: 100_000,
+            ..Default::default()
+        },
+    );
+    // Chat: `max_tokens` and `max_completion_tokens` at the full 1M window.
+    for field in ["max_tokens", "max_completion_tokens"] {
+        let mut body = sized_body(400);
+        body[field] = 1_048_576.into();
+        let response = app.clone().oneshot(chat_request(body)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{field}");
+    }
+    // Completions with token ids and the same output window.
+    let body =
+        serde_json::json!({"model": "test-model", "prompt": [1, 2, 3], "max_tokens": 1_048_576});
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/completions")
+        .header("authorization", "Bearer test-token")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(request).await.unwrap().status(),
+        StatusCode::OK
+    );
+    // Control: ~120k tokens of prompt (×1.2 = 144k) is long-tier work.
+    let response = app
+        .clone()
+        .oneshot(chat_request(sized_body(480_000)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    base.verify().await;
+    long.verify().await;
+}
+
 // ---- Models document ----
 
 async fn get_models(app: axum::Router) -> (StatusCode, serde_json::Value) {

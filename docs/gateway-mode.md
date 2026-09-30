@@ -286,6 +286,7 @@ back-pressure for the next admission decision
 `backend_tier_requests_total{tier,outcome=routed|fallback|fallback_late|refused|refused_late}`
 (the `refused*` outcomes only occur with `VLLM_BACKEND_TIER_STRICT`),
 `request_estimated_prompt_tokens`,
+`backend_tier_output_reserve_capped_total{tier}` (requests whose `max_tokens` counted only up to the reserve cap),
 plus the existing usage-report and upstream metrics.
 
 ## Long-context tier
@@ -309,7 +310,7 @@ computation next to it):
 ```text
 countable = (message text + serialized tool_calls + serialized tools) / 4
 uncounted = media parts × 1024 + messages × 4
-required  = ceil(countable × 1.2) + uncounted + max_tokens reserve
+required  = ceil(countable × 1.2) + uncounted + min(max_tokens, 32768)
 ```
 
 `required` strictly above `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` means the
@@ -317,6 +318,16 @@ long tier. The 1.2 safety factor covers the byte estimate only — media parts,
 template overhead, the reserved output window and `/v1/completions` token ids
 are already token counts. Tool definitions and tool-call arguments are counted
 because the lane's traffic is agentic, where they are most of the prompt.
+The `max_tokens` reserve is capped at 32,768 (cloud-api's
+`CONTEXT_ROUTE_OUTPUT_RESERVE_CAP`): it is the output a caller allows, not what it
+will produce, and aggregator clients often send the advertised maximum on
+one-line requests — counted in full, every such request would land on the
+long-context hosts.
+The trade-off is accepted deliberately: a capped request that really does generate
+hundreds of thousands of tokens runs on the tier its prompt picked (normally base),
+holding one engine slot and its growing KV there — both tiers run the same engine
+with the same context length, so it completes. `backend_tier_output_reserve_capped_total`
+counts these requests; read it beside `backend_engine_running`/`backend_engine_queued`.
 cloud-api additionally refines the decision near the boundary with an exact
 `POST /v1/tokenize`; the gateway deliberately does not — a tokenizer dependency
 and an extra upstream round trip are not worth it for a placement that is a

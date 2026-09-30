@@ -34,7 +34,7 @@
 //! ```text
 //! countable = (message text + serialized tool_calls + serialized tools) / 4
 //! uncounted = media parts × 1024 + messages × 4
-//! required  = ceil(countable × 1.2) + uncounted + min(output reserve, 32768)
+//! required  = ceil(countable × 1.2) + uncounted + min(output reserve, OUTPUT_RESERVE_CAP)
 //! ```
 //!
 //! so the 1.2 safety factor applies to the byte-estimated text only —
@@ -102,6 +102,9 @@ pub struct Estimate {
     text: u64,
     exact: u64,
     reserve: u64,
+    /// The caller asked for more output than `OUTPUT_RESERVE_CAP`, so only
+    /// the cap counted. Counted per tier, so the trade-off stays visible.
+    reserve_capped: bool,
 }
 
 impl Estimate {
@@ -153,7 +156,8 @@ pub fn chat_estimate(request: &Value) -> Estimate {
     Estimate {
         text: bytes / 4,
         exact: media_parts * MEDIA_PART_TOKENS + messages * MESSAGE_TOKENS,
-        reserve: output_reserve(request),
+        reserve: output_reserve(request).min(OUTPUT_RESERVE_CAP),
+        reserve_capped: output_reserve(request) > OUTPUT_RESERVE_CAP,
     }
 }
 
@@ -180,7 +184,8 @@ pub fn completion_estimate(request: &Value) -> Estimate {
     Estimate {
         text: bytes / 4,
         exact: ids,
-        reserve: output_reserve(request),
+        reserve: output_reserve(request).min(OUTPUT_RESERVE_CAP),
+        reserve_capped: output_reserve(request) > OUTPUT_RESERVE_CAP,
     }
 }
 
@@ -197,16 +202,15 @@ fn is_token_id(value: &Value) -> bool {
     value.as_i64().is_some() || value.as_u64().is_some()
 }
 
-/// The output window the caller reserved, capped at `OUTPUT_RESERVE_CAP`;
-/// cloud-api adds the same capped value to the demand before comparing
-/// against a tier's capacity.
+/// The output window the caller reserved (`max_completion_tokens` wins over
+/// `max_tokens`), uncapped; the estimate counts at most `OUTPUT_RESERVE_CAP`
+/// of it, as cloud-api does, before comparing against a tier's capacity.
 fn output_reserve(request: &Value) -> u64 {
-    (["max_completion_tokens", "max_tokens"]
+    let requested = ["max_completion_tokens", "max_tokens"]
         .iter()
         .find_map(|field| request.get(field).and_then(Value::as_i64))
-        .unwrap_or(0)
-        .max(0) as u64)
-        .min(OUTPUT_RESERVE_CAP)
+        .unwrap_or(0);
+    requested.max(0) as u64
 }
 
 /// What the tier decision produced for one request.
@@ -248,6 +252,14 @@ pub fn decide(
         (true, false) => "fallback",
     };
     metrics::histogram!("request_estimated_prompt_tokens").record(estimate.tokens() as f64);
+    if estimate.reserve_capped {
+        // A request whose output window only partly counted: if one of these
+        // really generates hundreds of thousands of tokens, it does so on the
+        // tier this estimate picked (normally base). Watch this beside the
+        // engines' running/queued counts.
+        metrics::counter!("backend_tier_output_reserve_capped_total", "tier" => estimated.as_str())
+            .increment(1);
+    }
     metrics::counter!(
         "backend_tier_requests_total",
         "tier" => estimated.as_str(),
@@ -436,6 +448,19 @@ mod tests {
                 ContextTier::Base,
                 "max_tokens {max_tokens}"
             );
+            assert_eq!(estimate.tier(input + OUTPUT_RESERVE_CAP), ContextTier::Base);
+            assert_eq!(
+                estimate.tier(input + OUTPUT_RESERVE_CAP - 1),
+                ContextTier::Long
+            );
+        }
+        // Exactly at the cap nothing is dropped; one above it is capped.
+        for (max_tokens, capped) in [
+            (OUTPUT_RESERVE_CAP as i64, false),
+            (OUTPUT_RESERVE_CAP as i64 + 1, true),
+        ] {
+            let estimate = chat_estimate(&body(max_tokens));
+            assert_eq!(estimate.reserve_capped, capped, "max_tokens {max_tokens}");
             assert_eq!(estimate.tier(input + OUTPUT_RESERVE_CAP), ContextTier::Base);
             assert_eq!(
                 estimate.tier(input + OUTPUT_RESERVE_CAP - 1),

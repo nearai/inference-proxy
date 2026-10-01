@@ -104,8 +104,8 @@ fn parse_long_context_safety_factor(raw: &str) -> anyhow::Result<f64> {
         .trim()
         .parse()
         .map_err(|_| anyhow::anyhow!("{NAME} must be a positive finite number, got {raw:?}"))?;
-    if !factor.is_finite() || factor <= 0.0 {
-        anyhow::bail!("{NAME} must be a positive finite number, got {raw:?}");
+    if !factor.is_finite() || factor <= 0.0 || factor > 10.0 {
+        anyhow::bail!("{NAME} must be a positive finite number no greater than 10.0, got {raw:?}");
     }
     Ok(factor)
 }
@@ -448,6 +448,9 @@ pub struct Config {
     /// `VLLM_BACKEND_URLS`) whose `/v1/metrics` is polled for the engine's
     /// running and queued request counts (`VLLM_BACKEND_PROBE_URLS`). Empty =
     /// no engine view; placement and admission use the gateway's own counts.
+    /// Replica state publishing (`REPLICA_STATE_*`), `None` when off or
+    /// invalid (an invalid value is logged and disables only this feature).
+    pub replica_state: Option<crate::replica_state::config::ReplicaStateConfig>,
     pub backend_probe_urls: Vec<String>,
     /// Poll interval for the probes (`VLLM_BACKEND_PROBE_INTERVAL_SECS`,
     /// default 2).
@@ -470,7 +473,7 @@ pub struct Config {
     /// own factor, kept deliberately: an over-estimate here only means a
     /// request prefills on the long tier instead of the base one, both of
     /// which run the same engine with the same context length). Must be a
-    /// positive, finite number. See `context_tier.rs`.
+    /// positive, finite number no greater than 10.0. See `context_tier.rs`.
     pub long_context_safety_factor: f64,
     /// Whether the caller's reserved output window (`max_completion_tokens` /
     /// `max_tokens`) counts toward the long-context tier decision
@@ -850,7 +853,7 @@ impl Config {
         let long_context_safety_factor: f64 =
             match env::var("VLLM_BACKEND_LONG_CONTEXT_SAFETY_FACTOR") {
                 Ok(raw) if !raw.trim().is_empty() => parse_long_context_safety_factor(&raw)?,
-                _ => 1.2,
+                _ => crate::context_tier::DEFAULT_SAFETY_FACTOR,
             };
         let long_context_count_output_reserve =
             env_bool("VLLM_BACKEND_LONG_CONTEXT_COUNT_OUTPUT_RESERVE");
@@ -912,6 +915,19 @@ impl Config {
                 long_context_above_tokens,
             );
 
+        let replica_state =
+            match crate::replica_state::config::ReplicaStateConfig::from_lookup(|k| {
+                env::var(k).ok()
+            }) {
+                Ok(rs) => rs,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "Replica state publishing disabled: invalid REPLICA_STATE_* configuration"
+                    );
+                    None
+                }
+            };
         let config = Config {
             model_name,
             tokens,
@@ -1012,6 +1028,7 @@ impl Config {
             admission_queue_saturated_at,
             admission_retry_after_secs,
             backend_connect_failover,
+            replica_state,
             backend_probe_urls,
             backend_probe_interval_secs,
             backend_long_context_urls,
@@ -1175,6 +1192,12 @@ impl Config {
         }
     }
 
+    /// Replica state publishing settings, `None` unless `REPLICA_STATE_REDIS_URL`
+    /// is set to a valid configuration.
+    pub fn replica_state(&self) -> Option<&crate::replica_state::config::ReplicaStateConfig> {
+        self.replica_state.as_ref()
+    }
+
     /// Lane admission settings, `None` unless `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` is set.
     pub fn admission(&self) -> Option<crate::admission::AdmissionConfig> {
         if self.admission_max_inflight == 0 {
@@ -1334,6 +1357,27 @@ mod tests {
         ] {
             env::remove_var(key);
         }
+    }
+
+    #[test]
+    fn replica_state_is_parsed_by_config_and_invalid_values_only_disable_it() {
+        let base = [
+            ("MODEL_NAME", "m"),
+            ("TOKEN", "t"),
+            ("VLLM_BACKEND_URLS", "http://a:8000"),
+            ("VLLM_BACKEND_LONG_CONTEXT_URLS", "http://b:8000"),
+            ("VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS", "32000"),
+            ("REPLICA_STATE_REDIS_URL", "redis://r:6379"),
+            ("REPLICA_STATE_HOST_ID", "gpu01"),
+        ];
+        with_env_vars(&base, || {
+            let config = Config::from_env().unwrap();
+            let rs = config.replica_state().expect("replica state configured");
+            assert_eq!(rs.host_id, "gpu01");
+        });
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            assert!(Config::from_env().unwrap().replica_state().is_none());
+        });
     }
 
     #[test]
@@ -1664,7 +1708,7 @@ mod tests {
             assert_eq!(config.long_context_safety_factor, 1.2);
             assert!(!config.long_context_count_output_reserve);
 
-            for (raw, expected) in [("1", 1.0), (" 1.5 ", 1.5), ("0.0001", 0.0001)] {
+            for (raw, expected) in [("1", 1.0), (" 1.5 ", 1.5), ("0.0001", 0.0001), ("10", 10.0)] {
                 env::set_var("VLLM_BACKEND_LONG_CONTEXT_SAFETY_FACTOR", raw);
                 assert_eq!(
                     Config::from_env().unwrap().long_context_safety_factor,
@@ -1672,7 +1716,7 @@ mod tests {
                     "{raw:?}"
                 );
             }
-            for bad in ["0", "-1", "abc", "NaN", "inf", "-inf"] {
+            for bad in ["0", "-1", "abc", "NaN", "inf", "-inf", "10.5", "1e20"] {
                 env::set_var("VLLM_BACKEND_LONG_CONTEXT_SAFETY_FACTOR", bad);
                 let err = Config::from_env().unwrap_err().to_string();
                 assert!(
@@ -1682,8 +1726,7 @@ mod tests {
             }
             env::remove_var("VLLM_BACKEND_LONG_CONTEXT_SAFETY_FACTOR");
 
-            // The rollback: setting this alone (the factor's default is
-            // already cloud-api's 1.2) reproduces cloud-api's old behaviour.
+            // The rollback: setting this alone restores #281's capped-reserve behaviour.
             env::set_var("VLLM_BACKEND_LONG_CONTEXT_COUNT_OUTPUT_RESERVE", "1");
             assert!(
                 Config::from_env()

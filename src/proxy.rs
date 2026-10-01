@@ -1687,6 +1687,13 @@ pub async fn proxy_json_request(
                 obj.insert("id".to_string(), serde_json::Value::String(id));
             }
         }
+        // Completion usage only: embeddings, rerank, score and image bodies
+        // also land here and stay exactly as the engine sent them.
+        if matches!(opts.usage_type, UsageType::ChatCompletion) {
+            if let Some(usage) = data.get_mut("usage") {
+                mirror_reasoning_usage(usage);
+            }
+        }
         data
     };
 
@@ -2074,7 +2081,8 @@ impl StreamingResponseAssembler {
         if let Some(created) = self.created {
             resp["created"] = created.into();
         }
-        if let Some(usage) = self.usage {
+        if let Some(mut usage) = self.usage {
+            mirror_reasoning_usage(&mut usage);
             resp["usage"] = usage;
         }
         if let Some(metadata) = self.metadata {
@@ -2766,12 +2774,55 @@ pub async fn proxy_streaming_request(
         .unwrap())
 }
 
+/// Copy the engine's top-level `usage.reasoning_tokens` into
+/// `usage.completion_tokens_details.reasoning_tokens`, where OpenAI's usage
+/// object puts it and where OpenAI-compatible clients and SDKs read it. SGLang
+/// reports the count only at the top level, so those clients otherwise see
+/// none.
+///
+/// Additive, and it never invents a count:
+/// - it acts only when the top-level `reasoning_tokens` is a non-negative
+///   integer (`0` is a real count and is mirrored as `0`); when it is absent,
+///   null, negative, fractional or not a number, `usage` is left untouched;
+/// - the top-level `reasoning_tokens` stays for existing readers;
+/// - a missing `completion_tokens_details` is created as
+///   `{"reasoning_tokens": n}`; an existing object gains `reasoning_tokens`
+///   only when it has none, so a provider's own value is never overwritten;
+///   a `completion_tokens_details` that is not an object is left alone.
+///
+/// Every caller runs it before the response is hashed and signed, so the
+/// signature covers the bytes that carry both fields.
+pub(crate) fn mirror_reasoning_usage(usage: &mut serde_json::Value) {
+    let Some(usage) = usage.as_object_mut() else {
+        return;
+    };
+    let Some(reasoning_tokens) = usage.get("reasoning_tokens").and_then(|v| v.as_u64()) else {
+        return;
+    };
+    let details = usage
+        .entry("completion_tokens_details")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let Some(details) = details.as_object_mut() {
+        details
+            .entry("reasoning_tokens")
+            .or_insert_with(|| serde_json::Value::from(reasoning_tokens));
+    }
+}
+
 /// Normalize OpenAI-compat chat completion streaming chunks emitted by upstream
 /// reasoning parsers that use the non-standard `delta.reasoning` field
 /// (vLLM `qwen3` parser as of v0.10) so downstream clients see the standard
 /// `delta.reasoning_content` field consistently across reasoning models.
 /// If both fields are present the existing `reasoning_content` is kept.
+///
+/// A chunk that carries a `usage` object (the final usage chunk, or every
+/// chunk with `continuous_usage_stats`) also gets its reasoning count mirrored
+/// into `completion_tokens_details` (see [`mirror_reasoning_usage`]);
+/// `usage: null` is left as is.
 pub(crate) fn normalize_chat_chunk(val: &mut serde_json::Value) {
+    if let Some(usage) = val.get_mut("usage") {
+        mirror_reasoning_usage(usage);
+    }
     let Some(choices) = val.get_mut("choices").and_then(|c| c.as_array_mut()) else {
         return;
     };
@@ -2788,7 +2839,8 @@ pub(crate) fn normalize_chat_chunk(val: &mut serde_json::Value) {
 }
 
 /// Line-buffered SSE transformer that handles data split across chunk boundaries.
-/// Always normalizes chat completion chunks (`delta.reasoning` → `delta.reasoning_content`)
+/// Always normalizes chat completion chunks (`delta.reasoning` → `delta.reasoning_content`,
+/// reasoning count mirrored into `usage.completion_tokens_details`)
 /// and optionally applies an additional transform (e.g. encryption).
 /// Fail-closed: if a data line contains JSON that cannot be transformed, the stream errors.
 struct SseTransformer {
@@ -4808,6 +4860,250 @@ data: [DONE]
         assert!(
             out_str.contains("\"reasoning_content\":\"x\""),
             "Got: {out_str}"
+        );
+    }
+
+    // ── mirror_reasoning_usage: usage.reasoning_tokens → completion_tokens_details ──
+
+    /// The usage object SGLang sends (`UsageInfo`): the reasoning count sits at
+    /// the top level and there is no `completion_tokens_details`.
+    fn sglang_usage(reasoning_tokens: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "prompt_tokens": 12,
+            "total_tokens": 62,
+            "completion_tokens": 50,
+            "prompt_tokens_details": null,
+            "reasoning_tokens": reasoning_tokens
+        })
+    }
+
+    #[test]
+    fn test_mirror_reasoning_usage_creates_completion_tokens_details() {
+        let mut usage = sglang_usage(42.into());
+        mirror_reasoning_usage(&mut usage);
+        // Only the details object is added; the legacy top-level field and
+        // every other key are untouched.
+        let mut expected = sglang_usage(42.into());
+        expected["completion_tokens_details"] = serde_json::json!({"reasoning_tokens": 42});
+        assert_eq!(usage, expected);
+    }
+
+    #[test]
+    fn test_mirror_reasoning_usage_mirrors_zero() {
+        let mut usage = sglang_usage(0.into());
+        mirror_reasoning_usage(&mut usage);
+        assert_eq!(
+            usage["completion_tokens_details"],
+            serde_json::json!({"reasoning_tokens": 0})
+        );
+        assert_eq!(usage["reasoning_tokens"], 0);
+    }
+
+    #[test]
+    fn test_mirror_reasoning_usage_invents_nothing_without_a_count() {
+        let mut usage =
+            serde_json::json!({"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7});
+        let before = usage.clone();
+        mirror_reasoning_usage(&mut usage);
+        assert_eq!(usage, before);
+    }
+
+    #[test]
+    fn test_mirror_reasoning_usage_ignores_counts_that_are_not_counts() {
+        for bad in [
+            serde_json::json!(null),
+            serde_json::json!(-1),
+            serde_json::json!(3.5),
+            serde_json::json!("7"),
+            serde_json::json!(true),
+            serde_json::json!({"n": 7}),
+        ] {
+            let mut usage = sglang_usage(bad.clone());
+            let before = usage.clone();
+            mirror_reasoning_usage(&mut usage);
+            assert_eq!(usage, before, "reasoning_tokens = {bad}");
+        }
+    }
+
+    #[test]
+    fn test_mirror_reasoning_usage_keeps_the_provider_value() {
+        let mut usage = sglang_usage(42.into());
+        usage["completion_tokens_details"] =
+            serde_json::json!({"reasoning_tokens": 40, "audio_tokens": 0});
+        let before = usage.clone();
+        mirror_reasoning_usage(&mut usage);
+        assert_eq!(usage, before);
+    }
+
+    #[test]
+    fn test_mirror_reasoning_usage_fills_an_existing_details_object() {
+        let mut usage = sglang_usage(42.into());
+        usage["completion_tokens_details"] = serde_json::json!({"audio_tokens": 0});
+        mirror_reasoning_usage(&mut usage);
+        assert_eq!(
+            usage["completion_tokens_details"],
+            serde_json::json!({"audio_tokens": 0, "reasoning_tokens": 42})
+        );
+    }
+
+    #[test]
+    fn test_mirror_reasoning_usage_leaves_non_object_details_alone() {
+        for details in [
+            serde_json::json!(null),
+            serde_json::json!(0),
+            serde_json::json!("n/a"),
+            serde_json::json!([42]),
+        ] {
+            let mut usage = sglang_usage(42.into());
+            usage["completion_tokens_details"] = details.clone();
+            let before = usage.clone();
+            mirror_reasoning_usage(&mut usage);
+            assert_eq!(usage, before, "completion_tokens_details = {details}");
+        }
+    }
+
+    #[test]
+    fn test_mirror_reasoning_usage_ignores_a_usage_that_is_not_an_object() {
+        for mut usage in [
+            serde_json::json!(null),
+            serde_json::json!(7),
+            serde_json::json!([]),
+        ] {
+            let before = usage.clone();
+            mirror_reasoning_usage(&mut usage);
+            assert_eq!(usage, before);
+        }
+    }
+
+    #[test]
+    fn test_normalize_mirrors_reasoning_tokens_in_the_usage_chunk() {
+        // SGLang's final usage chunk: empty choices, top-level reasoning count.
+        let mut v = serde_json::json!({
+            "id": "c1",
+            "object": "chat.completion.chunk",
+            "choices": [],
+            "usage": sglang_usage(42.into())
+        });
+        normalize_chat_chunk(&mut v);
+        assert_eq!(v["usage"]["reasoning_tokens"], 42);
+        assert_eq!(
+            v["usage"]["completion_tokens_details"],
+            serde_json::json!({"reasoning_tokens": 42})
+        );
+
+        // Same without a `choices` key at all.
+        let mut v = serde_json::json!({"usage": sglang_usage(7.into())});
+        normalize_chat_chunk(&mut v);
+        assert_eq!(
+            v["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            7
+        );
+    }
+
+    #[test]
+    fn test_normalize_mirrors_continuous_usage_next_to_a_delta() {
+        // continuous_usage_stats: usage rides on every content chunk; both
+        // normalizations apply to the same chunk.
+        let mut v = serde_json::json!({
+            "choices": [{"index": 0, "delta": {"reasoning": "think"}}],
+            "usage": sglang_usage(3.into())
+        });
+        normalize_chat_chunk(&mut v);
+        assert_eq!(v["choices"][0]["delta"]["reasoning_content"], "think");
+        assert_eq!(
+            v["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            3
+        );
+        assert_eq!(v["usage"]["reasoning_tokens"], 3);
+    }
+
+    #[test]
+    fn test_normalize_leaves_null_usage_alone() {
+        let mut v = serde_json::json!({
+            "id": "c1",
+            "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": null}],
+            "usage": null
+        });
+        let before = v.clone();
+        normalize_chat_chunk(&mut v);
+        assert_eq!(v, before);
+    }
+
+    #[test]
+    fn test_sse_transformer_emits_mirrored_usage_before_the_extra_transform() {
+        // The transformer output is what gets hashed and sent: it must carry
+        // both fields, and the extra transform (encryption) must already see them.
+        let extra: ChunkTransform = Arc::new(|v| {
+            let seen = v
+                .pointer("/usage/completion_tokens_details/reasoning_tokens")
+                .is_some();
+            v["saw_mirrored_usage"] = serde_json::Value::Bool(seen);
+            Ok(())
+        });
+        let mut transformer = SseTransformer::new(Some(extra));
+        let chunk = concat!(
+            "data: {\"id\":\"c1\",\"choices\":[],\"usage\":{\"prompt_tokens\":12,",
+            "\"total_tokens\":62,\"completion_tokens\":50,\"prompt_tokens_details\":null,",
+            "\"reasoning_tokens\":42}}\n\n"
+        );
+        let out = transformer.process_chunk(chunk.as_bytes()).unwrap();
+        let out = std::str::from_utf8(&out).unwrap();
+        let data = out
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("a data line");
+        let v: serde_json::Value = serde_json::from_str(data).unwrap();
+        assert_eq!(v["saw_mirrored_usage"], true);
+        assert_eq!(v["usage"]["reasoning_tokens"], 42);
+        assert_eq!(
+            v["usage"]["completion_tokens_details"],
+            serde_json::json!({"reasoning_tokens": 42})
+        );
+    }
+
+    #[test]
+    fn test_assembler_mirrors_sglang_reasoning_tokens() {
+        // Non-streaming requests are streamed internally and reassembled; the
+        // final SGLang usage chunk must come out with both fields.
+        let events = [
+            concat!(
+                "data: {\"id\":\"c1\",\"model\":\"m\",\"created\":100,\"choices\":[{\"index\":0,",
+                "\"delta\":{\"role\":\"assistant\",\"content\":null,",
+                "\"reasoning_content\":\"2+2\"},\"finish_reason\":null}],\"usage\":null}\n\n"
+            ),
+            concat!(
+                "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"4\"},",
+                "\"finish_reason\":\"stop\"}],\"usage\":null}\n\n"
+            ),
+            concat!(
+                "data: {\"id\":\"c1\",\"choices\":[],\"usage\":{\"prompt_tokens\":12,",
+                "\"total_tokens\":62,\"completion_tokens\":50,\"prompt_tokens_details\":null,",
+                "\"reasoning_tokens\":42}}\n\ndata: [DONE]\n\n"
+            ),
+        ];
+        let mut asm = StreamingResponseAssembler::new(ResponseShape::ChatCompletion);
+        for event in events {
+            asm.process_chunk(event.as_bytes());
+        }
+
+        let resp = asm.into_response("chatcmpl");
+        let mut expected_usage = sglang_usage(42.into());
+        expected_usage["completion_tokens_details"] = serde_json::json!({"reasoning_tokens": 42});
+        assert_eq!(resp["usage"], expected_usage);
+        assert_eq!(resp["choices"][0]["message"]["reasoning_content"], "2+2");
+        assert_eq!(resp["choices"][0]["message"]["content"], "4");
+    }
+
+    #[test]
+    fn test_assembler_invents_no_reasoning_count() {
+        let mut asm = StreamingResponseAssembler::new(ResponseShape::ChatCompletion);
+        asm.process_chunk(
+            b"data: {\"id\":\"c1\",\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\ndata: [DONE]\n\n",
+        );
+        let resp = asm.into_response("chatcmpl");
+        assert_eq!(
+            resp["usage"],
+            serde_json::json!({"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7})
         );
     }
 

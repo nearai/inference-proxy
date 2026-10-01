@@ -5,6 +5,7 @@ use axum::response::Response;
 use axum::Extension;
 
 use crate::auth::RequireAuth;
+use crate::backend_affinity::{parse_replica_hint, ReplicaHint};
 use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
 use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageType};
@@ -103,7 +104,15 @@ pub async fn completions(
         state.config.context_tier_policy(),
         || crate::context_tier::completion_estimate(&request_json),
     );
-    let placed = place_completion(&state, ROUTE_COMPLETIONS, tier, None)?;
+    // Placement hint from cloud-api, same trust predicate as chat completions
+    // and `X-NearAI-Priority`: honoured only for a caller authenticated with
+    // the proxy's own config token, not an `sk-` API key.
+    let hint = if auth.cloud_api_key.is_none() {
+        parse_replica_hint(&headers)
+    } else {
+        ReplicaHint::Absent
+    };
+    let placed = place_completion(&state, ROUTE_COMPLETIONS, tier, None, hint)?;
 
     let opts = ProxyOpts {
         signing: state.signing.clone(),

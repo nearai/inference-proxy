@@ -49,7 +49,8 @@ struct GatewayOptions {
     backend_long_context_urls: Vec<String>,
     backend_long_context_probe_urls: Vec<String>,
     long_context_above_tokens: u64,
-    /// `VLLM_BACKEND_LONG_CONTEXT_SAFETY_FACTOR`; `None` = the default `1.2`.
+    /// `VLLM_BACKEND_LONG_CONTEXT_SAFETY_FACTOR`; `None` uses
+    /// `context_tier::DEFAULT_SAFETY_FACTOR`.
     long_context_safety_factor: Option<f64>,
     /// `VLLM_BACKEND_LONG_CONTEXT_COUNT_OUTPUT_RESERVE`, default `false`.
     long_context_count_output_reserve: bool,
@@ -79,6 +80,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         options.backend_urls.clone()
     };
     let config = config::Config {
+        replica_state: None,
         model_name: "test-model".to_string(),
         tokens: vec!["test-token".to_string()],
         vllm_base_url: mock_url.to_string(),
@@ -180,7 +182,9 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         backend_long_context_urls: options.backend_long_context_urls.clone(),
         backend_long_context_probe_urls: options.backend_long_context_probe_urls.clone(),
         long_context_above_tokens: options.long_context_above_tokens,
-        long_context_safety_factor: options.long_context_safety_factor.unwrap_or(1.2),
+        long_context_safety_factor: options
+            .long_context_safety_factor
+            .unwrap_or(context_tier::DEFAULT_SAFETY_FACTOR),
         long_context_count_output_reserve: options.long_context_count_output_reserve,
         backend_tier_strict: options.backend_tier_strict,
         dstack_socket_path: "/nonexistent/dstack.sock".to_string(),
@@ -377,6 +381,128 @@ async fn backend_token_is_attached_to_backend_requests() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = json_body(response).await;
     assert_eq!(body["choices"][0]["message"]["content"], "hi");
+}
+
+#[tokio::test]
+async fn gateway_defaults_missing_json_schema_name_before_backend_validation() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(wiremock::matchers::body_partial_json(serde_json::json!({
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "schema": {"type": "object"}
+                }
+            }
+        })))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": {"message": "json_schema.name is required"}
+        })))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(wiremock::matchers::body_partial_json(serde_json::json!({
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "response_schema",
+                    "schema": {"type": "object"}
+                }
+            }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+        .with_priority(1)
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let app = build_gateway(
+        &mock.uri(),
+        GatewayOptions {
+            backend_token: Some("backend-secret".to_string()),
+            ..Default::default()
+        },
+    );
+    let response = app
+        .oneshot(chat_request(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"schema": {"type": "object"}}
+            }
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let received = mock.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1);
+    assert_eq!(
+        received[0].headers.get("authorization").unwrap(),
+        "Bearer backend-secret"
+    );
+    let forwarded: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+    assert_eq!(
+        forwarded["response_format"],
+        serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "response_schema",
+                "schema": {"type": "object"}
+            }
+        })
+    );
+}
+
+#[tokio::test]
+async fn gateway_defaults_json_schema_name_on_streaming_requests() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(wiremock::matchers::body_partial_json(serde_json::json!({
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "response_schema",
+                    "schema": {"type": "object"}
+                }
+            }
+        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string("data: {\"id\":\"chatcmpl-stream\"}\n\ndata: [DONE]\n\n"),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let app = build_gateway(
+        &mock.uri(),
+        GatewayOptions {
+            backend_token: Some("backend-secret".to_string()),
+            ..Default::default()
+        },
+    );
+    let response = app
+        .oneshot(chat_request(serde_json::json!({
+            "model": "test-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"schema": {"type": "object"}}
+            }
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(String::from_utf8_lossy(&body).contains("data: [DONE]"));
 }
 
 #[tokio::test]
@@ -2268,6 +2394,83 @@ async fn a_token_id_prompt_is_routed_by_its_exact_length() {
     long.verify().await;
 }
 
+/// A huge output allowance leaves a short prompt on the base fleet by
+/// default. The opt-in reserve-counting policy sends it long; a genuinely
+/// oversized prompt also goes long without the opt-in.
+#[tokio::test]
+async fn a_huge_output_window_on_a_short_request_stays_on_the_base_fleet() {
+    let base = MockServer::start().await;
+    let long = MockServer::start().await;
+    let completion = serde_json::json!({
+        "id": "cmpl-1", "object": "text_completion", "model": "test-model",
+        "choices": [{"index": 0, "text": "hi", "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    });
+    mount_chat(&base, 2).await;
+    mount_chat(&long, 2).await;
+    for (mock, expected) in [(&base, 1), (&long, 0)] {
+        Mock::given(method("POST"))
+            .and(path("/v1/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion.clone()))
+            .expect(expected)
+            .mount(mock)
+            .await;
+    }
+    let app = build_gateway(
+        &base.uri(),
+        GatewayOptions {
+            backend_urls: vec![base.uri()],
+            backend_long_context_urls: vec![long.uri()],
+            long_context_above_tokens: 10_000,
+            ..Default::default()
+        },
+    );
+    // Chat: `max_tokens` and `max_completion_tokens` at the full 1M window.
+    for field in ["max_tokens", "max_completion_tokens"] {
+        let mut body = sized_body(400);
+        body[field] = 1_048_576.into();
+        let response = app.clone().oneshot(chat_request(body)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{field}");
+    }
+    let legacy_app = build_gateway(
+        &base.uri(),
+        GatewayOptions {
+            backend_urls: vec![base.uri()],
+            backend_long_context_urls: vec![long.uri()],
+            long_context_above_tokens: 10_000,
+            long_context_count_output_reserve: true,
+            ..Default::default()
+        },
+    );
+    let mut legacy_body = sized_body(400);
+    legacy_body["max_tokens"] = 1_048_576.into();
+    let response = legacy_app.oneshot(chat_request(legacy_body)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // Completions with token ids and the same output window.
+    let body =
+        serde_json::json!({"model": "test-model", "prompt": [1, 2, 3], "max_tokens": 1_048_576});
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/completions")
+        .header("authorization", "Bearer test-token")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(request).await.unwrap().status(),
+        StatusCode::OK
+    );
+    // Control: ~120k tokens of prompt (×1.2 = 144k) is long-tier work.
+    let response = app
+        .clone()
+        .oneshot(chat_request(sized_body(480_000)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    base.verify().await;
+    long.verify().await;
+}
+
 // ---- Models document ----
 
 async fn get_models(app: axum::Router) -> (StatusCode, serde_json::Value) {
@@ -3168,4 +3371,99 @@ async fn borrowing_connect_failover_keeps_destination_cap_and_one_permit() {
     for task in tasks {
         task.abort();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Reasoning usage: the lane's responses carry completion_tokens_details too
+// ---------------------------------------------------------------------------
+
+/// What an SGLang reasoning model streams back: `usage: null` on the content
+/// chunks, then the reasoning count at the top level of the final `usage`.
+const SGLANG_REASONING_STREAM: &str = concat!(
+    "data: {\"id\":\"chatcmpl-r\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"reasoning_content\":\"2+2\"},\"finish_reason\":null}],\"usage\":null}\n\n",
+    "data: {\"id\":\"chatcmpl-r\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"4\"},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+    "data: {\"id\":\"chatcmpl-r\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"total_tokens\":62,\"completion_tokens\":50,\"prompt_tokens_details\":null,\"reasoning_tokens\":42}}\n\n",
+    "data: [DONE]\n\n",
+);
+
+/// A gateway configured like the lane. Of these settings only the first-event
+/// peek and the commit window change the (streaming) response path. The backend
+/// bearer is request-path config: it is the upstream `Authorization` header,
+/// which `mount_reasoning_stream` asserts, and it turns on the request-side
+/// reasoning switch in `routes/chat.rs`. Non-TEE only hides the attestation,
+/// signature and GPU-evidence routes.
+fn reasoning_lane(mock: &MockServer) -> axum::Router {
+    build_gateway(
+        &mock.uri(),
+        GatewayOptions {
+            backend_token: Some("backend-secret".to_string()),
+            non_tee_deployment: true,
+            stream_error_peek_ms: 1000,
+            stream_commit_ms: 300,
+            ..Default::default()
+        },
+    )
+}
+
+async fn mount_reasoning_stream(mock: &MockServer) {
+    // Only a request carrying the lane's backend bearer is answered, so a
+    // dropped or wrong bearer fails these tests instead of passing unnoticed.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", "Bearer backend-secret"))
+        .respond_with(
+            // `set_body_raw`: `set_body_string` would force `text/plain`, and a
+            // non-streaming request only reassembles a `text/event-stream` answer.
+            ResponseTemplate::new(200).set_body_raw(SGLANG_REASONING_STREAM, "text/event-stream"),
+        )
+        .expect(1)
+        .mount(mock)
+        .await;
+}
+
+#[tokio::test]
+async fn streamed_usage_carries_reasoning_tokens_in_completion_tokens_details() {
+    let mock = MockServer::start().await;
+    mount_reasoning_stream(&mock).await;
+    let response = reasoning_lane(&mock)
+        .oneshot(stream_request())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = stream_frames(response).await.concat();
+    let usage = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str::<serde_json::Value>(data).unwrap())
+        .find_map(|event| event.get("usage").filter(|u| u.is_object()).cloned())
+        .unwrap_or_else(|| panic!("no usage chunk in {body}"));
+    assert_eq!(usage["reasoning_tokens"], 42);
+    assert_eq!(
+        usage["completion_tokens_details"],
+        serde_json::json!({"reasoning_tokens": 42})
+    );
+}
+
+#[tokio::test]
+async fn non_streamed_usage_carries_reasoning_tokens_in_completion_tokens_details() {
+    let mock = MockServer::start().await;
+    mount_reasoning_stream(&mock).await;
+    let response = reasoning_lane(&mock)
+        .oneshot(chat_request(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "2+2?"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = json_body(response).await;
+    assert_eq!(body["choices"][0]["message"]["content"], "4");
+    assert_eq!(body["usage"]["reasoning_tokens"], 42);
+    assert_eq!(
+        body["usage"]["completion_tokens_details"],
+        serde_json::json!({"reasoning_tokens": 42})
+    );
 }

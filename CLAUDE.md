@@ -35,6 +35,7 @@ This is a Rust rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-pro
 - `attestation.rs` — `AttestationCache`, `generate_attestation()`, GPU evidence collection with retry/serialization, dstack TDX quotes
 - `auth.rs` — `RequireAuth` axum extractor (validates Bearer token)
 - `routes/` — thin handlers that parse request, call proxy helpers
+- `replica_state/` — opt-in publishing of one signed host frame per tick to Redis (`spawn_replica_state_publisher`)
 
 ### Important patterns
 
@@ -73,12 +74,14 @@ This is a Rust rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-pro
 ## Deployment
 
 - Docker image: `nearaidev/vllm-proxy-rs` (published with digest-pinned refs in cvm-conf)
+- The image build is reproducible and externally verified: `ENABLE_NV_ATTESTATION_SDK=1 SOURCE_DATE_EPOCH=0 bash build-image.sh` on a fresh clone must produce the digest CI published, and `reproducible-build.yml` checks exactly that. Never add a required build env var or argument without coordinating with external verifiers first. See README "Reproducible build & verification" for the contract, the pinned inputs and how to bump them.
 - Deployed via compose files in [nearai/cvm-compose-files](https://github.com/nearai/cvm-compose-files)
 - Each proxy instance needs: `MODEL_NAME`, `TOKEN`, `VLLM_BASE_URL`, `TLS_CERT_PATH`
 - Optional: `CLOUD_API_URL` (enables usage reporting + `sk-` API key auth via cloud-api), `LOG_FORMAT=json` (structured JSON logs)
 - Pre-dispatch image validation is enabled by default for chat-completions image inputs. `VLLM_PROXY_IMAGE_VALIDATION_DISABLED=1` disables it. Tunables: `VLLM_PROXY_IMAGE_VALIDATION_TIMEOUT_SECS` (default 5), `VLLM_PROXY_IMAGE_VALIDATION_MAX_BYTES` (8192), `VLLM_PROXY_IMAGE_VALIDATION_MAX_CONCURRENCY` (8), `VLLM_PROXY_IMAGE_VALIDATION_ALLOW_PRIVATE_HOSTS` (default off), `VLLM_PROXY_IMAGE_VALIDATION_ALLOWED_DOMAINS` (exact remote `image_url` host allowlist checked before fetch and on every redirect; falls back to `VLLM_ALLOWED_MEDIA_DOMAINS` when unset; Gemma-4 defaults to `prod-files-secure.s3.us-west-2.amazonaws.com`; explicitly set empty to disable the proxy-side domain restriction), `VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB` (default off; `1` forces strict non-RGB PNG/JPEG rejection. Gemma-4 model names still auto-reject observed one-channel PNG/JPEG crash inputs).
 - `ATTESTATION_CACHE_TTL` (default 300s) — TTL for cached nonce-less attestation reports; background refresh runs at half-TTL
 - `DSTACK_SOCKET_PATH` (default `/var/run/dstack.sock`) — probed by `GET /healthz` so upstream load balancers (e.g. model-proxy) can detach this instance when the dstack guest-agent socket is unreachable. `/v1/models` alone won't catch this failure mode — sglang/vLLM keep serving while `/v1/attestation/report` silently 500s. The backend leg of `/healthz` probes `/health` (not `/v1/models`) since `/v1/models` serializes against the OpenAI request loop and can stall for >1s during prefill, producing spurious 503s on otherwise-healthy hosts.
+- Image base: slim Ubuntu 22.04 runtime, no vLLM/CUDA; apt and pip inputs pinned in `pinned-packages-builder.txt`, `pinned-packages-runtime.txt` and `attestation-constraints.txt` (bump procedure in the Dockerfile header)
 
 ### Gateway mode (fleet-wide, non-TEE)
 

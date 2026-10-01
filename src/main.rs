@@ -203,6 +203,8 @@ async fn main() -> anyhow::Result<()> {
         info!(
             backends = config.backend_long_context_urls.len(),
             above_tokens = config.long_context_above_tokens,
+            safety_factor = config.long_context_safety_factor,
+            count_output_reserve = config.long_context_count_output_reserve,
             "Long-context tier enabled"
         );
     }

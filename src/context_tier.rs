@@ -27,55 +27,60 @@
 //! with a long-context tier configured; set without one, it is ignored (a
 //! startup warning says so).
 //!
-//! The estimate mirrors the one cloud-api routes with,
-//! `inference_provider_pool::context_routing::estimate_input` plus the
-//! `required` computation in `inference_provider_pool/mod.rs`:
+//! The default estimate mirrors cloud-api's prompt-only routing decision:
 //!
 //! ```text
 //! countable = (message text + serialized tool_calls + serialized tools) / 4
 //! uncounted = media parts × 1024 + messages × 4
-//! required  = ceil(countable × 1.2) + uncounted + min(output reserve, OUTPUT_RESERVE_CAP)
+//! required  = ceil(countable × safety_factor) + uncounted
+//!             + (if count_output_reserve { min(output reserve, OUTPUT_RESERVE_CAP) } else { 0 })
 //! ```
 //!
-//! so the 1.2 safety factor applies to the byte-estimated text only —
-//! everything else is already a token count. Tool definitions and tool-call
-//! arguments are counted because the lane's dominant shape is agentic, where
-//! they are most of the prompt. cloud-api additionally refines the decision
-//! with an exact `POST /v1/tokenize` near the boundary; the gateway does not —
-//! that is a tokenizer dependency and an extra upstream round trip for a
-//! placement that is a preference, not a correctness rule (both tiers run the
-//! same engine with the same context length, so the "wrong" tier still
-//! answers).
+//! so the safety factor applies to the byte-estimated text only — everything
+//! else is already a token count. Tool definitions and tool-call arguments
+//! are counted because the lane's dominant shape is agentic, where they are
+//! most of the prompt. Neither router consults a tokenizer for this decision.
+//!
+//! `safety_factor` (`VLLM_BACKEND_LONG_CONTEXT_SAFETY_FACTOR`, default `1.2`)
+//! stays at cloud-api's own value deliberately: an over-estimate here only
+//! means a request prefills on the long tier instead of the base one, and
+//! both run the same engine with the same 1M context, so guessing high is
+//! cheap and guessing low sends a genuinely oversized prefill in front of
+//! short requests on the base fleet.
+//!
+//! `count_output_reserve` (`VLLM_BACKEND_LONG_CONTEXT_COUNT_OUTPUT_RESERVE`,
+//! default `false`) matches cloud-api's prompt-only routing. Set it to `1`
+//! to restore #281's capped-reserve behaviour without rebuilding. The reserve
+//! is an allowance, not actual output; counting it was placing requests with
+//! a small prompt but a large `max_tokens` on the long tier.
 //!
 //! Two small differences from cloud-api remain by construction: the gateway
 //! serializes the incoming `tool_calls`/`tools` values where cloud-api
 //! serializes its own typed structs, and it measures after
 //! `tool_calls::normalize_tool_call_arguments` has repaired the history, so
-//! byte counts can differ slightly at the boundary — far less than the
-//! tokenize refinement the gateway skips anyway.
+//! byte counts can differ slightly at the boundary.
 
 use serde_json::Value;
 use tracing::debug;
 
 use crate::backend_pool::BackendPool;
 
-/// cloud-api's `CONTEXT_ROUTE_SAFETY_FACTOR` (default 1.2): bytes/4
-/// underestimates code- and CJK-heavy prompts by roughly a quarter.
-const SAFETY_FACTOR: f64 = 1.2;
 /// cloud-api's `CONTEXT_ROUTE_MEDIA_PART_TOKENS` (default 1024), the flat cost
 /// of a non-text content part: byte-counting base64 media would read a single
 /// image as a ~250k-token prompt.
 const MEDIA_PART_TOKENS: u64 = 1024;
 /// Chat-template overhead cloud-api adds per message.
 const MESSAGE_TOKENS: u64 = 4;
-/// cloud-api's `CONTEXT_ROUTE_OUTPUT_RESERVE_CAP` (default 32768): the most of
-/// a request's `max_tokens` that counts toward its tier. `max_tokens` is the
+/// The cap introduced by #281: the most of a request's `max_tokens` that
+/// counts toward its tier when reserve counting is enabled. `max_tokens` is the
 /// output a caller allows, not what it will produce -- aggregator clients send
 /// the advertised maximum (up to 1,048,576) on one-line requests, and counting
 /// it in full would route all of them to the long-context hosts, where a full
 /// tier is a refusal. Real outputs are small (GLM-5.3 Flash: 99.98% under 20k
 /// tokens), and both tiers run the same engine with the same context length.
 const OUTPUT_RESERVE_CAP: u64 = 32_768;
+/// Default byte-estimate multiplier, shared by the gateway policy and config.
+pub const DEFAULT_SAFETY_FACTOR: f64 = 1.2;
 
 /// Which half of the pool a backend belongs to, and which one a request wants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,8 +107,8 @@ pub struct Estimate {
     text: u64,
     exact: u64,
     reserve: u64,
-    /// The caller asked for more output than `OUTPUT_RESERVE_CAP`, so only
-    /// the cap counted. Counted per tier, so the trade-off stays visible.
+    /// The caller asked for more output than `OUTPUT_RESERVE_CAP`. Only
+    /// reserve-counting decisions count this per tier.
     reserve_capped: bool,
 }
 
@@ -114,16 +119,56 @@ impl Estimate {
         self.text + self.exact
     }
 
-    /// Strictly above `above_tokens` — with the safety factor on the
-    /// byte-estimated part only — means the long-context tier.
-    fn tier(self, above_tokens: u64) -> ContextTier {
-        let required = (self.text as f64 * SAFETY_FACTOR).ceil() as u64 + self.exact + self.reserve;
+    /// Strictly above `above_tokens` — with `policy.safety_factor` applied to
+    /// the byte-estimated part, and `reserve` counted only when
+    /// `policy.count_output_reserve` — means the long-context tier.
+    fn tier(self, above_tokens: u64, policy: EstimatePolicy) -> ContextTier {
+        let reserve = if policy.count_output_reserve {
+            self.reserve
+        } else {
+            0
+        };
+        let required = ((self.text as f64 * policy.safety_factor).ceil() as u64)
+            .saturating_add(self.exact)
+            .saturating_add(reserve);
         if required > above_tokens {
             ContextTier::Long
         } else {
             ContextTier::Base
         }
     }
+}
+
+/// The two knobs `Estimate::tier` applies on top of the raw `Estimate`. See
+/// the module docs for the formula and defaults.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EstimatePolicy {
+    /// Multiplies `text` before it is added to the demand
+    /// (`VLLM_BACKEND_LONG_CONTEXT_SAFETY_FACTOR`).
+    pub safety_factor: f64,
+    /// Whether `reserve` (the caller's `max_completion_tokens` /
+    /// `max_tokens`) counts toward the demand at all
+    /// (`VLLM_BACKEND_LONG_CONTEXT_COUNT_OUTPUT_RESERVE`).
+    pub count_output_reserve: bool,
+}
+
+impl Default for EstimatePolicy {
+    /// The prompt-only default, matching cloud-api. See the module docs.
+    fn default() -> Self {
+        EstimatePolicy {
+            safety_factor: DEFAULT_SAFETY_FACTOR,
+            count_output_reserve: false,
+        }
+    }
+}
+
+impl EstimatePolicy {
+    /// The #281 capped-reserve policy, restored by setting
+    /// `VLLM_BACKEND_LONG_CONTEXT_COUNT_OUTPUT_RESERVE=1`.
+    pub const LEGACY_COUNT_RESERVE: EstimatePolicy = EstimatePolicy {
+        safety_factor: DEFAULT_SAFETY_FACTOR,
+        count_output_reserve: true,
+    };
 }
 
 /// `/v1/chat/completions`, as cloud-api counts it: the text of every message,
@@ -204,7 +249,7 @@ fn is_token_id(value: &Value) -> bool {
 
 /// The output window the caller reserved (`max_completion_tokens` wins over
 /// `max_tokens`), uncapped; the estimate counts at most `OUTPUT_RESERVE_CAP`
-/// of it, as cloud-api does, before comparing against a tier's capacity.
+/// of it when reserve counting is enabled, before comparing tiers.
 fn output_reserve(request: &Value) -> u64 {
     let requested = ["max_completion_tokens", "max_tokens"]
         .iter()
@@ -230,18 +275,20 @@ pub struct TierDecision {
 }
 
 /// Decide a request's tier. `None` when the feature is off; nothing is
-/// estimated then. `strict` is `Config::backend_tier_strict`.
+/// estimated then. `strict` is `Config::backend_tier_strict`; `policy` is
+/// `Config::context_tier_policy()`.
 pub fn decide(
     pool: &BackendPool,
     above_tokens: u64,
     strict: bool,
+    policy: EstimatePolicy,
     estimate: impl FnOnce() -> Estimate,
 ) -> Option<TierDecision> {
     if above_tokens == 0 {
         return None;
     }
     let estimate = estimate();
-    let estimated = estimate.tier(above_tokens);
+    let estimated = estimate.tier(above_tokens, policy);
     let restrict = restriction(pool, estimated, strict);
     // `restrict` alone cannot tell empty from full any more once strict mode
     // pins it either way, so the metric is computed straight off the pool.
@@ -252,7 +299,7 @@ pub fn decide(
         (true, false) => "fallback",
     };
     metrics::histogram!("request_estimated_prompt_tokens").record(estimate.tokens() as f64);
-    if estimate.reserve_capped {
+    if policy.count_output_reserve && estimate.reserve_capped {
         // A request whose output window only partly counted: if one of these
         // really generates hundreds of thousands of tokens, it does so on the
         // tier this estimate picked (normally base). Watch this beside the
@@ -386,8 +433,14 @@ mod tests {
         // A flat array of token ids is exact, and carries no safety factor.
         let estimate = completion_estimate(&json!({"prompt": [1, 2, 3, 4, 5]}));
         assert_eq!(estimate.tokens(), 5);
-        assert_eq!(estimate.tier(5), ContextTier::Base);
-        assert_eq!(estimate.tier(4), ContextTier::Long);
+        assert_eq!(
+            estimate.tier(5, EstimatePolicy::default()),
+            ContextTier::Base
+        );
+        assert_eq!(
+            estimate.tier(4, EstimatePolicy::default()),
+            ContextTier::Long
+        );
 
         // One array of ids per prompt sums their lengths; anything that is not
         // an integer is not a token.
@@ -402,55 +455,169 @@ mod tests {
 
     #[test]
     fn the_safety_factor_applies_to_estimated_text_and_the_bound_is_strict() {
-        // 400 bytes → 100 tokens → 120 with the factor, plus 4 for the message.
+        assert_eq!(DEFAULT_SAFETY_FACTOR, 1.2);
+        // Under the reserve-counting policy: 400 bytes → 100 tokens → 120 with the factor,
+        // plus 4 for the message.
         let estimate = chat_estimate(&chat(json!([{"role": "user", "content": "x".repeat(400)}])));
         assert_eq!(estimate.tokens(), 100 + MESSAGE_TOKENS);
-        assert_eq!(estimate.tier(124), ContextTier::Base, "strictly greater");
-        assert_eq!(estimate.tier(123), ContextTier::Long);
+        assert_eq!(
+            estimate.tier(124, EstimatePolicy::LEGACY_COUNT_RESERVE),
+            ContextTier::Base,
+            "strictly greater"
+        );
+        assert_eq!(
+            estimate.tier(123, EstimatePolicy::LEGACY_COUNT_RESERVE),
+            ContextTier::Long
+        );
         // Without the factor the demand would be 104 and this would be Base.
-        assert_eq!(estimate.tier(110), ContextTier::Long);
+        assert_eq!(
+            estimate.tier(110, EstimatePolicy::LEGACY_COUNT_RESERVE),
+            ContextTier::Long
+        );
     }
 
     #[test]
-    fn the_reserved_output_window_counts_toward_the_decision_only() {
+    fn the_reserved_output_window_counts_toward_the_decision_only_under_the_legacy_policy() {
         let body = |field: &str, value: Value| json!({"messages": [{"role": "user", "content": "12345678"}], field.to_string(): value});
         // Text 2 → 3 with the factor, plus 4 for the message: 4000 more of
-        // reserved output decides the tier without being prompt.
+        // reserved output decides the tier without being prompt — but only
+        // under the legacy policy, which counts it; the default does not
+        // (see `default_policy_does_not_count_the_reserved_output_window`).
         let estimate = chat_estimate(&body("max_tokens", json!(4_000)));
         assert_eq!(estimate.tokens(), 2 + MESSAGE_TOKENS);
-        assert_eq!(estimate.tier(4_007), ContextTier::Base);
-        assert_eq!(estimate.tier(4_006), ContextTier::Long);
+        assert_eq!(
+            estimate.tier(4_007, EstimatePolicy::LEGACY_COUNT_RESERVE),
+            ContextTier::Base
+        );
+        assert_eq!(
+            estimate.tier(4_006, EstimatePolicy::LEGACY_COUNT_RESERVE),
+            ContextTier::Long
+        );
         // `max_completion_tokens` wins over `max_tokens`, and a negative or
         // null value reserves nothing.
         let mut both = body("max_tokens", json!(4_000));
         both["max_completion_tokens"] = json!(8);
-        assert_eq!(chat_estimate(&both).tier(15), ContextTier::Base);
         assert_eq!(
-            chat_estimate(&body("max_tokens", json!(-5))).tier(7),
+            chat_estimate(&both).tier(15, EstimatePolicy::LEGACY_COUNT_RESERVE),
             ContextTier::Base
         );
         assert_eq!(
-            completion_estimate(&json!({"prompt": [1, 2, 3], "max_tokens": 10})).tier(13),
+            chat_estimate(&body("max_tokens", json!(-5)))
+                .tier(7, EstimatePolicy::LEGACY_COUNT_RESERVE),
+            ContextTier::Base
+        );
+        assert_eq!(
+            completion_estimate(&json!({"prompt": [1, 2, 3], "max_tokens": 10}))
+                .tier(13, EstimatePolicy::LEGACY_COUNT_RESERVE),
             ContextTier::Base
         );
     }
 
     #[test]
+    fn default_policy_does_not_count_the_reserved_output_window() {
+        // ~500 tokens of prompt text (2000 bytes) with a huge reserve: the
+        // default policy (no output reserve counted) stays on the base tier;
+        // the #281 reserve-counting policy counts the reserve and the same request
+        // crosses onto the long one.
+        let body = json!({
+            "messages": [{"role": "user", "content": "x".repeat(2_000)}],
+            "max_tokens": 131_072,
+        });
+        let estimate = chat_estimate(&body);
+        assert_eq!(estimate.tokens(), 500 + MESSAGE_TOKENS);
+        assert_eq!(
+            estimate.tier(10_000, EstimatePolicy::default()),
+            ContextTier::Base
+        );
+        assert_eq!(
+            estimate.tier(10_000, EstimatePolicy::LEGACY_COUNT_RESERVE),
+            ContextTier::Long
+        );
+    }
+
+    #[test]
+    fn default_policy_still_applies_the_safety_factor_to_the_byte_estimate() {
+        // The default keeps cloud-api's 1.2 factor: bytes/4 = 90,000 inflates
+        // to 108,000, above the 100k threshold, while 83,000 inflates to
+        // 99,600, just under it. Only the output reserve stopped counting by
+        // default — not the safety factor.
+        let estimate = |tokens: u64| {
+            chat_estimate(&chat(json!([{
+                "role": "user",
+                "content": "x".repeat((tokens * 4) as usize)
+            }])))
+        };
+        assert_eq!(
+            estimate(90_000).tier(100_000, EstimatePolicy::default()),
+            ContextTier::Long
+        );
+        assert_eq!(
+            estimate(83_000).tier(100_000, EstimatePolicy::default()),
+            ContextTier::Base
+        );
+    }
+
+    #[test]
+    fn default_policy_bound_stays_strict_above_the_threshold() {
+        // bytes/4 = 100,001: one token over the threshold before the safety
+        // factor is even applied is still the long tier under the default
+        // policy.
+        let estimate = chat_estimate(&chat(json!([{
+            "role": "user",
+            "content": "x".repeat(400_004)
+        }])));
+        assert_eq!(estimate.tokens(), 100_001 + MESSAGE_TOKENS);
+        assert_eq!(
+            estimate.tier(100_000, EstimatePolicy::default()),
+            ContextTier::Long
+        );
+    }
+
+    #[test]
+    fn media_and_message_overhead_count_under_either_policy() {
+        // Media parts and the chat-template's per-message overhead are
+        // `exact`, not `text`: neither the safety factor nor the
+        // output-reserve flag ever touches them, under either policy.
+        let estimate = chat_estimate(&chat(json!([{
+            "role": "user",
+            "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]
+        }])));
+        let threshold = MEDIA_PART_TOKENS + MESSAGE_TOKENS;
+        assert_eq!(estimate.tokens(), threshold);
+        for policy in [
+            EstimatePolicy::default(),
+            EstimatePolicy::LEGACY_COUNT_RESERVE,
+        ] {
+            assert_eq!(estimate.tier(threshold, policy), ContextTier::Base);
+            assert_eq!(estimate.tier(threshold - 1, policy), ContextTier::Long);
+        }
+    }
+
+    #[test]
     fn a_huge_output_window_does_not_make_a_short_request_long() {
-        // A one-line request that allows the advertised maximum output stays on
-        // the base tier: only OUTPUT_RESERVE_CAP of it counts.
+        // In reserve-counting mode a one-line request stays on the base tier
+        // at 100k because at most OUTPUT_RESERVE_CAP counts.
         let body = |value: i64| json!({"messages": [{"role": "user", "content": "12345678"}], "max_tokens": value});
         let input = 3 + MESSAGE_TOKENS; // ceil(2 × 1.2) + one message
         for max_tokens in [1_048_576, 943_718, 131_073] {
             let estimate = chat_estimate(&body(max_tokens));
             assert_eq!(
-                estimate.tier(100_000),
+                estimate.tier(100_000, EstimatePolicy::LEGACY_COUNT_RESERVE),
                 ContextTier::Base,
                 "max_tokens {max_tokens}"
             );
-            assert_eq!(estimate.tier(input + OUTPUT_RESERVE_CAP), ContextTier::Base);
             assert_eq!(
-                estimate.tier(input + OUTPUT_RESERVE_CAP - 1),
+                estimate.tier(
+                    input + OUTPUT_RESERVE_CAP,
+                    EstimatePolicy::LEGACY_COUNT_RESERVE
+                ),
+                ContextTier::Base
+            );
+            assert_eq!(
+                estimate.tier(
+                    input + OUTPUT_RESERVE_CAP - 1,
+                    EstimatePolicy::LEGACY_COUNT_RESERVE
+                ),
                 ContextTier::Long
             );
         }
@@ -461,21 +628,86 @@ mod tests {
         ] {
             let estimate = chat_estimate(&body(max_tokens));
             assert_eq!(estimate.reserve_capped, capped, "max_tokens {max_tokens}");
-            assert_eq!(estimate.tier(input + OUTPUT_RESERVE_CAP), ContextTier::Base);
             assert_eq!(
-                estimate.tier(input + OUTPUT_RESERVE_CAP - 1),
+                estimate.tier(
+                    input + OUTPUT_RESERVE_CAP,
+                    EstimatePolicy::LEGACY_COUNT_RESERVE
+                ),
+                ContextTier::Base
+            );
+            assert_eq!(
+                estimate.tier(
+                    input + OUTPUT_RESERVE_CAP - 1,
+                    EstimatePolicy::LEGACY_COUNT_RESERVE
+                ),
                 ContextTier::Long
             );
         }
         // Below the cap the reserve still counts in full.
         assert_eq!(
-            chat_estimate(&body(8_000)).tier(input + 8_000 - 1),
+            chat_estimate(&body(8_000))
+                .tier(input + 8_000 - 1, EstimatePolicy::LEGACY_COUNT_RESERVE),
             ContextTier::Long
         );
         assert_eq!(
             completion_estimate(&json!({"prompt": [1, 2, 3], "max_tokens": 1_048_576}))
-                .tier(100_000),
+                .tier(100_000, EstimatePolicy::LEGACY_COUNT_RESERVE),
             ContextTier::Base
+        );
+    }
+
+    #[test]
+    fn tier_saturates_when_scaled_prompt_and_exact_tokens_overflow() {
+        let estimate = Estimate {
+            text: u64::MAX,
+            exact: 1,
+            reserve: 1,
+            ..Estimate::default()
+        };
+        assert_eq!(
+            estimate.tier(u64::MAX - 1, EstimatePolicy::LEGACY_COUNT_RESERVE),
+            ContextTier::Long
+        );
+    }
+
+    #[test]
+    fn capped_reserve_metric_only_counts_when_reserve_affects_tier() {
+        let pool = BackendPool::with_long_context(
+            vec!["http://base:8000".to_string()],
+            vec!["http://long:8000".to_string()],
+        );
+        let estimate = || {
+            chat_estimate(&json!({
+                "messages": [{"role": "user", "content": "short"}],
+                "max_tokens": 1_048_576
+            }))
+        };
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            decide(&pool, 10_000, false, EstimatePolicy::default(), estimate);
+        });
+        assert!(!handle
+            .render()
+            .contains("backend_tier_output_reserve_capped_total"));
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            decide(
+                &pool,
+                10_000,
+                false,
+                EstimatePolicy::LEGACY_COUNT_RESERVE,
+                estimate,
+            );
+        });
+        assert!(
+            handle
+                .render()
+                .contains("backend_tier_output_reserve_capped_total{tier=\"long\"} 1"),
+            "{}",
+            handle.render()
         );
     }
 
@@ -491,9 +723,11 @@ mod tests {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
-            decide(&pool, 100_000, false, || Estimate {
-                text: 1_000_000,
-                ..Estimate::default()
+            decide(&pool, 100_000, false, EstimatePolicy::default(), || {
+                Estimate {
+                    text: 1_000_000,
+                    ..Estimate::default()
+                }
             })
         });
         let rendered = handle.render();
@@ -529,25 +763,33 @@ mod tests {
             })
         };
         assert_eq!(
-            decide(&pool, 0, false, || panic!("not estimated when off")),
+            decide(&pool, 0, false, EstimatePolicy::default(), || panic!(
+                "not estimated when off"
+            )),
             None
         );
         assert_eq!(
-            decide(&pool, 100_000, false, huge),
+            decide(&pool, 100_000, false, EstimatePolicy::default(), huge),
             decided(ContextTier::Long, Some(ContextTier::Long))
         );
         // The long tier is down: place it on the base fleet rather than
         // refuse, but the request stays a long one for the breaker.
         health(1, false);
         assert_eq!(
-            decide(&pool, 100_000, false, huge),
+            decide(&pool, 100_000, false, EstimatePolicy::default(), huge),
             decided(ContextTier::Long, None)
         );
         // And the other way around.
         health(1, true);
         health(0, false);
         assert_eq!(
-            decide(&pool, 100_000, false, Estimate::default),
+            decide(
+                &pool,
+                100_000,
+                false,
+                EstimatePolicy::default(),
+                Estimate::default
+            ),
             decided(ContextTier::Base, None)
         );
     }
@@ -570,8 +812,9 @@ mod tests {
         // refuses it instead of spilling onto the base fleet.
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
-        let decision =
-            metrics::with_local_recorder(&recorder, || decide(&pool, 100_000, true, huge));
+        let decision = metrics::with_local_recorder(&recorder, || {
+            decide(&pool, 100_000, true, EstimatePolicy::default(), huge)
+        });
         assert_eq!(
             decision,
             Some(TierDecision {
@@ -589,7 +832,7 @@ mod tests {
             .healthy
             .store(true, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
-            decide(&pool, 100_000, true, huge),
+            decide(&pool, 100_000, true, EstimatePolicy::default(), huge),
             Some(TierDecision {
                 estimated: ContextTier::Long,
                 restrict: Some(ContextTier::Long),

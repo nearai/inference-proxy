@@ -49,6 +49,11 @@ struct GatewayOptions {
     backend_long_context_urls: Vec<String>,
     backend_long_context_probe_urls: Vec<String>,
     long_context_above_tokens: u64,
+    /// `VLLM_BACKEND_LONG_CONTEXT_SAFETY_FACTOR`; `None` uses
+    /// `context_tier::DEFAULT_SAFETY_FACTOR`.
+    long_context_safety_factor: Option<f64>,
+    /// `VLLM_BACKEND_LONG_CONTEXT_COUNT_OUTPUT_RESERVE`, default `false`.
+    long_context_count_output_reserve: bool,
     /// `VLLM_BACKEND_TIER_STRICT`: refuse a request whose tier has no
     /// healthy backend instead of falling back to the other one.
     backend_tier_strict: bool,
@@ -177,6 +182,10 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         backend_long_context_urls: options.backend_long_context_urls.clone(),
         backend_long_context_probe_urls: options.backend_long_context_probe_urls.clone(),
         long_context_above_tokens: options.long_context_above_tokens,
+        long_context_safety_factor: options
+            .long_context_safety_factor
+            .unwrap_or(context_tier::DEFAULT_SAFETY_FACTOR),
+        long_context_count_output_reserve: options.long_context_count_output_reserve,
         backend_tier_strict: options.backend_tier_strict,
         dstack_socket_path: "/nonexistent/dstack.sock".to_string(),
         gpu_evidence_delegate_url: None,
@@ -2028,6 +2037,33 @@ async fn oversized_requests_go_to_the_long_tier_and_the_rest_to_the_base_fleet()
 }
 
 #[tokio::test]
+async fn the_safety_factor_knob_moves_a_prompt_near_the_threshold() {
+    let base = MockServer::start().await;
+    let long = MockServer::start().await;
+    mount_chat(&base, 1).await;
+    mount_chat(&long, 1).await;
+
+    // 36,000 bytes estimate to 9,000 text tokens, plus 4 for the message.
+    // A 1.0 factor stays below 10,000; the default 1.2 factor crosses it.
+    for factor in [Some(1.0), None] {
+        let app = build_gateway(
+            &base.uri(),
+            GatewayOptions {
+                backend_urls: vec![base.uri()],
+                backend_long_context_urls: vec![long.uri()],
+                long_context_above_tokens: 10_000,
+                long_context_safety_factor: factor,
+                ..Default::default()
+            },
+        );
+        let response = app.oneshot(chat_request(sized_body(36_000))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    base.verify().await;
+    long.verify().await;
+}
+
+#[tokio::test]
 async fn a_conversation_that_grows_past_the_threshold_moves_and_stays_there() {
     let base = MockServer::start().await;
     let long = MockServer::start().await;
@@ -2385,10 +2421,9 @@ async fn a_token_id_prompt_is_routed_by_its_exact_length() {
     long.verify().await;
 }
 
-/// A short request that allows a huge output (aggregator clients send the
-/// advertised maximum) stays on the base fleet: only `OUTPUT_RESERVE_CAP`
-/// (32,768) of its `max_tokens` counts toward the tier, at the production
-/// threshold. A genuinely oversized prompt still goes to the long tier.
+/// A huge output allowance leaves a short prompt on the base fleet by
+/// default. The opt-in reserve-counting policy sends it long; a genuinely
+/// oversized prompt also goes long without the opt-in.
 #[tokio::test]
 async fn a_huge_output_window_on_a_short_request_stays_on_the_base_fleet() {
     let base = MockServer::start().await;
@@ -2399,7 +2434,7 @@ async fn a_huge_output_window_on_a_short_request_stays_on_the_base_fleet() {
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
     });
     mount_chat(&base, 2).await;
-    mount_chat(&long, 1).await;
+    mount_chat(&long, 2).await;
     for (mock, expected) in [(&base, 1), (&long, 0)] {
         Mock::given(method("POST"))
             .and(path("/v1/completions"))
@@ -2413,7 +2448,7 @@ async fn a_huge_output_window_on_a_short_request_stays_on_the_base_fleet() {
         GatewayOptions {
             backend_urls: vec![base.uri()],
             backend_long_context_urls: vec![long.uri()],
-            long_context_above_tokens: 100_000,
+            long_context_above_tokens: 10_000,
             ..Default::default()
         },
     );
@@ -2424,6 +2459,20 @@ async fn a_huge_output_window_on_a_short_request_stays_on_the_base_fleet() {
         let response = app.clone().oneshot(chat_request(body)).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK, "{field}");
     }
+    let legacy_app = build_gateway(
+        &base.uri(),
+        GatewayOptions {
+            backend_urls: vec![base.uri()],
+            backend_long_context_urls: vec![long.uri()],
+            long_context_above_tokens: 10_000,
+            long_context_count_output_reserve: true,
+            ..Default::default()
+        },
+    );
+    let mut legacy_body = sized_body(400);
+    legacy_body["max_tokens"] = 1_048_576.into();
+    let response = legacy_app.oneshot(chat_request(legacy_body)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
     // Completions with token ids and the same output window.
     let body =
         serde_json::json!({"model": "test-model", "prompt": [1, 2, 3], "max_tokens": 1_048_576});

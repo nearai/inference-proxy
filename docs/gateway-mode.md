@@ -112,6 +112,8 @@ to the current in-CVM behavior.
 | `VLLM_BACKEND_LONG_CONTEXT_URLS` | the `-long-b<handle>` URLs | The hosts of the long-context tier, listed as their handle URLs under the model's `-long` model-proxy domain (see below). Appended to the pool after `VLLM_BACKEND_URLS`, so the base backends keep their indexes. Empty = one flat pool, as today. |
 | `VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS` | `http://<host-ip>:8000,…` | One engine-load probe per long-context backend, same order. Required when `VLLM_BACKEND_PROBE_URLS` is set, and empty when it is not; internally the two lists are concatenated in pool order. |
 | `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` | `100000` | Estimated input tokens above which a request is placed on that tier. `0`/unset switches the whole feature off, and nothing is even estimated. |
+| `VLLM_BACKEND_LONG_CONTEXT_SAFETY_FACTOR` | `1.2` (default) | Multiplies the byte-estimated text portion of the estimate below. Kept at cloud-api's own value by default: an over-estimate here only costs a prefill on the long tier instead of the base one. Must be positive, finite and no greater than 10.0. |
+| `VLLM_BACKEND_LONG_CONTEXT_COUNT_OUTPUT_RESERVE` | `0` (default) | Whether the capped `max_tokens` / `max_completion_tokens` reserve counts toward the tier decision. Off by default, matching cloud-api's prompt-only routing. `1` restores #281's capped-reserve behaviour without rebuilding (the rollback). |
 | `VLLM_BACKEND_TIER_STRICT` | `1` | Isolate the tiers in both directions: a request whose tier has no healthy backend is refused (429 + `Retry-After`, or a 503 with `error_type: "tier_unavailable"` when admission is off) instead of placed on the other tier. Off by default (see below). Only meaningful with `VLLM_BACKEND_LONG_CONTEXT_URLS` and a nonzero `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS`; without either it is ignored (a startup warning says so). |
 | `NON_TEE_DEPLOYMENT` | `1` | No dstack socket outside a CVM: `/healthz` reports `"dstack":"skipped"`, no attestation refresh, and `/v1/attestation/report`, `/v1/signature/{id}`, `/internal/gpu_evidence` answer 404 so nothing unverifiable is advertised. |
 | `DEV` / `GPU_NO_HW_MODE` | `1` / `1` | Non-TEE: random signing keys, no hardware evidence. |
@@ -286,7 +288,7 @@ back-pressure for the next admission decision
 `backend_tier_requests_total{tier,outcome=routed|fallback|fallback_late|refused|refused_late}`
 (the `refused*` outcomes only occur with `VLLM_BACKEND_TIER_STRICT`),
 `request_estimated_prompt_tokens`,
-`backend_tier_output_reserve_capped_total{tier}` (requests whose `max_tokens` counted only up to the reserve cap),
+`backend_tier_output_reserve_capped_total{tier}` (reserve-counting requests whose output window exceeded the cap),
 plus the existing usage-report and upstream metrics.
 
 ## Long-context tier
@@ -303,36 +305,36 @@ body is not touched either: `model` stays the canonical id on both domains.
 
 cloud-api routes to the tier from the model row's `long_context`
 providerConfig; the gateway bypasses cloud-api, so it makes the same decision
-itself and mirrors the estimate cloud-api routes with
-(`inference_provider_pool::context_routing::estimate_input` plus the `required`
-computation next to it):
+itself and mirrors cloud-api's prompt-only estimate by default:
 
 ```text
 countable = (message text + serialized tool_calls + serialized tools) / 4
 uncounted = media parts × 1024 + messages × 4
-required  = ceil(countable × 1.2) + uncounted + min(max_tokens, 32768)
+required  = ceil(countable × safety_factor) + uncounted
+            + (if count_output_reserve { min(output reserve, OUTPUT_RESERVE_CAP) } else { 0 })
 ```
 
 `required` strictly above `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` means the
-long tier. The 1.2 safety factor covers the byte estimate only — media parts,
-template overhead, the reserved output window and `/v1/completions` token ids
-are already token counts. Tool definitions and tool-call arguments are counted
-because the lane's traffic is agentic, where they are most of the prompt.
-The `max_tokens` reserve is capped at 32,768 (cloud-api's
-`CONTEXT_ROUTE_OUTPUT_RESERVE_CAP`): it is the output a caller allows, not what it
-will produce, and aggregator clients often send the advertised maximum on
-one-line requests — counted in full, every such request would land on the
-long-context hosts.
-The trade-off is accepted deliberately: a capped request that really does generate
-hundreds of thousands of tokens runs on the tier its prompt picked (normally base),
-holding one engine slot and its growing KV there — both tiers run the same engine
-with the same context length, so it completes. `backend_tier_output_reserve_capped_total`
-counts these requests; read it beside `backend_engine_running`/`backend_engine_queued`.
-cloud-api additionally refines the decision near the boundary with an exact
-`POST /v1/tokenize`; the gateway deliberately does not — a tokenizer dependency
-and an extra upstream round trip are not worth it for a placement that is a
-preference rather than a correctness rule. Both tiers run the same engine with
-the same context length, so a request on the "wrong" tier still succeeds.
+long tier. `safety_factor` (`VLLM_BACKEND_LONG_CONTEXT_SAFETY_FACTOR`, default
+`1.2`) covers the byte estimate only — media parts, template overhead, the
+reserved output window and `/v1/completions` token ids are already token
+counts. Tool definitions and tool-call arguments are counted because the
+lane's traffic is agentic, where they are most of the prompt. Neither router
+consults a tokenizer for this decision.
+
+The output reserve is ignored by default, as in cloud-api. Setting
+`VLLM_BACKEND_LONG_CONTEXT_COUNT_OUTPUT_RESERVE=1` restores #281's behaviour
+without rebuilding: at most `OUTPUT_RESERVE_CAP` (32,768) of the caller's
+`max_completion_tokens` / `max_tokens` is added. The reserve is an allowance,
+not actual output; aggregator clients may send the advertised maximum on a
+short prompt. Capping it avoids routing every such request to the long tier.
+In this legacy mode, a request that does generate hundreds of thousands of
+tokens can stay on the tier chosen by its prompt and capped reserve, holding
+one engine slot and growing KV there. Both tiers run the same engine and
+context length, so it can complete. The
+`backend_tier_output_reserve_capped_total{tier}` counter increments only when
+reserve counting is enabled and the request exceeds the cap; read it beside
+`backend_engine_running` / `backend_engine_queued`.
 
 Everything downstream of the decision is restricted to the request's tier:
 placement, the connection fail-over, and the fleet-wide "every backend is
@@ -345,8 +347,7 @@ queueing" refusal. The consequences are deliberate:
 - **Untiered traffic stays on the base fleet.** `/tokenize`, media, `/v1/models`
   and the health probe carry no size of their own; they would all land on the
   idle long host under least-connections, so they are restricted to the base
-  backends (cloud-api keeps its tokenize traffic off that host for the same
-  reason). The pool health checker still probes every backend.
+  backends. The pool health checker still probes every backend.
 - **Full is a refusal, not a spill.** A long-tier host at its share or steered
   around (engine queue, recent engine rejection) means `429` + `Retry-After`
   for the next oversized request — keeping those prefills off the base fleet is

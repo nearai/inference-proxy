@@ -101,6 +101,7 @@ pub async fn completions(
         &state.backend_pool,
         state.config.long_context_above_tokens,
         state.config.backend_tier_strict,
+        state.config.context_tier_policy(),
         || crate::context_tier::completion_estimate(&request_json),
     );
     // Placement hint from cloud-api, same trust predicate as chat completions

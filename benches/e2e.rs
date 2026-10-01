@@ -124,7 +124,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         backend_long_context_urls: Vec::new(),
         backend_long_context_probe_urls: Vec::new(),
         long_context_above_tokens: 0,
-        long_context_safety_factor: 1.2,
+        long_context_safety_factor: context_tier::DEFAULT_SAFETY_FACTOR,
         long_context_count_output_reserve: false,
         backend_tier_strict: false,
         backend_probe_interval_secs: 2,

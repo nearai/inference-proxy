@@ -2037,6 +2037,33 @@ async fn oversized_requests_go_to_the_long_tier_and_the_rest_to_the_base_fleet()
 }
 
 #[tokio::test]
+async fn the_safety_factor_knob_moves_a_prompt_near_the_threshold() {
+    let base = MockServer::start().await;
+    let long = MockServer::start().await;
+    mount_chat(&base, 1).await;
+    mount_chat(&long, 1).await;
+
+    // 36,000 bytes estimate to 9,000 text tokens, plus 4 for the message.
+    // A 1.0 factor stays below 10,000; the default 1.2 factor crosses it.
+    for factor in [Some(1.0), None] {
+        let app = build_gateway(
+            &base.uri(),
+            GatewayOptions {
+                backend_urls: vec![base.uri()],
+                backend_long_context_urls: vec![long.uri()],
+                long_context_above_tokens: 10_000,
+                long_context_safety_factor: factor,
+                ..Default::default()
+            },
+        );
+        let response = app.oneshot(chat_request(sized_body(36_000))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    base.verify().await;
+    long.verify().await;
+}
+
+#[tokio::test]
 async fn a_conversation_that_grows_past_the_threshold_moves_and_stays_there() {
     let base = MockServer::start().await;
     let long = MockServer::start().await;

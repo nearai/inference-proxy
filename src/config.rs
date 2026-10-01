@@ -1405,7 +1405,10 @@ mod tests {
             assert!(config.backend_long_context_urls.is_empty());
             assert!(config.pool_probe_urls().is_empty());
             assert_eq!(config.long_context_above_tokens, 0);
-            assert_eq!(config.long_context_safety_factor, 1.2);
+            assert_eq!(
+                config.long_context_safety_factor,
+                crate::context_tier::DEFAULT_SAFETY_FACTOR
+            );
             assert!(!config.long_context_count_output_reserve);
             assert!(!config.backend_tier_strict);
             assert_eq!(config.backend_urls, vec!["http://localhost:8000"]);
@@ -1705,7 +1708,10 @@ mod tests {
             gateway_env_cleanup();
             // Unset: today's defaults (1.2, reserve not counted).
             let config = Config::from_env().unwrap();
-            assert_eq!(config.long_context_safety_factor, 1.2);
+            assert_eq!(
+                config.long_context_safety_factor,
+                crate::context_tier::DEFAULT_SAFETY_FACTOR
+            );
             assert!(!config.long_context_count_output_reserve);
 
             for (raw, expected) in [("1", 1.0), (" 1.5 ", 1.5), ("0.0001", 0.0001), ("10", 10.0)] {

@@ -455,6 +455,7 @@ mod tests {
 
     #[test]
     fn the_safety_factor_applies_to_estimated_text_and_the_bound_is_strict() {
+        assert_eq!(DEFAULT_SAFETY_FACTOR, 1.2);
         // Under the reserve-counting policy: 400 bytes → 100 tokens → 120 with the factor,
         // plus 4 for the message.
         let estimate = chat_estimate(&chat(json!([{"role": "user", "content": "x".repeat(400)}])));

@@ -114,7 +114,7 @@ to the current in-CVM behavior.
 | `VLLM_BACKEND_PROBE_URLS` / `_INTERVAL_SECS` | `http://<host-ip>:8000,…` / `2` | The engines' live running/queued counts, read from each host's plain metrics port (the same route model-proxy samples; reachable from the model-proxy hosts, no token). One reading covers the replica the host would route to, so a queue in it means no replica is free. Drives placement and the fleet-wide queue refusal below. |
 | `VLLM_BACKEND_LONG_CONTEXT_URLS` | the `-long-b<handle>` URLs | The hosts of the long-context tier, listed as their handle URLs under the model's `-long` model-proxy domain (see below). Appended to the pool after `VLLM_BACKEND_URLS`, so the base backends keep their indexes. Empty = one flat pool, as today. |
 | `VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS` | `http://<host-ip>:8000,…` | One engine-load probe per long-context backend, same order. Required when `VLLM_BACKEND_PROBE_URLS` is set, and empty when it is not; internally the two lists are concatenated in pool order. |
-| `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` | `100000` | Estimated input tokens above which a request is placed on that tier. `0`/unset switches the whole feature off, and nothing is even estimated. |
+| `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` | `64000` | Estimated input tokens above which a request is placed on that tier. `0`/unset switches the whole feature off, and nothing is even estimated. |
 | `VLLM_BACKEND_TIER_STRICT` | `1` | Isolate the tiers in both directions: a request whose tier has no healthy backend is refused (429 + `Retry-After`, or a 503 with `error_type: "tier_unavailable"` when admission is off) instead of placed on the other tier. Off by default (see below). Only meaningful with `VLLM_BACKEND_LONG_CONTEXT_URLS` and a nonzero `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS`; without either it is ignored (a startup warning says so). |
 | `NON_TEE_DEPLOYMENT` | `1` | No dstack socket outside a CVM: `/healthz` reports `"dstack":"skipped"`, no attestation refresh, and `/v1/attestation/report`, `/v1/signature/{id}`, `/internal/gpu_evidence` answer 404 so nothing unverifiable is advertised. |
 | `DEV` / `GPU_NO_HW_MODE` | `1` / `1` | Non-TEE: random signing keys, no hardware evidence. |
@@ -460,7 +460,7 @@ queueing" refusal. The consequences are deliberate:
 - **Conversation affinity crosses tiers.** A conversation pinned on a base host
   that grows past the threshold is placed fresh in the long tier and re-pinned
   there — the same re-prefill cloud-api pays at the boundary.
-- **The TTFT breaker ignores long-context requests.** A 100k-token prefill
+- **The TTFT breaker ignores long-context requests.** A 64k-token prefill
   takes tens of seconds by nature — on either tier — so a request estimated
   above the threshold contributes no time-to-first-generation sample, and that
   is fixed at admission: a request that falls back onto the base fleet does not

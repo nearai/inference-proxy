@@ -359,6 +359,9 @@ impl BackendPool {
                 return None;
             };
             let backend = &self.backends[index];
+            // Rust 1.99 renamed this to `try_update`, which is unavailable
+            // on the reproducible image build's pinned Rust 1.93 toolchain.
+            #[allow(deprecated)]
             let taken =
                 backend
                     .lane_conns

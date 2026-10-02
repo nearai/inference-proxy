@@ -12,13 +12,14 @@ use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageTyp
 use crate::routes::chat::{read_body_with_limit, resolve_request_hash_for_signing};
 use crate::routes::completion_placement::place_completion;
 use crate::routes::ROUTE_COMPLETIONS;
-use crate::{AppState, TracingIds};
+use crate::{AppState, RequestStart, TracingIds};
 
 /// POST /v1/completions
 pub async fn completions(
     State(state): State<AppState>,
     auth: RequireAuth,
     Extension(tracing_ids): Extension<TracingIds>,
+    request_start: Option<Extension<RequestStart>>,
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
@@ -97,11 +98,16 @@ pub async fn completions(
 
     // Long-context tier and lane admission (gateway mode), see the chat
     // route. Token ids in `prompt` are counted exactly; text is estimated.
+    // The estimate is walked at most once and also sizes the first-token
+    // deadline, which only streaming requests get.
+    let estimate = (state.config.long_context_above_tokens > 0
+        || (is_stream && state.config.first_token_deadline_ms > 0))
+        .then(|| crate::context_tier::completion_estimate(&request_json));
     let tier = crate::context_tier::decide(
         &state.backend_pool,
         state.config.long_context_above_tokens,
         state.config.backend_tier_strict,
-        || crate::context_tier::completion_estimate(&request_json),
+        || estimate.unwrap_or_else(|| crate::context_tier::completion_estimate(&request_json)),
     );
     // Placement hint from cloud-api, same trust predicate as chat completions
     // and `X-NearAI-Priority`: honoured only for a caller authenticated with
@@ -134,6 +140,13 @@ pub async fn completions(
         upstream_data_parallel_rank: None,
         admission: placed.admission,
         connect_failover: placed.connect_failover,
+        // See the chat route: the clock started when the request arrived.
+        first_token_deadline: proxy::first_token_deadline(
+            &state,
+            RequestStart::or_now(request_start),
+            estimate,
+            is_stream,
+        ),
     };
 
     if is_stream {

@@ -206,6 +206,14 @@ async fn main() -> anyhow::Result<()> {
             "Long-context tier enabled"
         );
     }
+    if config.first_token_deadline_ms > 0 {
+        info!(
+            deadline_ms = config.first_token_deadline_ms,
+            per_1k_tokens_ms = config.first_token_deadline_per_1k_tokens_ms,
+            max_ms = config.first_token_deadline_max_ms,
+            "Streaming requests are refused when the first token misses their deadline"
+        );
+    }
 
     // Replica state publishing (opt-in): one signed host frame per tick to Redis.
     if let Some(rs) = config.replica_state() {

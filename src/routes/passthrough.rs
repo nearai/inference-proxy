@@ -266,6 +266,7 @@ pub async fn images_edits(
         upstream_data_parallel_rank: None,
         admission: None,
         connect_failover: None,
+        first_token_deadline: None,
     };
 
     proxy::proxy_multipart_request(target.client, &target.url, form, &request_sha256, opts).await
@@ -355,6 +356,7 @@ pub async fn audio_transcriptions(
         upstream_data_parallel_rank: None,
         admission: None,
         connect_failover: None,
+        first_token_deadline: None,
     };
 
     proxy::proxy_multipart_request(target.client, &target.url, form, &request_sha256, opts).await
@@ -420,6 +422,7 @@ async fn json_passthrough_encrypted(
         upstream_data_parallel_rank: None,
         admission: None,
         connect_failover: None,
+        first_token_deadline: None,
     };
 
     proxy::proxy_json_request(target.client, &target.url, forward_body, opts).await

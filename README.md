@@ -102,7 +102,7 @@ All configuration is via environment variables:
 | `VLLM_BASE_URL` | No | `http://localhost:8000` | Backend base URL |
 | `VLLM_DATA_PARALLEL_SIZE` | No | unset | Number of independent vLLM DP engines in one backend. When set, assigns new chat conversations round-robin and keeps append-only turns on the same rank via `X-data-parallel-rank`, improving local prefix-cache reuse without trusting a client-supplied rank. Requires exactly one backend URL. |
 | `VLLM_BACKEND_CONVERSATION_AFFINITY` | No | `false` | With several `VLLM_BACKEND_URLS`, keep append-only chat conversations on the backend that served their first turn (same salted conversation digest as the DP affinity above) so multi-turn prompts reuse that engine's prefix cache instead of being re-prefilled after every least-connections switch. New conversations still go to the least-loaded healthy backend; an unhealthy pinned backend is skipped. Applies to the exact and alias `/v1/chat/completions` routes; other routes keep least-connections. Mutually exclusive with `VLLM_DATA_PARALLEL_SIZE`. |
-| `VLLM_BACKEND_AFFINITY_MAX_IMBALANCE` | No | `8` | Load-balance guard for the affinity above: when the pinned backend has more than this many extra in-flight requests over the least-loaded healthy backend, the turn goes to the least-loaded backend and the conversation is re-pinned there. |
+| `VLLM_BACKEND_AFFINITY_MAX_IMBALANCE` | No | `8` | Load-balance guard for the affinity above: when the pinned backend has more than this many extra in-flight requests over the least-loaded healthy backend, the turn goes to the least-loaded backend and the conversation is re-pinned there. It also bounds a trusted `x-nearai-replica` hint (see below) when there is no engine view. |
 | `DEV` | No | `false` | Dev mode (random signing keys instead of KMS) |
 | `GPU_NO_HW_MODE` | No | `false` | Use canned GPU evidence |
 | `CHAT_CACHE_EXPIRATION` | No | `1200` | Signature cache TTL in seconds |
@@ -135,6 +135,7 @@ All configuration is via environment variables:
 | `VLLM_PROXY_REJECTED_CONTENT_PART_TYPES` | No | empty | Chat content part `type`s refused with 400 before dispatch, e.g. `video_url,input_audio,file` |
 | `VLLM_PROXY_MODELS_DOCUMENT_URL` | No | empty | Gateway mode: serve `GET /v1/models` from this URL (cloud-api's `/v1/models`: pricing, modalities, `is_ready`, `openrouter.slug`) reduced to `MODEL_NAME` and completed with `capacity`; when the source cannot be read the engine's own list is passed through (counted in `models_document_source_failures_total`) |
 | `VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE` | No | `0` (not declared) | Requests per minute declared in the models document's `capacity`; the concurrency entry is `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` |
+| `VLLM_PROXY_DISCOUNT_TO_USER` | No | empty (list price) | Gateway mode: the lane's discount off the list price, a fraction in `[0, 1)` with at most four decimal places (`0.2` = 20 % off; empty or `0` = none; an invalid value fails startup). Requires `VLLM_PROXY_MODELS_DOCUMENT_URL`. Published as `discount_to_user` on the models document entry (and on every entry of the engine list served while that source is unreadable) and sent as `discount_to_user` on every usage report, so the advertised and the billed price come from one setting |
 | `VLLM_PROXY_REASONING_OFF_EFFORT` | No | `none` | Gateway mode: the `reasoning_effort` sent for "as little reasoning as possible" when an aggregator asks for `reasoning.enabled: false`, an effort of `none`/`minimal`, or sends those as `reasoning_effort`. Other efforts in the `reasoning` object are copied. GLM-5.3 Flash needs `low` (its template only knows `low`/`high`; switched off outright it writes its reasoning as content) |
 | `VLLM_PROXY_SSE_KEEPALIVE_SECS` | No | `0` (off) | Emit `: keep-alive` SSE comments to the client whenever the upstream stream is silent this long. Not hashed into signatures — keep off where clients verify raw stream bytes |
 | `VLLM_PROXY_ADMISSION_TIER_BORROWING` | No | off | Let base hosts share the global admission budget using configured tier counts; requires admission, both tiers, and a positive long-host ceiling |
@@ -143,18 +144,26 @@ All configuration is via environment variables:
 | `VLLM_PROXY_ADMISSION_START_INFLIGHT` | No | = max | Budget at start-up; it ramps by `VLLM_PROXY_ADMISSION_RAMP_STEP` (default `8`) every `VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS` (default `1800`) up to the maximum, but only after an interval without an overload signal |
 | `VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS` | No | `30000` (`0` = off) | Refuse new lane work while, over the last minute, at least 20 lane requests reached the engine and 5 % of them (at least two) waited longer than this for their first generation event. A request that ends before generating counts with the time it waited |
 | `VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS` | No | `10` | A backend that rejected at engine admission (queue full / priority abort) within this many seconds is steered around while other hosts have room; when every healthy backend did, new lane work is refused |
+| `VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT` | No | `1` | Engine-reported queue depth (from `VLLM_BACKEND_PROBE_URLS`) at or above which a backend counts as saturated for placement and the fleet-wide queue refusal |
 | `VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS` | No | `2` | `Retry-After` value on admission refusals |
 | `VLLM_BACKEND_CONNECT_FAILOVER` | No | `false` | Retry a chat/completions request once on another healthy backend when the connection to the chosen one fails before anything was sent; the unreachable backend leaves the rotation until the health checker sees it again and a pinned conversation follows the request. HTTP errors, queue-full included, are never retried |
-| `VLLM_BACKEND_PROBE_URLS` | No | empty | Gateway mode: one plain-HTTP base URL per backend (same order as `VLLM_BACKEND_URLS`) whose `/v1/metrics` is polled for the engine's running and queued requests. New conversations go to the least-loaded engine, a queueing host is steered around, and when every host queues new lane work gets 429. Empty = the gateway's own counts only |
+| `VLLM_BACKEND_PROBE_URLS` | No | empty | Gateway mode: one plain-HTTP base URL per backend (same order as `VLLM_BACKEND_URLS`) whose `/v1/metrics` is polled for the engine's running and queued requests. New conversations go to the least-loaded engine, a host whose queue is at or above `VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT` (default 1) is steered around, and when every host queues new lane work gets 429. Empty = the gateway's own counts only |
 | `VLLM_BACKEND_PROBE_INTERVAL_SECS` | No | `2` | Poll interval for the probes; a sample older than three intervals counts as unknown |
 | `VLLM_BACKEND_LONG_CONTEXT_URLS` | No | empty | Gateway mode: backends of the long-context tier — the same hosts' handle URLs under the model's `-long` model-proxy domain — appended to the pool after `VLLM_BACKEND_URLS` so their indexes do not move. Requests estimated above `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` are placed there, everything else on the base backends. Mutually exclusive with `VLLM_DATA_PARALLEL_SIZE` |
 | `VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS` | No | empty | One engine-load probe base URL per long-context backend, same order. Required when `VLLM_BACKEND_PROBE_URLS` is set, empty when it is not |
-| `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` | No | `0` (off) | Estimated input tokens above which a request goes to the long-context tier, using cloud-api's own routing estimate (text, tool calls and tool definitions at bytes/4 with its 1.2 safety factor, plus a flat cost per media part, per-message template overhead and the reserved output window; `prompt` token ids counted exactly). A tier with no healthy backend falls back to the other one; a full one refuses with 429. Not combinable with `FUSION_ENABLED` or `WEB_CONTEXT_SEARCH_URL` |
+| `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` | No | `0` (off) | Estimated input tokens above which a request goes to the long-context tier, using cloud-api's own routing estimate (text, tool calls and tool definitions at bytes/4 with its 1.2 safety factor, plus a flat cost per media part, per-message template overhead and the reserved output window; `prompt` token ids counted exactly). By default a tier with no healthy backend falls back to the other one (`VLLM_BACKEND_TIER_STRICT` turns that off); a full one refuses with 429. Not combinable with `FUSION_ENABLED` or `WEB_CONTEXT_SEARCH_URL` |
+| `VLLM_BACKEND_TIER_STRICT` | No | `false` | Isolate the context tiers in both directions instead of falling back: a request whose tier has no healthy backend is refused rather than placed on the other one — 429 with `Retry-After` when admission is enabled (`admission_rejections_total{reason="tier_unavailable"}`), 503 (`error_type: "tier_unavailable"`) when it is not. Only meaningful with `VLLM_BACKEND_LONG_CONTEXT_URLS` set; without one it is ignored (a startup warning is logged) |
 | `VLLM_IMAGES_URL` | No | `{base}/v1/images/generations` | Override images endpoint |
 | `VLLM_IMAGES_EDITS_URL` | No | `{base}/v1/images/edits` | Override image edits endpoint |
 | `VLLM_TRANSCRIPTIONS_URL` | No | `{base}/v1/audio/transcriptions` | Override transcriptions endpoint |
 | `VLLM_RERANK_URL` | No | `{base}/v1/rerank` | Override rerank endpoint |
 | `VLLM_SCORE_URL` | No | `{base}/v1/score` | Override score endpoint |
+| `REPLICA_STATE_REDIS_URL` | No | unset (feature off) | Redis URL for opt-in signed host-frame state publishing |
+| `REPLICA_STATE_HOST_ID` | Yes, if the URL is set | — | Host identifier used in Redis keys and every published frame |
+| `REPLICA_STATE_REDIS_CA_CERT` | No | unset | PEM CA the Redis TLS certificate chains to (`rediss://` only); used for Redis instead of the system trust store. Literal `\n` accepted |
+| `REPLICA_STATE_INTERVAL_MS` | No | `500` | Publish interval in ms; must be within `200..=2000` (otherwise the feature is disabled with an error) |
+
+`x-nearai-replica: <index>` (the backend's position in `VLLM_BACKEND_URLS`, then the long-context URLs) is honoured only from callers using the proxy's `TOKEN` (same as `X-NearAI-Priority`), under the guard above. It is ignored for API-key callers. Metrics: `placement_hint_honored_total`, `placement_hint_overridden_total{reason}`.
 
 ### Fusion
 
@@ -242,9 +251,161 @@ The server listens on `0.0.0.0:8000` by default (configurable via `LISTEN_PORT`)
 
 ## Building
 
+The Docker image (`./build-image.sh`) is a slim Ubuntu 22.04 runtime with no vLLM or CUDA; its apt and pip inputs are pinned in `pinned-packages-builder.txt`, `pinned-packages-runtime.txt` and `attestation-constraints.txt` (see the Dockerfile header). To build only the binary:
+
 ```bash
 cargo build --release
 ```
+
+The Docker image is built with `./build-image.sh` (or `make build`, which also
+loads it into the local Docker daemon as `vllm-proxy-rs:latest`); see
+[Reproducible build & verification](#reproducible-build--verification).
+
+## Reproducible build & verification
+
+The published image, `nearaidev/vllm-proxy-rs`, is reproducible: rebuilding a
+commit gives the same image digest, bit for bit. External verifiers rely on this
+to check that a deployed proxy runs the source it claims to run.
+
+### What external verifiers do
+
+Every deployment pins the proxy image by digest, so each served model runs one
+image built from one commit of this repository. For each model, a verifier
+records that source commit and then:
+
+1. Checks the image's build provenance. `build.yml` publishes a GitHub artifact
+   attestation and a keyless cosign signature for every image it pushes, and
+   both name the source commit.
+2. Rebuilds the commit from a fresh clone. The only inputs it sets are two
+   environment variables, and each image rebuild gets 60 minutes:
+
+   ```bash
+   git clone https://github.com/nearai/inference-proxy && cd inference-proxy
+   git checkout <commit>
+   ENABLE_NV_ATTESTATION_SDK=1 SOURCE_DATE_EPOCH=0 bash build-image.sh
+   tar -xOf oci.tar index.json | jq -r '.manifests[0].digest'   # must equal the deployed digest
+   ```
+
+To find the commit behind a published digest:
+
+```bash
+gh api /repos/nearai/inference-proxy/attestations/sha256:<hex> \
+  --jq '.attestations[0].bundle.dsseEnvelope.payload' | base64 -d \
+  | jq -r '.predicate.buildDefinition.resolvedDependencies[0].digest.gitCommit'
+```
+
+### The contract
+
+- The command above, run on a fresh clone of a published commit, must produce
+  the published digest: today, and when the commit is rebuilt months later.
+- **Never add a required build environment variable or argument without
+  coordinating with external verifiers first.** Their build environment is
+  fixed. A new Dockerfile build arg must default to the value CI builds with.
+- `build-image.sh` writes `./oci.tar`, which holds exactly one image manifest,
+  and prints its digest. Its default path needs `docker` with buildx, `git`,
+  `jq` and `tar`. It must not depend on `skopeo`, which only `--push` uses
+  (some verifier environments replace it with a stub). `LOAD_IMAGE=1` also
+  loads the image into the local Docker daemon; the digest is the same.
+- Check out with umask 022, the default for CI runners and root. A file the
+  Dockerfile copies without `--chmod` keeps its checkout mode in the image, so
+  a clone made with umask 0002 (the default for many interactive Ubuntu
+  accounts) can give a different digest.
+
+### Expected rebuild time
+
+Two things set the rebuild time: the builder stage (Ubuntu packages, Rust
+toolchain, cargo build) and the size of the runtime base image, which is
+downloaded, unpacked and exported in full. With the vLLM-based runtime image
+(September 2026), a rebuild with no cached layers took 4 to 5 minutes on a
+24-thread x86_64 machine with a 10 Gbit/s link, and about 7 minutes on our CI
+hosts. Downloading and unpacking the 12.5 GB base took about 1.5 minutes, in
+parallel with the builder stage, and writing the 12.5 GB archive 1.3 to 2
+minutes. Slow package mirrors add minutes, and shared, busy hosts have needed
+close to 30 minutes. The verifier-parity job below reports the time of every
+rebuild in its run summary and warns above 30 minutes.
+
+### How CI checks it
+
+`reproducible-build.yml` runs on every merge to `main` that touches a build
+input, weekly on `main` (Mondays 03:00 UTC, to catch drift in the archives and
+registries the build reads), and on manual dispatch:
+
+- two builds in parallel, normally on two different hosts, and two in a row on
+  one host, whose archives must be identical byte for byte;
+- a verifier-parity rebuild: a fresh `git clone` of the commit under umask 022,
+  `env -i PATH=… HOME=… ENABLE_NV_ATTESTATION_SDK=1 SOURCE_DATE_EPOCH=0 bash build-image.sh`
+  with a 60-minute limit, digest read from `index.json`;
+- every digest must match the others and the digest `build.yml` published for
+  the same commit (read from its one successful `Reproducible Docker Image`
+  job, and for `main` also from the `staging-<date>-<sha>` tag on Docker Hub).
+  Auxiliary `Security audit` checks are excluded because they have no
+  downloadable logs;
+- a pins guard: one build runs with `LOAD_IMAGE=1`, and every committed
+  `pinned-packages-*.txt` must equal the package list that build installed.
+
+Failures on `main` post an alert to Slack. To check a branch before merging,
+dispatch `build.yml` on it first (so there is a published digest to compare
+with), then `reproducible-build.yml`:
+
+```bash
+gh workflow run build.yml --ref <branch> -R nearai/inference-proxy
+gh workflow run reproducible-build.yml --ref <branch> -R nearai/inference-proxy
+```
+
+### Hermetic inputs and how to bump them
+
+Everything the build downloads is pinned; the Dockerfile header describes each
+pin. Every bump changes the image digest, which is expected: bump in a pull
+request and dispatch `reproducible-build.yml` on its branch.
+
+| Input | Pinned in | How to bump |
+|---|---|---|
+| Base images | `FROM …@sha256:` lines in `Dockerfile` | Replace the digest (`docker buildx imagetools inspect <image>:<tag>`), then regenerate the pin files. |
+| Ubuntu packages | `UBUNTU_SNAPSHOT` in `Dockerfile`, plus the pin files | Pick a snapshot timestamp in the past (`YYYYMMDDTHHMMSSZ`; the service also answers for future timestamps, whose content is not frozen yet), check that `https://snapshot.ubuntu.com/ubuntu/<timestamp>/dists/<suite>/InRelease` exists for every suite the Dockerfile uses, then regenerate the pin files. |
+| Pin files | `pinned-packages-*.txt`, one per stage that installs Ubuntu packages | Empty them (`: > pinned-packages-builder.txt`), run `LOAD_IMAGE=1 ENABLE_NV_ATTESTATION_SDK=1 ./build-image.sh`, copy each `pinned-packages-*.resolved.txt` over its committed file, rebuild, and check that `diff -u` between each pair is empty (the CI pins guard runs the same diff). Always use `ENABLE_NV_ATTESTATION_SDK=1`: its package set includes the other one. |
+| libnvat | `LIBNVAT_VERSION` in `Dockerfile` | Pick a version listed in NVIDIA's `ubuntu2204` repository index, then regenerate the pin files. |
+| rustup | `RUSTUP_VERSION`, `RUSTUP_INIT_SHA256` in `Dockerfile` | Take the version from `https://static.rust-lang.org/rustup/release-stable.toml`, download `rustup-init` for it, hash it yourself and compare with the published `rustup-init.sha256`. |
+| Rust toolchain | `--default-toolchain` in `Dockerfile` | Change the version. Published toolchain releases never change. |
+| NVIDIA apt keyring | `CUDA_KEYRING_SHA256` in `Dockerfile` | `sha256sum` of the new `cuda-keyring` .deb. |
+| Python packages | `NV_ATTESTATION_SDK_VERSION`, `NV_PPCIE_VERIFIER_VERSION` in `Dockerfile`, `attestation-constraints.txt` | Regenerate the constraints with the recipe in the file header. |
+| Rust crates | `Cargo.lock` (with checksums) | `cargo update`. |
+| BuildKit | `BUILDKIT_IMAGE` in `build-image.sh` (tag and digest) | BuildKit versions serialize layers differently, so a new version also changes the digest. |
+
+### What the Ubuntu snapshot pin guarantees
+
+- The snapshot service keeps each dated archive immutable:
+  `https://snapshot.ubuntu.com/ubuntu/<timestamp>` serves the Ubuntu archive
+  as it was at that time, and apt checks every package it downloads against
+  that snapshot's indexes, which are signed with Ubuntu's archive key.
+  Installing from the same timestamp gives the same versions and the same files.
+- The committed exact versions are the second check. apt holds every package at
+  the version listed in `pinned-packages-*.txt` (pin priority 1001): it installs
+  that version or fails, never another one, and the CI pins guard compares what
+  was installed with the committed list.
+
+All APT stages use up to five command attempts, with 30-, 60-, 120- and
+240-second waits between attempts and 30-second HTTP/HTTPS timeouts, on top of
+APT's own per-file retries, so a snapshot.ubuntu.com outage of a few minutes
+does not fail the build. Exhausted retries, incomplete package indexes, missing
+packages and checksum mismatches still fail the build.
+
+What it does not guarantee:
+
+- Availability. If the snapshot service stops serving a timestamp, commits that
+  use it can no longer be rebuilt. The build fails; it does not silently
+  produce a different image. The same holds for the base images on Docker Hub,
+  crates.io, the Rust release server, NVIDIA's repository and PyPI.
+- Byte identity beyond the archive signatures. The pin files record versions,
+  not package hashes: we trust the snapshot service to keep serving the same
+  signed indexes for a timestamp, and the rebuilt digest is the final check.
+- Inputs outside the snapshot. NVIDIA's apt repository has no snapshot service
+  (libnvat is pinned to an exact version; if NVIDIA dropped it, older commits
+  would stop building). Python packages are pinned by version, not by hash, and
+  a project can add files to an existing version. The throwaway `ca-bootstrap`
+  stage installs `ca-certificates` from the live Ubuntu archive, but only its CA
+  bundle is used, to reach the snapshot over TLS, and nothing from that stage
+  reaches the image. Any stage that still installs from the live archive is
+  called out in the Dockerfile header.
 
 ## Testing
 

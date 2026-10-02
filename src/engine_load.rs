@@ -4,17 +4,19 @@
 //! the hosts also serve. Each backend's engine metrics (`/v1/metrics`, the
 //! same route model-proxy samples) are polled on a short interval for the
 //! running and queued request counts, which then drive placement (least
-//! loaded host for a new conversation, a queueing host is steered around)
-//! and admission (every host queueing = refuse). A sample older than three
-//! intervals counts as unknown, so a probe outage degrades to the gateway's
-//! own view instead of blocking the lane.
+//! loaded host for a new conversation, a host with a queue of at least N is
+//! steered around) and admission (every host with a queue of at least N =
+//! refuse). N is `AdmissionConfig::queue_saturated_at`
+//! (`VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT`, default 1). A sample older
+//! than three intervals counts as unknown, so a probe outage degrades to the
+//! gateway's own view instead of blocking the lane.
 //!
 //! One reading covers one engine replica: the probe goes to the host's proxy,
 //! which forwards it to whichever of its replicas is least busy — the same
 //! choice it makes for the inference request that follows, so the reading
-//! describes where the work would land. A queue in that reading therefore
-//! means the host has no free replica, while a zero means at least one
-//! replica is free.
+//! describes where the work would land. A queue of at least N in that
+//! reading therefore means the host has no free replica by that bar, while
+//! fewer means it is treated as having room.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

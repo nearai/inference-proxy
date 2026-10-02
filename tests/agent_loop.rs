@@ -39,6 +39,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
 ) -> axum::Router {
     let base = upstream_mock_url.trim_end_matches('/');
     let config = config::Config {
+        replica_state: None,
         model_name: "test-model".to_string(),
         tokens: vec!["test-token".to_string()],
         vllm_base_url: upstream_mock_url.to_string(),
@@ -116,6 +117,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
         rejected_content_part_types: Vec::new(),
         models_document_url: None,
         capacity_requests_per_minute: 0,
+        discount_to_user: None,
         reasoning_off_effort: "none".to_string(),
         allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,
@@ -127,12 +129,14 @@ fn build_agent_loop_app_with_cloud_and_idle(
         admission_ramp_interval_secs: 1800,
         admission_ttft_p95_max_ms: 30_000,
         admission_backpressure_secs: 10,
+        admission_queue_saturated_at: 1,
         admission_retry_after_secs: 2,
         backend_connect_failover: false,
         backend_probe_urls: Vec::new(),
         backend_long_context_urls: Vec::new(),
         backend_long_context_probe_urls: Vec::new(),
         long_context_above_tokens: 0,
+        backend_tier_strict: false,
         backend_probe_interval_secs: 2,
         dstack_socket_path: "/var/run/dstack.sock".to_string(),
         gpu_evidence_delegate_url: None,

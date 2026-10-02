@@ -49,6 +49,7 @@ async fn operational_public_routes_echo_uuid_request_id_headers() {
         TestAppOptions {
             cloud_api_url: None,
             dstack_socket_path: Some("/missing/dstack.sock".to_string()),
+            ..Default::default()
         },
     );
     let probes = [

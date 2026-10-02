@@ -54,6 +54,45 @@ fn env_bool_optional(name: &str) -> Option<bool> {
     env::var(name).ok().map(|v| parse_bool(&v))
 }
 
+/// Whether `VLLM_BACKEND_TIER_STRICT` has an actual long-context tier to
+/// isolate: hosts configured *and* the threshold armed. Config validation
+/// keeps these two in lock step (`VLLM_BACKEND_LONG_CONTEXT_URLS` and
+/// `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` each require the other, checked
+/// just above where this is called), but `context_tier::decide`'s own
+/// off-switch is `above_tokens == 0` — checked directly here too, rather than
+/// leaning on that separate invariant, so strict mode's warning stays
+/// correct even if the two ever come apart.
+fn tier_strict_has_something_to_isolate(long_context_urls: &[String], above_tokens: u64) -> bool {
+    !long_context_urls.is_empty() && above_tokens != 0
+}
+
+/// `VLLM_PROXY_DISCOUNT_TO_USER`: the lane's discount off the list price, as
+/// a fraction. Empty or zero means none. Anything else must be a finite
+/// number in `[0, 1)` with at most four decimal places (cloud-api bills in
+/// basis points), or startup fails: this value changes what customers are
+/// shown and charged, so a typo must not be guessed at.
+fn parse_discount_to_user(raw: &str) -> anyhow::Result<Option<f64>> {
+    const NAME: &str = "VLLM_PROXY_DISCOUNT_TO_USER";
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let discount: f64 = raw
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{NAME} must be a number in [0, 1), got {raw:?}"))?;
+    if !discount.is_finite() || !(0.0..1.0).contains(&discount) {
+        anyhow::bail!("{NAME} must be a number in [0, 1), got {raw:?}");
+    }
+    // Exact, no tolerance: a value with at most four decimal places parses to
+    // the f64 nearest to `basis_points / 10_000`, so the round trip gives it
+    // back (0.1 passes although it has no exact binary form); 0.12345 does not.
+    let basis_points = (discount * 10_000.0).round();
+    if basis_points / 10_000.0 != discount {
+        anyhow::bail!("{NAME} must have at most four decimal places, got {raw:?}");
+    }
+    Ok((basis_points > 0.0).then_some(discount))
+}
+
 fn is_gemma4_model_name(model_name: &str) -> bool {
     let name = model_name.to_ascii_lowercase();
     ["gemma-4", "gemma4"].iter().any(|needle| {
@@ -339,6 +378,15 @@ pub struct Config {
     /// (`VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE`, 0 = not declared). The
     /// concurrency entry comes from `VLLM_PROXY_ADMISSION_MAX_INFLIGHT`.
     pub capacity_requests_per_minute: u64,
+    /// Gateway mode: the lane's discount off the list price, a fraction in
+    /// `[0, 1)` with at most four decimal places
+    /// (`VLLM_PROXY_DISCOUNT_TO_USER`; unset, empty or `0` = `None`, list
+    /// price). One setting drives both surfaces so the advertised and the
+    /// billed price cannot drift: it is published as `discount_to_user` on the
+    /// models document entry and sent as `discount_to_user` on every usage
+    /// report, where cloud-api applies it after catalog pricing. Requires
+    /// `VLLM_PROXY_MODELS_DOCUMENT_URL`.
+    pub discount_to_user: Option<f64>,
     /// Gateway mode: the `reasoning_effort` that stands for "as little
     /// reasoning as possible" on the served model
     /// (`VLLM_PROXY_REASONING_OFF_EFFORT`, default `none`). Applied to an
@@ -381,6 +429,11 @@ pub struct Config {
     /// How long an engine admission rejection counts against its backend
     /// (`VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS`, default 10).
     pub admission_backpressure_secs: u64,
+    /// Engine-reported queue depth at or above which a backend counts as
+    /// saturated for placement and admission
+    /// (`VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT`, default 1: a queue of at
+    /// least one request).
+    pub admission_queue_saturated_at: u32,
     /// `Retry-After` on refusals (`VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS`,
     /// default 2).
     pub admission_retry_after_secs: u64,
@@ -393,6 +446,9 @@ pub struct Config {
     /// `VLLM_BACKEND_URLS`) whose `/v1/metrics` is polled for the engine's
     /// running and queued request counts (`VLLM_BACKEND_PROBE_URLS`). Empty =
     /// no engine view; placement and admission use the gateway's own counts.
+    /// Replica state publishing (`REPLICA_STATE_*`), `None` when off or
+    /// invalid (an invalid value is logged and disables only this feature).
+    pub replica_state: Option<crate::replica_state::config::ReplicaStateConfig>,
     pub backend_probe_urls: Vec<String>,
     /// Poll interval for the probes (`VLLM_BACKEND_PROBE_INTERVAL_SECS`,
     /// default 2).
@@ -410,6 +466,12 @@ pub struct Config {
     /// long-context tier (`VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS`, 0 = off,
     /// the default). See `context_tier.rs` for the estimate.
     pub long_context_above_tokens: u64,
+    /// Isolate the context tiers in both directions: a request whose tier
+    /// has no healthy backend is refused instead of placed on the other tier
+    /// (`VLLM_BACKEND_TIER_STRICT`, bool, default `false`). Only meaningful
+    /// with `backend_long_context_urls` set; without one it is ignored (a
+    /// startup warning says so). See `context_tier.rs`.
+    pub backend_tier_strict: bool,
 
     // Endpoint URL overrides (Some = explicitly set, bypasses backend pool)
     pub images_url_override: Option<String>,
@@ -619,6 +681,21 @@ impl Config {
             .filter(|s| !s.is_empty());
         let capacity_requests_per_minute: u64 =
             env_parse("VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE", 0)?;
+        let discount_to_user = match env::var("VLLM_PROXY_DISCOUNT_TO_USER") {
+            Ok(raw) => parse_discount_to_user(&raw)?,
+            Err(env::VarError::NotPresent) => None,
+            Err(env::VarError::NotUnicode(_)) => {
+                anyhow::bail!("VLLM_PROXY_DISCOUNT_TO_USER must be valid UTF-8")
+            }
+        };
+        // Every usage report is billed at the discount, so the listing has to
+        // publish it, and only the models document can: without it `/v1/models`
+        // would pass the engine's list through at list price.
+        if discount_to_user.is_some() && models_document_url.is_none() {
+            anyhow::bail!(
+                "VLLM_PROXY_DISCOUNT_TO_USER requires VLLM_PROXY_MODELS_DOCUMENT_URL: usage is billed at the discount, so the models document must publish it"
+            );
+        }
         let reasoning_off_effort = env_or("VLLM_PROXY_REASONING_OFF_EFFORT", "none")
             .trim()
             .to_string();
@@ -700,6 +777,8 @@ impl Config {
             env_parse("VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS", 30_000)?;
         let admission_backpressure_secs: u64 =
             env_parse("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS", 10)?;
+        let admission_queue_saturated_at: u32 =
+            env_parse("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT", 1)?;
         let admission_retry_after_secs: u64 =
             env_parse("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS", 2)?;
         if admission_max_inflight > 0 {
@@ -718,6 +797,9 @@ impl Config {
             }
             if admission_backpressure_secs == 0 {
                 anyhow::bail!("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS must be at least 1");
+            }
+            if admission_queue_saturated_at == 0 {
+                anyhow::bail!("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT must be at least 1");
             }
             if admission_retry_after_secs == 0 {
                 anyhow::bail!("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS must be at least 1");
@@ -790,6 +872,24 @@ impl Config {
                 "VLLM_BACKEND_LONG_CONTEXT_URLS and VLLM_DATA_PARALLEL_SIZE are mutually exclusive; data-parallel affinity serves one backend"
             );
         }
+        let backend_tier_strict = env_bool("VLLM_BACKEND_TIER_STRICT");
+        if backend_tier_strict
+            && !tier_strict_has_something_to_isolate(
+                &backend_long_context_urls,
+                long_context_above_tokens,
+            )
+        {
+            warn!(
+                "VLLM_BACKEND_TIER_STRICT is set but the long-context tier is not effectively \
+                 configured (VLLM_BACKEND_LONG_CONTEXT_URLS is empty or \
+                 VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS is 0); ignoring it, there is nothing to isolate"
+            );
+        }
+        let backend_tier_strict = backend_tier_strict
+            && tier_strict_has_something_to_isolate(
+                &backend_long_context_urls,
+                long_context_above_tokens,
+            );
 
         // First-token deadline: the slope and the cap only mean something
         // together with the base, and a cap below the base would exempt every
@@ -813,6 +913,19 @@ impl Config {
             );
         }
 
+        let replica_state =
+            match crate::replica_state::config::ReplicaStateConfig::from_lookup(|k| {
+                env::var(k).ok()
+            }) {
+                Ok(rs) => rs,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "Replica state publishing disabled: invalid REPLICA_STATE_* configuration"
+                    );
+                    None
+                }
+            };
         let config = Config {
             model_name,
             tokens,
@@ -901,6 +1014,7 @@ impl Config {
             rejected_content_part_types,
             models_document_url,
             capacity_requests_per_minute,
+            discount_to_user,
             reasoning_off_effort,
             allowed_org_ids,
             sse_keepalive_secs: env_int("VLLM_PROXY_SSE_KEEPALIVE_SECS", 0) as u64,
@@ -912,13 +1026,16 @@ impl Config {
             admission_ramp_interval_secs,
             admission_ttft_p95_max_ms,
             admission_backpressure_secs,
+            admission_queue_saturated_at,
             admission_retry_after_secs,
             backend_connect_failover,
+            replica_state,
             backend_probe_urls,
             backend_probe_interval_secs,
             backend_long_context_urls,
             backend_long_context_probe_urls,
             long_context_above_tokens,
+            backend_tier_strict,
             images_url_override,
             images_edits_url_override,
             transcriptions_url_override,
@@ -1065,6 +1182,12 @@ impl Config {
             .collect()
     }
 
+    /// Replica state publishing settings, `None` unless `REPLICA_STATE_REDIS_URL`
+    /// is set to a valid configuration.
+    pub fn replica_state(&self) -> Option<&crate::replica_state::config::ReplicaStateConfig> {
+        self.replica_state.as_ref()
+    }
+
     /// Lane admission settings, `None` unless `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` is set.
     pub fn admission(&self) -> Option<crate::admission::AdmissionConfig> {
         if self.admission_max_inflight == 0 {
@@ -1080,6 +1203,7 @@ impl Config {
             ttft_p95_max: (self.admission_ttft_p95_max_ms > 0)
                 .then(|| std::time::Duration::from_millis(self.admission_ttft_p95_max_ms)),
             backpressure_ttl: std::time::Duration::from_secs(self.admission_backpressure_secs),
+            queue_saturated_at: self.admission_queue_saturated_at,
             retry_after: std::time::Duration::from_secs(self.admission_retry_after_secs),
         })
     }
@@ -1223,6 +1347,8 @@ mod tests {
             "VLLM_PROXY_MAP_QUEUE_FULL_TO_429",
             "VLLM_PROXY_STREAM_ERROR_PEEK_MS",
             "VLLM_PROXY_REJECTED_CONTENT_PART_TYPES",
+            "VLLM_PROXY_MODELS_DOCUMENT_URL",
+            "VLLM_PROXY_DISCOUNT_TO_USER",
             "VLLM_PROXY_ALLOWED_ORG_IDS",
             "VLLM_PROXY_SSE_KEEPALIVE_SECS",
             "VLLM_PROXY_FIRST_TOKEN_DEADLINE_MS",
@@ -1236,6 +1362,7 @@ mod tests {
             "VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS",
             "VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS",
             "VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS",
+            "VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT",
             "VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS",
             "VLLM_BACKEND_CONNECT_FAILOVER",
             "VLLM_BACKEND_PROBE_URLS",
@@ -1243,10 +1370,32 @@ mod tests {
             "VLLM_BACKEND_LONG_CONTEXT_URLS",
             "VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS",
             "VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS",
+            "VLLM_BACKEND_TIER_STRICT",
             "LISTEN_ADDR",
         ] {
             env::remove_var(key);
         }
+    }
+
+    #[test]
+    fn replica_state_is_parsed_by_config_and_invalid_values_only_disable_it() {
+        let base = [
+            ("MODEL_NAME", "m"),
+            ("TOKEN", "t"),
+            ("VLLM_BACKEND_URLS", "http://a:8000"),
+            ("VLLM_BACKEND_LONG_CONTEXT_URLS", "http://b:8000"),
+            ("VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS", "32000"),
+            ("REPLICA_STATE_REDIS_URL", "redis://r:6379"),
+            ("REPLICA_STATE_HOST_ID", "gpu01"),
+        ];
+        with_env_vars(&base, || {
+            let config = Config::from_env().unwrap();
+            let rs = config.replica_state().expect("replica state configured");
+            assert_eq!(rs.host_id, "gpu01");
+        });
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            assert!(Config::from_env().unwrap().replica_state().is_none());
+        });
     }
 
     #[test]
@@ -1265,6 +1414,7 @@ mod tests {
             assert_eq!(config.first_token_deadline_ms, 0);
             assert!(config.first_token_deadline(1_000).is_none());
             assert!(config.rejected_content_part_types.is_empty());
+            assert!(config.discount_to_user.is_none());
             assert!(config.allowed_org_ids.is_empty());
             assert_eq!(config.sse_keepalive_secs, 0);
             assert_eq!(config.admission_max_inflight, 0);
@@ -1275,6 +1425,7 @@ mod tests {
             assert!(config.backend_long_context_urls.is_empty());
             assert!(config.pool_probe_urls().is_empty());
             assert_eq!(config.long_context_above_tokens, 0);
+            assert!(!config.backend_tier_strict);
             assert_eq!(config.backend_urls, vec!["http://localhost:8000"]);
         });
     }
@@ -1414,6 +1565,96 @@ mod tests {
     }
 
     #[test]
+    fn test_discount_to_user_parses_and_validates() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            gateway_env_cleanup();
+            env::set_var(
+                "VLLM_PROXY_MODELS_DOCUMENT_URL",
+                "https://cloud-api.test/v1/models",
+            );
+            let discount = |raw: &str| {
+                env::set_var("VLLM_PROXY_DISCOUNT_TO_USER", raw);
+                Config::from_env().map(|config| config.discount_to_user)
+            };
+            // Unset, empty and zero all mean list price: nothing to publish
+            // or report.
+            assert_eq!(Config::from_env().unwrap().discount_to_user, None);
+            for none in ["", "  ", "0", "0.0", "0.0000"] {
+                assert_eq!(discount(none).unwrap(), None, "{none:?}");
+            }
+            for (raw, expected) in [
+                ("0.2", 0.2),
+                (" 0.15 ", 0.15),
+                ("0.1500", 0.15),
+                ("0.0001", 0.0001),
+                ("0.1234", 0.1234),
+                ("0.9999", 0.9999),
+            ] {
+                assert_eq!(discount(raw).unwrap(), Some(expected), "{raw:?}");
+            }
+            // Anything else fails startup instead of changing what customers
+            // are shown and charged.
+            for bad in [
+                "1", "1.0", "1.5", "-0.1", "0.12345", "0.99999", "NaN", "inf", "abc", "20%",
+            ] {
+                let err = discount(bad).unwrap_err().to_string();
+                assert!(err.contains("VLLM_PROXY_DISCOUNT_TO_USER"), "{bad}: {err}");
+            }
+            let err = discount("0.12345").unwrap_err().to_string();
+            assert!(err.contains("at most four decimal places"), "{err}");
+            let err = discount("1").unwrap_err().to_string();
+            assert!(err.contains("[0, 1)"), "{err}");
+            gateway_env_cleanup();
+        });
+    }
+
+    #[test]
+    fn test_discount_to_user_requires_the_models_document() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            gateway_env_cleanup();
+            // A discount billed on every usage report but never published
+            // (the engine's list is served at list price) fails startup.
+            env::set_var("VLLM_PROXY_DISCOUNT_TO_USER", "0.2");
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(
+                err.contains("VLLM_PROXY_DISCOUNT_TO_USER requires VLLM_PROXY_MODELS_DOCUMENT_URL"),
+                "{err}"
+            );
+            env::set_var("VLLM_PROXY_MODELS_DOCUMENT_URL", "  ");
+            assert!(Config::from_env().is_err(), "a blank URL is no URL");
+            env::set_var(
+                "VLLM_PROXY_MODELS_DOCUMENT_URL",
+                "https://cloud-api.test/v1/models",
+            );
+            assert_eq!(Config::from_env().unwrap().discount_to_user, Some(0.2));
+            // No discount, nothing to publish: no document needed.
+            env::remove_var("VLLM_PROXY_MODELS_DOCUMENT_URL");
+            env::set_var("VLLM_PROXY_DISCOUNT_TO_USER", "0");
+            assert_eq!(Config::from_env().unwrap().discount_to_user, None);
+            gateway_env_cleanup();
+        });
+    }
+
+    #[test]
+    fn test_discount_to_user_round_trip_is_exact() {
+        // Every four-decimal value in range is accepted as the f64 the same
+        // literal gives, so the models document and the usage report carry
+        // exactly the number the operator wrote.
+        for basis_points in 1..10_000_u32 {
+            let raw = format!("0.{basis_points:04}");
+            let expected: f64 = raw.parse().unwrap();
+            assert_eq!(
+                parse_discount_to_user(&raw).unwrap(),
+                Some(expected),
+                "{raw}"
+            );
+            // One more decimal place that is not a trailing zero is refused.
+            let finer = format!("{raw}5");
+            assert!(parse_discount_to_user(&finer).is_err(), "{finer}");
+        }
+    }
+
+    #[test]
     fn test_backend_token_requires_cloud_api_billing() {
         with_env_vars(
             &[
@@ -1545,6 +1786,45 @@ mod tests {
             env::remove_var("FUSION_INTERNAL_BEARER_TOKEN");
             gateway_env_cleanup();
         });
+    }
+
+    #[test]
+    fn test_tier_strict_requires_a_long_tier_or_is_ignored() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            gateway_env_cleanup();
+            // Set without a long tier: not an error, just ignored (a startup
+            // warning is logged, not asserted here).
+            env::set_var("VLLM_BACKEND_TIER_STRICT", "1");
+            assert!(!Config::from_env().unwrap().backend_tier_strict);
+            // With a long tier configured, it takes effect.
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_URLS", "https://m-long-b1.test");
+            env::set_var("VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS", "100000");
+            assert!(Config::from_env().unwrap().backend_tier_strict);
+            // Unset (the default) leaves today's fallback behavior.
+            env::set_var("VLLM_BACKEND_TIER_STRICT", "0");
+            assert!(!Config::from_env().unwrap().backend_tier_strict);
+            env::remove_var("VLLM_BACKEND_TIER_STRICT");
+            assert!(!Config::from_env().unwrap().backend_tier_strict);
+            gateway_env_cleanup();
+        });
+    }
+
+    #[test]
+    fn test_tier_strict_is_inert_without_a_long_tier_or_a_zero_threshold() {
+        // `Config::from_env`'s own bail!()s keep "urls empty" and
+        // "above_tokens == 0" in lock step for any config that actually
+        // loads, so this exercises `tier_strict_has_something_to_isolate`
+        // directly: it must not rely on that invariant holding forever, since
+        // `context_tier::decide`'s real off-switch is `above_tokens == 0`.
+        assert!(!tier_strict_has_something_to_isolate(&[], 100_000));
+        assert!(!tier_strict_has_something_to_isolate(
+            &["https://m-long-b1.test".to_string()],
+            0
+        ));
+        assert!(tier_strict_has_something_to_isolate(
+            &["https://m-long-b1.test".to_string()],
+            100_000
+        ));
     }
 
     #[test]
@@ -2237,6 +2517,7 @@ mod tests {
                 ("VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS", "1800"),
                 ("VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS", "30000"),
                 ("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS", "10"),
+                ("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT", "4"),
                 ("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS", "2"),
                 ("VLLM_BACKEND_CONNECT_FAILOVER", "1"),
             ],
@@ -2253,18 +2534,22 @@ mod tests {
                         ramp_interval: std::time::Duration::from_secs(1800),
                         ttft_p95_max: Some(std::time::Duration::from_secs(30)),
                         backpressure_ttl: std::time::Duration::from_secs(10),
+                        queue_saturated_at: 4,
                         retry_after: std::time::Duration::from_secs(2),
                     })
                 );
                 assert!(config.backend_connect_failover);
 
-                // No TTFT check when the bound is 0; no ramp when start is omitted.
+                // No TTFT check when the bound is 0; no ramp when start is omitted;
+                // unset queue threshold falls back to 1 (today's behaviour).
                 env::set_var("VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS", "0");
                 env::remove_var("VLLM_PROXY_ADMISSION_START_INFLIGHT");
+                env::remove_var("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT");
                 let config = Config::from_env().unwrap();
                 let admission = config.admission().unwrap();
                 assert_eq!(admission.ttft_p95_max, None);
                 assert_eq!(admission.start_inflight, 48);
+                assert_eq!(admission.queue_saturated_at, 1);
 
                 // Validation.
                 env::set_var("VLLM_PROXY_ADMISSION_START_INFLIGHT", "64");
@@ -2286,6 +2571,13 @@ mod tests {
                     "{err}"
                 );
                 env::remove_var("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS");
+                env::set_var("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT", "0");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT"),
+                    "{err}"
+                );
+                env::remove_var("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT");
                 env::set_var("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS", "0");
                 let err = Config::from_env().unwrap_err().to_string();
                 assert!(

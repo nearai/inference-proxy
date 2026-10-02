@@ -215,6 +215,22 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Replica state publishing (opt-in): one signed host frame per tick to Redis.
+    if let Some(rs) = config.replica_state() {
+        info!(
+            host_id = %rs.host_id,
+            interval_ms = rs.interval.as_millis() as u64,
+            redis = %rs.redis_host_for_logs(),
+            "Publishing replica state to Redis"
+        );
+        vllm_proxy_rs::replica_state::spawn_replica_state_publisher(
+            rs.clone(),
+            backend_pool.clone(),
+            backend_client.clone(),
+            config.dev_mode || config.non_tee_deployment,
+        );
+    }
+
     // Live engine load per backend (gateway mode): polled when probe URLs are
     // configured; a sample older than three intervals counts as unknown.
     let probe_interval = std::time::Duration::from_secs(config.backend_probe_interval_secs);
@@ -251,6 +267,7 @@ async fn main() -> anyhow::Result<()> {
             ramp_interval_secs = settings.ramp_interval.as_secs(),
             ttft_p95_max_ms = settings.ttft_p95_max.map_or(0, |d| d.as_millis()),
             backpressure_secs = settings.backpressure_ttl.as_secs(),
+            queue_saturated_at = settings.queue_saturated_at,
             retry_after_secs = settings.retry_after.as_secs(),
             "Lane admission enabled"
         );

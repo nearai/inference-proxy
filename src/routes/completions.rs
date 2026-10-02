@@ -4,15 +4,14 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use axum::Extension;
 
-use crate::admission::RejectReason;
 use crate::auth::RequireAuth;
-use crate::backend_pool;
+use crate::backend_affinity::{parse_replica_hint, ReplicaHint};
 use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
-use crate::proxy::{
-    self, make_usage_reporter, ConnectFailover, ProxyOpts, ResponseShape, UsageType,
-};
+use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageType};
 use crate::routes::chat::{read_body_with_limit, resolve_request_hash_for_signing};
+use crate::routes::completion_placement::place_completion;
+use crate::routes::ROUTE_COMPLETIONS;
 use crate::{AppState, RequestStart, TracingIds};
 
 /// POST /v1/completions
@@ -107,52 +106,18 @@ pub async fn completions(
     let tier = crate::context_tier::decide(
         &state.backend_pool,
         state.config.long_context_above_tokens,
+        state.config.backend_tier_strict,
         || estimate.unwrap_or_else(|| crate::context_tier::completion_estimate(&request_json)),
     );
-    let permit = state.admission.try_admit(&state.backend_pool, tier)?;
-    let limits = state.admission.backend_limits(&state.backend_pool);
-    let mut restrict = tier.and_then(|tier| tier.restrict);
-    let requested_tier = tier.map(|decision| decision.estimated);
-    let place = |tier| {
-        let policy = backend_pool::Policy {
-            max_conns: None,
-            max_conns_by_backend: limits.as_deref(),
-            requested_tier,
-            avoid: &|index| state.admission.backend_saturated(index),
-            engine: &|index| state.admission.engine(index),
-            tier,
-        };
-        state
-            .backend_affinity
-            .place(&state.backend_pool, None, "/v1/completions", &policy)
+    // Placement hint from cloud-api, same trust predicate as chat completions
+    // and `X-NearAI-Priority`: honoured only for a caller authenticated with
+    // the proxy's own config token, not an `sk-` API key.
+    let hint = if auth.cloud_api_key.is_none() {
+        parse_replica_hint(&headers)
+    } else {
+        ReplicaHint::Absent
     };
-    // See the chat route: a tier that just emptied falls back, and `restrict`
-    // follows the placement.
-    let mut placement = place(restrict);
-    if placement.is_none()
-        && restrict.is_some_and(|tier| {
-            crate::context_tier::recheck_restriction(&state.backend_pool, tier).is_none()
-        })
-    {
-        restrict = None;
-        placement = place(None);
-    }
-    let placement =
-        placement.ok_or_else(|| AppError::from(state.admission.reject(RejectReason::HostShare)))?;
-    if let Some(permit) = permit.as_ref() {
-        permit.attach_backend(placement.index);
-    }
-    let connect_failover = state
-        .config
-        .backend_connect_failover
-        .then(|| ConnectFailover {
-            pool: state.backend_pool.clone(),
-            path: "/v1/completions",
-            index: placement.index,
-            tier: restrict,
-            affinity: None,
-        });
-    let url = placement.url;
+    let placed = place_completion(&state, ROUTE_COMPLETIONS, tier, None, hint)?;
 
     let opts = ProxyOpts {
         signing: state.signing.clone(),
@@ -164,7 +129,7 @@ pub async fn completions(
         request_hash: original_request_hash,
         response_transform,
         chunk_transform,
-        backend_guard: Some(placement.guard),
+        backend_guard: Some(placed.backend_guard),
         stream_idle_timeout_secs: state.config.stream_idle_timeout_secs,
         sse_keepalive_secs: state.config.sse_keepalive_secs,
         map_queue_full_to_429: state.config.map_queue_full_to_429,
@@ -173,8 +138,8 @@ pub async fn completions(
         response_shape: ResponseShape::TextCompletion,
         tracing_ids: Some(tracing_ids),
         upstream_data_parallel_rank: None,
-        admission: permit,
-        connect_failover,
+        admission: placed.admission,
+        connect_failover: placed.connect_failover,
         // See the chat route: the clock started when the request arrived.
         first_token_deadline: proxy::first_token_deadline(
             &state,
@@ -185,8 +150,9 @@ pub async fn completions(
     };
 
     if is_stream {
-        proxy::proxy_streaming_request(&state.backend_client, &url, modified_body, opts).await
+        proxy::proxy_streaming_request(&state.backend_client, &placed.url, modified_body, opts)
+            .await
     } else {
-        proxy::proxy_json_request(&state.backend_client, &url, modified_body, opts).await
+        proxy::proxy_json_request(&state.backend_client, &placed.url, modified_body, opts).await
     }
 }

@@ -17,6 +17,21 @@ client ──sk-key──▶ inference-proxy (gateway, non-TEE) ──backend to
 
 ## What the gateway does per request
 
+Two compatibility repairs run on every lane (gateway and CVM alike), after
+decryption and before dispatch, because the engine's `400` is the same
+whichever lane sent the request: the tool-call `arguments` repair
+(`src/tool_calls.rs`, nearai/inference-proxy#239) and the
+`response_format.json_schema` repair (`src/response_format.rs`,
+nearai/inference-proxy#279). The latter inserts the required
+`json_schema.name` (`response_schema`) when a wrapper object has none, and
+wraps a bare JSON Schema sent as `json_schema` (recognised by a JSON Schema
+keyword at its root, such as `type` or `properties`) into `{"name", "schema"}`.
+Ambiguous objects such as `{}` only get the name, so the engine reports the
+missing schema rather than serving an accept-all grammar. An explicit `name`
+of any value is preserved for native backend validation; the schema,
+strictness and other fields are untouched.
+Repairs are counted by `json_schema_response_format_repaired_total{repair}`.
+
 1. `Authorization: Bearer sk-…` → `POST {CLOUD_API_URL}/v1/check_api_key`
    (retries on transport/5xx; 401/402/429 pass through). With
    `VLLM_PROXY_ALLOWED_ORG_IDS` set, a valid key from any other organization
@@ -30,8 +45,9 @@ client ──sk-key──▶ inference-proxy (gateway, non-TEE) ──backend to
 4. Forward with `Authorization: Bearer $VLLM_BACKEND_TOKEN` on the dedicated
    backend client. The CVM proxy treats it as a trusted config token: it does
    **not** re-validate the customer key and does **not** report usage, so
-   exactly one component bills. The body is forwarded verbatim; for streams the
-   gateway forces `stream_options.include_usage` and `continuous_usage_stats`.
+   exactly one component bills. The body is forwarded verbatim apart from the
+   compatibility repairs above; for streams the gateway forces
+   `stream_options.include_usage` and `continuous_usage_stats`.
 5. Response streamed back. On client disconnect the upstream connection is
    dropped (the CVM proxy drops its engine connection, the engine aborts) and
    the usage observed so far is reported.
@@ -81,6 +97,7 @@ to the current in-CVM behavior.
 | `VLLM_PROXY_ALLOWED_ORG_IDS` | the partner's organization id | Only that organization's keys are served; any other valid key gets 403. Without it any cloud-api key works here, same as the direct `*.completions.near.ai` endpoints. |
 | `VLLM_PROXY_REJECTED_CONTENT_PART_TYPES` | `video_url,input_audio,file` | Modalities this deployment does not serve → deterministic `400`. |
 | `VLLM_PROXY_MODELS_DOCUMENT_URL` / `VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE` | `https://cloud-api.near.ai/v1/models` / `150` | `GET /v1/models` serves cloud-api's entry for `MODEL_NAME` (pricing, modalities, `is_ready`, `openrouter.slug`) with `capacity` added: concurrency = `VLLM_PROXY_ADMISSION_MAX_INFLIGHT`, requests per minute = this value. One URL for inference and the listing; `is_ready` stays under cloud-api's catalog control (the kill switch). Source unreadable → the engine's list, as without the variable. |
+| `VLLM_PROXY_DISCOUNT_TO_USER` | unset (list price) | The lane's discount off the list price, a fraction in `[0, 1)` with at most four decimal places (`0.2` = 20 % off): published as `discount_to_user` on the models document entry (in place of any the source carries) and sent with every usage report, so cloud-api bills the price the aggregator shows; empty or `0` = none, an invalid value fails startup, and it requires `VLLM_PROXY_MODELS_DOCUMENT_URL`. While that source is unreadable, the engine list served instead carries the discount on every entry, and an engine answer that is not a model list becomes a 502 rather than going out without it. cloud-api refuses a report whose discount exceeds its `INTERNAL_USAGE_MAX_DISCOUNT` (default `0.5`), leaving that usage unbilled, so keep the value within it. |
 | `VLLM_PROXY_REASONING_OFF_EFFORT` | `low` | What "no reasoning" means for GLM-5.3 Flash (see below). |
 | `VLLM_PROXY_SSE_KEEPALIVE_SECS` | `15` | `: keep-alive` SSE comments while the upstream is silent (long prefill/queueing), so intermediaries with read timeouts do not cancel. Off in CVMs: comments are not part of the signed bytes. |
 | `VLLM_PROXY_MAP_QUEUE_FULL_TO_429` | `1` | The engine's admission rejection (queue full, or a queued request displaced by a higher-priority one) becomes 429 with `Retry-After: 2` and type `overloaded`, the same shape as the gateway's own refusals: back-pressure, not an outage. Off in CVMs: cloud-api's peer fallback keys on the 503. |
@@ -92,11 +109,13 @@ to the current in-CVM behavior.
 | `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` / `_START_INFLIGHT` | `48` / `48` | The lane's in-flight budget: refuse with 429 + `Retry-After` before dispatch instead of queueing (see below). Set start equal to maximum for separately reviewed rollout stages; optional ramp settings remain available. |
 | `VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS` | `30000` | Refuse new work while, over the last minute, at least 20 lane requests reached the engine and 5 % of them (at least two) waited longer than this for their first generation event. |
 | `VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS` | `10` | A backend that rejected at engine admission within this window is steered around; when every healthy backend did, new work is refused. |
+| `VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT` | `1` | Engine-reported queue depth at or above which a backend counts as saturated for placement and the fleet-wide queue refusal below; the OpenRouter lane runs `4` for engines that run chunked prefill, where a shallow queue is normal while slots are still free. |
 | `VLLM_BACKEND_CONNECT_FAILOVER` | `1` | A backend that refuses the connection (host down, proxy restarting) costs the request nothing: it is re-sent once to another healthy backend, the dead one leaves the rotation until a probe succeeds, and a pinned conversation follows. Never on an HTTP error. |
 | `VLLM_BACKEND_PROBE_URLS` / `_INTERVAL_SECS` | `http://<host-ip>:8000,…` / `2` | The engines' live running/queued counts, read from each host's plain metrics port (the same route model-proxy samples; reachable from the model-proxy hosts, no token). One reading covers the replica the host would route to, so a queue in it means no replica is free. Drives placement and the fleet-wide queue refusal below. |
 | `VLLM_BACKEND_LONG_CONTEXT_URLS` | the `-long-b<handle>` URLs | The hosts of the long-context tier, listed as their handle URLs under the model's `-long` model-proxy domain (see below). Appended to the pool after `VLLM_BACKEND_URLS`, so the base backends keep their indexes. Empty = one flat pool, as today. |
 | `VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS` | `http://<host-ip>:8000,…` | One engine-load probe per long-context backend, same order. Required when `VLLM_BACKEND_PROBE_URLS` is set, and empty when it is not; internally the two lists are concatenated in pool order. |
 | `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` | `100000` | Estimated input tokens above which a request is placed on that tier. `0`/unset switches the whole feature off, and nothing is even estimated. |
+| `VLLM_BACKEND_TIER_STRICT` | `1` | Isolate the tiers in both directions: a request whose tier has no healthy backend is refused (429 + `Retry-After`, or a 503 with `error_type: "tier_unavailable"` when admission is off) instead of placed on the other tier. Off by default (see below). Only meaningful with `VLLM_BACKEND_LONG_CONTEXT_URLS` and a nonzero `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS`; without either it is ignored (a startup warning says so). |
 | `NON_TEE_DEPLOYMENT` | `1` | No dstack socket outside a CVM: `/healthz` reports `"dstack":"skipped"`, no attestation refresh, and `/v1/attestation/report`, `/v1/signature/{id}`, `/internal/gpu_evidence` answer 404 so nothing unverifiable is advertised. |
 | `DEV` / `GPU_NO_HW_MODE` | `1` / `1` | Non-TEE: random signing keys, no hardware evidence. |
 | `LISTEN_ADDR` / `LISTEN_PORT` | `127.0.0.1` / `31700` | Bind behind the local TLS terminator. |
@@ -243,6 +262,8 @@ Details worth knowing:
   by default.
 - The deadline reads the same input estimate as the long-context tier
   (`context_tier.rs`), and that estimate is computed even when the tier is off.
+  Only prompt tokens size the deadline: the output reserve used for tier
+  placement, including its 32,768-token cap, does not extend or exempt it.
 - Counter `first_token_deadline_refusals_total`, plus one info line per refusal
   ("First-token deadline passed, refusing") with the deadline, the wait and the
   estimated prompt size — numbers only.
@@ -250,6 +271,12 @@ Details worth knowing:
 Why first tokens are late in the first place is an engine-side scheduling
 question (short requests queued behind a long chunked prefill on the same
 replica); the deadline only decides what the caller is told meanwhile.
+
+Queue saturation checks and strict context-tier isolation still apply before
+dispatch. They reduce overload and keep long prefills on the intended hosts;
+this deadline also bounds the wait after a request has been admitted and
+placed. Enabling it does not change tier selection or permit cross-tier
+failover.
 
 ## Admission budget
 
@@ -284,7 +311,8 @@ upstream:
 
 1. **Observed overload.** The engines' own queues first: with
    `VLLM_BACKEND_PROBE_URLS` each host's running and queued request counts are
-   polled every two seconds; a host with a non-empty queue is steered around,
+   polled every two seconds; a host whose queue is at or above
+   `VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT` (default 1) is steered around,
    and once every healthy host queues, new work is refused (reason
    `backend_queue`). Then two signals the gateway measures on its own traffic.
    Time to first generation, measured from the moment the request is sent
@@ -340,8 +368,10 @@ back-pressure for the next admission decision
 `admission_backpressure_total{backend}`, `backend_failover_total{outcome}`,
 `upstream_stream_error_events_total{phase}`, `backend_engine_running{backend}`,
 `backend_engine_queued{backend}`, `backend_engine_probe_failures_total{backend}`,
-`backend_tier_requests_total{tier,outcome=routed|fallback|fallback_late}`,
+`backend_tier_requests_total{tier,outcome=routed|fallback|fallback_late|refused|refused_late}`
+(the `refused*` outcomes only occur with `VLLM_BACKEND_TIER_STRICT`),
 `request_estimated_prompt_tokens`,
+`backend_tier_output_reserve_capped_total{tier}` (requests whose `max_tokens` counted only up to the reserve cap),
 plus the existing usage-report and upstream metrics.
 
 ## Long-context tier
@@ -365,7 +395,7 @@ computation next to it):
 ```text
 countable = (message text + serialized tool_calls + serialized tools) / 4
 uncounted = media parts × 1024 + messages × 4
-required  = ceil(countable × 1.2) + uncounted + max_tokens reserve
+required  = ceil(countable × 1.2) + uncounted + min(max_tokens, 32768)
 ```
 
 `required` strictly above `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` means the
@@ -373,6 +403,16 @@ long tier. The 1.2 safety factor covers the byte estimate only — media parts,
 template overhead, the reserved output window and `/v1/completions` token ids
 are already token counts. Tool definitions and tool-call arguments are counted
 because the lane's traffic is agentic, where they are most of the prompt.
+The `max_tokens` reserve is capped at 32,768 (cloud-api's
+`CONTEXT_ROUTE_OUTPUT_RESERVE_CAP`): it is the output a caller allows, not what it
+will produce, and aggregator clients often send the advertised maximum on
+one-line requests — counted in full, every such request would land on the
+long-context hosts.
+The trade-off is accepted deliberately: a capped request that really does generate
+hundreds of thousands of tokens runs on the tier its prompt picked (normally base),
+holding one engine slot and its growing KV there — both tiers run the same engine
+with the same context length, so it completes. `backend_tier_output_reserve_capped_total`
+counts these requests; read it beside `backend_engine_running`/`backend_engine_queued`.
 cloud-api additionally refines the decision near the boundary with an exact
 `POST /v1/tokenize`; the gateway deliberately does not — a tokenizer dependency
 and an extra upstream round trip are not worth it for a placement that is a
@@ -396,14 +436,27 @@ queueing" refusal. The consequences are deliberate:
   around (engine queue, recent engine rejection) means `429` + `Retry-After`
   for the next oversized request — keeping those prefills off the base fleet is
   the whole point, and a fast refusal lets the aggregator route elsewhere.
-- **A tier with no healthy backend falls back.** If the wanted tier is down
-  entirely the request is placed in the other one rather than refused
-  (`backend_tier_requests_total{outcome="fallback"}`), including when its last
-  host goes unreachable mid-request: both the placement and the connection
-  fail-over re-resolve the restriction after taking that host out of the
-  rotation and cross over, counted `fallback_late` — so each request adds
-  exactly one `routed` or `fallback`, plus a `fallback_late` if its tier died
-  under it.
+- **A tier with no healthy backend falls back — by default.** If the wanted
+  tier is down entirely the request is placed in the other one rather than
+  refused (`backend_tier_requests_total{outcome="fallback"}`), including when
+  its last host goes unreachable mid-request: both the placement and the
+  connection fail-over re-resolve the restriction after taking that host out
+  of the rotation and cross over, counted `fallback_late` — so each request
+  adds exactly one `routed` or `fallback`, plus a `fallback_late` if its tier
+  died under it. `VLLM_BACKEND_TIER_STRICT` turns this off for deployments
+  that isolate the tiers on purpose: the restriction never lifts, so an empty
+  tier is refused instead of spilling onto the other one — `429` +
+  `Retry-After` when admission is enabled
+  (`admission_rejections_total{reason="tier_unavailable"}`), a plain `503`
+  with `error_type: "tier_unavailable"` when it is not — counted
+  `refused`/`refused_late` in place of `fallback`/`fallback_late`. A live
+  request's connect failure marks its backend unreachable immediately, with
+  no debounce; the pool health checker's own probe needs
+  `HEALTH_CHECK_MAX_FAILURES` (default `3`) consecutive failures on its
+  `HEALTH_CHECK_INTERVAL_SECS` (default `5` s) cadence to mark one down, but
+  only one success to bring it back — so in strict mode a single failed
+  connect can leave a one-host tier refusing everything for up to one
+  interval before the next successful probe recovers it.
 - **Conversation affinity crosses tiers.** A conversation pinned on a base host
   that grows past the threshold is placed fresh in the long tier and re-pinned
   there — the same re-prefill cloud-api pays at the boundary.

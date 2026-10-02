@@ -33,6 +33,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
     let base = mock_url.trim_end_matches('/');
 
     let config = config::Config {
+        replica_state: None,
         model_name: "bench-model".to_string(),
         tokens: vec!["bench-token".to_string()],
         vllm_base_url: mock_url.to_string(),
@@ -107,6 +108,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         rejected_content_part_types: Vec::new(),
         models_document_url: None,
         capacity_requests_per_minute: 0,
+        discount_to_user: None,
         reasoning_off_effort: "none".to_string(),
         allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,
@@ -118,12 +120,14 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         admission_ramp_interval_secs: 1800,
         admission_ttft_p95_max_ms: 30_000,
         admission_backpressure_secs: 10,
+        admission_queue_saturated_at: 1,
         admission_retry_after_secs: 2,
         backend_connect_failover: false,
         backend_probe_urls: Vec::new(),
         backend_long_context_urls: Vec::new(),
         backend_long_context_probe_urls: Vec::new(),
         long_context_above_tokens: 0,
+        backend_tier_strict: false,
         backend_probe_interval_secs: 2,
         dstack_socket_path: "/var/run/dstack.sock".to_string(),
         gpu_evidence_delegate_url: None,
@@ -638,9 +642,12 @@ fn bench_streaming_sse_processing(c: &mut Criterion) {
 fn bench_auth_token_comparison(c: &mut Criterion) {
     use subtle::ConstantTimeEq;
 
-    let token = "rr9w3S91rog35JM6Sgr2YqwbMvKrbnLA95hQoiwip+4=";
-    let matching = "rr9w3S91rog35JM6Sgr2YqwbMvKrbnLA95hQoiwip+4=";
-    let non_matching = "xx9w3S91rog35JM6Sgr2YqwbMvKrbnLA95hQoiwip+4=";
+    // Fake, fixed-length (44-byte, base64-shaped) placeholders — this benchmark
+    // only measures constant-time byte comparison, so the values themselves
+    // are irrelevant as long as their length/shape matches a real token.
+    let token = "dGVzdC10b2tlbi1mb3ItYmVuY2htYXJrcy1vbmx5AA==";
+    let matching = "dGVzdC10b2tlbi1mb3ItYmVuY2htYXJrcy1vbmx5AA==";
+    let non_matching = "xxVzdC10b2tlbi1mb3ItYmVuY2htYXJrcy1vbmx5AA==";
 
     let mut group = c.benchmark_group("auth_token");
 

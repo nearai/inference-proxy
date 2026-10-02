@@ -35,6 +35,7 @@ This is a Rust rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-pro
 - `attestation.rs` — `AttestationCache`, `generate_attestation()`, GPU evidence collection with retry/serialization, dstack TDX quotes
 - `auth.rs` — `RequireAuth` axum extractor (validates Bearer token)
 - `routes/` — thin handlers that parse request, call proxy helpers
+- `replica_state/` — opt-in publishing of one signed host frame per tick to Redis (`spawn_replica_state_publisher`)
 
 ### Important patterns
 
@@ -63,7 +64,6 @@ This is a Rust rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-pro
 - Error types in `error.rs` produce OpenAI-compatible JSON: `{"error": {"message": ..., "type": ..., "param": null, "code": null}}`
 - Internal errors hide details from clients (returns generic "Internal server error")
 - Named route upstream errors are passed through verbatim (status code + body)
-- Catch-all upstream errors are parsed and re-wrapped via `AppError::UpstreamParsed` (never leaks raw body)
 - `parse_upstream_error()` in `proxy.rs` handles both vLLM flat (`{"message":"..."}`) and nested (`{"error":{"message":"..."}}`) formats
 - All upstream errors logged with `warn!` including `error_message` and `error_type` (never body content)
 - `request_id_middleware` wraps requests in a tracing span — all log lines automatically include `request_id`, `method`, `path`
@@ -74,12 +74,14 @@ This is a Rust rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-pro
 ## Deployment
 
 - Docker image: `nearaidev/vllm-proxy-rs` (published with digest-pinned refs in cvm-conf)
+- The image build is reproducible and externally verified: `ENABLE_NV_ATTESTATION_SDK=1 SOURCE_DATE_EPOCH=0 bash build-image.sh` on a fresh clone must produce the digest CI published, and `reproducible-build.yml` checks exactly that. Never add a required build env var or argument without coordinating with external verifiers first. See README "Reproducible build & verification" for the contract, the pinned inputs and how to bump them.
 - Deployed via compose files in [nearai/cvm-compose-files](https://github.com/nearai/cvm-compose-files)
 - Each proxy instance needs: `MODEL_NAME`, `TOKEN`, `VLLM_BASE_URL`, `TLS_CERT_PATH`
 - Optional: `CLOUD_API_URL` (enables usage reporting + `sk-` API key auth via cloud-api), `LOG_FORMAT=json` (structured JSON logs)
 - Pre-dispatch image validation is enabled by default for chat-completions image inputs. `VLLM_PROXY_IMAGE_VALIDATION_DISABLED=1` disables it. Tunables: `VLLM_PROXY_IMAGE_VALIDATION_TIMEOUT_SECS` (default 5), `VLLM_PROXY_IMAGE_VALIDATION_MAX_BYTES` (8192), `VLLM_PROXY_IMAGE_VALIDATION_MAX_CONCURRENCY` (8), `VLLM_PROXY_IMAGE_VALIDATION_ALLOW_PRIVATE_HOSTS` (default off), `VLLM_PROXY_IMAGE_VALIDATION_ALLOWED_DOMAINS` (exact remote `image_url` host allowlist checked before fetch and on every redirect; falls back to `VLLM_ALLOWED_MEDIA_DOMAINS` when unset; Gemma-4 defaults to `prod-files-secure.s3.us-west-2.amazonaws.com`; explicitly set empty to disable the proxy-side domain restriction), `VLLM_PROXY_IMAGE_VALIDATION_REJECT_NON_RGB` (default off; `1` forces strict non-RGB PNG/JPEG rejection. Gemma-4 model names still auto-reject observed one-channel PNG/JPEG crash inputs).
 - `ATTESTATION_CACHE_TTL` (default 300s) — TTL for cached nonce-less attestation reports; background refresh runs at half-TTL
 - `DSTACK_SOCKET_PATH` (default `/var/run/dstack.sock`) — probed by `GET /healthz` so upstream load balancers (e.g. model-proxy) can detach this instance when the dstack guest-agent socket is unreachable. `/v1/models` alone won't catch this failure mode — sglang/vLLM keep serving while `/v1/attestation/report` silently 500s. The backend leg of `/healthz` probes `/health` (not `/v1/models`) since `/v1/models` serializes against the OpenAI request loop and can stall for >1s during prefill, producing spurious 503s on otherwise-healthy hosts.
+- Image base: slim Ubuntu 22.04 runtime, no vLLM/CUDA; apt and pip inputs pinned in `pinned-packages-builder.txt`, `pinned-packages-runtime.txt` and `attestation-constraints.txt` (bump procedure in the Dockerfile header)
 
 ### Gateway mode (fleet-wide, non-TEE)
 
@@ -100,7 +102,10 @@ timeout; such requests skip the commit window),
 `NON_TEE_DEPLOYMENT` (404s the attestation, signature and GPU-evidence routes),
 `VLLM_BACKEND_HEALTH_PATH`, `LISTEN_ADDR`, `VLLM_PROXY_MODELS_DOCUMENT_URL` +
 `VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE` (`/v1/models` = cloud-api's entry for
-`MODEL_NAME` plus declared `capacity`), the lane admission budget
+`MODEL_NAME` plus declared `capacity`), `VLLM_PROXY_DISCOUNT_TO_USER` (requires
+the document URL; one fraction published as that entry's `discount_to_user`, also
+on the engine-list fallback, and sent on every usage report, so the listed and
+the billed price cannot drift), the lane admission budget
 (`VLLM_PROXY_ADMISSION_*`, `admission.rs`: in-flight budget with a ramp, per-host
 share, refusal on observed TTFT/engine back-pressure — 429 + `Retry-After` before
 dispatch), the long-context tier (`VLLM_BACKEND_LONG_CONTEXT_URLS` +
@@ -121,5 +126,5 @@ knows `low`/`high` and leaks its thinking into `content` when switched off).
 ### Cloud API integration
 
 - `CLOUD_API_URL` enables two features: (1) `sk-live-`/`sk-test-` API key validation via `POST /v1/check_api_key`, (2) fire-and-forget usage reporting via `POST /v1/internal/usage`
-- Usage reporting is in `proxy.rs`: `spawn_usage_report()` posts to `/v1/internal/usage` with the shared `CLOUD_API_USAGE_TOKEN` as Bearer and the subject identity (org/workspace/api_key_id, from the `/v1/check_api_key` response) in the body. The legacy `sk-`-authenticated `POST /v1/usage` endpoint was removed from cloud-api; if `CLOUD_API_USAGE_TOKEN` (or any identity field) is missing, reporting is **skipped with an error log** — there is no fallback. Failures are logged as warnings.
+- Usage reporting is in `proxy.rs`: `spawn_usage_report()` posts to `/v1/internal/usage` with the shared `CLOUD_API_USAGE_TOKEN` as Bearer and the subject identity (org/workspace/api_key_id, from the `/v1/check_api_key` response) in the body, plus a top-level `discount_to_user` when `VLLM_PROXY_DISCOUNT_TO_USER` is set (`complete_usage_body`). The legacy `sk-`-authenticated `POST /v1/usage` endpoint was removed from cloud-api; if `CLOUD_API_USAGE_TOKEN` (or any identity field) is missing, reporting is **skipped with an error log** — there is no fallback. Failures are logged as warnings.
 - **MODEL_NAME must exactly match `model_name` in cloud-api's model table** — cloud-api does NOT check model aliases, so a mismatch causes silent 404s on usage reporting

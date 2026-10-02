@@ -29,6 +29,8 @@ struct TestAppOptions {
     backend_urls: Vec<String>,
     backend_conversation_affinity: bool,
     backend_affinity_max_imbalance: u32,
+    /// `sk-` key validation endpoint; `None` disables cloud_api_key auth.
+    cloud_api_url: Option<String>,
 }
 
 impl Default for TestAppOptions {
@@ -49,6 +51,7 @@ impl Default for TestAppOptions {
             backend_urls: Vec::new(),
             backend_conversation_affinity: false,
             backend_affinity_max_imbalance: 8,
+            cloud_api_url: None,
         }
     }
 }
@@ -154,6 +157,23 @@ fn build_test_app_with_backends(
     )
 }
 
+/// Multi-backend test app authenticated with `sk-` keys against `cloud_api_url`
+/// (untrusted callers), rather than the config-token auth `build_test_app_with_backends` uses.
+fn build_test_app_with_backends_and_cloud_api(
+    backend_urls: Vec<String>,
+    cloud_api_url: &str,
+) -> (axum::Router, Arc<vllm_proxy_rs::backend_pool::BackendPool>) {
+    let mock_url = backend_urls[0].clone();
+    build_test_app_inner_with_pool(
+        &mock_url,
+        TestAppOptions {
+            backend_urls,
+            cloud_api_url: Some(cloud_api_url.to_string()),
+            ..Default::default()
+        },
+    )
+}
+
 fn build_test_app_inner_with_pool(
     mock_url: &str,
     options: TestAppOptions,
@@ -166,6 +186,7 @@ fn build_test_app_inner_with_pool(
     };
 
     let config = config::Config {
+        replica_state: None,
         model_name: "test-model".to_string(),
         tokens: if options.fusion_enabled {
             vec!["test-token".to_string(), "fusion-token".to_string()]
@@ -207,7 +228,7 @@ fn build_test_app_inner_with_pool(
         rate_limit_per_second: options.rate_per_second,
         rate_limit_burst_size: options.rate_burst,
         rate_limit_trust_proxy_headers: true,
-        cloud_api_url: None,
+        cloud_api_url: options.cloud_api_url.clone(),
         cloud_api_auth_max_attempts: 1,
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
@@ -249,6 +270,7 @@ fn build_test_app_inner_with_pool(
         rejected_content_part_types: Vec::new(),
         models_document_url: None,
         capacity_requests_per_minute: 0,
+        discount_to_user: None,
         reasoning_off_effort: "none".to_string(),
         allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,
@@ -260,12 +282,14 @@ fn build_test_app_inner_with_pool(
         admission_ramp_interval_secs: 1800,
         admission_ttft_p95_max_ms: 30_000,
         admission_backpressure_secs: 10,
+        admission_queue_saturated_at: 1,
         admission_retry_after_secs: 2,
         backend_connect_failover: false,
         backend_probe_urls: Vec::new(),
         backend_long_context_urls: Vec::new(),
         backend_long_context_probe_urls: Vec::new(),
         long_context_above_tokens: 0,
+        backend_tier_strict: false,
         backend_probe_interval_secs: 2,
         dstack_socket_path: options.dstack_socket_path,
         gpu_evidence_delegate_url: None,
@@ -700,6 +724,20 @@ async fn mount_chat_ok(server: &MockServer, path_str: &str, expected: u64) {
         .await;
 }
 
+async fn mount_completions_ok(server: &MockServer, expected: u64) {
+    Mock::given(method("POST"))
+        .and(path("/v1/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "cmpl-affinity",
+            "object": "text_completion",
+            "choices": [{"index": 0, "text": "ok", "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11}
+        })))
+        .expect(expected)
+        .mount(server)
+        .await;
+}
+
 async fn post_chat(app: axum::Router, uri: &str, body: &serde_json::Value) -> StatusCode {
     app.oneshot(
         Request::builder()
@@ -852,6 +890,182 @@ async fn test_multiple_backends_without_affinity_stay_least_connections() {
     );
     assert_eq!(requests_seen(&backend_a).await, 1);
     assert_eq!(requests_seen(&backend_b).await, 1);
+}
+
+#[tokio::test]
+async fn test_replica_hint_routes_to_hinted_backend() {
+    let backend_a = MockServer::start().await;
+    let backend_b = MockServer::start().await;
+    mount_chat_ok(&backend_a, "/v1/chat/completions", 1).await;
+    mount_chat_ok(&backend_b, "/v1/chat/completions", 1).await;
+    let (app, _pool) =
+        build_test_app_with_backends(vec![backend_a.uri(), backend_b.uri()], false, 8);
+
+    // Trusted caller (config-token auth, same as the priority tests) hints
+    // pool index 1 (backend_b): honoured, request lands on backend_b.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header(backend_affinity::REPLICA_HINT_HEADER, "1")
+                .body(Body::from(
+                    serde_json::to_vec(&affinity_chat_body(0)).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(requests_seen(&backend_b).await, 1);
+    assert_eq!(requests_seen(&backend_a).await, 0);
+
+    // Out-of-range hint: invalid, request still succeeds (falls back to
+    // least-connections, which now favors the still-idle backend_a).
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header(backend_affinity::REPLICA_HINT_HEADER, "7")
+                .body(Body::from(
+                    serde_json::to_vec(&affinity_chat_body(0)).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(requests_seen(&backend_a).await, 1);
+    assert_eq!(requests_seen(&backend_b).await, 1);
+}
+
+#[tokio::test]
+async fn test_completions_replica_hint_routes_to_hinted_backend() {
+    let backend_a = MockServer::start().await;
+    let backend_b = MockServer::start().await;
+    mount_completions_ok(&backend_a, 0).await;
+    mount_completions_ok(&backend_b, 1).await;
+    let (app, _pool) =
+        build_test_app_with_backends(vec![backend_a.uri(), backend_b.uri()], false, 8);
+
+    // Trusted caller (config-token auth, same as the chat test above) hints
+    // pool index 1 (backend_b): honoured, request lands on backend_b.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header(backend_affinity::REPLICA_HINT_HEADER, "1")
+                .body(Body::from(r#"{"prompt":"hello ","stream":false}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(requests_seen(&backend_b).await, 1);
+    assert_eq!(requests_seen(&backend_a).await, 0);
+}
+
+#[tokio::test]
+async fn test_completions_replica_hint_is_dropped_for_cloud_api_key_auth() {
+    let backend_a = MockServer::start().await;
+    let backend_b = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    mount_completions_ok(&backend_a, 1).await;
+    mount_completions_ok(&backend_b, 0).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})))
+        .mount(&cloud_api)
+        .await;
+    let (app, pool) = build_test_app_with_backends_and_cloud_api(
+        vec![backend_a.uri(), backend_b.uri()],
+        &cloud_api.uri(),
+    );
+
+    // Load backend_b (the index the hint asks for) so an honored hint would
+    // land there, while a dropped hint keeps least-connections on idle
+    // backend_a — deterministic either way.
+    pool.backends()[1]
+        .active_conns
+        .store(3, std::sync::atomic::Ordering::Relaxed);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .header(backend_affinity::REPLICA_HINT_HEADER, "1")
+                .body(Body::from(r#"{"prompt":"hello ","stream":false}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    // An `sk-` (untrusted) caller's hint must not be forwarded: the request
+    // stays on least-connections, landing on the idle backend_a rather than
+    // the hinted, already-loaded backend_b.
+    assert_eq!(requests_seen(&backend_a).await, 1);
+    assert_eq!(requests_seen(&backend_b).await, 0);
+}
+
+#[tokio::test]
+async fn test_chat_completions_replica_hint_is_dropped_for_cloud_api_key_auth() {
+    let backend_a = MockServer::start().await;
+    let backend_b = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    mount_chat_ok(&backend_a, "/v1/chat/completions", 1).await;
+    mount_chat_ok(&backend_b, "/v1/chat/completions", 0).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})))
+        .mount(&cloud_api)
+        .await;
+    let (app, pool) = build_test_app_with_backends_and_cloud_api(
+        vec![backend_a.uri(), backend_b.uri()],
+        &cloud_api.uri(),
+    );
+
+    // Load backend_b (the index the hint asks for) so an honored hint would
+    // land there, while a dropped hint keeps least-connections on idle
+    // backend_a — deterministic either way.
+    pool.backends()[1]
+        .active_conns
+        .store(3, std::sync::atomic::Ordering::Relaxed);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .header(backend_affinity::REPLICA_HINT_HEADER, "1")
+                .body(Body::from(
+                    serde_json::to_vec(&affinity_chat_body(0)).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    // An `sk-` (untrusted) caller's hint must not be forwarded: the request
+    // stays on least-connections, landing on the idle backend_a rather than
+    // the hinted, already-loaded backend_b.
+    assert_eq!(requests_seen(&backend_a).await, 1);
+    assert_eq!(requests_seen(&backend_b).await, 0);
 }
 
 #[tokio::test]
@@ -4094,6 +4308,70 @@ async fn test_tool_call_arguments_are_normalized_before_dispatch() {
     // The mock expectation (body_json) verifies the backend received the repaired history
 }
 
+#[tokio::test]
+async fn test_json_schema_response_format_is_repaired_before_dispatch() {
+    use wiremock::matchers::body_json;
+
+    let mock_server = MockServer::start().await;
+
+    // Not gateway-specific: a nameless `json_schema` is a pydantic 400 on
+    // SGLang whichever lane sent it, so the CVM proxy repairs it too.
+    let expected_backend_body = serde_json::json!({
+        "messages": [{"role": "user", "content": "one word"}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "response_schema",
+                "schema": {"type": "object", "properties": {"word": {"type": "string"}}},
+                "strict": true
+            }
+        },
+        "stream": true,
+        "stream_options": {"include_usage": true},
+        "priority": 0
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_json(&expected_backend_body))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-rf",
+            "choices": [{"message": {"content": "{\"word\":\"ok\"}"}, "finish_reason": "stop"}]
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let request_body = serde_json::json!({
+        "messages": [{"role": "user", "content": "one word"}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "schema": {"type": "object", "properties": {"word": {"type": "string"}}},
+                "strict": true
+            }
+        }
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    // The mock expectation (body_json) verifies the backend received the named schema
+}
+
 /// Matches a chat body whose first assistant tool call carries exactly these
 /// plaintext `function.arguments`.
 struct FirstToolCallArguments(&'static str);
@@ -4519,6 +4797,313 @@ async fn test_streaming_signature_cached_and_verifiable() {
     let sig_hex = sig_body["signature"].as_str().unwrap();
     assert!(sig_hex.starts_with("0x"));
     assert_eq!(sig_hex.len(), 132); // 65 bytes hex + "0x"
+}
+
+// ---- Reasoning usage: usage.reasoning_tokens mirrored into completion_tokens_details ----
+
+/// SGLang's usage object: the reasoning count at the top level of `usage` and
+/// no `completion_tokens_details`.
+fn sglang_reasoning_usage() -> serde_json::Value {
+    serde_json::json!({
+        "prompt_tokens": 12,
+        "total_tokens": 62,
+        "completion_tokens": 50,
+        "prompt_tokens_details": null,
+        "reasoning_tokens": 42
+    })
+}
+
+/// An SGLang chat stream for a reasoning model: `usage: null` on the content
+/// chunks, then a final usage-only chunk shaped by `sglang_reasoning_usage`.
+fn sglang_reasoning_stream(id: &str) -> String {
+    let events = [
+        serde_json::json!({
+            "id": id, "object": "chat.completion.chunk", "created": 1, "model": "test-model",
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": null, "reasoning_content": "2+2"}, "finish_reason": null}],
+            "usage": null
+        }),
+        serde_json::json!({
+            "id": id, "object": "chat.completion.chunk", "created": 1, "model": "test-model",
+            "choices": [{"index": 0, "delta": {"content": "4"}, "finish_reason": "stop"}],
+            "usage": null
+        }),
+        serde_json::json!({
+            "id": id, "object": "chat.completion.chunk", "created": 1, "model": "test-model",
+            "choices": [],
+            "usage": sglang_reasoning_usage()
+        }),
+    ];
+    let mut body = String::new();
+    for event in events {
+        body.push_str("data: ");
+        body.push_str(&event.to_string());
+        body.push_str("\n\n");
+    }
+    body.push_str("data: [DONE]\n\n");
+    body
+}
+
+fn assert_reasoning_usage_mirrored(usage: &serde_json::Value) {
+    let mut expected = sglang_reasoning_usage();
+    expected["completion_tokens_details"] = serde_json::json!({"reasoning_tokens": 42});
+    assert_eq!(usage, &expected);
+}
+
+/// Fetch the ECDSA signature for `chat_id`, check that its text binds the
+/// request bytes and exactly the response bytes the client received, and that
+/// the EIP-191 signature recovers to the advertised signing address.
+async fn assert_ecdsa_signature_covers(
+    app: axum::Router,
+    chat_id: &str,
+    request_bytes: &[u8],
+    response_bytes: &[u8],
+) {
+    use k256::ecdsa::{RecoveryId, VerifyingKey};
+    use sha2::{Digest, Sha256};
+    use sha3::Keccak256;
+
+    let sig_response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/signature/{chat_id}?signing_algo=ecdsa"))
+                .header(auth_header().0, auth_header().1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sig_response.status(), StatusCode::OK);
+    let sig_body = body_to_json(sig_response).await;
+    let text = sig_body["text"].as_str().unwrap();
+    let signature_hex = sig_body["signature"].as_str().unwrap();
+    let signing_address = sig_body["signing_address"].as_str().unwrap();
+
+    let request_hash = hex::encode(Sha256::digest(request_bytes));
+    let response_hash = hex::encode(Sha256::digest(response_bytes));
+    assert_eq!(text, format!("test-model:{request_hash}:{response_hash}"));
+
+    let sig_bytes = hex::decode(&signature_hex[2..]).unwrap();
+    assert_eq!(sig_bytes.len(), 65);
+    let prefix = format!("\x19Ethereum Signed Message:\n{}", text.len());
+    let mut prefixed = prefix.into_bytes();
+    prefixed.extend_from_slice(text.as_bytes());
+    let msg_hash = Keccak256::digest(&prefixed);
+    let signature = k256::ecdsa::Signature::from_slice(&sig_bytes[..64]).unwrap();
+    let recovery_id = RecoveryId::from_byte(sig_bytes[64] - 27).unwrap();
+    let recovered_key =
+        VerifyingKey::recover_from_prehash(&msg_hash[..], &signature, recovery_id).unwrap();
+    let pk_encoded = recovered_key.to_encoded_point(false);
+    let addr_hash = Keccak256::digest(&pk_encoded.as_bytes()[1..]);
+    assert_eq!(
+        format!("0x{}", hex::encode(&addr_hash[12..32])),
+        signing_address
+    );
+}
+
+#[tokio::test]
+async fn test_non_streaming_reasoning_usage_mirrored_and_signed() {
+    // Non-streaming: the proxy streams from the engine internally and
+    // reassembles; the signed body must carry both usage fields. The mock uses
+    // `set_body_raw` because `set_body_string` forces `text/plain`, which would
+    // send the proxy down its plain-JSON branch instead of the reassembly.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            sglang_reasoning_stream("chatcmpl-reasoning-json"),
+            "text/event-stream",
+        ))
+        .mount(&mock_server)
+        .await;
+    let app = build_test_app(&mock_server.uri());
+
+    let request_bytes = serde_json::to_vec(&serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "2+2?"}]
+    }))
+    .unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(request_bytes.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_bytes = body_to_bytes(response).await;
+    let body: serde_json::Value = serde_json::from_slice(&response_bytes).unwrap();
+    assert_eq!(body["id"], "chatcmpl-reasoning-json");
+    assert_eq!(body["choices"][0]["message"]["content"], "4");
+    assert_reasoning_usage_mirrored(&body["usage"]);
+
+    assert_ecdsa_signature_covers(
+        app,
+        "chatcmpl-reasoning-json",
+        &request_bytes,
+        &response_bytes,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_non_streaming_plain_json_reasoning_usage_mirrored_and_signed() {
+    // An engine that ignores the injected `stream: true` and answers with one
+    // JSON object takes the plain-JSON branch; same result.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-reasoning-plain",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "4", "reasoning_content": "2+2"},
+                "finish_reason": "stop"
+            }],
+            "usage": sglang_reasoning_usage()
+        })))
+        .mount(&mock_server)
+        .await;
+    let app = build_test_app(&mock_server.uri());
+
+    let request_bytes = serde_json::to_vec(&serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "2+2?"}]
+    }))
+    .unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(request_bytes.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_bytes = body_to_bytes(response).await;
+    let body: serde_json::Value = serde_json::from_slice(&response_bytes).unwrap();
+    assert_reasoning_usage_mirrored(&body["usage"]);
+
+    assert_ecdsa_signature_covers(
+        app,
+        "chatcmpl-reasoning-plain",
+        &request_bytes,
+        &response_bytes,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_streaming_reasoning_usage_mirrored_and_signed() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            sglang_reasoning_stream("chatcmpl-reasoning-stream"),
+            "text/event-stream",
+        ))
+        .mount(&mock_server)
+        .await;
+    let app = build_test_app(&mock_server.uri());
+
+    let request_bytes = serde_json::to_vec(&serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "2+2?"}],
+        "stream": true,
+        "stream_options": {"include_usage": true}
+    }))
+    .unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(request_bytes.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let stream_bytes = body_to_bytes(response).await;
+    let stream = String::from_utf8(stream_bytes.clone()).unwrap();
+    let events: Vec<serde_json::Value> = stream
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect();
+    assert_eq!(events.len(), 3, "{stream}");
+    // Content chunks keep their `usage: null`.
+    assert_eq!(events[0].get("usage"), Some(&serde_json::Value::Null));
+    assert_eq!(events[1].get("usage"), Some(&serde_json::Value::Null));
+    assert_reasoning_usage_mirrored(&events[2]["usage"]);
+
+    // The background task signs once the stream is consumed.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_ecdsa_signature_covers(
+        app,
+        "chatcmpl-reasoning-stream",
+        &request_bytes,
+        &stream_bytes,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_embeddings_usage_gets_no_completion_tokens_details() {
+    // Only completion usage is mirrored: an embeddings body stays as the engine sent it.
+    let engine_usage = serde_json::json!({
+        "prompt_tokens": 3,
+        "total_tokens": 3,
+        "completion_tokens": 0,
+        "prompt_tokens_details": null,
+        "reasoning_tokens": 0
+    });
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "emb-reasoning",
+            "object": "list",
+            "model": "test-model",
+            "data": [{"object": "embedding", "embedding": [0.1, 0.2], "index": 0}],
+            "usage": engine_usage.clone()
+        })))
+        .mount(&mock_server)
+        .await;
+    let app = build_test_app(&mock_server.uri());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(r#"{"input":"test","model":"test-model"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response).await;
+    assert_eq!(body["usage"], engine_usage);
 }
 
 // ---- Internal endpoints (delegate proxy) ----
@@ -5350,6 +5935,7 @@ fn build_test_app_with_cloud_api_retries(
     let base = mock_url.trim_end_matches('/');
 
     let config = config::Config {
+        replica_state: None,
         model_name: "test-model".to_string(),
         tokens: vec!["test-token".to_string()],
         vllm_base_url: mock_url.to_string(),
@@ -5431,6 +6017,7 @@ fn build_test_app_with_cloud_api_retries(
         rejected_content_part_types: Vec::new(),
         models_document_url: None,
         capacity_requests_per_minute: 0,
+        discount_to_user: None,
         reasoning_off_effort: "none".to_string(),
         allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,
@@ -5442,12 +6029,14 @@ fn build_test_app_with_cloud_api_retries(
         admission_ramp_interval_secs: 1800,
         admission_ttft_p95_max_ms: 30_000,
         admission_backpressure_secs: 10,
+        admission_queue_saturated_at: 1,
         admission_retry_after_secs: 2,
         backend_connect_failover: false,
         backend_probe_urls: Vec::new(),
         backend_long_context_urls: Vec::new(),
         backend_long_context_probe_urls: Vec::new(),
         long_context_above_tokens: 0,
+        backend_tier_strict: false,
         backend_probe_interval_secs: 2,
         dstack_socket_path: "/var/run/dstack.sock".to_string(),
         gpu_evidence_delegate_url: None,
@@ -7651,10 +8240,10 @@ async fn test_encrypted_streaming_completions_ed25519() {
     }
 }
 
-// ---- Multipart: signature covers encrypted response ----
+// ---- Multipart: signature covers raw request and encrypted response ----
 
 #[tokio::test]
-async fn test_encrypted_audio_transcription_signature_covers_transformed() {
+async fn test_encrypted_audio_transcription_signature_hashes_raw_request_and_response() {
     use sha2::{Digest, Sha256};
     use vllm_proxy_rs::encryption;
 
@@ -7759,15 +8348,14 @@ async fn test_encrypted_audio_transcription_signature_covers_transformed() {
     let sig_body = body_to_json(sig_response).await;
     let signed_text = sig_body["text"].as_str().unwrap();
 
-    // Verify response hash in the signature covers the encrypted response
-    let response_sha256 = hex::encode(Sha256::digest(&response_bytes));
-
-    let parts: Vec<&str> = signed_text.split(':').collect();
-    assert_eq!(parts.len(), 3);
-    assert_eq!(parts[0], "test-model");
+    let request_bytes = format!("whisper-1{encrypted_prompt}fakeaudiodata");
     assert_eq!(
-        parts[2], response_sha256,
-        "Multipart signature should cover encrypted response bytes (what client receives)"
+        signed_text,
+        format!(
+            "test-model:{}:{}",
+            hex::encode(Sha256::digest(request_bytes)),
+            hex::encode(Sha256::digest(&response_bytes))
+        )
     );
 }
 
@@ -7986,6 +8574,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
     ];
 
     let config = config::Config {
+        replica_state: None,
         model_name: "test-model".to_string(),
         tokens: vec!["test-token".to_string()],
         vllm_base_url: mock_url.to_string(),
@@ -8065,6 +8654,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         rejected_content_part_types: Vec::new(),
         models_document_url: None,
         capacity_requests_per_minute: 0,
+        discount_to_user: None,
         reasoning_off_effort: "none".to_string(),
         allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,
@@ -8076,12 +8666,14 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         admission_ramp_interval_secs: 1800,
         admission_ttft_p95_max_ms: 30_000,
         admission_backpressure_secs: 10,
+        admission_queue_saturated_at: 1,
         admission_retry_after_secs: 2,
         backend_connect_failover: false,
         backend_probe_urls: Vec::new(),
         backend_long_context_urls: Vec::new(),
         backend_long_context_probe_urls: Vec::new(),
         long_context_above_tokens: 0,
+        backend_tier_strict: false,
         backend_probe_interval_secs: 2,
         dstack_socket_path: "/var/run/dstack.sock".to_string(),
         gpu_evidence_delegate_url: None,
@@ -8445,6 +9037,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
     let port = listener.local_addr().unwrap().port();
 
     let config = config::Config {
+        replica_state: None,
         model_name: "test-model".to_string(),
         tokens: vec!["test-token".to_string()],
         vllm_base_url: mock_url.to_string(),
@@ -8524,6 +9117,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         rejected_content_part_types: Vec::new(),
         models_document_url: None,
         capacity_requests_per_minute: 0,
+        discount_to_user: None,
         reasoning_off_effort: "none".to_string(),
         allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,
@@ -8535,12 +9129,14 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         admission_ramp_interval_secs: 1800,
         admission_ttft_p95_max_ms: 30_000,
         admission_backpressure_secs: 10,
+        admission_queue_saturated_at: 1,
         admission_retry_after_secs: 2,
         backend_connect_failover: false,
         backend_probe_urls: Vec::new(),
         backend_long_context_urls: Vec::new(),
         backend_long_context_probe_urls: Vec::new(),
         long_context_above_tokens: 0,
+        backend_tier_strict: false,
         backend_probe_interval_secs: 2,
         dstack_socket_path: "/var/run/dstack.sock".to_string(),
         gpu_evidence_delegate_url: None,

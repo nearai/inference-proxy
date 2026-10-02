@@ -47,6 +47,7 @@ async fn direct_privacy_classify_reports_nested_input_usage() {
         TestAppOptions {
             cloud_api_url: Some(cloud_api.uri()),
             dstack_socket_path: None,
+            ..Default::default()
         },
     );
     let response = app

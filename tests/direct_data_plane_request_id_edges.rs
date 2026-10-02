@@ -137,6 +137,7 @@ async fn public_cloud_api_key_tenant_headers_are_not_forwarded() {
         TestAppOptions {
             cloud_api_url: Some(cloud_api.uri()),
             dstack_socket_path: None,
+            ..Default::default()
         },
     );
     let response = app

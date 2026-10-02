@@ -329,6 +329,10 @@ pub struct UsageReporter {
     pub org_id: Option<String>,
     pub workspace_id: Option<String>,
     pub api_key_id: Option<String>,
+    /// The deployment's `discount_to_user` (`VLLM_PROXY_DISCOUNT_TO_USER`),
+    /// sent on every report so cloud-api bills the price the models document
+    /// publishes. `None` = list price, and the field is not sent.
+    pub discount_to_user: Option<f64>,
     /// Safe correlation context for logs and the Cloud API request. None of
     /// these values are emitted as metric labels.
     pub request_id: Option<String>,
@@ -497,6 +501,7 @@ pub fn make_usage_reporter(
         org_id: auth.org_id.clone(),
         workspace_id: auth.workspace_id.clone(),
         api_key_id: auth.api_key_id.clone(),
+        discount_to_user: state.config.discount_to_user,
         request_id: auth.request_id.clone(),
         request_source: auth.request_source,
     })
@@ -689,10 +694,9 @@ pub(crate) fn report_chat_usage_if_present(
 /// already produced. The caller keeps signing/caching gated on clean completion;
 /// a partial response cannot be verified, but it was still billed.
 ///
-/// Shared by `proxy_streaming_request` and `proxy_streaming_response` so both
-/// streaming paths bill identically. The reporter only exists for direct `sk-`
-/// requests (`RequireAuth.cloud_api_key`); cloud-api's own `InterceptStream` is
-/// not in that path, so this is the sole biller and there is no double-billing.
+/// The reporter only exists for direct `sk-` requests
+/// (`RequireAuth.cloud_api_key`); cloud-api's own `InterceptStream` is not in
+/// that path, so this is the sole biller and there is no double-billing.
 fn report_stream_usage_on_finalize(
     usage_reporter: &Option<UsageReporter>,
     usage: Option<((i64, i64), Option<i64>)>,
@@ -738,6 +742,45 @@ fn report_stream_usage_on_finalize(
     }
 }
 
+/// Complete a usage event for cloud-api's `/v1/internal/usage`: the subject
+/// identity it attributes the usage to (`organization_id`, `workspace_id`,
+/// `api_key_id`) and, when the deployment has one, the top-level
+/// `discount_to_user` it bills at, the same value `/v1/models` publishes.
+/// Pure (no I/O) so it can be unit-tested. `spawn_usage_report` calls it only
+/// after `service_path_unavailable_reason` confirmed all three identity fields
+/// are present. A body that is not a JSON object is left untouched and its
+/// JSON kind returned, so the caller can drop it.
+fn complete_usage_body(
+    reporter: &UsageReporter,
+    body: &mut serde_json::Value,
+) -> Result<(), &'static str> {
+    let map = match body {
+        serde_json::Value::Object(map) => map,
+        serde_json::Value::Null => return Err("null"),
+        serde_json::Value::Bool(_) => return Err("bool"),
+        serde_json::Value::Number(_) => return Err("number"),
+        serde_json::Value::String(_) => return Err("string"),
+        serde_json::Value::Array(_) => return Err("array"),
+    };
+    let identity = [
+        ("organization_id", &reporter.org_id),
+        ("workspace_id", &reporter.workspace_id),
+        ("api_key_id", &reporter.api_key_id),
+    ];
+    for (field, value) in identity {
+        if let Some(value) = value {
+            map.insert(field.to_string(), serde_json::Value::String(value.clone()));
+        }
+    }
+    if let Some(discount) = reporter.discount_to_user {
+        map.insert(
+            "discount_to_user".to_string(),
+            serde_json::Value::from(discount),
+        );
+    }
+    Ok(())
+}
+
 /// Fire-and-forget POST of a usage event to cloud-api's `/v1/internal/usage`
 /// (service-token authenticated). The legacy `sk-`-authenticated `/v1/usage`
 /// endpoint has been removed from cloud-api, so when the service-token path is
@@ -768,52 +811,27 @@ pub(crate) fn spawn_usage_report(reporter: &UsageReporter, mut body: serde_json:
         return;
     }
 
-    // Inject subject identity into the body. Cloud-api's `/v1/internal/usage`
-    // handler reads these to attribute the usage.
-    match &mut body {
-        serde_json::Value::Object(map) => {
-            // `unwrap` is fine — all three `Option`s are checked by
-            // `can_use_service_token_path` above.
-            map.insert(
-                "organization_id".to_string(),
-                serde_json::Value::String(reporter.org_id.clone().unwrap()),
-            );
-            map.insert(
-                "workspace_id".to_string(),
-                serde_json::Value::String(reporter.workspace_id.clone().unwrap()),
-            );
-            map.insert(
-                "api_key_id".to_string(),
-                serde_json::Value::String(reporter.api_key_id.clone().unwrap()),
-            );
-        }
-        other => {
-            record_usage_report_outcome(reporter, UsageReportOutcome::InvalidBody, None);
-            // Today every call site builds the body via `serde_json::json!({…})`
-            // so it's always an object. Guard against a future caller passing
-            // something else: drop the report rather than send un-attributable
-            // bytes to cloud-api, which would silently fail to write a usage row.
-            warn!(
-                body_kind = %match other {
-                    serde_json::Value::Null => "null",
-                    serde_json::Value::Bool(_) => "bool",
-                    serde_json::Value::Number(_) => "number",
-                    serde_json::Value::String(_) => "string",
-                    serde_json::Value::Array(_) => "array",
-                    serde_json::Value::Object(_) => unreachable!(),
-                },
-                request_id = %reporter.request_id.as_deref().unwrap_or(""),
-                org_id = %reporter.org_id.as_deref().unwrap_or(""),
-                workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
-                api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
-                model = %reporter.model_name,
-                auth_path = reporter.request_source.auth_path.as_label(),
-                ingress_route = reporter.request_source.ingress_route.as_label(),
-                "Skipping usage report: body is not a JSON object — identity fields \
-                 can't be injected, refusing to send unattributable report"
-            );
-            return;
-        }
+    // Add the subject identity cloud-api's `/v1/internal/usage` handler
+    // attributes the usage to, and the configured discount.
+    if let Err(body_kind) = complete_usage_body(reporter, &mut body) {
+        record_usage_report_outcome(reporter, UsageReportOutcome::InvalidBody, None);
+        // Today every call site builds the body via `serde_json::json!({…})`
+        // so it's always an object. Guard against a future caller passing
+        // something else: drop the report rather than send un-attributable
+        // bytes to cloud-api, which would silently fail to write a usage row.
+        warn!(
+            body_kind = %body_kind,
+            request_id = %reporter.request_id.as_deref().unwrap_or(""),
+            org_id = %reporter.org_id.as_deref().unwrap_or(""),
+            workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
+            api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
+            model = %reporter.model_name,
+            auth_path = reporter.request_source.auth_path.as_label(),
+            ingress_route = reporter.request_source.ingress_route.as_label(),
+            "Skipping usage report: body is not a JSON object — identity fields \
+             can't be injected, refusing to send unattributable report"
+        );
+        return;
     }
 
     let client = reporter.http_client.clone();
@@ -1070,6 +1088,14 @@ pub struct ConnectFailover {
     /// Context tier the replacement must belong to (`None` = the whole pool,
     /// see `context_tier.rs`).
     pub tier: Option<crate::context_tier::ContextTier>,
+    /// `Config::backend_tier_strict`: whether `tier` is re-resolved
+    /// (`context_tier::recheck_restriction`) to `None` once it empties, or
+    /// stays pinned so an empty tier is refused instead.
+    pub strict: bool,
+    /// `Config::admission_retry_after_secs`: `Retry-After` for the 503
+    /// `AppError::tier_unavailable` refusal below, when admission is off and
+    /// there is no `Permit` to carry it instead.
+    pub retry_after_secs: u64,
     /// Conversation to re-pin onto the replacement backend once it answers.
     pub affinity: Option<(
         Arc<crate::backend_affinity::BackendConversationAffinity>,
@@ -1159,13 +1185,15 @@ async fn send_upstream(
     let response = match first {
         Ok(response) => response,
         Err(error) if error.is_connect() && opts.connect_failover.is_some() => {
-            let (pool, path, failed, tier, affinity) = {
+            let (pool, path, failed, tier, strict, retry_after_secs, affinity) = {
                 let failover = opts.connect_failover.as_ref().expect("checked above");
                 (
                     failover.pool.clone(),
                     failover.path,
                     failover.index,
                     failover.tier,
+                    failover.strict,
+                    failover.retry_after_secs,
                     failover.affinity.clone(),
                 )
             };
@@ -1182,8 +1210,11 @@ async fn send_upstream(
             }
             // The failed host may have been its tier's last one: re-resolve
             // the restriction now that it is out of the rotation, so the
-            // request falls back to the other tier instead of being refused.
-            let tier = tier.and_then(|tier| crate::context_tier::recheck_restriction(&pool, tier));
+            // request falls back to the other tier instead of being refused
+            // (non-strict). Strict mode never lifts it (see
+            // `recheck_restriction`); the check below refuses instead.
+            let tier =
+                tier.and_then(|tier| crate::context_tier::recheck_restriction(&pool, tier, strict));
             // Re-resolve destination limits after failure. Borrowing keeps
             // configured host counts; legacy mode follows healthy counts.
             let limits = opts
@@ -1208,6 +1239,38 @@ async fn send_upstream(
                 pool.select_excluding(failed, &policy)
             };
             let Some(next) = next else {
+                // Strict mode kept `tier` pinned above even though it is now
+                // empty: a healthy host elsewhere in the pool is not
+                // somewhere this request may go. Refuse deterministically
+                // rather than falling through to the generic host-share or
+                // exhausted cases below, which would either misreport the
+                // reason or (admission off) return a 502 that counts against
+                // upstream uptime the way a 429/503 does not.
+                //
+                // Gated on `strict` explicitly, not just on `tier` being
+                // `Some`: non-strict already lifts `tier` to `None` above
+                // whenever `recheck_restriction` saw the tier empty, but a
+                // concurrent request can empty it again between that check
+                // and `select_excluding` above, which would otherwise trip
+                // this block in non-strict mode too and refuse instead of
+                // falling through to the pre-existing host-share/exhausted
+                // handling below.
+                if strict && tier.is_some_and(|t| pool.healthy_count_in(Some(t)) == 0) {
+                    metrics::counter!("backend_failover_total", "outcome" => "refused")
+                        .increment(1);
+                    warn!(
+                        tier = tier.map_or("none", crate::context_tier::ContextTier::as_str),
+                        backend = %sanitized_upstream_url_for_logs(url),
+                        "Context tier has no healthy backend after fail-over, refusing"
+                    );
+                    return Err(match opts.admission.as_ref() {
+                        Some(permit) => {
+                            permit.abandon();
+                            AppError::from(permit.reject_tier_unavailable())
+                        }
+                        None => AppError::tier_unavailable(retry_after_secs),
+                    });
+                }
                 if pool.has_healthy_other_than(failed) {
                     if let Some(permit) = opts.admission.as_ref() {
                         // Somewhere to go, but every candidate is at its share
@@ -1744,6 +1807,13 @@ pub async fn proxy_json_request(
                 obj.insert("id".to_string(), serde_json::Value::String(id));
             }
         }
+        // Completion usage only: embeddings, rerank, score and image bodies
+        // also land here and stay exactly as the engine sent them.
+        if matches!(opts.usage_type, UsageType::ChatCompletion) {
+            if let Some(usage) = data.get_mut("usage") {
+                mirror_reasoning_usage(usage);
+            }
+        }
         data
     };
 
@@ -2131,7 +2201,8 @@ impl StreamingResponseAssembler {
         if let Some(created) = self.created {
             resp["created"] = created.into();
         }
-        if let Some(usage) = self.usage {
+        if let Some(mut usage) = self.usage {
+            mirror_reasoning_usage(&mut usage);
             resp["usage"] = usage;
         }
         if let Some(metadata) = self.metadata {
@@ -2920,12 +2991,55 @@ pub async fn proxy_streaming_request(
         .unwrap())
 }
 
+/// Copy the engine's top-level `usage.reasoning_tokens` into
+/// `usage.completion_tokens_details.reasoning_tokens`, where OpenAI's usage
+/// object puts it and where OpenAI-compatible clients and SDKs read it. SGLang
+/// reports the count only at the top level, so those clients otherwise see
+/// none.
+///
+/// Additive, and it never invents a count:
+/// - it acts only when the top-level `reasoning_tokens` is a non-negative
+///   integer (`0` is a real count and is mirrored as `0`); when it is absent,
+///   null, negative, fractional or not a number, `usage` is left untouched;
+/// - the top-level `reasoning_tokens` stays for existing readers;
+/// - a missing `completion_tokens_details` is created as
+///   `{"reasoning_tokens": n}`; an existing object gains `reasoning_tokens`
+///   only when it has none, so a provider's own value is never overwritten;
+///   a `completion_tokens_details` that is not an object is left alone.
+///
+/// Every caller runs it before the response is hashed and signed, so the
+/// signature covers the bytes that carry both fields.
+pub(crate) fn mirror_reasoning_usage(usage: &mut serde_json::Value) {
+    let Some(usage) = usage.as_object_mut() else {
+        return;
+    };
+    let Some(reasoning_tokens) = usage.get("reasoning_tokens").and_then(|v| v.as_u64()) else {
+        return;
+    };
+    let details = usage
+        .entry("completion_tokens_details")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let Some(details) = details.as_object_mut() {
+        details
+            .entry("reasoning_tokens")
+            .or_insert_with(|| serde_json::Value::from(reasoning_tokens));
+    }
+}
+
 /// Normalize OpenAI-compat chat completion streaming chunks emitted by upstream
 /// reasoning parsers that use the non-standard `delta.reasoning` field
 /// (vLLM `qwen3` parser as of v0.10) so downstream clients see the standard
 /// `delta.reasoning_content` field consistently across reasoning models.
 /// If both fields are present the existing `reasoning_content` is kept.
+///
+/// A chunk that carries a `usage` object (the final usage chunk, or every
+/// chunk with `continuous_usage_stats`) also gets its reasoning count mirrored
+/// into `completion_tokens_details` (see [`mirror_reasoning_usage`]);
+/// `usage: null` is left as is.
 pub(crate) fn normalize_chat_chunk(val: &mut serde_json::Value) {
+    if let Some(usage) = val.get_mut("usage") {
+        mirror_reasoning_usage(usage);
+    }
     let Some(choices) = val.get_mut("choices").and_then(|c| c.as_array_mut()) else {
         return;
     };
@@ -2942,7 +3056,8 @@ pub(crate) fn normalize_chat_chunk(val: &mut serde_json::Value) {
 }
 
 /// Line-buffered SSE transformer that handles data split across chunk boundaries.
-/// Always normalizes chat completion chunks (`delta.reasoning` → `delta.reasoning_content`)
+/// Always normalizes chat completion chunks (`delta.reasoning` → `delta.reasoning_content`,
+/// reasoning count mirrored into `usage.completion_tokens_details`)
 /// and optionally applies an additional transform (e.g. encryption).
 /// Fail-closed: if a data line contains JSON that cannot be transformed, the stream errors.
 struct SseTransformer {
@@ -3206,7 +3321,7 @@ pub(crate) struct CompletionContext {
 }
 
 /// Sign already-fetched JSON response bytes, cache the signature, and return a JSON response.
-/// Used by catch-all and Fusion when content-type is already known to be JSON.
+/// Used by Fusion and privacy classification after they assemble the upstream body.
 pub(crate) async fn sign_and_cache_json_response(
     response_bytes: &[u8],
     request_sha256: &str,
@@ -3288,260 +3403,6 @@ pub(crate) async fn sign_and_cache_json_response(
         .status(status)
         .header("content-type", "application/json")
         .body(Body::from(final_body))
-        .unwrap())
-}
-
-/// Proxy an already-received streaming SSE response. Hashes all chunks, signs at end, caches.
-/// Used by catch-all when content-type is already known to be SSE.
-pub async fn proxy_streaming_response(
-    response: reqwest::Response,
-    request_sha256: &str,
-    opts: ProxyOpts,
-    status: StatusCode,
-    request_started_at: std::time::Instant,
-) -> Result<Response, AppError> {
-    // Capture log fields before any partial moves from opts.
-    let (log_request_id, log_org_id, log_workspace_id) = log_ids_or_empty(&opts.tracing_ids);
-    let completion_tracing_ids = opts.tracing_ids.clone();
-
-    let signing = opts.signing.clone();
-    let cache = opts.cache.clone();
-    let usage_reporter = opts.usage_reporter.clone();
-    let model_name = opts.model_name.clone();
-    let chunk_transform = opts.chunk_transform;
-    let backend_guard = opts.backend_guard;
-    let stream_idle_timeout_secs = opts.stream_idle_timeout_secs;
-    let request_sha256 = request_sha256.to_string();
-
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
-
-    let byte_stream = response.bytes_stream();
-    tokio::spawn(async move {
-        use futures_util::StreamExt;
-
-        let _guard = StreamingGuard::new();
-        let _backend_guard = backend_guard;
-
-        let mut byte_stream = std::pin::pin!(byte_stream);
-        let mut hasher = Sha256::new();
-        let mut parser = SseParser::new();
-        let mut upstream_error = false;
-        let mut downstream_closed = false;
-        let mut incomplete_reason = None;
-        let mut received_upstream_progress = false;
-        let mut transformer = SseTransformer::new(chunk_transform);
-
-        loop {
-            tokio::select! {
-                chunk = byte_stream.next() => {
-                    match chunk {
-                        Some(Ok(chunk)) => {
-                            received_upstream_progress |= parser.process_chunk(&chunk);
-
-                            // Normalize (and encrypt, if active) the chunk, then hash
-                            // what the client actually receives for signatures.
-                            let to_send = match transformer.process_chunk(&chunk) {
-                                Ok(transformed) => transformed,
-                                Err(e) => {
-                                    error!(error = %e, "Stream transform failed");
-                                    let _ = tx.send(Err(std::io::Error::other(
-                                        "Stream transform failed",
-                                    ))).await;
-                                    upstream_error = true;
-                                    incomplete_reason = Some("transform_error");
-                                    break;
-                                }
-                            };
-
-                            hasher.update(&to_send);
-
-                            if tx.send(Ok(to_send)).await.is_err() {
-                                downstream_closed = true;
-                                break;
-                            }
-                        }
-                        Some(Err(e)) => {
-                            error!(error = %e, "Error reading upstream stream");
-                            upstream_error = true;
-                            incomplete_reason = Some("upstream_read_error");
-                            let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
-                            break;
-                        }
-                        None => break, // stream ended
-                    }
-                }
-                _ = tx.closed() => {
-                    info!("Client disconnected, aborting upstream stream processing");
-                    downstream_closed = true;
-                    break;
-                }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(
-                    stream_idle_timeout_secs,
-                )), if stream_idle_timeout_secs > 0 && received_upstream_progress => {
-                    warn!(
-                        request_id = %log_request_id,
-                        org_id = %log_org_id,
-                        workspace_id = %log_workspace_id,
-                        model = %model_name.to_lowercase(),
-                        timeout_secs = stream_idle_timeout_secs,
-                        "Upstream SSE stream exceeded the idle timeout"
-                    );
-                    upstream_error = true;
-                    incomplete_reason = Some("idle_timeout");
-                    let _ = tx.send(Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "Upstream response stream timed out",
-                    ))).await;
-                    break;
-                }
-            }
-        }
-
-        parser.finish();
-
-        // Flush any remaining buffered content in the transformer
-        if !upstream_error && !downstream_closed {
-            match transformer.flush() {
-                Ok(flushed) if !flushed.is_empty() => {
-                    hasher.update(&flushed);
-                    if tx.send(Ok(flushed)).await.is_err() {
-                        downstream_closed = true;
-                    }
-                }
-                Err(e) => {
-                    error!(error = %e, "Stream transform flush failed");
-                    let _ = tx
-                        .send(Err(std::io::Error::other("Stream transform failed")))
-                        .await;
-                    upstream_error = true;
-                    incomplete_reason = Some("transform_error");
-                }
-                _ => {}
-            }
-        }
-
-        if stream_idle_timeout_secs > 0
-            && !upstream_error
-            && !downstream_closed
-            && !parser.seen_done
-        {
-            incomplete_reason = Some("missing_done");
-            let _ = tx
-                .send(Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "Upstream response stream ended before [DONE]",
-                )))
-                .await;
-        }
-
-        let completed_cleanly = !upstream_error && !downstream_closed && parser.seen_done;
-        if !completed_cleanly && !downstream_closed {
-            let reason = incomplete_reason.unwrap_or("missing_done");
-            metrics::counter!(
-                "upstream_stream_incomplete_total",
-                "reason" => reason,
-                "mode" => "streaming_response",
-                "tenant_context" => tenant_context_label(opts.tracing_ids.as_ref())
-            )
-            .increment(1);
-            warn!(
-                request_id = %log_request_id,
-                org_id = %log_org_id,
-                workspace_id = %log_workspace_id,
-                chat_id = parser.chat_id.as_deref().unwrap_or(""),
-                model = %model_name.to_lowercase(),
-                reason,
-                mode = "streaming_response",
-                "Upstream stream did not complete"
-            );
-        } else if completed_cleanly && parser.finish_reason.is_none() {
-            metrics::counter!(
-                "upstream_stream_incomplete_total",
-                "reason" => "missing_finish_reason",
-                "mode" => "streaming_response",
-                "tenant_context" => tenant_context_label(opts.tracing_ids.as_ref())
-            )
-            .increment(1);
-            warn!(
-                request_id = %log_request_id,
-                org_id = %log_org_id,
-                workspace_id = %log_workspace_id,
-                chat_id = parser.chat_id.as_deref().unwrap_or(""),
-                model = %model_name.to_lowercase(),
-                mode = "streaming_response",
-                "Upstream stream terminated without declaring a finish reason"
-            );
-        }
-
-        // Bill for tokens already produced even on an interrupted stream
-        // (nearai/infra#98). Shared with proxy_streaming_request so both
-        // streaming proxy paths have identical billing semantics. This path is
-        // reachable from the authenticated catch-all SSE proxy. Signing/caching
-        // stays gated on a clean [DONE] below.
-        report_stream_usage_on_finalize(
-            &usage_reporter,
-            parser.usage.map(|usage| (usage, parser.cached_tokens)),
-            parser.chat_id.as_deref(),
-            completed_cleanly,
-            &log_request_id,
-            &log_org_id,
-            &log_workspace_id,
-        );
-
-        if completed_cleanly {
-            let response_sha256 = hex::encode(hasher.finalize());
-            if let Some(ref id) = parser.chat_id {
-                let text = format!("{model_name}:{request_sha256}:{response_sha256}");
-                let signature_cached = match signing.sign_chat(&text) {
-                    Ok(signed) => match serde_json::to_string(&signed) {
-                        Ok(signed_json) => {
-                            cache.set_chat(id, &signed_json);
-                            true
-                        }
-                        Err(e) => {
-                            error!(error = %e, "Failed to serialize streaming signature");
-                            false
-                        }
-                    },
-                    Err(e) => {
-                        error!(error = %e, "Signing failed for streaming response");
-                        false
-                    }
-                };
-
-                if signature_cached {
-                    let (input_tokens, output_tokens) = parser.usage.unwrap_or((0, 0));
-                    record_completed_request(
-                        completion_tracing_ids.as_ref(),
-                        &model_name,
-                        id,
-                        input_tokens,
-                        output_tokens,
-                        request_started_at.elapsed(),
-                        "streaming_response",
-                    );
-                }
-            } else {
-                error!("Chat id could not be extracted from the completed streaming response");
-            }
-        } else {
-            info!(
-                upstream_error,
-                downstream_closed,
-                seen_done = parser.seen_done,
-                "Skipping streaming signature cache: stream did not complete cleanly"
-            );
-        }
-    });
-
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    let body = Body::from_stream(stream);
-
-    Ok(Response::builder()
-        .status(status)
-        .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
-        .body(body)
         .unwrap())
 }
 
@@ -3931,6 +3792,7 @@ mod tests {
             org_id: org_id.map(String::from),
             workspace_id: workspace_id.map(String::from),
             api_key_id: api_key_id.map(String::from),
+            discount_to_user: None,
             request_id: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
             request_source: RequestSource {
                 auth_path: AuthPath::CloudApiKey,
@@ -3970,6 +3832,65 @@ mod tests {
 
         // Nothing configured: reporting is skipped.
         assert!(!reporter_with(None, None, None, None).can_use_service_token_path());
+    }
+
+    #[test]
+    fn complete_usage_body_adds_identity_and_the_configured_discount() {
+        let usage = || {
+            build_usage_body(
+                &UsageType::ChatCompletion,
+                &serde_json::json!({"usage": {"prompt_tokens": 12, "completion_tokens": 7}}),
+                "test-model",
+                "chatcmpl-1",
+            )
+            .unwrap()
+        };
+        let mut reporter = reporter_with(Some("tok"), Some("org"), Some("ws"), Some("key"));
+
+        // No discount configured: identity only, no `discount_to_user` at all.
+        let mut body = usage();
+        complete_usage_body(&reporter, &mut body).unwrap();
+        assert_eq!(body["organization_id"], "org");
+        assert_eq!(body["workspace_id"], "ws");
+        assert_eq!(body["api_key_id"], "key");
+        assert!(body.get("discount_to_user").is_none(), "{body}");
+
+        // Configured: a top-level JSON number next to the identity, and the
+        // usage itself untouched (cloud-api applies it after pricing).
+        reporter.discount_to_user = Some(0.15);
+        let mut body = usage();
+        complete_usage_body(&reporter, &mut body).unwrap();
+        assert_eq!(body["organization_id"], "org");
+        assert_eq!(body["workspace_id"], "ws");
+        assert_eq!(body["api_key_id"], "key");
+        assert!(body["discount_to_user"].is_f64(), "{body}");
+        assert_eq!(body["discount_to_user"].as_f64(), Some(0.15));
+        assert_eq!(body["input_tokens"], 12);
+        assert_eq!(body["output_tokens"], 7);
+        assert_eq!(body["id"], "chatcmpl-1");
+        assert!(
+            serde_json::to_string(&body)
+                .unwrap()
+                .contains(r#""discount_to_user":0.15"#),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn complete_usage_body_refuses_a_body_that_is_not_an_object() {
+        let mut reporter = reporter_with(Some("tok"), Some("org"), Some("ws"), Some("key"));
+        reporter.discount_to_user = Some(0.15);
+        for (mut body, kind) in [
+            (serde_json::Value::Null, "null"),
+            (serde_json::json!(true), "bool"),
+            (serde_json::json!(1), "number"),
+            (serde_json::json!("usage"), "string"),
+            (serde_json::json!([]), "array"),
+        ] {
+            let before = body.clone();
+            assert_eq!(complete_usage_body(&reporter, &mut body), Err(kind));
+            assert_eq!(body, before, "a refused body is left untouched");
+        }
     }
 
     #[test]
@@ -4390,49 +4311,78 @@ mod tests {
         );
     }
 
-    async fn raw_sse_response(body: Option<&'static str>, hold_open: bool) -> reqwest::Response {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn assert_streaming_post(socket: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+
+        let mut request = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0_u8; 1024];
+            let read = socket.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "client closed before sending request headers");
+            request.extend_from_slice(&chunk[..read]);
+            assert!(request.len() <= 16 * 1024, "test request headers too large");
+            if let Some(offset) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break offset + 4;
+            }
+        };
+
+        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+        assert!(headers.starts_with("POST / HTTP/1.1\r\n"));
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .expect("native proxy request must include content-length");
+        while request.len() < header_end + content_length {
+            let mut chunk = [0_u8; 1024];
+            let read = socket.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "client closed before sending request body");
+            request.extend_from_slice(&chunk[..read]);
+        }
+        let body: serde_json::Value =
+            serde_json::from_slice(&request[header_end..header_end + content_length]).unwrap();
+        assert_eq!(
+            body.get("model").and_then(|value| value.as_str()),
+            Some("test-model")
+        );
+        assert_eq!(body.get("stream"), Some(&serde_json::Value::Bool(true)));
+    }
+
+    async fn raw_sse_server_url(body: &'static str) -> String {
+        use tokio::io::AsyncWriteExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 2048];
-            let _ = socket.read(&mut request).await;
+            assert_streaming_post(&mut socket).await;
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
                 )
                 .await
                 .unwrap();
-            if let Some(body) = body {
-                let encoded = format!("{:X}\r\n{}\r\n0\r\n\r\n", body.len(), body);
-                socket.write_all(encoded.as_bytes()).await.unwrap();
-            }
-            if hold_open {
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            }
+            let encoded = format!("{:X}\r\n{}\r\n0\r\n\r\n", body.len(), body);
+            socket.write_all(encoded.as_bytes()).await.unwrap();
         });
 
-        reqwest::Client::new()
-            .get(format!("http://{address}"))
-            .send()
-            .await
-            .unwrap()
+        format!("http://{address}")
     }
 
     async fn delayed_sse_server_url(
         body: &'static str,
         initial_delay: std::time::Duration,
     ) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 2048];
-            let _ = socket.read(&mut request).await;
+            assert_streaming_post(&mut socket).await;
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
@@ -4447,29 +4397,17 @@ mod tests {
         format!("http://{address}")
     }
 
-    async fn delayed_sse_response(
-        body: &'static str,
-        initial_delay: std::time::Duration,
-    ) -> reqwest::Response {
-        reqwest::Client::new()
-            .get(delayed_sse_server_url(body, initial_delay).await)
-            .send()
-            .await
-            .unwrap()
-    }
-
-    async fn sse_response_then_stall(
+    async fn sse_server_url_then_stall(
         body: &'static str,
         stall_duration: std::time::Duration,
-    ) -> reqwest::Response {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    ) -> String {
+        use tokio::io::AsyncWriteExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 2048];
-            let _ = socket.read(&mut request).await;
+            assert_streaming_post(&mut socket).await;
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
@@ -4481,11 +4419,7 @@ mod tests {
             tokio::time::sleep(stall_duration).await;
         });
 
-        reqwest::Client::new()
-            .get(format!("http://{address}"))
-            .send()
-            .await
-            .unwrap()
+        format!("http://{address}")
     }
 
     async fn sse_server_url_with_delayed_tail(
@@ -4493,14 +4427,13 @@ mod tests {
         tail: &'static str,
         delay: std::time::Duration,
     ) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 2048];
-            let _ = socket.read(&mut request).await;
+            assert_streaming_post(&mut socket).await;
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
@@ -4519,19 +4452,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_idle_watchdog_does_not_limit_time_to_first_chunk() {
-        let upstream = delayed_sse_response(
+        let url = delayed_sse_server_url(
             "data: {\"id\":\"chat-slow-prefill\",\"choices\":[]}\n\ndata: [DONE]\n\n",
             std::time::Duration::from_secs(2),
         )
         .await;
         let mut opts = test_proxy_opts();
         opts.stream_idle_timeout_secs = 1;
-        let response = proxy_streaming_response(
-            upstream,
-            "request-sha256",
+        opts.request_hash = Some("request-sha256".into());
+        let response = proxy_streaming_request(
+            &reqwest::Client::new(),
+            &url,
+            br#"{"model":"test-model","stream":true}"#.to_vec(),
             opts,
-            StatusCode::OK,
-            std::time::Instant::now(),
         )
         .await
         .unwrap();
@@ -4618,22 +4551,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_streaming_response_watchdog_ignores_role_only_hidden_reasoning_gap() {
+    async fn test_fixed_hash_streaming_watchdog_ignores_role_only_hidden_reasoning_gap() {
         let url = sse_server_url_with_delayed_tail(
             ROLE_ONLY_CHAT_SSE,
             FINISH_CHAT_SSE,
             std::time::Duration::from_secs(2),
         )
         .await;
-        let upstream = reqwest::Client::new().get(url).send().await.unwrap();
         let mut opts = test_proxy_opts();
         opts.stream_idle_timeout_secs = 1;
-        let response = proxy_streaming_response(
-            upstream,
-            "request-sha256",
+        opts.request_hash = Some("request-sha256".into());
+        let cache = opts.cache.clone();
+        let response = proxy_streaming_request(
+            &reqwest::Client::new(),
+            &url,
+            br#"{"model":"test-model","stream":true}"#.to_vec(),
             opts,
-            StatusCode::OK,
-            std::time::Instant::now(),
         )
         .await
         .unwrap();
@@ -4646,6 +4579,13 @@ mod tests {
         .expect("hidden reasoning should finish after the idle threshold")
         .expect("role-only metadata must not arm the idle watchdog");
         assert!(body.ends_with(b"data: [DONE]\n\n"));
+        let signed: crate::types::SignedChat = serde_json::from_str(
+            &cache
+                .get_chat("chat-hidden-reasoning")
+                .expect("completed stream must cache its signature"),
+        )
+        .unwrap();
+        assert!(signed.text.starts_with("test-model:request-sha256:"));
     }
 
     #[tokio::test]
@@ -4734,19 +4674,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_idle_watchdog_fails_after_first_chunk() {
-        let upstream = sse_response_then_stall(
+        let url = sse_server_url_then_stall(
             "data: {\"id\":\"chat-stalled\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
             std::time::Duration::from_secs(3),
         )
         .await;
         let mut opts = test_proxy_opts();
         opts.stream_idle_timeout_secs = 1;
-        let response = proxy_streaming_response(
-            upstream,
-            "request-sha256",
+        opts.request_hash = Some("request-sha256".into());
+        let response = proxy_streaming_request(
+            &reqwest::Client::new(),
+            &url,
+            br#"{"model":"test-model","stream":true}"#.to_vec(),
             opts,
-            StatusCode::OK,
-            std::time::Instant::now(),
         )
         .await
         .unwrap();
@@ -4765,16 +4705,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_missing_done_fails_downstream_body_when_watchdog_enabled() {
-        let upstream =
-            raw_sse_response(Some("data: {\"id\":\"chat-1\",\"choices\":[]}\n\n"), false).await;
+        let url = raw_sse_server_url("data: {\"id\":\"chat-1\",\"choices\":[]}\n\n").await;
         let mut opts = test_proxy_opts();
         opts.stream_idle_timeout_secs = 1;
-        let response = proxy_streaming_response(
-            upstream,
-            "request-sha256",
+        opts.request_hash = Some("request-sha256".into());
+        let response = proxy_streaming_request(
+            &reqwest::Client::new(),
+            &url,
+            br#"{"model":"test-model","stream":true}"#.to_vec(),
             opts,
-            StatusCode::OK,
-            std::time::Instant::now(),
         )
         .await
         .unwrap();
@@ -4788,19 +4727,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_done_without_trailing_newline_completes_cleanly() {
-        let upstream = raw_sse_response(
-            Some("data: {\"id\":\"chat-1\",\"choices\":[]}\n\ndata: [DONE]"),
-            false,
-        )
-        .await;
+        let url =
+            raw_sse_server_url("data: {\"id\":\"chat-1\",\"choices\":[]}\n\ndata: [DONE]").await;
         let mut opts = test_proxy_opts();
         opts.stream_idle_timeout_secs = 1;
-        let response = proxy_streaming_response(
-            upstream,
-            "request-sha256",
+        opts.request_hash = Some("request-sha256".into());
+        let response = proxy_streaming_request(
+            &reqwest::Client::new(),
+            &url,
+            br#"{"model":"test-model","stream":true}"#.to_vec(),
             opts,
-            StatusCode::OK,
-            std::time::Instant::now(),
         )
         .await
         .unwrap();
@@ -5206,6 +5142,250 @@ data: [DONE]
         );
     }
 
+    // ── mirror_reasoning_usage: usage.reasoning_tokens → completion_tokens_details ──
+
+    /// The usage object SGLang sends (`UsageInfo`): the reasoning count sits at
+    /// the top level and there is no `completion_tokens_details`.
+    fn sglang_usage(reasoning_tokens: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "prompt_tokens": 12,
+            "total_tokens": 62,
+            "completion_tokens": 50,
+            "prompt_tokens_details": null,
+            "reasoning_tokens": reasoning_tokens
+        })
+    }
+
+    #[test]
+    fn test_mirror_reasoning_usage_creates_completion_tokens_details() {
+        let mut usage = sglang_usage(42.into());
+        mirror_reasoning_usage(&mut usage);
+        // Only the details object is added; the legacy top-level field and
+        // every other key are untouched.
+        let mut expected = sglang_usage(42.into());
+        expected["completion_tokens_details"] = serde_json::json!({"reasoning_tokens": 42});
+        assert_eq!(usage, expected);
+    }
+
+    #[test]
+    fn test_mirror_reasoning_usage_mirrors_zero() {
+        let mut usage = sglang_usage(0.into());
+        mirror_reasoning_usage(&mut usage);
+        assert_eq!(
+            usage["completion_tokens_details"],
+            serde_json::json!({"reasoning_tokens": 0})
+        );
+        assert_eq!(usage["reasoning_tokens"], 0);
+    }
+
+    #[test]
+    fn test_mirror_reasoning_usage_invents_nothing_without_a_count() {
+        let mut usage =
+            serde_json::json!({"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7});
+        let before = usage.clone();
+        mirror_reasoning_usage(&mut usage);
+        assert_eq!(usage, before);
+    }
+
+    #[test]
+    fn test_mirror_reasoning_usage_ignores_counts_that_are_not_counts() {
+        for bad in [
+            serde_json::json!(null),
+            serde_json::json!(-1),
+            serde_json::json!(3.5),
+            serde_json::json!("7"),
+            serde_json::json!(true),
+            serde_json::json!({"n": 7}),
+        ] {
+            let mut usage = sglang_usage(bad.clone());
+            let before = usage.clone();
+            mirror_reasoning_usage(&mut usage);
+            assert_eq!(usage, before, "reasoning_tokens = {bad}");
+        }
+    }
+
+    #[test]
+    fn test_mirror_reasoning_usage_keeps_the_provider_value() {
+        let mut usage = sglang_usage(42.into());
+        usage["completion_tokens_details"] =
+            serde_json::json!({"reasoning_tokens": 40, "audio_tokens": 0});
+        let before = usage.clone();
+        mirror_reasoning_usage(&mut usage);
+        assert_eq!(usage, before);
+    }
+
+    #[test]
+    fn test_mirror_reasoning_usage_fills_an_existing_details_object() {
+        let mut usage = sglang_usage(42.into());
+        usage["completion_tokens_details"] = serde_json::json!({"audio_tokens": 0});
+        mirror_reasoning_usage(&mut usage);
+        assert_eq!(
+            usage["completion_tokens_details"],
+            serde_json::json!({"audio_tokens": 0, "reasoning_tokens": 42})
+        );
+    }
+
+    #[test]
+    fn test_mirror_reasoning_usage_leaves_non_object_details_alone() {
+        for details in [
+            serde_json::json!(null),
+            serde_json::json!(0),
+            serde_json::json!("n/a"),
+            serde_json::json!([42]),
+        ] {
+            let mut usage = sglang_usage(42.into());
+            usage["completion_tokens_details"] = details.clone();
+            let before = usage.clone();
+            mirror_reasoning_usage(&mut usage);
+            assert_eq!(usage, before, "completion_tokens_details = {details}");
+        }
+    }
+
+    #[test]
+    fn test_mirror_reasoning_usage_ignores_a_usage_that_is_not_an_object() {
+        for mut usage in [
+            serde_json::json!(null),
+            serde_json::json!(7),
+            serde_json::json!([]),
+        ] {
+            let before = usage.clone();
+            mirror_reasoning_usage(&mut usage);
+            assert_eq!(usage, before);
+        }
+    }
+
+    #[test]
+    fn test_normalize_mirrors_reasoning_tokens_in_the_usage_chunk() {
+        // SGLang's final usage chunk: empty choices, top-level reasoning count.
+        let mut v = serde_json::json!({
+            "id": "c1",
+            "object": "chat.completion.chunk",
+            "choices": [],
+            "usage": sglang_usage(42.into())
+        });
+        normalize_chat_chunk(&mut v);
+        assert_eq!(v["usage"]["reasoning_tokens"], 42);
+        assert_eq!(
+            v["usage"]["completion_tokens_details"],
+            serde_json::json!({"reasoning_tokens": 42})
+        );
+
+        // Same without a `choices` key at all.
+        let mut v = serde_json::json!({"usage": sglang_usage(7.into())});
+        normalize_chat_chunk(&mut v);
+        assert_eq!(
+            v["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            7
+        );
+    }
+
+    #[test]
+    fn test_normalize_mirrors_continuous_usage_next_to_a_delta() {
+        // continuous_usage_stats: usage rides on every content chunk; both
+        // normalizations apply to the same chunk.
+        let mut v = serde_json::json!({
+            "choices": [{"index": 0, "delta": {"reasoning": "think"}}],
+            "usage": sglang_usage(3.into())
+        });
+        normalize_chat_chunk(&mut v);
+        assert_eq!(v["choices"][0]["delta"]["reasoning_content"], "think");
+        assert_eq!(
+            v["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            3
+        );
+        assert_eq!(v["usage"]["reasoning_tokens"], 3);
+    }
+
+    #[test]
+    fn test_normalize_leaves_null_usage_alone() {
+        let mut v = serde_json::json!({
+            "id": "c1",
+            "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": null}],
+            "usage": null
+        });
+        let before = v.clone();
+        normalize_chat_chunk(&mut v);
+        assert_eq!(v, before);
+    }
+
+    #[test]
+    fn test_sse_transformer_emits_mirrored_usage_before_the_extra_transform() {
+        // The transformer output is what gets hashed and sent: it must carry
+        // both fields, and the extra transform (encryption) must already see them.
+        let extra: ChunkTransform = Arc::new(|v| {
+            let seen = v
+                .pointer("/usage/completion_tokens_details/reasoning_tokens")
+                .is_some();
+            v["saw_mirrored_usage"] = serde_json::Value::Bool(seen);
+            Ok(())
+        });
+        let mut transformer = SseTransformer::new(Some(extra));
+        let chunk = concat!(
+            "data: {\"id\":\"c1\",\"choices\":[],\"usage\":{\"prompt_tokens\":12,",
+            "\"total_tokens\":62,\"completion_tokens\":50,\"prompt_tokens_details\":null,",
+            "\"reasoning_tokens\":42}}\n\n"
+        );
+        let out = transformer.process_chunk(chunk.as_bytes()).unwrap();
+        let out = std::str::from_utf8(&out).unwrap();
+        let data = out
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("a data line");
+        let v: serde_json::Value = serde_json::from_str(data).unwrap();
+        assert_eq!(v["saw_mirrored_usage"], true);
+        assert_eq!(v["usage"]["reasoning_tokens"], 42);
+        assert_eq!(
+            v["usage"]["completion_tokens_details"],
+            serde_json::json!({"reasoning_tokens": 42})
+        );
+    }
+
+    #[test]
+    fn test_assembler_mirrors_sglang_reasoning_tokens() {
+        // Non-streaming requests are streamed internally and reassembled; the
+        // final SGLang usage chunk must come out with both fields.
+        let events = [
+            concat!(
+                "data: {\"id\":\"c1\",\"model\":\"m\",\"created\":100,\"choices\":[{\"index\":0,",
+                "\"delta\":{\"role\":\"assistant\",\"content\":null,",
+                "\"reasoning_content\":\"2+2\"},\"finish_reason\":null}],\"usage\":null}\n\n"
+            ),
+            concat!(
+                "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"4\"},",
+                "\"finish_reason\":\"stop\"}],\"usage\":null}\n\n"
+            ),
+            concat!(
+                "data: {\"id\":\"c1\",\"choices\":[],\"usage\":{\"prompt_tokens\":12,",
+                "\"total_tokens\":62,\"completion_tokens\":50,\"prompt_tokens_details\":null,",
+                "\"reasoning_tokens\":42}}\n\ndata: [DONE]\n\n"
+            ),
+        ];
+        let mut asm = StreamingResponseAssembler::new(ResponseShape::ChatCompletion);
+        for event in events {
+            asm.process_chunk(event.as_bytes());
+        }
+
+        let resp = asm.into_response("chatcmpl");
+        let mut expected_usage = sglang_usage(42.into());
+        expected_usage["completion_tokens_details"] = serde_json::json!({"reasoning_tokens": 42});
+        assert_eq!(resp["usage"], expected_usage);
+        assert_eq!(resp["choices"][0]["message"]["reasoning_content"], "2+2");
+        assert_eq!(resp["choices"][0]["message"]["content"], "4");
+    }
+
+    #[test]
+    fn test_assembler_invents_no_reasoning_count() {
+        let mut asm = StreamingResponseAssembler::new(ResponseShape::ChatCompletion);
+        asm.process_chunk(
+            b"data: {\"id\":\"c1\",\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\ndata: [DONE]\n\n",
+        );
+        let resp = asm.into_response("chatcmpl");
+        assert_eq!(
+            resp["usage"],
+            serde_json::json!({"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7})
+        );
+    }
+
     #[test]
     fn test_assembler_accumulates_delta_reasoning_fallback() {
         // Upstream emits `delta.reasoning` (vLLM qwen3 parser); assembler should
@@ -5587,6 +5767,7 @@ data: [DONE]
                 ramp_interval: std::time::Duration::from_secs(60),
                 ttft_p95_max: Some(std::time::Duration::from_secs(30)),
                 backpressure_ttl: std::time::Duration::from_secs(10),
+                queue_saturated_at: 1,
                 retry_after: std::time::Duration::from_secs(2),
             }),
             1,

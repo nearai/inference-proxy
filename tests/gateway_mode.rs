@@ -43,6 +43,7 @@ struct GatewayOptions {
     admission_start_inflight: Option<u32>,
     admission_ttft_p95_max_ms: Option<u64>,
     admission_backpressure_secs: Option<u64>,
+    admission_queue_saturated_at: Option<u32>,
     backend_connect_failover: bool,
     /// Engine metrics probe base URLs, one per backend (polled every 100 ms here).
     backend_probe_urls: Vec<String>,
@@ -51,9 +52,16 @@ struct GatewayOptions {
     backend_long_context_urls: Vec<String>,
     backend_long_context_probe_urls: Vec<String>,
     long_context_above_tokens: u64,
+    /// `VLLM_BACKEND_TIER_STRICT`: refuse a request whose tier has no
+    /// healthy backend instead of falling back to the other one.
+    backend_tier_strict: bool,
     /// Source of the models document (a mock cloud-api `/v1/models`).
     models_document_url: Option<String>,
     capacity_requests_per_minute: u64,
+    /// `VLLM_PROXY_DISCOUNT_TO_USER`, already validated.
+    discount_to_user: Option<f64>,
+    /// `CLOUD_API_USAGE_TOKEN`: without it usage reports are skipped.
+    cloud_api_usage_token: Option<String>,
     /// `VLLM_PROXY_REASONING_OFF_EFFORT` (default `none`).
     reasoning_off_effort: Option<String>,
 }
@@ -70,6 +78,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         options.backend_urls.clone()
     };
     let config = config::Config {
+        replica_state: None,
         model_name: "test-model".to_string(),
         tokens: vec!["test-token".to_string()],
         vllm_base_url: mock_url.to_string(),
@@ -109,7 +118,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         cloud_api_auth_max_attempts: 1,
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
-        cloud_api_usage_token: None,
+        cloud_api_usage_token: options.cloud_api_usage_token.clone(),
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,
@@ -149,6 +158,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         rejected_content_part_types: options.rejected_content_part_types,
         models_document_url: options.models_document_url.clone(),
         capacity_requests_per_minute: options.capacity_requests_per_minute,
+        discount_to_user: options.discount_to_user,
         reasoning_off_effort: options
             .reasoning_off_effort
             .clone()
@@ -165,6 +175,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         admission_ramp_interval_secs: 1800,
         admission_ttft_p95_max_ms: options.admission_ttft_p95_max_ms.unwrap_or(30_000),
         admission_backpressure_secs: options.admission_backpressure_secs.unwrap_or(10),
+        admission_queue_saturated_at: options.admission_queue_saturated_at.unwrap_or(1),
         admission_retry_after_secs: 2,
         backend_connect_failover: options.backend_connect_failover,
         backend_probe_urls: options.backend_probe_urls.clone(),
@@ -172,6 +183,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         backend_long_context_urls: options.backend_long_context_urls.clone(),
         backend_long_context_probe_urls: options.backend_long_context_probe_urls.clone(),
         long_context_above_tokens: options.long_context_above_tokens,
+        backend_tier_strict: options.backend_tier_strict,
         dstack_socket_path: "/nonexistent/dstack.sock".to_string(),
         gpu_evidence_delegate_url: None,
         gpu_evidence_delegate_timeout_secs: 30,
@@ -303,6 +315,12 @@ fn chat_request(body: serde_json::Value) -> Request<Body> {
         .unwrap()
 }
 
+const COMPLETION_ROUTES: [&str; 2] = [routes::ROUTE_CHAT_COMPLETIONS, routes::ROUTE_COMPLETIONS];
+async fn call(app: axum::Router, route: &str) -> axum::response::Response {
+    let mut request = chat_request(serde_json::json!({"messages": [], "prompt": "hello"}));
+    *request.uri_mut() = route.parse().unwrap();
+    app.oneshot(request).await.unwrap()
+}
 fn chat_completion_json() -> serde_json::Value {
     serde_json::json!({
         "id": "chatcmpl-gw-1",
@@ -360,6 +378,128 @@ async fn backend_token_is_attached_to_backend_requests() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = json_body(response).await;
     assert_eq!(body["choices"][0]["message"]["content"], "hi");
+}
+
+#[tokio::test]
+async fn gateway_defaults_missing_json_schema_name_before_backend_validation() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(wiremock::matchers::body_partial_json(serde_json::json!({
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "schema": {"type": "object"}
+                }
+            }
+        })))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": {"message": "json_schema.name is required"}
+        })))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(wiremock::matchers::body_partial_json(serde_json::json!({
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "response_schema",
+                    "schema": {"type": "object"}
+                }
+            }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+        .with_priority(1)
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let app = build_gateway(
+        &mock.uri(),
+        GatewayOptions {
+            backend_token: Some("backend-secret".to_string()),
+            ..Default::default()
+        },
+    );
+    let response = app
+        .oneshot(chat_request(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"schema": {"type": "object"}}
+            }
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let received = mock.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1);
+    assert_eq!(
+        received[0].headers.get("authorization").unwrap(),
+        "Bearer backend-secret"
+    );
+    let forwarded: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+    assert_eq!(
+        forwarded["response_format"],
+        serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "response_schema",
+                "schema": {"type": "object"}
+            }
+        })
+    );
+}
+
+#[tokio::test]
+async fn gateway_defaults_json_schema_name_on_streaming_requests() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(wiremock::matchers::body_partial_json(serde_json::json!({
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "response_schema",
+                    "schema": {"type": "object"}
+                }
+            }
+        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string("data: {\"id\":\"chatcmpl-stream\"}\n\ndata: [DONE]\n\n"),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let app = build_gateway(
+        &mock.uri(),
+        GatewayOptions {
+            backend_token: Some("backend-secret".to_string()),
+            ..Default::default()
+        },
+    );
+    let response = app
+        .oneshot(chat_request(serde_json::json!({
+            "model": "test-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"schema": {"type": "object"}}
+            }
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(String::from_utf8_lossy(&body).contains("data: [DONE]"));
 }
 
 #[tokio::test]
@@ -1414,52 +1554,41 @@ async fn assert_overloaded(response: axum::response::Response) {
     let json = json_body(response).await;
     assert_eq!(json["error"]["type"], "overloaded");
 }
-
 #[tokio::test]
 async fn admission_budget_refuses_with_429_before_dispatch() {
-    let mock = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(chat_completion_json())
-                .set_delay(Duration::from_millis(700)),
-        )
-        .expect(2) // the first and the third request; the second never dispatches
-        .mount(&mock)
-        .await;
-    let app = build_gateway(
-        &mock.uri(),
-        GatewayOptions {
-            admission_max_inflight: 1,
-            ..Default::default()
-        },
-    );
-
-    let first = tokio::spawn({
-        let app = app.clone();
-        async move { app.oneshot(chat_request(hello_body())).await.unwrap() }
-    });
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let started = std::time::Instant::now();
-    let second = app
-        .clone()
-        .oneshot(chat_request(hello_body()))
-        .await
-        .unwrap();
-    assert!(
-        started.elapsed() < Duration::from_millis(300),
-        "refusal must not wait for the in-flight request"
-    );
-    assert_overloaded(second).await;
-
-    assert_eq!(first.await.unwrap().status(), StatusCode::OK);
-    // The slot was released with the response.
-    let third = app.oneshot(chat_request(hello_body())).await.unwrap();
-    assert_eq!(third.status(), StatusCode::OK);
-    mock.verify().await;
+    for route in COMPLETION_ROUTES {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(chat_completion_json())
+                    .set_delay(Duration::from_millis(700)),
+            )
+            .expect(2) // the first and third requests; the second never dispatches
+            .mount(&mock)
+            .await;
+        let app = build_gateway(
+            &mock.uri(),
+            GatewayOptions {
+                admission_max_inflight: 1,
+                ..Default::default()
+            },
+        );
+        let first = tokio::spawn(call(app.clone(), route));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let started = std::time::Instant::now();
+        let second = call(app.clone(), route).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "refusal must not wait for the in-flight request"
+        );
+        assert_overloaded(second).await;
+        assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(call(app, route).await.status(), StatusCode::OK);
+        mock.verify().await;
+    }
 }
-
 #[tokio::test]
 async fn admission_is_inert_when_not_configured() {
     let mock = MockServer::start().await;
@@ -1527,27 +1656,28 @@ async fn engine_queue_full_on_every_backend_refuses_new_work_without_dispatch() 
 
 #[tokio::test]
 async fn connect_error_fails_over_to_another_backend_when_enabled() {
-    let mock = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
-        .expect(1)
-        .mount(&mock)
-        .await;
-    // Least-connections picks the first (dead) backend for the first request.
-    let dead = unreachable_backend_url();
-    let app = build_gateway(
-        &mock.uri(),
-        GatewayOptions {
-            backend_urls: vec![dead, mock.uri()],
-            backend_connect_failover: true,
-            admission_max_inflight: 4,
-            ..Default::default()
-        },
-    );
-    let response = app.oneshot(chat_request(hello_body())).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    mock.verify().await;
+    for route in COMPLETION_ROUTES {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        // Least-connections picks the first (dead) backend.
+        let dead = unreachable_backend_url();
+        let app = build_gateway(
+            &mock.uri(),
+            GatewayOptions {
+                backend_urls: vec![dead, mock.uri()],
+                backend_connect_failover: true,
+                admission_max_inflight: 4,
+                ..Default::default()
+            },
+        );
+        assert_eq!(call(app, route).await.status(), StatusCode::OK);
+        mock.verify().await;
+    }
 }
 
 #[tokio::test]
@@ -1576,33 +1706,37 @@ async fn connect_error_is_not_retried_without_failover() {
 
 #[tokio::test]
 async fn failover_never_retries_an_engine_rejection() {
-    let saturated = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(503).set_body_string(QUEUE_FULL_BODY))
-        .expect(1)
-        .mount(&saturated)
-        .await;
-    let idle = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
-        .expect(0)
-        .mount(&idle)
-        .await;
-    let app = build_gateway(
-        &saturated.uri(),
-        GatewayOptions {
-            backend_urls: vec![saturated.uri(), idle.uri()],
-            backend_connect_failover: true,
-            map_queue_full_to_429: true,
-            ..Default::default()
-        },
-    );
-    let response = app.oneshot(chat_request(hello_body())).await.unwrap();
-    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-    saturated.verify().await;
-    idle.verify().await;
+    for route in COMPLETION_ROUTES {
+        let rejected = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(503).set_body_string(QUEUE_FULL_BODY))
+            .expect(1)
+            .mount(&rejected)
+            .await;
+        let idle = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+            .expect(0)
+            .mount(&idle)
+            .await;
+        let app = build_gateway(
+            &rejected.uri(),
+            GatewayOptions {
+                backend_urls: vec![rejected.uri(), idle.uri()],
+                backend_connect_failover: true,
+                map_queue_full_to_429: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            call(app, route).await.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        rejected.verify().await;
+        idle.verify().await;
+    }
 }
 
 #[tokio::test]
@@ -1785,6 +1919,51 @@ async fn a_queueing_engine_is_steered_around_and_a_fleet_wide_queue_refuses() {
     let response = app.oneshot(chat_request(hello_body())).await.unwrap();
     assert_overloaded(response).await;
     idle.verify().await;
+}
+
+#[tokio::test]
+async fn a_configured_queue_threshold_gates_admission() {
+    let backend_a = MockServer::start().await;
+    let backend_b = MockServer::start().await;
+    // Symmetric loads: least-connections ties break on index, so backend_a
+    // (first in the pool) is the one dispatched to below the threshold.
+    mount_engine(&backend_a, 0, 2, 1).await;
+    mount_engine(&backend_b, 0, 2, 0).await;
+    let app = build_gateway(
+        &backend_a.uri(),
+        GatewayOptions {
+            backend_urls: vec![backend_a.uri(), backend_b.uri()],
+            backend_probe_urls: vec![backend_a.uri(), backend_b.uri()],
+            admission_max_inflight: 8,
+            admission_queue_saturated_at: Some(4),
+            ..Default::default()
+        },
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await; // a few polls
+
+    // queued=2 on every backend is below the configured threshold of 4:
+    // neither backend is saturated, so the request is admitted.
+    let response = app
+        .clone()
+        .oneshot(chat_request(hello_body()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    backend_a.verify().await;
+    backend_b.verify().await;
+
+    // Now every backend queues at the threshold: fleet-wide refusal. (Which
+    // refusal it was lives in the log line and in
+    // `admission_rejections_total{reason="backend_queue"}`, neither
+    // observable from here — this test file's `metrics_handle` is never
+    // installed as the global recorder, so `/metrics` always renders empty.)
+    backend_a.reset().await;
+    backend_b.reset().await;
+    mount_engine(&backend_a, 0, 4, 0).await;
+    mount_engine(&backend_b, 0, 4, 0).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let response = app.oneshot(chat_request(hello_body())).await.unwrap();
+    assert_overloaded(response).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1979,6 +2158,143 @@ async fn a_tier_without_a_healthy_backend_falls_back_to_the_other_one() {
     live.verify().await;
 }
 
+/// The 429 body only ever carries the generic `overloaded` type (`error.rs`
+/// maps every `RejectReason` to the same shape): the specific reason is only
+/// in the log line and `admission_rejections_total{reason}`. Captured with a
+/// local recorder scoped around the request — safe here because
+/// `#[tokio::test]` defaults to the single-threaded flavor, so nothing this
+/// request touches runs on another OS thread outside the guard's scope.
+async fn oneshot_with_rejection_reason_metric(
+    app: axum::Router,
+    request: Request<Body>,
+) -> (axum::response::Response, String) {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let guard = metrics::set_default_local_recorder(&recorder);
+    let response = app.oneshot(request).await.unwrap();
+    drop(guard);
+    (response, handle.render())
+}
+
+#[tokio::test]
+async fn strict_mode_refuses_instead_of_falling_back_across_the_tiers() {
+    let live = MockServer::start().await;
+    let dead = unreachable_backend_url();
+    // The long tier's only host is unreachable; strict mode pins the
+    // restriction through the connect fail-over instead of widening the
+    // search, so the oversized request is refused rather than landing its
+    // 300k-token prefill on a base host.
+    let app = build_gateway(
+        &live.uri(),
+        GatewayOptions {
+            backend_urls: vec![live.uri()],
+            backend_long_context_urls: vec![dead],
+            long_context_above_tokens: ABOVE_TOKENS,
+            backend_connect_failover: true,
+            backend_tier_strict: true,
+            admission_max_inflight: 4,
+            ..Default::default()
+        },
+    );
+    let (response, rendered_metrics) =
+        oneshot_with_rejection_reason_metric(app.clone(), chat_request(sized_body(4_000))).await;
+    assert_overloaded(response).await;
+    assert!(
+        rendered_metrics.contains("admission_rejections_total{reason=\"tier_unavailable\"} 1"),
+        "{rendered_metrics}"
+    );
+    // A short request is unaffected: it never touches the long tier.
+    mount_chat(&live, 1).await;
+    let response = app.oneshot(chat_request(sized_body(400))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    live.verify().await;
+    live.reset().await;
+
+    // And the other way around: with the base fleet gone, a short request is
+    // refused rather than served by the idle long-context host.
+    let dead = unreachable_backend_url();
+    let app = build_gateway(
+        &live.uri(),
+        GatewayOptions {
+            backend_urls: vec![dead],
+            backend_long_context_urls: vec![live.uri()],
+            long_context_above_tokens: ABOVE_TOKENS,
+            backend_connect_failover: true,
+            backend_tier_strict: true,
+            admission_max_inflight: 4,
+            ..Default::default()
+        },
+    );
+    let (response, rendered_metrics) =
+        oneshot_with_rejection_reason_metric(app.clone(), chat_request(sized_body(400))).await;
+    assert_overloaded(response).await;
+    assert!(
+        rendered_metrics.contains("admission_rejections_total{reason=\"tier_unavailable\"} 1"),
+        "{rendered_metrics}"
+    );
+    mount_chat(&live, 1).await;
+    let response = app.oneshot(chat_request(sized_body(4_000))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    live.verify().await;
+}
+
+#[tokio::test]
+async fn strict_mode_tier_already_empty_before_placement_refuses_with_tier_unavailable() {
+    let live = MockServer::start().await;
+    let dead = unreachable_backend_url();
+    // Unlike `strict_mode_refuses_instead_of_falling_back_across_the_tiers`,
+    // the long tier's only backend is marked unhealthy up front rather than
+    // failing a live connect attempt: placement (`completion_placement.rs`)
+    // finds it already empty and refuses directly, so the connect fail-over
+    // path in `proxy.rs` is never reached for this request.
+    let (app, state) = build_gateway_with_state(
+        &live.uri(),
+        GatewayOptions {
+            backend_urls: vec![live.uri()],
+            backend_long_context_urls: vec![dead],
+            long_context_above_tokens: ABOVE_TOKENS,
+            backend_tier_strict: true,
+            admission_max_inflight: 4,
+            ..Default::default()
+        },
+    );
+    state.backend_pool.backends()[1]
+        .healthy
+        .store(false, std::sync::atomic::Ordering::Release);
+    let (response, rendered_metrics) =
+        oneshot_with_rejection_reason_metric(app, chat_request(sized_body(4_000))).await;
+    assert_overloaded(response).await;
+    assert!(
+        rendered_metrics.contains("admission_rejections_total{reason=\"tier_unavailable\"} 1"),
+        "{rendered_metrics}"
+    );
+}
+
+#[tokio::test]
+async fn strict_mode_returns_503_when_admission_is_disabled() {
+    let live = MockServer::start().await;
+    let dead = unreachable_backend_url();
+    // No `admission_max_inflight`: admission is off, so the refusal has no
+    // `Permit` to build the 429 `Overloaded` shape from and falls back to a
+    // plain 503 with `error_type: "tier_unavailable"`.
+    let app = build_gateway(
+        &live.uri(),
+        GatewayOptions {
+            backend_urls: vec![live.uri()],
+            backend_long_context_urls: vec![dead],
+            long_context_above_tokens: ABOVE_TOKENS,
+            backend_connect_failover: true,
+            backend_tier_strict: true,
+            ..Default::default()
+        },
+    );
+    let response = app.oneshot(chat_request(sized_body(4_000))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let json = json_body(response).await;
+    assert_eq!(json["error"]["type"], "tier_unavailable");
+    live.verify().await;
+}
+
 #[tokio::test]
 async fn a_full_long_tier_refuses_while_the_base_fleet_keeps_serving() {
     let base = MockServer::start().await;
@@ -2071,6 +2387,70 @@ async fn a_token_id_prompt_is_routed_by_its_exact_length() {
         let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
+    base.verify().await;
+    long.verify().await;
+}
+
+/// A short request that allows a huge output (aggregator clients send the
+/// advertised maximum) stays on the base fleet: only `OUTPUT_RESERVE_CAP`
+/// (32,768) of its `max_tokens` counts toward the tier, at the production
+/// threshold. A genuinely oversized prompt still goes to the long tier.
+#[tokio::test]
+async fn a_huge_output_window_on_a_short_request_stays_on_the_base_fleet() {
+    let base = MockServer::start().await;
+    let long = MockServer::start().await;
+    let completion = serde_json::json!({
+        "id": "cmpl-1", "object": "text_completion", "model": "test-model",
+        "choices": [{"index": 0, "text": "hi", "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    });
+    mount_chat(&base, 2).await;
+    mount_chat(&long, 1).await;
+    for (mock, expected) in [(&base, 1), (&long, 0)] {
+        Mock::given(method("POST"))
+            .and(path("/v1/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion.clone()))
+            .expect(expected)
+            .mount(mock)
+            .await;
+    }
+    let app = build_gateway(
+        &base.uri(),
+        GatewayOptions {
+            backend_urls: vec![base.uri()],
+            backend_long_context_urls: vec![long.uri()],
+            long_context_above_tokens: 100_000,
+            ..Default::default()
+        },
+    );
+    // Chat: `max_tokens` and `max_completion_tokens` at the full 1M window.
+    for field in ["max_tokens", "max_completion_tokens"] {
+        let mut body = sized_body(400);
+        body[field] = 1_048_576.into();
+        let response = app.clone().oneshot(chat_request(body)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{field}");
+    }
+    // Completions with token ids and the same output window.
+    let body =
+        serde_json::json!({"model": "test-model", "prompt": [1, 2, 3], "max_tokens": 1_048_576});
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/completions")
+        .header("authorization", "Bearer test-token")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(request).await.unwrap().status(),
+        StatusCode::OK
+    );
+    // Control: ~120k tokens of prompt (×1.2 = 144k) is long-tier work.
+    let response = app
+        .clone()
+        .oneshot(chat_request(sized_body(480_000)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
     base.verify().await;
     long.verify().await;
 }
@@ -2216,6 +2596,239 @@ async fn models_document_falls_back_to_the_engine_list_when_the_source_fails() {
     let (status, body) = get_models(app).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"][0]["owned_by"], "sglang");
+}
+
+#[tokio::test]
+async fn models_document_publishes_the_configured_discount_as_a_number() {
+    let engine = MockServer::start().await;
+    let source = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "other-model", "name": "Other"},
+                {"id": "test-model", "name": "Test Model",
+                 "pricing": {"prompt": "0.00000015", "completion": "0.0000006"}}
+            ]
+        })))
+        .expect(1)
+        .mount(&source)
+        .await;
+    let app = build_gateway(
+        &engine.uri(),
+        GatewayOptions {
+            models_document_url: Some(format!("{}/v1/models", source.uri())),
+            admission_max_inflight: 48,
+            discount_to_user: Some(0.15),
+            ..Default::default()
+        },
+    );
+    let (status, body) = get_models(app).await;
+    assert_eq!(status, StatusCode::OK);
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 1, "{body}");
+    // A JSON number, not a string, on the model's entry.
+    assert!(data[0]["discount_to_user"].is_f64(), "{body}");
+    assert_eq!(data[0]["discount_to_user"].as_f64(), Some(0.15));
+    // The prices stay the catalog's list prices: the aggregator applies the
+    // discount itself. The capacity is still declared next to it.
+    assert_eq!(data[0]["pricing"]["prompt"], "0.00000015");
+    assert_eq!(data[0]["pricing"]["completion"], "0.0000006");
+    assert_eq!(data[0]["capacity"][0]["value"], 48);
+}
+
+#[tokio::test]
+async fn models_document_carries_no_discount_when_unset() {
+    let engine = MockServer::start().await;
+    let source = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list",
+            // A discount already in the source is not this lane's: its usage
+            // reports would not carry it, so it is not published either.
+            "data": [{"id": "test-model", "name": "Test Model", "discount_to_user": 0.3}]
+        })))
+        .expect(1)
+        .mount(&source)
+        .await;
+    let app = build_gateway(
+        &engine.uri(),
+        GatewayOptions {
+            models_document_url: Some(format!("{}/v1/models", source.uri())),
+            ..Default::default()
+        },
+    );
+    let (status, body) = get_models(app).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"][0]["name"], "Test Model");
+    assert!(body["data"][0].get("discount_to_user").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn models_document_fallback_carries_the_discount() {
+    // The source is down, but usage reports still carry the discount: the
+    // engine list served in its place must publish it too.
+    let engine = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "test-model", "object": "model", "owned_by": "sglang"},
+                {"id": "test-model-lora", "object": "model", "owned_by": "sglang"}
+            ]
+        })))
+        .expect(1)
+        .mount(&engine)
+        .await;
+    let source = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&source)
+        .await;
+    let app = build_gateway(
+        &engine.uri(),
+        GatewayOptions {
+            models_document_url: Some(format!("{}/v1/models", source.uri())),
+            discount_to_user: Some(0.15),
+            ..Default::default()
+        },
+    );
+    let (status, body) = get_models(app).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["object"], "list");
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2, "{body}");
+    for entry in data {
+        assert_eq!(entry["owned_by"], "sglang", "{body}");
+        assert!(entry["discount_to_user"].is_f64(), "{body}");
+        assert_eq!(entry["discount_to_user"].as_f64(), Some(0.15));
+    }
+    assert_eq!(data[0]["id"], "test-model");
+}
+
+#[tokio::test]
+async fn models_document_fallback_refuses_an_engine_answer_it_cannot_discount() {
+    // An engine answer that is not a model list cannot carry the discount, so
+    // it is not served without it.
+    let source = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&source)
+        .await;
+    for engine_answer in [
+        ResponseTemplate::new(200).set_body_string("ok"),
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({"object": "list"})),
+    ] {
+        let engine = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(engine_answer)
+            .expect(1)
+            .mount(&engine)
+            .await;
+        let app = build_gateway(
+            &engine.uri(),
+            GatewayOptions {
+                models_document_url: Some(format!("{}/v1/models", source.uri())),
+                discount_to_user: Some(0.15),
+                ..Default::default()
+            },
+        );
+        let (status, body) = get_models(app).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["error"]["type"], "upstream_invalid_response");
+    }
+}
+
+/// The first usage report the gateway posted. Reports are fire-and-forget,
+/// so poll for it.
+async fn usage_report(cloud_api: &MockServer) -> serde_json::Value {
+    for _ in 0..100 {
+        let requests = cloud_api.received_requests().await.unwrap_or_default();
+        if let Some(report) = requests
+            .iter()
+            .find(|request| request.url.path() == "/v1/internal/usage")
+        {
+            return serde_json::from_slice(&report.body).unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("no usage report was posted");
+}
+
+#[tokio::test]
+async fn usage_reports_carry_the_discount_the_models_document_publishes() {
+    for discount in [Some(0.15), None] {
+        // One mock plays the engine and cloud-api: the key check, the usage
+        // intake and the catalog the models document is read from.
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        mount_key_check(&mock, "sk-live-partner", Some("org-partner")).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/internal/usage"))
+            .and(header("authorization", "Bearer usage-secret"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [{"id": "test-model", "name": "Test Model"}]
+            })))
+            .mount(&mock)
+            .await;
+        let app = build_gateway(
+            &mock.uri(),
+            GatewayOptions {
+                cloud_api_url: Some(mock.uri()),
+                cloud_api_usage_token: Some("usage-secret".to_string()),
+                models_document_url: Some(format!("{}/v1/models", mock.uri())),
+                discount_to_user: discount,
+                ..Default::default()
+            },
+        );
+
+        let (status, models) = get_models(app.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        let response = app
+            .oneshot(chat_request_with("sk-live-partner", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        json_body(response).await;
+
+        let report = usage_report(&mock).await;
+        assert_eq!(report["organization_id"], "org-partner");
+        assert_eq!(report["workspace_id"], "ws");
+        assert_eq!(report["api_key_id"], "k");
+        assert_eq!(report["input_tokens"], 3);
+        assert_eq!(report["output_tokens"], 1);
+        let published = &models["data"][0];
+        match discount {
+            Some(discount) => {
+                assert_eq!(published["discount_to_user"].as_f64(), Some(discount));
+                assert!(report["discount_to_user"].is_f64(), "{report}");
+                assert_eq!(report["discount_to_user"], published["discount_to_user"]);
+            }
+            None => {
+                assert!(published.get("discount_to_user").is_none(), "{models}");
+                assert!(report.get("discount_to_user").is_none(), "{report}");
+            }
+        }
+        mock.verify().await;
+    }
 }
 
 // ---- Reasoning switch ----
@@ -2725,6 +3338,85 @@ async fn a_first_token_inside_the_deadline_streams_as_usual() {
 }
 
 #[tokio::test]
+async fn first_token_deadlines_preserve_strict_tier_placement_on_both_routes() {
+    for route in ["/v1/chat/completions", "/v1/completions"] {
+        for long in [false, true] {
+            let base = MockServer::start().await;
+            let large = MockServer::start().await;
+            for (backend, expected) in [(&base, u64::from(!long)), (&large, u64::from(long))] {
+                Mock::given(method("POST"))
+                    .and(path(route))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_delay(Duration::from_millis(2500))
+                            .set_body_raw(ONE_TOKEN_STREAM, "text/event-stream"),
+                    )
+                    .expect(expected)
+                    .mount(backend)
+                    .await;
+            }
+            let (app, state) = build_gateway_with_state(
+                &base.uri(),
+                GatewayOptions {
+                    backend_urls: vec![base.uri()],
+                    backend_long_context_urls: vec![large.uri()],
+                    long_context_above_tokens: ABOVE_TOKENS,
+                    backend_tier_strict: true,
+                    admission_max_inflight: 4,
+                    admission_queue_saturated_at: Some(4),
+                    first_token_deadline_ms: 400,
+                    stream_commit_ms: 100,
+                    ..Default::default()
+                },
+            );
+            let text = "x".repeat(if long { 4000 } else { 4 });
+            let body = if route == "/v1/completions" {
+                serde_json::json!({"model":"test-model", "prompt":text, "stream":true})
+            } else {
+                serde_json::json!({"model":"test-model", "messages":[{"role":"user", "content":text}], "stream":true})
+            };
+            let mut request = chat_request(body);
+            *request.uri_mut() = route.parse().unwrap();
+            assert_overloaded(app.oneshot(request).await.unwrap()).await;
+            assert_borrowing_released(&state).await;
+            base.verify().await;
+            large.verify().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn output_reserve_does_not_extend_or_exempt_the_first_token_deadline() {
+    for route in ["/v1/chat/completions", "/v1/completions"] {
+        let (backend, handle) = spawn_late_first_event_backend(Duration::from_millis(2500)).await;
+        let app = build_gateway(
+            &backend,
+            GatewayOptions {
+                first_token_deadline_ms: 400,
+                first_token_deadline_per_1k_tokens_ms: 4_000,
+                first_token_deadline_max_ms: 1_000,
+                stream_commit_ms: 100,
+                ..Default::default()
+            },
+        );
+        let mut body = if route == "/v1/completions" {
+            serde_json::json!({"model":"test-model", "prompt":"hi", "stream":true})
+        } else {
+            serde_json::json!({"model":"test-model", "messages":[{"role":"user", "content":"hi"}], "stream":true})
+        };
+        // Even the capped 32,768-token output reserve would exempt this
+        // request if the deadline accidentally used total context demand.
+        body["max_tokens"] = 1_048_576.into();
+        let mut request = chat_request(body);
+        *request.uri_mut() = route.parse().unwrap();
+        let started = std::time::Instant::now();
+        assert_overloaded(app.oneshot(request).await.unwrap()).await;
+        assert!(started.elapsed() < Duration::from_millis(1500));
+        handle.abort();
+    }
+}
+
+#[tokio::test]
 async fn the_deadline_grows_with_the_estimated_prompt() {
     // The long-context tier is off here, so this also covers the estimate
     // being computed for the deadline alone.
@@ -3175,4 +3867,99 @@ async fn borrowing_connect_failover_keeps_destination_cap_and_one_permit() {
     for task in tasks {
         task.abort();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Reasoning usage: the lane's responses carry completion_tokens_details too
+// ---------------------------------------------------------------------------
+
+/// What an SGLang reasoning model streams back: `usage: null` on the content
+/// chunks, then the reasoning count at the top level of the final `usage`.
+const SGLANG_REASONING_STREAM: &str = concat!(
+    "data: {\"id\":\"chatcmpl-r\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"reasoning_content\":\"2+2\"},\"finish_reason\":null}],\"usage\":null}\n\n",
+    "data: {\"id\":\"chatcmpl-r\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"4\"},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+    "data: {\"id\":\"chatcmpl-r\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"total_tokens\":62,\"completion_tokens\":50,\"prompt_tokens_details\":null,\"reasoning_tokens\":42}}\n\n",
+    "data: [DONE]\n\n",
+);
+
+/// A gateway configured like the lane. Of these settings only the first-event
+/// peek and the commit window change the (streaming) response path. The backend
+/// bearer is request-path config: it is the upstream `Authorization` header,
+/// which `mount_reasoning_stream` asserts, and it turns on the request-side
+/// reasoning switch in `routes/chat.rs`. Non-TEE only hides the attestation,
+/// signature and GPU-evidence routes.
+fn reasoning_lane(mock: &MockServer) -> axum::Router {
+    build_gateway(
+        &mock.uri(),
+        GatewayOptions {
+            backend_token: Some("backend-secret".to_string()),
+            non_tee_deployment: true,
+            stream_error_peek_ms: 1000,
+            stream_commit_ms: 300,
+            ..Default::default()
+        },
+    )
+}
+
+async fn mount_reasoning_stream(mock: &MockServer) {
+    // Only a request carrying the lane's backend bearer is answered, so a
+    // dropped or wrong bearer fails these tests instead of passing unnoticed.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", "Bearer backend-secret"))
+        .respond_with(
+            // `set_body_raw`: `set_body_string` would force `text/plain`, and a
+            // non-streaming request only reassembles a `text/event-stream` answer.
+            ResponseTemplate::new(200).set_body_raw(SGLANG_REASONING_STREAM, "text/event-stream"),
+        )
+        .expect(1)
+        .mount(mock)
+        .await;
+}
+
+#[tokio::test]
+async fn streamed_usage_carries_reasoning_tokens_in_completion_tokens_details() {
+    let mock = MockServer::start().await;
+    mount_reasoning_stream(&mock).await;
+    let response = reasoning_lane(&mock)
+        .oneshot(stream_request())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = stream_frames(response).await.concat();
+    let usage = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str::<serde_json::Value>(data).unwrap())
+        .find_map(|event| event.get("usage").filter(|u| u.is_object()).cloned())
+        .unwrap_or_else(|| panic!("no usage chunk in {body}"));
+    assert_eq!(usage["reasoning_tokens"], 42);
+    assert_eq!(
+        usage["completion_tokens_details"],
+        serde_json::json!({"reasoning_tokens": 42})
+    );
+}
+
+#[tokio::test]
+async fn non_streamed_usage_carries_reasoning_tokens_in_completion_tokens_details() {
+    let mock = MockServer::start().await;
+    mount_reasoning_stream(&mock).await;
+    let response = reasoning_lane(&mock)
+        .oneshot(chat_request(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "2+2?"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = json_body(response).await;
+    assert_eq!(body["choices"][0]["message"]["content"], "4");
+    assert_eq!(body["usage"]["reasoning_tokens"], 42);
+    assert_eq!(
+        body["usage"]["completion_tokens_details"],
+        serde_json::json!({"reasoning_tokens": 42})
+    );
 }

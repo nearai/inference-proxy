@@ -29,21 +29,35 @@ const MAX_AFFINITY_ASSIGNMENTS: u64 = 100_000;
 /// backend it wants this request to land on.
 pub const REPLICA_HINT_HEADER: &str = "x-nearai-replica";
 
+/// Optional companion header naming the host the hint was computed for. The
+/// index is only meaningful on that host (model-proxy's rotation can move
+/// indices between hosts), so a mismatch means the hint is not honoured.
+pub const REPLICA_HINT_HOST_HEADER: &str = "x-nearai-replica-host";
+
+/// Longest accepted `x-nearai-replica-host` value, in bytes.
+const MAX_HOST_HEADER_LEN: usize = 128;
+
 /// Parsed `x-nearai-replica` header value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplicaHint {
     /// No header present.
     Absent,
-    /// Header present but not a plain, in-range, non-negative integer.
+    /// Header present but not a plain, in-range, non-negative integer, or a
+    /// malformed `x-nearai-replica-host`.
     Invalid,
+    /// `x-nearai-replica-host` names a different host than this one (or this
+    /// proxy has no host id configured): the hint was meant for another host.
+    WrongHost,
     /// Header parsed to this pool index (not yet validated against the pool).
     Index(usize),
 }
 
 /// Parse the `x-nearai-replica` header: missing → `Absent`; a value that is
 /// not (after trimming) ASCII digits only, is empty, or overflows `usize` →
-/// `Invalid`; otherwise `Index(n)`.
-pub fn parse_replica_hint(headers: &axum::http::HeaderMap) -> ReplicaHint {
+/// `Invalid`; otherwise `Index(n)`. When `x-nearai-replica-host` is present it
+/// must be a valid host id (else `Invalid`) equal to `own_host` (else
+/// `WrongHost`); without that header the hint is taken as-is.
+pub fn parse_replica_hint(headers: &axum::http::HeaderMap, own_host: Option<&str>) -> ReplicaHint {
     let Some(value) = headers.get(REPLICA_HINT_HEADER) else {
         return ReplicaHint::Absent;
     };
@@ -54,10 +68,26 @@ pub fn parse_replica_hint(headers: &axum::http::HeaderMap) -> ReplicaHint {
     if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
         return ReplicaHint::Invalid;
     }
-    match trimmed.parse::<usize>() {
-        Ok(index) => ReplicaHint::Index(index),
-        Err(_) => ReplicaHint::Invalid,
+    let Ok(index) = trimmed.parse::<usize>() else {
+        return ReplicaHint::Invalid;
+    };
+    if let Some(host) = headers.get(REPLICA_HINT_HOST_HEADER) {
+        let Ok(host) = host.to_str() else {
+            return ReplicaHint::Invalid;
+        };
+        let valid = !host.is_empty()
+            && host.len() <= MAX_HOST_HEADER_LEN
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+        if !valid {
+            return ReplicaHint::Invalid;
+        }
+        if own_host != Some(host) {
+            return ReplicaHint::WrongHost;
+        }
     }
+    ReplicaHint::Index(index)
 }
 
 /// Opaque conversation digest used as the affinity key. Contains no prompt
@@ -149,6 +179,10 @@ impl BackendConversationAffinity {
             ReplicaHint::Absent => {}
             ReplicaHint::Invalid => {
                 metrics::counter!("placement_hint_overridden_total", "reason" => "invalid")
+                    .increment(1);
+            }
+            ReplicaHint::WrongHost => {
+                metrics::counter!("placement_hint_overridden_total", "reason" => "wrong_host")
                     .increment(1);
             }
             ReplicaHint::Index(i) if i >= pool.len() => {
@@ -572,16 +606,77 @@ mod tests {
         h
     }
 
+    fn hdr_with_host(v: &str, host: &str) -> axum::http::HeaderMap {
+        let mut h = hdr(v);
+        h.insert(REPLICA_HINT_HOST_HEADER, host.parse().unwrap());
+        h
+    }
+
     #[test]
     fn parse_hint_values() {
         assert_eq!(
-            parse_replica_hint(&axum::http::HeaderMap::new()),
+            parse_replica_hint(&axum::http::HeaderMap::new(), None),
             ReplicaHint::Absent
         );
-        assert_eq!(parse_replica_hint(&hdr("2")), ReplicaHint::Index(2));
-        assert_eq!(parse_replica_hint(&hdr(" 2 ")), ReplicaHint::Index(2));
+        assert_eq!(parse_replica_hint(&hdr("2"), None), ReplicaHint::Index(2));
+        assert_eq!(parse_replica_hint(&hdr(" 2 "), None), ReplicaHint::Index(2));
         for bad in ["", "-1", "x", "1.0", "99999999999999999999999"] {
-            assert_eq!(parse_replica_hint(&hdr(bad)), ReplicaHint::Invalid, "{bad}");
+            assert_eq!(
+                parse_replica_hint(&hdr(bad), None),
+                ReplicaHint::Invalid,
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn hint_with_matching_host_is_honoured() {
+        assert_eq!(
+            parse_replica_hint(&hdr_with_host("2", "gpu01"), Some("gpu01")),
+            ReplicaHint::Index(2)
+        );
+    }
+
+    #[test]
+    fn hint_with_other_host_is_wrong_host_and_not_honoured() {
+        assert_eq!(
+            parse_replica_hint(&hdr_with_host("1", "gpu02"), Some("gpu01")),
+            ReplicaHint::WrongHost
+        );
+        // Not honoured by placement: falls through to least-connections.
+        let pool = BackendPool::new(vec!["http://a".into(), "http://b".into()]);
+        let aff = BackendConversationAffinity::new(false, 3, 8, 60);
+        let p = aff
+            .place(&pool, None, ReplicaHint::WrongHost, "/x", &Policy::NONE)
+            .unwrap();
+        assert_eq!(p.index, 0);
+    }
+
+    #[test]
+    fn hint_without_host_header_behaves_as_before() {
+        assert_eq!(
+            parse_replica_hint(&hdr("2"), Some("gpu01")),
+            ReplicaHint::Index(2)
+        );
+    }
+
+    #[test]
+    fn host_header_without_configured_host_id_is_wrong_host() {
+        assert_eq!(
+            parse_replica_hint(&hdr_with_host("2", "gpu01"), None),
+            ReplicaHint::WrongHost
+        );
+    }
+
+    #[test]
+    fn malformed_host_header_is_invalid() {
+        let long = "a".repeat(129);
+        for bad in ["", "gpu 01", "gpu/01", "gpü", long.as_str()] {
+            assert_eq!(
+                parse_replica_hint(&hdr_with_host("2", bad), Some("gpu01")),
+                ReplicaHint::Invalid,
+                "{bad}"
+            );
         }
     }
 

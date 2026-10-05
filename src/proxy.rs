@@ -1289,6 +1289,14 @@ async fn send_upstream(
                 abandon_without_dispatch(opts.admission.as_ref());
                 return Err(upstream_unreachable());
             };
+            if next.backend.tier == crate::context_tier::ContextTier::Base {
+                if let Some(permit) = opts.admission.as_ref() {
+                    if let Err(rejected) = permit.count_as_base() {
+                        permit.abandon();
+                        return Err(AppError::from(rejected));
+                    }
+                }
+            }
             metrics::counter!("backend_failover_total", "outcome" => "retried").increment(1);
             warn!(
                 failed_backend = %sanitized_upstream_url_for_logs(url),

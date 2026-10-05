@@ -308,14 +308,19 @@ for requests bound for the long tier:
   usual 429 with `Retry-After`, counted as
   `admission_rejections_total{reason="long_reserve"}`. `reason="budget"` keeps
   meaning that the whole budget is in use.
-- A request bound for the long tier is held only by the global budget and the
-  long-host ceiling. The reserve is a floor, not a ceiling: with the base tier
-  quiet, long requests can use the whole budget.
+- The reserve is a floor and adds no ceiling of its own. The admission budget
+  check lets long-bound requests past the reserve, but placement still applies
+  the per-long-host bound. The long tier holds at most `long hosts x
+  min(ceil(current_budget / configured_total_hosts), long-host ceiling)`.
+  Keep `N` at or below that aggregate: any larger reserve cannot be used by
+  the long tier and only reduces the base tier's allowance.
 - Each base host may hold `ceil((current_budget - N) / configured_base_hosts)`,
   so the base bounds add up to what the base tier may hold. The long-host bound
   is unchanged.
-- "Bound for the long tier" means placed there. A long request that falls back
-  to the base hosts, because its tier has no healthy backend, counts as base.
+- "Bound for the long tier" means placed there. If a long request falls back
+  to a base host during placement or connection fail-over, it moves to the base
+  count then. When the base allowance is full, that fallback is refused with
+  `long_reserve`.
 
 At a budget of 48 with a reserve of 12, three base hosts and one long host: the
 base tier holds at most 36 (12 per host) and the long host its 12, whatever the

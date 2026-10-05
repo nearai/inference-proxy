@@ -1,7 +1,7 @@
 use crate::admission::{Permit, RejectReason};
 use crate::backend_affinity::{ConversationKey, ReplicaHint};
 use crate::backend_pool::{BackendGuard, Policy};
-use crate::context_tier::TierDecision;
+use crate::context_tier::{ContextTier, TierDecision};
 use crate::error::AppError;
 use crate::proxy::ConnectFailover;
 use crate::AppState;
@@ -91,6 +91,11 @@ pub(super) fn place_completion(
         }
     };
     if let Some(permit) = admission.as_ref() {
+        if placement.guard.backend().tier == ContextTier::Base {
+            if let Err(rejected) = permit.count_as_base() {
+                return Err(AppError::from(rejected));
+            }
+        }
         permit.attach_backend(placement.index);
     }
     let connect_failover = state

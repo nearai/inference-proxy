@@ -3940,6 +3940,70 @@ async fn borrowing_connect_failover_keeps_destination_cap_and_one_permit() {
     }
 }
 
+#[tokio::test]
+async fn long_connect_failover_to_base_counts_against_the_reserve() {
+    let (app, state, release, mut tasks) = borrowing_gateway_with_reserve(12).await;
+    let failed = tasks.remove(3);
+    failed.abort();
+    let _ = failed.await;
+
+    let response = borrowing_request(app.clone(), true, false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        (state.admission.inflight(), state.admission.inflight_base()),
+        (1, 1)
+    );
+    release.send(1).unwrap();
+    assert!(stream_frames(response).await.concat().contains("[DONE]"));
+    assert_borrowing_released(&state).await;
+    assert_eq!(state.admission.inflight_base(), 0);
+    for task in tasks {
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn long_connect_failover_refuses_when_base_allowance_is_full() {
+    let (app, state, release, mut tasks) = borrowing_gateway_with_reserve(11).await;
+    let held = futures_util::future::join_all(
+        (0..37).map(|_| borrowing_request(app.clone(), false, false)),
+    )
+    .await;
+    assert!(held
+        .iter()
+        .all(|response| response.status() == StatusCode::OK));
+    assert_eq!(
+        (state.admission.inflight(), state.admission.inflight_base()),
+        (37, 37)
+    );
+
+    let failed = tasks.remove(3);
+    failed.abort();
+    let _ = failed.await;
+    let mut body = sized_body(4_000);
+    body["stream"] = true.into();
+    let (response, rendered_metrics) =
+        oneshot_with_rejection_reason_metric(app.clone(), chat_request(body)).await;
+    assert_overloaded(response).await;
+    assert!(
+        rendered_metrics.contains("admission_rejections_total{reason=\"long_reserve\"} 1"),
+        "{rendered_metrics}"
+    );
+    assert_eq!(
+        (state.admission.inflight(), state.admission.inflight_base()),
+        (37, 37)
+    );
+
+    release.send(1).unwrap();
+    for response in held {
+        assert!(stream_frames(response).await.concat().contains("[DONE]"));
+    }
+    assert_borrowing_released(&state).await;
+    for task in tasks {
+        task.abort();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reasoning usage: the lane's responses carry completion_tokens_details too
 // ---------------------------------------------------------------------------

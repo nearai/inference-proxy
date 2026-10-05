@@ -270,6 +270,32 @@ impl AdmissionController {
         self.budget().saturating_sub(reserve)
     }
 
+    fn take_base_slot(&self) -> Result<(), Rejected> {
+        if self
+            .config
+            .as_ref()
+            .is_none_or(|config| config.long_reserved_inflight == 0)
+        {
+            self.inflight_base.fetch_add(1, Ordering::AcqRel);
+            return Ok(());
+        }
+        let mut current = self.inflight_base.load(Ordering::Acquire);
+        loop {
+            if current >= self.base_budget() {
+                return Err(self.reject(RejectReason::LongReserve));
+            }
+            match self.inflight_base.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
     /// Per-backend in-flight bound for the current budget, `None` when
     /// admission is disabled. With no healthy backend the share is computed
     /// as for one, so the (degraded) selection still has a bound to apply.
@@ -439,30 +465,15 @@ impl AdmissionController {
             return Ok(None);
         };
         self.precheck_at(pool, tier, now)?;
-        // Only a request placed on the long tier draws on the reserve. One
-        // that is long by size but falls back to the base hosts (its tier has
-        // no healthy backend) loads the base fleet and counts with it.
+        // A long-bound request starts outside the base count. If placement or
+        // connection fail-over sends it to a base host, it moves there then.
         let base = !tier.is_some_and(|tier| tier.restrict == Some(ContextTier::Long));
         // With a reserve, take the base slot first: a base request that then
         // loses the race for the global slot gives it back, and never holds a
         // global slot a long-tier request could have had.
         let capped = base && config.long_reserved_inflight > 0;
         if capped {
-            let mut current = self.inflight_base.load(Ordering::Acquire);
-            loop {
-                if current >= self.base_budget() {
-                    return Err(self.reject(RejectReason::LongReserve));
-                }
-                match self.inflight_base.compare_exchange_weak(
-                    current,
-                    current + 1,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => break,
-                    Err(actual) => current = actual,
-                }
-            }
+            self.take_base_slot()?;
         }
         let mut current = self.inflight.load(Ordering::Acquire);
         loop {
@@ -493,7 +504,7 @@ impl AdmissionController {
             controller: Arc::clone(self),
             backend: AtomicUsize::new(NO_BACKEND),
             long_request: tier.is_some_and(|tier| tier.estimated == ContextTier::Long),
-            base,
+            base: AtomicBool::new(base),
             state: AtomicU8::new(PENDING),
             dispatched_at: OnceLock::new(),
         }))
@@ -710,13 +721,29 @@ pub struct Permit {
     /// seconds on either tier, so the wait is not a lane observation wherever
     /// the request ends up running.
     long_request: bool,
-    /// Counted in `inflight_base`: admitted as not bound for the long tier.
-    base: bool,
+    /// Counted in `inflight_base`, including after a fallback to a base host.
+    base: AtomicBool,
     state: AtomicU8,
     dispatched_at: OnceLock<Instant>,
 }
 
 impl Permit {
+    /// Count a long-bound request against the base allowance before placing
+    /// it on a base host. Once counted, it stays there even if it moves back
+    /// to a long host.
+    pub fn count_as_base(&self) -> Result<(), Rejected> {
+        if self.base.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.controller.take_base_slot()?;
+        if self.base.swap(true, Ordering::AcqRel) {
+            self.controller.inflight_base.fetch_sub(1, Ordering::AcqRel);
+        } else {
+            metrics::gauge!("admission_inflight_base").increment(1.0);
+        }
+        Ok(())
+    }
+
     pub fn requested_tier(&self) -> ContextTier {
         if self.long_request {
             ContextTier::Long
@@ -853,7 +880,7 @@ impl Permit {
         }
         self.controller.inflight.fetch_sub(1, Ordering::AcqRel);
         metrics::gauge!("admission_inflight").decrement(1.0);
-        if self.base {
+        if self.base.load(Ordering::Acquire) {
             self.controller.inflight_base.fetch_sub(1, Ordering::AcqRel);
             metrics::gauge!("admission_inflight_base").decrement(1.0);
         }
@@ -865,7 +892,7 @@ impl std::fmt::Debug for Permit {
         f.debug_struct("Permit")
             .field("backend", &self.backend())
             .field("long_request", &self.long_request)
-            .field("base", &self.base)
+            .field("base", &self.base.load(Ordering::Relaxed))
             .field("state", &self.state.load(Ordering::Relaxed))
             .finish()
     }
@@ -1098,6 +1125,62 @@ mod tests {
     }
 
     #[test]
+    fn a_long_permit_falling_back_to_base_counts_once_and_releases() {
+        let p = two_tier_pool();
+        let c = controller(reserve_config(8, 3), 4);
+        let permit = c
+            .try_admit(&p, tier(ContextTier::Long, Some(ContextTier::Long)))
+            .unwrap()
+            .unwrap();
+        assert_eq!((c.inflight(), c.inflight_base()), (1, 0));
+        assert!(permit.count_as_base().is_ok());
+        assert!(permit.count_as_base().is_ok());
+        assert_eq!((c.inflight(), c.inflight_base()), (1, 1));
+        drop(permit);
+        assert_eq!((c.inflight(), c.inflight_base()), (0, 0));
+    }
+
+    #[test]
+    fn a_long_permit_cannot_take_a_reserved_slot_on_base_fallback() {
+        let p = two_tier_pool();
+        let c = controller(reserve_config(8, 3), 4);
+        let base: Vec<_> = (0..5)
+            .map(|_| {
+                c.try_admit(&p, tier(ContextTier::Base, Some(ContextTier::Base)))
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        let long = c
+            .try_admit(&p, tier(ContextTier::Long, Some(ContextTier::Long)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            long.count_as_base().unwrap_err().reason,
+            RejectReason::LongReserve
+        );
+        assert_eq!((c.inflight(), c.inflight_base()), (6, 5));
+        drop(long);
+        assert_eq!((c.inflight(), c.inflight_base()), (5, 5));
+        drop(base);
+        assert_eq!((c.inflight(), c.inflight_base()), (0, 0));
+    }
+
+    #[test]
+    fn a_long_permit_falling_back_without_a_reserve_is_counted() {
+        let p = two_tier_pool();
+        let c = controller(reserve_config(8, 0), 4);
+        let permit = c
+            .try_admit(&p, tier(ContextTier::Long, Some(ContextTier::Long)))
+            .unwrap()
+            .unwrap();
+        assert!(permit.count_as_base().is_ok());
+        assert_eq!((c.inflight(), c.inflight_base()), (1, 1));
+        drop(permit);
+        assert_eq!((c.inflight(), c.inflight_base()), (0, 0));
+    }
+
+    #[test]
     fn a_long_reserve_caps_everything_not_bound_for_the_long_tier() {
         let p = two_tier_pool();
         let c = controller(reserve_config(8, 3), 4);
@@ -1152,9 +1235,9 @@ mod tests {
     }
 
     #[test]
-    fn the_long_tier_may_use_more_than_its_reserve() {
-        // The reserve is a floor for the long tier, not a ceiling: with the
-        // base tier idle, long requests take the whole budget.
+    fn the_budget_check_does_not_cap_the_long_tier_at_its_reserve() {
+        // This checks the global budget only. Per-long-host bounds apply at
+        // placement and may keep the long tier below the full budget.
         let p = two_tier_pool();
         let c = controller(reserve_config(8, 3), 4);
         let long_tier = tier(ContextTier::Long, Some(ContextTier::Long));

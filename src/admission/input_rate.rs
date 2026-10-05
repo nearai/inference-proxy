@@ -46,12 +46,13 @@ impl InputRateTable {
     /// instances is about the pre-flood p99 for prompts under 2,000 tokens.
     /// V1 replaces it at runtime from AppConfig.
     pub fn v0() -> Self {
-        Self::new(vec![InputRateBucket {
-            below_tokens: 2_000,
-            per_minute: 100,
-            burst: 20,
-        }])
-        .expect("the V0 input rate table is valid")
+        Self {
+            buckets: vec![InputRateBucket {
+                below_tokens: 2_000,
+                per_minute: 100,
+                burst: 20,
+            }],
+        }
     }
 
     pub fn buckets(&self) -> &[InputRateBucket] {
@@ -140,14 +141,14 @@ impl InputRateLimiter {
     }
 
     pub(super) fn enabled(&self) -> bool {
-        self.rows().is_some()
+        self.lock_rows().is_some()
     }
 
     /// Swap the table; every row of a changed table starts with a full
     /// bucket. An identical table is a no-op: buckets keep their level, so a
     /// periodic re-push cannot hand out a fresh burst.
     pub(super) fn replace(&self, table: Option<InputRateTable>, now: Instant) {
-        let mut guard = self.rows();
+        let mut guard = self.lock_rows();
         if guard.as_ref().map(|rows| &rows.table) == table.as_ref() {
             return;
         }
@@ -155,7 +156,7 @@ impl InputRateLimiter {
     }
 
     pub(super) fn take_at(&self, estimated_tokens: u64, now: Instant) -> Result<(), RateLimited> {
-        let mut guard = self.rows();
+        let mut guard = self.lock_rows();
         let Some(rows) = guard.as_mut() else {
             return Ok(());
         };
@@ -171,7 +172,7 @@ impl InputRateLimiter {
         })
     }
 
-    fn rows(&self) -> MutexGuard<'_, Option<Rows>> {
+    fn lock_rows(&self) -> MutexGuard<'_, Option<Rows>> {
         self.rows.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
@@ -336,5 +337,10 @@ mod tests {
     #[test]
     fn v0_table_is_the_reviewed_one() {
         assert_eq!(InputRateTable::v0().buckets(), &[row(2_000, 100, 20)]);
+    }
+
+    #[test]
+    fn v0_table_satisfies_the_validator() {
+        assert!(InputRateTable::new(InputRateTable::v0().buckets().to_vec()).is_ok());
     }
 }

@@ -316,6 +316,7 @@ impl AdmissionController {
     }
 
     /// Attach the input-token rate table (`None` = off).
+    #[must_use]
     pub fn with_input_rate(self, table: Option<InputRateTable>) -> Self {
         self.replace_input_rate_table(table);
         self
@@ -518,5 +519,7 @@ impl AdmissionController {
     }
 }
 
+#[cfg(test)]
+mod input_rate_tests;
 #[cfg(test)]
 mod tests;

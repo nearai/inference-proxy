@@ -39,17 +39,19 @@
 //! endpoint or extra token is involved. Disabled (`max_inflight = 0`) the
 //! module is inert and the in-CVM behavior is unchanged.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::backend_pool::BackendPool;
 use crate::context_tier::{ContextTier, TierDecision};
 use crate::engine_load::EngineLoad;
 
+mod saturation;
 mod ttft;
+use saturation::BackendSaturation;
 use ttft::TtftBreaker;
 pub use ttft::{TTFT_BREACH_FRACTION, TTFT_MIN_BREACHES, TTFT_MIN_SAMPLES, TTFT_WINDOW};
 
@@ -149,16 +151,7 @@ pub struct AdmissionController {
     budget: AtomicU32,
     ramp: Mutex<Ramp>,
     ttft: TtftBreaker,
-    /// Per backend index: last engine admission rejection as milliseconds
-    /// since `epoch`, plus one so that zero means "never".
-    backpressure: Vec<AtomicU64>,
-    /// Live engine view per backend when `VLLM_BACKEND_PROBE_URLS` is set.
-    engine: Arc<EngineLoad>,
-    epoch: Instant,
-    /// Latched "every backend queues" state, one per tier: the verdict is
-    /// computed over the request's own tier, so a single flag would flap
-    /// between a queueing base fleet and an idle long host.
-    queue_tripped: [AtomicBool; 2],
+    saturation: BackendSaturation,
 }
 
 impl AdmissionController {
@@ -188,10 +181,7 @@ impl AdmissionController {
                 dirty: false,
             }),
             ttft: TtftBreaker::new(now),
-            backpressure: (0..backend_count).map(|_| AtomicU64::new(0)).collect(),
-            engine,
-            epoch: now,
-            queue_tripped: [AtomicBool::new(false), AtomicBool::new(false)],
+            saturation: BackendSaturation::new(backend_count, engine, now),
         }
     }
 
@@ -202,7 +192,7 @@ impl AdmissionController {
 
     /// Fresh engine view `(running, queued)` for backend `index`, when polled.
     pub fn engine(&self, index: usize) -> Option<(u32, u32)> {
-        self.engine.get(index).map(|s| (s.running, s.queued))
+        self.saturation.engine(index)
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -325,30 +315,8 @@ impl AdmissionController {
     }
 
     pub(crate) fn backend_saturated_at(&self, index: usize, now: Instant) -> bool {
-        // The engine sample is checked before the config `None` return: a
-        // gateway that sets `VLLM_BACKEND_PROBE_URLS` without admission still
-        // steers placement around a queueing backend (threshold 1, same as
-        // admission's own default).
-        let threshold = self.config.as_ref().map_or(1, |c| c.queue_saturated_at);
-        if self
-            .engine
-            .get_at(index, now)
-            .is_some_and(|s| s.queued >= threshold)
-        {
-            return true;
-        }
-        let Some(config) = &self.config else {
-            return false;
-        };
-        let stamp = self
-            .backpressure
-            .get(index)
-            .map_or(0, |s| s.load(Ordering::Relaxed));
-        if stamp == 0 {
-            return false;
-        }
-        let at = self.epoch + Duration::from_millis(stamp - 1);
-        now.saturating_duration_since(at) <= config.backpressure_ttl
+        self.saturation
+            .saturated_at(self.config.as_ref(), index, now)
     }
 
     /// Build (and count) a refusal for `reason`.
@@ -553,19 +521,10 @@ impl AdmissionController {
     }
 
     fn record_backpressure(&self, backend: usize, now: Instant) {
-        if let Some(slot) = self.backpressure.get(backend) {
-            let millis = u64::try_from(now.saturating_duration_since(self.epoch).as_millis())
-                .unwrap_or(u64::MAX - 1);
-            slot.store(millis + 1, Ordering::Relaxed);
-        }
-        metrics::counter!("admission_backpressure_total", "backend" => backend.to_string())
-            .increment(1);
+        self.saturation.record_backpressure(backend, now);
         self.mark_dirty();
     }
 
-    /// Every healthy backend of the request's tier is saturated: its engine
-    /// queue is at or above `queue_saturated_at`, or it rejected a lane
-    /// request at engine admission within the TTL.
     fn every_backend_queued(
         &self,
         config: &AdmissionConfig,
@@ -573,37 +532,8 @@ impl AdmissionController {
         tier: Option<ContextTier>,
         now: Instant,
     ) -> bool {
-        let mut healthy = 0usize;
-        let mut all_queued = true;
-        for (index, backend) in pool.backends().iter().enumerate() {
-            if !backend.healthy.load(Ordering::Relaxed)
-                || tier.is_some_and(|tier| tier != backend.tier)
-            {
-                continue;
-            }
-            healthy += 1;
-            if !self.backend_saturated_at(index, now) {
-                all_queued = false;
-                break;
-            }
-        }
-        let queued = healthy > 0 && all_queued;
-        let latch = &self.queue_tripped[usize::from(tier == Some(ContextTier::Long))];
-        if queued != latch.swap(queued, Ordering::Relaxed) {
-            let tier = tier.map_or("any", ContextTier::as_str);
-            if queued {
-                warn!(
-                    tier,
-                    healthy_backends = healthy,
-                    queue_saturated_at = config.queue_saturated_at,
-                    ttl_secs = config.backpressure_ttl.as_secs(),
-                    "Every backend's engine queue is at or above the saturation threshold, or it rejected a lane request at engine admission recently; refusing new work"
-                );
-            } else {
-                info!(tier, "A backend accepts lane work again");
-            }
-        }
-        queued
+        self.saturation
+            .every_backend_queued(config, pool, tier, now)
     }
 }
 

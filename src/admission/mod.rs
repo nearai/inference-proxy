@@ -57,10 +57,12 @@ use crate::context_tier::{ContextTier, TierDecision};
 use crate::engine_load::EngineLoad;
 
 mod budget;
+mod input_rate;
 mod permit;
 mod saturation;
 mod ttft;
 use budget::Budget;
+pub use input_rate::{InputRateBucket, InputRateTable};
 pub use permit::Permit;
 use saturation::BackendSaturation;
 use ttft::TtftBreaker;

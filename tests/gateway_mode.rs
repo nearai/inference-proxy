@@ -45,6 +45,8 @@ struct GatewayOptions {
     admission_ttft_p95_max_ms: Option<u64>,
     admission_backpressure_secs: Option<u64>,
     admission_queue_saturated_at: Option<u32>,
+    /// `VLLM_PROXY_ADMISSION_INPUT_RATE`: the V0 input-token rate table.
+    admission_input_rate: bool,
     backend_connect_failover: bool,
     /// Engine metrics probe base URLs, one per backend (polled every 100 ms here).
     backend_probe_urls: Vec<String>,
@@ -179,6 +181,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         admission_backpressure_secs: options.admission_backpressure_secs.unwrap_or(10),
         admission_queue_saturated_at: options.admission_queue_saturated_at.unwrap_or(1),
         admission_retry_after_secs: 2,
+        admission_input_rate: options.admission_input_rate,
         backend_connect_failover: options.backend_connect_failover,
         backend_probe_urls: options.backend_probe_urls.clone(),
         backend_probe_interval_secs: 2,

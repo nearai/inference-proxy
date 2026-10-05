@@ -440,6 +440,11 @@ pub struct Config {
     /// `Retry-After` on refusals (`VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS`,
     /// default 2).
     pub admission_retry_after_secs: u64,
+    /// Opt-in input-token rate limit (`VLLM_PROXY_ADMISSION_INPUT_RATE`, see
+    /// `admission::InputRateTable::v0`): requests estimated under 2,000 input
+    /// tokens are capped per minute with 429 + `Retry-After`. Works without
+    /// the in-flight budget.
+    pub admission_input_rate: bool,
     /// Retry a chat/completions request once on another healthy backend when
     /// the connection to the chosen one fails before anything was sent
     /// (`VLLM_BACKEND_CONNECT_FAILOVER`). HTTP errors, queue-full included,
@@ -786,6 +791,7 @@ impl Config {
             env_parse("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT", 1)?;
         let admission_retry_after_secs: u64 =
             env_parse("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS", 2)?;
+        let admission_input_rate = env_bool("VLLM_PROXY_ADMISSION_INPUT_RATE");
         if admission_max_inflight > 0 {
             if admission_start_inflight == 0 || admission_start_inflight > admission_max_inflight {
                 anyhow::bail!(
@@ -1044,6 +1050,7 @@ impl Config {
             admission_backpressure_secs,
             admission_queue_saturated_at,
             admission_retry_after_secs,
+            admission_input_rate,
             backend_connect_failover,
             replica_state,
             backend_probe_urls,
@@ -1225,6 +1232,12 @@ impl Config {
         })
     }
 
+    /// The input-token rate table, `None` unless `VLLM_PROXY_ADMISSION_INPUT_RATE` is set.
+    pub fn input_rate_table(&self) -> Option<crate::admission::InputRateTable> {
+        self.admission_input_rate
+            .then(crate::admission::InputRateTable::v0)
+    }
+
     /// How long a streaming request of this estimated prompt size may go
     /// without an upstream answer before it is refused. `None` when the
     /// feature is off, and when the computed deadline is above
@@ -1382,6 +1395,7 @@ mod tests {
             "VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS",
             "VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT",
             "VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS",
+            "VLLM_PROXY_ADMISSION_INPUT_RATE",
             "VLLM_BACKEND_CONNECT_FAILOVER",
             "VLLM_BACKEND_PROBE_URLS",
             "VLLM_BACKEND_PROBE_INTERVAL_SECS",
@@ -2665,5 +2679,24 @@ mod tests {
                 env::remove_var("VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS");
             },
         );
+    }
+
+    #[test]
+    fn test_admission_input_rate_is_opt_in() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            gateway_env_cleanup();
+            let config = Config::from_env().unwrap();
+            assert!(!config.admission_input_rate);
+            assert_eq!(config.input_rate_table(), None);
+
+            env::set_var("VLLM_PROXY_ADMISSION_INPUT_RATE", "1");
+            let config = Config::from_env().unwrap();
+            assert!(config.admission_input_rate);
+            assert_eq!(
+                config.input_rate_table(),
+                Some(crate::admission::InputRateTable::v0())
+            );
+            gateway_env_cleanup();
+        });
     }
 }

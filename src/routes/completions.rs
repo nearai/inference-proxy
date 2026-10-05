@@ -101,8 +101,9 @@ pub async fn completions(
     // The estimate is walked at most once and also sizes the first-token
     // deadline, which only streaming requests get.
     let estimate = (state.config.long_context_above_tokens > 0
-        || (is_stream && state.config.first_token_deadline_ms > 0))
-        .then(|| crate::context_tier::completion_estimate(&request_json));
+        || (is_stream && state.config.first_token_deadline_ms > 0)
+        || state.admission.input_rate_enabled())
+    .then(|| crate::context_tier::completion_estimate(&request_json));
     let tier = crate::context_tier::decide(
         &state.backend_pool,
         state.config.long_context_above_tokens,
@@ -119,7 +120,11 @@ pub async fn completions(
     };
     // Lane admission (gateway mode), first half — as in chat. `place_completion`
     // re-runs the same signal checks before reserving the slot.
-    state.admission.precheck(&state.backend_pool, tier)?;
+    state.admission.precheck(
+        &state.backend_pool,
+        tier,
+        estimate.map(crate::context_tier::Estimate::tokens),
+    )?;
     let placed = place_completion(&state, ROUTE_COMPLETIONS, tier, None, hint)?;
 
     let opts = ProxyOpts {

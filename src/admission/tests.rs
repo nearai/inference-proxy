@@ -1,6 +1,6 @@
 use super::*;
 
-fn config() -> AdmissionConfig {
+pub(super) fn config() -> AdmissionConfig {
     AdmissionConfig {
         max_inflight: 8,
         tier_borrowing: false,
@@ -16,7 +16,7 @@ fn config() -> AdmissionConfig {
     }
 }
 
-fn pool(n: usize) -> BackendPool {
+pub(super) fn pool(n: usize) -> BackendPool {
     BackendPool::new((0..n).map(|i| format!("http://b{i}:8000")).collect())
 }
 
@@ -290,7 +290,7 @@ fn a_long_reserve_caps_everything_not_bound_for_the_long_tier() {
         RejectReason::LongReserve
     );
     assert_eq!(
-        c.precheck(&p, base_tier).unwrap_err().reason,
+        c.precheck(&p, base_tier, None).unwrap_err().reason,
         RejectReason::LongReserve
     );
     // No tier decision (the feature is off for this request) and a long
@@ -307,7 +307,7 @@ fn a_long_reserve_caps_everything_not_bound_for_the_long_tier() {
     );
     assert_eq!((c.inflight(), c.inflight_base()), (5, 5));
     // The reserve is there for the long tier, up to the global budget.
-    assert!(c.precheck(&p, long_tier).is_ok());
+    assert!(c.precheck(&p, long_tier, None).is_ok());
     let long: Vec<_> = (0..3)
         .map(|_| c.try_admit(&p, long_tier).unwrap().unwrap())
         .collect();
@@ -982,11 +982,11 @@ fn a_strict_empty_tier_is_admitted_here_and_left_to_placement_to_refuse() {
 fn precheck_refuses_without_taking_a_slot() {
     let c = controller(config(), 1);
     let p = pool(1);
-    assert!(c.precheck(&p, None).is_ok());
+    assert!(c.precheck(&p, None, None).is_ok());
     let _a = c.try_admit(&p, None).unwrap().unwrap();
     let _b = c.try_admit(&p, None).unwrap().unwrap();
     assert_eq!(
-        c.precheck(&p, None).unwrap_err().reason,
+        c.precheck(&p, None, None).unwrap_err().reason,
         RejectReason::Budget
     );
     assert_eq!(c.inflight(), 2);

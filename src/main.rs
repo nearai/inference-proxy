@@ -254,11 +254,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Lane admission (gateway mode): inert unless configured.
-    let admission = Arc::new(admission::AdmissionController::new(
-        config.admission(),
-        backend_pool.len(),
-        engine_load,
-    ));
+    let admission = Arc::new(
+        admission::AdmissionController::new(config.admission(), backend_pool.len(), engine_load)
+            .with_input_rate(config.input_rate_table()),
+    );
     if let Some(settings) = admission.config() {
         info!(
             max_inflight = settings.max_inflight,
@@ -272,6 +271,16 @@ async fn main() -> anyhow::Result<()> {
             retry_after_secs = settings.retry_after.as_secs(),
             "Lane admission enabled"
         );
+    }
+    if let Some(table) = config.input_rate_table() {
+        for bucket in table.buckets() {
+            info!(
+                below_tokens = bucket.below_tokens,
+                per_minute = bucket.per_minute,
+                burst = bucket.burst,
+                "Input-token rate limit enabled"
+            );
+        }
     }
     if config.backend_connect_failover {
         info!("Connection fail-over to another backend enabled for chat/completions");

@@ -406,7 +406,7 @@ pub struct Config {
     /// the response signature, so leave this off where clients verify
     /// signatures over the raw stream bytes.
     pub sse_keepalive_secs: u64,
-    /// Lane admission (gateway mode, see `admission.rs`): hard ceiling on
+    /// Lane admission (gateway mode, see `admission/`): hard ceiling on
     /// chat/completions requests in flight across the fleet
     /// (`VLLM_PROXY_ADMISSION_MAX_INFLIGHT`, 0 = off, the default).
     pub admission_max_inflight: u32,

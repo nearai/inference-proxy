@@ -22,7 +22,7 @@
 //! short requests off the long host when the base fleet is down, rather than
 //! trading one kind of head-of-line blocking for the other. Strict mode pins
 //! the restriction even once the tier is empty; callers refuse the request
-//! instead (`RejectReason::TierUnavailable` in `admission.rs`, or a 503 with
+//! instead (`RejectReason::TierUnavailable` in `admission/`, or a 503 with
 //! `error_type: "tier_unavailable"` when admission is off). Only meaningful
 //! with a long-context tier configured; set without one, it is ignored (a
 //! startup warning says so).

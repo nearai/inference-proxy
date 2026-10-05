@@ -117,6 +117,9 @@ pub async fn completions(
     } else {
         ReplicaHint::Absent
     };
+    // Lane admission (gateway mode), first half — as in chat. `place_completion`
+    // re-runs the same signal checks before reserving the slot.
+    state.admission.precheck(&state.backend_pool, tier)?;
     let placed = place_completion(&state, ROUTE_COMPLETIONS, tier, None, hint)?;
 
     let opts = ProxyOpts {

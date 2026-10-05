@@ -39,6 +39,7 @@ struct GatewayOptions {
     admission_max_inflight: u32,
     admission_tier_borrowing: bool,
     admission_long_max_inflight_per_host: u32,
+    admission_long_reserved_inflight: u32,
 
     admission_start_inflight: Option<u32>,
     admission_ttft_p95_max_ms: Option<u64>,
@@ -168,6 +169,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         admission_max_inflight: options.admission_max_inflight,
         admission_tier_borrowing: options.admission_tier_borrowing,
         admission_long_max_inflight_per_host: options.admission_long_max_inflight_per_host,
+        admission_long_reserved_inflight: options.admission_long_reserved_inflight,
         admission_start_inflight: options
             .admission_start_inflight
             .unwrap_or(options.admission_max_inflight),
@@ -3641,6 +3643,18 @@ async fn borrowing_gateway() -> (
     tokio::sync::watch::Sender<u8>,
     Vec<tokio::task::JoinHandle<()>>,
 ) {
+    borrowing_gateway_with_reserve(0).await
+}
+
+// The same fleet with `reserve` budget slots kept for the long tier.
+async fn borrowing_gateway_with_reserve(
+    reserve: u32,
+) -> (
+    axum::Router,
+    AppState,
+    tokio::sync::watch::Sender<u8>,
+    Vec<tokio::task::JoinHandle<()>>,
+) {
     let (release, receiver) = tokio::sync::watch::channel(0u8);
     let mut urls = Vec::new();
     let mut tasks = Vec::new();
@@ -3693,6 +3707,7 @@ async fn borrowing_gateway() -> (
             admission_max_inflight: 48,
             admission_tier_borrowing: true,
             admission_long_max_inflight_per_host: 12,
+            admission_long_reserved_inflight: reserve,
             backend_connect_failover: true,
             ..Default::default()
         },
@@ -3766,6 +3781,62 @@ async fn borrowing_serves_48_base_streams_and_releases_after_done() {
         );
     }
     assert_borrowing_released(&state).await;
+    for task in tasks {
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn a_long_reserve_keeps_room_for_long_requests_under_a_base_flood() {
+    let (app, state, release, tasks) = borrowing_gateway_with_reserve(12).await;
+    // 60 short requests against a budget of 48: the base tier stops at
+    // 48 - 12 = 36, 12 per host, and the other 24 are refused.
+    let flood = futures_util::future::join_all(
+        (0..60).map(|_| borrowing_request(app.clone(), false, false)),
+    )
+    .await;
+    let (held, refused): (Vec<_>, Vec<_>) = flood
+        .into_iter()
+        .partition(|response| response.status() == StatusCode::OK);
+    assert_eq!(held.len(), 36);
+    assert_eq!(refused.len(), 24);
+    for response in refused {
+        assert_overloaded(response).await;
+    }
+    assert_eq!(state.admission.inflight(), 36);
+    assert_eq!(state.admission.inflight_base(), 36);
+    for backend in &state.backend_pool.backends()[..3] {
+        assert_eq!(
+            backend
+                .lane_conns
+                .load(std::sync::atomic::Ordering::Acquire),
+            12
+        );
+    }
+    // The flood is still in flight and the long tier gets its 12 slots.
+    let long = futures_util::future::join_all(
+        (0..12).map(|_| borrowing_request(app.clone(), true, false)),
+    )
+    .await;
+    assert!(long.iter().all(|r| r.status() == StatusCode::OK));
+    assert_eq!(state.admission.inflight(), 48);
+    assert_eq!(state.admission.inflight_base(), 36);
+    assert_eq!(
+        state.backend_pool.backends()[3]
+            .lane_conns
+            .load(std::sync::atomic::Ordering::Acquire),
+        12
+    );
+    // Full on both counts now.
+    assert_overloaded(borrowing_request(app.clone(), false, false).await).await;
+    assert_overloaded(borrowing_request(app.clone(), true, false).await).await;
+    release.send(1).unwrap();
+    for response in held.into_iter().chain(long) {
+        let body = stream_frames(response).await.concat();
+        assert!(body.contains("[DONE]"), "{body}");
+    }
+    assert_borrowing_released(&state).await;
+    assert_eq!(state.admission.inflight_base(), 0);
     for task in tasks {
         task.abort();
     }
@@ -3862,6 +3933,70 @@ async fn borrowing_connect_failover_keeps_destination_cap_and_one_permit() {
     release.send(1).unwrap();
     for r in held {
         assert!(stream_frames(r).await.concat().contains("[DONE]"));
+    }
+    assert_borrowing_released(&state).await;
+    for task in tasks {
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn long_connect_failover_to_base_counts_against_the_reserve() {
+    let (app, state, release, mut tasks) = borrowing_gateway_with_reserve(12).await;
+    let failed = tasks.remove(3);
+    failed.abort();
+    let _ = failed.await;
+
+    let response = borrowing_request(app.clone(), true, false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        (state.admission.inflight(), state.admission.inflight_base()),
+        (1, 1)
+    );
+    release.send(1).unwrap();
+    assert!(stream_frames(response).await.concat().contains("[DONE]"));
+    assert_borrowing_released(&state).await;
+    assert_eq!(state.admission.inflight_base(), 0);
+    for task in tasks {
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn long_connect_failover_refuses_when_base_allowance_is_full() {
+    let (app, state, release, mut tasks) = borrowing_gateway_with_reserve(11).await;
+    let held = futures_util::future::join_all(
+        (0..37).map(|_| borrowing_request(app.clone(), false, false)),
+    )
+    .await;
+    assert!(held
+        .iter()
+        .all(|response| response.status() == StatusCode::OK));
+    assert_eq!(
+        (state.admission.inflight(), state.admission.inflight_base()),
+        (37, 37)
+    );
+
+    let failed = tasks.remove(3);
+    failed.abort();
+    let _ = failed.await;
+    let mut body = sized_body(4_000);
+    body["stream"] = true.into();
+    let (response, rendered_metrics) =
+        oneshot_with_rejection_reason_metric(app.clone(), chat_request(body)).await;
+    assert_overloaded(response).await;
+    assert!(
+        rendered_metrics.contains("admission_rejections_total{reason=\"long_reserve\"} 1"),
+        "{rendered_metrics}"
+    );
+    assert_eq!(
+        (state.admission.inflight(), state.admission.inflight_base()),
+        (37, 37)
+    );
+
+    release.send(1).unwrap();
+    for response in held {
+        assert!(stream_frames(response).await.concat().contains("[DONE]"));
     }
     assert_borrowing_released(&state).await;
     for task in tasks {

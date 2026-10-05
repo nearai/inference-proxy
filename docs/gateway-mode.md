@@ -288,12 +288,50 @@ rollout). Defaults preserve the legacy uniform-share policy.
 With borrowing, each base host may hold `ceil(current_budget / configured_base_hosts)`;
 each long host may hold `min(ceil(current_budget / configured_total_hosts), long_host_limit)`.
 Configured counts prevent surviving hosts receiving larger limits during an outage.
-The atomic global budget still bounds their sum, and no slots are reserved for long
-traffic. At 48 with three base hosts and one long host, base can use all 48 slots
+The atomic global budget still bounds their sum, and by default no slots are reserved
+for long traffic (see the reserve below). At 48 with three base hosts and one long host, base can use all 48 slots
 (16 per host); the long host remains capped at 12. At budgets 56 and 64 the base
 bounds become 19 and 22, while long stays at 12. A full shared budget refuses
 both tiers. These bounds follow the destination backend during fallback and
 connection failover; the context threshold and engine back-pressure policy are unchanged.
+
+### Reserving budget for the long tier
+
+Without a reserve, a flood of short requests can hold the whole budget. The
+budget check does not look at the tier, so long-context requests are refused
+with the rest while the long hosts sit under their ceiling.
+`VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT=N` keeps `N` slots of the budget
+for requests bound for the long tier:
+
+- A request that is not bound for the long tier is admitted only while fewer
+  than `current_budget - N` such requests are in flight. Past that it gets the
+  usual 429 with `Retry-After`, counted as
+  `admission_rejections_total{reason="long_reserve"}`. `reason="budget"` keeps
+  meaning that the whole budget is in use.
+- The reserve is a floor and adds no ceiling of its own. The admission budget
+  check lets long-bound requests past the reserve, but placement still applies
+  the per-long-host bound. The long tier holds at most `long hosts x
+  min(ceil(current_budget / configured_total_hosts), long-host ceiling)`.
+  Keep `N` at or below that aggregate: any larger reserve cannot be used by
+  the long tier and only reduces the base tier's allowance.
+- Each base host may hold `ceil((current_budget - N) / configured_base_hosts)`,
+  so the base bounds add up to what the base tier may hold. The long-host bound
+  is unchanged.
+- "Bound for the long tier" means placed there. If a long request falls back
+  to a base host during placement or connection fail-over, it moves to the base
+  count then. When the base allowance is full, that fallback is refused with
+  `long_reserve`.
+
+At a budget of 48 with a reserve of 12, three base hosts and one long host: the
+base tier holds at most 36 (12 per host) and the long host its 12, whatever the
+base demand. Raising the budget and the reserve together leaves the base bounds
+where they were: 64 with a reserve of 16 gives the base hosts 16 each, as 48
+did without one.
+
+The setting requires `VLLM_PROXY_ADMISSION_TIER_BORROWING` and must be below
+`VLLM_PROXY_ADMISSION_START_INFLIGHT`, the lowest the budget ever is. `0`, the
+default, changes nothing. `admission_inflight_base` is the in-flight count the
+reserve applies to and `admission_long_reserve` the configured value.
 
 `admission_backend_inflight{backend,tier}` and `admission_backend_limit{backend,tier}`
 are snapshots at metrics scrape time. `admission_selection_failures_total{requested_tier,tier,reason}`

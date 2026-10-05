@@ -290,7 +290,7 @@ fn a_long_reserve_caps_everything_not_bound_for_the_long_tier() {
         RejectReason::LongReserve
     );
     assert_eq!(
-        c.precheck(&p, base_tier).unwrap_err().reason,
+        c.precheck(&p, base_tier, None).unwrap_err().reason,
         RejectReason::LongReserve
     );
     // No tier decision (the feature is off for this request) and a long
@@ -307,7 +307,7 @@ fn a_long_reserve_caps_everything_not_bound_for_the_long_tier() {
     );
     assert_eq!((c.inflight(), c.inflight_base()), (5, 5));
     // The reserve is there for the long tier, up to the global budget.
-    assert!(c.precheck(&p, long_tier).is_ok());
+    assert!(c.precheck(&p, long_tier, None).is_ok());
     let long: Vec<_> = (0..3)
         .map(|_| c.try_admit(&p, long_tier).unwrap().unwrap())
         .collect();
@@ -982,12 +982,75 @@ fn a_strict_empty_tier_is_admitted_here_and_left_to_placement_to_refuse() {
 fn precheck_refuses_without_taking_a_slot() {
     let c = controller(config(), 1);
     let p = pool(1);
-    assert!(c.precheck(&p, None).is_ok());
+    assert!(c.precheck(&p, None, None).is_ok());
     let _a = c.try_admit(&p, None).unwrap().unwrap();
     let _b = c.try_admit(&p, None).unwrap().unwrap();
     assert_eq!(
-        c.precheck(&p, None).unwrap_err().reason,
+        c.precheck(&p, None, None).unwrap_err().reason,
         RejectReason::Budget
     );
     assert_eq!(c.inflight(), 2);
+}
+
+fn one_per_minute_burst_one() -> InputRateTable {
+    InputRateTable::new(vec![InputRateBucket {
+        below_tokens: 2_000,
+        per_minute: 1,
+        burst: 1,
+    }])
+    .unwrap()
+}
+
+#[test]
+fn precheck_takes_an_input_rate_token_even_without_a_budget() {
+    let c = AdmissionController::disabled().with_input_rate(Some(one_per_minute_burst_one()));
+    let p = pool(1);
+    let t0 = Instant::now();
+    assert!(c.input_rate_enabled());
+    assert_eq!(c.precheck_at(&p, None, Some(100), t0), Ok(()));
+    let refused = c.precheck_at(&p, None, Some(100), t0).unwrap_err();
+    assert_eq!(refused.reason, RejectReason::InputTokens);
+    assert_eq!(refused.reason.as_str(), "input_tokens");
+    assert_eq!(refused.retry_after, Duration::from_secs(60));
+    // No estimate, or one past the table: nothing to limit.
+    assert_eq!(c.precheck_at(&p, None, None, t0), Ok(()));
+    assert_eq!(c.precheck_at(&p, None, Some(2_000), t0), Ok(()));
+}
+
+#[test]
+fn try_admit_never_takes_an_input_rate_token() {
+    let c = Arc::new(
+        AdmissionController::new(Some(config()), 1, Arc::new(EngineLoad::disabled()))
+            .with_input_rate(Some(one_per_minute_burst_one())),
+    );
+    let p = pool(1);
+    let t0 = Instant::now();
+    assert_eq!(c.precheck_at(&p, None, Some(100), t0), Ok(()));
+    // try_admit re-runs the signal checks only; the bucket is untouched.
+    drop(c.try_admit_at(&p, None, t0).unwrap());
+    drop(c.try_admit_at(&p, None, t0).unwrap());
+    assert_eq!(
+        c.precheck_at(&p, None, Some(100), t0).unwrap_err().reason,
+        RejectReason::InputTokens
+    );
+}
+
+#[test]
+fn an_overload_refusal_does_not_take_an_input_rate_token() {
+    let c = Arc::new(
+        AdmissionController::new(Some(config()), 1, Arc::new(EngineLoad::disabled()))
+            .with_input_rate(Some(one_per_minute_burst_one())),
+    );
+    let p = pool(1);
+    let t0 = Instant::now();
+    // Fill the budget (config(): start_inflight 2).
+    let first = c.try_admit_at(&p, None, t0).unwrap();
+    let _second = c.try_admit_at(&p, None, t0).unwrap();
+    assert_eq!(
+        c.precheck_at(&p, None, Some(100), t0).unwrap_err().reason,
+        RejectReason::Budget
+    );
+    drop(first);
+    // The budget refusal left the token in the bucket.
+    assert_eq!(c.precheck_at(&p, None, Some(100), t0), Ok(()));
 }

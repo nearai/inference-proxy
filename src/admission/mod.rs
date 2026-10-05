@@ -25,6 +25,8 @@
 //!    reserves the slot atomically and only on backends under their share: a
 //!    pinned conversation moves when its host is full, and only when no host
 //!    has room is the request refused.
+//! 4. **Input-token rate** (opt-in, `input_rate.rs`): one token per request from
+//!    the bucket of its estimated-input row, taken in `precheck` only.
 //!
 //! The controller is a facade over `TtftBreaker` (1), `BackendSaturation`
 //! (1, and placement steering) and `Budget` (2, 3); an overload signal from
@@ -50,7 +52,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::backend_pool::BackendPool;
 use crate::context_tier::{ContextTier, TierDecision};
@@ -62,6 +64,7 @@ mod permit;
 mod saturation;
 mod ttft;
 use budget::Budget;
+use input_rate::InputRateLimiter;
 pub use input_rate::{InputRateBucket, InputRateTable};
 pub use permit::Permit;
 use saturation::BackendSaturation;
@@ -117,6 +120,9 @@ pub enum RejectReason {
     /// has no healthy backend at all, and strict mode refuses rather than
     /// placing it on the other tier. See `context_tier.rs`.
     TierUnavailable,
+    /// The request's estimated input falls in a row of the input-token rate
+    /// table (`VLLM_PROXY_ADMISSION_INPUT_RATE`) whose bucket is empty.
+    InputTokens,
 }
 
 impl RejectReason {
@@ -128,6 +134,7 @@ impl RejectReason {
             RejectReason::BackendQueue => "backend_queue",
             RejectReason::Ttft => "ttft",
             RejectReason::TierUnavailable => "tier_unavailable",
+            RejectReason::InputTokens => "input_tokens",
         }
     }
 }
@@ -145,6 +152,7 @@ pub struct AdmissionController {
     budget: Budget,
     ttft: TtftBreaker,
     saturation: BackendSaturation,
+    input_rate: InputRateLimiter,
 }
 
 impl AdmissionController {
@@ -170,6 +178,7 @@ impl AdmissionController {
             budget: Budget::new(budget, reserve, now),
             ttft: TtftBreaker::new(now),
             saturation: BackendSaturation::new(backend_count, engine, now),
+            input_rate: InputRateLimiter::new(None, now),
         }
     }
 
@@ -287,6 +296,14 @@ impl AdmissionController {
 
     /// Build (and count) a refusal for `reason`.
     pub fn reject(&self, reason: RejectReason) -> Rejected {
+        let retry_after = self
+            .config
+            .as_ref()
+            .map_or(Duration::from_secs(1), |c| c.retry_after);
+        self.reject_after(reason, retry_after)
+    }
+
+    fn reject_after(&self, reason: RejectReason, retry_after: Duration) -> Rejected {
         metrics::counter!("admission_rejections_total", "reason" => reason.as_str()).increment(1);
         debug!(
             reason = reason.as_str(),
@@ -294,11 +311,23 @@ impl AdmissionController {
         );
         Rejected {
             reason,
-            retry_after: self
-                .config
-                .as_ref()
-                .map_or(Duration::from_secs(1), |c| c.retry_after),
+            retry_after,
         }
+    }
+
+    /// Attach the input-token rate table (`None` = off).
+    pub fn with_input_rate(self, table: Option<InputRateTable>) -> Self {
+        self.replace_input_rate_table(table);
+        self
+    }
+
+    pub fn input_rate_enabled(&self) -> bool {
+        self.input_rate.enabled()
+    }
+
+    /// Swap the input-token rate table (V1: AppConfig); every row starts full.
+    pub fn replace_input_rate_table(&self, table: Option<InputRateTable>) {
+        self.input_rate.replace(table, Instant::now());
     }
 
     /// The overload and budget checks without taking a slot: a cheap early
@@ -306,17 +335,41 @@ impl AdmissionController {
     /// ahead of `try_admit`. Nothing is reserved; the later `try_admit` can
     /// still refuse. The tier decision restricts the fleet-wide queue check
     /// to the backends this request may use (`None` = the whole pool).
-    pub fn precheck(&self, pool: &BackendPool, tier: Option<TierDecision>) -> Result<(), Rejected> {
-        self.precheck_at(pool, tier, Instant::now())
+    ///
+    /// `input_tokens` is the request's estimated input
+    /// (`context_tier::Estimate::tokens`) when the input-token rate is on: a
+    /// token is taken here, once per request, after the overload and budget
+    /// checks passed — never in `try_admit`.
+    pub fn precheck(
+        &self,
+        pool: &BackendPool,
+        tier: Option<TierDecision>,
+        input_tokens: Option<u64>,
+    ) -> Result<(), Rejected> {
+        self.precheck_at(pool, tier, input_tokens, Instant::now())
     }
 
     pub(crate) fn precheck_at(
         &self,
         pool: &BackendPool,
         tier: Option<TierDecision>,
+        input_tokens: Option<u64>,
         now: Instant,
     ) -> Result<(), Rejected> {
-        self.check_signals_and_budget_at(pool, tier, now)
+        self.check_signals_and_budget_at(pool, tier, now)?;
+        if let Some(estimated_tokens) = input_tokens {
+            if let Err(limited) = self.input_rate.take_at(estimated_tokens, now) {
+                info!(
+                    estimated_tokens,
+                    below_tokens = limited.bucket.below_tokens,
+                    per_minute = limited.bucket.per_minute,
+                    retry_after_secs = limited.retry_after.as_secs(),
+                    "Lane request refused: input-token rate"
+                );
+                return Err(self.reject_after(RejectReason::InputTokens, limited.retry_after));
+            }
+        }
+        Ok(())
     }
 
     /// The overload signals and the budget peek. Read-only apart from the

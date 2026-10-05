@@ -110,6 +110,7 @@ to the current in-CVM behavior.
 | `VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS` | `30000` | Refuse new work while, over the last minute, at least 20 lane requests reached the engine and 5 % of them (at least two) waited longer than this for their first generation event. |
 | `VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS` | `10` | A backend that rejected at engine admission within this window is steered around; when every healthy backend did, new work is refused. |
 | `VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT` | `1` | Engine-reported queue depth at or above which a backend counts as saturated for placement and the fleet-wide queue refusal below; the OpenRouter lane runs `4` for engines that run chunked prefill, where a shallow queue is normal while slots are still free. |
+| `VLLM_PROXY_ADMISSION_INPUT_RATE` | `1` | Input-token rate limit, independent of the in-flight budget: requests whose estimated input (the long-context tier's estimate, without the output reserve) is under 2,000 tokens are capped at 100 per minute per gateway instance, burst 20 — about 200/min across the lane's two instances, the pre-flood p99. Beyond it: 429 + `Retry-After` (seconds until the next request fits), reason `input_tokens`. Larger prompts are never limited. Sized on the 2026-10-05 flood of 700–1,500-token requests; the table is `admission::InputRateTable::v0`. |
 | `VLLM_BACKEND_CONNECT_FAILOVER` | `1` | A backend that refuses the connection (host down, proxy restarting) costs the request nothing: it is re-sent once to another healthy backend, the dead one leaves the rotation until a probe succeeds, and a pinned conversation follows. Never on an HTTP error. |
 | `VLLM_BACKEND_PROBE_URLS` / `_INTERVAL_SECS` | `http://<host-ip>:8000,…` / `2` | The engines' live running/queued counts, read from each host's plain metrics port (the same route model-proxy samples; reachable from the model-proxy hosts, no token). One reading covers the replica the host would route to, so a queue in it means no replica is free. Drives placement and the fleet-wide queue refusal below. |
 | `VLLM_BACKEND_LONG_CONTEXT_URLS` | the `-long-b<handle>` URLs | The hosts of the long-context tier, listed as their handle URLs under the model's `-long` model-proxy domain (see below). Appended to the pool after `VLLM_BACKEND_URLS`, so the base backends keep their indexes. Empty = one flat pool, as today. |
@@ -388,7 +389,7 @@ upstream:
 
 A refusal is `429` with `Retry-After: VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS`
 and an error of type `overloaded`; the slot is released when the response —
-the whole stream, for SSE — is complete. Nothing is retried on the engine's
+the whole stream, for SSE — is complete. An input-token rate refusal carries its own `Retry-After`: the seconds until that size row's bucket holds a request again. Nothing is retried on the engine's
 behalf: one upstream attempt per request, with the single exception of a
 connection that cannot be established at all (`VLLM_BACKEND_CONNECT_FAILOVER`),
 where nothing reached the engine yet (a connection failure without fail-over
@@ -402,7 +403,7 @@ back-pressure for the next admission decision
 `backend_affinity_*`, `rejected_content_parts_total{part_type}`,
 `sse_keepalive_comments_total`, `upstream_stream_first_event_errors_total`,
 `stream_client_disconnects_total`, `admission_inflight`, `admission_budget`,
-`admission_rejections_total{reason}`, `admission_ttft_seconds`,
+`admission_rejections_total{reason}` (`budget`, `host_share`, `backend_queue`, `ttft`, `tier_unavailable`, `input_tokens`), `admission_ttft_seconds`,
 `admission_backpressure_total{backend}`, `backend_failover_total{outcome}`,
 `upstream_stream_error_events_total{phase}`, `backend_engine_running{backend}`,
 `backend_engine_queued{backend}`, `backend_engine_probe_failures_total{backend}`,

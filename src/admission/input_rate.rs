@@ -2,9 +2,6 @@
 //! capped by estimated input size, one token bucket per row of a table. A
 //! token is taken once per request, in `AdmissionController::precheck_at`.
 
-// Nothing calls this yet; the allow goes in Task 3, which wires it in.
-#![allow(dead_code)]
-
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 

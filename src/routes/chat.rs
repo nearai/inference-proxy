@@ -96,9 +96,11 @@ pub async fn chat_completions(
         .unwrap_or(false);
     // The input estimate the long-context tier routes on. Not free — it
     // re-serializes the tool definitions and the tool calls in the history —
-    // so it is walked at most once per request and only where it is read.
-    let estimate = (state.config.long_context_above_tokens > 0)
-        .then(|| crate::context_tier::chat_estimate(&request_json));
+    // so it is walked at most once per request and only where it is read: by
+    // the tier and by the input-token rate.
+    let estimate = (state.config.long_context_above_tokens > 0
+        || state.admission.input_rate_enabled())
+    .then(|| crate::context_tier::chat_estimate(&request_json));
     // Long-context tier (gateway mode): a request whose estimated input is
     // above the threshold belongs on the long-context backends, and every
     // candidate selection below is restricted to its tier. `tier` is `None`
@@ -117,7 +119,11 @@ pub async fn chat_completions(
     // checks, so a request the lane cannot take is refused before any image
     // is fetched. The slot and the backend placement are taken on the normal
     // proxy path below, after the special branches, right before dispatch.
-    state.admission.precheck(&state.backend_pool, tier)?;
+    state.admission.precheck(
+        &state.backend_pool,
+        tier,
+        estimate.map(crate::context_tier::Estimate::tokens),
+    )?;
     // Same conversation digest, applied across independent backends: later
     // turns follow the backend that already holds this conversation's prefix.
     let backend_affinity_key = state

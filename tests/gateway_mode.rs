@@ -268,11 +268,10 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
             Duration::from_millis(100),
         );
     }
-    let admission = Arc::new(admission::AdmissionController::new(
-        config.admission(),
-        backend_pool.len(),
-        engine_load,
-    ));
+    let admission = Arc::new(
+        admission::AdmissionController::new(config.admission(), backend_pool.len(), engine_load)
+            .with_input_rate(config.input_rate_table()),
+    );
     let backend_affinity = Arc::new(backend_affinity::BackendConversationAffinity::new(
         config.backend_conversation_affinity,
         backend_pool.len(),
@@ -1614,6 +1613,131 @@ async fn admission_is_inert_when_not_configured() {
         assert!(response.headers().get("retry-after").is_none());
     }
     mock.verify().await;
+}
+
+/// A chat/completions body whose estimated input is at least `tokens` (text is bytes / 4).
+fn prompt_of_about(tokens: usize) -> serde_json::Value {
+    serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "x".repeat(tokens * 4)}],
+        "prompt": "x".repeat(tokens * 4),
+    })
+}
+
+async fn call_with(
+    app: axum::Router,
+    route: &str,
+    body: serde_json::Value,
+) -> axum::response::Response {
+    let mut request = chat_request(body);
+    *request.uri_mut() = route.parse().unwrap();
+    app.oneshot(request).await.unwrap()
+}
+
+/// The input-token rate on (`VLLM_PROXY_ADMISSION_INPUT_RATE`), its V0 table
+/// swapped through the V1 seam for one that cannot refill during the test:
+/// under 2,000 tokens, 1/min, burst 2. V0's values are pinned by
+/// `admission::input_rate::tests::v0_table_is_the_reviewed_one`.
+fn input_rate_gateway(mock_url: &str) -> axum::Router {
+    let (app, state) = build_gateway_with_state(
+        mock_url,
+        GatewayOptions {
+            admission_input_rate: true,
+            ..Default::default()
+        },
+    );
+    assert!(state.admission.input_rate_enabled());
+    state.admission.replace_input_rate_table(Some(
+        admission::InputRateTable::new(vec![admission::InputRateBucket {
+            below_tokens: 2_000,
+            per_minute: 1,
+            burst: 2,
+        }])
+        .unwrap(),
+    ));
+    app
+}
+
+#[tokio::test]
+async fn input_rate_refuses_small_prompts_beyond_the_burst_before_dispatch() {
+    // Tier and first-token deadline are off: the estimate exists only for the
+    // limiter. Exactly the third request is refused on both routes — chat
+    // runs `precheck` and `try_admit`, and spends one token.
+    for route in COMPLETION_ROUTES {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+            .expect(2) // the third never dispatches
+            .mount(&mock)
+            .await;
+        let app = input_rate_gateway(&mock.uri());
+        for i in 0..2 {
+            assert_eq!(
+                call(app.clone(), route).await.status(),
+                StatusCode::OK,
+                "request {i} on {route}"
+            );
+        }
+        let refused = call(app.clone(), route).await;
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            refused
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("60")
+        );
+        let json = json_body(refused).await;
+        assert_eq!(json["error"]["type"], "overloaded");
+        mock.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn input_rate_never_limits_prompts_at_or_above_2000_tokens() {
+    for route in COMPLETION_ROUTES {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+            .expect(2 + 30)
+            .mount(&mock)
+            .await;
+        let app = input_rate_gateway(&mock.uri());
+        for _ in 0..2 {
+            assert_eq!(call(app.clone(), route).await.status(), StatusCode::OK);
+        }
+        assert_eq!(
+            call(app.clone(), route).await.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        for _ in 0..30 {
+            let response = call_with(app.clone(), route, prompt_of_about(2_100)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        mock.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn input_rate_is_inert_when_not_configured() {
+    for route in COMPLETION_ROUTES {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+            .expect(30)
+            .mount(&mock)
+            .await;
+        let app = build_gateway(&mock.uri(), GatewayOptions::default());
+        for _ in 0..30 {
+            let response = call(app.clone(), route).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response.headers().get("retry-after").is_none());
+        }
+        mock.verify().await;
+    }
 }
 
 #[tokio::test]

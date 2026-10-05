@@ -26,6 +26,13 @@
 //!    pinned conversation moves when its host is full, and only when no host
 //!    has room is the request refused.
 //!
+//! The controller is a facade over `TtftBreaker` (1), `BackendSaturation`
+//! (1, and placement steering) and `Budget` (2, 3); an overload signal from
+//! the first two is counted against the budget's ramp here, so the
+//! components never reference each other. `precheck` runs once per request,
+//! early; `try_admit` re-runs only the re-runnable part
+//! (`check_signals_and_budget_at`) before reserving a slot.
+//!
 //! Opt-in tier borrowing uses configured counts instead: base hosts may each
 //! use ceil(budget / base hosts); long hosts keep a separate ceiling. See
 //! `backend_limits`. By default the global budget is shared, with no reserved
@@ -307,6 +314,21 @@ impl AdmissionController {
         tier: Option<TierDecision>,
         now: Instant,
     ) -> Result<(), Rejected> {
+        self.check_signals_and_budget_at(pool, tier, now)
+    }
+
+    /// The overload signals and the budget peek. Read-only apart from the
+    /// ramp tick, and safe to run more than once per request: `precheck`
+    /// runs it early and `try_admit` again right before reserving the slot,
+    /// since the lane may have changed in between (image validation). A rule
+    /// that consumes something per request belongs in `precheck_at`, never
+    /// here.
+    fn check_signals_and_budget_at(
+        &self,
+        pool: &BackendPool,
+        tier: Option<TierDecision>,
+        now: Instant,
+    ) -> Result<(), Rejected> {
         let Some(config) = &self.config else {
             return Ok(());
         };
@@ -355,7 +377,7 @@ impl AdmissionController {
         let Some(config) = &self.config else {
             return Ok(None);
         };
-        self.precheck_at(pool, tier, now)?;
+        self.check_signals_and_budget_at(pool, tier, now)?;
         // A long-bound request starts outside the base count. If placement or
         // connection fail-over sends it to a base host, it moves there then.
         let base = !tier.is_some_and(|tier| tier.restrict == Some(ContextTier::Long));

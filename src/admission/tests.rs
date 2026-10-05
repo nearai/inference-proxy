@@ -72,7 +72,7 @@ fn borrowing_limits_follow_budget_but_not_health() {
         (56, vec![19, 19, 19, 12]),
         (64, vec![22, 22, 22, 12]),
     ] {
-        c.budget.store(budget, Ordering::Relaxed);
+        c.budget.limit.store(budget, Ordering::Relaxed);
         assert_eq!(c.backend_limits(&p).unwrap(), expected);
         p.backends()[0].healthy.store(false, Ordering::Relaxed);
         assert_eq!(c.backend_limits(&p).unwrap(), expected);
@@ -372,7 +372,7 @@ fn the_long_reserve_follows_the_ramping_budget() {
         4,
     );
     assert_eq!(c.base_budget(), 2);
-    c.budget.store(8, Ordering::Relaxed);
+    c.budget.limit.store(8, Ordering::Relaxed);
     assert_eq!(c.base_budget(), 6);
     let base_tier = tier(ContextTier::Base, Some(ContextTier::Base));
     let held: Vec<_> = (0..6)

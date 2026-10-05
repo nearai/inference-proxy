@@ -39,18 +39,20 @@
 //! endpoint or extra token is involved. Disabled (`max_inflight = 0`) the
 //! module is inert and the in-CVM behavior is unchanged.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::backend_pool::BackendPool;
 use crate::context_tier::{ContextTier, TierDecision};
 use crate::engine_load::EngineLoad;
 
+mod budget;
 mod saturation;
 mod ttft;
+use budget::Budget;
 use saturation::BackendSaturation;
 use ttft::TtftBreaker;
 pub use ttft::{TTFT_BREACH_FRACTION, TTFT_MIN_BREACHES, TTFT_MIN_SAMPLES, TTFT_WINDOW};
@@ -135,21 +137,10 @@ pub struct Rejected {
     pub retry_after: Duration,
 }
 
-struct Ramp {
-    interval_started: Instant,
-    /// An overload signal was seen in the current interval.
-    dirty: bool,
-}
-
 /// Fleet-wide admission state shared by every request (`AppState.admission`).
 pub struct AdmissionController {
     config: Option<AdmissionConfig>,
-    inflight: AtomicU32,
-    /// The part of `inflight` that is not bound for the long tier. Capped at
-    /// `budget - long_reserved_inflight` when a reserve is configured.
-    inflight_base: AtomicU32,
-    budget: AtomicU32,
-    ramp: Mutex<Ramp>,
+    budget: Budget,
     ttft: TtftBreaker,
     saturation: BackendSaturation,
 }
@@ -171,15 +162,10 @@ impl AdmissionController {
             metrics::gauge!("admission_long_reserve").set(f64::from(config.long_reserved_inflight));
             debug_assert!(config.start_inflight <= config.max_inflight);
         }
+        let reserve = config.as_ref().map_or(0, |c| c.long_reserved_inflight);
         Self {
             config,
-            inflight: AtomicU32::new(0),
-            inflight_base: AtomicU32::new(0),
-            budget: AtomicU32::new(budget),
-            ramp: Mutex::new(Ramp {
-                interval_started: now,
-                dirty: false,
-            }),
+            budget: Budget::new(budget, reserve, now),
             ttft: TtftBreaker::new(now),
             saturation: BackendSaturation::new(backend_count, engine, now),
         }
@@ -205,53 +191,31 @@ impl AdmissionController {
 
     /// Current effective budget (0 when disabled).
     pub fn budget(&self) -> u32 {
-        self.budget.load(Ordering::Relaxed)
+        self.budget.limit()
     }
 
     /// Lane requests currently in flight.
     pub fn inflight(&self) -> u32 {
-        self.inflight.load(Ordering::Relaxed)
+        self.budget.inflight()
     }
 
     /// Lane requests in flight that are not bound for the long tier.
     pub fn inflight_base(&self) -> u32 {
-        self.inflight_base.load(Ordering::Relaxed)
+        self.budget.inflight_base()
     }
 
     /// Ceiling on in-flight requests that are not bound for the long tier:
     /// the current budget less the long-tier reserve (the whole budget when
     /// no reserve is configured, 0 when disabled).
     pub fn base_budget(&self) -> u32 {
-        let reserve = self
-            .config
-            .as_ref()
-            .map_or(0, |config| config.long_reserved_inflight);
-        self.budget().saturating_sub(reserve)
+        self.budget.base_limit()
     }
 
     fn take_base_slot(&self) -> Result<(), Rejected> {
-        if self
-            .config
-            .as_ref()
-            .is_none_or(|config| config.long_reserved_inflight == 0)
-        {
-            self.inflight_base.fetch_add(1, Ordering::AcqRel);
-            return Ok(());
-        }
-        let mut current = self.inflight_base.load(Ordering::Acquire);
-        loop {
-            if current >= self.base_budget() {
-                return Err(self.reject(RejectReason::LongReserve));
-            }
-            match self.inflight_base.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Ok(()),
-                Err(actual) => current = actual,
-            }
+        if self.budget.take_base_slot() {
+            Ok(())
+        } else {
+            Err(self.reject(RejectReason::LongReserve))
         }
     }
 
@@ -260,7 +224,7 @@ impl AdmissionController {
     /// as for one, so the (degraded) selection still has a bound to apply.
     pub fn host_share(&self, healthy_backends: usize) -> Option<u32> {
         self.config.as_ref()?;
-        let budget = self.budget.load(Ordering::Relaxed).max(1);
+        let budget = self.budget.limit().max(1);
         let hosts = u32::try_from(healthy_backends.max(1)).unwrap_or(u32::MAX);
         Some(budget.div_ceil(hosts))
     }
@@ -366,14 +330,11 @@ impl AdmissionController {
         if self.every_backend_queued(config, pool, tier.and_then(|tier| tier.restrict), now) {
             return Err(self.reject(RejectReason::BackendQueue));
         }
-        self.tick_ramp(config, now);
-        if self.inflight.load(Ordering::Acquire) >= self.budget.load(Ordering::Relaxed) {
+        self.budget.tick_ramp(config, now);
+        if self.budget.is_full() {
             return Err(self.reject(RejectReason::Budget));
         }
-        if config.long_reserved_inflight > 0
-            && !on_long_tier
-            && self.inflight_base.load(Ordering::Acquire) >= self.base_budget()
-        {
+        if config.long_reserved_inflight > 0 && !on_long_tier && self.budget.base_full() {
             return Err(self.reject(RejectReason::LongReserve));
         }
         Ok(())
@@ -412,30 +373,17 @@ impl AdmissionController {
         if capped {
             self.take_base_slot()?;
         }
-        let mut current = self.inflight.load(Ordering::Acquire);
-        loop {
-            if current >= self.budget.load(Ordering::Relaxed) {
-                if capped {
-                    self.inflight_base.fetch_sub(1, Ordering::AcqRel);
-                }
-                return Err(self.reject(RejectReason::Budget));
+        if !self.budget.try_reserve() {
+            if capped {
+                self.budget.unreserve_base();
             }
-            match self.inflight.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(actual) => current = actual,
-            }
+            return Err(self.reject(RejectReason::Budget));
         }
         if base && !capped {
-            self.inflight_base.fetch_add(1, Ordering::AcqRel);
+            self.budget.count_base();
         }
-        metrics::gauge!("admission_inflight").increment(1.0);
         if base {
-            metrics::gauge!("admission_inflight_base").increment(1.0);
+            self.budget.gauge_base_admitted();
         }
         Ok(Some(Permit {
             controller: Arc::clone(self),
@@ -447,49 +395,8 @@ impl AdmissionController {
         }))
     }
 
-    fn ramp(&self) -> MutexGuard<'_, Ramp> {
-        self.ramp.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Grow the budget by one step when a whole interval passed without an
-    /// overload signal; a dirty interval just restarts the clock.
-    fn tick_ramp(&self, config: &AdmissionConfig, now: Instant) {
-        let mut ramp = self.ramp();
-        if now.saturating_duration_since(ramp.interval_started) < config.ramp_interval {
-            return;
-        }
-        let clean = !ramp.dirty;
-        ramp.dirty = false;
-        ramp.interval_started = now;
-        drop(ramp);
-
-        let budget = self.budget.load(Ordering::Relaxed);
-        if budget >= config.max_inflight {
-            return;
-        }
-        if clean {
-            let next = budget
-                .saturating_add(config.ramp_step)
-                .min(config.max_inflight);
-            self.budget.store(next, Ordering::Relaxed);
-            metrics::gauge!("admission_budget").set(f64::from(next));
-            info!(
-                from = budget,
-                to = next,
-                max = config.max_inflight,
-                "Admission budget ramped up"
-            );
-        } else {
-            info!(
-                budget,
-                max = config.max_inflight,
-                "Admission budget held: overload signals during the last interval"
-            );
-        }
-    }
-
     fn mark_dirty(&self) {
-        self.ramp().dirty = true;
+        self.budget.mark_dirty();
     }
 
     /// One time-to-first-generation observation (or a censored one: the
@@ -571,9 +478,9 @@ impl Permit {
         }
         self.controller.take_base_slot()?;
         if self.base.swap(true, Ordering::AcqRel) {
-            self.controller.inflight_base.fetch_sub(1, Ordering::AcqRel);
+            self.controller.budget.unreserve_base();
         } else {
-            metrics::gauge!("admission_inflight_base").increment(1.0);
+            self.controller.budget.gauge_base_admitted();
         }
         Ok(())
     }
@@ -712,11 +619,9 @@ impl Permit {
         {
             self.record_ttft(now);
         }
-        self.controller.inflight.fetch_sub(1, Ordering::AcqRel);
-        metrics::gauge!("admission_inflight").decrement(1.0);
+        self.controller.budget.release();
         if self.base.load(Ordering::Acquire) {
-            self.controller.inflight_base.fetch_sub(1, Ordering::AcqRel);
-            metrics::gauge!("admission_inflight_base").decrement(1.0);
+            self.controller.budget.release_base();
         }
     }
 }

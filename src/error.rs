@@ -41,7 +41,7 @@ pub enum AppError {
     RateLimited,
 
     /// Refused rather than queued: 429 with `Retry-After`. Lane admission
-    /// (`admission.rs`) refuses before anything is sent upstream; a missed
+    /// (`admission/`) refuses before anything is sent upstream; a missed
     /// first-token deadline (`proxy.rs`) refuses a request that was already
     /// dispatched, dropping the upstream attempt with it.
     #[error("overloaded ({reason})")]

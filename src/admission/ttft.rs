@@ -57,7 +57,8 @@ impl TtftBreaker {
 
     /// One observation (or a censored one). Returns whether it breached
     /// `max`; the caller counts a breach against the ramp interval even if the
-    /// breaker is not (yet) tripped. `None` = no TTFT check: nothing counted.
+    /// breaker is not (yet) tripped. `None` = no TTFT check: the histogram is still
+    /// recorded, but nothing enters the window and nothing counts as a breach.
     pub(super) fn record(&self, now: Instant, ttft: Duration, max: Option<Duration>) -> bool {
         metrics::histogram!("admission_ttft_seconds").record(ttft.as_secs_f64());
         let Some(max) = max else {

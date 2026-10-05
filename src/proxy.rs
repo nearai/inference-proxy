@@ -958,7 +958,7 @@ pub struct ProxyOpts {
     /// Optional vLLM data-parallel engine rank. Chat routes derive this from a
     /// stable conversation prefix when `VLLM_DATA_PARALLEL_SIZE` is configured.
     pub upstream_data_parallel_rank: Option<usize>,
-    /// Lane admission permit (gateway mode, `admission.rs`). Holds one budget
+    /// Lane admission permit (gateway mode, `admission/`). Holds one budget
     /// slot until the response is complete; the streaming path moves it into
     /// the pump task next to `backend_guard`. `None` when admission is off.
     pub admission: Option<crate::admission::Permit>,

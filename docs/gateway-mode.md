@@ -344,7 +344,7 @@ The `fallback` destination label means selection was unrestricted.
 Mapping the engine's rejection to 429 only helps once the engine's queue is
 full; by then the lane's earlier requests are already waiting behind large
 prefills and their time to first token is minutes. The gateway therefore
-bounds the lane itself (`admission.rs`), in this order, before anything is sent
+bounds the lane itself (`admission/`), in this order, before anything is sent
 upstream:
 
 1. **Observed overload.** The engines' own queues first: with

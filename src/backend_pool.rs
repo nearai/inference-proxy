@@ -285,7 +285,7 @@ impl BackendPool {
 
     /// `select_with_preference` under a `Policy`: only backends that are not
     /// avoided and have fewer than `max_conns` lane requests in flight (the
-    /// admission per-host share, see `admission.rs`), ranked by the engine
+    /// admission per-host share, see `admission/`), ranked by the engine
     /// view when polled. The slot is taken atomically, so concurrent
     /// selections cannot overshoot the bound. A preferred backend that is
     /// avoided or at the bound is treated like an overloaded one and the turn

@@ -17,7 +17,7 @@ struct Ramp {
 }
 
 pub(super) struct Budget {
-    pub(super) inflight: AtomicU32,
+    inflight: AtomicU32,
     /// The part of `inflight` that is not bound for the long tier. Capped at
     /// `limit - reserve` when a reserve is configured.
     inflight_base: AtomicU32,

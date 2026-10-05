@@ -106,7 +106,7 @@ timeout; such requests skip the commit window),
 the document URL; one fraction published as that entry's `discount_to_user`, also
 on the engine-list fallback, and sent on every usage report, so the listed and
 the billed price cannot drift), the lane admission budget
-(`VLLM_PROXY_ADMISSION_*`, `admission.rs`: in-flight budget with a ramp, per-host
+(`VLLM_PROXY_ADMISSION_*`, `admission/`: in-flight budget with a ramp, per-host
 share, refusal on observed TTFT/engine back-pressure — 429 + `Retry-After` before
 dispatch), the long-context tier (`VLLM_BACKEND_LONG_CONTEXT_URLS` +
 `_PROBE_URLS` + `_ABOVE_TOKENS`, `context_tier.rs`: oversized prompts go to

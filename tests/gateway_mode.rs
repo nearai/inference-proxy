@@ -1695,6 +1695,49 @@ async fn input_rate_refuses_small_prompts_beyond_the_burst_before_dispatch() {
 }
 
 #[tokio::test]
+async fn input_rate_refuses_streaming_requests_too() {
+    let route = routes::ROUTE_CHAT_COMPLETIONS;
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(route))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string("data: [DONE]\n\n"),
+        )
+        .expect(2) // the third never dispatches
+        .mount(&mock)
+        .await;
+    let app = input_rate_gateway(&mock.uri());
+    let body = || {
+        serde_json::json!({
+            "model": "test-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+    };
+    for i in 0..2 {
+        let response = call_with(app.clone(), route, body()).await;
+        assert_ne!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "request {i}"
+        );
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+    }
+    let refused = call_with(app.clone(), route, body()).await;
+    assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        refused
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+        Some("60")
+    );
+    mock.verify().await;
+}
+
+#[tokio::test]
 async fn input_rate_never_limits_prompts_at_or_above_2000_tokens() {
     for route in COMPLETION_ROUTES {
         let mock = MockServer::start().await;

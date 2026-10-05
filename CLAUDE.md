@@ -111,7 +111,8 @@ share, refusal on observed TTFT/engine back-pressure — 429 + `Retry-After` bef
 dispatch), the input-token rate (`VLLM_PROXY_ADMISSION_INPUT_RATE`,
 `admission/input_rate.rs`: under 2,000 estimated input tokens, 100/min per
 instance, burst 20; a token is taken in `precheck` only — `try_admit` re-runs
-`check_signals_and_budget_at`, so a consuming rule there would count twice), the long-context tier (`VLLM_BACKEND_LONG_CONTEXT_URLS` +
+`check_signals_and_budget_at`, so a consuming rule there would count twice),
+the long-context tier (`VLLM_BACKEND_LONG_CONTEXT_URLS` +
 `_PROBE_URLS` + `_ABOVE_TOKENS`, `context_tier.rs`: oversized prompts go to
 backends registered under the model's `-long` domain, estimated exactly as
 cloud-api's `context_routing::estimate_input` does it) and

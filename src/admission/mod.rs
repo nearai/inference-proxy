@@ -52,7 +52,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::backend_pool::BackendPool;
 use crate::context_tier::{ContextTier, TierDecision};
@@ -325,7 +325,9 @@ impl AdmissionController {
         self.input_rate.enabled()
     }
 
-    /// Swap the input-token rate table (V1: AppConfig); every row starts full.
+    /// Swap the input-token rate table (V1: AppConfig); every row of a changed
+    /// table starts full. An identical table is a no-op: buckets keep their
+    /// level, so a periodic re-push cannot hand out a fresh burst.
     pub fn replace_input_rate_table(&self, table: Option<InputRateTable>) {
         self.input_rate.replace(table, Instant::now());
     }
@@ -359,7 +361,12 @@ impl AdmissionController {
         self.check_signals_and_budget_at(pool, tier, now)?;
         if let Some(estimated_tokens) = input_tokens {
             if let Err(limited) = self.input_rate.take_at(estimated_tokens, now) {
-                info!(
+                metrics::counter!(
+                    "admission_input_rate_rejections_total",
+                    "below_tokens" => limited.bucket.below_tokens.to_string()
+                )
+                .increment(1);
+                debug!(
                     estimated_tokens,
                     below_tokens = limited.bucket.below_tokens,
                     per_minute = limited.bucket.per_minute,

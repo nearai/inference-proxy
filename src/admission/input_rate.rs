@@ -143,9 +143,15 @@ impl InputRateLimiter {
         self.rows().is_some()
     }
 
-    /// Swap the table; every row of the new one starts with a full bucket.
+    /// Swap the table; every row of a changed table starts with a full
+    /// bucket. An identical table is a no-op: buckets keep their level, so a
+    /// periodic re-push cannot hand out a fresh burst.
     pub(super) fn replace(&self, table: Option<InputRateTable>, now: Instant) {
-        *self.rows() = table.map(|table| Rows::new(table, now));
+        let mut guard = self.rows();
+        if guard.as_ref().map(|rows| &rows.table) == table.as_ref() {
+            return;
+        }
+        *guard = table.map(|table| Rows::new(table, now));
     }
 
     pub(super) fn take_at(&self, estimated_tokens: u64, now: Instant) -> Result<(), RateLimited> {
@@ -271,6 +277,24 @@ mod tests {
         assert!(limiter.take_at(10, t0).is_err());
         limiter.replace(None, t0);
         assert!(!limiter.enabled());
+        assert_eq!(limiter.take_at(10, t0), Ok(()));
+    }
+
+    #[test]
+    fn replacing_with_an_identical_table_keeps_the_buckets() {
+        let t0 = Instant::now();
+        let limiter = limiter(&[row(2_000, 60, 1)], t0);
+        assert_eq!(limiter.take_at(10, t0), Ok(()));
+        assert!(limiter.take_at(10, t0).is_err());
+        limiter.replace(
+            Some(InputRateTable::new(vec![row(2_000, 60, 1)]).unwrap()),
+            t0,
+        );
+        assert!(limiter.take_at(10, t0).is_err());
+        limiter.replace(
+            Some(InputRateTable::new(vec![row(2_000, 60, 2)]).unwrap()),
+            t0,
+        );
         assert_eq!(limiter.take_at(10, t0), Ok(()));
     }
 

@@ -263,6 +263,7 @@ async fn main() -> anyhow::Result<()> {
         info!(
             max_inflight = settings.max_inflight,
             start_inflight = settings.start_inflight,
+            long_reserved_inflight = settings.long_reserved_inflight,
             ramp_step = settings.ramp_step,
             ramp_interval_secs = settings.ramp_interval.as_secs(),
             ttft_p95_max_ms = settings.ttft_p95_max.map_or(0, |d| d.as_millis()),

@@ -414,6 +414,9 @@ pub struct Config {
     pub admission_tier_borrowing: bool,
     /// Long-host ceiling while borrowing (positive when enabled).
     pub admission_long_max_inflight_per_host: u32,
+    /// Budget slots kept for requests bound for the long tier
+    /// (`VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT`, default 0: none).
+    pub admission_long_reserved_inflight: u32,
     /// Budget at start-up (`VLLM_PROXY_ADMISSION_START_INFLIGHT`, default =
     /// the maximum, i.e. no ramp).
     pub admission_start_inflight: u32,
@@ -765,6 +768,8 @@ impl Config {
         let admission_tier_borrowing = env_bool("VLLM_PROXY_ADMISSION_TIER_BORROWING");
         let admission_long_max_inflight_per_host: u32 =
             env_parse("VLLM_PROXY_ADMISSION_LONG_MAX_INFLIGHT_PER_HOST", 0)?;
+        let admission_long_reserved_inflight: u32 =
+            env_parse("VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT", 0)?;
         let admission_max_inflight: u32 = env_parse("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", 0)?;
         let admission_start_inflight: u32 = env_parse(
             "VLLM_PROXY_ADMISSION_START_INFLIGHT",
@@ -840,6 +845,16 @@ impl Config {
                 || admission_long_max_inflight_per_host == 0)
         {
             anyhow::bail!("VLLM_PROXY_ADMISSION_TIER_BORROWING requires admission, both backend tiers, and positive VLLM_PROXY_ADMISSION_LONG_MAX_INFLIGHT_PER_HOST");
+        }
+        if admission_long_reserved_inflight > 0 {
+            if !admission_tier_borrowing {
+                anyhow::bail!("VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT requires VLLM_PROXY_ADMISSION_TIER_BORROWING");
+            }
+            // Compared with the starting budget, the lowest the budget ever
+            // is, so the base tier always keeps at least one slot.
+            if admission_long_reserved_inflight >= admission_start_inflight {
+                anyhow::bail!("VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT must be below VLLM_PROXY_ADMISSION_START_INFLIGHT");
+            }
         }
         if let Some(both) = backend_long_context_urls
             .iter()
@@ -1021,6 +1036,7 @@ impl Config {
             admission_max_inflight,
             admission_tier_borrowing,
             admission_long_max_inflight_per_host,
+            admission_long_reserved_inflight,
             admission_start_inflight,
             admission_ramp_step,
             admission_ramp_interval_secs,
@@ -1197,6 +1213,7 @@ impl Config {
             max_inflight: self.admission_max_inflight,
             tier_borrowing: self.admission_tier_borrowing,
             long_max_inflight_per_host: self.admission_long_max_inflight_per_host,
+            long_reserved_inflight: self.admission_long_reserved_inflight,
             start_inflight: self.admission_start_inflight,
             ramp_step: self.admission_ramp_step,
             ramp_interval: std::time::Duration::from_secs(self.admission_ramp_interval_secs),
@@ -1356,6 +1373,7 @@ mod tests {
             "VLLM_PROXY_FIRST_TOKEN_DEADLINE_MAX_MS",
             "VLLM_PROXY_ADMISSION_TIER_BORROWING",
             "VLLM_PROXY_ADMISSION_LONG_MAX_INFLIGHT_PER_HOST",
+            "VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT",
             "VLLM_PROXY_ADMISSION_MAX_INFLIGHT",
             "VLLM_PROXY_ADMISSION_START_INFLIGHT",
             "VLLM_PROXY_ADMISSION_RAMP_STEP",
@@ -2483,6 +2501,31 @@ mod tests {
                 let c = Config::from_env().unwrap();
                 assert!(c.admission().unwrap().tier_borrowing);
                 assert_eq!(c.admission_long_max_inflight_per_host, 12);
+                assert_eq!(c.admission().unwrap().long_reserved_inflight, 0);
+                env::set_var("VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT", "12");
+                assert_eq!(
+                    Config::from_env()
+                        .unwrap()
+                        .admission()
+                        .unwrap()
+                        .long_reserved_inflight,
+                    12
+                );
+                // The base tier must keep at least one slot at the starting budget.
+                env::set_var("VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT", "48");
+                assert!(Config::from_env()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("LONG_RESERVED_INFLIGHT"));
+                // A reserve needs the two tiers that borrowing configures.
+                env::set_var("VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT", "12");
+                env::remove_var("VLLM_PROXY_ADMISSION_TIER_BORROWING");
+                assert!(Config::from_env()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("LONG_RESERVED_INFLIGHT"));
+                env::set_var("VLLM_PROXY_ADMISSION_TIER_BORROWING", "1");
+                env::remove_var("VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT");
                 env::set_var("VLLM_PROXY_ADMISSION_LONG_MAX_INFLIGHT_PER_HOST", "0");
                 assert!(Config::from_env()
                     .unwrap_err()
@@ -2529,6 +2572,7 @@ mod tests {
                         max_inflight: 48,
                         tier_borrowing: false,
                         long_max_inflight_per_host: 0,
+                        long_reserved_inflight: 0,
                         start_inflight: 32,
                         ramp_step: 8,
                         ramp_interval: std::time::Duration::from_secs(1800),

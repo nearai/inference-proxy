@@ -5762,6 +5762,7 @@ data: [DONE]
                 max_inflight: 4,
                 tier_borrowing: false,
                 long_max_inflight_per_host: 0,
+                long_reserved_inflight: 0,
                 start_inflight: 4,
                 ramp_step: 1,
                 ramp_interval: std::time::Duration::from_secs(60),

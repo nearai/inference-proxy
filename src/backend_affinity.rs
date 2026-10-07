@@ -343,7 +343,7 @@ mod tests {
         affinity.record_followup(Some(&key), &turn(1));
         let placed = affinity.place(
             &pool,
-            Some(key.clone()),
+            Some(key),
             ReplicaHint::Absent,
             "/v1/chat/completions",
             &Policy::NONE,
@@ -353,7 +353,7 @@ mod tests {
         // record_followup never changes placement state.
         affinity.record_followup(Some(&key), &turn(1));
         affinity.record_followup(None, &turn(1));
-        assert_eq!(affinity.assignments.entry_count() <= 1, true);
+        assert!(affinity.assignments.entry_count() <= 1);
     }
 
     #[test]

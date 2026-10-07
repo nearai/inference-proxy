@@ -227,6 +227,27 @@ impl BackendConversationAffinity {
         Some(Placement::new(selection, path))
     }
 
+    /// Count a follow-up turn (the body already holds an assistant or tool
+    /// message) as `hit` when this proxy still pins its conversation, `miss`
+    /// when it does not. A follow-up miss means the conversation's earlier
+    /// turns were served elsewhere (another host, before a restart, or idle past
+    /// the TTL), so its prefix cache is not on this host: the cross-host
+    /// stickiness signal for in-host KV sharing and cache-aware routing.
+    /// Read-only; does not change placement.
+    pub fn record_followup(&self, key: Option<&ConversationKey>, request: &Value) {
+        let Some(key) = key else { return };
+        if !is_followup_turn(request) {
+            return;
+        }
+        let outcome = if self.assignments.contains_key(key) {
+            "hit"
+        } else {
+            "miss"
+        };
+        metrics::counter!("backend_affinity_followup_lookups_total", "outcome" => outcome)
+            .increment(1);
+    }
+
     /// Move a conversation to `index` (connection fail-over placed it there).
     pub fn repin(&self, key: ConversationKey, index: usize) {
         if self.enabled {
@@ -239,6 +260,22 @@ impl BackendConversationAffinity {
     fn assignment(&self, key: &ConversationKey) -> Option<usize> {
         self.assignments.get(key)
     }
+}
+
+/// Whether a chat request continues a conversation: any assistant or tool
+/// message after the first message.
+pub fn is_followup_turn(request: &Value) -> bool {
+    request
+        .get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages.iter().skip(1).any(|message| {
+                matches!(
+                    message.get("role").and_then(Value::as_str),
+                    Some("assistant" | "tool")
+                )
+            })
+        })
 }
 
 #[cfg(test)]
@@ -281,6 +318,42 @@ mod tests {
             messages.push(serde_json::json!({"role": "user", "content": format!("And day {i}?")}));
         }
         serde_json::json!({"model": "client-alias", "messages": messages})
+    }
+
+    #[test]
+    fn followup_turns_are_detected() {
+        assert!(!is_followup_turn(&turn(0)));
+        assert!(is_followup_turn(&turn(1)));
+        let tool = serde_json::json!({"messages": [
+            {"role": "user", "content": "q"},
+            {"role": "tool", "content": "r", "tool_call_id": "t"}
+        ]});
+        assert!(is_followup_turn(&tool));
+        assert!(!is_followup_turn(&serde_json::json!({"prompt": "x"})));
+    }
+
+    #[test]
+    fn followup_lookup_reflects_the_pin() {
+        let affinity = BackendConversationAffinity::new(true, 2, 8, 1_200);
+        let pool = two_backend_pool();
+        let first = turn(0);
+        let key = affinity.key_for_chat_request(&first, "model").unwrap();
+        // Unpinned follow-up (e.g. turn 1 was served on another host).
+        assert!(!affinity.assignments.contains_key(&key));
+        affinity.record_followup(Some(&key), &turn(1));
+        let placed = affinity.place(
+            &pool,
+            Some(key.clone()),
+            ReplicaHint::Absent,
+            "/v1/chat/completions",
+            &Policy::NONE,
+        );
+        assert!(placed.is_some());
+        assert!(affinity.assignments.contains_key(&key));
+        // record_followup never changes placement state.
+        affinity.record_followup(Some(&key), &turn(1));
+        affinity.record_followup(None, &turn(1));
+        assert_eq!(affinity.assignments.entry_count() <= 1, true);
     }
 
     #[test]

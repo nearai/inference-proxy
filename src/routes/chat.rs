@@ -123,6 +123,9 @@ pub async fn chat_completions(
     let backend_affinity_key = state
         .backend_affinity
         .key_for_chat_request(&request_json, &state.config.model_name);
+    state
+        .backend_affinity
+        .record_followup(backend_affinity_key.as_ref(), &request_json);
 
     crate::image_validation::reject_invalid_images(&request_json, &state.config.image_validation())
         .await?;

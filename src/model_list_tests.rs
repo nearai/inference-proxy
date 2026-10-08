@@ -796,6 +796,102 @@ fn a_reasoning_effort_map_requires_a_backend_token() {
 }
 
 #[test]
+fn merge_system_messages_is_read_from_the_entry_that_writes_it() {
+    // The documented example: alpha's template needs it, the others' do not.
+    let models = parse_list(documented_list()).unwrap();
+    assert!(models[0].merge_system_messages);
+    assert!(!models[1].merge_system_messages);
+    assert!(!models[2].merge_system_messages);
+    let printed = format!("{:?}", models[0]);
+    assert!(printed.contains("merge_system_messages: true"), "{printed}");
+    let printed = format!("{:?}", models[1]);
+    assert!(
+        printed.contains("merge_system_messages: false"),
+        "{printed}"
+    );
+
+    // Written out either way or left out, and with a backend token or
+    // without one: it is no part of the reasoning handling.
+    for (extra, expected) in [
+        (serde_json::json!({"merge_system_messages": true}), true),
+        (serde_json::json!({"merge_system_messages": false}), false),
+        (serde_json::json!({}), false),
+    ] {
+        for list in [one(extra.clone()), one_lane(extra.clone())] {
+            let models = parse_list(list).unwrap();
+            assert_eq!(models[0].merge_system_messages, expected, "{extra}");
+        }
+    }
+
+    // No process-level value reaches it: a model that does not write the key
+    // does not have it, whatever the defaults of the other keys are.
+    let everything_set = ModelDefaults {
+        admission_max_inflight: 8,
+        reasoning_off_effort: "low".to_string(),
+        backend_token: Some("shared-secret".to_string()),
+        ..defaults()
+    };
+    let models = parse_with(one(serde_json::json!({})), &everything_set, &process()).unwrap();
+    assert!(!models[0].merge_system_messages);
+}
+
+#[test]
+fn a_merge_system_messages_that_is_not_a_boolean_is_refused() {
+    for value in [
+        serde_json::json!("true"),
+        serde_json::json!("false"),
+        serde_json::json!(""),
+        serde_json::json!(1),
+        serde_json::json!(0),
+        serde_json::json!(null),
+        serde_json::json!([true]),
+        serde_json::json!({"enabled": true}),
+    ] {
+        let error = error_of(one(serde_json::json!({"merge_system_messages": value})));
+        assert!(
+            error.contains("not a valid model list") && error.contains("expected a boolean"),
+            "{value}: {error}"
+        );
+    }
+    // Written twice, it is not settled by which one came last.
+    // (Written out: a `json!` object cannot hold it.)
+    let error = parse(
+        r#"{"models": [{
+            "id": "m",
+            "backend_urls": ["https://a.example"],
+            "merge_system_messages": true,
+            "merge_system_messages": false
+        }]}"#,
+        &defaults(),
+        &process(),
+        &lookup,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("duplicate field `merge_system_messages`"),
+        "{error}"
+    );
+    // It is a key of a model, not of its tier or of the file.
+    for list in [
+        tiered(
+            serde_json::json!({"merge_system_messages": true}),
+            serde_json::json!({}),
+        ),
+        serde_json::json!({
+            "models": [{"id": "m", "backend_urls": ["https://a.example"]}],
+            "merge_system_messages": true
+        }),
+    ] {
+        let error = error_of(list);
+        assert!(
+            error.contains("unknown field `merge_system_messages`"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn a_token_variable_must_be_of_the_backend_token_family_and_set() {
     let error = error_of(one(
         serde_json::json!({"backend_token_env": "VLLM_BACKEND_TOKEN_UNSET"}),

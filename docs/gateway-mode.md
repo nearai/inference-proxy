@@ -32,6 +32,14 @@ of any value is preserved for native backend validation; the schema,
 strictness and other fields are untouched.
 Repairs are counted by `json_schema_response_format_repaired_total{repair}`.
 
+A third rewrite is not for every lane: a model of a
+[model list](#several-models-in-one-gateway) whose chat template takes one
+`system` message, as the first message, can have a request's system messages
+merged into that before dispatch (`merge_system_messages`,
+`src/system_messages.rs`, see
+[System messages a model takes only first](#system-messages-a-model-takes-only-first)).
+It runs after the two repairs above. A process without a list never does it.
+
 1. `Authorization: Bearer sk-…` → `POST {CLOUD_API_URL}/v1/check_api_key`
    (retries on transport/5xx; 401/402/429 pass through). With
    `VLLM_PROXY_ALLOWED_ORG_IDS` set, a valid key from any other organization
@@ -698,9 +706,10 @@ A JSON file rendered by deploy tooling: `{"models": [ … ]}`, one object per
 model. It holds no secrets: a model's backend token is referenced by the *name*
 of the environment variable that carries it. Every key except `id` and
 `backend_urls` is optional and falls back to the process-level variable, so
-the variables act as defaults for the whole list (`reasoning_effort_map` has
-no variable: a model has one only when its entry writes it). A key that is not
-in the tables below is refused, so a typo cannot silently become a default.
+the variables act as defaults for the whole list (`reasoning_effort_map` and
+`merge_system_messages` have no variable: a model has either only when its
+entry writes it). A key that is not in the tables below is refused, so a typo
+cannot silently become a default.
 
 | Key | When omitted | Meaning |
 | --- | --- | --- |
@@ -715,6 +724,7 @@ in the tables below is refused, so a typo cannot silently become a default.
 | `discount_to_user` | `VLLM_PROXY_DISCOUNT_TO_USER` | A JSON number under the same rules as the variable; `0` = list price. Published on the model's entry and sent on its usage reports. |
 | `reasoning_off_effort` | `VLLM_PROXY_REASONING_OFF_EFFORT` | What "no reasoning" means for this model. |
 | `reasoning_effort_map` | no mapping | An object of effort to effort, for example `{"high": "xhigh"}`: a request's reasoning effort that is one of the keys is sent to this model's engine as the value. For the model of the entry only, with no process-level variable. See [Reasoning efforts a model does not accept](#reasoning-efforts-a-model-does-not-accept). |
+| `merge_system_messages` | `false` | `true` for a model whose chat template refuses a `system` message that is not the first message: a request with one anywhere else is sent to this model's engine with a single `system` message, first, holding the text of all of them. For the model of the entry only, with no process-level variable. See [System messages a model takes only first](#system-messages-a-model-takes-only-first). |
 | `backend_token_env` | the value of `VLLM_BACKEND_TOKEN` | Name of the variable that holds this model's backend bearer: upper-case letters, digits and underscores, starting with `VLLM_BACKEND_TOKEN` (for example `VLLM_BACKEND_TOKEN_ALPHA`), and set. |
 | `backend_priority` | `VLLM_BACKEND_PRIORITY` | Sent as `X-NearAI-Priority` to this model's backends. |
 
@@ -764,6 +774,7 @@ Three models, one with a long-context tier and two plain ones:
       "discount_to_user": 0.3,
       "reasoning_off_effort": "low",
       "reasoning_effort_map": {"high": "xhigh"},
+      "merge_system_messages": true,
       "backend_token_env": "VLLM_BACKEND_TOKEN_ALPHA",
       "backend_priority": -1
     },
@@ -811,7 +822,8 @@ cannot be read or is not valid, an empty list, an id listed twice, a model
 without backends, a URL that is not a plain `http(s)` base URL (no query, no
 fragment, no credentials), a probe count that differs from the backend count,
 a `backend_token_env` that is not set, a `reasoning_effort_map` that breaks
-one of its rules below, a backend or probe listed under two
+one of its rules below, a `merge_system_messages` that is not `true` or
+`false`, a backend or probe listed under two
 models (a backend serves one model), and every rule the variables are held to
 for one model — the admission and long-context tier rules above. Those are
 checked on what each entry resolves to, and their messages name the variable a
@@ -880,15 +892,102 @@ object's when the two fields were mapped to different ones) and `model` the
 configured id. What the caller sent is not a label, and nothing is logged per
 request. The startup line of each model prints its map.
 
+### System messages a model takes only first
+
+Some chat templates accept a `system` message only as the first message of
+the conversation, and the engine answers `400` ("System message must be at
+the beginning.") to anything else: two system messages in a row, a second one
+later in the history, or one that follows a user message. Agent frameworks
+send all of these and other providers accept them, so a valid request fails
+for that model only. `merge_system_messages` on the model's entry makes the
+gateway put such a request in the shape the template takes:
+
+```json
+"merge_system_messages": true
+```
+
+On `/v1/chat/completions`, a request whose `messages` hold more than one
+message with the role `system`, or a single one that is not the first
+message, is sent to the engine with exactly one `system` message, first:
+
+- its content is one string: the text of every system message, in the order
+  they were sent, with a blank line between two of them. An empty content
+  adds nothing, not even the blank line;
+- every other message keeps its place among the others, and is not changed;
+- only the role `system`, spelled exactly so, is read as a system message. A
+  `developer` message is like any other: never merged, and after the merged
+  system message when one is moved in front of it.
+
+| Sent | Reaches the engine as |
+| --- | --- |
+| `system` `"A"`, `system` `"B"`, `user` | `system` `"A\n\nB"`, `user` |
+| `system` `"A"`, `user`, `system` `"B"` | `system` `"A\n\nB"`, `user` |
+| `user`, `system` `"B"` | `system` `"B"`, `user` |
+
+A system message's content may be a string or an array of text parts
+(`{"type": "text", "text": "…"}`); the parts of one message are concatenated
+in order, with nothing between them. The gateway never drops part of a
+request to make it fit. When it cannot keep everything, it does not rewrite
+at all: the request goes out as the caller sent it, and the engine answers.
+That is the case when
+
+- a system message has a part that is not a text part (an image, any other
+  type, a text part without a string `text`), or a content that is neither a
+  string nor an array (`null`, or none at all);
+- a text part has a key other than `type`, `text` and `cache_control`.
+  `cache_control` marks a cache breakpoint for providers that have them and
+  cannot be carried by a string, so it goes with the part. Any other key is
+  not this gateway's to judge;
+- two system messages give a field other than `role` and `content` different
+  values (two different `name`s, say). Such a field is otherwise kept on the
+  merged message, whichever system message carried it, and then covers the
+  whole of it.
+
+A request the template already takes, with no system message or with one as
+its first message, is not looked at further and goes out byte for byte as it
+would without the key, whatever that first message holds. So do
+`/v1/completions`, which has no messages, and every request of another model
+of the same process.
+
+The merge runs at a fixed place among the things a request goes through:
+
+1. the model is selected, and the reasoning handling (`reasoning_off_effort`,
+   `reasoning_effort_map`) is applied. It reads the top-level `reasoning` and
+   `reasoning_effort` only, never the messages;
+2. an encrypted request is decrypted; then the tool-call `arguments` and
+   `response_format` repairs and the content part policy
+   (`VLLM_PROXY_REJECTED_CONTENT_PART_TYPES`), on the messages as the caller
+   sent them;
+3. the merge;
+4. the input estimate (long-context tier, first-token deadline) and
+   conversation affinity, on the messages as they are dispatched, and image
+   validation, which is the same either way: a system message with an image
+   is never merged.
+
+A system message that a caller adds or changes late in a conversation ends up
+in the first message, so that turn's prompt differs from the previous one's
+inside its first message: the engine's prefix cache covers what comes before
+the change and nothing after it, and the conversation may be placed on another
+backend. That is the price of a template that takes system messages nowhere
+else.
+
+A request that was rewritten is counted in
+`inference_proxy_model_system_messages_merged_total{model}`, where `model` is
+the configured id, the only label. Requests that were left alone are not
+counted, nothing about the messages is a label, and nothing is logged per
+request. The startup line of each model prints its `merge_system_messages`.
+
 ### Requests
 
 `/v1/chat/completions` and `/v1/completions` authenticate as before and then
 read the body's `model`. An exact, case-sensitive match against the configured
 ids selects that model's bundle: its pool, affinity, admission, engine view,
-tier, backend token and priority, reasoning-off effort, effort map and
-discount. The body is forwarded as it would be for a single model, `model`
-included; for a model with a `reasoning_effort_map`, with the efforts it names
-replaced.
+tier, backend token and priority, reasoning-off effort, effort map, system
+message handling and discount. The body is forwarded as it would be for a
+single model, `model` included; for a model with a `reasoning_effort_map`,
+with the efforts it names replaced, and for a model with
+`merge_system_messages`, with its system messages merged into the first
+message.
 
 Anything else — another model, a configured id in a different case, no `model`,
 a `model` that is not a string — is OpenAI's `404`:
@@ -1010,7 +1109,7 @@ With one model there is no `model` label on any series: existing dashboards
 and alerts match on exactly those label sets. `src/model_metrics.rs` is where
 the difference lives.
 
-Three series exist in list mode only. Two of them count responses:
+Four series exist in list mode only. Two of them count responses:
 `http_requests_total` and `http_errors_total` stay process-wide, so without
 these an error rate could not be read per model:
 
@@ -1063,6 +1162,11 @@ The third,
 for a model with a `reasoning_effort_map`: one per request whose reasoning
 effort the map replaced, under the effort that was sent instead (see
 [Reasoning efforts a model does not accept](#reasoning-efforts-a-model-does-not-accept)).
+
+The fourth, `inference_proxy_model_system_messages_merged_total{model}`,
+exists for a model with `merge_system_messages`: one per request whose system
+messages were merged into the first message (see
+[System messages a model takes only first](#system-messages-a-model-takes-only-first)).
 
 Startup logs one "Serving model" line per model with its effective settings
 (the backend token only as `backend_token=true|false`) and a "Model list

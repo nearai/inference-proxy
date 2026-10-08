@@ -340,6 +340,9 @@ pub struct UsageReporter {
     /// these values are emitted as metric labels.
     pub request_id: Option<String>,
     pub request_source: crate::auth::RequestSource,
+    /// The process's report delivery (`usage_report.rs`): the timeout, the
+    /// retries, the cap on reports in flight and the queue behind it.
+    pub delivery: Arc<crate::usage_report::UsageReportDelivery>,
 }
 
 impl UsageReporter {
@@ -367,8 +370,13 @@ impl UsageReporter {
 /// Terminal state of one direct-key usage-reporting flow. Values are bounded
 /// and intentionally exclude tenant or request identifiers, so they are safe
 /// as metric labels.
+///
+/// With retries (`usage_report.rs`) the HTTP and transport values are the
+/// outcome of the report's last attempt. `QueueFull` and `DeadlineExceeded`
+/// only occur with a cap on reports in flight or an overall deadline: the
+/// report was dropped before the billing API answered it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum UsageReportOutcome {
+pub(crate) enum UsageReportOutcome {
     Accepted,
     Http4xx,
     Http5xx,
@@ -381,10 +389,12 @@ enum UsageReportOutcome {
     InvalidBody,
     MissingBillableUsage,
     MissingResponseId,
+    QueueFull,
+    DeadlineExceeded,
 }
 
 impl UsageReportOutcome {
-    fn as_label(self) -> &'static str {
+    pub(crate) fn as_label(self) -> &'static str {
         match self {
             Self::Accepted => "accepted",
             Self::Http4xx => "http_4xx",
@@ -398,11 +408,13 @@ impl UsageReportOutcome {
             Self::InvalidBody => "invalid_body",
             Self::MissingBillableUsage => "missing_billable_usage",
             Self::MissingResponseId => "missing_response_id",
+            Self::QueueFull => "queue_full",
+            Self::DeadlineExceeded => "deadline_exceeded",
         }
     }
 }
 
-fn classify_usage_http_status(status: reqwest::StatusCode) -> UsageReportOutcome {
+pub(crate) fn classify_usage_http_status(status: reqwest::StatusCode) -> UsageReportOutcome {
     if status.is_success() {
         UsageReportOutcome::Accepted
     } else if status.is_client_error() {
@@ -414,7 +426,7 @@ fn classify_usage_http_status(status: reqwest::StatusCode) -> UsageReportOutcome
     }
 }
 
-fn classify_usage_request_error(error: &reqwest::Error) -> UsageReportOutcome {
+pub(crate) fn classify_usage_request_error(error: &reqwest::Error) -> UsageReportOutcome {
     if error.is_timeout() {
         UsageReportOutcome::Timeout
     } else if error.is_connect() {
@@ -424,7 +436,9 @@ fn classify_usage_request_error(error: &reqwest::Error) -> UsageReportOutcome {
     }
 }
 
-fn record_usage_report_outcome(
+/// Count a report's final outcome, with the duration of the request that
+/// decided it when there was one (the last attempt, with retries).
+pub(crate) fn record_usage_report_outcome(
     reporter: &UsageReporter,
     outcome: UsageReportOutcome,
     duration: Option<std::time::Duration>,
@@ -548,6 +562,7 @@ fn usage_reporter(
         model_label,
         request_id: auth.request_id.clone(),
         request_source: auth.request_source,
+        delivery: state.usage_report_delivery.clone(),
     })
 }
 
@@ -830,6 +845,10 @@ fn complete_usage_body(
 /// endpoint has been removed from cloud-api, so when the service-token path is
 /// unavailable (missing usage token or identity fields) we log an error and
 /// skip — never post to the deleted endpoint.
+///
+/// The report is checked and completed here and then handed to the process's
+/// `UsageReportDelivery`, which sends it off the request path: once, with a
+/// 5 second timeout, unless `VLLM_PROXY_USAGE_REPORT_*` says otherwise.
 pub(crate) fn spawn_usage_report(reporter: &UsageReporter, mut body: serde_json::Value) {
     if let Some(outcome) = reporter.service_path_unavailable_reason() {
         record_usage_report_outcome(reporter, outcome, None);
@@ -878,74 +897,31 @@ pub(crate) fn spawn_usage_report(reporter: &UsageReporter, mut body: serde_json:
         return;
     }
 
-    let client = reporter.http_client.clone();
-    let url = format!("{}/v1/internal/usage", reporter.cloud_api_url);
-    let auth = format!("Bearer {}", reporter.cloud_api_usage_token.clone().unwrap());
-    let reporter = reporter.clone();
-    tokio::spawn(async move {
-        let started_at = std::time::Instant::now();
-        let mut request = client
-            .post(&url)
-            .header("authorization", &auth)
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(5));
-        if let Some(request_id) = reporter.request_id.as_deref() {
-            request = request.header("x-request-id", request_id);
+    // Serialized once: a retry sends exactly the bytes of the first attempt.
+    let payload = match serde_json::to_vec(&body) {
+        Ok(payload) => bytes::Bytes::from(payload),
+        Err(error) => {
+            record_usage_report_outcome(reporter, UsageReportOutcome::InvalidBody, None);
+            warn!(
+                error = %error,
+                request_id = %reporter.request_id.as_deref().unwrap_or(""),
+                org_id = %reporter.org_id.as_deref().unwrap_or(""),
+                workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
+                api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
+                model = %reporter.model_name,
+                auth_path = reporter.request_source.auth_path.as_label(),
+                ingress_route = reporter.request_source.ingress_route.as_label(),
+                "Skipping usage report: body could not be serialized"
+            );
+            return;
         }
-        match request.send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                let outcome = classify_usage_http_status(status);
-                let elapsed = started_at.elapsed();
-                record_usage_report_outcome(&reporter, outcome, Some(elapsed));
-                if outcome == UsageReportOutcome::Accepted {
-                    info!(
-                        request_id = %reporter.request_id.as_deref().unwrap_or(""),
-                        org_id = %reporter.org_id.as_deref().unwrap_or(""),
-                        workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
-                        api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
-                        model = %reporter.model_name,
-                        status = %status,
-                        duration_ms = elapsed.as_millis() as u64,
-                        auth_path = reporter.request_source.auth_path.as_label(),
-                        ingress_route = reporter.request_source.ingress_route.as_label(),
-                        "Direct-key usage report accepted by Cloud API"
-                    );
-                } else {
-                    warn!(
-                        request_id = %reporter.request_id.as_deref().unwrap_or(""),
-                        org_id = %reporter.org_id.as_deref().unwrap_or(""),
-                        workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
-                        api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
-                        model = %reporter.model_name,
-                        status = %status,
-                        duration_ms = elapsed.as_millis() as u64,
-                        auth_path = reporter.request_source.auth_path.as_label(),
-                        ingress_route = reporter.request_source.ingress_route.as_label(),
-                        outcome = outcome.as_label(),
-                        "Usage reporting returned non-success"
-                    );
-                }
-            }
-            Err(error) => {
-                let outcome = classify_usage_request_error(&error);
-                let elapsed = started_at.elapsed();
-                record_usage_report_outcome(&reporter, outcome, Some(elapsed));
-                warn!(
-                    request_id = %reporter.request_id.as_deref().unwrap_or(""),
-                    org_id = %reporter.org_id.as_deref().unwrap_or(""),
-                    workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
-                    api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
-                    model = %reporter.model_name,
-                    error = %error,
-                    duration_ms = elapsed.as_millis() as u64,
-                    auth_path = reporter.request_source.auth_path.as_label(),
-                    ingress_route = reporter.request_source.ingress_route.as_label(),
-                    outcome = outcome.as_label(),
-                    "Usage reporting failed"
-                );
-            }
-        }
+    };
+    reporter.delivery.submit(crate::usage_report::Job {
+        url: format!("{}/v1/internal/usage", reporter.cloud_api_url),
+        authorization: format!("Bearer {}", reporter.cloud_api_usage_token.clone().unwrap()),
+        body: payload,
+        completed_at: std::time::Instant::now(),
+        reporter: reporter.clone(),
     });
 }
 
@@ -3918,6 +3894,7 @@ mod tests {
                 auth_path: AuthPath::CloudApiKey,
                 ingress_route: IngressRouteKind::Canonical,
             },
+            delivery: Default::default(),
         }
     }
 
@@ -4045,9 +4022,11 @@ mod tests {
             UsageReportOutcome::InvalidBody,
             UsageReportOutcome::MissingBillableUsage,
             UsageReportOutcome::MissingResponseId,
+            UsageReportOutcome::QueueFull,
+            UsageReportOutcome::DeadlineExceeded,
         ]
         .map(UsageReportOutcome::as_label);
-        assert_eq!(labels.len(), 12);
+        assert_eq!(labels.len(), 14);
         assert!(labels.iter().all(|label| !label.is_empty()));
     }
 

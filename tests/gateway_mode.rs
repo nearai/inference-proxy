@@ -63,6 +63,9 @@ struct GatewayOptions {
     discount_to_user: Option<f64>,
     /// `CLOUD_API_USAGE_TOKEN`: without it usage reports are skipped.
     cloud_api_usage_token: Option<String>,
+    /// How usage reports are delivered (`VLLM_PROXY_USAGE_REPORT_*`); the
+    /// default is one attempt with a 5 second timeout.
+    usage_report: usage_report::UsageReportPolicy,
     /// `VLLM_PROXY_REASONING_OFF_EFFORT` (default `none`).
     reasoning_off_effort: Option<String>,
 }
@@ -121,6 +124,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
         cloud_api_usage_token: options.cloud_api_usage_token.clone(),
+        usage_report: options.usage_report.clone(),
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,
@@ -279,6 +283,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
     ));
     let state = AppState {
         models: None,
+        usage_report_delivery: usage_report::UsageReportDelivery::new(config.usage_report.clone()),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(cache::ChatCache::new("test-model", 1200)),
@@ -2833,6 +2838,132 @@ async fn usage_reports_carry_the_discount_the_models_document_publishes() {
         }
         mock.verify().await;
     }
+}
+
+// ---- Usage report delivery (`VLLM_PROXY_USAGE_REPORT_*`) ----
+
+/// The usage reports posted so far.
+async fn usage_reports(cloud_api: &MockServer) -> Vec<wiremock::Request> {
+    cloud_api
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| request.url.path() == "/v1/internal/usage")
+        .collect()
+}
+
+/// A gateway whose engine and cloud-api are `mock`, with a customer key, and
+/// a usage intake that answers `first_answers` in turn and 200 after them.
+async fn gateway_with_usage_intake(
+    mock: &MockServer,
+    first_answers: &[u16],
+    usage_report: usage_report::UsageReportPolicy,
+) -> (axum::Router, AppState) {
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+        .mount(mock)
+        .await;
+    mount_key_check(mock, "sk-live-partner", Some("org-partner")).await;
+    // wiremock answers with the first mounted mock that still has turns left.
+    for status in first_answers {
+        Mock::given(method("POST"))
+            .and(path("/v1/internal/usage"))
+            .respond_with(ResponseTemplate::new(*status))
+            .up_to_n_times(1)
+            .mount(mock)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path("/v1/internal/usage"))
+        .and(header("authorization", "Bearer usage-secret"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(mock)
+        .await;
+    build_gateway_with_state(
+        &mock.uri(),
+        GatewayOptions {
+            cloud_api_url: Some(mock.uri()),
+            cloud_api_usage_token: Some("usage-secret".to_string()),
+            usage_report,
+            ..Default::default()
+        },
+    )
+}
+
+#[tokio::test]
+async fn a_failed_usage_report_is_not_sent_again_unless_retries_are_configured() {
+    let mock = MockServer::start().await;
+    let (app, state) = gateway_with_usage_intake(&mock, &[503], Default::default()).await;
+    assert_eq!(
+        state.config.usage_report,
+        usage_report::UsageReportPolicy::default()
+    );
+
+    let response = app
+        .oneshot(chat_request_with("sk-live-partner", None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    json_body(response).await;
+
+    // One attempt, as always: the 503 is the report's final answer.
+    let drained = state
+        .usage_report_delivery
+        .drain(Duration::from_secs(30))
+        .await;
+    assert_eq!(drained.left(), 0);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(usage_reports(&mock).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_usage_report_the_intake_fails_is_sent_again_unchanged_when_retries_are_configured() {
+    let mock = MockServer::start().await;
+    let (app, state) = gateway_with_usage_intake(
+        &mock,
+        &[503, 429],
+        usage_report::UsageReportPolicy {
+            max_attempts: 5,
+            initial_backoff: Duration::from_millis(10),
+            max_in_flight: 8,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // The response does not wait for the report: it is back while the report
+    // still has two failures and two backoffs ahead of it.
+    let response = app
+        .oneshot(chat_request_with("sk-live-partner", None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    json_body(response).await;
+    assert!(usage_reports(&mock).await.len() < 3);
+
+    let drained = state
+        .usage_report_delivery
+        .drain(Duration::from_secs(30))
+        .await;
+    assert_eq!(drained.left(), 0);
+    let reports = usage_reports(&mock).await;
+    assert_eq!(reports.len(), 3);
+    for report in &reports {
+        assert_eq!(report.body, reports[0].body);
+        assert_eq!(
+            report.headers.get("authorization").unwrap(),
+            "Bearer usage-secret"
+        );
+        assert_eq!(
+            report.headers.get("x-request-id"),
+            reports[0].headers.get("x-request-id")
+        );
+    }
+    let report: serde_json::Value = serde_json::from_slice(&reports[0].body).unwrap();
+    assert_eq!(report["id"], chat_completion_json()["id"]);
+    assert_eq!(report["organization_id"], "org-partner");
 }
 
 // ---- Reasoning switch ----

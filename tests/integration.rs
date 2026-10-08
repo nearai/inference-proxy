@@ -234,6 +234,7 @@ fn build_test_app_inner_with_pool(
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
         cloud_api_usage_token: None,
+        usage_report: Default::default(),
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,
@@ -354,6 +355,7 @@ fn build_test_app_inner_with_pool(
 
     let state = AppState {
         models: None,
+        usage_report_delivery: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),
@@ -6087,6 +6089,7 @@ fn build_test_app_with_cloud_api_retries(
         // Usage is reported via the service-token /v1/internal/usage path only;
         // configure the token so usage-reporting tests exercise the real path.
         cloud_api_usage_token: Some("test-usage-token".to_string()),
+        usage_report: Default::default(),
         compose_manager_url: None,
         dev_mode: true,
         gpu_no_hw_mode: true,
@@ -6199,6 +6202,7 @@ fn build_test_app_with_cloud_api_retries(
 
     let state = AppState {
         models: None,
+        usage_report_delivery: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),
@@ -8733,6 +8737,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
         cloud_api_usage_token: None,
+        usage_report: Default::default(),
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,
@@ -8836,6 +8841,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
 
     let state = AppState {
         models: None,
+        usage_report_delivery: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),
@@ -9199,6 +9205,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
         cloud_api_usage_token: None,
+        usage_report: Default::default(),
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,
@@ -9293,6 +9300,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
 
     let state = AppState {
         models: None,
+        usage_report_delivery: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(cache::ChatCache::new("test-model", 1200)),

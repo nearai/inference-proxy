@@ -48,6 +48,13 @@ pub async fn metrics_middleware(request: Request<axum::body::Body>, next: Next) 
 
 /// Handler for `GET /metrics` — renders Prometheus text format.
 pub async fn prometheus_metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
-    state.admission.record_backend_metrics(&state.backend_pool);
+    match state.models.as_deref() {
+        Some(models) => {
+            for model in models.iter() {
+                model.admission.record_backend_metrics(&model.backend_pool);
+            }
+        }
+        None => state.admission.record_backend_metrics(&state.backend_pool),
+    }
     state.metrics_handle.render()
 }

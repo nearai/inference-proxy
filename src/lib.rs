@@ -18,6 +18,8 @@ pub mod fusion;
 pub mod gpu_evidence_delegate;
 pub mod image_validation;
 pub mod metrics_middleware;
+pub mod model_list;
+pub mod model_metrics;
 pub mod ohttp_gateway;
 pub mod priority;
 pub mod proxy;
@@ -68,4 +70,13 @@ pub struct AppState {
     /// for chat/completions (gateway mode, `VLLM_PROXY_ADMISSION_*`). Inert
     /// unless configured.
     pub admission: Arc<admission::AdmissionController>,
+    /// Gateway list mode (`VLLM_PROXY_MODEL_LIST_FILE`, `model_list.rs`):
+    /// the served models, each with its own backend client, pool, affinity
+    /// and admission. `None` = the process serves one model and
+    /// `backend_client`, `backend_pool`, `backend_affinity` and `admission`
+    /// above are that model's. With a list those four are the inert
+    /// single-model defaults (no bearer, an unroutable backend, admission
+    /// off): chat/completions go through `model_list::model_for`, and the
+    /// routes that read them directly are not served.
+    pub models: Option<Arc<model_list::ModelList>>,
 }

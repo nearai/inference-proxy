@@ -79,6 +79,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         options.backend_urls.clone()
     };
     let config = config::Config {
+        model_list: None,
         replica_state: None,
         model_name: "test-model".to_string(),
         tokens: vec!["test-token".to_string()],
@@ -277,6 +278,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         1_200,
     ));
     let state = AppState {
+        models: None,
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(cache::ChatCache::new("test-model", 1200)),

@@ -36,6 +36,7 @@ This is a Rust rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-pro
 - `auth.rs` — `RequireAuth` axum extractor (validates Bearer token)
 - `routes/` — thin handlers that parse request, call proxy helpers
 - `replica_state/` — opt-in publishing of one signed host frame per tick to Redis (`spawn_replica_state_publisher`)
+- `model_list.rs` — gateway list mode (`VLLM_PROXY_MODEL_LIST_FILE`): the list file, one bundle per model (`ServedModel`), model selection (`model_for` → `ModelView`); `model_metrics.rs` holds the `model` label macros
 
 ### Important patterns
 
@@ -122,6 +123,26 @@ In gateway mode `reasoning.rs` maps an aggregator's `reasoning` object
 (`enabled: false`, `effort`) onto `reasoning_effort`; "off" is
 `VLLM_PROXY_REASONING_OFF_EFFORT` (`low` for GLM-5.3 Flash, whose template only
 knows `low`/`high` and leaks its thinking into `content` when switched off).
+
+A gateway can serve several models from one process: `VLLM_PROXY_MODEL_LIST_FILE`
+names a JSON file of models (`model_list.rs`, schema and example in
+docs/gateway-mode.md). Chat/completions then pick the model from the body's
+`model` (exact match, 404 `model_not_found` otherwise, after auth) through
+`model_list::model_for`, which returns a `ModelView`: read everything
+model-specific from it (`backend_client`, `backend_pool`, `backend_affinity`,
+`admission`, tier, discount, reasoning-off effort), never from `AppState` or
+`Config` directly, so the single-model and the list path stay one code path.
+Each model has its own pool, affinity, admission, engine poller and backend
+client (its bearer goes to its backends only). Per-model metric series go
+through the `model_counter!`/`model_gauge!`/`model_histogram!` macros
+(`model_metrics.rs`): a `model` label in list mode, exactly the old series
+without one. A new per-model setting needs a `ModelConfig` field, a file key,
+a `ModelDefaults` fallback and `Config::single_model`. `main` builds a list's
+whole state with `model_list::app_state` and serves `routes::build_app`, and
+`tests/model_list.rs` starts its gateways through the same two functions (one
+test runs the built binary), so list-mode wiring belongs in the library, not
+in `main.rs`. Without the variable the process serves one model from env and
+nothing may change for it.
 
 ### Cloud API integration
 

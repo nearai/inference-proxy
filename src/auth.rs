@@ -147,6 +147,17 @@ pub(crate) fn token_eq(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
+/// Whether the request presents one of the proxy's own config tokens (`TOKEN`)
+/// as its bearer. For a route that answers everyone but says more to the
+/// operator; `RequireTrustedAuth` is the extractor that refuses everyone else.
+pub(crate) fn presents_config_token(headers: &axum::http::HeaderMap, config: &Config) -> bool {
+    headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|header| header.strip_prefix("Bearer "))
+        .is_some_and(|token| config.tokens.iter().any(|trusted| token_eq(token, trusted)))
+}
+
 /// Classify a `reqwest::Error` into a coarse bucket so failure modes are
 /// distinguishable in logs and metrics. The raw `Display` is the same string
 /// (`"error sending request for url ..."`) for connect/RST/EOF/etc, which is

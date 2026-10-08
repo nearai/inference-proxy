@@ -64,6 +64,8 @@ const DSTACK_TIMEOUT: &str = "timeout";
 const BACKEND_TIMEOUT: &str = "timeout";
 const BACKEND_UNREACHABLE: &str = "unreachable";
 const DSTACK_SKIPPED: &str = "skipped";
+/// List mode: the model's pool has no healthy backend, so none was probed.
+const BACKEND_UNHEALTHY: &str = "unhealthy";
 
 /// GET /healthz — readiness probe for upstream load balancers.
 ///
@@ -88,7 +90,22 @@ const DSTACK_SKIPPED: &str = "skipped";
 /// `checks` is a stable token (`"ok"`, `"unreachable"`, `"timeout"`, or
 /// `"http_<code>"`) — detailed errors (paths, URLs, OS messages) are logged
 /// server-side rather than returned to the unauthenticated caller.
-pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
+///
+/// In gateway list mode the backend leg is per model: see `healthz_for_list`.
+pub async fn healthz(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if let Some(models) = state.models.as_deref() {
+        let operator = crate::auth::presents_config_token(&headers, &state.config);
+        return healthz_for_list(&state, models, operator)
+            .await
+            .into_response();
+    }
+    healthz_single(&state).await.into_response()
+}
+
+async fn healthz_single(state: &AppState) -> (StatusCode, Json<serde_json::Value>) {
     let dstack_path = state.config.dstack_socket_path.clone();
     let skip_dstack = state.config.non_tee_deployment;
     // Hold the BackendGuard for the full probe so the backend's
@@ -118,6 +135,78 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "backend": status_token(&backend_result),
         },
     });
+
+    let status = if healthy {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(body))
+}
+
+/// `/healthz` in gateway list mode. The process is healthy while at least one
+/// model is: one model's outage must not take the others off the load
+/// balancer. The body keeps the single-model shape, and `checks.backend` is
+/// `"ok"` exactly when the status is.
+///
+/// The route is unauthenticated, and which models are configured is not for
+/// everyone: chat/completions answer an unknown model only after
+/// authentication so that the ids cannot be enumerated. So the per-model
+/// state — `models`, one entry per configured model in list order, with the
+/// same stable tokens — is added only for the `operator`, a caller that
+/// presents the gateway's own config `TOKEN`. Status code, `status` and
+/// `checks` are the same for everyone.
+///
+/// Each model is probed the way the single model is, one backend picked from
+/// its pool, all models at once. A model whose pool already has no healthy
+/// backend is reported `"unhealthy"` without a probe: its health checker
+/// knows, and a probe that can only time out would make every answer here as
+/// slow as that model's dead hosts.
+async fn healthz_for_list(
+    state: &AppState,
+    models: &crate::model_list::ModelList,
+    operator: bool,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let skip_dstack = state.config.non_tee_deployment;
+    let dstack_check = async {
+        if skip_dstack {
+            Ok(())
+        } else {
+            check_dstack(&state.config.dstack_socket_path).await
+        }
+    };
+    let model_checks = futures_util::future::join_all(models.iter().map(|model| async move {
+        if model.backend_pool.healthy_count() == 0 {
+            return Err(BACKEND_UNHEALTHY);
+        }
+        let (url, guard) = model
+            .backend_pool
+            .select_url(&state.config.backend_health_path);
+        check_backend(&state.http_client, &url, &guard).await
+    }));
+    let (dstack_result, model_results) = tokio::join!(dstack_check, model_checks);
+
+    let any_model = model_results.iter().any(Result::is_ok);
+    let healthy = dstack_result.is_ok() && any_model;
+    let mut body = serde_json::json!({
+        "status": if healthy { STATUS_OK } else { "unhealthy" },
+        "checks": {
+            "dstack": if skip_dstack { DSTACK_SKIPPED } else { status_token(&dstack_result) },
+            "backend": if any_model { STATUS_OK } else { BACKEND_UNHEALTHY },
+        },
+    });
+    if operator {
+        body["models"] = models
+            .iter()
+            .zip(&model_results)
+            .map(|(model, result)| {
+                serde_json::json!({
+                    "id": model.id(),
+                    "backend": status_token(result),
+                })
+            })
+            .collect();
+    }
 
     let status = if healthy {
         StatusCode::OK

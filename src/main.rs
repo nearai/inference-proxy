@@ -1,14 +1,12 @@
 use std::sync::Arc;
 
-use axum::middleware;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use tokio::net::TcpListener;
 use tracing::info;
 use vllm_proxy_rs::ohttp_gateway::OhttpGateway;
 use vllm_proxy_rs::{
     admission, attestation, backend_affinity, backend_pool, cache, config, engine_load, fusion,
-    metrics_middleware, rate_limit, request_id_middleware, routes, signing, startup_checks,
-    vllm_dp_affinity, AppState,
+    metrics_middleware, model_list, routes, signing, startup_checks, vllm_dp_affinity, AppState,
 };
 
 /// DNS resolver that returns only IPv4 addresses.
@@ -34,6 +32,33 @@ impl Resolve for Ipv4OnlyResolver {
             Ok(Box::new(v4.into_iter()) as Addrs)
         })
     }
+}
+
+/// An HTTP client with the process's connection-pool and timeout settings and,
+/// for a backend-only client, the default headers it carries.
+///
+/// pool_idle_timeout must be shorter than upstream keepalive_timeout
+/// (typically 75s on nginx) to avoid reusing connections the server has
+/// closed. A reused-but-closed connection surfaces as
+/// `error sending request for url ...` and produced ~12 spurious 401s/h
+/// on `/v1/check_api_key` before we capped this. (See auth.rs retry path.)
+fn build_http_client(
+    config: &config::Config,
+    default_headers: Option<reqwest::header::HeaderMap>,
+) -> reqwest::Result<reqwest::Client> {
+    let mut http_builder = reqwest::Client::builder()
+        .dns_resolver(Arc::new(Ipv4OnlyResolver))
+        .pool_max_idle_per_host(config.max_keepalive)
+        .timeout(std::time::Duration::from_secs(config.timeout_secs));
+    if config.pool_idle_timeout_secs > 0 {
+        http_builder = http_builder.pool_idle_timeout(std::time::Duration::from_secs(
+            config.pool_idle_timeout_secs,
+        ));
+    }
+    if let Some(headers) = default_headers {
+        http_builder = http_builder.default_headers(headers);
+    }
+    http_builder.build()
 }
 
 #[tokio::main]
@@ -62,10 +87,21 @@ async fn main() -> anyhow::Result<()> {
     // Warn if any backend URL points to the proxy's own listen address
     let self_local = format!("://localhost:{listen_port}");
     let self_ip = format!("://127.0.0.1:{listen_port}");
+    // Gateway list mode: every model's backends, which are then the only ones.
+    let listed_models = config
+        .model_list
+        .as_ref()
+        .map_or(&[][..], |list| list.models.as_slice());
     for url in config
         .backend_urls
         .iter()
         .chain(&config.backend_long_context_urls)
+        .chain(listed_models.iter().flat_map(|model| {
+            model
+                .backend_urls
+                .iter()
+                .chain(&model.backend_long_context_urls)
+        }))
     {
         let backend_base = url.trim_end_matches('/');
         if backend_base.contains(&self_local) || backend_base.contains(&self_ip) {
@@ -78,13 +114,22 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    info!(
-        model = %config.model_name,
-        backends = ?config.backend_urls,
-        listen_port,
-        dev_mode = config.dev_mode,
-        "Starting vllm-proxy-rs"
-    );
+    match &config.model_list {
+        Some(list) => info!(
+            models = ?list.models.iter().map(|model| model.id.as_str()).collect::<Vec<_>>(),
+            model_list_file = %list.path,
+            listen_port,
+            dev_mode = config.dev_mode,
+            "Starting vllm-proxy-rs"
+        ),
+        None => info!(
+            model = %config.model_name,
+            backends = ?config.backend_urls,
+            listen_port,
+            dev_mode = config.dev_mode,
+            "Starting vllm-proxy-rs"
+        ),
+    }
 
     // Initialize signing keys
     let signing = signing::SigningPair::init(&config.model_name, config.dev_mode).await?;
@@ -93,6 +138,24 @@ async fn main() -> anyhow::Result<()> {
         ed25519_address = %signing.ed25519.signing_address,
         "Signing keys ready"
     );
+
+    // Gateway list mode: the whole state is built by the library, in the
+    // function the tests start a gateway with (`model_list::app_state`), and
+    // served like any other. Nothing below this block runs for a list: it
+    // builds, checks and attests the one model of a single-model process,
+    // and a list is refused at startup next to what would need it (OHTTP, a
+    // TEE, the compatibility check, replica state).
+    if config.model_list.is_some() {
+        let config = Arc::new(config);
+        let state = model_list::app_state(model_list::Process {
+            config: config.clone(),
+            signing,
+            http_client: build_http_client(&config, None)?,
+            metrics_handle: metrics_middleware::setup_metrics_recorder(),
+            backend_client: &|headers| Ok(build_http_client(&config, Some(headers))?),
+        })?;
+        return serve(state, &listen_addr, listen_port).await;
+    }
 
     // Track the TLS certificate's SPKI hash. The tracker seeds itself from
     // disk at startup, then the background attestation cache refresh task
@@ -144,28 +207,7 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     // Initialize HTTP client with connection pooling.
-    //
-    // pool_idle_timeout must be shorter than upstream keepalive_timeout
-    // (typically 75s on nginx) to avoid reusing connections the server has
-    // closed. A reused-but-closed connection surfaces as
-    // `error sending request for url ...` and produced ~12 spurious 401s/h
-    // on `/v1/check_api_key` before we capped this. (See auth.rs retry path.)
-    let build_http_client = |default_headers: Option<reqwest::header::HeaderMap>| {
-        let mut http_builder = reqwest::Client::builder()
-            .dns_resolver(Arc::new(Ipv4OnlyResolver))
-            .pool_max_idle_per_host(config.max_keepalive)
-            .timeout(std::time::Duration::from_secs(config.timeout_secs));
-        if config.pool_idle_timeout_secs > 0 {
-            http_builder = http_builder.pool_idle_timeout(std::time::Duration::from_secs(
-                config.pool_idle_timeout_secs,
-            ));
-        }
-        if let Some(headers) = default_headers {
-            http_builder = http_builder.default_headers(headers);
-        }
-        http_builder.build()
-    };
-    let http_client = build_http_client(None)?;
+    let http_client = build_http_client(&config, None)?;
     // Backend-only client: carries the backend bearer and the priority header
     // (if any) as default headers so they can never be attached to a cloud-api
     // or registry request.
@@ -187,7 +229,7 @@ async fn main() -> anyhow::Result<()> {
     let backend_client = if backend_headers.is_empty() {
         http_client.clone()
     } else {
-        build_http_client(Some(backend_headers))?
+        build_http_client(&config, Some(backend_headers))?
     };
 
     // Initialize metrics
@@ -295,6 +337,7 @@ async fn main() -> anyhow::Result<()> {
         vllm_dp_affinity,
         backend_affinity,
         admission,
+        models: None,
     };
 
     // Spawn background attestation cache refresh task.
@@ -364,15 +407,11 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Build rate limiter
-    let rate_limiter = rate_limit::build_rate_limiter(
-        state.config.rate_limit_per_second,
-        state.config.rate_limit_burst_size,
-    );
-    let rate_limit_state = rate_limit::RateLimitState {
-        limiter: rate_limiter,
-        trust_proxy_headers: state.config.rate_limit_trust_proxy_headers,
-    };
+    serve(state, &listen_addr, listen_port).await
+}
+
+/// Serve `state` on the listen address until a shutdown signal.
+async fn serve(state: AppState, listen_addr: &str, listen_port: u16) -> anyhow::Result<()> {
     info!(
         per_second = state.config.rate_limit_per_second,
         burst = state.config.rate_limit_burst_size,
@@ -380,13 +419,9 @@ async fn main() -> anyhow::Result<()> {
         "Rate limiter configured"
     );
 
-    // Build router
-    let app = routes::build_router()
-        .layer(middleware::from_fn(rate_limit::rate_limit_middleware))
-        .layer(axum::Extension(rate_limit_state))
-        .layer(middleware::from_fn(request_id_middleware))
-        .layer(middleware::from_fn(metrics_middleware::metrics_middleware))
-        .with_state(state);
+    // The routes for this state behind the rate limiter, the request id and
+    // the HTTP metrics.
+    let app = routes::build_app(state);
 
     // Bind and serve
     // Bind from the parsed address so an IPv6 `LISTEN_ADDR` gets its brackets.

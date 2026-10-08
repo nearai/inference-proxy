@@ -38,10 +38,16 @@ pub async fn metrics(
 /// source cannot be read, the engine's own list is passed through as before;
 /// with `VLLM_PROXY_DISCOUNT_TO_USER` set (which requires the document URL),
 /// that list carries the discount on every entry.
+///
+/// In gateway list mode the document is the only source: see
+/// `models_document_for_list`.
 pub async fn models(
     State(state): State<AppState>,
     Extension(tracing_ids): Extension<TracingIds>,
 ) -> Result<Response, AppError> {
+    if let Some(models) = state.models.as_deref() {
+        return models_document_for_list(&state, models).await;
+    }
     if let Some(source) = state.config.models_document_url.as_deref() {
         match fetch_models_document(&state, source).await {
             Ok(document) => {
@@ -103,10 +109,85 @@ async fn engine_list_with_discount(
     Ok((StatusCode::OK, axum::Json(list)).into_response())
 }
 
-/// Read the source document, keep only this deployment's model and attach
-/// the declared capacity and, when configured, the lane's discount. Any
-/// failure falls back to the engine list.
-async fn fetch_models_document(state: &AppState, source: &str) -> anyhow::Result<Value> {
+/// `/v1/models` in gateway list mode: one read of the source document, the
+/// entries of the configured models kept, each completed with its own
+/// model's declared capacity and discount. A configured model the source does
+/// not list is left out — the source's catalog stays the switch for what is
+/// advertised — and counted on every read; the log line is written when a
+/// model drops out of the document and when it is back, not on every read of
+/// a route that is polled. A source that cannot be read is a 502: there is no
+/// single engine list to fall back to, and a list assembled from some of the
+/// engines would advertise models at prices nothing vouches for.
+async fn models_document_for_list(
+    state: &AppState,
+    models: &crate::model_list::ModelList,
+) -> Result<Response, AppError> {
+    let unavailable = |error: anyhow::Error| {
+        metrics::counter!("models_document_source_failures_total").increment(1);
+        tracing::warn!(error = %error, "Models document source unavailable");
+        AppError::UpstreamParsed {
+            status: StatusCode::BAD_GATEWAY,
+            message: "The model list is temporarily unavailable".to_string(),
+            error_type: "models_document_unavailable".to_string(),
+        }
+    };
+    // Startup requires the source in list mode (`model_list::check_process`).
+    let Some(source) = state.config.models_document_url.as_deref() else {
+        return Err(unavailable(anyhow::anyhow!("no source configured")));
+    };
+    let mut document = read_models_source(state, source)
+        .await
+        .map_err(unavailable)?;
+    let Some(entries) = document.get_mut("data").and_then(Value::as_array_mut) else {
+        return Err(unavailable(anyhow::anyhow!(
+            "source document has no `data` array"
+        )));
+    };
+    let mut listed = std::collections::HashSet::new();
+    entries.retain_mut(|entry| {
+        let Some(model) = entry
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|id| models.get(id))
+        else {
+            return false;
+        };
+        listed.insert(model.id());
+        if let Some(entry) = entry.as_object_mut() {
+            let capacity = capacity_entries_for(
+                model.config.admission_max_inflight,
+                model.config.capacity_requests_per_minute,
+            );
+            if !capacity.is_empty() {
+                entry.insert("capacity".to_string(), Value::Array(capacity));
+            }
+            set_discount(entry, model.config.discount_to_user);
+        }
+        true
+    });
+    for model in models.iter() {
+        let is_listed = listed.contains(model.id());
+        if !is_listed {
+            metrics::counter!("models_document_missing_models_total", "model" => model.id().to_string())
+                .increment(1);
+        }
+        match (model.note_listed(is_listed), is_listed) {
+            (true, false) => tracing::warn!(
+                model = %model.id(),
+                "Configured model is not in the models document, leaving it out of /v1/models"
+            ),
+            (true, true) => tracing::info!(
+                model = %model.id(),
+                "Configured model is in the models document again"
+            ),
+            (false, _) => {}
+        }
+    }
+    Ok((StatusCode::OK, axum::Json(document)).into_response())
+}
+
+/// One read of the models document source, as JSON.
+async fn read_models_source(state: &AppState, source: &str) -> anyhow::Result<Value> {
     let response = state
         .http_client
         .get(source)
@@ -116,7 +197,14 @@ async fn fetch_models_document(state: &AppState, source: &str) -> anyhow::Result
     if !response.status().is_success() {
         anyhow::bail!("source answered {}", response.status());
     }
-    let mut document: Value = response.json().await?;
+    Ok(response.json().await?)
+}
+
+/// Read the source document, keep only this deployment's model and attach
+/// the declared capacity and, when configured, the lane's discount. Any
+/// failure falls back to the engine list.
+async fn fetch_models_document(state: &AppState, source: &str) -> anyhow::Result<Value> {
+    let mut document = read_models_source(state, source).await?;
     let model_name = state.config.model_name.as_str();
     let entries = document
         .get_mut("data")
@@ -159,20 +247,28 @@ const MODELS_DOCUMENT_TIMEOUT_SECS: u64 = 5;
 /// The lane's declared capacity, in the aggregator's schema: concurrency from
 /// the admission budget's ceiling, a per-minute request rate when configured.
 pub fn capacity_entries(config: &crate::config::Config) -> Vec<Value> {
+    capacity_entries_for(
+        config.admission_max_inflight,
+        config.capacity_requests_per_minute,
+    )
+}
+
+/// `capacity_entries` from one model's own numbers (0 = not declared).
+fn capacity_entries_for(admission_max_inflight: u32, requests_per_minute: u64) -> Vec<Value> {
     let mut entries = Vec::new();
-    if config.admission_max_inflight > 0 {
+    if admission_max_inflight > 0 {
         entries.push(serde_json::json!({
             "type": "concurrency",
             "unit": "request",
-            "value": config.admission_max_inflight,
+            "value": admission_max_inflight,
         }));
     }
-    if config.capacity_requests_per_minute > 0 {
+    if requests_per_minute > 0 {
         entries.push(serde_json::json!({
             "type": "request",
             "unit": "request",
             "per": "minute",
-            "value": config.capacity_requests_per_minute,
+            "value": requests_per_minute,
         }));
     }
     entries

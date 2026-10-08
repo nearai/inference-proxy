@@ -8,7 +8,7 @@ use crate::auth::RequireAuth;
 use crate::backend_affinity::{parse_replica_hint, ReplicaHint};
 use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
-use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageType};
+use crate::proxy::{self, make_usage_reporter_for, ProxyOpts, ResponseShape, UsageType};
 use crate::routes::chat::{read_body_with_limit, resolve_request_hash_for_signing};
 use crate::routes::completion_placement::place_completion;
 use crate::routes::ROUTE_COMPLETIONS;
@@ -27,6 +27,10 @@ pub async fn completions(
 
     let mut request_json: serde_json::Value = serde_json::from_slice(&request_body)
         .map_err(|e| AppError::BadRequest(format!("Invalid JSON: {e}")))?;
+
+    // See the chat route: the process's one model, or the list entry the
+    // body's `model` names.
+    let model = crate::model_list::model_for(&state, &request_json)?;
 
     // Engine `priority`: the proxy decides it (trusted callers may set it via
     // header; any client value is discarded).
@@ -100,13 +104,13 @@ pub async fn completions(
     // route. Token ids in `prompt` are counted exactly; text is estimated.
     // The estimate is walked at most once and also sizes the first-token
     // deadline, which only streaming requests get.
-    let estimate = (state.config.long_context_above_tokens > 0
+    let estimate = (model.long_context_above_tokens > 0
         || (is_stream && state.config.first_token_deadline_ms > 0))
         .then(|| crate::context_tier::completion_estimate(&request_json));
     let tier = crate::context_tier::decide(
-        &state.backend_pool,
-        state.config.long_context_above_tokens,
-        state.config.backend_tier_strict,
+        model.backend_pool,
+        model.long_context_above_tokens,
+        model.backend_tier_strict,
         || estimate.unwrap_or_else(|| crate::context_tier::completion_estimate(&request_json)),
     );
     // Placement hint from cloud-api, same trust predicate as chat completions
@@ -117,14 +121,15 @@ pub async fn completions(
     } else {
         ReplicaHint::Absent
     };
-    let placed = place_completion(&state, ROUTE_COMPLETIONS, tier, None, hint)?;
+    let placed = place_completion(&state, &model, ROUTE_COMPLETIONS, tier, None, hint)?;
 
     let opts = ProxyOpts {
         signing: state.signing.clone(),
         cache: state.cache.clone(),
         id_prefix: "cmpl".to_string(),
-        model_name: state.config.model_name.clone(),
-        usage_reporter: make_usage_reporter(&auth, &state),
+        model_name: model.id.to_string(),
+        model_label: model.label,
+        usage_reporter: make_usage_reporter_for(&auth, &state, &model),
         usage_type: UsageType::ChatCompletion,
         request_hash: original_request_hash,
         response_transform,
@@ -143,6 +148,7 @@ pub async fn completions(
         // See the chat route: the clock started when the request arrived.
         first_token_deadline: proxy::first_token_deadline(
             &state,
+            &model,
             RequestStart::or_now(request_start),
             estimate,
             is_stream,
@@ -150,9 +156,8 @@ pub async fn completions(
     };
 
     if is_stream {
-        proxy::proxy_streaming_request(&state.backend_client, &placed.url, modified_body, opts)
-            .await
+        proxy::proxy_streaming_request(model.backend_client, &placed.url, modified_body, opts).await
     } else {
-        proxy::proxy_json_request(&state.backend_client, &placed.url, modified_body, opts).await
+        proxy::proxy_json_request(model.backend_client, &placed.url, modified_body, opts).await
     }
 }

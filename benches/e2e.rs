@@ -33,6 +33,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
     let base = mock_url.trim_end_matches('/');
 
     let config = config::Config {
+        model_list: None,
         replica_state: None,
         model_name: "bench-model".to_string(),
         tokens: vec!["bench-token".to_string()],
@@ -167,6 +168,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
     let backend_pool = Arc::new(backend_pool::BackendPool::new(vec![mock_url.to_string()]));
 
     let state = AppState {
+        models: None,
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),

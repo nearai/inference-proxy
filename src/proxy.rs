@@ -333,6 +333,9 @@ pub struct UsageReporter {
     /// sent on every report so cloud-api bills the price the models document
     /// publishes. `None` = list price, and the field is not sent.
     pub discount_to_user: Option<f64>,
+    /// `model` label of the report metrics: `None` unless `model_name` is an
+    /// entry of a model list (`model_metrics.rs`).
+    pub model_label: crate::model_metrics::ModelLabel,
     /// Safe correlation context for logs and the Cloud API request. None of
     /// these values are emitted as metric labels.
     pub request_id: Option<String>,
@@ -434,10 +437,23 @@ fn record_usage_report_outcome(
             reporter.request_source.ingress_route.as_label(),
         ),
     ];
-    metrics::counter!("inference_proxy_usage_reports_total", &labels).increment(1);
+    match reporter.model_label {
+        None => metrics::counter!("inference_proxy_usage_reports_total", &labels),
+        Some(model) => metrics::counter!(
+            "inference_proxy_usage_reports_total",
+            crate::model_metrics::with_model(&labels, model)
+        ),
+    }
+    .increment(1);
     if let Some(duration) = duration {
-        metrics::histogram!("inference_proxy_usage_report_duration_seconds", &labels)
-            .record(duration.as_secs_f64());
+        match reporter.model_label {
+            None => metrics::histogram!("inference_proxy_usage_report_duration_seconds", &labels),
+            Some(model) => metrics::histogram!(
+                "inference_proxy_usage_report_duration_seconds",
+                crate::model_metrics::with_model(&labels, model)
+            ),
+        }
+        .record(duration.as_secs_f64());
     }
 }
 
@@ -488,6 +504,33 @@ pub fn make_usage_reporter(
     auth: &crate::auth::RequireAuth,
     state: &AppState,
 ) -> Option<UsageReporter> {
+    usage_reporter(
+        auth,
+        state,
+        &state.config.model_name,
+        state.config.discount_to_user,
+        None,
+    )
+}
+
+/// `make_usage_reporter` for a chat/completions request: usage is billed
+/// under the id of the model the request was served as, at that model's
+/// discount (the process's single model, or the list entry the body selected).
+pub fn make_usage_reporter_for(
+    auth: &crate::auth::RequireAuth,
+    state: &AppState,
+    model: &crate::model_list::ModelView<'_>,
+) -> Option<UsageReporter> {
+    usage_reporter(auth, state, model.id, model.discount_to_user, model.label)
+}
+
+fn usage_reporter(
+    auth: &crate::auth::RequireAuth,
+    state: &AppState,
+    model_name: &str,
+    discount_to_user: Option<f64>,
+    model_label: crate::model_metrics::ModelLabel,
+) -> Option<UsageReporter> {
     // Gate: a reporter exists only for direct sk- requests. The key value
     // itself is no longer stored — usage is attributed via the identity fields
     // below, not the sk-.
@@ -496,12 +539,13 @@ pub fn make_usage_reporter(
     Some(UsageReporter {
         http_client: state.http_client.clone(),
         cloud_api_url: url.clone(),
-        model_name: state.config.model_name.clone(),
+        model_name: model_name.to_string(),
         cloud_api_usage_token: state.config.cloud_api_usage_token.clone(),
         org_id: auth.org_id.clone(),
         workspace_id: auth.workspace_id.clone(),
         api_key_id: auth.api_key_id.clone(),
-        discount_to_user: state.config.discount_to_user,
+        discount_to_user,
+        model_label,
         request_id: auth.request_id.clone(),
         request_source: auth.request_source,
     })
@@ -913,6 +957,9 @@ pub struct ProxyOpts {
     pub id_prefix: String,
     /// Model name included in the signed text.
     pub model_name: String,
+    /// `model` label of the completed-request metrics: `None` unless
+    /// `model_name` is an entry of a model list (`model_metrics.rs`).
+    pub model_label: crate::model_metrics::ModelLabel,
     /// If set, report usage to the cloud API after a successful response.
     pub usage_reporter: Option<UsageReporter>,
     /// What kind of usage to extract from the response.
@@ -987,6 +1034,8 @@ pub struct FirstTokenDeadline {
     pub estimated_tokens: u64,
     /// `Retry-After` value on the refusal.
     pub retry_after_secs: u64,
+    /// `model` label of the refusal counter (`model_metrics.rs`).
+    pub model: crate::model_metrics::ModelLabel,
 }
 
 impl FirstTokenDeadline {
@@ -1001,8 +1050,10 @@ impl FirstTokenDeadline {
 
     /// The 429 the caller gets instead of a 200 it would have cancelled.
     fn refusal(&self) -> AppError {
-        metrics::counter!("first_token_deadline_refusals_total").increment(1);
+        crate::model_metrics::model_counter!(self.model, "first_token_deadline_refusals_total")
+            .increment(1);
         info!(
+            model = self.model,
             deadline_ms = self.budget.as_millis() as u64,
             waited_ms = self.started_at.elapsed().as_millis() as u64,
             estimated_tokens = self.estimated_tokens,
@@ -1053,9 +1104,11 @@ fn deadline_refused(refused: &std::sync::atomic::AtomicBool) -> bool {
 /// does not get one: the feature is off, the request is not a stream, or its
 /// computed deadline is above the cap (those keep the commit window and the
 /// keep-alives). `estimate` is the request's input estimate, already computed
-/// for the tier decision.
+/// for the tier decision. The deadline itself is a stream timing of the
+/// process; `model` supplies the lane whose `Retry-After` the refusal carries.
 pub fn first_token_deadline(
     state: &AppState,
+    model: &crate::model_list::ModelView<'_>,
     started_at: std::time::Instant,
     estimate: Option<crate::context_tier::Estimate>,
     is_stream: bool,
@@ -1070,10 +1123,11 @@ pub fn first_token_deadline(
         estimated_tokens,
         // Same wait the lane's own refusals advertise; the engine's queue
         // drains in seconds.
-        retry_after_secs: state
+        retry_after_secs: model
             .admission
             .config()
             .map_or(2, |config| config.retry_after.as_secs().max(1)),
+        model: model.label,
     })
 }
 
@@ -1256,7 +1310,7 @@ async fn send_upstream(
                 // falling through to the pre-existing host-share/exhausted
                 // handling below.
                 if strict && tier.is_some_and(|t| pool.healthy_count_in(Some(t)) == 0) {
-                    metrics::counter!("backend_failover_total", "outcome" => "refused")
+                    crate::model_metrics::model_counter!(pool.model(), "backend_failover_total", "outcome" => "refused")
                         .increment(1);
                     warn!(
                         tier = tier.map_or("none", crate::context_tier::ContextTier::as_str),
@@ -1280,7 +1334,7 @@ async fn send_upstream(
                         return Err(AppError::from(permit.reject_host_share()));
                     }
                 }
-                metrics::counter!("backend_failover_total", "outcome" => "exhausted").increment(1);
+                crate::model_metrics::model_counter!(pool.model(), "backend_failover_total", "outcome" => "exhausted").increment(1);
                 warn!(
                     backend = %sanitized_upstream_url_for_logs(url),
                     error = %error,
@@ -1297,7 +1351,7 @@ async fn send_upstream(
                     }
                 }
             }
-            metrics::counter!("backend_failover_total", "outcome" => "retried").increment(1);
+            crate::model_metrics::model_counter!(pool.model(), "backend_failover_total", "outcome" => "retried").increment(1);
             warn!(
                 failed_backend = %sanitized_upstream_url_for_logs(url),
                 next_backend = %sanitized_upstream_url_for_logs(&next.backend.base_url),
@@ -1322,7 +1376,7 @@ async fn send_upstream(
                 }
                 Err(error) if error.is_connect() => {
                     mark_backend_unreachable(&pool, next.index);
-                    metrics::counter!("backend_failover_total", "outcome" => "exhausted")
+                    crate::model_metrics::model_counter!(pool.model(), "backend_failover_total", "outcome" => "exhausted")
                         .increment(1);
                     warn!(
                         backend = %sanitized_upstream_url_for_logs(url),
@@ -1482,6 +1536,7 @@ pub(crate) fn tenant_context_label(tracing_ids: Option<&TracingIds>) -> &'static
 }
 
 fn record_completed_request_metrics(
+    model_label: crate::model_metrics::ModelLabel,
     labels: RequestMetricLabels,
     input_tokens: i64,
     total_duration_ms: u128,
@@ -1494,12 +1549,24 @@ fn record_completed_request_metrics(
         ("request_id_origin", labels.request_id_origin),
         ("mode", mode),
     ];
-    metrics::counter!("inference_proxy_completed_requests_total", &common_labels).increment(1);
-    metrics::counter!("inference_proxy_input_tokens_total", &common_labels)
+    let Some(model) = model_label else {
+        metrics::counter!("inference_proxy_completed_requests_total", &common_labels).increment(1);
+        metrics::counter!("inference_proxy_input_tokens_total", &common_labels)
+            .increment(input_tokens.max(0) as u64);
+        metrics::histogram!("inference_proxy_input_tokens", &common_labels)
+            .record(input_tokens.max(0) as f64);
+        metrics::histogram!("inference_proxy_request_duration_seconds", &common_labels)
+            .record(total_duration_ms as f64 / 1_000.0);
+        return;
+    };
+    // One entry of a model list: the same series, told apart by `model`.
+    let labels = crate::model_metrics::with_model(&common_labels, model);
+    metrics::counter!("inference_proxy_completed_requests_total", labels.clone()).increment(1);
+    metrics::counter!("inference_proxy_input_tokens_total", labels.clone())
         .increment(input_tokens.max(0) as u64);
-    metrics::histogram!("inference_proxy_input_tokens", &common_labels)
+    metrics::histogram!("inference_proxy_input_tokens", labels.clone())
         .record(input_tokens.max(0) as f64);
-    metrics::histogram!("inference_proxy_request_duration_seconds", &common_labels)
+    metrics::histogram!("inference_proxy_request_duration_seconds", labels)
         .record(total_duration_ms as f64 / 1_000.0);
 }
 
@@ -1507,6 +1574,31 @@ fn record_completed_request_metrics(
 /// metric dimensions. Verified tenant IDs remain structured-log fields and
 /// are never copied into metric labels.
 pub(crate) fn record_completed_request(
+    tracing_ids: Option<&TracingIds>,
+    model_name: &str,
+    response_id: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+    total_duration: std::time::Duration,
+    mode: &'static str,
+) {
+    record_completed_request_for(
+        None,
+        tracing_ids,
+        model_name,
+        response_id,
+        input_tokens,
+        output_tokens,
+        total_duration,
+        mode,
+    );
+}
+
+/// `record_completed_request` with the `model` label of the metrics
+/// (`ProxyOpts::model_label`): `None` everywhere but in a model list.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_completed_request_for(
+    model_label: crate::model_metrics::ModelLabel,
     tracing_ids: Option<&TracingIds>,
     model_name: &str,
     response_id: &str,
@@ -1525,7 +1617,7 @@ pub(crate) fn record_completed_request(
         ),
         None => ("", "", ""),
     };
-    record_completed_request_metrics(source_labels, input_tokens, total_ms, mode);
+    record_completed_request_metrics(model_label, source_labels, input_tokens, total_ms, mode);
     info!(
         request_id = %request_id,
         org_id = %org_id,
@@ -1859,7 +1951,8 @@ pub async fn proxy_json_request(
     let signed_json = serde_json::to_string(&signed).map_err(|e| AppError::Internal(e.into()))?;
     opts.cache.set_chat(&chat_id, &signed_json);
 
-    record_completed_request(
+    record_completed_request_for(
+        opts.model_label,
         opts.tracing_ids.as_ref(),
         &opts.model_name,
         &chat_id,
@@ -2669,6 +2762,7 @@ pub async fn proxy_streaming_request(
         let cache = opts.cache;
         let usage_reporter = opts.usage_reporter;
         let model_name = opts.model_name;
+        let model_label = opts.model_label;
         let chunk_transform = opts.chunk_transform;
         let backend_guard = opts.backend_guard;
         let admission = opts.admission;
@@ -2922,7 +3016,8 @@ pub async fn proxy_streaming_request(
 
                 if signature_cached {
                     let (input_tokens, output_tokens) = parser.usage.unwrap_or((0, 0));
-                    record_completed_request(
+                    record_completed_request_for(
+                        model_label,
                         completion_tracing_ids.as_ref(),
                         &model_name,
                         id,
@@ -3251,7 +3346,8 @@ pub async fn proxy_multipart_request(
     let signed_json = serde_json::to_string(&signed).map_err(|e| AppError::Internal(e.into()))?;
     opts.cache.set_chat(&response_id, &signed_json);
 
-    record_completed_request(
+    record_completed_request_for(
+        opts.model_label,
         opts.tracing_ids.as_ref(),
         &opts.model_name,
         &response_id,
@@ -3396,7 +3492,8 @@ pub(crate) async fn sign_and_cache_json_response(
     opts.cache.set_chat(&chat_id, &signed_json);
 
     if let Some(completion) = completion {
-        record_completed_request(
+        record_completed_request_for(
+            opts.model_label,
             opts.tracing_ids.as_ref(),
             &opts.model_name,
             &chat_id,
@@ -3801,6 +3898,7 @@ mod tests {
             workspace_id: workspace_id.map(String::from),
             api_key_id: api_key_id.map(String::from),
             discount_to_user: None,
+            model_label: None,
             request_id: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
             request_source: RequestSource {
                 auth_path: AuthPath::CloudApiKey,
@@ -4028,6 +4126,7 @@ mod tests {
             budget: std::time::Duration::from_millis(8_500),
             estimated_tokens: 1_234,
             retry_after_secs: 2,
+            model: None,
         };
         assert!(deadline.remaining().is_some());
 
@@ -4111,6 +4210,7 @@ mod tests {
             cache,
             id_prefix: "test".to_string(),
             model_name: "test-model".to_string(),
+            model_label: None,
             usage_reporter: None,
             usage_type: UsageType::default(),
             request_hash: None,

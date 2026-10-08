@@ -1499,6 +1499,7 @@ async fn finish_response(
         cache: ctx.state.cache.clone(),
         id_prefix: "chatcmpl".to_string(),
         model_name: ctx.state.config.model_name.clone(),
+        model_label: None,
         usage_reporter: make_usage_reporter(&ctx.auth, &ctx.state),
         usage_type: UsageType::ChatCompletion,
         request_hash: Some(ctx.request_hash.clone()),

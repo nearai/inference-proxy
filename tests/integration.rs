@@ -186,6 +186,7 @@ fn build_test_app_inner_with_pool(
     };
 
     let config = config::Config {
+        model_list: None,
         replica_state: None,
         model_name: "test-model".to_string(),
         tokens: if options.fusion_enabled {
@@ -352,6 +353,7 @@ fn build_test_app_inner_with_pool(
     );
 
     let state = AppState {
+        models: None,
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),
@@ -5936,6 +5938,7 @@ fn build_test_app_with_cloud_api_retries(
     let base = mock_url.trim_end_matches('/');
 
     let config = config::Config {
+        model_list: None,
         replica_state: None,
         model_name: "test-model".to_string(),
         tokens: vec!["test-token".to_string()],
@@ -6086,6 +6089,7 @@ fn build_test_app_with_cloud_api_retries(
     ]));
 
     let state = AppState {
+        models: None,
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),
@@ -8576,6 +8580,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
     ];
 
     let config = config::Config {
+        model_list: None,
         replica_state: None,
         model_name: "test-model".to_string(),
         tokens: vec!["test-token".to_string()],
@@ -8721,6 +8726,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
     let backend_pool = Arc::new(backend_pool::BackendPool::new(vec![mock_url.to_string()]));
 
     let state = AppState {
+        models: None,
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),
@@ -9040,6 +9046,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
     let port = listener.local_addr().unwrap().port();
 
     let config = config::Config {
+        model_list: None,
         replica_state: None,
         model_name: "test-model".to_string(),
         tokens: vec!["test-token".to_string()],
@@ -9176,6 +9183,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
     let backend_pool = Arc::new(backend_pool::BackendPool::new(vec![mock_url.to_string()]));
 
     let state = AppState {
+        models: None,
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(cache::ChatCache::new("test-model", 1200)),

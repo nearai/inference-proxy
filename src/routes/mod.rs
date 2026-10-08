@@ -49,6 +49,60 @@ async fn unknown_route() -> AppError {
     AppError::NotFound("Endpoint not found".to_string())
 }
 
+/// What the process serves: the router for `state` behind the middleware
+/// stack, outermost first: HTTP metrics, the request id, the per-IP rate
+/// limit. `main` serves exactly this, and the list-mode tests drive it.
+pub fn build_app(state: AppState) -> Router {
+    let rate_limit_state = crate::rate_limit::RateLimitState {
+        limiter: crate::rate_limit::build_rate_limiter(
+            state.config.rate_limit_per_second,
+            state.config.rate_limit_burst_size,
+        ),
+        trust_proxy_headers: state.config.rate_limit_trust_proxy_headers,
+    };
+    build_router_for(&state)
+        .layer(axum::middleware::from_fn(
+            crate::rate_limit::rate_limit_middleware,
+        ))
+        .layer(axum::Extension(rate_limit_state))
+        .layer(axum::middleware::from_fn(crate::request_id_middleware))
+        .layer(axum::middleware::from_fn(
+            crate::metrics_middleware::metrics_middleware,
+        ))
+        .with_state(state)
+}
+
+/// The router for `state`: every route for a process that serves one model,
+/// the model-list subset in gateway list mode.
+pub fn build_router_for(state: &AppState) -> Router<AppState> {
+    if state.models.is_some() {
+        build_model_list_router()
+    } else {
+        build_router()
+    }
+}
+
+/// Gateway list mode (`model_list.rs`): only what is defined for several
+/// models — chat completions, completions, the models document, health,
+/// metrics and the version. The other inference routes (tokenize, embeddings,
+/// rerank, score, images, audio, privacy), the engine metrics passthrough,
+/// attestation, signatures and OHTTP all assume the one model, backend pool
+/// and signing identity of a single-model process, so here they are the same
+/// 404 as any undeclared route.
+pub fn build_model_list_router() -> Router<AppState> {
+    Router::new()
+        .route(ROUTE_VERSION, get(health::version))
+        .route(ROUTE_HEALTHZ, get(health::healthz))
+        .route(
+            ROUTE_METRICS,
+            get(crate::metrics_middleware::prometheus_metrics_handler),
+        )
+        .route(ROUTE_V1_MODELS, get(metrics::models))
+        .route(ROUTE_CHAT_COMPLETIONS, post(chat::chat_completions))
+        .route(ROUTE_COMPLETIONS, post(completions::completions))
+        .fallback(unknown_route)
+}
+
 pub fn build_router() -> Router<AppState> {
     Router::new()
         // Unauthenticated health endpoints

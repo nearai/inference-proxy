@@ -960,6 +960,10 @@ pub struct ProxyOpts {
     /// `model` label of the completed-request metrics: `None` unless
     /// `model_name` is an entry of a model list (`model_metrics.rs`).
     pub model_label: crate::model_metrics::ModelLabel,
+    /// Gateway list mode: what a stream that fails after its 200 is counted
+    /// under (`model_metrics::count_stream_error`). `None` for a process that
+    /// serves one model and on every route but chat/completions.
+    pub model_request: Option<crate::model_metrics::ModelRequest>,
     /// If set, report usage to the cloud API after a successful response.
     pub usage_reporter: Option<UsageReporter>,
     /// What kind of usage to extract from the response.
@@ -2762,6 +2766,12 @@ pub async fn proxy_streaming_request(
                     }
                     // Too late for a status line: the client already has a 200.
                     metrics::counter!("stream_late_upstream_errors_total").increment(1);
+                    // List mode: a failed stream, unless the body channel is
+                    // already closed. That is a client that left, on its 200
+                    // or before any status was sent, and not a stream error.
+                    crate::model_metrics::count_stream_error(
+                        opts.model_request.filter(|_| !tx.is_closed()),
+                    );
                     let _ = tx.send(Ok(late_error_event(err).await)).await;
                 }
                 return;
@@ -2771,6 +2781,11 @@ pub async fn proxy_streaming_request(
         // Capture log fields before any partial moves from opts.
         let (log_request_id, log_org_id, log_workspace_id) = log_ids_or_empty(&opts.tracing_ids);
         let completion_tracing_ids = opts.tracing_ids.clone();
+        // List mode: what a failure of this stream is counted under
+        // (`model_metrics::count_stream_error`). Nothing when the client is
+        // already gone as the upstream answers: it left on its 200 or before
+        // any status was sent, which is a disconnect and not a failed stream.
+        let stream_errors = opts.model_request.filter(|_| !tx.is_closed());
 
         let signing = opts.signing;
         let cache = opts.cache;
@@ -2797,6 +2812,7 @@ pub async fn proxy_streaming_request(
         let mut hasher = Sha256::new();
         let mut parser = SseParser::new();
         let mut upstream_error = false;
+        let mut error_event_seen = false;
         let mut downstream_closed = false;
         let mut incomplete_reason = None;
         let mut received_upstream_progress = false;
@@ -2834,6 +2850,7 @@ pub async fn proxy_streaming_request(
                                     "phase" => "after_headers"
                                 )
                                 .increment(1);
+                                error_event_seen = true;
                                 note_engine_error(
                                     admission.as_ref(),
                                     error.get("message").and_then(|m| m.as_str()),
@@ -2952,6 +2969,12 @@ pub async fn proxy_streaming_request(
         }
 
         let completed_cleanly = !upstream_error && !downstream_closed && parser.seen_done;
+        // Once per stream: its 200 is out and it then failed, on an engine
+        // error event or by not completing. A client that left in the middle
+        // is not a failure of the stream.
+        if error_event_seen || (!completed_cleanly && !downstream_closed) {
+            crate::model_metrics::count_stream_error(stream_errors);
+        }
         if !completed_cleanly && !downstream_closed {
             let reason = incomplete_reason.unwrap_or("missing_done");
             metrics::counter!(
@@ -4225,6 +4248,7 @@ mod tests {
             id_prefix: "test".to_string(),
             model_name: "test-model".to_string(),
             model_label: None,
+            model_request: None,
             usage_reporter: None,
             usage_type: UsageType::default(),
             request_hash: None,

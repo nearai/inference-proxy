@@ -136,7 +136,12 @@ Each model has its own pool, affinity, admission, engine poller and backend
 client (its bearer goes to its backends only). Per-model metric series go
 through the `model_counter!`/`model_gauge!`/`model_histogram!` macros
 (`model_metrics.rs`): a `model` label in list mode, exactly the old series
-without one. A new per-model setting needs a `ModelConfig` field, a file key,
+without one. Two series exist in list mode only (`ModelRequest`, same file):
+`inference_proxy_model_requests_total{endpoint,status,model}`, counted on what
+the chat/completions handlers return (`count_response`, so every exit after
+model selection), and `inference_proxy_model_stream_errors_total{endpoint,model}`
+for a stream that failed after its 200 (`count_stream_error`, in the streaming
+task). A new per-model setting needs a `ModelConfig` field, a file key,
 a `ModelDefaults` fallback and `Config::single_model`. `main` builds a list's
 whole state with `model_list::app_state` and serves `routes::build_app`, and
 `tests/model_list.rs` starts its gateways through the same two functions (one

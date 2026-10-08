@@ -8,6 +8,7 @@ use crate::auth::RequireAuth;
 use crate::backend_affinity::{parse_replica_hint, ReplicaHint};
 use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
+use crate::model_metrics::ModelRequest;
 use crate::proxy::{self, make_usage_reporter_for, ProxyOpts, ResponseShape, UsageType};
 use crate::routes::chat::{read_body_with_limit, resolve_request_hash_for_signing};
 use crate::routes::completion_placement::place_completion;
@@ -23,6 +24,30 @@ pub async fn completions(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
+    // See the chat route: list mode counts the response under its model.
+    let mut counted_as = None;
+    let result = serve(
+        state,
+        auth,
+        tracing_ids,
+        request_start,
+        headers,
+        body,
+        &mut counted_as,
+    )
+    .await;
+    crate::model_metrics::count_response(counted_as, result)
+}
+
+async fn serve(
+    state: AppState,
+    auth: RequireAuth,
+    tracing_ids: TracingIds,
+    request_start: Option<Extension<RequestStart>>,
+    headers: HeaderMap,
+    body: Body,
+    counted_as: &mut Option<ModelRequest>,
+) -> Result<Response, AppError> {
     let request_body = read_body_with_limit(body, state.config.max_request_size).await?;
 
     let mut request_json = proxy::parse_json_object(&request_body)?;
@@ -30,6 +55,7 @@ pub async fn completions(
     // See the chat route: the process's one model, or the list entry the
     // body's `model` names.
     let model = crate::model_list::model_for(&state, &request_json)?;
+    *counted_as = ModelRequest::of(model.label, ROUTE_COMPLETIONS);
 
     // Engine `priority`: the proxy decides it (trusted callers may set it via
     // header; any client value is discarded).
@@ -128,6 +154,7 @@ pub async fn completions(
         id_prefix: "cmpl".to_string(),
         model_name: model.id.to_string(),
         model_label: model.label,
+        model_request: *counted_as,
         usage_reporter: make_usage_reporter_for(&auth, &state, &model),
         usage_type: UsageType::ChatCompletion,
         request_hash: original_request_hash,

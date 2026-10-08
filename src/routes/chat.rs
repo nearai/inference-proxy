@@ -10,6 +10,7 @@ use crate::auth::RequireAuth;
 use crate::backend_affinity::parse_replica_hint;
 use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
+use crate::model_metrics::ModelRequest;
 use crate::proxy::{self, make_usage_reporter_for, ProxyOpts, ResponseShape, UsageType};
 use crate::routes::completion_placement::place_completion;
 use crate::routes::ROUTE_CHAT_COMPLETIONS;
@@ -25,6 +26,32 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
+    // Gateway list mode counts the response under the model `serve` resolves
+    // (`model_metrics::count_response`). With one model this stays `None`
+    // and the result goes out untouched.
+    let mut counted_as = None;
+    let result = serve(
+        state,
+        auth,
+        tracing_ids,
+        request_start,
+        headers,
+        body,
+        &mut counted_as,
+    )
+    .await;
+    crate::model_metrics::count_response(counted_as, result)
+}
+
+async fn serve(
+    state: AppState,
+    auth: RequireAuth,
+    tracing_ids: TracingIds,
+    request_start: Option<Extension<RequestStart>>,
+    headers: HeaderMap,
+    body: Body,
+    counted_as: &mut Option<ModelRequest>,
+) -> Result<Response, AppError> {
     let request_body = read_body_with_limit(body, state.config.max_request_size).await?;
 
     let mut request_json = proxy::parse_json_object(&request_body)?;
@@ -33,6 +60,7 @@ pub async fn chat_completions(
     // gateway list mode, the entry the body's `model` names (404 otherwise).
     // After authentication, before anything model-specific.
     let model = crate::model_list::model_for(&state, &request_json)?;
+    *counted_as = ModelRequest::of(model.label, ROUTE_CHAT_COMPLETIONS);
 
     // Strip empty tool_calls (vLLM bug workaround)
     strip_empty_tool_calls(&mut request_json);
@@ -291,6 +319,7 @@ pub async fn chat_completions(
         id_prefix: "chatcmpl".to_string(),
         model_name: model.id.to_string(),
         model_label: model.label,
+        model_request: *counted_as,
         usage_reporter: make_usage_reporter_for(&auth, &state, &model),
         usage_type: UsageType::ChatCompletion,
         request_hash: Some(request_hash),

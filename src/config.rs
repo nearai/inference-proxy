@@ -119,6 +119,8 @@ fn usage_report_policy() -> anyhow::Result<crate::usage_report::UsageReportPolic
     const SHUTDOWN_DRAIN: &str = "VLLM_PROXY_USAGE_REPORT_SHUTDOWN_DRAIN_SECS";
     const TIMEOUT_LIMIT_SECS: u64 = 300;
     const MAX_ATTEMPTS_LIMIT: u32 = 10;
+    /// The backoff never exceeds 30 seconds, whatever it starts from.
+    const INITIAL_BACKOFF_LIMIT_MS: u64 = 30_000;
     const MAX_IN_FLIGHT_LIMIT: usize = 1_000;
     /// Each waiting report holds its serialized body and its ids, a
     /// kilobyte or two, so this bounds the queue to a few hundred megabytes.
@@ -141,6 +143,9 @@ fn usage_report_policy() -> anyhow::Result<crate::usage_report::UsageReportPolic
     }
     if !(1..=MAX_ATTEMPTS_LIMIT).contains(&max_attempts) {
         anyhow::bail!("{MAX_ATTEMPTS} must be between 1 and {MAX_ATTEMPTS_LIMIT}");
+    }
+    if initial_backoff_ms > INITIAL_BACKOFF_LIMIT_MS {
+        anyhow::bail!("{INITIAL_BACKOFF} must be at most {INITIAL_BACKOFF_LIMIT_MS}");
     }
     if max_attempts > 1 && initial_backoff_ms == 0 {
         anyhow::bail!("{INITIAL_BACKOFF} must be at least 1 when {MAX_ATTEMPTS} is above 1");
@@ -1786,6 +1791,7 @@ mod tests {
                 (MAX_ATTEMPTS, "11", "5"),
                 (MAX_ATTEMPTS, "-1", "5"),
                 (INITIAL_BACKOFF, "0", "250"),
+                (INITIAL_BACKOFF, "30001", "250"),
                 // Nothing would be left to wait or to back off in, and no
                 // attempt could start.
                 (DEADLINE, "30", "300"),

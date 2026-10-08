@@ -650,6 +650,16 @@ async fn a_report_that_cannot_be_sent_before_its_deadline_is_dropped_and_counted
     );
     assert_eq!(value(&recorder, REPORTS, &["outcome=\"http_5xx\""]), 0.0);
     assert_eq!(value(&recorder, REPORTS, &[]), 13.0);
+    // The report dropped after its attempts has the duration of the last
+    // one; the reports dropped unsent have none.
+    assert_eq!(
+        value(
+            &recorder,
+            DURATION_COUNT,
+            &["outcome=\"deadline_exceeded\""]
+        ),
+        1.0
+    );
     // A retry is counted when it is made, not when it is planned.
     assert_eq!(
         value(&recorder, ATTEMPTS, &["outcome=\"http_5xx\""]),
@@ -767,6 +777,50 @@ async fn a_full_queue_drops_the_report_that_waited_longest_and_counts_it() {
     assert_eq!(value(&recorder, REPORTS, &["outcome=\"accepted\""]), 4.0);
     // Every report has exactly one final outcome.
     assert_eq!(value(&recorder, REPORTS, &[]), 6.0);
+    assert_eq!(value(&recorder, WAITING, &[]), 0.0);
+}
+
+#[tokio::test]
+async fn every_report_dropped_from_a_full_queue_is_counted_however_many_at_once() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let billing = Billing::start(Answers::Script(vec![(Duration::from_millis(50), 200)])).await;
+    let delivery = policy(|policy| {
+        policy.max_in_flight = 1;
+        policy.max_queued = 1;
+    });
+    // More drops in one go than get a task of their own for their line: the
+    // ones past that are accounted for on the spot.
+    let reports = MAX_DROPS_BEING_LOGGED + 500;
+    for n in 0..reports {
+        billing.report(&delivery, &format!("chatcmpl-{n}"), None);
+    }
+    assert_eq!(delivery.pending(), (1, 1));
+    assert_eq!(
+        value(&recorder, REPORTS, &["outcome=\"queue_full\""]),
+        498.0
+    );
+    delivered(&delivery).await;
+
+    // The first took the place, the last is the one still waiting; every
+    // report in between was dropped, and each has its one final outcome.
+    assert_eq!(
+        billing.written(),
+        [
+            "chatcmpl-0".to_string(),
+            format!("chatcmpl-{}", reports - 1)
+        ]
+    );
+    let dropped = (reports - 2) as f64;
+    assert_eq!(
+        value(&recorder, REPORTS, &["outcome=\"queue_full\""]),
+        dropped
+    );
+    assert_eq!(
+        value(&recorder, DROPPED, &["reason=\"queue_full\""]),
+        dropped
+    );
+    assert_eq!(value(&recorder, REPORTS, &[]), reports as f64);
     assert_eq!(value(&recorder, WAITING, &[]), 0.0);
 }
 

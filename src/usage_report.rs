@@ -4,8 +4,8 @@
 //! `proxy::spawn_usage_report` checks and completes a report, serializes it
 //! once and hands it over here. From then on the report is off the request
 //! path: `submit` takes a lock for a queue operation and returns, and nothing
-//! in this module is ever awaited by a handler. Everything else, the log line
-//! of a dropped report included, happens in tasks of this module's own,
+//! in this module is ever awaited by a handler. Sending, and the line of a
+//! report dropped from a full queue, happen in tasks of this module's own,
 //! outside the span of the request that happened to be completing.
 //!
 //! With the default [`UsageReportPolicy`] delivery is what it has always been:
@@ -42,6 +42,11 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// The three lines a report has always ended with were written by `proxy.rs`
 /// and keep its log target, so a filter or a query on it still finds them.
 const FINAL_OUTCOME_TARGET: &str = "vllm_proxy_rs::proxy";
+
+/// How many reports dropped from a full queue may have their line still to
+/// be written, each in a task of its own. Past it the line is written where
+/// the drop happens, so these tasks cannot pile up without bound either.
+const MAX_DROPS_BEING_LOGGED: usize = 1_000;
 
 /// How usage reports are delivered. `Default` is the delivery every
 /// deployment had before these settings existed.
@@ -110,6 +115,14 @@ struct State {
     waiting: VecDeque<Job>,
     /// Places taken: reports being sent or backing off before a retry.
     in_flight: usize,
+    /// Reports dropped from a full queue whose line is still to be written.
+    drops_being_logged: usize,
+}
+
+impl State {
+    fn is_idle(&self) -> bool {
+        self.waiting.is_empty() && self.in_flight == 0 && self.drops_being_logged == 0
+    }
 }
 
 /// Why a report was given up on without a final answer from the billing API.
@@ -118,10 +131,10 @@ enum GiveUp {
     /// Pushed out of a full queue; it was never sent.
     QueueFull,
     /// No attempt fits before its deadline any more, after this many
-    /// attempts, the last of which ended like this.
+    /// attempts, the last of which ended like this and took this long.
     Deadline {
         attempts: u32,
-        last_attempt: Option<UsageReportOutcome>,
+        last_attempt: Option<(UsageReportOutcome, Duration)>,
     },
 }
 
@@ -144,9 +157,10 @@ impl Drained {
 /// model of a list (the billing API and its capacity are shared too).
 pub struct UsageReportDelivery {
     policy: UsageReportPolicy,
-    /// False for the default policy. The delivery series, the extra log
-    /// fields and the shutdown line exist only for a process that changed a
-    /// setting, so one that changed none keeps its `/metrics` and its logs.
+    /// False for the default policy, however it was arrived at. The delivery
+    /// series, the extra log fields and the shutdown line exist only for a
+    /// process whose policy differs from the default, so one that changed
+    /// nothing keeps its `/metrics` and its logs.
     extended: bool,
     state: Mutex<State>,
     /// Notified whenever nothing is pending any more.
@@ -197,6 +211,11 @@ impl UsageReportDelivery {
         (state.waiting.len(), state.in_flight)
     }
 
+    /// Nothing waits, nothing is in flight, and every drop has been logged.
+    fn is_idle(&self) -> bool {
+        self.state().is_idle()
+    }
+
     fn state(&self) -> MutexGuard<'_, State> {
         // Nothing panics while holding the lock; if something ever does, the
         // counts are still the best there is.
@@ -229,7 +248,13 @@ impl UsageReportDelivery {
             // The queue is full: the report that has waited longest goes. It
             // has the least time left before its deadline.
             let evicted = if state.waiting.len() >= self.policy.max_queued {
-                state.waiting.pop_front()
+                state.waiting.pop_front().map(|evicted| {
+                    let in_own_task = state.drops_being_logged < MAX_DROPS_BEING_LOGGED;
+                    if in_own_task {
+                        state.drops_being_logged += 1;
+                    }
+                    (evicted, in_own_task)
+                })
             } else {
                 None
             };
@@ -237,13 +262,26 @@ impl UsageReportDelivery {
             evicted
         };
         self.waiting_gauge(model, Step::Up);
-        if let Some(evicted) = evicted {
+        if let Some((evicted, in_own_task)) = evicted {
             self.waiting_gauge(evicted.reporter.model_label, Step::Down);
-            // Logged and counted in a task of its own: the line is about
-            // another request's report, so it belongs neither on this
-            // caller's path nor in its request span.
-            let delivery = Arc::clone(self);
-            tokio::spawn(async move { delivery.give_up(&evicted, GiveUp::QueueFull) });
+            if in_own_task {
+                // The line is about another request's report: it belongs
+                // neither on this caller's path nor in its request span.
+                let delivery = Arc::clone(self);
+                tokio::spawn(async move {
+                    delivery.give_up(&evicted, GiveUp::QueueFull);
+                    let idle = {
+                        let mut state = delivery.state();
+                        state.drops_being_logged -= 1;
+                        state.is_idle()
+                    };
+                    if idle {
+                        delivery.idle.notify_waiters();
+                    }
+                });
+            } else {
+                self.give_up(&evicted, GiveUp::QueueFull);
+            }
         }
     }
 
@@ -318,7 +356,7 @@ impl UsageReportDelivery {
                 Ok(status) => classify_usage_http_status(*status),
                 Err(error) => classify_usage_request_error(error),
             };
-            last_attempt = Some(outcome);
+            last_attempt = Some((outcome, elapsed));
             self.count(
                 "inference_proxy_usage_report_attempts_total",
                 reporter,
@@ -454,49 +492,62 @@ impl UsageReportDelivery {
     /// outcome and as a drop, and logged with its ids.
     fn give_up(&self, job: &Job, why: GiveUp) {
         let reporter = &job.reporter;
-        let (outcome, reason) = match why {
-            GiveUp::QueueFull => (UsageReportOutcome::QueueFull, "queue_full"),
-            GiveUp::Deadline { .. } => (UsageReportOutcome::DeadlineExceeded, "deadline"),
-        };
-        record_usage_report_outcome(reporter, outcome, None);
-        self.count(
-            "inference_proxy_usage_reports_dropped_total",
-            reporter,
-            ("reason", reason),
-        );
         let since_completion_ms = job.completed_at.elapsed().as_millis() as u64;
         match why {
-            GiveUp::QueueFull => warn!(
-                request_id = %reporter.request_id.as_deref().unwrap_or(""),
-                org_id = %reporter.org_id.as_deref().unwrap_or(""),
-                workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
-                api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
-                model = %reporter.model_name,
-                auth_path = reporter.request_source.auth_path.as_label(),
-                ingress_route = reporter.request_source.ingress_route.as_label(),
-                outcome = outcome.as_label(),
-                since_completion_ms,
-                max_queued = self.policy.max_queued,
-                "Usage report dropped: the waiting queue is full and this report waited \
-                 longest — usage NOT billed"
-            ),
+            GiveUp::QueueFull => {
+                let outcome = UsageReportOutcome::QueueFull;
+                record_usage_report_outcome(reporter, outcome, None);
+                self.count(
+                    "inference_proxy_usage_reports_dropped_total",
+                    reporter,
+                    ("reason", "queue_full"),
+                );
+                warn!(
+                    request_id = %reporter.request_id.as_deref().unwrap_or(""),
+                    org_id = %reporter.org_id.as_deref().unwrap_or(""),
+                    workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
+                    api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
+                    model = %reporter.model_name,
+                    auth_path = reporter.request_source.auth_path.as_label(),
+                    ingress_route = reporter.request_source.ingress_route.as_label(),
+                    outcome = outcome.as_label(),
+                    since_completion_ms,
+                    max_queued = self.policy.max_queued,
+                    "Usage report dropped: the waiting queue is full and this report waited \
+                     longest — usage NOT billed"
+                );
+            }
             GiveUp::Deadline {
                 attempts,
                 last_attempt,
-            } => warn!(
-                request_id = %reporter.request_id.as_deref().unwrap_or(""),
-                org_id = %reporter.org_id.as_deref().unwrap_or(""),
-                workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
-                api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
-                model = %reporter.model_name,
-                auth_path = reporter.request_source.auth_path.as_label(),
-                ingress_route = reporter.request_source.ingress_route.as_label(),
-                outcome = outcome.as_label(),
-                attempts,
-                last_attempt = last_attempt.map(UsageReportOutcome::as_label),
-                since_completion_ms,
-                "Usage report dropped: not accepted before its deadline — usage NOT billed"
-            ),
+            } => {
+                let outcome = UsageReportOutcome::DeadlineExceeded;
+                // With the duration of its last attempt, when it had one.
+                record_usage_report_outcome(
+                    reporter,
+                    outcome,
+                    last_attempt.map(|(_, elapsed)| elapsed),
+                );
+                self.count(
+                    "inference_proxy_usage_reports_dropped_total",
+                    reporter,
+                    ("reason", "deadline"),
+                );
+                warn!(
+                    request_id = %reporter.request_id.as_deref().unwrap_or(""),
+                    org_id = %reporter.org_id.as_deref().unwrap_or(""),
+                    workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
+                    api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
+                    model = %reporter.model_name,
+                    auth_path = reporter.request_source.auth_path.as_label(),
+                    ingress_route = reporter.request_source.ingress_route.as_label(),
+                    outcome = outcome.as_label(),
+                    attempts,
+                    last_attempt = last_attempt.map(|(outcome, _)| outcome.as_label()),
+                    since_completion_ms,
+                    "Usage report dropped: not accepted before its deadline — usage NOT billed"
+                );
+            }
         }
     }
 
@@ -507,14 +558,12 @@ impl UsageReportDelivery {
         let (waiting, in_flight) = self.pending();
         let pending = waiting + in_flight;
         loop {
-            // Registered before the count is read, so the notification of a
+            // Registered before the state is read, so the notification of a
             // report that ends in between is not missed.
             let idle = self.idle.notified();
             tokio::pin!(idle);
             idle.as_mut().enable();
-            let (waiting, in_flight) = self.pending();
-            if waiting + in_flight == 0 || tokio::time::timeout_at(give_up_at, idle).await.is_err()
-            {
+            if self.is_idle() || tokio::time::timeout_at(give_up_at, idle).await.is_err() {
                 let (left_waiting, left_in_flight) = self.pending();
                 return Drained {
                     pending,
@@ -640,7 +689,7 @@ impl Place {
                 state.in_flight -= 1;
                 self.held = false;
             }
-            (next, state.in_flight == 0)
+            (next, state.is_idle())
         };
         self.delivery.in_flight_gauge(self.model, Step::Down);
         if let Some(next) = &next {
@@ -665,7 +714,7 @@ impl Drop for Place {
             let idle = {
                 let mut state = self.delivery.state();
                 state.in_flight -= 1;
-                state.in_flight == 0 && state.waiting.is_empty()
+                state.is_idle()
             };
             self.delivery.in_flight_gauge(self.model, Step::Down);
             if idle {

@@ -420,7 +420,8 @@ back-pressure for the next admission decision
 `request_model_match_total{result}` (how the body's `model` compares with what
 the gateway serves, see [below](#before-switching-it-on)),
 plus the existing usage-report and upstream metrics, and the delivery series
-of [Usage report delivery](#usage-report-delivery) once it is configured.
+of [Usage report delivery](#usage-report-delivery) once a setting there
+differs from its default.
 
 ## Long-context tier
 
@@ -539,7 +540,7 @@ then has to wait for.
 | --- | --- | --- | --- |
 | `VLLM_PROXY_USAGE_REPORT_TIMEOUT_SECS` | `5` | `30` | Timeout of one attempt (1 to 300). Above 5 requires `_MAX_IN_FLIGHT`. |
 | `VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS` | `1` | `5` | Attempts per report, the first one included; `1` = never retried, at most `10`. More than one requires `_MAX_IN_FLIGHT`. |
-| `VLLM_PROXY_USAGE_REPORT_INITIAL_BACKOFF_MS` | `500` | default | Backoff before the first retry; doubled for each later one, at most 30 s. |
+| `VLLM_PROXY_USAGE_REPORT_INITIAL_BACKOFF_MS` | `500` | default | Backoff before the first retry (at most 30000); doubled for each later one, at most 30 s. |
 | `VLLM_PROXY_USAGE_REPORT_DEADLINE_SECS` | `0` (none) | `300` | How long after its request completed a report may still be sent. Above the timeout: the difference is the time a report has to wait and to back off. |
 | `VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT` | `0` (no cap) | `8` | Reports in flight at once, for the whole process (at most 1000). |
 | `VLLM_PROXY_USAGE_REPORT_MAX_QUEUED` | `10000` | default | Reports that may wait for a place when the cap is reached (1 to 100000). Unused without a cap. |
@@ -597,8 +598,8 @@ left at exit, and whatever a process held when it was killed, is lost.
 outcome of a report, one count per report: with retries the outcome of its
 last attempt, plus `queue_full` and `deadline_exceeded` for a report dropped
 before cloud-api answered it. `inference_proxy_usage_report_duration_seconds`
-is the duration of that last attempt. A process with any of the settings
-above also has:
+is the duration of that last attempt (a report dropped before any attempt has
+none). A process whose settings differ from the defaults also has:
 
 - `inference_proxy_usage_report_attempts_total{outcome}`: every attempt, by
   what it met;
@@ -615,9 +616,10 @@ above also has:
   included.
 
 The counters and the histogram carry `auth_path` and `ingress_route`, like the
-two series that were there before. A process with none of the settings has
-none of these series and none of the extra log fields (`attempts`,
-`since_completion_ms`): its `/metrics` and its log lines are unchanged. Log
+two series that were there before. A process with none of the settings, or
+with every one at its default, has none of these series and none of the extra
+log fields (`attempts`, `since_completion_ms`): its `/metrics` and its log
+lines are unchanged. Log
 lines carry ids only (request, organization, workspace, key, model), never a
 report's content.
 

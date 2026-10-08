@@ -4520,6 +4520,115 @@ async fn test_invalid_json_body() {
         .contains("Invalid JSON"));
 }
 
+/// A body that is valid JSON but not an object used to panic the handler (the
+/// client saw a dropped connection), and `null` was dispatched as an object.
+/// Every JSON route must answer 400 instead, before anything reaches an
+/// engine and with nothing billed.
+#[tokio::test]
+async fn test_non_object_json_body_is_rejected_before_dispatch() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+
+    // An `sk-` caller with usage reporting on, and an engine that answers
+    // anything with billable usage: a dispatched request would be billed.
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-test",
+            "workspace_id": "ws-test",
+            "api_key_id": "key-test"
+        })))
+        .mount(&cloud_api)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/internal/usage"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_api)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-non-object",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11}
+        })))
+        .mount(&backend)
+        .await;
+
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+    let post = |uri: &'static str, body: &'static str, encrypted: bool| {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer sk-test-valid-key-12345678901");
+        if encrypted {
+            request = request
+                .header("x-signing-algo", "ed25519")
+                .header("x-client-pub-key", "11".repeat(32));
+        }
+        app.clone().oneshot(request.body(Body::from(body)).unwrap())
+    };
+
+    for uri in [
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/embeddings",
+        "/v1/rerank",
+        "/v1/score",
+        "/v1/images/generations",
+    ] {
+        for body in [
+            "[]",
+            r#"[{"role":"user","content":"hi"}]"#,
+            r#""hi""#,
+            "42",
+            "true",
+            "null",
+        ] {
+            // With and without end-to-end encryption headers: the passthrough
+            // routes parse the body on a different branch for each.
+            for encrypted in [false, true] {
+                let case = format!("{uri} body={body} encrypted={encrypted}");
+                let response = post(uri, body, encrypted).await.unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{case}");
+                let error = body_to_json(response).await;
+                assert_eq!(
+                    error,
+                    serde_json::json!({"error": {
+                        "message": "Request body must be a JSON object",
+                        "type": "bad_request",
+                        "param": null,
+                        "code": null,
+                    }}),
+                    "{case}"
+                );
+            }
+        }
+    }
+    assert_eq!(requests_seen(&backend).await, 0);
+
+    // Control: the same app dispatches and bills an object body, so the
+    // zeroes are not an artifact of the fixture.
+    let response = post(
+        "/v1/chat/completions",
+        r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(requests_seen(&backend).await, 1);
+    wait_for_usage_request(&cloud_api, 1).await;
+    // Reports are asynchronous: by the time the control's has landed, any
+    // report from the rejected requests before it would have landed too.
+    assert_eq!(get_usage_requests(&cloud_api).await.len(), 1);
+}
+
 // ---- Signature cryptographic verification ----
 
 #[tokio::test]

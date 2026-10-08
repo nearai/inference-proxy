@@ -945,6 +945,54 @@ With one model there is no `model` label on any series: existing dashboards
 and alerts match on exactly those label sets. `src/model_metrics.rs` is where
 the difference lives.
 
+Two series exist in list mode only. `http_requests_total` and
+`http_errors_total` stay process-wide, so without these an error rate could
+not be read per model:
+
+- `inference_proxy_model_requests_total{endpoint, status, model}`: one per
+  `/v1/chat/completions` or `/v1/completions` response of a request whose
+  model was resolved. `endpoint` is the route and `status` the HTTP status the
+  client was sent, whoever decided it: the engine (a `200`, or its own `4xx`
+  or `5xx` as the gateway forwards it, so an engine `500` is a `500` here and
+  not a `502`), the gateway refusing (`429` at the admission budget or on the
+  first-token deadline, `503` for a strict tier with no healthy backend) or
+  the gateway answering for an upstream that failed (`502` unreachable or cut
+  short, `504` timed out). A connection fail-over is still one response.
+- `inference_proxy_model_stream_errors_total{endpoint, model}`: one per
+  stream that failed after its `200` was sent, which the series above can
+  only show as a `200`. That is an engine error event on the open stream, a
+  failure that arrives after the early commit (`VLLM_PROXY_STREAM_COMMIT_MS`),
+  a cut or unreadable upstream connection, the idle watchdog
+  (`VLLM_PROXY_STREAM_IDLE_TIMEOUT_SECS`) and a stream that ends without
+  `[DONE]`.
+
+A response is counted when its status goes out, the moment
+`http_requests_total` counts it. A stream is therefore counted when its `200`
+is committed, whatever happens to it afterwards, and a client that
+disconnects before any status was sent is not counted at all. A client that
+disconnects from an open stream is not a stream error either
+(`stream_client_disconnects_total`, process-wide, has those).
+
+A request without a resolved model is in neither series: an unknown or missing
+`model` (the `404` above, counted by `request_model_match_total`) and
+everything refused before the body's `model` is read (the key check's `401`,
+`402`, `403` and `429`, the per-IP rate limit, a `413`, a body that is not a
+JSON object).
+
+The share of one model's responses that are server errors, and of its streams
+that failed after their `200`:
+
+```promql
+sum by (model) (rate(inference_proxy_model_requests_total{status=~"5.."}[5m]))
+  / sum by (model) (rate(inference_proxy_model_requests_total[5m]))
+
+sum by (model) (rate(inference_proxy_model_stream_errors_total[5m]))
+  / sum by (model) (rate(inference_proxy_model_requests_total{status="200"}[5m]))
+```
+
+(The second ratio's denominator also holds the non-streaming `200`s: the
+status series does not tell streams apart.)
+
 Startup logs one "Serving model" line per model with its effective settings
 (the backend token only as `backend_token=true|false`) and a "Model list
 enabled" line with the settings every lane shares, the first-token deadline

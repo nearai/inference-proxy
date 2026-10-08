@@ -121,6 +121,7 @@ pub async fn classify(
             id_prefix: "privacy".to_string(),
             model_name: state.config.model_name.clone(),
             model_label: None,
+            model_request: None,
             usage_reporter: make_usage_reporter(&auth, &state),
             usage_type: UsageType::PrivacyClassify,
             request_hash: None,

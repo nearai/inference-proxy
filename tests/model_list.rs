@@ -107,6 +107,8 @@ fn start(list: Option<&Value>, env: &[(&str, &str)], metrics: Option<PrometheusH
     }
     let config = Arc::new(config.expect("valid configuration"));
     assert_eq!(config.model_list.is_some(), list.is_some());
+    // The total request bound `main` gives its HTTP clients.
+    let timeout = Duration::from_secs(config.timeout_secs);
 
     let ecdsa_key: [u8; 32] = [
         0xac, 0x09, 0x74, 0xbe, 0xc3, 0x9a, 0x17, 0xe3, 0x6b, 0xa4, 0xa6, 0xb4, 0xd2, 0x38, 0xff,
@@ -124,12 +126,13 @@ fn start(list: Option<&Value>, env: &[(&str, &str)], metrics: Option<PrometheusH
             ecdsa: signing::EcdsaContext::from_key_bytes(&ecdsa_key).unwrap(),
             ed25519: signing::Ed25519Context::from_key_bytes(&ed25519_key).unwrap(),
         },
-        http_client: reqwest::Client::new(),
+        http_client: reqwest::Client::builder().timeout(timeout).build().unwrap(),
         metrics_handle: metrics
             .unwrap_or_else(|| PrometheusBuilder::new().build_recorder().handle()),
         backend_client: &|headers| {
             Ok(reqwest::Client::builder()
                 .default_headers(headers)
+                .timeout(timeout)
                 .build()?)
         },
     };
@@ -372,11 +375,21 @@ async fn usage_reports(cloud: &MockServer, expected: usize) -> Vec<Value> {
     panic!("expected {expected} usage reports");
 }
 
+/// The URL of a backend that refuses every connection, for the rest of the
+/// test process. Its port stays bound, so it is handed to nobody else, and
+/// never listens, so a connection to it is refused at once. (A port that is
+/// only picked and released can be given to a listener of another test, in
+/// this process or another one, before the gateway connects to it.)
 fn unreachable_backend_url() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    format!("http://127.0.0.1:{port}")
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = socket.local_addr().unwrap();
+    // Refused, and immediately: neither accepted nor left to time out.
+    let refused = std::net::TcpStream::connect(address).unwrap_err();
+    assert_eq!(refused.kind(), std::io::ErrorKind::ConnectionRefused);
+    // Never closed: no test holds a value to tie the socket's life to.
+    std::mem::forget(socket);
+    format!("http://{address}")
 }
 
 /// Poll `ready` until it holds, for at most `secs` seconds.
@@ -1925,6 +1938,7 @@ async fn per_model_series_carry_a_model_label_in_list_mode_and_none_for_a_single
         "inference_proxy_completed_requests_total",
         "inference_proxy_input_tokens",
         "inference_proxy_request_duration_seconds",
+        LIST_ONLY,
     ];
     let mut labelled = 0;
     let mut stripped = BTreeSet::new();
@@ -1940,8 +1954,688 @@ async fn per_model_series_carry_a_model_label_in_list_mode_and_none_for_a_single
     // and only a list starts one for a one-backend tier.)
     let on_a_timer = |series: &String| series.starts_with("backend_pool_");
     stripped.retain(|series| !on_a_timer(series));
+    // (The per-model response and stream-error counters exist for a list
+    // only: a single model must have none of them, which the equality below
+    // then says.)
+    assert!(stripped.iter().any(|series| series.starts_with(LIST_ONLY)));
+    stripped.retain(|series| !series.starts_with(LIST_ONLY));
     let single: BTreeSet<String> = single.into_iter().filter(|s| !on_a_timer(s)).collect();
     assert_eq!(stripped, single);
+}
+
+// ---------------------------------------------------------------------------
+// Responses and failed streams per model (list mode only)
+// ---------------------------------------------------------------------------
+
+/// What the two list-only series start with.
+const LIST_ONLY: &str = "inference_proxy_model_";
+const MODEL_REQUESTS: &str = "inference_proxy_model_requests_total";
+const MODEL_STREAM_ERRORS: &str = "inference_proxy_model_stream_errors_total";
+const DELTA: &str = "example/delta";
+const CHAT: &str = routes::ROUTE_CHAT_COMPLETIONS;
+const TEXT: &str = routes::ROUTE_COMPLETIONS;
+
+const FIRST_EVENT: &str = "data: {\"id\":\"chatcmpl-s\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\n";
+
+/// An engine that starts generating and then reports an error on its 200.
+const STREAM_WITH_AN_ERROR_EVENT: &str = concat!(
+    "data: {\"id\":\"chatcmpl-s\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+    "data: {\"error\":{\"message\":\"engine failure\",\"type\":\"internal_error\",\"code\":500}}\n\n",
+    "data: [DONE]\n\n",
+);
+
+/// Every sample of the counter `name` in a rendering: its labels and value.
+fn samples(rendered: &str, name: &str) -> BTreeSet<String> {
+    rendered
+        .lines()
+        .filter_map(|line| line.strip_prefix(name))
+        .filter(|sample| sample.starts_with('{'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The sample that says `model` answered `count` requests on `route` with
+/// `status`.
+fn responses(route: &str, status: u16, model: &str, count: u32) -> String {
+    format!("{{endpoint=\"{route}\",status=\"{status}\",model=\"{model}\"}} {count}")
+}
+
+/// The sample that says `count` of `model`'s streams on `route` failed after
+/// their 200.
+fn stream_errors(route: &str, model: &str, count: u32) -> String {
+    format!("{{endpoint=\"{route}\",model=\"{model}\"}} {count}")
+}
+
+/// The samples of `name` once they are `expected`, or what they still were
+/// after five seconds. (A stream's task finishes its bookkeeping after the
+/// client has its last byte.)
+async fn samples_when(
+    handle: &PrometheusHandle,
+    name: &str,
+    expected: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut seen = samples(&handle.render(), name);
+    for _ in 0..250 {
+        if &seen == expected {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        seen = samples(&handle.render(), name);
+    }
+    seen
+}
+
+/// A request for `model` on `route` from the operator's config token.
+fn request_for(route: &str, model: &str, stream: bool) -> Request<Body> {
+    let mut body = body_for(Some(json!(model)));
+    body["stream"] = json!(stream);
+    post(route, Some("test-token"), &body)
+}
+
+fn sse(body: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200)
+        .insert_header("content-type", "text/event-stream")
+        .set_body_string(body)
+}
+
+/// Read a streamed body to its end: what arrived, and whether it ended in an
+/// error instead of a clean end.
+async fn drain(response: axum::response::Response) -> (String, bool) {
+    let mut body = response.into_body();
+    let mut text = String::new();
+    while let Some(frame) = body.frame().await {
+        match frame {
+            Ok(frame) => {
+                if let Ok(data) = frame.into_data() {
+                    text.push_str(&String::from_utf8_lossy(&data));
+                }
+            }
+            Err(_) => return (text, true),
+        }
+    }
+    (text, false)
+}
+
+/// What `interrupted_stream_backend` does once its 200 and first event are out.
+#[derive(Clone, Copy)]
+enum Then {
+    /// Goes silent and keeps the connection open.
+    Stall,
+    /// Closes the connection in the middle of the body.
+    Cut,
+}
+
+/// A backend that answers every request `200 text/event-stream` with one
+/// event and then stalls or cuts the connection. wiremock sends whole bodies,
+/// so it can do neither.
+async fn interrupted_stream_backend(then: Then) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                // The whole request, so that closing the socket below is a
+                // clean end of the connection and not a reset.
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 8192];
+                loop {
+                    match socket.read(&mut buffer).await {
+                        Ok(read) if read > 0 => request.extend_from_slice(&buffer[..read]),
+                        _ => return,
+                    }
+                    let Some(head) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let length = String::from_utf8_lossy(&request[..head])
+                        .to_ascii_lowercase()
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:")?.trim().parse().ok())
+                        .unwrap_or(0_usize);
+                    if request.len() >= head + 4 + length {
+                        break;
+                    }
+                }
+                let start = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                     transfer-encoding: chunked\r\n\r\n{:X}\r\n{FIRST_EVENT}\r\n",
+                    FIRST_EVENT.len()
+                );
+                if socket.write_all(start.as_bytes()).await.is_err() {
+                    return;
+                }
+                match then {
+                    Then::Stall => tokio::time::sleep(Duration::from_secs(60)).await,
+                    // Long enough for the first event to be read as one.
+                    Then::Cut => tokio::time::sleep(Duration::from_millis(100)).await,
+                }
+                // Dropping the socket ends the chunked body without its
+                // terminating chunk.
+            });
+        }
+    });
+    format!("http://{address}")
+}
+
+#[tokio::test]
+async fn every_response_is_counted_once_under_its_model_route_and_status() {
+    // alpha answers; beta's engine fails; gamma's backend is down; delta's
+    // never answers in time.
+    let alpha = MockServer::start().await;
+    mount_completions(&alpha, CHAT, 2).await;
+    mount_completions(&alpha, TEXT, 1).await;
+    let beta = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+            "error": {"message": "engine failure", "type": "internal_error"}
+        })))
+        .expect(2)
+        .mount(&beta)
+        .await;
+    let delta = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(completion_json())
+                .set_delay(Duration::from_secs(30)),
+        )
+        .mount(&delta)
+        .await;
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let gateway = start_list(
+        &json!({"models": [
+            {"id": ALPHA, "backend_urls": [alpha.uri()], "admission_max_inflight": 1},
+            {"id": BETA, "backend_urls": [beta.uri()]},
+            {"id": GAMMA, "backend_urls": [unreachable_backend_url()]},
+            {"id": DELTA, "backend_urls": [delta.uri()]}
+        ]}),
+        &[
+            ("VLLM_PROXY_TIMEOUT_SECS", "1"),
+            ("VLLM_PROXY_MAX_REQUEST_SIZE", "4096"),
+        ],
+        Some(handle.clone()),
+    );
+    let status_of = |request: Request<Body>| {
+        let app = gateway.app.clone();
+        async move { app.oneshot(request).await.unwrap().status() }
+    };
+
+    // 200. Twice on one route and once on the other, so a count on the wrong
+    // route or a count shared between routes shows.
+    for route in [CHAT, CHAT, TEXT] {
+        let status = status_of(request_for(route, ALPHA, false)).await;
+        assert_eq!(status, StatusCode::OK, "{route}");
+    }
+    // 429: alpha's whole budget is in flight, so the gateway refuses.
+    let alpha_model = gateway.model(ALPHA);
+    let held = alpha_model
+        .admission
+        .try_admit(&alpha_model.backend_pool, None)
+        .unwrap()
+        .expect("admission is on");
+    for route in [CHAT, TEXT, TEXT] {
+        let status = status_of(request_for(route, ALPHA, false)).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{route}");
+    }
+    drop(held);
+    for route in ROUTES {
+        // An engine's own 5xx goes out with the status it came with.
+        let status = status_of(request_for(route, BETA, false)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{route}");
+        // No backend to connect to: the gateway's 502.
+        let status = status_of(request_for(route, GAMMA, false)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{route}");
+        // No answer within the request timeout: the gateway's 504.
+        let status = status_of(request_for(route, DELTA, false)).await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{route}");
+    }
+
+    // Not counted, on either route: a model that is not configured or not
+    // named (404), and everything refused before the model is read — no
+    // valid key (401), a body over the limit (413), a body that is not JSON
+    // (400).
+    for route in ROUTES {
+        for model in [
+            Some(json!("example/unknown")),
+            Some(json!("Example/Alpha")),
+            None,
+        ] {
+            let request = post(route, Some("test-token"), &body_for(model));
+            assert_model_not_found(gateway.app.clone().oneshot(request).await.unwrap()).await;
+        }
+        let no_key = post(route, None, &body_for(Some(json!(ALPHA))));
+        assert_eq!(status_of(no_key).await, StatusCode::UNAUTHORIZED);
+        let too_large = sized(route, "test-token", ALPHA, 8_192);
+        assert_eq!(status_of(too_large).await, StatusCode::PAYLOAD_TOO_LARGE);
+        let not_json = Request::builder()
+            .method("POST")
+            .uri(route)
+            .header("authorization", "Bearer test-token")
+            .body(Body::from("not json"))
+            .unwrap();
+        assert_eq!(status_of(not_json).await, StatusCode::BAD_REQUEST);
+    }
+
+    // Each response once, under the configured id of its own model, its
+    // route and the status that went out — and nothing else: no model has a
+    // sample for a status it did not send, and no caller's string is a label.
+    let rendered = handle.render();
+    let expected = BTreeSet::from([
+        responses(CHAT, 200, ALPHA, 2),
+        responses(TEXT, 200, ALPHA, 1),
+        responses(CHAT, 429, ALPHA, 1),
+        responses(TEXT, 429, ALPHA, 2),
+        responses(CHAT, 500, BETA, 1),
+        responses(TEXT, 500, BETA, 1),
+        responses(CHAT, 502, GAMMA, 1),
+        responses(TEXT, 502, GAMMA, 1),
+        responses(CHAT, 504, DELTA, 1),
+        responses(TEXT, 504, DELTA, 1),
+    ]);
+    assert_eq!(samples(&rendered, MODEL_REQUESTS), expected, "{rendered}");
+    assert!(!rendered.contains(MODEL_STREAM_ERRORS), "{rendered}");
+    for requested in ["example/unknown", "Example/Alpha"] {
+        assert!(!rendered.contains(requested), "{rendered}");
+    }
+    alpha.verify().await;
+    beta.verify().await;
+}
+
+#[tokio::test]
+async fn the_gateways_own_refusals_are_counted_under_the_model_they_refused() {
+    // alpha's engine is slow to its first token. beta's long-context tier is
+    // down and strict, so an oversized prompt has nowhere to go.
+    let alpha = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(sse(ONE_TOKEN_STREAM).set_delay(Duration::from_secs(30)))
+        .mount(&alpha)
+        .await;
+    let beta = MockServer::start().await;
+    expect_untouched(&beta).await;
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let gateway = start_list(
+        &json!({"models": [
+            {"id": ALPHA, "backend_urls": [alpha.uri()]},
+            {"id": BETA, "backend_urls": [beta.uri()], "long_context": {
+                "backend_urls": [unreachable_backend_url()],
+                "above_tokens": 1000,
+                "strict": true
+            }}
+        ]}),
+        &[("VLLM_PROXY_FIRST_TOKEN_DEADLINE_MS", "300")],
+        Some(handle.clone()),
+    );
+    gateway.model(BETA).backend_pool.backends()[1]
+        .healthy
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    for route in ROUTES {
+        // A 429 instead of a 200 the caller would have cancelled.
+        let request = request_for(route, ALPHA, true);
+        let response = gateway.app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS, "{route}");
+        // A 503: the tier this prompt belongs on has no healthy backend.
+        let request = sized(route, "test-token", BETA, 4_000);
+        let response = gateway.app.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{route}"
+        );
+    }
+
+    let expected = BTreeSet::from([
+        responses(CHAT, 429, ALPHA, 1),
+        responses(TEXT, 429, ALPHA, 1),
+        responses(CHAT, 503, BETA, 1),
+        responses(TEXT, 503, BETA, 1),
+    ]);
+    assert_eq!(samples(&handle.render(), MODEL_REQUESTS), expected);
+    // A stream refused on its deadline never had a 200, so it did not fail
+    // after one: its task drops the upstream attempt and counts nothing.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let rendered = handle.render();
+    assert!(
+        rendered.contains("first_token_deadline_refusals_total{model=\"example/alpha\"} 2"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains(MODEL_STREAM_ERRORS), "{rendered}");
+    beta.verify().await;
+}
+
+#[tokio::test]
+async fn a_connection_fail_over_is_still_one_response() {
+    let live = MockServer::start().await;
+    for route in ROUTES {
+        mount_completions(&live, route, 1).await;
+    }
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let gateway = start_list(
+        &json!({"models": [
+            // The dead backend comes first: with nothing in flight the first
+            // request is placed on it.
+            {"id": ALPHA, "backend_urls": [unreachable_backend_url(), live.uri()]},
+            {"id": GAMMA, "backend_urls": [unreachable_backend_url()]}
+        ]}),
+        &[("VLLM_BACKEND_CONNECT_FAILOVER", "1")],
+        Some(handle.clone()),
+    );
+    for route in ROUTES {
+        // alpha: retried on its other backend the first time, placed there
+        // directly the second. One 200 either way.
+        let request = request_for(route, ALPHA, false);
+        let response = gateway.app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{route}");
+        // gamma has nowhere to fail over to: one 502.
+        let request = request_for(route, GAMMA, false);
+        let response = gateway.app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{route}");
+    }
+    let rendered = handle.render();
+    for expected in [
+        "backend_failover_total{outcome=\"retried\",model=\"example/alpha\"} 1",
+        "backend_failover_total{outcome=\"exhausted\",model=\"example/gamma\"} 2",
+    ] {
+        assert!(rendered.contains(expected), "{expected}: {rendered}");
+    }
+    let expected = BTreeSet::from([
+        responses(CHAT, 200, ALPHA, 1),
+        responses(TEXT, 200, ALPHA, 1),
+        responses(CHAT, 502, GAMMA, 1),
+        responses(TEXT, 502, GAMMA, 1),
+    ]);
+    assert_eq!(samples(&rendered, MODEL_REQUESTS), expected, "{rendered}");
+    live.verify().await;
+}
+
+#[tokio::test]
+async fn a_stream_that_fails_after_its_200_is_a_stream_error_of_its_model_and_still_a_200() {
+    // alpha's engine reports an error after its first event; beta's
+    // connection is cut in the middle of the body; gamma's stream is whole.
+    let alpha = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(sse(STREAM_WITH_AN_ERROR_EVENT))
+        .expect(2)
+        .mount(&alpha)
+        .await;
+    let beta = interrupted_stream_backend(Then::Cut).await;
+    let gamma = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(sse(ONE_TOKEN_STREAM))
+        .expect(2)
+        .mount(&gamma)
+        .await;
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let gateway = start_list(
+        &json!({"models": [
+            {"id": ALPHA, "backend_urls": [alpha.uri()]},
+            {"id": BETA, "backend_urls": [beta]},
+            {"id": GAMMA, "backend_urls": [gamma.uri()]}
+        ]}),
+        &[],
+        Some(handle.clone()),
+    );
+    for route in ROUTES {
+        for (id, cut) in [(ALPHA, false), (BETA, true), (GAMMA, false)] {
+            let request = request_for(route, id, true);
+            let response = gateway.app.clone().oneshot(request).await.unwrap();
+            // The status was sent before the stream failed.
+            assert_eq!(response.status(), StatusCode::OK, "{route} {id}");
+            let (body, errored) = drain(response).await;
+            assert!(body.contains("chatcmpl-s"), "{route} {id}: {body}");
+            assert_eq!(errored, cut, "{route} {id}: {body}");
+            assert_eq!(body.contains("engine failure"), id == ALPHA, "{body}");
+        }
+    }
+
+    // One stream error per failed stream, under its own model and route;
+    // gamma's whole streams are none.
+    let expected = BTreeSet::from([
+        stream_errors(CHAT, ALPHA, 1),
+        stream_errors(TEXT, ALPHA, 1),
+        stream_errors(CHAT, BETA, 1),
+        stream_errors(TEXT, BETA, 1),
+    ]);
+    let seen = samples_when(&handle, MODEL_STREAM_ERRORS, &expected).await;
+    assert_eq!(seen, expected, "{}", handle.render());
+    // And every one of them is a 200 in the response counter: that is the
+    // status its client was sent.
+    let expected: BTreeSet<String> = ROUTES
+        .into_iter()
+        .flat_map(|route| [ALPHA, BETA, GAMMA].map(|id| responses(route, 200, id, 1)))
+        .collect();
+    let rendered = handle.render();
+    assert_eq!(samples(&rendered, MODEL_REQUESTS), expected, "{rendered}");
+    alpha.verify().await;
+    gamma.verify().await;
+}
+
+#[tokio::test]
+async fn a_stalled_stream_and_a_failure_after_the_early_commit_are_stream_errors() {
+    // alpha's engine goes silent after its first event; beta's fails once the
+    // gateway has committed the 200 on its own; gamma's ends without `[DONE]`.
+    let alpha = interrupted_stream_backend(Then::Stall).await;
+    let beta = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .set_body_json(json!({
+                    "error": {"message": "engine failure", "type": "internal_error"}
+                }))
+                .set_delay(Duration::from_millis(800)),
+        )
+        .expect(2)
+        .mount(&beta)
+        .await;
+    let gamma = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(sse(FIRST_EVENT))
+        .expect(2)
+        .mount(&gamma)
+        .await;
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let gateway = start_list(
+        &json!({"models": [
+            {"id": ALPHA, "backend_urls": [alpha]},
+            {"id": BETA, "backend_urls": [beta.uri()]},
+            {"id": GAMMA, "backend_urls": [gamma.uri()]}
+        ]}),
+        &[
+            ("VLLM_PROXY_STREAM_IDLE_TIMEOUT_SECS", "1"),
+            ("VLLM_PROXY_STREAM_COMMIT_MS", "100"),
+        ],
+        Some(handle.clone()),
+    );
+    for route in ROUTES {
+        // The idle watchdog ends alpha's stream with a body error.
+        let request = request_for(route, ALPHA, true);
+        let response = gateway.app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{route}");
+        let (body, errored) = drain(response).await;
+        assert!(errored && body.contains("chatcmpl-s"), "{route}: {body}");
+
+        // beta's 500 arrives after the 200: it can only be an event.
+        let request = request_for(route, BETA, true);
+        let response = gateway.app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{route}");
+        let (body, errored) = drain(response).await;
+        assert!(
+            !errored && body.contains("engine failure"),
+            "{route}: {body}"
+        );
+        assert!(body.ends_with("data: [DONE]\n\n"), "{route}: {body}");
+
+        // With the watchdog on, an end without `[DONE]` is a body error too.
+        let request = request_for(route, GAMMA, true);
+        let response = gateway.app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{route}");
+        let (body, errored) = drain(response).await;
+        assert!(errored && body.contains("chatcmpl-s"), "{route}: {body}");
+    }
+
+    let expected: BTreeSet<String> = ROUTES
+        .into_iter()
+        .flat_map(|route| [ALPHA, BETA, GAMMA].map(|id| stream_errors(route, id, 1)))
+        .collect();
+    let seen = samples_when(&handle, MODEL_STREAM_ERRORS, &expected).await;
+    assert_eq!(seen, expected, "{}", handle.render());
+    let expected: BTreeSet<String> = ROUTES
+        .into_iter()
+        .flat_map(|route| [ALPHA, BETA, GAMMA].map(|id| responses(route, 200, id, 1)))
+        .collect();
+    let rendered = handle.render();
+    assert_eq!(samples(&rendered, MODEL_REQUESTS), expected, "{rendered}");
+    assert!(
+        rendered.contains("stream_late_upstream_errors_total 2"),
+        "{rendered}"
+    );
+    beta.verify().await;
+    gamma.verify().await;
+}
+
+#[tokio::test]
+async fn a_client_that_leaves_is_no_stream_error_and_is_counted_only_once_it_was_answered() {
+    // alpha's stream stalls after its first event; beta never answers.
+    let alpha = interrupted_stream_backend(Then::Stall).await;
+    let beta = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(sse(ONE_TOKEN_STREAM).set_delay(Duration::from_secs(30)))
+        .mount(&beta)
+        .await;
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let gateway = start_list(
+        &json!({"models": [
+            {"id": ALPHA, "backend_urls": [alpha]},
+            {"id": BETA, "backend_urls": [beta.uri()]}
+        ]}),
+        &[],
+        Some(handle.clone()),
+    );
+
+    for route in ROUTES {
+        // Answered with a 200, then gone in the middle of the stream.
+        let request = request_for(route, ALPHA, true);
+        let response = gateway.app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{route}");
+        let mut body = response.into_body();
+        let first = body.frame().await.expect("a first event").unwrap();
+        assert!(first.into_data().is_ok_and(|data| !data.is_empty()));
+        drop(body);
+
+        // Gone before any status was sent: beta's backend has the request,
+        // so its model was resolved, and the client hangs up.
+        for stream in [false, true] {
+            let sent = requests_to(&beta, route).await.len();
+            let request = request_for(route, BETA, stream);
+            let pending = tokio::spawn(gateway.app.clone().oneshot(request));
+            for _ in 0..250 {
+                if requests_to(&beta, route).await.len() > sent {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(requests_to(&beta, route).await.len(), sent + 1, "{route}");
+            pending.abort();
+            assert!(pending.await.unwrap_err().is_cancelled());
+        }
+    }
+
+    // Both kinds of departure reached the streaming tasks: alpha's two
+    // streams, and beta's two streaming requests.
+    eventually(5, "the disconnects to be seen", || {
+        handle
+            .render()
+            .contains("stream_client_disconnects_total 4")
+    })
+    .await;
+    let rendered = handle.render();
+    // alpha's 200s went out and are counted as such; beta's requests were
+    // never answered and are not counted at all.
+    let expected = BTreeSet::from([
+        responses(CHAT, 200, ALPHA, 1),
+        responses(TEXT, 200, ALPHA, 1),
+    ]);
+    assert_eq!(samples(&rendered, MODEL_REQUESTS), expected, "{rendered}");
+    // A client that left is not a failed stream.
+    assert!(!rendered.contains(MODEL_STREAM_ERRORS), "{rendered}");
+}
+
+#[tokio::test]
+async fn a_single_model_process_has_neither_per_model_response_series() {
+    let backend = MockServer::start().await;
+    mount_completions(&backend, CHAT, 1).await;
+    Mock::given(method("POST"))
+        .and(path(TEXT))
+        .respond_with(sse(STREAM_WITH_AN_ERROR_EVENT))
+        .expect(1)
+        .mount(&backend)
+        .await;
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let gateway = start_single(
+        &[
+            ("MODEL_NAME", ALPHA),
+            ("VLLM_BACKEND_URLS", &backend.uri()),
+            ("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", "1"),
+        ],
+        Some(handle.clone()),
+    );
+
+    // The traffic a list counts per model: a 200, a refusal at the budget,
+    // and a stream that fails after its 200.
+    let response = gateway.app.clone().oneshot(chat(ALPHA)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let held = gateway
+        .state
+        .admission
+        .try_admit(&gateway.state.backend_pool, None)
+        .unwrap()
+        .expect("admission is on");
+    let response = gateway.app.clone().oneshot(chat(ALPHA)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    drop(held);
+    let request = request_for(TEXT, ALPHA, true);
+    let response = gateway.app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let (body, _) = drain(response).await;
+    assert!(body.contains("engine failure"), "{body}");
+    eventually(5, "the failed stream to be seen", || {
+        handle
+            .render()
+            .contains("upstream_stream_error_events_total{phase=\"after_headers\"} 1")
+    })
+    .await;
+    backend.verify().await;
+
+    // All of it happened, and is counted where it always was ...
+    let rendered = handle.render();
+    for expected in [
+        "http_requests_total{method=\"POST\",endpoint=\"/v1/chat/completions\",status=\"200\"} 1",
+        "http_requests_total{method=\"POST\",endpoint=\"/v1/chat/completions\",status=\"429\"} 1",
+        "http_requests_total{method=\"POST\",endpoint=\"/v1/completions\",status=\"200\"} 1",
+        "admission_rejections_total{reason=\"budget\"} 1",
+    ] {
+        assert!(rendered.contains(expected), "{expected}: {rendered}");
+    }
+    // ... and in neither of the series a list adds, nor under any `model`.
+    assert!(!rendered.contains(LIST_ONLY), "{rendered}");
+    assert!(!rendered.contains("model=\""), "{rendered}");
 }
 
 // ---------------------------------------------------------------------------

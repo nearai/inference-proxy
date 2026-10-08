@@ -33,6 +33,7 @@ pub mod signing;
 pub mod startup_checks;
 pub mod tool_calls;
 pub mod types;
+pub mod usage_report;
 pub mod vllm_dp_affinity;
 
 pub use request_tracing::{request_id_middleware, RequestStart, TracingIds};
@@ -79,4 +80,8 @@ pub struct AppState {
     /// off): chat/completions go through `model_list::model_for`, and the
     /// routes that read them directly are not served.
     pub models: Option<Arc<model_list::ModelList>>,
+    /// Delivery of usage reports to cloud-api, off the request path
+    /// (`usage_report.rs`, `VLLM_PROXY_USAGE_REPORT_*`). One per process,
+    /// shared by every model of a list.
+    pub usage_report_delivery: Arc<usage_report::UsageReportDelivery>,
 }

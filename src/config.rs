@@ -102,6 +102,83 @@ pub(crate) fn validate_discount_to_user(discount: f64, raw: &str) -> anyhow::Res
     Ok((basis_points > 0.0).then_some(discount))
 }
 
+/// `VLLM_PROXY_USAGE_REPORT_*`: how usage reports are delivered to the
+/// billing API (`usage_report.rs`). With none of them set delivery is what it
+/// has always been: one attempt, 5 seconds, no cap on reports in flight,
+/// nothing awaited at shutdown. A value that cannot work fails startup: these
+/// settings decide whether usage is billed, so a typo must not be guessed at.
+fn usage_report_policy() -> anyhow::Result<crate::usage_report::UsageReportPolicy> {
+    use std::time::Duration;
+
+    const TIMEOUT: &str = "VLLM_PROXY_USAGE_REPORT_TIMEOUT_SECS";
+    const MAX_ATTEMPTS: &str = "VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS";
+    const INITIAL_BACKOFF: &str = "VLLM_PROXY_USAGE_REPORT_INITIAL_BACKOFF_MS";
+    const DEADLINE: &str = "VLLM_PROXY_USAGE_REPORT_DEADLINE_SECS";
+    const MAX_IN_FLIGHT: &str = "VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT";
+    const MAX_QUEUED: &str = "VLLM_PROXY_USAGE_REPORT_MAX_QUEUED";
+    const SHUTDOWN_DRAIN: &str = "VLLM_PROXY_USAGE_REPORT_SHUTDOWN_DRAIN_SECS";
+    const TIMEOUT_LIMIT_SECS: u64 = 300;
+    const MAX_ATTEMPTS_LIMIT: u32 = 10;
+    const MAX_IN_FLIGHT_LIMIT: usize = 1_000;
+    /// Each waiting report holds its serialized body and its ids, a
+    /// kilobyte or two, so this bounds the queue to a few hundred megabytes.
+    const MAX_QUEUED_LIMIT: usize = 100_000;
+    const SHUTDOWN_DRAIN_LIMIT_SECS: u64 = 600;
+
+    let default = crate::usage_report::UsageReportPolicy::default();
+    let default_timeout_secs = default.attempt_timeout.as_secs();
+    let timeout_secs: u64 = env_parse(TIMEOUT, default_timeout_secs)?;
+    let max_attempts: u32 = env_parse(MAX_ATTEMPTS, default.max_attempts)?;
+    let initial_backoff_ms: u64 =
+        env_parse(INITIAL_BACKOFF, default.initial_backoff.as_millis() as u64)?;
+    let deadline_secs: u64 = env_parse(DEADLINE, 0)?;
+    let max_in_flight: usize = env_parse(MAX_IN_FLIGHT, default.max_in_flight)?;
+    let max_queued: usize = env_parse(MAX_QUEUED, default.max_queued)?;
+    let shutdown_drain_secs: u64 = env_parse(SHUTDOWN_DRAIN, 0)?;
+
+    if !(1..=TIMEOUT_LIMIT_SECS).contains(&timeout_secs) {
+        anyhow::bail!("{TIMEOUT} must be between 1 and {TIMEOUT_LIMIT_SECS}");
+    }
+    if !(1..=MAX_ATTEMPTS_LIMIT).contains(&max_attempts) {
+        anyhow::bail!("{MAX_ATTEMPTS} must be between 1 and {MAX_ATTEMPTS_LIMIT}");
+    }
+    if max_attempts > 1 && initial_backoff_ms == 0 {
+        anyhow::bail!("{INITIAL_BACKOFF} must be at least 1 when {MAX_ATTEMPTS} is above 1");
+    }
+    if max_in_flight > MAX_IN_FLIGHT_LIMIT {
+        anyhow::bail!("{MAX_IN_FLIGHT} must be at most {MAX_IN_FLIGHT_LIMIT}");
+    }
+    // A report may outlive the 5 seconds it has always had only under a cap,
+    // with its bounded queue. Without one, an outage of the billing API
+    // would hold every report of that longer life in memory, each with a
+    // request open, and send them all again when it comes back.
+    if max_in_flight == 0 && (timeout_secs > default_timeout_secs || max_attempts > 1) {
+        anyhow::bail!(
+            "{TIMEOUT} above {default_timeout_secs} and {MAX_ATTEMPTS} above 1 require {MAX_IN_FLIGHT}: a report only gets more time under a cap on reports in flight, with a bounded queue behind it"
+        );
+    }
+    // The difference is all the time a report has to wait for a place and to
+    // back off: an attempt only starts while its whole timeout still fits.
+    if deadline_secs > 0 && deadline_secs <= timeout_secs {
+        anyhow::bail!("{DEADLINE} must be above {TIMEOUT}, or no attempt could ever start");
+    }
+    if !(1..=MAX_QUEUED_LIMIT).contains(&max_queued) {
+        anyhow::bail!("{MAX_QUEUED} must be between 1 and {MAX_QUEUED_LIMIT}");
+    }
+    if shutdown_drain_secs > SHUTDOWN_DRAIN_LIMIT_SECS {
+        anyhow::bail!("{SHUTDOWN_DRAIN} must be at most {SHUTDOWN_DRAIN_LIMIT_SECS}");
+    }
+    Ok(crate::usage_report::UsageReportPolicy {
+        attempt_timeout: Duration::from_secs(timeout_secs),
+        max_attempts,
+        initial_backoff: Duration::from_millis(initial_backoff_ms),
+        deadline: (deadline_secs > 0).then(|| Duration::from_secs(deadline_secs)),
+        max_in_flight,
+        max_queued,
+        shutdown_drain: Duration::from_secs(shutdown_drain_secs),
+    })
+}
+
 /// One model's admission numbers, as `check_admission` reads them.
 pub(crate) struct AdmissionKnobs {
     pub max_inflight: u32,
@@ -394,6 +471,12 @@ pub struct Config {
     /// usage reporting is skipped — cloud-api removed the legacy `Bearer sk-…`
     /// `/v1/usage` endpoint, so there is no fallback.
     pub cloud_api_usage_token: Option<String>,
+    /// How usage reports are delivered to cloud-api
+    /// (`VLLM_PROXY_USAGE_REPORT_*`, see `usage_report.rs`): per-attempt
+    /// timeout, retries, an overall deadline, a cap on reports in flight with
+    /// a bounded queue behind it, and a drain at shutdown. The default is one
+    /// attempt with a 5 second timeout and none of the rest.
+    pub usage_report: crate::usage_report::UsageReportPolicy,
 
     // Compose-manager attestation (deployment actions attestation)
     pub compose_manager_url: Option<String>,
@@ -1097,6 +1180,7 @@ impl Config {
             cloud_api_usage_token: env::var("CLOUD_API_USAGE_TOKEN")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            usage_report: usage_report_policy()?,
             compose_manager_url,
             gpu_evidence_delegate_url: env::var("GPU_EVIDENCE_DELEGATE_URL")
                 .ok()
@@ -1611,9 +1695,153 @@ mod tests {
             "VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS",
             "VLLM_BACKEND_TIER_STRICT",
             "LISTEN_ADDR",
-        ] {
+        ]
+        .into_iter()
+        .chain(USAGE_REPORT_ENV)
+        {
             env::remove_var(key);
         }
+    }
+
+    const USAGE_REPORT_ENV: [&str; 7] = [
+        "VLLM_PROXY_USAGE_REPORT_TIMEOUT_SECS",
+        "VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS",
+        "VLLM_PROXY_USAGE_REPORT_INITIAL_BACKOFF_MS",
+        "VLLM_PROXY_USAGE_REPORT_DEADLINE_SECS",
+        "VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT",
+        "VLLM_PROXY_USAGE_REPORT_MAX_QUEUED",
+        "VLLM_PROXY_USAGE_REPORT_SHUTDOWN_DRAIN_SECS",
+    ];
+
+    #[test]
+    fn test_usage_report_delivery_is_unchanged_without_its_settings() {
+        use std::time::Duration;
+        with_clean_env(&[("MODEL_NAME", "m"), ("TOKEN", "t")], &[], || {
+            let policy = Config::from_env().unwrap().usage_report;
+            assert_eq!(policy, crate::usage_report::UsageReportPolicy::default());
+            // One attempt, 5 seconds, no cap, no deadline, no drain: what a
+            // report got before any of this could be set.
+            assert_eq!(policy.attempt_timeout, Duration::from_secs(5));
+            assert_eq!(policy.max_attempts, 1);
+            assert_eq!(policy.max_in_flight, 0);
+            assert_eq!(policy.deadline, None);
+            assert_eq!(policy.shutdown_drain, Duration::ZERO);
+            // An empty value is an unset one.
+            for name in USAGE_REPORT_ENV {
+                env::set_var(name, " ");
+            }
+            assert_eq!(
+                Config::from_env().unwrap().usage_report,
+                crate::usage_report::UsageReportPolicy::default()
+            );
+            gateway_env_cleanup();
+        });
+    }
+
+    #[test]
+    fn test_usage_report_settings_parse_and_validate() {
+        use std::time::Duration;
+        const TIMEOUT: &str = "VLLM_PROXY_USAGE_REPORT_TIMEOUT_SECS";
+        const MAX_ATTEMPTS: &str = "VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS";
+        const INITIAL_BACKOFF: &str = "VLLM_PROXY_USAGE_REPORT_INITIAL_BACKOFF_MS";
+        const DEADLINE: &str = "VLLM_PROXY_USAGE_REPORT_DEADLINE_SECS";
+        const MAX_IN_FLIGHT: &str = "VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT";
+        const MAX_QUEUED: &str = "VLLM_PROXY_USAGE_REPORT_MAX_QUEUED";
+        const SHUTDOWN_DRAIN: &str = "VLLM_PROXY_USAGE_REPORT_SHUTDOWN_DRAIN_SECS";
+        // The settings docs/gateway-mode.md suggests for a lane.
+        let lane = [
+            (TIMEOUT, "30"),
+            (MAX_ATTEMPTS, "5"),
+            (DEADLINE, "300"),
+            (MAX_IN_FLIGHT, "8"),
+        ];
+        with_clean_env(&[("MODEL_NAME", "m"), ("TOKEN", "t")], &lane, || {
+            let policy = Config::from_env().unwrap().usage_report;
+            assert_eq!(
+                policy,
+                crate::usage_report::UsageReportPolicy {
+                    attempt_timeout: Duration::from_secs(30),
+                    max_attempts: 5,
+                    initial_backoff: Duration::from_millis(500),
+                    deadline: Some(Duration::from_secs(300)),
+                    max_in_flight: 8,
+                    max_queued: 10_000,
+                    shutdown_drain: Duration::ZERO,
+                }
+            );
+            env::set_var(INITIAL_BACKOFF, "250");
+            env::set_var(MAX_QUEUED, "2000");
+            env::set_var(SHUTDOWN_DRAIN, "20");
+            let policy = Config::from_env().unwrap().usage_report;
+            assert_eq!(policy.initial_backoff, Duration::from_millis(250));
+            assert_eq!(policy.max_queued, 2_000);
+            assert_eq!(policy.shutdown_drain, Duration::from_secs(20));
+
+            // What cannot work fails startup, naming the variable.
+            for (name, bad, restored) in [
+                (TIMEOUT, "0", "30"),
+                (TIMEOUT, "301", "30"),
+                (TIMEOUT, "soon", "30"),
+                (MAX_ATTEMPTS, "0", "5"),
+                (MAX_ATTEMPTS, "11", "5"),
+                (MAX_ATTEMPTS, "-1", "5"),
+                (INITIAL_BACKOFF, "0", "250"),
+                // Nothing would be left to wait or to back off in, and no
+                // attempt could start.
+                (DEADLINE, "30", "300"),
+                (DEADLINE, "29", "300"),
+                // More time for a report only under a cap, with its queue.
+                (MAX_IN_FLIGHT, "0", "8"),
+                (MAX_IN_FLIGHT, "", "8"),
+                (MAX_IN_FLIGHT, "1001", "8"),
+                (MAX_QUEUED, "0", "2000"),
+                (MAX_QUEUED, "100001", "2000"),
+                (SHUTDOWN_DRAIN, "601", "20"),
+            ] {
+                env::set_var(name, bad);
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains(name), "{name}={bad}: {err}");
+                env::set_var(name, restored);
+            }
+            assert!(Config::from_env().is_ok());
+
+            // Without a cap a report gets what it always got and no more:
+            // one attempt, and a timeout of 5 seconds at most.
+            env::set_var(MAX_IN_FLIGHT, "0");
+            env::set_var(MAX_ATTEMPTS, "1");
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(
+                err.contains(TIMEOUT) && err.contains(MAX_IN_FLIGHT),
+                "{err}"
+            );
+            env::set_var(TIMEOUT, "5");
+            env::set_var(MAX_ATTEMPTS, "2");
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(err.contains(MAX_IN_FLIGHT), "{err}");
+            env::set_var(MAX_ATTEMPTS, "1");
+            env::set_var(TIMEOUT, "3");
+            env::set_var(INITIAL_BACKOFF, "0");
+            env::set_var(DEADLINE, "0");
+            let policy = Config::from_env().unwrap().usage_report;
+            assert_eq!(policy.attempt_timeout, Duration::from_secs(3));
+            assert_eq!((policy.max_attempts, policy.max_in_flight), (1, 0));
+            assert_eq!(policy.deadline, None);
+            // And a cap alone is a policy too.
+            env::set_var(TIMEOUT, "");
+            env::set_var(MAX_IN_FLIGHT, "8");
+            let policy = Config::from_env().unwrap().usage_report;
+            assert_eq!(policy.attempt_timeout, Duration::from_secs(5));
+            assert_eq!((policy.max_attempts, policy.max_in_flight), (1, 8));
+            gateway_env_cleanup();
+        });
+
+        // One delivery per process: a model list takes the same settings.
+        with_model_list(&two_models(), &lane, || {
+            let config = Config::from_env().unwrap();
+            assert!(config.model_list.is_some());
+            assert_eq!(config.usage_report.max_in_flight, 8);
+            assert_eq!(config.usage_report.max_attempts, 5);
+        });
     }
 
     #[test]

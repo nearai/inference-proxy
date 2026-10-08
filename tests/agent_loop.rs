@@ -81,6 +81,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
         cloud_api_usage_token: Some("test-usage-token".to_string()),
+        usage_report: Default::default(),
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,
@@ -184,6 +185,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
 
     let state = AppState {
         models: None,
+        usage_report_delivery: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),

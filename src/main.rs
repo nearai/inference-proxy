@@ -6,7 +6,8 @@ use tracing::info;
 use vllm_proxy_rs::ohttp_gateway::OhttpGateway;
 use vllm_proxy_rs::{
     admission, attestation, backend_affinity, backend_pool, cache, config, engine_load, fusion,
-    metrics_middleware, model_list, routes, signing, startup_checks, vllm_dp_affinity, AppState,
+    metrics_middleware, model_list, routes, signing, startup_checks, usage_report,
+    vllm_dp_affinity, AppState,
 };
 
 /// DNS resolver that returns only IPv4 addresses.
@@ -322,6 +323,7 @@ async fn main() -> anyhow::Result<()> {
     // Build app state
     let model_name = config.model_name.clone();
     let state = AppState {
+        usage_report_delivery: usage_report::UsageReportDelivery::new(config.usage_report.clone()),
         config: Arc::new(config),
         signing: Arc::new(signing),
         cache: Arc::new(chat_cache),
@@ -421,6 +423,7 @@ async fn serve(state: AppState, listen_addr: &str, listen_port: u16) -> anyhow::
 
     // The routes for this state behind the rate limiter, the request id and
     // the HTTP metrics.
+    let usage_report_delivery = state.usage_report_delivery.clone();
     let app = routes::build_app(state);
 
     // Bind and serve
@@ -435,6 +438,11 @@ async fn serve(state: AppState, listen_addr: &str, listen_port: u16) -> anyhow::
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+
+    // The server has stopped. Give the usage reports still pending their
+    // time (`VLLM_PROXY_USAGE_REPORT_*`; by default nothing is awaited, as
+    // before).
+    let _ = usage_report_delivery.drain_at_shutdown().await;
 
     info!("Server shut down");
     Ok(())

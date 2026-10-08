@@ -75,6 +75,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
         cloud_api_usage_token: Some("test-usage-token".to_string()),
+        usage_report: Default::default(),
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,
@@ -181,6 +182,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
 
     let state = AppState {
         models: None,
+        usage_report_delivery: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),

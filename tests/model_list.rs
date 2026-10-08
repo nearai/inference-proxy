@@ -208,6 +208,7 @@ fn single_model_state(process: model_list::Process<'_>) -> AppState {
         fusion_caches: Arc::new(fusion::FusionCaches::default()),
         vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(None, 1_200)),
         models: None,
+        usage_report_delivery: usage_report::UsageReportDelivery::new(config.usage_report.clone()),
         config,
     }
 }
@@ -2567,4 +2568,275 @@ async fn the_binary_serves_a_model_list() {
     }
     alpha.verify().await;
     beta.verify().await;
+}
+
+// ---------------------------------------------------------------------------
+// Usage report delivery (`VLLM_PROXY_USAGE_REPORT_*`)
+// ---------------------------------------------------------------------------
+
+/// The delivery series follow the rule of the usage-report series that were
+/// there before them: `model` in list mode, no such label for one model.
+#[tokio::test]
+async fn usage_report_delivery_series_carry_the_model_label_in_list_mode_only() {
+    let lane = [
+        ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+        ("VLLM_PROXY_USAGE_REPORT_TIMEOUT_SECS", "30"),
+        ("VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS", "5"),
+        ("VLLM_PROXY_USAGE_REPORT_DEADLINE_SECS", "300"),
+        ("VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT", "8"),
+    ];
+    for listed in [false, true] {
+        let backend = MockServer::start().await;
+        mount_completions(&backend, routes::ROUTE_CHAT_COMPLETIONS, 1).await;
+        let cloud = cloud_api("sk-live-customer").await;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let (backend_url, cloud_url) = (backend.uri(), cloud.uri());
+        let mut env = lane.to_vec();
+        env.push(("CLOUD_API_URL", cloud_url.as_str()));
+        let gateway = if listed {
+            start_list(
+                &json!({"models": [{"id": ALPHA, "backend_urls": [backend_url]}]}),
+                &env,
+                Some(recorder.handle()),
+            )
+        } else {
+            env.extend([
+                ("MODEL_NAME", ALPHA),
+                ("VLLM_BACKEND_URLS", backend_url.as_str()),
+            ]);
+            start_single(&env, Some(recorder.handle()))
+        };
+        // One delivery for the process, with the settings of its environment.
+        let policy = gateway.state.usage_report_delivery.policy();
+        assert_eq!(policy, &gateway.state.config.usage_report);
+        assert_eq!((policy.max_attempts, policy.max_in_flight), (5, 8));
+
+        let customer = post(
+            routes::ROUTE_CHAT_COMPLETIONS,
+            Some("sk-live-customer"),
+            &body_for(Some(json!(ALPHA))),
+        );
+        let response = gateway.app.clone().oneshot(customer).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        json_body(response).await;
+        let drained = gateway
+            .state
+            .usage_report_delivery
+            .drain(Duration::from_secs(30))
+            .await;
+        assert_eq!(drained.left(), 0);
+        assert_eq!(usage_reports(&cloud, 1).await.len(), 1);
+
+        let response = gateway
+            .app
+            .clone()
+            .oneshot(get(routes::ROUTE_METRICS))
+            .await
+            .unwrap();
+        let rendered = text_body(response).await;
+        let usage: Vec<String> = series(&rendered)
+            .into_iter()
+            .filter(|series| series.starts_with("inference_proxy_usage_report"))
+            .collect();
+        for family in [
+            "inference_proxy_usage_reports_total{outcome=\"accepted\"",
+            "inference_proxy_usage_report_duration_seconds_count{outcome=\"accepted\"",
+            "inference_proxy_usage_report_attempts_total{outcome=\"accepted\"",
+            "inference_proxy_usage_report_time_to_accepted_seconds_count",
+            "inference_proxy_usage_reports_in_flight",
+        ] {
+            assert!(
+                usage.iter().any(|series| series.starts_with(family)),
+                "{family} missing: {usage:#?}"
+            );
+        }
+        for series in &usage {
+            let (_, had_model) = without_model(series);
+            assert_eq!(had_model, listed, "{series}");
+            assert_eq!(
+                series.contains("model=\"example/alpha\""),
+                listed,
+                "{series}"
+            );
+        }
+        backend.verify().await;
+    }
+}
+
+/// `main` at shutdown. With a drain time, a usage report the billing API has
+/// not answered yet is waited for after SIGTERM, and the process says so.
+/// With no usage-report setting it exits at once, as it always has.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_binary_waits_for_pending_usage_reports_at_shutdown_only_when_told_to() {
+    const ACCEPTED: &str = "Direct-key usage report accepted by Cloud API";
+    const RETRYING: &str = "Usage report attempt failed, retrying";
+    const DRAINED: &str = "Usage reports drained before shutdown";
+    for configured in [true, false] {
+        let backend = MockServer::start().await;
+        mount_completions(&backend, routes::ROUTE_CHAT_COMPLETIONS, 1).await;
+        // A cloud-api whose usage intake takes its time, after one failure
+        // for the process that retries.
+        let cloud = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/check_api_key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "valid": true,
+                "organization_id": "org",
+                "workspace_id": "ws",
+                "api_key_id": "k"
+            })))
+            .mount(&cloud)
+            .await;
+        if configured {
+            Mock::given(method("POST"))
+                .and(path("/v1/internal/usage"))
+                .respond_with(ResponseTemplate::new(503))
+                .up_to_n_times(1)
+                .mount(&cloud)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path("/v1/internal/usage"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(2_500)))
+            .mount(&cloud)
+            .await;
+        let (cloud_url, catalog_url) = (cloud.uri(), format!("{}/v1/models", cloud.uri()));
+        let mut env = vec![
+            ("CLOUD_API_URL", cloud_url.as_str()),
+            ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+            ("VLLM_PROXY_MODELS_DOCUMENT_URL", catalog_url.as_str()),
+        ];
+        if configured {
+            env.extend([
+                ("VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS", "3"),
+                ("VLLM_PROXY_USAGE_REPORT_INITIAL_BACKOFF_MS", "20"),
+                ("VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT", "4"),
+                ("VLLM_PROXY_USAGE_REPORT_SHUTDOWN_DRAIN_SECS", "30"),
+            ]);
+        }
+        let mut binary = Binary::start(
+            &json!({"models": [{"id": ALPHA, "backend_urls": [backend.uri()]}]}),
+            &env,
+        )
+        .await;
+
+        // A customer request is answered while its report is on its way.
+        {
+            let response = reqwest::Client::new()
+                .post(format!("{}{}", binary.base, routes::ROUTE_CHAT_COMPLETIONS))
+                .bearer_auth("sk-live-customer")
+                .json(&body_for(Some(json!(ALPHA))))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            response.bytes().await.unwrap();
+        }
+        // The attempt the intake is slow to answer is in flight: the first
+        // one, or the retry after the 503.
+        let attempts = if configured { 2 } else { 1 };
+        let reports = requests_to_eventually(&cloud, "/v1/internal/usage", attempts).await;
+        assert!(binary.logged(ACCEPTED).is_empty());
+
+        let terminated = std::process::Command::new("kill")
+            .args(["-TERM", &binary.child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(terminated.success());
+        let mut exit = None;
+        for _ in 0..600 {
+            exit = binary.child.try_wait().unwrap();
+            if exit.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(exit.expect("the process exits").success());
+
+        let log = binary.log();
+        let at = |message: &str| log.find(message);
+        assert_eq!(binary.logged("Server shut down").len(), 1, "{log}");
+        if configured {
+            // The retry carried the bytes of the first attempt.
+            assert_eq!(reports[0].body, reports[1].body);
+            // The report was accepted after the signal and before the exit.
+            let accepted = binary.logged(ACCEPTED);
+            assert_eq!(accepted.len(), 1, "{log}");
+            assert_eq!(accepted[0]["attempts"], 2);
+            // The line a report has always ended with keeps its log target.
+            let targets: Vec<Value> = log
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|line| line["fields"]["message"] == ACCEPTED)
+                .map(|mut line| line["target"].take())
+                .collect();
+            assert_eq!(targets, ["vllm_proxy_rs::proxy"]);
+            let drained = binary.logged(DRAINED);
+            assert_eq!(drained.len(), 1, "{log}");
+            assert_eq!(drained[0]["pending"], 1);
+            assert!(at("Shutdown signal received") < at(ACCEPTED), "{log}");
+            assert!(at(ACCEPTED) < at(DRAINED), "{log}");
+            assert!(at(DRAINED) < at("Server shut down"), "{log}");
+            assert_eq!(binary.logged("Usage report delivery configured").len(), 1);
+            // A failed attempt is logged with ids, labels and numbers only.
+            let retrying = binary.logged(RETRYING);
+            assert_eq!(retrying.len(), 1, "{log}");
+            let fields: BTreeSet<&str> = retrying[0]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                fields,
+                BTreeSet::from([
+                    "message",
+                    "request_id",
+                    "org_id",
+                    "workspace_id",
+                    "api_key_id",
+                    "model",
+                    "status",
+                    "duration_ms",
+                    "auth_path",
+                    "ingress_route",
+                    "outcome",
+                    "attempt",
+                    "max_attempts",
+                    "retry_in_ms",
+                ])
+            );
+            assert_eq!(retrying[0]["status"], "503 Service Unavailable");
+            assert_eq!(retrying[0]["outcome"], "http_5xx");
+        } else {
+            // Nothing was waited for and nothing new was said.
+            let accepted = binary.logged(ACCEPTED);
+            assert!(accepted.is_empty(), "{log}");
+            assert!(!log.contains("Usage reports"), "{log}");
+            assert!(!log.contains("Usage report delivery"), "{log}");
+        }
+        // No secret and nothing of the request's content in the log.
+        for unwanted in ["usage-secret", "sk-live-customer", "hello"] {
+            assert!(!log.contains(unwanted), "{unwanted} in the log");
+        }
+        backend.verify().await;
+    }
+}
+
+/// The requests `server` got on `route`, once there are `expected` of them.
+async fn requests_to_eventually(
+    server: &MockServer,
+    route: &str,
+    expected: usize,
+) -> Vec<wiremock::Request> {
+    for _ in 0..250 {
+        let requests = requests_to(server, route).await;
+        if requests.len() >= expected {
+            return requests;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("expected {expected} requests on {route}");
 }

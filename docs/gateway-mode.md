@@ -52,7 +52,10 @@ Repairs are counted by `json_schema_response_format_repaired_total{repair}`.
    dropped (the CVM proxy drops its engine connection, the engine aborts) and
    the usage observed so far is reported.
 6. `POST {CLOUD_API_URL}/v1/internal/usage` with the shared usage token,
-   idempotent on the provider completion id.
+   idempotent on the provider completion id. The report is handed over when
+   the request completes and sent off the request path: once, with a 5 s
+   timeout, unless `VLLM_PROXY_USAGE_REPORT_*` says otherwise (see
+   [Usage report delivery](#usage-report-delivery)).
 
 Nothing about request or response content is logged or stored at any hop.
 
@@ -99,6 +102,9 @@ to the current in-CVM behavior.
 | `VLLM_PROXY_REJECTED_CONTENT_PART_TYPES` | `video_url,input_audio,file` | Modalities this deployment does not serve → deterministic `400`. |
 | `VLLM_PROXY_MODELS_DOCUMENT_URL` / `VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE` | `https://cloud-api.near.ai/v1/models` / `150` | `GET /v1/models` serves cloud-api's entry for `MODEL_NAME` (pricing, modalities, `is_ready`, `openrouter.slug`) with `capacity` added: concurrency = `VLLM_PROXY_ADMISSION_MAX_INFLIGHT`, requests per minute = this value. One URL for inference and the listing; `is_ready` stays under cloud-api's catalog control (the kill switch). Source unreadable → the engine's list, as without the variable. |
 | `VLLM_PROXY_DISCOUNT_TO_USER` | unset (list price) | The lane's discount off the list price, a fraction in `[0, 1)` with at most four decimal places (`0.2` = 20 % off): published as `discount_to_user` on the models document entry (in place of any the source carries) and sent with every usage report, so cloud-api bills the price the aggregator shows; empty or `0` = none, an invalid value fails startup, and it requires `VLLM_PROXY_MODELS_DOCUMENT_URL`. While that source is unreadable, the engine list served instead carries the discount on every entry, and an engine answer that is not a model list becomes a 502 rather than going out without it. cloud-api refuses a report whose discount exceeds its `INTERNAL_USAGE_MAX_DISCOUNT` (default `0.5`), leaving that usage unbilled, so keep the value within it. |
+| `VLLM_PROXY_USAGE_REPORT_TIMEOUT_SECS` / `_MAX_ATTEMPTS` / `_DEADLINE_SECS` | `30` / `5` / `300` | How long one attempt at a usage report may take, how many attempts a report gets, and how long after its request it may still be sent (see [Usage report delivery](#usage-report-delivery)). Unset = one attempt of 5 s and no deadline, as in a CVM. |
+| `VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT` | `8` | Usage reports in flight at once; the others wait in a bounded in-memory queue (`_MAX_QUEUED`, default `10000`). Unset = no cap. Required for a timeout above 5 s or more than one attempt. |
+| `VLLM_PROXY_USAGE_REPORT_SHUTDOWN_DRAIN_SECS` | below the service's stop timeout | On SIGTERM, how long to wait for usage reports still queued or in flight before exiting. Unset = no wait. |
 | `VLLM_PROXY_REASONING_OFF_EFFORT` | `low` | What "no reasoning" means for GLM-5.3 Flash (see below). |
 | `VLLM_PROXY_SSE_KEEPALIVE_SECS` | `15` | `: keep-alive` SSE comments while the upstream is silent (long prefill/queueing), so intermediaries with read timeouts do not cancel. Off in CVMs: comments are not part of the signed bytes. |
 | `VLLM_PROXY_MAP_QUEUE_FULL_TO_429` | `1` | The engine's admission rejection (queue full, or a queued request displaced by a higher-priority one) becomes 429 with `Retry-After: 2` and type `overloaded`, the same shape as the gateway's own refusals: back-pressure, not an outage. Off in CVMs: cloud-api's peer fallback keys on the 503. |
@@ -413,7 +419,8 @@ back-pressure for the next admission decision
 `backend_tier_output_reserve_capped_total{tier}` (requests whose `max_tokens` counted only up to the reserve cap),
 `request_model_match_total{result}` (how the body's `model` compares with what
 the gateway serves, see [below](#before-switching-it-on)),
-plus the existing usage-report and upstream metrics.
+plus the existing usage-report and upstream metrics, and the delivery series
+of [Usage report delivery](#usage-report-delivery) once it is configured.
 
 ## Long-context tier
 
@@ -511,6 +518,109 @@ queueing" refusal. The consequences are deliberate:
   startup: those modes place their own backend requests, which no tier
   restriction reaches.
 
+## Usage report delivery
+
+Every request made with a customer key ends with one usage report to cloud-api
+(step 6 above). The report is handed over when the request completes and sent
+off the request path: nothing a client sees waits for it.
+
+With none of the settings below a report gets what it has always got: one
+attempt with a 5 s timeout, as many reports in flight as requests complete, and
+nothing awaited at shutdown. That is too little for a busy lane. cloud-api
+writes the usage of one organization one report at a time, about 17 a second,
+and a lane completes requests in waves. When 200 of them finish within a
+second, the last report waits about 12 s for its write. With one 5 s attempt
+the tail of every wave times out, and cloud-api abandons a write whose caller
+hung up, so that usage is never recorded. The reports of a wave are also all
+open at once, and each holds a database connection that cloud-api's key check
+then has to wait for.
+
+| Variable | Default | Lane value | Meaning |
+| --- | --- | --- | --- |
+| `VLLM_PROXY_USAGE_REPORT_TIMEOUT_SECS` | `5` | `30` | Timeout of one attempt (1 to 300). Above 5 requires `_MAX_IN_FLIGHT`. |
+| `VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS` | `1` | `5` | Attempts per report, the first one included; `1` = never retried, at most `10`. More than one requires `_MAX_IN_FLIGHT`. |
+| `VLLM_PROXY_USAGE_REPORT_INITIAL_BACKOFF_MS` | `500` | default | Backoff before the first retry; doubled for each later one, at most 30 s. |
+| `VLLM_PROXY_USAGE_REPORT_DEADLINE_SECS` | `0` (none) | `300` | How long after its request completed a report may still be sent. Above the timeout: the difference is the time a report has to wait and to back off. |
+| `VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT` | `0` (no cap) | `8` | Reports in flight at once, for the whole process (at most 1000). |
+| `VLLM_PROXY_USAGE_REPORT_MAX_QUEUED` | `10000` | default | Reports that may wait for a place when the cap is reached (1 to 100000). Unused without a cap. |
+| `VLLM_PROXY_USAGE_REPORT_SHUTDOWN_DRAIN_SECS` | `0` (no wait) | below the service's stop timeout | How long shutdown waits for pending reports (at most 600). |
+
+A value that cannot work fails startup. A report only gets more than the one
+5 s attempt it has always had under a cap, so whatever is configured, what the
+process holds while cloud-api is down stays bounded. Why the lane values: cloud-api drains
+about 17 reports a second however many are in flight, so a cap of 8 costs no
+throughput. A wave of 200 reports still clears in about 12 s (200 / 17), each
+request waits about half a second for its write (8 / 17), far inside the 30 s
+timeout, and this lane never holds more than 8 of cloud-api's connections, so
+it cannot starve the pool. Five attempts inside five minutes ride out a
+restart of cloud-api; past the deadline a report is dropped rather than sent
+late for ever.
+
+**Retries.** A timeout, a connection or transport error, a 5xx and a 429 are
+retried. Any other 4xx, and any other answer that is not a success, is final:
+cloud-api refused the report itself, and the same bytes would get the same
+answer. A retry sends the body of the first attempt byte for byte, with the
+same `x-request-id`, and cloud-api deduplicates on the completion id, so a
+report whose timed-out attempt was written after all is not billed twice. A
+report is sent by one task, one attempt at a time, never two at once. The
+backoff after attempt `n` is `INITIAL_BACKOFF_MS × 2^(n-1)`, at most 30 s: half
+of it fixed, the other half random, so the reports that failed together do not
+come back together. `Retry-After` is not read.
+
+**Cap and queue.** At most `MAX_IN_FLIGHT` reports hold a place at once. A
+report keeps its place while it backs off, so a struggling cloud-api gets
+fewer requests, not the same number a little later. The others wait in memory,
+oldest first, at most `MAX_QUEUED` of them. When the queue is full, a new
+report takes the place of the one that has waited longest: that one is
+dropped, logged with its ids and counted as `queue_full`. The oldest goes
+because it has the least time left before its deadline. The process never
+holds more than `MAX_IN_FLIGHT + MAX_QUEUED` reports, a kilobyte or two each,
+however long cloud-api is down.
+
+**Deadline.** Counted from the completion of the request. An attempt is only
+started while its whole timeout still fits before the deadline, so no attempt
+is cut short. A report that can no longer get one, because it waited too long
+for a place or because its next backoff would end too late, is dropped,
+logged and counted as `deadline`. Cutting attempts short instead would, with
+a backlog as old as the deadline, send every report with almost no time left
+and get none of them accepted. With the lane values a report can wait up to
+270 s for a place.
+
+**Shutdown.** On SIGTERM the server finishes the open requests as before, then
+waits up to `SHUTDOWN_DRAIN_SECS` for the reports still queued or in flight
+and logs `Usage reports drained before shutdown` or `Usage reports left
+undelivered at shutdown` with how many were pending and how many were left
+(the count, not the ids of the reports). The queue is in memory only: what is
+left at exit, and whatever a process held when it was killed, is lost.
+
+**Metrics.** `inference_proxy_usage_reports_total{outcome}` is still the final
+outcome of a report, one count per report: with retries the outcome of its
+last attempt, plus `queue_full` and `deadline_exceeded` for a report dropped
+before cloud-api answered it. `inference_proxy_usage_report_duration_seconds`
+is the duration of that last attempt. A process with any of the settings
+above also has:
+
+- `inference_proxy_usage_report_attempts_total{outcome}`: every attempt, by
+  what it met;
+- `inference_proxy_usage_report_retries_total{reason}`: retries by cause
+  (`timeout`, `connect_error`, `transport_error`, `http_5xx`, `http_429`);
+- `inference_proxy_usage_reports_dropped_total{reason}`: reports given up on,
+  that is usage not billed: `queue_full`, `deadline`, `attempts_exhausted`,
+  `rejected` (a final answer that is not a success);
+- `inference_proxy_usage_report_queue_depth` and
+  `inference_proxy_usage_reports_in_flight`: reports waiting for a place and
+  reports holding one;
+- `inference_proxy_usage_report_time_to_accepted_seconds`: from the completion
+  of the request to cloud-api's acceptance, waiting, backoff and every attempt
+  included.
+
+The counters and the histogram carry `auth_path` and `ingress_route`, like the
+two series that were there before. A process with none of the settings has
+none of these series and none of the extra log fields (`attempts`,
+`since_completion_ms`): its `/metrics` and its log lines are unchanged. Log
+lines carry ids only (request, organization, workspace, key, model), never a
+report's content.
+
 ## Several models in one gateway
 
 A gateway is model-scoped: `MODEL_NAME` is its billing key, it has one backend
@@ -541,9 +651,11 @@ only ever sent to that model's backends: not to another model's, and not to
 cloud-api.
 
 One per process, as before: the key check against cloud-api, the organization
-allowlist, the usage-report endpoint and token, the content policy, the models
-document source, the stream timings (keep-alive, commit window, error peek,
-first-token deadline) and the health-check timings. The remaining gateway
+allowlist, the usage-report endpoint and token and the delivery of the reports
+(`VLLM_PROXY_USAGE_REPORT_*`: one cap and one queue for all models, since they
+report to the same cloud-api), the content policy, the models document source,
+the stream timings (keep-alive, commit window, error peek, first-token
+deadline) and the health-check timings. The remaining gateway
 switches are process-level too and apply to every model:
 `VLLM_BACKEND_CONVERSATION_AFFINITY`, `VLLM_BACKEND_CONNECT_FAILOVER`,
 `VLLM_PROXY_MAP_QUEUE_FULL_TO_429`, `VLLM_BACKEND_HEALTH_PATH`,
@@ -786,7 +898,14 @@ id, as their last label:
   `request_estimated_prompt_tokens`;
 - `first_token_deadline_refusals_total`;
 - `inference_proxy_usage_reports_total`,
-  `inference_proxy_usage_report_duration_seconds`,
+  `inference_proxy_usage_report_duration_seconds` and the series of
+  [Usage report delivery](#usage-report-delivery)
+  (`inference_proxy_usage_report_attempts_total`,
+  `inference_proxy_usage_report_retries_total`,
+  `inference_proxy_usage_reports_dropped_total`,
+  `inference_proxy_usage_report_queue_depth`,
+  `inference_proxy_usage_reports_in_flight`,
+  `inference_proxy_usage_report_time_to_accepted_seconds`),
   `inference_proxy_completed_requests_total`,
   `inference_proxy_input_tokens_total`, `inference_proxy_input_tokens`,
   `inference_proxy_request_duration_seconds`.

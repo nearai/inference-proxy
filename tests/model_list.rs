@@ -1072,6 +1072,362 @@ async fn each_model_keeps_its_own_tier_and_reasoning_switch() {
     beta.verify().await;
 }
 
+// ---------------------------------------------------------------------------
+// Reasoning effort map (`reasoning_effort_map`)
+// ---------------------------------------------------------------------------
+
+/// An effort no map names and no engine knows: what a caller may write. It
+/// passes through, and must never show up in a label or a log line.
+const CALLER_EFFORT: &str = "caller-effort-sentinel";
+
+/// The request body the gateway sent `backend` last on `route`.
+async fn last_body(backend: &MockServer, route: &str) -> (Value, String) {
+    let request = requests_to(backend, route)
+        .await
+        .pop()
+        .expect("the backend was asked");
+    let raw = String::from_utf8(request.body.clone()).unwrap();
+    (serde_json::from_str(&raw).unwrap(), raw)
+}
+
+/// Whatever of `reasoning_effort` and `reasoning` a body carries, and
+/// nothing else of it.
+fn reasoning_of(body: &Value) -> Value {
+    let mut fields = serde_json::Map::new();
+    for key in ["reasoning_effort", "reasoning"] {
+        if let Some(value) = body.get(key) {
+            fields.insert(key.to_string(), value.clone());
+        }
+    }
+    Value::Object(fields)
+}
+
+/// Post `body` for `model` on `route` and return what its backend was sent.
+async fn sent_upstream(
+    gateway: &Gateway,
+    backend: &MockServer,
+    route: &str,
+    model: &str,
+    body: &Value,
+) -> (Value, String) {
+    let mut body = body.clone();
+    let stream = body["stream"] == true;
+    let content = if stream { STREAMED } else { "hello" };
+    body["model"] = json!(model);
+    body["messages"] = json!([{"role": "user", "content": content}]);
+    body["prompt"] = json!("hello");
+    let response = gateway
+        .app
+        .clone()
+        .oneshot(post(route, Some("test-token"), &body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{model} {body}");
+    if stream {
+        let (text, failed) = drain(response).await;
+        assert!(!failed && text.contains("[DONE]"), "{text}");
+    } else {
+        json_body(response).await;
+    }
+    last_body(backend, route).await
+}
+
+/// The message of a request its caller wants streamed (`sent_upstream`).
+const STREAMED: &str = "as a stream";
+
+/// A backend for the two routes that answers a caller's own stream as one.
+/// The gateway asks the engine for a stream either way, so the mock tells
+/// the two apart by the message.
+async fn reasoning_backend() -> MockServer {
+    let backend = MockServer::start().await;
+    for route in ROUTES {
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(|request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                if body["messages"][0]["content"] == STREAMED {
+                    sse(ONE_TOKEN_STREAM)
+                } else {
+                    ResponseTemplate::new(200).set_body_json(completion_json())
+                }
+            })
+            .mount(&backend)
+            .await;
+    }
+    backend
+}
+
+#[tokio::test]
+async fn a_mapped_effort_reaches_its_models_engine_as_the_target_and_no_other_model() {
+    let alpha = reasoning_backend().await;
+    let beta = reasoning_backend().await;
+    let cloud = cloud_api("sk-live-customer").await;
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let logs = Logs::default();
+    let _logs = logs.capture();
+    // alpha's engine knows `low`, `medium` and `xhigh`, and `low` is its "no
+    // reasoning". beta's takes every effort, with the default `none`.
+    let gateway = start_list(
+        &json!({"models": [
+            {
+                "id": ALPHA,
+                "backend_urls": [alpha.uri()],
+                "reasoning_off_effort": "low",
+                "reasoning_effort_map": {"high": "xhigh"},
+                "backend_token_env": "VLLM_BACKEND_TOKEN_ALPHA"
+            },
+            {
+                "id": BETA,
+                "backend_urls": [beta.uri()],
+                "backend_token_env": "VLLM_BACKEND_TOKEN_BETA"
+            }
+        ]}),
+        &[
+            ("CLOUD_API_URL", &cloud.uri()),
+            ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+            ("VLLM_BACKEND_TOKEN_ALPHA", "alpha-secret"),
+            ("VLLM_BACKEND_TOKEN_BETA", "beta-secret"),
+        ],
+        Some(handle.clone()),
+    );
+
+    // What a caller sends, what alpha's engine gets and what beta's gets.
+    let cases = [
+        // `high` in each request shape, and in both at once.
+        (
+            json!({"reasoning_effort": "high"}),
+            json!({"reasoning_effort": "xhigh"}),
+            json!({"reasoning_effort": "high"}),
+        ),
+        (
+            json!({"reasoning": {"effort": "high"}}),
+            json!({"reasoning_effort": "xhigh", "reasoning": {"effort": "xhigh"}}),
+            json!({"reasoning_effort": "high", "reasoning": {"effort": "high"}}),
+        ),
+        (
+            json!({"reasoning_effort": "high", "reasoning": {"effort": "high", "exclude": true}}),
+            json!({"reasoning_effort": "xhigh", "reasoning": {"effort": "xhigh", "exclude": true}}),
+            json!({"reasoning_effort": "high", "reasoning": {"effort": "high", "exclude": true}}),
+        ),
+        // A caller's own stream.
+        (
+            json!({"reasoning": {"effort": "high"}, "stream": true}),
+            json!({"reasoning_effort": "xhigh", "reasoning": {"effort": "xhigh"}}),
+            json!({"reasoning_effort": "high", "reasoning": {"effort": "high"}}),
+        ),
+        // Two different efforts: each field on its own.
+        (
+            json!({"reasoning_effort": "high", "reasoning": {"effort": "medium"}}),
+            json!({"reasoning_effort": "xhigh", "reasoning": {"effort": "medium"}}),
+            json!({"reasoning_effort": "high", "reasoning": {"effort": "medium"}}),
+        ),
+        (
+            json!({"reasoning_effort": "medium", "reasoning": {"effort": "high"}}),
+            json!({"reasoning_effort": "medium", "reasoning": {"effort": "xhigh"}}),
+            json!({"reasoning_effort": "medium", "reasoning": {"effort": "high"}}),
+        ),
+        // An effort the map does not name passes through, known or not.
+        (
+            json!({"reasoning_effort": "medium"}),
+            json!({"reasoning_effort": "medium"}),
+            json!({"reasoning_effort": "medium"}),
+        ),
+        (
+            json!({"reasoning": {"effort": "xhigh"}}),
+            json!({"reasoning_effort": "xhigh", "reasoning": {"effort": "xhigh"}}),
+            json!({"reasoning_effort": "xhigh", "reasoning": {"effort": "xhigh"}}),
+        ),
+        (
+            json!({"reasoning_effort": CALLER_EFFORT}),
+            json!({"reasoning_effort": CALLER_EFFORT}),
+            json!({"reasoning_effort": CALLER_EFFORT}),
+        ),
+        (
+            json!({"reasoning_effort": "HIGH", "reasoning": {"effort": "High"}}),
+            json!({"reasoning_effort": "HIGH", "reasoning": {"effort": "High"}}),
+            json!({"reasoning_effort": "HIGH", "reasoning": {"effort": "High"}}),
+        ),
+        // "Off" is still each model's off effort, however it is asked for.
+        (
+            json!({"reasoning": {"enabled": false}}),
+            json!({"reasoning_effort": "low", "reasoning": {"enabled": false, "effort": "low"}}),
+            json!({"reasoning_effort": "none", "reasoning": {"enabled": false, "effort": "none"}}),
+        ),
+        (
+            json!({"reasoning": {"enabled": false, "effort": "high"}}),
+            json!({"reasoning_effort": "low", "reasoning": {"enabled": false, "effort": "low"}}),
+            json!({"reasoning_effort": "none", "reasoning": {"enabled": false, "effort": "none"}}),
+        ),
+        (
+            json!({"reasoning_effort": "none"}),
+            json!({"reasoning_effort": "low"}),
+            json!({"reasoning_effort": "none"}),
+        ),
+        (
+            json!({"reasoning": {"effort": "minimal"}}),
+            json!({"reasoning_effort": "low", "reasoning": {"effort": "low"}}),
+            json!({"reasoning_effort": "none", "reasoning": {"effort": "none"}}),
+        ),
+        (
+            json!({"reasoning_effort": "minimal", "reasoning": {"effort": "high"}}),
+            json!({"reasoning_effort": "low", "reasoning": {"effort": "low"}}),
+            json!({"reasoning_effort": "none", "reasoning": {"effort": "none"}}),
+        ),
+        // No effort: none is added.
+        (json!({}), json!({}), json!({})),
+        (
+            json!({"reasoning": {"exclude": true}}),
+            json!({"reasoning": {"exclude": true}}),
+            json!({"reasoning": {"exclude": true}}),
+        ),
+    ];
+    for (sent, to_alpha, to_beta) in &cases {
+        let (body, raw) = sent_upstream(&gateway, &alpha, CHAT, ALPHA, sent).await;
+        assert_eq!(&reasoning_of(&body), to_alpha, "alpha, sent {sent}");
+        // Nowhere in what alpha's engine is sent, in whatever field.
+        assert!(!raw.contains("\"high\""), "alpha, sent {sent}: {raw}");
+        let (body, _) = sent_upstream(&gateway, &beta, CHAT, BETA, sent).await;
+        assert_eq!(&reasoning_of(&body), to_beta, "beta, sent {sent}");
+    }
+
+    // Text completions have no reasoning handling, with a map as without.
+    let text = json!({"reasoning_effort": "high", "reasoning": {"effort": "high"}});
+    for (backend, model) in [(&alpha, ALPHA), (&beta, BETA)] {
+        let (body, _) = sent_upstream(&gateway, backend, TEXT, model, &text).await;
+        assert_eq!(reasoning_of(&body), text, "{model}");
+    }
+
+    // The six requests the map changed, under alpha and the effort that was
+    // sent. Nothing for beta, and nothing a caller wrote.
+    let rendered = handle.render();
+    let mapped: Vec<&str> = rendered
+        .lines()
+        .filter(|line| line.starts_with("inference_proxy_model_reasoning_effort_mapped_total"))
+        .collect();
+    assert_eq!(
+        mapped,
+        ["inference_proxy_model_reasoning_effort_mapped_total{effort=\"xhigh\",model=\"example/alpha\"} 6"],
+        "{rendered}"
+    );
+    // The switch still counts what it applied, for both models together.
+    for kind in ["disabled", "off_effort", "effort"] {
+        assert!(
+            rendered.contains(&format!(
+                "reasoning_switch_applied_total{{kind=\"{kind}\"}}"
+            )),
+            "{kind}: {rendered}"
+        );
+    }
+    let captured = logs.contents();
+    for line in [
+        "reasoning_effort_map={\"high\": \"xhigh\"}",
+        "reasoning_effort_map={}",
+    ] {
+        assert!(captured.contains(line), "{line}: {captured}");
+    }
+    assert!(captured.contains("request completed"), "{captured}");
+    for written in [CALLER_EFFORT, "HIGH", "hello", STREAMED] {
+        assert!(!rendered.contains(written), "{written}: {rendered}");
+        assert!(!captured.contains(written), "{written}: {captured}");
+    }
+    // The only efforts in the log are the ones of the two startup lines.
+    assert_eq!(captured.matches("xhigh").count(), 1, "{captured}");
+}
+
+#[tokio::test]
+async fn a_single_model_process_sends_efforts_as_before_and_has_no_map_series() {
+    let cloud = cloud_api("sk-live-customer").await;
+    let cloud_url = cloud.uri();
+    // A gateway lane (a backend token: the reasoning switch is on), and a
+    // proxy as it runs in a CVM (none: the body goes out as it came).
+    let lane = vec![
+        ("VLLM_BACKEND_TOKEN", "backend-secret"),
+        ("CLOUD_API_URL", cloud_url.as_str()),
+        ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+    ];
+    for (env, is_lane) in [(lane, true), (vec![], false)] {
+        let backend = reasoning_backend().await;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let backend_url = backend.uri();
+        let mut vars = vec![
+            ("MODEL_NAME", ALPHA),
+            ("VLLM_BACKEND_URLS", backend_url.as_str()),
+        ];
+        vars.extend(env);
+        let gateway = start_single(&vars, Some(handle.clone()));
+        assert!(gateway.state.models.is_none());
+        assert!(gateway
+            .state
+            .config
+            .single_model()
+            .reasoning_effort_map
+            .is_empty());
+
+        // `high` reaches the engine as `high`, in both shapes.
+        let (body, _) = sent_upstream(
+            &gateway,
+            &backend,
+            CHAT,
+            ALPHA,
+            &json!({"reasoning_effort": "high"}),
+        )
+        .await;
+        assert_eq!(reasoning_of(&body), json!({"reasoning_effort": "high"}));
+        let (body, _) = sent_upstream(
+            &gateway,
+            &backend,
+            CHAT,
+            ALPHA,
+            &json!({"reasoning": {"effort": "high"}}),
+        )
+        .await;
+        let copied = json!({"reasoning_effort": "high", "reasoning": {"effort": "high"}});
+        let untouched = json!({"reasoning": {"effort": "high"}});
+        assert_eq!(
+            reasoning_of(&body),
+            if is_lane { copied } else { untouched },
+            "lane: {is_lane}"
+        );
+        // "Off" on the lane is the switch's, as it was.
+        let (body, _) = sent_upstream(
+            &gateway,
+            &backend,
+            CHAT,
+            ALPHA,
+            &json!({"reasoning": {"enabled": false}}),
+        )
+        .await;
+        let off =
+            json!({"reasoning_effort": "none", "reasoning": {"enabled": false, "effort": "none"}});
+        let untouched = json!({"reasoning": {"enabled": false}});
+        assert_eq!(
+            reasoning_of(&body),
+            if is_lane { off } else { untouched },
+            "lane: {is_lane}"
+        );
+
+        let rendered = handle.render();
+        assert!(
+            !rendered.contains("reasoning_effort_mapped"),
+            "lane: {is_lane}: {rendered}"
+        );
+        assert!(
+            !rendered.contains("model=\""),
+            "lane: {is_lane}: {rendered}"
+        );
+        assert_eq!(
+            rendered.contains("reasoning_switch_applied_total{kind=\"effort\"} 1")
+                && rendered.contains("reasoning_switch_applied_total{kind=\"disabled\"} 1"),
+            is_lane,
+            "{rendered}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_tier_is_strict_for_the_model_that_says_so_on_both_routes() {
     // alpha isolates its tiers, beta does not, gamma leaves it to the
@@ -3262,6 +3618,191 @@ async fn the_binary_serves_a_model_list() {
     }
     alpha.verify().await;
     beta.verify().await;
+}
+
+/// Start the binary with a list it must refuse, and return what it printed
+/// before it exited. One that comes up instead fails the test.
+async fn refused_at_startup(list: &Value, env: &[(&str, &str)]) -> String {
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let mut list_file = tempfile::NamedTempFile::new().unwrap();
+    list_file.write_all(list.to_string().as_bytes()).unwrap();
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_vllm-proxy-rs"))
+        .env_clear()
+        .envs([
+            ("TOKEN", "test-token"),
+            ("NON_TEE_DEPLOYMENT", "1"),
+            ("DEV", "1"),
+            ("GPU_NO_HW_MODE", "1"),
+            ("LISTEN_ADDR", "127.0.0.1"),
+            ("VLLM_PROXY_IMAGE_VALIDATION_DISABLED", "1"),
+            (
+                "VLLM_PROXY_MODELS_DOCUMENT_URL",
+                "http://catalog.invalid/v1/models",
+            ),
+        ])
+        .env("LISTEN_PORT", port.to_string())
+        .env(model_list::MODEL_LIST_FILE_ENV, list_file.path())
+        .envs(env.iter().copied())
+        .stdin(std::process::Stdio::null())
+        .stdout(log.reopen().unwrap())
+        .stderr(log.reopen().unwrap())
+        .spawn()
+        .expect("the binary starts");
+    for _ in 0..400 {
+        if let Some(status) = child.try_wait().unwrap() {
+            let printed = std::fs::read_to_string(log.path()).unwrap();
+            assert!(!status.success(), "{list}: {printed}");
+            return printed;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!("the binary did not refuse {list}");
+}
+
+/// `main` itself with a `reasoning_effort_map`: served as written, or not
+/// started at all.
+#[tokio::test]
+async fn the_binary_applies_a_reasoning_effort_map_and_refuses_one_it_cannot_serve() {
+    let alpha = MockServer::start().await;
+    mount_completions(&alpha, CHAT, 2).await;
+    let cloud = cloud_api("sk-live-customer").await;
+    let (alpha_url, cloud_url) = (alpha.uri(), cloud.uri());
+    let env = [
+        ("CLOUD_API_URL", cloud_url.as_str()),
+        ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+        ("VLLM_BACKEND_TOKEN_ALPHA", "alpha-secret"),
+    ];
+    let list = |extra: Value| {
+        let mut entry = json!({
+            "id": ALPHA,
+            "backend_urls": [alpha_url],
+            "backend_token_env": "VLLM_BACKEND_TOKEN_ALPHA"
+        });
+        entry
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        json!({"models": [entry, {"id": BETA, "backend_urls": ["http://beta.invalid"]}]})
+    };
+
+    for (extra, expected) in [
+        // A chain.
+        (
+            json!({"reasoning_effort_map": {"high": "xhigh", "xhigh": "max"}}),
+            "\"high\" becomes \"xhigh\", which is itself a key",
+        ),
+        // An empty key, an empty value.
+        (
+            json!({"reasoning_effort_map": {"": "xhigh"}}),
+            "every key and value must be 1 to 32 characters",
+        ),
+        (
+            json!({"reasoning_effort_map": {"high": ""}}),
+            "every key and value must be 1 to 32 characters",
+        ),
+        // Against the off handling: an off value as a key, the model's off
+        // effort as a key, an off value that is not the model's as a target.
+        (
+            json!({"reasoning_effort_map": {"none": "low"}}),
+            "\"none\" cannot be a key",
+        ),
+        (
+            json!({"reasoning_off_effort": "low", "reasoning_effort_map": {"low": "medium"}}),
+            "\"low\" cannot be a key: it is this model's `reasoning_off_effort`",
+        ),
+        (
+            json!({"reasoning_off_effort": "low", "reasoning_effort_map": {"high": "none"}}),
+            "\"high\" cannot become \"none\"",
+        ),
+        // Not an object of strings.
+        (
+            json!({"reasoning_effort_map": {"high": ["xhigh"]}}),
+            "not a valid model list",
+        ),
+    ] {
+        let printed = refused_at_startup(&list(extra.clone()), &env).await;
+        assert!(
+            printed.contains("VLLM_PROXY_MODEL_LIST_FILE (") && printed.contains(expected),
+            "{extra}: {printed}"
+        );
+        assert!(!printed.contains("Serving model"), "{extra}: {printed}");
+        assert!(!printed.contains("alpha-secret"), "{printed}");
+    }
+    // Nothing was asked of a backend by a process that did not start.
+    assert!(alpha.received_requests().await.unwrap().is_empty());
+
+    let binary = Binary::start(
+        &list(json!({
+            "reasoning_off_effort": "low",
+            "reasoning_effort_map": {"high": "xhigh"}
+        })),
+        &[
+            env[0],
+            env[1],
+            env[2],
+            (
+                "VLLM_PROXY_MODELS_DOCUMENT_URL",
+                "http://catalog.invalid/v1/models",
+            ),
+            ("HEALTH_CHECK_INTERVAL_SECS", "3600"),
+        ],
+    )
+    .await;
+    let client = reqwest::Client::new();
+    for reasoning in [
+        json!({"reasoning_effort": "high"}),
+        json!({"reasoning": {"effort": "high"}}),
+    ] {
+        let mut body = body_for(Some(json!(ALPHA)));
+        body.as_object_mut()
+            .unwrap()
+            .extend(reasoning.as_object().unwrap().clone());
+        let response = client
+            .post(format!("{}{CHAT}", binary.base))
+            .bearer_auth("test-token")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+    }
+    let sent = requests_to(&alpha, CHAT).await;
+    assert_eq!(sent.len(), 2);
+    for request in &sent {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["reasoning_effort"], "xhigh", "{body}");
+        assert!(
+            !String::from_utf8_lossy(&request.body).contains("\"high\""),
+            "{body}"
+        );
+    }
+    let body: Value = serde_json::from_slice(&sent[1].body).unwrap();
+    assert_eq!(body["reasoning"]["effort"], "xhigh", "{body}");
+
+    let rendered = client
+        .get(format!("{}{}", binary.base, routes::ROUTE_METRICS))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        rendered.contains(
+            "inference_proxy_model_reasoning_effort_mapped_total{effort=\"xhigh\",model=\"example/alpha\"} 2"
+        ),
+        "{rendered}"
+    );
+    let serving = binary.logged("Serving model");
+    assert_eq!(serving[0]["reasoning_effort_map"], r#"{"high": "xhigh"}"#);
+    assert_eq!(serving[1]["reasoning_effort_map"], "{}");
+    alpha.verify().await;
 }
 
 // ---------------------------------------------------------------------------

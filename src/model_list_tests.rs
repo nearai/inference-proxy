@@ -543,6 +543,258 @@ fn discount_priority_and_reasoning_effort_are_validated() {
     }
 }
 
+/// `one(extra)` with a backend token, which a model with a map needs.
+fn one_lane(extra: serde_json::Value) -> serde_json::Value {
+    let mut extra = extra;
+    extra["backend_token_env"] = serde_json::json!("VLLM_BACKEND_TOKEN_ALPHA");
+    one(extra)
+}
+
+#[test]
+fn a_reasoning_effort_map_is_read_from_the_entry_that_writes_one() {
+    // The documented example: alpha maps one effort, the others none.
+    let models = parse_list(documented_list()).unwrap();
+    assert_eq!(models[0].reasoning_effort_map.get("high"), Some("xhigh"));
+    assert_eq!(models[0].reasoning_effort_map.get("xhigh"), None);
+    assert_eq!(models[0].reasoning_effort_map.get("low"), None);
+    assert!(models[1].reasoning_effort_map.is_empty());
+    assert!(models[2].reasoning_effort_map.is_empty());
+    let printed = format!("{:?}", models[0]);
+    assert!(
+        printed.contains(r#"reasoning_effort_map: {"high": "xhigh"}"#),
+        "{printed}"
+    );
+
+    // Several efforts may share a target; an empty object, `null` and no key
+    // at all are a model without a map, token or not.
+    let models = parse_list(one_lane(serde_json::json!({
+        "reasoning_effort_map": {"high": "xhigh", "max": "xhigh", "medium": "low"}
+    })))
+    .unwrap();
+    let map = &models[0].reasoning_effort_map;
+    assert_eq!(
+        [map.get("high"), map.get("max"), map.get("medium")],
+        [Some("xhigh"), Some("xhigh"), Some("low")]
+    );
+    for extra in [
+        serde_json::json!({"reasoning_effort_map": {}}),
+        serde_json::json!({"reasoning_effort_map": null}),
+        serde_json::json!({}),
+    ] {
+        let models = parse_list(one(extra.clone())).unwrap();
+        assert!(models[0].reasoning_effort_map.is_empty(), "{extra}");
+    }
+}
+
+#[test]
+fn a_reasoning_effort_map_of_another_shape_is_refused() {
+    for map in [
+        serde_json::json!("high=xhigh"),
+        serde_json::json!(["high", "xhigh"]),
+        serde_json::json!([{"high": "xhigh"}]),
+        serde_json::json!({"high": 1}),
+        serde_json::json!({"high": null}),
+        serde_json::json!({"high": ["xhigh"]}),
+        serde_json::json!({"high": {"effort": "xhigh"}}),
+        serde_json::json!(true),
+    ] {
+        let error = error_of(one_lane(serde_json::json!({"reasoning_effort_map": map})));
+        assert!(error.contains("not a valid model list"), "{map}: {error}");
+    }
+    // A key written twice is not settled by which one came last, and is
+    // refused like every other rule of the map, with the model named.
+    // (Written out: a `json!` object cannot hold it.)
+    let error = parse(
+        r#"{"models": [{
+            "id": "m",
+            "backend_urls": ["https://a.example"],
+            "backend_token_env": "VLLM_BACKEND_TOKEN_ALPHA",
+            "reasoning_effort_map": {"high": "xhigh", "high": "max"}
+        }]}"#,
+        &defaults(),
+        &process(),
+        &lookup,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("model \"m\": `reasoning_effort_map`: \"high\" is a key more than once"),
+        "{error}"
+    );
+    // It is a key of a model, not of its tier or of the file.
+    for list in [
+        tiered(
+            serde_json::json!({"reasoning_effort_map": {"high": "xhigh"}}),
+            serde_json::json!({}),
+        ),
+        serde_json::json!({
+            "models": [{"id": "m", "backend_urls": ["https://a.example"]}],
+            "reasoning_effort_map": {"high": "xhigh"}
+        }),
+    ] {
+        let error = error_of(list);
+        assert!(
+            error.contains("unknown field `reasoning_effort_map`"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn a_reasoning_effort_map_is_validated() {
+    for (map, expected) in [
+        // A chain: the result would depend on the order of two lookups.
+        (
+            serde_json::json!({"high": "xhigh", "xhigh": "max"}),
+            "\"high\" becomes \"xhigh\", which is itself a key",
+        ),
+        (
+            serde_json::json!({"high": "high"}),
+            "\"high\" becomes \"high\", which is itself a key",
+        ),
+        (
+            serde_json::json!({"": "xhigh"}),
+            "every key and value must be 1 to 32 characters",
+        ),
+        (
+            serde_json::json!({"high": ""}),
+            "every key and value must be 1 to 32 characters",
+        ),
+        (
+            serde_json::json!({"high": "x high"}),
+            "every key and value must be 1 to 32 characters",
+        ),
+        (
+            serde_json::json!({"high": "x".repeat(33)}),
+            "every key and value must be 1 to 32 characters",
+        ),
+        // The off values and the off effort belong to `reasoning_off_effort`
+        // (the built-in `none` here).
+        (
+            serde_json::json!({"none": "low"}),
+            "\"none\" cannot be a key",
+        ),
+        (
+            serde_json::json!({"minimal": "low"}),
+            "\"minimal\" cannot be a key",
+        ),
+        (
+            serde_json::json!({"high": "minimal"}),
+            "\"high\" cannot become \"minimal\"",
+        ),
+    ] {
+        let error = error_of(one_lane(
+            serde_json::json!({"reasoning_effort_map": map.clone()}),
+        ));
+        assert!(
+            error.contains("model \"m\": `reasoning_effort_map`") && error.contains(expected),
+            "{map}: {error}"
+        );
+    }
+    let too_many: serde_json::Map<String, serde_json::Value> = (0..17)
+        .map(|n| (format!("effort-{n}"), serde_json::json!("xhigh")))
+        .collect();
+    let error = error_of(one_lane(
+        serde_json::json!({"reasoning_effort_map": too_many}),
+    ));
+    assert!(error.contains("more than 16 entries"), "{error}");
+}
+
+#[test]
+fn a_reasoning_effort_map_is_checked_against_the_off_effort_the_model_resolves_to() {
+    let low_by_default = ModelDefaults {
+        reasoning_off_effort: "low".to_string(),
+        ..defaults()
+    };
+    let parsed = |extra: serde_json::Value, defaults: &ModelDefaults| {
+        parse_with(one_lane(extra), defaults, &process())
+            .map(|models| models[0].clone())
+            .map_err(|error| error.to_string())
+    };
+
+    // The entry's own off effort.
+    let error = parsed(
+        serde_json::json!({
+            "reasoning_off_effort": "low",
+            "reasoning_effort_map": {"low": "medium"}
+        }),
+        &defaults(),
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("\"low\" cannot be a key: it is this model's `reasoning_off_effort`"),
+        "{error}"
+    );
+    let error = parsed(
+        serde_json::json!({
+            "reasoning_off_effort": "low",
+            "reasoning_effort_map": {"high": "none"}
+        }),
+        &defaults(),
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("\"high\" cannot become \"none\"") && error.contains("(\"low\")"),
+        "{error}"
+    );
+
+    // The process-level one, for an entry that leaves it out ...
+    let error = parsed(
+        serde_json::json!({"reasoning_effort_map": {"low": "medium"}}),
+        &low_by_default,
+    )
+    .unwrap_err();
+    assert!(error.contains("\"low\" cannot be a key"), "{error}");
+    // ... and not for one that has its own: `low` is an effort like any
+    // other for this model, and `none` is its off effort.
+    let model = parsed(
+        serde_json::json!({
+            "reasoning_off_effort": "none",
+            "reasoning_effort_map": {"low": "medium", "max": "none"}
+        }),
+        &low_by_default,
+    )
+    .unwrap();
+    assert_eq!(model.reasoning_off_effort, "none");
+    assert_eq!(model.reasoning_effort_map.get("low"), Some("medium"));
+    assert_eq!(model.reasoning_effort_map.get("max"), Some("none"));
+    // The model's off effort as a target, when it is not an off value.
+    let model = parsed(
+        serde_json::json!({"reasoning_effort_map": {"medium": "low"}}),
+        &low_by_default,
+    )
+    .unwrap();
+    assert_eq!(model.reasoning_effort_map.get("medium"), Some("low"));
+}
+
+#[test]
+fn a_reasoning_effort_map_requires_a_backend_token() {
+    // The reasoning handling only runs for a model with a backend token, so
+    // a map without one would be configured and never applied.
+    let error = error_of(one(
+        serde_json::json!({"reasoning_effort_map": {"high": "xhigh"}}),
+    ));
+    assert!(
+        error.contains("model \"m\": `reasoning_effort_map` requires a backend token"),
+        "{error}"
+    );
+    // The model's own token or the process-level one.
+    parse_list(one_lane(
+        serde_json::json!({"reasoning_effort_map": {"high": "xhigh"}}),
+    ))
+    .unwrap();
+    let with_default_token = ModelDefaults {
+        backend_token: Some("shared-secret".to_string()),
+        ..defaults()
+    };
+    parse_with(
+        one(serde_json::json!({"reasoning_effort_map": {"high": "xhigh"}})),
+        &with_default_token,
+        &process(),
+    )
+    .unwrap();
+}
+
 #[test]
 fn a_token_variable_must_be_of_the_backend_token_family_and_set() {
     let error = error_of(one(

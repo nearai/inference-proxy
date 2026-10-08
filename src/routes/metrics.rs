@@ -113,10 +113,11 @@ async fn engine_list_with_discount(
 /// entries of the configured models kept, each completed with its own
 /// model's declared capacity and discount. A configured model the source does
 /// not list is left out — the source's catalog stays the switch for what is
-/// advertised — with a warning and a count. A source that cannot be read is a
-/// 502: there is no single engine list to fall back to, and a list assembled
-/// from some of the engines would advertise models at prices nothing vouches
-/// for.
+/// advertised — and counted on every read; the log line is written when a
+/// model drops out of the document and when it is back, not on every read of
+/// a route that is polled. A source that cannot be read is a 502: there is no
+/// single engine list to fall back to, and a list assembled from some of the
+/// engines would advertise models at prices nothing vouches for.
 async fn models_document_for_list(
     state: &AppState,
     models: &crate::model_list::ModelList,
@@ -164,13 +165,23 @@ async fn models_document_for_list(
         }
         true
     });
-    for model in models.iter().filter(|model| !listed.contains(model.id())) {
-        metrics::counter!("models_document_missing_models_total", "model" => model.id().to_string())
-            .increment(1);
-        tracing::warn!(
-            model = %model.id(),
-            "Configured model is not in the models document, leaving it out of /v1/models"
-        );
+    for model in models.iter() {
+        let is_listed = listed.contains(model.id());
+        if !is_listed {
+            metrics::counter!("models_document_missing_models_total", "model" => model.id().to_string())
+                .increment(1);
+        }
+        match (model.note_listed(is_listed), is_listed) {
+            (true, false) => tracing::warn!(
+                model = %model.id(),
+                "Configured model is not in the models document, leaving it out of /v1/models"
+            ),
+            (true, true) => tracing::info!(
+                model = %model.id(),
+                "Configured model is in the models document again"
+            ),
+            (false, _) => {}
+        }
     }
     Ok((StatusCode::OK, axum::Json(document)).into_response())
 }

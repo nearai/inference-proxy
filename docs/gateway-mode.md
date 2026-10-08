@@ -664,12 +664,20 @@ The rest of the environment in list mode:
 
 Anything wrong fails startup rather than serving a partial list: a file that
 cannot be read or is not valid, an empty list, an id listed twice, a model
-without backends, a URL that is not `http(s)`, a probe count that differs from
-the backend count, a `backend_token_env` that is not set, a backend or probe
-URL listed under two models (a backend serves one model), and every rule the
-variables are held to for one model — the admission and long-context tier
-rules above. Those are checked on what each entry resolves to, and their
-messages name the variable a key is named after, prefixed with the model.
+without backends, a URL that is not a plain `http(s)` base URL (no query, no
+fragment, no credentials), a probe count that differs from the backend count,
+a `backend_token_env` that is not set, a backend or probe listed under two
+models (a backend serves one model), and every rule the variables are held to
+for one model — the admission and long-context tier rules above. Those are
+checked on what each entry resolves to, and their messages name the variable a
+key is named after, prefixed with the model.
+
+Whether two URLs are the same backend is decided on where they point, not on
+how they are written: scheme, host (case-insensitive, with or without a
+trailing dot), effective port and normalised path. `https://HOST.example`,
+`https://host.example:443` and `https://host.example/v1/..` are one backend,
+under two models as well as in both tiers of one. Two names that resolve to
+the same host are still two backends as far as this check can tell.
 
 ### Requests
 
@@ -707,9 +715,11 @@ One read of the models document per request. The entries of the configured
 models are kept, in the document's order, each completed with its own model's
 `capacity` (its `admission_max_inflight` and `capacity_requests_per_minute`)
 and `discount_to_user`. A configured model the document does not list is left
-out, so the catalog stays the switch for what is advertised; it is logged
-("Configured model is not in the models document") and counted in
-`models_document_missing_models_total{model}`.
+out, so the catalog stays the switch for what is advertised. Every read it is
+missing from is counted in `models_document_missing_models_total{model}`; the
+log has one line when it drops out ("Configured model is not in the models
+document") and one when it is back ("… is in the models document again"), not
+one per read of a route that is polled.
 
 When the document cannot be read the answer is `502` with error type
 `models_document_unavailable`. There is no engine-list fallback in list mode
@@ -719,8 +729,21 @@ without the document would advertise models at prices nothing vouches for.
 ### `/healthz`
 
 `200` while at least one model has a healthy backend, `503` when none has. One
-model's outage does not take the process off its load balancer. The body keeps
-the single-model shape and adds one entry per model, in list order:
+model's outage does not take the process off its load balancer.
+
+The route is unauthenticated, and which models are configured is not for
+everyone: an unknown `model` is only answered after authentication so that the
+ids cannot be enumerated. So the body has the single-model shape and nothing
+else:
+
+```json
+{"status": "ok", "checks": {"dstack": "skipped", "backend": "ok"}}
+```
+
+`checks.backend` is `"ok"` exactly when the status is, `"unhealthy"` otherwise.
+
+A caller that presents the gateway's own config `TOKEN` as its bearer (the
+operator, deploy tooling) also gets one entry per model, in list order:
 
 ```json
 {
@@ -734,13 +757,14 @@ the single-model shape and adds one entry per model, in list order:
 }
 ```
 
-`checks.backend` is `"ok"` exactly when the status is, `"unhealthy"` otherwise.
-A model's `backend` is the token the single-model probe would report (`ok`,
-`unreachable`, `timeout`, `http_5xx`, …) for one backend picked from its pool,
-all models probed at once. A model whose pool already has no healthy backend
-reads `"unhealthy"` without being probed, so its dead hosts cannot make the
-answer slow for everyone. Deploy tooling that waits for every model should
-check each entry, not the status.
+Status code, `status` and `checks` are the same with and without the token; a
+customer key is not the token and gets the short body. A model's `backend` is
+the token the single-model probe would report (`ok`, `unreachable`, `timeout`,
+`http_5xx`, …) for one backend picked from its pool, all models probed at once.
+A model whose pool already has no healthy backend reads `"unhealthy"` without
+being probed, so its dead hosts cannot make the answer slow for everyone.
+Deploy tooling that waits for every model should send the token and check each
+entry, not the status.
 
 For that reason, and because a host taken out after a failed connect only comes
 back through a probe, list mode runs the pool health checker for every model,
@@ -778,7 +802,10 @@ the difference lives.
 
 Startup logs one "Serving model" line per model with its effective settings
 (the backend token only as `backend_token=true|false`) and a "Model list
-enabled" line with the settings every lane shares. The lane log lines of
+enabled" line with the settings every lane shares, the first-token deadline
+and connection fail-over included. The single-model startup lines about one
+model's token, tier, admission, health checker and attestation are not
+written. The lane log lines of
 `admission.rs`, the first-token refusal and the engine probe carry a `model`
 field in list mode and are unchanged without one.
 
@@ -795,10 +822,10 @@ request_model_match_total{result="exact" | "case_differs" | "other" | "missing"}
 
 `missing` is an absent `model` or one that is not a string. Nothing else
 changes: every request is served and billed as `MODEL_NAME`, as before. The
-counter exists only where `VLLM_BACKEND_TOKEN` is set, which is what marks a
-gateway lane; a proxy inside a CVM does not emit it. In list mode the same
-counter compares against the configured ids, and everything but `exact` is the
-`404` above. The requested name itself is the caller's string: it is never a
+counter exists only in a gateway lane, a process with `NON_TEE_DEPLOYMENT=1`
+and `VLLM_BACKEND_TOKEN`; a proxy inside a CVM does not emit it, with or
+without a backend token. In list mode the same counter compares against the
+configured ids, and everything but `exact` is the `404` above. The requested name itself is the caller's string: it is never a
 metric label and never in a log line.
 
 ## What is deliberately not offered here

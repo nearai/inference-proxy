@@ -653,6 +653,132 @@ fn a_backend_or_a_probe_belongs_to_one_model() {
 }
 
 #[test]
+fn one_backend_under_two_spellings_is_still_one_backend() {
+    let two = |a: &str, b: &str, key: &str| {
+        let mut model_a = serde_json::json!({"id": "a", "backend_urls": ["https://a.example"]});
+        let mut model_b = serde_json::json!({"id": "b", "backend_urls": ["https://b.example"]});
+        model_a[key] = serde_json::json!([a]);
+        model_b[key] = serde_json::json!([b]);
+        serde_json::json!({"models": [model_a, model_b]})
+    };
+    // The host in another case, the scheme's own port written out, a path
+    // that resolves to the same place, a trailing dot on the host, and an
+    // address written another way: one endpoint each.
+    let same = [
+        ("http://shared.example:8000", "http://SHARED.example:8000"),
+        ("https://shared.example", "https://shared.example:443"),
+        ("http://shared.example", "http://shared.example:80/"),
+        ("https://shared.example", "https://shared.example/v1/.."),
+        ("https://shared.example/v1", "https://shared.example/v1/./"),
+        ("https://shared.example", "https://shared.example."),
+        ("https://shared.example", "HTTPS://Shared.Example"),
+        ("http://127.0.0.1:8000", "http://127.1:8000"),
+    ];
+    for key in ["backend_urls", "backend_probe_urls"] {
+        let what = if key == "backend_urls" {
+            "backend URL"
+        } else {
+            "probe URL"
+        };
+        for (first, second) in same {
+            let error = error_of(two(first, second, key));
+            assert!(
+                error.contains(what)
+                    && error.contains(&format!("is the same endpoint as {first}"))
+                    && error.contains("is listed under both \"a\" and \"b\""),
+                "{first} / {second}: {error}"
+            );
+        }
+    }
+    // The long-context tier of one model against the base tier of another.
+    let error = error_of(serde_json::json!({"models": [
+        {
+            "id": "a",
+            "backend_urls": ["https://a.example"],
+            "long_context": {"backend_urls": ["https://Shared.example:443"], "above_tokens": 1}
+        },
+        {"id": "b", "backend_urls": ["https://shared.example"]}
+    ]}));
+    assert!(
+        error.contains("is the same endpoint as https://Shared.example:443"),
+        "{error}"
+    );
+
+    // Another port, scheme, path or host is another backend.
+    let different = [
+        ("https://shared.example", "https://shared.example:8443"),
+        ("http://shared.example", "https://shared.example"),
+        ("https://shared.example/a", "https://shared.example/b"),
+        ("https://shared.example", "https://shared.example.org"),
+        ("http://127.0.0.1:8000", "http://127.0.0.2:8000"),
+    ];
+    for (first, second) in different {
+        let models = parse_list(two(first, second, "backend_urls"))
+            .unwrap_or_else(|error| panic!("{first} / {second}: {error}"));
+        // The URLs are kept as they were written; only the comparison is
+        // on where they point.
+        assert_eq!(models[0].backend_urls, [first]);
+        assert_eq!(models[1].backend_urls, [second]);
+    }
+}
+
+#[test]
+fn one_backend_serves_one_tier_however_it_is_spelled() {
+    // The tier rules of the variables, with the comparison a list makes.
+    let error = error_of(tiered(
+        serde_json::json!({"backend_urls": ["https://A.example:443/"]}),
+        serde_json::json!({}),
+    ));
+    assert!(
+        error.contains("model \"m\"")
+            && error
+                .contains("is listed in both VLLM_BACKEND_URLS and VLLM_BACKEND_LONG_CONTEXT_URLS"),
+        "{error}"
+    );
+    let error = error_of(tiered(
+        serde_json::json!({"backend_probe_urls": ["http://P1.example:8000"]}),
+        serde_json::json!({"backend_probe_urls": ["http://p1.example:8000/"]}),
+    ));
+    assert!(
+        error.contains(
+            "is listed in both VLLM_BACKEND_PROBE_URLS and VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS"
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_backend_url_is_a_base_url_without_credentials() {
+    for url in [
+        "https://a.example?x=1",
+        "https://a.example/v1?x=1",
+        "https://a.example#top",
+    ] {
+        let error = error_of(serde_json::json!({"models": [{"id": "m", "backend_urls": [url]}]}));
+        assert!(
+            error.contains("must be a base URL, without a query or fragment"),
+            "{url}: {error}"
+        );
+    }
+    // Credentials do not belong in the file, and are not repeated.
+    for url in [
+        "https://operator:pasted-secret@a.example",
+        "https://pasted-secret@a.example",
+    ] {
+        for key in ["backend_urls", "backend_probe_urls"] {
+            let mut model = serde_json::json!({"id": "m", "backend_urls": ["https://a.example"]});
+            model[key] = serde_json::json!([url]);
+            let error = error_of(serde_json::json!({"models": [model]}));
+            assert!(
+                error.contains(&format!("`{key}`: a URL must not carry credentials")),
+                "{error}"
+            );
+            assert!(!error.contains("pasted-secret"), "{error}");
+        }
+    }
+}
+
+#[test]
 fn a_requested_model_is_exact_a_case_variant_another_string_or_missing() {
     let ids = ["org/Model-A", "org/model-b"];
     let class = |requested: Option<&str>| classify(requested, ids.iter().copied());
@@ -691,13 +817,6 @@ fn a_requested_model_is_exact_a_case_variant_another_string_or_missing() {
         .map(ModelMatch::as_str),
         ["exact", "case_differs", "other", "missing"]
     );
-}
-
-#[test]
-fn the_unrouted_backend_cannot_resolve() {
-    // RFC 6761 reserves `.invalid`: no resolver may answer for it.
-    let url = reqwest::Url::parse(UNROUTED_BACKEND_URL).unwrap();
-    assert!(url.host_str().unwrap().ends_with(".invalid"));
 }
 
 #[derive(Clone, Default)]

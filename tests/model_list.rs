@@ -2,9 +2,12 @@
 //! (`VLLM_PROXY_MODEL_LIST_FILE`), and what must not change for a process
 //! that serves one.
 //!
-//! Every gateway here is started the way `main` starts it: the environment
-//! (and, in list mode, the list file) goes through `Config::from_env`, the
-//! models through `ModelList::start`, the routes through `build_router_for`.
+//! A list gateway here is the one `main` runs: the environment and the list
+//! file go through `Config::from_env`, the state comes from
+//! `model_list::app_state` and the routes and middleware from
+//! `routes::build_app`, the two functions `main` calls. Only the signing keys
+//! and the HTTP clients are the test's own. One test starts the built binary
+//! itself.
 
 use std::collections::BTreeSet;
 use std::io::Write;
@@ -13,7 +16,6 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::middleware;
 use http_body_util::BodyExt;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde_json::{json, Value};
@@ -71,8 +73,8 @@ fn start(list: Option<&Value>, env: &[(&str, &str)], metrics: Option<PrometheusH
         ("GPU_NO_HW_MODE", "1"),
         ("CLOUD_API_AUTH_MAX_ATTEMPTS", "1"),
         ("VLLM_PROXY_IMAGE_VALIDATION_DISABLED", "1"),
-        // The pool health checkers stay out of the way: nothing here waits
-        // for one, and a probe must not land on a mock that expects none.
+        // The pool health checkers stay out of the way unless a test is
+        // about them: a probe must not land on a mock that expects none.
         ("HEALTH_CHECK_INTERVAL_SECS", "3600"),
     ]
     .iter()
@@ -103,16 +105,56 @@ fn start(list: Option<&Value>, env: &[(&str, &str)], metrics: Option<PrometheusH
     for (key, _) in &vars {
         std::env::remove_var(key);
     }
-    let config = config.expect("valid configuration");
+    let config = Arc::new(config.expect("valid configuration"));
     assert_eq!(config.model_list.is_some(), list.is_some());
 
-    // From here on: `main`, with fixed signing keys.
-    let http_client = reqwest::Client::new();
-    let client_with = |headers: reqwest::header::HeaderMap| -> anyhow::Result<reqwest::Client> {
-        Ok(reqwest::Client::builder()
-            .default_headers(headers)
-            .build()?)
+    let ecdsa_key: [u8; 32] = [
+        0xac, 0x09, 0x74, 0xbe, 0xc3, 0x9a, 0x17, 0xe3, 0x6b, 0xa4, 0xa6, 0xb4, 0xd2, 0x38, 0xff,
+        0x94, 0x4b, 0xac, 0xb3, 0x5e, 0x5d, 0xc4, 0xaf, 0x0f, 0x33, 0x47, 0xe5, 0x87, 0x31, 0x79,
+        0x67, 0x0f,
+    ];
+    let ed25519_key: [u8; 32] = [
+        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
+        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
+        0x7f, 0x60,
+    ];
+    let process = model_list::Process {
+        config,
+        signing: signing::SigningPair {
+            ecdsa: signing::EcdsaContext::from_key_bytes(&ecdsa_key).unwrap(),
+            ed25519: signing::Ed25519Context::from_key_bytes(&ed25519_key).unwrap(),
+        },
+        http_client: reqwest::Client::new(),
+        metrics_handle: metrics
+            .unwrap_or_else(|| PrometheusBuilder::new().build_recorder().handle()),
+        backend_client: &|headers| {
+            Ok(reqwest::Client::builder()
+                .default_headers(headers)
+                .build()?)
+        },
     };
+    let state = if process.config.model_list.is_some() {
+        model_list::app_state(process).expect("the list starts")
+    } else {
+        single_model_state(process)
+    };
+    Gateway {
+        app: routes::build_app(state.clone()),
+        state,
+    }
+}
+
+/// The state of a process that serves one model, wired as `main` wires it.
+/// (That wiring lives in the binary, so this is a copy of it, as in the
+/// other test files; a list goes through `model_list::app_state` instead.)
+fn single_model_state(process: model_list::Process<'_>) -> AppState {
+    let model_list::Process {
+        config,
+        signing,
+        http_client,
+        metrics_handle,
+        backend_client,
+    } = process;
     let mut backend_headers = reqwest::header::HeaderMap::new();
     if let Some(token) = &config.backend_token {
         backend_headers.insert(
@@ -126,11 +168,6 @@ fn start(list: Option<&Value>, env: &[(&str, &str)], metrics: Option<PrometheusH
             reqwest::header::HeaderValue::from(priority),
         );
     }
-    let backend_client = if backend_headers.is_empty() {
-        http_client.clone()
-    } else {
-        client_with(backend_headers).unwrap()
-    };
     let backend_pool = Arc::new(backend_pool::BackendPool::with_long_context(
         config.backend_urls.clone(),
         config.backend_long_context_urls.clone(),
@@ -139,66 +176,40 @@ fn start(list: Option<&Value>, env: &[(&str, &str)], metrics: Option<PrometheusH
         backend_pool.len(),
         Duration::from_secs(config.backend_probe_interval_secs) * 3,
     ));
-    let admission = Arc::new(admission::AdmissionController::new(
-        config.admission(),
-        backend_pool.len(),
-        engine_load,
-    ));
-    let backend_affinity = Arc::new(backend_affinity::BackendConversationAffinity::new(
-        config.backend_conversation_affinity,
-        backend_pool.len(),
-        config.backend_affinity_max_imbalance,
-        config.chat_cache_expiration_secs,
-    ));
-    let models = config.model_list.is_some().then(|| {
-        Arc::new(model_list::ModelList::start(&config, &http_client, &client_with).unwrap())
-    });
-
-    let ecdsa_key: [u8; 32] = [
-        0xac, 0x09, 0x74, 0xbe, 0xc3, 0x9a, 0x17, 0xe3, 0x6b, 0xa4, 0xa6, 0xb4, 0xd2, 0x38, 0xff,
-        0x94, 0x4b, 0xac, 0xb3, 0x5e, 0x5d, 0xc4, 0xaf, 0x0f, 0x33, 0x47, 0xe5, 0x87, 0x31, 0x79,
-        0x67, 0x0f,
-    ];
-    let ed25519_key: [u8; 32] = [
-        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
-        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
-        0x7f, 0x60,
-    ];
-    let state = AppState {
-        signing: Arc::new(signing::SigningPair {
-            ecdsa: signing::EcdsaContext::from_key_bytes(&ecdsa_key).unwrap(),
-            ed25519: signing::Ed25519Context::from_key_bytes(&ed25519_key).unwrap(),
-        }),
+    AppState {
+        signing: Arc::new(signing),
         cache: Arc::new(cache::ChatCache::new(
             &config.model_name,
             config.chat_cache_expiration_secs,
         )),
         attestation_cache: Arc::new(attestation::AttestationCache::new(300)),
+        backend_client: if backend_headers.is_empty() {
+            http_client.clone()
+        } else {
+            backend_client(backend_headers).unwrap()
+        },
         http_client,
-        backend_client,
-        metrics_handle: metrics
-            .unwrap_or_else(|| PrometheusBuilder::new().build_recorder().handle()),
+        metrics_handle,
         tls_cert_fingerprint: Arc::new(attestation::TlsCertTracker::new(None).unwrap()),
+        admission: Arc::new(admission::AdmissionController::new(
+            config.admission(),
+            backend_pool.len(),
+            engine_load,
+        )),
+        backend_affinity: Arc::new(backend_affinity::BackendConversationAffinity::new(
+            config.backend_conversation_affinity,
+            backend_pool.len(),
+            config.backend_affinity_max_imbalance,
+            config.chat_cache_expiration_secs,
+        )),
         backend_pool,
         ohttp_gateway: None,
         ohttp_attestation_ed25519: None,
         fusion_caches: Arc::new(fusion::FusionCaches::default()),
         vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(None, 1_200)),
-        backend_affinity,
-        admission,
-        models,
-        config: Arc::new(config),
-    };
-    let rate_limit_state = rate_limit::RateLimitState {
-        limiter: rate_limit::build_rate_limiter(100, 200),
-        trust_proxy_headers: true,
-    };
-    let app = routes::build_router_for(&state)
-        .layer(middleware::from_fn(rate_limit::rate_limit_middleware))
-        .layer(axum::Extension(rate_limit_state))
-        .layer(middleware::from_fn(request_id_middleware))
-        .with_state(state.clone());
-    Gateway { app, state }
+        models: None,
+        config,
+    }
 }
 
 fn completion_json() -> Value {
@@ -261,6 +272,27 @@ fn chat(model: &str) -> Request<Body> {
         Some("test-token"),
         &body_for(Some(json!(model))),
     )
+}
+
+/// A request for `model` on `route` whose prompt is `bytes` long: a chat
+/// message or a text prompt, estimated at a quarter of that in tokens.
+fn sized(route: &str, bearer: &str, model: &str, bytes: usize) -> Request<Body> {
+    let body = if route == routes::ROUTE_CHAT_COMPLETIONS {
+        json!({"model": model, "messages": [{"role": "user", "content": "x".repeat(bytes)}]})
+    } else {
+        json!({"model": model, "prompt": "x".repeat(bytes)})
+    };
+    post(route, Some(bearer), &body)
+}
+
+/// `get` from the operator: the gateway's own config token as bearer.
+fn get_as(route: &str, bearer: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(route)
+        .header("authorization", format!("Bearer {bearer}"))
+        .body(Body::empty())
+        .unwrap()
 }
 
 fn get(route: &str) -> Request<Body> {
@@ -346,6 +378,17 @@ fn unreachable_backend_url() -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+/// Poll `ready` until it holds, for at most `secs` seconds.
+async fn eventually(secs: u64, what: &str, mut ready: impl FnMut() -> bool) {
+    for _ in 0..secs * 50 {
+        if ready() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
 fn bearer_of(request: &wiremock::Request) -> Option<String> {
     request
         .headers
@@ -402,8 +445,8 @@ async fn an_unknown_or_missing_model_is_a_404_and_nothing_is_dispatched_or_bille
     let cloud = cloud_api("sk-live-customer").await;
     let gateway = start_list(
         &json!({"models": [
-            {"id": ALPHA, "backend_urls": [alpha.uri()], "admission_max_inflight": 4},
-            {"id": BETA, "backend_urls": [beta.uri()], "admission_max_inflight": 4}
+            {"id": ALPHA, "backend_urls": [alpha.uri()], "admission_max_inflight": 1},
+            {"id": BETA, "backend_urls": [beta.uri()], "admission_max_inflight": 1}
         ]}),
         &[
             ("CLOUD_API_URL", &cloud.uri()),
@@ -411,6 +454,18 @@ async fn an_unknown_or_missing_model_is_a_404_and_nothing_is_dispatched_or_bille
         ],
         None,
     );
+    // Every model's budget is in use for the whole test: a request that
+    // needed a slot, of any model, would be a 429 here, never a 404.
+    let held = [ALPHA, BETA].map(|id| {
+        let model = gateway.model(id);
+        model
+            .admission
+            .try_admit(&model.backend_pool, None)
+            .unwrap()
+            .expect("admission is on")
+    });
+    let response = gateway.app.clone().oneshot(chat(ALPHA)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
 
     // Not a configured id — another model, or a configured one in another
     // case — and no usable `model` at all.
@@ -471,12 +526,15 @@ async fn an_unknown_or_missing_model_is_a_404_and_nothing_is_dispatched_or_bille
     let response = gateway.app.clone().oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-    // Nothing reached a backend, no budget slot was taken, nothing was billed.
+    // Nothing reached a backend, and nothing was billed. No slot was asked
+    // for either: the budgets were full throughout, and every answer above
+    // was the 404 or the 401, with only the held slots in flight.
     alpha.verify().await;
     beta.verify().await;
     for id in [ALPHA, BETA] {
-        assert_eq!(gateway.model(id).admission.inflight(), 0);
+        assert_eq!(gateway.model(id).admission.inflight(), 1);
     }
+    drop(held);
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(requests_to(&cloud, "/v1/internal/usage").await.is_empty());
 }
@@ -493,7 +551,9 @@ async fn usage_is_billed_under_the_selected_model_at_its_own_discount() {
         MockServer::start().await,
     ];
     for backend in &backends {
-        mount_completions(backend, routes::ROUTE_CHAT_COMPLETIONS, 1).await;
+        for route in ROUTES {
+            mount_completions(backend, route, 1).await;
+        }
     }
     let cloud = cloud_api("sk-live-customer").await;
     let gateway = start_list(
@@ -510,36 +570,111 @@ async fn usage_is_billed_under_the_selected_model_at_its_own_discount() {
         ],
         None,
     );
-    for id in [ALPHA, BETA, GAMMA] {
-        let request = post(
-            routes::ROUTE_CHAT_COMPLETIONS,
-            Some("sk-live-customer"),
-            &body_for(Some(json!(id))),
-        );
-        let response = gateway.app.clone().oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK, "{id}");
-        json_body(response).await;
-    }
+    // One route at a time, so each route's reports are read on their own.
+    for (round, route) in ROUTES.into_iter().enumerate() {
+        for id in [ALPHA, BETA, GAMMA] {
+            let request = post(route, Some("sk-live-customer"), &body_for(Some(json!(id))));
+            let response = gateway.app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{route} {id}");
+            json_body(response).await;
+        }
 
-    let reports = usage_reports(&cloud, 3).await;
-    assert_eq!(reports.len(), 3);
-    let report_of = |id: &str| {
-        reports
-            .iter()
-            .find(|report| report["model"] == id)
-            .unwrap_or_else(|| panic!("no usage report for {id}: {reports:?}"))
-    };
-    for id in [ALPHA, BETA, GAMMA] {
-        let report = report_of(id);
-        assert_eq!(report["organization_id"], "org");
-        assert_eq!(report["input_tokens"], 3);
-        assert_eq!(report["output_tokens"], 1);
+        let reports = usage_reports(&cloud, 3 * (round + 1)).await;
+        let reports = &reports[3 * round..];
+        assert_eq!(reports.len(), 3, "{route}");
+        let report_of = |id: &str| {
+            reports
+                .iter()
+                .find(|report| report["model"] == id)
+                .unwrap_or_else(|| panic!("{route}: no usage report for {id}: {reports:?}"))
+        };
+        for id in [ALPHA, BETA, GAMMA] {
+            let report = report_of(id);
+            assert_eq!(report["organization_id"], "org");
+            assert_eq!(report["input_tokens"], 3);
+            assert_eq!(report["output_tokens"], 1);
+        }
+        assert_eq!(report_of(ALPHA)["discount_to_user"].as_f64(), Some(0.3));
+        assert!(report_of(BETA).get("discount_to_user").is_none());
+        assert_eq!(report_of(GAMMA)["discount_to_user"].as_f64(), Some(0.15));
     }
-    assert_eq!(report_of(ALPHA)["discount_to_user"].as_f64(), Some(0.3));
-    assert!(report_of(BETA).get("discount_to_user").is_none());
-    assert_eq!(report_of(GAMMA)["discount_to_user"].as_f64(), Some(0.15));
     for backend in &backends {
         backend.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn text_completions_are_placed_billed_and_counted_as_their_model() {
+    let alpha = MockServer::start().await;
+    let alpha_long = MockServer::start().await;
+    let beta = MockServer::start().await;
+    for backend in [&alpha, &alpha_long, &beta] {
+        mount_completions(backend, routes::ROUTE_COMPLETIONS, 1).await;
+    }
+    let cloud = cloud_api("sk-live-customer").await;
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let gateway = start_list(
+        &json!({"models": [
+            {
+                "id": ALPHA,
+                "backend_urls": [alpha.uri()],
+                "long_context": {"backend_urls": [alpha_long.uri()], "above_tokens": 1000},
+                "discount_to_user": 0.3
+            },
+            {"id": BETA, "backend_urls": [beta.uri()]}
+        ]}),
+        &[
+            ("CLOUD_API_URL", &cloud.uri()),
+            ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+        ],
+        Some(handle.clone()),
+    );
+    // ~100 and ~1,000 estimated tokens: under and over alpha's threshold,
+    // which is alpha's alone. beta has no tier.
+    for (id, bytes) in [(ALPHA, 400), (ALPHA, 4_000), (BETA, 4_000)] {
+        let request = sized(routes::ROUTE_COMPLETIONS, "sk-live-customer", id, bytes);
+        let response = gateway.app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{id} {bytes}");
+        json_body(response).await;
+    }
+    // Placed by alpha's own tier: one prompt on each of its tiers.
+    alpha.verify().await;
+    alpha_long.verify().await;
+    beta.verify().await;
+
+    // Billed under the model's id, at its discount.
+    let reports = usage_reports(&cloud, 3).await;
+    let of = |id: &'static str| reports.iter().filter(move |report| report["model"] == id);
+    assert_eq!(of(ALPHA).count(), 2, "{reports:?}");
+    assert_eq!(of(BETA).count(), 1, "{reports:?}");
+    assert!(of(ALPHA).all(|report| report["discount_to_user"].as_f64() == Some(0.3)));
+    assert!(of(BETA).all(|report| report.get("discount_to_user").is_none()));
+
+    // Counted under the model's label.
+    let rendered = handle.render();
+    let completed = |id: &str, count: u32| {
+        format!(
+            "inference_proxy_completed_requests_total{{auth_path=\"cloud_api_key\",\
+             ingress_route=\"missing\",tenant_context=\"verified\",\
+             request_id_origin=\"generated\",mode=\"json_via_stream\",model=\"{id}\"}} {count}"
+        )
+    };
+    assert!(rendered.contains(&completed(ALPHA, 2)), "{rendered}");
+    assert!(rendered.contains(&completed(BETA, 1)), "{rendered}");
+    for expected in [
+        "backend_tier_requests_total{tier=\"base\",outcome=\"routed\",model=\"example/alpha\"} 1",
+        "backend_tier_requests_total{tier=\"long\",outcome=\"routed\",model=\"example/alpha\"} 1",
+    ] {
+        assert!(rendered.contains(expected), "{expected}: {rendered}");
+    }
+    for series in series(&rendered) {
+        if series.starts_with("inference_proxy_completed_requests_total")
+            || series.starts_with("backend_tier_requests_total")
+        {
+            assert!(series.contains("model=\""), "{series}");
+        }
     }
 }
 
@@ -923,6 +1058,255 @@ async fn each_model_keeps_its_own_tier_and_reasoning_switch() {
     beta.verify().await;
 }
 
+#[tokio::test]
+async fn a_tier_is_strict_for_the_model_that_says_so_on_both_routes() {
+    // alpha isolates its tiers, beta does not, gamma leaves it to the
+    // process — once with the variable unset and once with it set, so each
+    // model's own word is on the other side of the default at least once.
+    for process_default in [false, true] {
+        let bases = [
+            MockServer::start().await,
+            MockServer::start().await,
+            MockServer::start().await,
+        ];
+        let strict = [true, false, process_default];
+        for (base, strict) in bases.iter().zip(strict) {
+            for route in ROUTES {
+                mount_completions(base, route, u64::from(!strict)).await;
+            }
+        }
+        let tier = |extra: Value| {
+            let mut tier = json!({
+                "backend_urls": [unreachable_backend_url()],
+                "above_tokens": 1000
+            });
+            tier.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            tier
+        };
+        let gateway = start_list(
+            &json!({"models": [
+                {"id": ALPHA, "backend_urls": [bases[0].uri()],
+                 "long_context": tier(json!({"strict": true}))},
+                {"id": BETA, "backend_urls": [bases[1].uri()],
+                 "long_context": tier(json!({"strict": false}))},
+                {"id": GAMMA, "backend_urls": [bases[2].uri()], "long_context": tier(json!({}))}
+            ]}),
+            &[(
+                "VLLM_BACKEND_TIER_STRICT",
+                if process_default { "1" } else { "" },
+            )],
+            None,
+        );
+        // Every model's long-context tier is down, and its pool knows.
+        for id in [ALPHA, BETA, GAMMA] {
+            gateway.model(id).backend_pool.backends()[1]
+                .healthy
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        for route in ROUTES {
+            for (id, strict) in [ALPHA, BETA, GAMMA].into_iter().zip(strict) {
+                // An oversized prompt belongs on the tier that is down.
+                let request = sized(route, "test-token", id, 4_000);
+                let response = gateway.app.clone().oneshot(request).await.unwrap();
+                let context = format!("{route} {id} default={process_default}");
+                if strict {
+                    // Refused rather than put in front of the short requests.
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "{context}"
+                    );
+                    let body = json_body(response).await;
+                    assert_eq!(body["error"]["type"], "tier_unavailable", "{context}");
+                } else {
+                    // Served by the base hosts instead.
+                    assert_eq!(response.status(), StatusCode::OK, "{context}");
+                }
+            }
+        }
+        for base in &bases {
+            base.verify().await;
+        }
+    }
+}
+
+/// Turn `turn` of one append-only conversation with `model`.
+fn conversation(model: &str, turn: usize) -> Request<Body> {
+    let mut messages = vec![
+        json!({"role": "system", "content": "be brief"}),
+        json!({"role": "user", "content": "start"}),
+    ];
+    for i in 0..turn {
+        messages.push(json!({"role": "assistant", "content": "ok"}));
+        messages.push(json!({"role": "user", "content": format!("more {i}")}));
+    }
+    post(
+        routes::ROUTE_CHAT_COMPLETIONS,
+        Some("test-token"),
+        &json!({"model": model, "messages": messages}),
+    )
+}
+
+#[tokio::test]
+async fn a_conversation_stays_on_its_backend_within_its_own_model() {
+    let alpha = [MockServer::start().await, MockServer::start().await];
+    let beta = [MockServer::start().await, MockServer::start().await];
+    mount_completions(&alpha[0], routes::ROUTE_CHAT_COMPLETIONS, 0).await;
+    mount_completions(&alpha[1], routes::ROUTE_CHAT_COMPLETIONS, 2).await;
+    mount_completions(&beta[0], routes::ROUTE_CHAT_COMPLETIONS, 1).await;
+    mount_completions(&beta[1], routes::ROUTE_CHAT_COMPLETIONS, 0).await;
+    let gateway = start_list(
+        &json!({"models": [
+            {"id": ALPHA, "backend_urls": [alpha[0].uri(), alpha[1].uri()]},
+            {"id": BETA, "backend_urls": [beta[0].uri(), beta[1].uri()]}
+        ]}),
+        &[("VLLM_BACKEND_CONVERSATION_AFFINITY", "1")],
+        None,
+    );
+
+    // The first turn finds alpha's first backend busy and starts on the second.
+    let busy =
+        backend_pool::BackendGuard::new(gateway.model(ALPHA).backend_pool.backends()[0].clone());
+    let response = gateway
+        .app
+        .clone()
+        .oneshot(conversation(ALPHA, 0))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(busy);
+    // Both are idle now, and least-connections alone would take the first.
+    // The conversation is pinned where its prefix is cached: the second.
+    let response = gateway
+        .app
+        .clone()
+        .oneshot(conversation(ALPHA, 1))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // The same conversation with beta is beta's own: nothing pins it, and it
+    // goes to beta's first backend, not to "backend 1" as alpha's does.
+    let response = gateway
+        .app
+        .clone()
+        .oneshot(conversation(BETA, 1))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    for backend in alpha.iter().chain(&beta) {
+        backend.verify().await;
+    }
+}
+
+fn engine_metrics(running: u32, queued: u32) -> String {
+    format!(
+        "sglang:num_running_reqs{{model_name=\"m\"}} {running}.0\nsglang:num_queue_reqs{{model_name=\"m\"}} {queued}.0\n"
+    )
+}
+
+#[tokio::test]
+async fn every_model_gets_a_health_checker_and_an_engine_poller_that_carry_no_bearer() {
+    // alpha's one backend fails its first health probe and passes the next.
+    let alpha = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/health"))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .mount(&alpha)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&alpha)
+        .await;
+    let alpha_engine = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/metrics"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(engine_metrics(3, 2)))
+        .mount(&alpha_engine)
+        .await;
+    let beta = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&beta)
+        .await;
+    let cloud = cloud_api("sk-live-customer").await;
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let gateway = start_list(
+        &json!({"models": [
+            {
+                "id": ALPHA,
+                "backend_urls": [alpha.uri()],
+                "backend_probe_urls": [alpha_engine.uri()],
+                "backend_token_env": "VLLM_BACKEND_TOKEN_ALPHA",
+                "backend_priority": -1
+            },
+            {"id": BETA, "backend_urls": [beta.uri()]}
+        ]}),
+        &[
+            ("CLOUD_API_URL", &cloud.uri()),
+            ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+            ("VLLM_BACKEND_TOKEN_ALPHA", "alpha-secret"),
+            ("HEALTH_CHECK_INTERVAL_SECS", "1"),
+            ("HEALTH_CHECK_MAX_FAILURES", "1"),
+            ("VLLM_BACKEND_PROBE_INTERVAL_SECS", "1"),
+        ],
+        Some(handle.clone()),
+    );
+    let (alpha_model, beta_model) = (gateway.model(ALPHA), gateway.model(BETA));
+
+    // The poller: alpha's engine view arrives; beta, without probes, has none.
+    eventually(5, "alpha's engine sample", || {
+        alpha_model.admission.engine(0) == Some((3, 2))
+    })
+    .await;
+    assert_eq!(beta_model.admission.engine(0), None);
+
+    // The checker, for a pool of one backend too: alpha's host is taken out
+    // on its failed probe and comes back on the next one.
+    assert_eq!(alpha_model.backend_pool.healthy_count(), 1);
+    eventually(5, "alpha's backend to be marked down", || {
+        alpha_model.backend_pool.healthy_count() == 0
+    })
+    .await;
+    assert_eq!(beta_model.backend_pool.healthy_count(), 1);
+    eventually(5, "alpha's backend to come back", || {
+        alpha_model.backend_pool.healthy_count() == 1
+    })
+    .await;
+
+    // Both ran on the general client: neither probe carries alpha's bearer
+    // or its priority.
+    let health_probes = requests_to(&alpha, "/health").await;
+    let engine_probes = requests_to(&alpha_engine, "/v1/metrics").await;
+    assert!(health_probes.len() >= 2, "{}", health_probes.len());
+    assert!(!engine_probes.is_empty());
+    for probe in health_probes.iter().chain(&engine_probes) {
+        assert_eq!(bearer_of(probe), None);
+        assert!(probe.headers.get(priority::PRIORITY_HEADER).is_none());
+    }
+    assert!(!requests_to(&beta, "/health").await.is_empty());
+
+    let rendered = handle.render();
+    for expected in [
+        "backend_engine_running{backend=\"0\",model=\"example/alpha\"} 3",
+        "backend_engine_queued{backend=\"0\",model=\"example/alpha\"} 2",
+        "backend_pool_size{model=\"example/alpha\"} 1",
+        "backend_pool_healthy{model=\"example/alpha\"} 1",
+        "backend_pool_size{model=\"example/beta\"} 1",
+        "backend_pool_healthy{model=\"example/beta\"} 1",
+    ] {
+        assert!(rendered.contains(expected), "{expected}: {rendered}");
+    }
+    assert!(!rendered.contains("model=\"example/beta\",backend_engine"));
+    assert!(!rendered.contains("backend_engine_running{backend=\"0\",model=\"example/beta\"}"));
+}
+
 // ---------------------------------------------------------------------------
 // /v1/models
 // ---------------------------------------------------------------------------
@@ -1067,12 +1451,98 @@ async fn an_unreadable_models_document_is_a_502_and_never_an_engine_list() {
     backend.verify().await;
 }
 
+#[tokio::test]
+async fn a_model_missing_from_the_document_is_logged_when_that_changes_and_counted_every_time() {
+    let backend = MockServer::start().await;
+    let source = MockServer::start().await;
+    let document = |ids: &[&str]| {
+        let data: Vec<Value> = ids.iter().map(|id| json!({"id": id})).collect();
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"object": "list", "data": data})),
+            )
+    };
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let logs = Logs::default();
+    let _logs = logs.capture();
+    let gateway = start_list(
+        &json!({"models": [
+            {"id": ALPHA, "backend_urls": [format!("{}/a", backend.uri())]},
+            {"id": GAMMA, "backend_urls": [format!("{}/c", backend.uri())]}
+        ]}),
+        &[(
+            "VLLM_PROXY_MODELS_DOCUMENT_URL",
+            &format!("{}/v1/models", source.uri()),
+        )],
+        Some(handle.clone()),
+    );
+    let listed = || async {
+        let response = gateway
+            .app
+            .clone()
+            .oneshot(get(routes::ROUTE_V1_MODELS))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        json_body(response).await["data"].as_array().unwrap().len()
+    };
+    let lines = |message: &str| {
+        logs.contents()
+            .lines()
+            .filter(|line| line.contains(message) && line.contains("model=example/gamma"))
+            .count()
+    };
+    let missing = "Configured model is not in the models document";
+    let back = "Configured model is in the models document again";
+    let counted = |count: u32| {
+        format!("models_document_missing_models_total{{model=\"example/gamma\"}} {count}")
+    };
+
+    // The route is polled: gamma is counted on every read it is missing
+    // from, and logged once.
+    document(&[ALPHA]).mount(&source).await;
+    for _ in 0..3 {
+        assert_eq!(listed().await, 1);
+    }
+    assert_eq!((lines(missing), lines(back)), (1, 0), "{}", logs.contents());
+    assert!(handle.render().contains(&counted(3)), "{}", handle.render());
+
+    // Back in the document: said once, and no longer counted.
+    source.reset().await;
+    document(&[ALPHA, GAMMA]).mount(&source).await;
+    for _ in 0..2 {
+        assert_eq!(listed().await, 2);
+    }
+    assert_eq!((lines(missing), lines(back)), (1, 1), "{}", logs.contents());
+    assert!(handle.render().contains(&counted(3)), "{}", handle.render());
+
+    // Gone again: a new change, a new line.
+    source.reset().await;
+    document(&[ALPHA]).mount(&source).await;
+    for _ in 0..2 {
+        assert_eq!(listed().await, 1);
+    }
+    assert_eq!((lines(missing), lines(back)), (2, 1), "{}", logs.contents());
+    assert!(handle.render().contains(&counted(5)), "{}", handle.render());
+    // alpha was there throughout: never a line about it.
+    assert!(!logs
+        .contents()
+        .lines()
+        .any(|line| line.contains("models document") && line.contains("model=example/alpha")));
+    assert!(!handle
+        .render()
+        .contains("models_document_missing_models_total{model=\"example/alpha\"}"));
+}
+
 // ---------------------------------------------------------------------------
 // /healthz
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn healthz_is_ok_while_one_model_is_and_reports_each_of_them() {
+async fn healthz_is_ok_while_one_model_is_and_names_the_models_to_the_operator_only() {
     let alpha = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/healthz"))
@@ -1085,30 +1555,39 @@ async fn healthz_is_ok_while_one_model_is_and_reports_each_of_them() {
         .respond_with(ResponseTemplate::new(503))
         .mount(&gamma)
         .await;
+    let cloud = cloud_api("sk-live-customer").await;
     let gateway = start_list(
         &json!({"models": [
             {"id": ALPHA, "backend_urls": [alpha.uri()]},
             {"id": BETA, "backend_urls": [unreachable_backend_url()]},
             {"id": GAMMA, "backend_urls": [gamma.uri()]}
         ]}),
-        &[("VLLM_BACKEND_HEALTH_PATH", "/healthz")],
+        &[
+            ("VLLM_BACKEND_HEALTH_PATH", "/healthz"),
+            ("CLOUD_API_URL", &cloud.uri()),
+            ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+        ],
         None,
     );
-    let healthz = || async {
-        let response = gateway
-            .app
-            .clone()
-            .oneshot(get(routes::ROUTE_HEALTHZ))
-            .await
-            .unwrap();
-        (response.status(), json_body(response).await)
+    let healthz = |bearer: Option<&'static str>| {
+        let request = match bearer {
+            Some(bearer) => get_as(routes::ROUTE_HEALTHZ, bearer),
+            None => get(routes::ROUTE_HEALTHZ),
+        };
+        let app = gateway.app.clone();
+        async move {
+            let response = app.oneshot(request).await.unwrap();
+            (response.status(), text_body(response).await)
+        }
     };
+    let json = |body: &str| serde_json::from_str::<Value>(body).unwrap();
 
     // Two of three models are down; the process still serves the third.
-    let (status, body) = healthz().await;
+    // The operator, who holds the gateway's own token, sees each model.
+    let (status, body) = healthz(Some("test-token")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        body,
+        json(&body),
         json!({
             "status": "ok",
             "checks": {"dstack": "skipped", "backend": "ok"},
@@ -1119,6 +1598,20 @@ async fn healthz_is_ok_while_one_model_is_and_reports_each_of_them() {
             ]
         })
     );
+    // Anyone else gets the same verdict and no model: the ids are not for
+    // unauthenticated callers, and a customer key is not the operator.
+    for bearer in [None, Some("sk-live-customer"), Some("not-the-token")] {
+        let (status, body) = healthz(bearer).await;
+        assert_eq!(status, StatusCode::OK, "{bearer:?}");
+        assert_eq!(
+            json(&body),
+            json!({"status": "ok", "checks": {"dstack": "skipped", "backend": "ok"}}),
+            "{bearer:?}"
+        );
+        for id in [ALPHA, BETA, GAMMA, "models"] {
+            assert!(!body.contains(id), "{bearer:?}: {body}");
+        }
+    }
 
     // Once a model's pool knows it has no healthy backend, it is reported
     // without being probed again.
@@ -1128,28 +1621,40 @@ async fn healthz_is_ok_while_one_model_is_and_reports_each_of_them() {
             .healthy
             .store(false, std::sync::atomic::Ordering::Relaxed);
     }
-    let (status, body) = healthz().await;
+    let (status, body) = healthz(Some("test-token")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        body["models"][2],
+        json(&body)["models"][2],
         json!({"id": GAMMA, "backend": "unhealthy"})
     );
     assert_eq!(requests_to(&gamma, "/healthz").await.len(), before);
 
-    // No model left: the process is down.
+    // No model left: the process is down, for everyone.
     alpha.reset().await;
     Mock::given(method("GET"))
         .and(path("/healthz"))
         .respond_with(ResponseTemplate::new(500))
         .mount(&alpha)
         .await;
-    let (status, body) = healthz().await;
+    let (status, body) = healthz(None).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(body["status"], "unhealthy");
-    assert_eq!(body["checks"]["backend"], "unhealthy");
     assert_eq!(
-        body["models"][0],
-        json!({"id": ALPHA, "backend": "http_5xx"})
+        json(&body),
+        json!({"status": "unhealthy", "checks": {"dstack": "skipped", "backend": "unhealthy"}})
+    );
+    let (status, body) = healthz(Some("test-token")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        json(&body),
+        json!({
+            "status": "unhealthy",
+            "checks": {"dstack": "skipped", "backend": "unhealthy"},
+            "models": [
+                {"id": ALPHA, "backend": "http_5xx"},
+                {"id": BETA, "backend": "unreachable"},
+                {"id": GAMMA, "backend": "unhealthy"}
+            ]
+        })
     );
 }
 
@@ -1558,28 +2063,47 @@ async fn a_single_model_lane_counts_how_the_requested_model_compares_and_serves_
 
 #[tokio::test]
 async fn a_process_that_is_not_a_lane_does_not_look_at_the_requested_model() {
-    let backend = MockServer::start().await;
-    mount_completions(&backend, routes::ROUTE_CHAT_COMPLETIONS, 2).await;
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let handle = recorder.handle();
-    let _metrics = metrics::set_default_local_recorder(&recorder);
-    // No backend token: what every proxy inside a CVM looks like.
-    let gateway = start_single(
-        &[("MODEL_NAME", ALPHA), ("VLLM_BASE_URL", &backend.uri())],
-        Some(handle.clone()),
-    );
-    for model in [ALPHA, REQUESTED[1]] {
-        let response = gateway.app.clone().oneshot(chat(model)).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        json_body(response).await;
+    let cloud = cloud_api("sk-live-customer").await;
+    let cloud_url = cloud.uri();
+    // What a proxy inside a CVM looks like: no backend token. And one that
+    // was given a backend token there all the same: still inside a TEE, so
+    // still not a lane.
+    let inside_a_cvm: [Vec<(&str, &str)>; 2] = [
+        vec![],
+        vec![
+            ("NON_TEE_DEPLOYMENT", ""),
+            ("VLLM_BACKEND_TOKEN", "backend-secret"),
+            ("CLOUD_API_URL", &cloud_url),
+            ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+        ],
+    ];
+    for extra in inside_a_cvm {
+        let backend = MockServer::start().await;
+        mount_completions(&backend, routes::ROUTE_CHAT_COMPLETIONS, 2).await;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let backend_url = backend.uri();
+        let mut env = vec![
+            ("MODEL_NAME", ALPHA),
+            ("VLLM_BASE_URL", backend_url.as_str()),
+        ];
+        env.extend(extra.iter().copied());
+        let gateway = start_single(&env, Some(handle.clone()));
+        assert_eq!(gateway.state.config.non_tee_deployment, extra.is_empty());
+        for model in [ALPHA, REQUESTED[1]] {
+            let response = gateway.app.clone().oneshot(chat(model)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            json_body(response).await;
+        }
+        backend.verify().await;
+        let rendered = handle.render();
+        assert!(
+            !rendered.contains("request_model_match_total"),
+            "{extra:?}: {rendered}"
+        );
+        assert!(!rendered.contains("model=\""), "{extra:?}: {rendered}");
     }
-    backend.verify().await;
-    let rendered = handle.render();
-    assert!(
-        !rendered.contains("request_model_match_total"),
-        "{rendered}"
-    );
-    assert!(!rendered.contains("model=\""), "{rendered}");
 }
 
 #[tokio::test]
@@ -1625,4 +2149,422 @@ async fn list_mode_counts_refused_models_without_naming_them() {
         assert!(!rendered.contains(requested), "{rendered}");
         assert!(!captured.contains(requested), "{captured}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Wiring
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn in_list_mode_the_single_model_state_serves_nothing() {
+    let seen = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&seen)
+        .await;
+    let backend = MockServer::start().await;
+    let cloud = cloud_api("sk-live-customer").await;
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    // The environment of a single-model lane, minus its name and backends:
+    // in list mode all of it is defaults for the entries.
+    let gateway = start_list(
+        &json!({"models": [{"id": ALPHA, "backend_urls": [backend.uri()]}]}),
+        &[
+            ("CLOUD_API_URL", &cloud.uri()),
+            ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+            ("VLLM_BACKEND_TOKEN", "shared-secret"),
+            ("VLLM_BACKEND_PRIORITY", "-1"),
+            ("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", "8"),
+            ("VLLM_BACKEND_CONVERSATION_AFFINITY", "1"),
+            ("VLLM_PROXY_DISCOUNT_TO_USER", "0.2"),
+        ],
+        Some(handle.clone()),
+    );
+    let state = &gateway.state;
+
+    // The model got them ...
+    let model = gateway.model(ALPHA);
+    assert!(model.admission.is_enabled());
+    assert_eq!(model.config.discount_to_user, Some(0.2));
+    model.backend_client.get(seen.uri()).send().await.unwrap();
+    // ... and the process itself is no model: one backend that cannot
+    // resolve, no budget, nothing to pin, nothing to bill as, and a client
+    // without the bearer or the priority.
+    let single_model_backends: Vec<_> = state
+        .backend_pool
+        .backends()
+        .iter()
+        .map(|backend| backend.base_url.as_str())
+        .collect();
+    assert_eq!(single_model_backends, [model_list::UNROUTED_BACKEND_URL]);
+    assert!(model_list::UNROUTED_BACKEND_URL.ends_with(".invalid"));
+    assert!(!state.admission.is_enabled());
+    assert!(!state.backend_affinity.is_active());
+    assert_eq!(state.config.model_name, "");
+    assert!(state.config.backend_token.is_none());
+    assert!(state.config.discount_to_user.is_none());
+    state.backend_client.get(seen.uri()).send().await.unwrap();
+
+    let requests = seen.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        bearer_of(&requests[0]).as_deref(),
+        Some("Bearer shared-secret")
+    );
+    assert_eq!(
+        requests[0]
+            .headers
+            .get(priority::PRIORITY_HEADER)
+            .map(|value| value.to_str().unwrap()),
+        Some("-1")
+    );
+    assert_eq!(bearer_of(&requests[1]), None);
+    assert!(requests[1].headers.get(priority::PRIORITY_HEADER).is_none());
+
+    // No lane without a model: every admission series is alpha's.
+    let response = gateway
+        .app
+        .clone()
+        .oneshot(get(routes::ROUTE_METRICS))
+        .await
+        .unwrap();
+    let rendered = text_body(response).await;
+    let admission: Vec<_> = series(&rendered)
+        .into_iter()
+        .filter(|series| series.starts_with("admission_"))
+        .collect();
+    assert!(admission.contains(&"admission_budget{model=\"example/alpha\"}".to_string()));
+    for series in &admission {
+        assert!(series.contains("model=\"example/alpha\""), "{series}");
+    }
+}
+
+/// The built binary serving a list, until dropped.
+struct Binary {
+    child: std::process::Child,
+    base: String,
+    log: tempfile::NamedTempFile,
+    _list: tempfile::NamedTempFile,
+}
+
+impl Drop for Binary {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Binary {
+    /// Start `vllm-proxy-rs` on a free loopback port with `list` and `env`,
+    /// and wait until it answers.
+    async fn start(list: &Value, env: &[(&str, &str)]) -> Binary {
+        let mut last_log = String::new();
+        // The port is picked by binding and releasing it; if something else
+        // takes it in between, the binary exits and another one is tried.
+        for _ in 0..5 {
+            let port = {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.local_addr().unwrap().port()
+            };
+            let mut list_file = tempfile::NamedTempFile::new().unwrap();
+            list_file.write_all(list.to_string().as_bytes()).unwrap();
+            let log = tempfile::NamedTempFile::new().unwrap();
+            let child = std::process::Command::new(env!("CARGO_BIN_EXE_vllm-proxy-rs"))
+                .env_clear()
+                .envs([
+                    ("TOKEN", "test-token"),
+                    ("NON_TEE_DEPLOYMENT", "1"),
+                    ("DEV", "1"),
+                    ("GPU_NO_HW_MODE", "1"),
+                    ("LOG_FORMAT", "json"),
+                    ("LISTEN_ADDR", "127.0.0.1"),
+                    ("CLOUD_API_AUTH_MAX_ATTEMPTS", "1"),
+                    ("VLLM_PROXY_IMAGE_VALIDATION_DISABLED", "1"),
+                ])
+                .env("LISTEN_PORT", port.to_string())
+                .env(model_list::MODEL_LIST_FILE_ENV, list_file.path())
+                .envs(env.iter().copied())
+                .stdin(std::process::Stdio::null())
+                .stdout(log.reopen().unwrap())
+                .stderr(log.reopen().unwrap())
+                .spawn()
+                .expect("the binary starts");
+            let mut binary = Binary {
+                child,
+                base: format!("http://127.0.0.1:{port}"),
+                log,
+                _list: list_file,
+            };
+            let client = reqwest::Client::new();
+            for _ in 0..400 {
+                if binary.child.try_wait().unwrap().is_some() {
+                    break;
+                }
+                let version = client.get(format!("{}/version", binary.base)).send().await;
+                if version.is_ok_and(|response| response.status().is_success()) {
+                    return binary;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            last_log = binary.log();
+        }
+        panic!("the binary did not come up: {last_log}");
+    }
+
+    fn log(&self) -> String {
+        std::fs::read_to_string(self.log.path()).unwrap()
+    }
+
+    /// The `fields` of every JSON log line with this message.
+    fn logged(&self, message: &str) -> Vec<Value> {
+        self.log()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|line| line["fields"]["message"] == message)
+            .map(|mut line| line["fields"].take())
+            .collect()
+    }
+}
+
+/// `main` itself, in list mode: the process the deploy starts, with the
+/// environment and the file it is given, answering over a real socket.
+#[tokio::test]
+async fn the_binary_serves_a_model_list() {
+    let alpha = MockServer::start().await;
+    let beta = MockServer::start().await;
+    for backend in [&alpha, &beta] {
+        mount_completions(backend, routes::ROUTE_CHAT_COMPLETIONS, 1).await;
+        Mock::given(method("GET"))
+            .and(path("/healthz"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(backend)
+            .await;
+    }
+    let alpha_engine = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/metrics"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(engine_metrics(3, 0)))
+        .mount(&alpha_engine)
+        .await;
+    let cloud = cloud_api("sk-live-customer").await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [{"id": ALPHA, "name": "Alpha"}, {"id": BETA, "name": "Beta"}]
+        })))
+        .mount(&cloud)
+        .await;
+
+    let binary = Binary::start(
+        &json!({"models": [
+            {
+                "id": ALPHA,
+                "backend_urls": [alpha.uri()],
+                "backend_probe_urls": [alpha_engine.uri()],
+                "admission_max_inflight": 4,
+                "discount_to_user": 0.3,
+                "backend_token_env": "VLLM_BACKEND_TOKEN_ALPHA",
+                "backend_priority": -1
+            },
+            {"id": BETA, "backend_urls": [beta.uri()]}
+        ]}),
+        &[
+            ("CLOUD_API_URL", &cloud.uri()),
+            ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+            (
+                "VLLM_PROXY_MODELS_DOCUMENT_URL",
+                &format!("{}/v1/models", cloud.uri()),
+            ),
+            ("VLLM_BACKEND_TOKEN_ALPHA", "alpha-secret"),
+            ("VLLM_BACKEND_HEALTH_PATH", "/healthz"),
+            ("HEALTH_CHECK_INTERVAL_SECS", "1"),
+            ("VLLM_BACKEND_PROBE_INTERVAL_SECS", "1"),
+        ],
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let url = |route: &str| format!("{}{route}", binary.base);
+    let chat = |bearer: &'static str, model: &'static str| {
+        client
+            .post(url(routes::ROUTE_CHAT_COMPLETIONS))
+            .bearer_auth(bearer)
+            .json(&body_for(Some(json!(model))))
+            .send()
+    };
+
+    // Each model answers from its own backend; another model is a 404, and
+    // so is a route that needs the one model of a single-model process.
+    let response = chat("sk-live-customer", ALPHA).await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["choices"][0]["message"]["content"],
+        "hi"
+    );
+    let response = chat("test-token", BETA).await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let response = chat("test-token", GAMMA).await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"]["code"],
+        "model_not_found"
+    );
+    let response = client
+        .post(url(routes::ROUTE_EMBEDDINGS))
+        .bearer_auth("test-token")
+        .json(&json!({"model": ALPHA, "input": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let models: Value = client
+        .get(url(routes::ROUTE_V1_MODELS))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        models["data"],
+        json!([
+            {
+                "id": ALPHA,
+                "name": "Alpha",
+                "capacity": [{"type": "concurrency", "unit": "request", "value": 4}],
+                "discount_to_user": 0.3
+            },
+            {"id": BETA, "name": "Beta"}
+        ])
+    );
+
+    // `/healthz`: the verdict for everyone, the models for the operator.
+    let health = client.get(url(routes::ROUTE_HEALTHZ)).send().await.unwrap();
+    assert_eq!(health.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        health.json::<Value>().await.unwrap(),
+        json!({"status": "ok", "checks": {"dstack": "skipped", "backend": "ok"}})
+    );
+    let health: Value = client
+        .get(url(routes::ROUTE_HEALTHZ))
+        .bearer_auth("test-token")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        health["models"],
+        json!([{"id": ALPHA, "backend": "ok"}, {"id": BETA, "backend": "ok"}])
+    );
+
+    // The customer's request was billed as alpha, at alpha's discount.
+    let reports = usage_reports(&cloud, 1).await;
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0]["model"], ALPHA);
+    assert_eq!(reports[0]["discount_to_user"].as_f64(), Some(0.3));
+
+    // Every model's health checker and alpha's engine poller run in the
+    // real process, and the scrape tells the models apart.
+    let mut rendered = String::new();
+    let waited_for = [
+        "backend_pool_healthy{model=\"example/alpha\"} 1",
+        "backend_pool_healthy{model=\"example/beta\"} 1",
+        "backend_engine_running{backend=\"0\",model=\"example/alpha\"} 3",
+        "inference_proxy_usage_reports_total{outcome=\"accepted\"",
+    ];
+    for _ in 0..300 {
+        rendered = client
+            .get(url(routes::ROUTE_METRICS))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        if waited_for.iter().all(|series| rendered.contains(series)) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    for expected in waited_for.into_iter().chain([
+        "admission_budget{model=\"example/alpha\"} 4",
+        "request_model_match_total{result=\"exact\"} 2",
+        "request_model_match_total{result=\"other\"} 1",
+        "http_errors_total{error_type=\"model_not_found\"} 1",
+        // The HTTP metrics middleware is part of what is served.
+        "http_requests_total{method=\"POST\",endpoint=\"/v1/chat/completions\",status=\"200\"} 2",
+        "http_requests_total{method=\"POST\",endpoint=\"/v1/chat/completions\",status=\"404\"} 1",
+    ]) {
+        assert!(rendered.contains(expected), "{expected}: {rendered}");
+    }
+    // The process itself is no lane: no admission series without a model.
+    for series in series(&rendered) {
+        if series.starts_with("admission_") || series.starts_with("backend_pool_") {
+            assert!(series.contains("model=\""), "{series}");
+        }
+    }
+
+    // alpha's bearer and priority went to alpha's inference requests and
+    // nowhere else: not to the probes, not to beta, not to cloud-api.
+    let inference = requests_to(&alpha, routes::ROUTE_CHAT_COMPLETIONS).await;
+    assert_eq!(inference.len(), 1);
+    assert_eq!(
+        bearer_of(&inference[0]).as_deref(),
+        Some("Bearer alpha-secret")
+    );
+    assert_eq!(
+        inference[0].headers.get(priority::PRIORITY_HEADER).unwrap(),
+        "-1"
+    );
+    let probes: Vec<_> = requests_to(&alpha, "/healthz")
+        .await
+        .into_iter()
+        .chain(requests_to(&alpha_engine, "/v1/metrics").await)
+        .collect();
+    assert!(probes.len() >= 3, "{}", probes.len());
+    for request in probes
+        .iter()
+        .chain(&beta.received_requests().await.unwrap())
+        .chain(&cloud.received_requests().await.unwrap())
+    {
+        let raw = format!(
+            "{:?}{}",
+            request.headers,
+            String::from_utf8_lossy(&request.body)
+        );
+        assert!(!raw.contains("alpha-secret"), "{}", request.url);
+        assert!(request.headers.get(priority::PRIORITY_HEADER).is_none());
+    }
+
+    // What the process says at startup, and what it must not say.
+    let starting = binary.logged("Starting vllm-proxy-rs");
+    assert_eq!(starting.len(), 1);
+    assert!(starting[0].get("model").is_none(), "{}", starting[0]);
+    let serving = binary.logged("Serving model");
+    let served: Vec<_> = serving.iter().map(|line| line["model"].clone()).collect();
+    assert_eq!(served, [ALPHA, BETA]);
+    assert_eq!(serving[0]["backend_token"], true);
+    assert_eq!(serving[0]["engine_probes"], true);
+    assert_eq!(serving[0]["admission_max_inflight"], 4);
+    assert_eq!(serving[1]["backend_token"], false);
+    let enabled = binary.logged("Model list enabled");
+    assert_eq!(enabled.len(), 1);
+    assert_eq!(enabled[0]["models"], 2);
+    assert_eq!(binary.logged("Rate limiter configured").len(), 1);
+    let log = binary.log();
+    for secret in [
+        "alpha-secret",
+        "usage-secret",
+        "test-token",
+        "sk-live-customer",
+    ] {
+        assert!(!log.contains(secret), "{secret} in the log");
+    }
+    alpha.verify().await;
+    beta.verify().await;
 }

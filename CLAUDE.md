@@ -137,8 +137,12 @@ client (its bearer goes to its backends only). Per-model metric series go
 through the `model_counter!`/`model_gauge!`/`model_histogram!` macros
 (`model_metrics.rs`): a `model` label in list mode, exactly the old series
 without one. A new per-model setting needs a `ModelConfig` field, a file key,
-a `ModelDefaults` fallback and `Config::single_model`. Without the variable
-the process serves one model from env and nothing may change for it.
+a `ModelDefaults` fallback and `Config::single_model`. `main` builds a list's
+whole state with `model_list::app_state` and serves `routes::build_app`, and
+`tests/model_list.rs` starts its gateways through the same two functions (one
+test runs the built binary), so list-mode wiring belongs in the library, not
+in `main.rs`. Without the variable the process serves one model from env and
+nothing may change for it.
 
 ### Cloud API integration
 

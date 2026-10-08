@@ -49,6 +49,29 @@ async fn unknown_route() -> AppError {
     AppError::NotFound("Endpoint not found".to_string())
 }
 
+/// What the process serves: the router for `state` behind the middleware
+/// stack, outermost first: HTTP metrics, the request id, the per-IP rate
+/// limit. `main` serves exactly this, and the list-mode tests drive it.
+pub fn build_app(state: AppState) -> Router {
+    let rate_limit_state = crate::rate_limit::RateLimitState {
+        limiter: crate::rate_limit::build_rate_limiter(
+            state.config.rate_limit_per_second,
+            state.config.rate_limit_burst_size,
+        ),
+        trust_proxy_headers: state.config.rate_limit_trust_proxy_headers,
+    };
+    build_router_for(&state)
+        .layer(axum::middleware::from_fn(
+            crate::rate_limit::rate_limit_middleware,
+        ))
+        .layer(axum::Extension(rate_limit_state))
+        .layer(axum::middleware::from_fn(crate::request_id_middleware))
+        .layer(axum::middleware::from_fn(
+            crate::metrics_middleware::metrics_middleware,
+        ))
+        .with_state(state)
+}
+
 /// The router for `state`: every route for a process that serves one model,
 /// the model-list subset in gateway list mode.
 pub fn build_router_for(state: &AppState) -> Router<AppState> {

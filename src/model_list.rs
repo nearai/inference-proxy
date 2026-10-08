@@ -26,6 +26,7 @@
 //! its environment, as every CVM proxy and single-model gateway does.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -413,17 +414,54 @@ fn resolve(
 }
 
 /// Base URLs as the variables hold them: trimmed, no trailing slash. A blank
-/// or unparsable entry is a mistake in a rendered file, not something to skip.
+/// or unparsable entry is a mistake in a rendered file, not something to skip,
+/// and so is anything that is more than a base: a query or fragment (paths
+/// are appended to these), or credentials, which do not belong in the file.
 fn urls(key: &str, raw: Vec<String>) -> anyhow::Result<Vec<String>> {
     raw.into_iter()
         .map(|url| {
             let url = url.trim().trim_end_matches('/').to_string();
-            match reqwest::Url::parse(&url) {
-                Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => Ok(url),
-                _ => Err(anyhow::anyhow!("`{key}`: {url:?} is not an http(s) URL")),
+            let parsed = match reqwest::Url::parse(&url) {
+                Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => parsed,
+                _ => anyhow::bail!("`{key}`: {url:?} is not an http(s) URL"),
+            };
+            // Not echoed: the URL holds the secret.
+            if !parsed.username().is_empty() || parsed.password().is_some() {
+                anyhow::bail!("`{key}`: a URL must not carry credentials");
             }
+            if parsed.query().is_some() || parsed.fragment().is_some() {
+                anyhow::bail!("`{key}`: {url:?} must be a base URL, without a query or fragment");
+            }
+            Ok(url)
         })
         .collect()
+}
+
+/// Where a base URL points, for telling whether two entries are one backend:
+/// scheme, host, effective port and path. The parser lower-cases the host,
+/// drops a default port, resolves `.`/`..` segments and writes an IP address
+/// one way; a trailing dot on the host and a trailing slash on the path are
+/// dropped here. So `https://HOST`, `https://host:443` and
+/// `https://host/v1/..` are the same endpoint, however they are spelled.
+fn endpoint(url: &str) -> anyhow::Result<String> {
+    let parsed =
+        reqwest::Url::parse(url).map_err(|_| anyhow::anyhow!("{url:?} is not an http(s) URL"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("{url:?} has no host"))?
+        .trim_end_matches('.');
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("{url:?} has no port"))?;
+    Ok(format!(
+        "{}://{host}:{port}{}",
+        parsed.scheme(),
+        parsed.path().trim_end_matches('/')
+    ))
+}
+
+fn endpoints(urls: &[String]) -> anyhow::Result<Vec<String>> {
+    urls.iter().map(|url| endpoint(url)).collect()
 }
 
 /// The backend bearer named by `backend_token_env`. The name is not echoed
@@ -460,11 +498,13 @@ fn validate(model: &ModelConfig, process: &ProcessSettings) -> anyhow::Result<()
         retry_after_secs: process.admission_retry_after_secs,
     })?;
     check_probe_urls(&model.backend_urls, &model.backend_probe_urls)?;
+    // By endpoint, so the rules that one backend, and one engine, serves one
+    // tier hold however a host is spelled (`endpoint`).
     check_long_context_tier(&TierKnobs {
-        backend_urls: &model.backend_urls,
-        backend_probe_urls: &model.backend_probe_urls,
-        backend_long_context_urls: &model.backend_long_context_urls,
-        backend_long_context_probe_urls: &model.backend_long_context_probe_urls,
+        backend_urls: &endpoints(&model.backend_urls)?,
+        backend_probe_urls: &endpoints(&model.backend_probe_urls)?,
+        backend_long_context_urls: &endpoints(&model.backend_long_context_urls)?,
+        backend_long_context_probe_urls: &endpoints(&model.backend_long_context_probe_urls)?,
         long_context_above_tokens: model.long_context_above_tokens,
         admission_max_inflight: model.admission_max_inflight,
         admission_start_inflight: model.admission_start_inflight,
@@ -486,6 +526,8 @@ fn validate(model: &ModelConfig, process: &ProcessSettings) -> anyhow::Result<()
 /// engine probe listed under two models. A backend serves one model; a
 /// request for another one sent there would be answered, and billed, as the
 /// wrong model, and a shared probe would count one engine's load twice.
+/// Backends and probes are compared by `endpoint`, not as strings: two
+/// spellings of one host are still one backend.
 fn check_across_models(models: &[ModelConfig]) -> anyhow::Result<()> {
     let mut ids = std::collections::HashSet::new();
     for model in models {
@@ -517,20 +559,27 @@ fn check_across_models(models: &[ModelConfig]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Record `model` as the owner of `urls`, refusing one another model owns.
+/// Record `model` as the owner of the endpoints of `urls`, refusing one that
+/// another model owns. `owners` maps an endpoint to the model that listed it
+/// first and the URL it wrote.
 fn claim<'a>(
-    owners: &mut HashMap<&'a str, &'a str>,
+    owners: &mut HashMap<String, (&'a str, &'a str)>,
     what: &str,
     model: &'a ModelConfig,
     urls: impl Iterator<Item = &'a String>,
 ) -> anyhow::Result<()> {
     for url in urls {
-        match owners.insert(url, &model.id) {
-            Some(other) if other != model.id => anyhow::bail!(
+        match owners.insert(endpoint(url)?, (&model.id, url)) {
+            Some((other, _)) if other == model.id => {}
+            Some((other, theirs)) if theirs == url => anyhow::bail!(
                 "{what} {url} is listed under both {other:?} and {:?}: a backend serves one model",
                 model.id
             ),
-            _ => {}
+            Some((other, theirs)) => anyhow::bail!(
+                "{what} {url} is the same endpoint as {theirs}, and is listed under both {other:?} and {:?}: a backend serves one model",
+                model.id
+            ),
+            None => {}
         }
     }
     Ok(())
@@ -549,11 +598,21 @@ pub struct ServedModel {
     pub backend_pool: Arc<BackendPool>,
     pub backend_affinity: Arc<BackendConversationAffinity>,
     pub admission: Arc<AdmissionController>,
+    /// The last read of the models document did not list this model
+    /// (`note_listed`).
+    unlisted: AtomicBool,
 }
 
 impl ServedModel {
     pub fn id(&self) -> &str {
         &self.config.id
+    }
+
+    /// Record whether the models document lists this model, and say whether
+    /// that changed since the last read: `/v1/models` is polled, so the
+    /// change is worth a log line and the steady state is not.
+    pub(crate) fn note_listed(&self, listed: bool) -> bool {
+        self.unlisted.swap(!listed, Ordering::Relaxed) == listed
     }
 
     pub fn view(&self) -> ModelView<'_> {
@@ -630,7 +689,7 @@ impl ModelList {
     /// single-model process skips: `/healthz` here reports each model from
     /// its pool's view, and a host taken out after a failed connect only
     /// comes back through a probe.
-    pub fn start(
+    fn start(
         config: &Config,
         http_client: &reqwest::Client,
         backend_client: &dyn Fn(reqwest::header::HeaderMap) -> anyhow::Result<reqwest::Client>,
@@ -717,6 +776,7 @@ impl ModelList {
                 backend_pool: pool,
                 backend_affinity: affinity,
                 admission,
+                unlisted: AtomicBool::new(false),
             });
         }
         let by_id = models
@@ -767,6 +827,92 @@ impl ModelList {
             }
         }
     }
+}
+
+/// What `app_state` takes from the process that calls it: `main`, or a test
+/// that starts a gateway.
+pub struct Process<'a> {
+    pub config: Arc<Config>,
+    pub signing: crate::signing::SigningPair,
+    /// The general client: cloud-api, the models document, the health and
+    /// engine probes. It never carries a backend bearer.
+    pub http_client: reqwest::Client,
+    pub metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+    /// Builds a client with these default headers and the process's pool and
+    /// timeout settings: one for each model that has a bearer or a priority.
+    pub backend_client: &'a dyn Fn(reqwest::header::HeaderMap) -> anyhow::Result<reqwest::Client>,
+}
+
+/// The whole state of a process in list mode, with every model's background
+/// tasks started. `main` builds its state here and so do the tests, so what
+/// is tested is what runs. Must run inside a Tokio runtime.
+///
+/// The single-model fields of `AppState` are set to serve nothing: no backend
+/// bearer, one backend that cannot resolve, admission off, nothing to pin.
+/// The routes a list serves do not read them (`model_for`), and the ones that
+/// do are not served (`routes::build_router_for`).
+pub fn app_state(process: Process<'_>) -> anyhow::Result<AppState> {
+    let Process {
+        config,
+        signing,
+        http_client,
+        metrics_handle,
+        backend_client,
+    } = process;
+    let models = ModelList::start(&config, &http_client, backend_client)?;
+    // What every model's lane shares; each model's own numbers are on its
+    // "Serving model" line.
+    info!(
+        models = models.len(),
+        admission_ramp_step = config.admission_ramp_step,
+        admission_ramp_interval_secs = config.admission_ramp_interval_secs,
+        admission_ttft_p95_max_ms = config.admission_ttft_p95_max_ms,
+        admission_backpressure_secs = config.admission_backpressure_secs,
+        admission_retry_after_secs = config.admission_retry_after_secs,
+        probe_interval_secs = config.backend_probe_interval_secs,
+        health_check_interval_secs = config.health_check_interval_secs,
+        health_check_max_failures = config.health_check_max_failures,
+        health_path = %config.backend_health_path,
+        conversation_affinity = config.backend_conversation_affinity,
+        connect_failover = config.backend_connect_failover,
+        first_token_deadline_ms = config.first_token_deadline_ms,
+        first_token_deadline_per_1k_tokens_ms = config.first_token_deadline_per_1k_tokens_ms,
+        first_token_deadline_max_ms = config.first_token_deadline_max_ms,
+        "Model list enabled"
+    );
+    Ok(AppState {
+        signing: Arc::new(signing),
+        cache: Arc::new(crate::cache::ChatCache::new(
+            &config.model_name,
+            config.chat_cache_expiration_secs,
+        )),
+        attestation_cache: Arc::new(crate::attestation::AttestationCache::new(
+            config.attestation_cache_ttl_secs,
+        )),
+        backend_client: http_client.clone(),
+        http_client,
+        metrics_handle,
+        tls_cert_fingerprint: Arc::new(crate::attestation::TlsCertTracker::new(
+            config.tls_cert_path.clone(),
+        )?),
+        backend_pool: Arc::new(BackendPool::new(vec![UNROUTED_BACKEND_URL.to_string()])),
+        ohttp_gateway: None,
+        ohttp_attestation_ed25519: None,
+        fusion_caches: Arc::new(crate::fusion::FusionCaches::default()),
+        vllm_dp_affinity: Arc::new(crate::vllm_dp_affinity::VllmDpAffinity::new(
+            None,
+            config.chat_cache_expiration_secs,
+        )),
+        backend_affinity: Arc::new(BackendConversationAffinity::new(
+            false,
+            1,
+            config.backend_affinity_max_imbalance,
+            config.chat_cache_expiration_secs,
+        )),
+        admission: Arc::new(AdmissionController::disabled()),
+        models: Some(Arc::new(models)),
+        config,
+    })
 }
 
 /// The default headers of a model's backend client: its bearer and its
@@ -852,15 +998,16 @@ fn count_model_match(result: ModelMatch) {
 /// enumerate models.
 ///
 /// A single-model process serves its one model whatever the body says, as it
-/// always has. When it runs as a gateway lane (a backend token is configured,
-/// which no CVM proxy has) it also counts how the body's `model` compares
-/// with `MODEL_NAME`, so the effect of exact matching can be read from
-/// production before a list switches it on.
+/// always has. When it runs as a gateway lane — outside a TEE
+/// (`NON_TEE_DEPLOYMENT`) and with a backend token, which together no proxy
+/// inside a CVM has — it also counts how the body's `model` compares with
+/// `MODEL_NAME`, so the effect of exact matching can be read from production
+/// before a list switches it on.
 pub fn model_for<'a>(state: &'a AppState, request: &Value) -> Result<ModelView<'a>, AppError> {
     match &state.models {
         Some(models) => models.select(request).map(ServedModel::view),
         None => {
-            if state.config.backend_token.is_some() {
+            if state.config.non_tee_deployment && state.config.backend_token.is_some() {
                 count_model_match(classify(
                     requested_model(request),
                     std::iter::once(state.config.model_name.as_str()),

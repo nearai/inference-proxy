@@ -92,9 +92,15 @@ const BACKEND_UNHEALTHY: &str = "unhealthy";
 /// server-side rather than returned to the unauthenticated caller.
 ///
 /// In gateway list mode the backend leg is per model: see `healthz_for_list`.
-pub async fn healthz(State(state): State<AppState>) -> axum::response::Response {
+pub async fn healthz(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
     if let Some(models) = state.models.as_deref() {
-        return healthz_for_list(&state, models).await.into_response();
+        let operator = crate::auth::presents_config_token(&headers, &state.config);
+        return healthz_for_list(&state, models, operator)
+            .await
+            .into_response();
     }
     healthz_single(&state).await.into_response()
 }
@@ -140,9 +146,16 @@ async fn healthz_single(state: &AppState) -> (StatusCode, Json<serde_json::Value
 
 /// `/healthz` in gateway list mode. The process is healthy while at least one
 /// model is: one model's outage must not take the others off the load
-/// balancer. The body keeps the single-model shape — `checks.backend` is
-/// `"ok"` exactly when the status is — and adds `models`, one entry per
-/// configured model in list order, with the same stable tokens.
+/// balancer. The body keeps the single-model shape, and `checks.backend` is
+/// `"ok"` exactly when the status is.
+///
+/// The route is unauthenticated, and which models are configured is not for
+/// everyone: chat/completions answer an unknown model only after
+/// authentication so that the ids cannot be enumerated. So the per-model
+/// state — `models`, one entry per configured model in list order, with the
+/// same stable tokens — is added only for the `operator`, a caller that
+/// presents the gateway's own config `TOKEN`. Status code, `status` and
+/// `checks` are the same for everyone.
 ///
 /// Each model is probed the way the single model is, one backend picked from
 /// its pool, all models at once. A model whose pool already has no healthy
@@ -152,6 +165,7 @@ async fn healthz_single(state: &AppState) -> (StatusCode, Json<serde_json::Value
 async fn healthz_for_list(
     state: &AppState,
     models: &crate::model_list::ModelList,
+    operator: bool,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let skip_dstack = state.config.non_tee_deployment;
     let dstack_check = async {
@@ -174,21 +188,25 @@ async fn healthz_for_list(
 
     let any_model = model_results.iter().any(Result::is_ok);
     let healthy = dstack_result.is_ok() && any_model;
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "status": if healthy { STATUS_OK } else { "unhealthy" },
         "checks": {
             "dstack": if skip_dstack { DSTACK_SKIPPED } else { status_token(&dstack_result) },
             "backend": if any_model { STATUS_OK } else { BACKEND_UNHEALTHY },
         },
-        "models": models
+    });
+    if operator {
+        body["models"] = models
             .iter()
             .zip(&model_results)
-            .map(|(model, result)| serde_json::json!({
-                "id": model.id(),
-                "backend": status_token(result),
-            }))
-            .collect::<Vec<_>>(),
-    });
+            .map(|(model, result)| {
+                serde_json::json!({
+                    "id": model.id(),
+                    "backend": status_token(result),
+                })
+            })
+            .collect();
+    }
 
     let status = if healthy {
         StatusCode::OK

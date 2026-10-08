@@ -10,7 +10,7 @@ use crate::auth::RequireAuth;
 use crate::backend_affinity::parse_replica_hint;
 use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
-use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageType};
+use crate::proxy::{self, make_usage_reporter_for, ProxyOpts, ResponseShape, UsageType};
 use crate::routes::completion_placement::place_completion;
 use crate::routes::ROUTE_CHAT_COMPLETIONS;
 use crate::{agent_loop, fusion};
@@ -30,6 +30,11 @@ pub async fn chat_completions(
     let mut request_json: serde_json::Value = serde_json::from_slice(&request_body)
         .map_err(|e| AppError::BadRequest(format!("Invalid JSON: {e}")))?;
 
+    // The model this request is served as: the process's one model, or, in
+    // gateway list mode, the entry the body's `model` names (404 otherwise).
+    // After authentication, before anything model-specific.
+    let model = crate::model_list::model_for(&state, &request_json)?;
+
     // Strip empty tool_calls (vLLM bug workaround)
     strip_empty_tool_calls(&mut request_json);
 
@@ -40,11 +45,8 @@ pub async fn chat_completions(
     // Gateway mode: an aggregator's `reasoning` object becomes the engine's
     // `reasoning_effort` switch (`enabled: false` → `none`), otherwise the
     // model keeps thinking and the caller pays for it.
-    if state.config.backend_token.is_some() {
-        crate::reasoning::apply_reasoning_switch(
-            &mut request_json,
-            &state.config.reasoning_off_effort,
-        );
+    if model.trusted_by_backends {
+        crate::reasoning::apply_reasoning_switch(&mut request_json, model.reasoning_off_effort);
     }
 
     // Extract encryption context from headers
@@ -97,7 +99,7 @@ pub async fn chat_completions(
     // The input estimate the long-context tier routes on. Not free — it
     // re-serializes the tool definitions and the tool calls in the history —
     // so it is walked at most once per request and only where it is read.
-    let estimate = (state.config.long_context_above_tokens > 0)
+    let estimate = (model.long_context_above_tokens > 0)
         .then(|| crate::context_tier::chat_estimate(&request_json));
     // Long-context tier (gateway mode): a request whose estimated input is
     // above the threshold belongs on the long-context backends, and every
@@ -108,21 +110,21 @@ pub async fn chat_completions(
     // pinned `Some` so it is refused later (`VLLM_BACKEND_TIER_STRICT`). See
     // `context_tier.rs`.
     let tier = crate::context_tier::decide(
-        &state.backend_pool,
-        state.config.long_context_above_tokens,
-        state.config.backend_tier_strict,
+        model.backend_pool,
+        model.long_context_above_tokens,
+        model.backend_tier_strict,
         || estimate.unwrap_or_else(|| crate::context_tier::chat_estimate(&request_json)),
     );
     // Lane admission (gateway mode), first half: the overload and budget
     // checks, so a request the lane cannot take is refused before any image
     // is fetched. The slot and the backend placement are taken on the normal
     // proxy path below, after the special branches, right before dispatch.
-    state.admission.precheck(&state.backend_pool, tier)?;
+    model.admission.precheck(model.backend_pool, tier)?;
     // Same conversation digest, applied across independent backends: later
     // turns follow the backend that already holds this conversation's prefix.
-    let backend_affinity_key = state
+    let backend_affinity_key = model
         .backend_affinity
-        .key_for_chat_request(&request_json, &state.config.model_name);
+        .key_for_chat_request(&request_json, model.id);
 
     crate::image_validation::reject_invalid_images(&request_json, &state.config.image_validation())
         .await?;
@@ -241,7 +243,7 @@ pub async fn chat_completions(
 
     let upstream_data_parallel_rank = state
         .vllm_dp_affinity
-        .rank_for_chat_request(&request_json, &state.config.model_name);
+        .rank_for_chat_request(&request_json, model.id);
     let modified_body =
         serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?;
 
@@ -278,6 +280,7 @@ pub async fn chat_completions(
     // shared with text completions. Chat retains its conversation affinity.
     let placed = place_completion(
         &state,
+        &model,
         ROUTE_CHAT_COMPLETIONS,
         tier,
         backend_affinity_key,
@@ -287,8 +290,9 @@ pub async fn chat_completions(
         signing: state.signing.clone(),
         cache: state.cache.clone(),
         id_prefix: "chatcmpl".to_string(),
-        model_name: state.config.model_name.clone(),
-        usage_reporter: make_usage_reporter(&auth, &state),
+        model_name: model.id.to_string(),
+        model_label: model.label,
+        usage_reporter: make_usage_reporter_for(&auth, &state, &model),
         usage_type: UsageType::ChatCompletion,
         request_hash: Some(request_hash),
         response_transform,
@@ -309,6 +313,7 @@ pub async fn chat_completions(
         // authentication and the validation above count against it.
         first_token_deadline: proxy::first_token_deadline(
             &state,
+            &model,
             RequestStart::or_now(request_start),
             estimate,
             is_stream,
@@ -316,10 +321,9 @@ pub async fn chat_completions(
     };
 
     if is_stream {
-        proxy::proxy_streaming_request(&state.backend_client, &placed.url, modified_body, opts)
-            .await
+        proxy::proxy_streaming_request(model.backend_client, &placed.url, modified_body, opts).await
     } else {
-        proxy::proxy_json_request(&state.backend_client, &placed.url, modified_body, opts).await
+        proxy::proxy_json_request(model.backend_client, &placed.url, modified_body, opts).await
     }
 }
 

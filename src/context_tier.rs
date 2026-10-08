@@ -58,6 +58,7 @@ use serde_json::Value;
 use tracing::debug;
 
 use crate::backend_pool::BackendPool;
+use crate::model_metrics::{model_counter, model_histogram};
 
 /// cloud-api's `CONTEXT_ROUTE_SAFETY_FACTOR` (default 1.2): bytes/4
 /// underestimates code- and CJK-heavy prompts by roughly a quarter.
@@ -251,16 +252,18 @@ pub fn decide(
         (true, true) => "refused",
         (true, false) => "fallback",
     };
-    metrics::histogram!("request_estimated_prompt_tokens").record(estimate.tokens() as f64);
+    model_histogram!(pool.model(), "request_estimated_prompt_tokens")
+        .record(estimate.tokens() as f64);
     if estimate.reserve_capped {
         // A request whose output window only partly counted: if one of these
         // really generates hundreds of thousands of tokens, it does so on the
         // tier this estimate picked (normally base). Watch this beside the
         // engines' running/queued counts.
-        metrics::counter!("backend_tier_output_reserve_capped_total", "tier" => estimated.as_str())
+        model_counter!(pool.model(), "backend_tier_output_reserve_capped_total", "tier" => estimated.as_str())
             .increment(1);
     }
-    metrics::counter!(
+    model_counter!(
+        pool.model(),
         "backend_tier_requests_total",
         "tier" => estimated.as_str(),
         "outcome" => outcome
@@ -308,7 +311,8 @@ pub fn recheck_restriction(
     let restrict = restriction(pool, tier, strict);
     match restrict {
         None => {
-            metrics::counter!(
+            model_counter!(
+                pool.model(),
                 "backend_tier_requests_total",
                 "tier" => tier.as_str(),
                 "outcome" => "fallback_late"
@@ -316,7 +320,8 @@ pub fn recheck_restriction(
             .increment(1);
         }
         Some(_) if strict && pool.healthy_count_in(Some(tier)) == 0 => {
-            metrics::counter!(
+            model_counter!(
+                pool.model(),
                 "backend_tier_requests_total",
                 "tier" => tier.as_str(),
                 "outcome" => "refused_late"

@@ -5,6 +5,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::context_tier::ContextTier;
+use crate::model_metrics::{model_counter, model_gauge, ModelLabel};
 
 /// A single backend instance (e.g., one vLLM process).
 pub struct Backend {
@@ -207,6 +208,9 @@ pub struct BackendPool {
     /// long hosts, which are idle by design and would otherwise attract all
     /// of it. `None` for an untiered pool.
     untiered: Option<ContextTier>,
+    /// `model` label of this pool's series (`model_metrics.rs`); `None`
+    /// unless the pool belongs to one entry of a model list.
+    model: ModelLabel,
 }
 
 impl BackendPool {
@@ -230,7 +234,23 @@ impl BackendPool {
                     .map(|u| Arc::new(Backend::new(u, ContextTier::Long))),
             )
             .collect();
-        Self { backends, untiered }
+        Self {
+            backends,
+            untiered,
+            model: None,
+        }
+    }
+
+    /// The pool of one entry of a model list: its series, and those of the
+    /// placement code that works on it, carry `model`.
+    pub fn with_model(mut self, model: ModelLabel) -> Self {
+        self.model = model;
+        self
+    }
+
+    /// See `with_model`.
+    pub fn model(&self) -> ModelLabel {
+        self.model
     }
 
     /// Number of backends in the pool.
@@ -409,7 +429,7 @@ impl BackendPool {
             (_, false, true) => "backpressure",
             _ => "reservation_contention",
         });
-        metrics::counter!("admission_selection_failures_total", "requested_tier" => policy.requested_tier.map_or("base", ContextTier::as_str), "tier" => policy.tier.map_or("fallback", ContextTier::as_str), "reason" => reason).increment(1);
+        model_counter!(self.model, "admission_selection_failures_total", "requested_tier" => policy.requested_tier.map_or("base", ContextTier::as_str), "tier" => policy.tier.map_or("fallback", ContextTier::as_str), "reason" => reason).increment(1);
     }
 
     /// The selection policy on a snapshot of the counters (no reservation).
@@ -597,8 +617,8 @@ pub fn spawn_health_check(
                 .iter()
                 .filter(|b| b.healthy.load(Ordering::Relaxed))
                 .count();
-            metrics::gauge!("backend_pool_size").set(pool.len() as f64);
-            metrics::gauge!("backend_pool_healthy").set(healthy as f64);
+            model_gauge!(pool.model, "backend_pool_size").set(pool.len() as f64);
+            model_gauge!(pool.model, "backend_pool_healthy").set(healthy as f64);
         }
     });
 }

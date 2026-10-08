@@ -23,6 +23,8 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, warn};
 
+use crate::model_metrics::{model_counter, model_gauge, ModelLabel};
+
 /// One reading of a backend's engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sample {
@@ -33,6 +35,9 @@ pub struct Sample {
 pub struct EngineLoad {
     samples: Vec<Mutex<Option<(Instant, Sample)>>>,
     pub(crate) stale_after: Duration,
+    /// `model` label of the engine series (`model_metrics.rs`); `None` unless
+    /// these are the backends of one entry of a model list.
+    model: ModelLabel,
 }
 
 impl EngineLoad {
@@ -40,7 +45,14 @@ impl EngineLoad {
         Self {
             samples: (0..backends).map(|_| Mutex::new(None)).collect(),
             stale_after,
+            model: None,
         }
+    }
+
+    /// The engine view of one entry of a model list: its series carry `model`.
+    pub fn with_model(mut self, model: ModelLabel) -> Self {
+        self.model = model;
+        self
     }
 
     /// No probes configured: every backend reads as unknown.
@@ -67,9 +79,9 @@ impl EngineLoad {
         if let Some(slot) = self.samples.get(index) {
             *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some((now, sample));
         }
-        metrics::gauge!("backend_engine_running", "backend" => index.to_string())
+        model_gauge!(self.model, "backend_engine_running", "backend" => index.to_string())
             .set(f64::from(sample.running));
-        metrics::gauge!("backend_engine_queued", "backend" => index.to_string())
+        model_gauge!(self.model, "backend_engine_queued", "backend" => index.to_string())
             .set(f64::from(sample.queued));
     }
 }
@@ -141,21 +153,22 @@ pub fn spawn_engine_load_poller(
                 let body = match client.get(&url).timeout(timeout).send().await {
                     Ok(response) if response.status().is_success() => response.text().await.ok(),
                     Ok(response) => {
-                        debug!(backend = index, status = %response.status(), "Engine metrics probe failed");
+                        debug!(model = load.model, backend = index, status = %response.status(), "Engine metrics probe failed");
                         None
                     }
                     Err(error) => {
-                        debug!(backend = index, error = %error, "Engine metrics probe failed");
+                        debug!(model = load.model, backend = index, error = %error, "Engine metrics probe failed");
                         None
                     }
                 };
                 match body.as_deref().and_then(parse_sample) {
                     Some(sample) => load.record_at(index, sample, Instant::now()),
                     None => {
-                        metrics::counter!("backend_engine_probe_failures_total", "backend" => index.to_string())
+                        model_counter!(load.model, "backend_engine_probe_failures_total", "backend" => index.to_string())
                             .increment(1);
                         if body.is_some() {
                             warn!(
+                                model = load.model,
                                 backend = index,
                                 "Engine metrics did not expose a running-requests gauge"
                             );

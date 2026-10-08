@@ -80,6 +80,15 @@ fn parse_discount_to_user(raw: &str) -> anyhow::Result<Option<f64>> {
     let discount: f64 = raw
         .parse()
         .map_err(|_| anyhow::anyhow!("{NAME} must be a number in [0, 1), got {raw:?}"))?;
+    validate_discount_to_user(discount, raw)
+}
+
+/// The range and precision rules of `parse_discount_to_user`, for a value that
+/// is already a number: the variable, or a model list entry's
+/// `discount_to_user` (`model_list.rs`). `raw` is how it was written, for the
+/// message.
+pub(crate) fn validate_discount_to_user(discount: f64, raw: &str) -> anyhow::Result<Option<f64>> {
+    const NAME: &str = "VLLM_PROXY_DISCOUNT_TO_USER";
     if !discount.is_finite() || !(0.0..1.0).contains(&discount) {
         anyhow::bail!("{NAME} must be a number in [0, 1), got {raw:?}");
     }
@@ -91,6 +100,139 @@ fn parse_discount_to_user(raw: &str) -> anyhow::Result<Option<f64>> {
         anyhow::bail!("{NAME} must have at most four decimal places, got {raw:?}");
     }
     Ok((basis_points > 0.0).then_some(discount))
+}
+
+/// One model's admission numbers, as `check_admission` reads them.
+pub(crate) struct AdmissionKnobs {
+    pub max_inflight: u32,
+    pub start_inflight: u32,
+    pub ramp_step: u32,
+    pub ramp_interval_secs: u64,
+    pub backpressure_secs: u64,
+    pub queue_saturated_at: u32,
+    pub retry_after_secs: u64,
+}
+
+/// The rules of one model's admission budget. Applied to the single-model
+/// variables and to every entry of a model list (`model_list.rs`), whose keys
+/// are named after the variables in the messages. Nothing to check while
+/// admission is off.
+pub(crate) fn check_admission(knobs: &AdmissionKnobs) -> anyhow::Result<()> {
+    if knobs.max_inflight == 0 {
+        return Ok(());
+    }
+    if knobs.start_inflight == 0 || knobs.start_inflight > knobs.max_inflight {
+        anyhow::bail!(
+            "VLLM_PROXY_ADMISSION_START_INFLIGHT must be between 1 and VLLM_PROXY_ADMISSION_MAX_INFLIGHT"
+        );
+    }
+    if knobs.start_inflight < knobs.max_inflight && knobs.ramp_step == 0 {
+        anyhow::bail!("VLLM_PROXY_ADMISSION_RAMP_STEP must be at least 1 when the budget ramps");
+    }
+    if knobs.ramp_interval_secs == 0 {
+        anyhow::bail!("VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS must be at least 1");
+    }
+    if knobs.backpressure_secs == 0 {
+        anyhow::bail!("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS must be at least 1");
+    }
+    if knobs.queue_saturated_at == 0 {
+        anyhow::bail!("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT must be at least 1");
+    }
+    if knobs.retry_after_secs == 0 {
+        anyhow::bail!("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS must be at least 1");
+    }
+    Ok(())
+}
+
+/// One engine-load probe per backend, or none at all. Same sharing as
+/// `check_admission`.
+pub(crate) fn check_probe_urls(
+    backend_urls: &[String],
+    backend_probe_urls: &[String],
+) -> anyhow::Result<()> {
+    if !backend_probe_urls.is_empty() && backend_probe_urls.len() != backend_urls.len() {
+        anyhow::bail!(
+            "VLLM_BACKEND_PROBE_URLS must list one probe URL per VLLM_BACKEND_URLS entry, in the same order"
+        );
+    }
+    Ok(())
+}
+
+/// One model's backends and tier settings, as `check_long_context_tier` reads
+/// them.
+pub(crate) struct TierKnobs<'a> {
+    pub backend_urls: &'a [String],
+    pub backend_probe_urls: &'a [String],
+    pub backend_long_context_urls: &'a [String],
+    pub backend_long_context_probe_urls: &'a [String],
+    pub long_context_above_tokens: u64,
+    pub admission_max_inflight: u32,
+    pub admission_start_inflight: u32,
+    pub admission_tier_borrowing: bool,
+    pub admission_long_max_inflight_per_host: u32,
+    pub admission_long_reserved_inflight: u32,
+}
+
+/// The rules of one model's long-context tier. Same sharing as
+/// `check_admission`.
+pub(crate) fn check_long_context_tier(tier: &TierKnobs<'_>) -> anyhow::Result<()> {
+    if !tier.backend_long_context_urls.is_empty() && tier.long_context_above_tokens == 0 {
+        anyhow::bail!(
+            "VLLM_BACKEND_LONG_CONTEXT_URLS requires VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS: without a threshold nothing would ever be placed there"
+        );
+    }
+    if tier.long_context_above_tokens > 0 && tier.backend_long_context_urls.is_empty() {
+        anyhow::bail!(
+            "VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS requires VLLM_BACKEND_LONG_CONTEXT_URLS"
+        );
+    }
+    if tier.admission_tier_borrowing
+        && (tier.admission_max_inflight == 0
+            || tier.backend_urls.is_empty()
+            || tier.backend_long_context_urls.is_empty()
+            || tier.admission_long_max_inflight_per_host == 0)
+    {
+        anyhow::bail!("VLLM_PROXY_ADMISSION_TIER_BORROWING requires admission, both backend tiers, and positive VLLM_PROXY_ADMISSION_LONG_MAX_INFLIGHT_PER_HOST");
+    }
+    if tier.admission_long_reserved_inflight > 0 {
+        if !tier.admission_tier_borrowing {
+            anyhow::bail!("VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT requires VLLM_PROXY_ADMISSION_TIER_BORROWING");
+        }
+        // Compared with the starting budget, the lowest the budget ever
+        // is, so the base tier always keeps at least one slot.
+        if tier.admission_long_reserved_inflight >= tier.admission_start_inflight {
+            anyhow::bail!("VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT must be below VLLM_PROXY_ADMISSION_START_INFLIGHT");
+        }
+    }
+    if let Some(both) = tier
+        .backend_long_context_urls
+        .iter()
+        .find(|url| tier.backend_urls.contains(url))
+    {
+        anyhow::bail!(
+            "{both} is listed in both VLLM_BACKEND_URLS and VLLM_BACKEND_LONG_CONTEXT_URLS; one pool entry serves one tier"
+        );
+    }
+    let expected_long_probes = if tier.backend_probe_urls.is_empty() {
+        0
+    } else {
+        tier.backend_long_context_urls.len()
+    };
+    if tier.backend_long_context_probe_urls.len() != expected_long_probes {
+        anyhow::bail!(
+            "VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS must list one probe URL per VLLM_BACKEND_LONG_CONTEXT_URLS entry when VLLM_BACKEND_PROBE_URLS is set, and none when it is not"
+        );
+    }
+    if let Some(twice) = tier
+        .backend_long_context_probe_urls
+        .iter()
+        .find(|url| tier.backend_probe_urls.contains(url))
+    {
+        anyhow::bail!(
+            "{twice} is listed in both VLLM_BACKEND_PROBE_URLS and VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS: a host serving both tiers has two pool entries but one engine, which the share and the engine samples would count twice"
+        );
+    }
+    Ok(())
 }
 
 fn is_gemma4_model_name(model_name: &str) -> bool {
@@ -130,6 +272,15 @@ fn normalize_host(host: &str) -> String {
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Gateway list mode (`VLLM_PROXY_MODEL_LIST_FILE`, `model_list.rs`): the
+    /// models this process serves, each resolved against the per-model
+    /// variables as its defaults. `None` = one model, described by the
+    /// fields below, exactly as before the list existed. With a list those
+    /// per-model fields (`model_name`, the backend lists, the backend token
+    /// and priority, the admission budget, the tier, capacity, discount and
+    /// reasoning-off effort) are left unset: the list is the only place a
+    /// model is defined.
+    pub model_list: Option<crate::model_list::ModelListConfig>,
     pub model_name: String,
     /// Accepted admin tokens. Parsed from `TOKEN` (comma-separated) so multiple
     /// tokens can be active at once during a rotation.
@@ -538,8 +689,30 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
-        let model_name = env::var("MODEL_NAME")
-            .map_err(|_| anyhow::anyhow!("MODEL_NAME environment variable is required"))?;
+        // Gateway list mode: ids and backends come from the file, so the
+        // variables that name the one model of a single-model process have
+        // nothing to say next to it, and are refused rather than ignored.
+        let model_list_file = env::var(crate::model_list::MODEL_LIST_FILE_ENV)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let list_mode = model_list_file.is_some();
+        if list_mode {
+            for name in crate::model_list::SINGLE_MODEL_ENV {
+                if env::var(name).is_ok_and(|v| !v.trim().is_empty()) {
+                    anyhow::bail!(
+                        "{name} cannot be set together with {}: the file names every model and its backends",
+                        crate::model_list::MODEL_LIST_FILE_ENV
+                    );
+                }
+            }
+        }
+        let model_name = if list_mode {
+            String::new()
+        } else {
+            env::var("MODEL_NAME")
+                .map_err(|_| anyhow::anyhow!("MODEL_NAME environment variable is required"))?
+        };
         let raw_tokens = env::var("TOKEN")
             .map_err(|_| anyhow::anyhow!("TOKEN environment variable is required"))?;
         let tokens: Vec<String> = raw_tokens
@@ -551,7 +724,13 @@ impl Config {
             anyhow::bail!("TOKEN must contain at least one non-empty token");
         }
 
-        let vllm_base_url = env_or("VLLM_BASE_URL", "http://localhost:8000");
+        // List mode has no engine of its own next to it: the single-model
+        // backend is a name that cannot resolve (`UNROUTED_BACKEND_URL`).
+        let vllm_base_url = if list_mode {
+            crate::model_list::UNROUTED_BACKEND_URL.to_string()
+        } else {
+            env_or("VLLM_BASE_URL", "http://localhost:8000")
+        };
         let base = vllm_base_url.trim_end_matches('/');
 
         // Multi-backend: VLLM_BACKEND_URLS takes precedence over VLLM_BASE_URL
@@ -775,6 +954,8 @@ impl Config {
             "VLLM_PROXY_ADMISSION_START_INFLIGHT",
             admission_max_inflight,
         )?;
+        let admission_start_inflight_is_set =
+            env::var("VLLM_PROXY_ADMISSION_START_INFLIGHT").is_ok_and(|raw| !raw.trim().is_empty());
         let admission_ramp_step: u32 = env_parse("VLLM_PROXY_ADMISSION_RAMP_STEP", 8)?;
         let admission_ramp_interval_secs: u64 =
             env_parse("VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS", 1800)?;
@@ -786,37 +967,22 @@ impl Config {
             env_parse("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT", 1)?;
         let admission_retry_after_secs: u64 =
             env_parse("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS", 2)?;
-        if admission_max_inflight > 0 {
-            if admission_start_inflight == 0 || admission_start_inflight > admission_max_inflight {
-                anyhow::bail!(
-                    "VLLM_PROXY_ADMISSION_START_INFLIGHT must be between 1 and VLLM_PROXY_ADMISSION_MAX_INFLIGHT"
-                );
-            }
-            if admission_start_inflight < admission_max_inflight && admission_ramp_step == 0 {
-                anyhow::bail!(
-                    "VLLM_PROXY_ADMISSION_RAMP_STEP must be at least 1 when the budget ramps"
-                );
-            }
-            if admission_ramp_interval_secs == 0 {
-                anyhow::bail!("VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS must be at least 1");
-            }
-            if admission_backpressure_secs == 0 {
-                anyhow::bail!("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS must be at least 1");
-            }
-            if admission_queue_saturated_at == 0 {
-                anyhow::bail!("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT must be at least 1");
-            }
-            if admission_retry_after_secs == 0 {
-                anyhow::bail!("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS must be at least 1");
-            }
+        // In list mode these are the entries' defaults, and each entry is
+        // checked with what it resolves to (`model_list::load`, below).
+        if !list_mode {
+            check_admission(&AdmissionKnobs {
+                max_inflight: admission_max_inflight,
+                start_inflight: admission_start_inflight,
+                ramp_step: admission_ramp_step,
+                ramp_interval_secs: admission_ramp_interval_secs,
+                backpressure_secs: admission_backpressure_secs,
+                queue_saturated_at: admission_queue_saturated_at,
+                retry_after_secs: admission_retry_after_secs,
+            })?;
         }
         let backend_connect_failover = env_bool("VLLM_BACKEND_CONNECT_FAILOVER");
         let backend_probe_urls = url_list("VLLM_BACKEND_PROBE_URLS");
-        if !backend_probe_urls.is_empty() && backend_probe_urls.len() != backend_urls.len() {
-            anyhow::bail!(
-                "VLLM_BACKEND_PROBE_URLS must list one probe URL per VLLM_BACKEND_URLS entry, in the same order"
-            );
-        }
+        check_probe_urls(&backend_urls, &backend_probe_urls)?;
         let backend_probe_interval_secs: u64 = env_parse("VLLM_BACKEND_PROBE_INTERVAL_SECS", 2)?;
         if backend_probe_interval_secs == 0 {
             anyhow::bail!("VLLM_BACKEND_PROBE_INTERVAL_SECS must be at least 1");
@@ -828,59 +994,21 @@ impl Config {
         let backend_long_context_probe_urls = url_list("VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS");
         let long_context_above_tokens: u64 =
             env_parse("VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS", 0)?;
-        if !backend_long_context_urls.is_empty() && long_context_above_tokens == 0 {
-            anyhow::bail!(
-                "VLLM_BACKEND_LONG_CONTEXT_URLS requires VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS: without a threshold nothing would ever be placed there"
-            );
-        }
-        if long_context_above_tokens > 0 && backend_long_context_urls.is_empty() {
-            anyhow::bail!(
-                "VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS requires VLLM_BACKEND_LONG_CONTEXT_URLS"
-            );
-        }
-        if admission_tier_borrowing
-            && (admission_max_inflight == 0
-                || backend_urls.is_empty()
-                || backend_long_context_urls.is_empty()
-                || admission_long_max_inflight_per_host == 0)
-        {
-            anyhow::bail!("VLLM_PROXY_ADMISSION_TIER_BORROWING requires admission, both backend tiers, and positive VLLM_PROXY_ADMISSION_LONG_MAX_INFLIGHT_PER_HOST");
-        }
-        if admission_long_reserved_inflight > 0 {
-            if !admission_tier_borrowing {
-                anyhow::bail!("VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT requires VLLM_PROXY_ADMISSION_TIER_BORROWING");
-            }
-            // Compared with the starting budget, the lowest the budget ever
-            // is, so the base tier always keeps at least one slot.
-            if admission_long_reserved_inflight >= admission_start_inflight {
-                anyhow::bail!("VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT must be below VLLM_PROXY_ADMISSION_START_INFLIGHT");
-            }
-        }
-        if let Some(both) = backend_long_context_urls
-            .iter()
-            .find(|url| backend_urls.contains(url))
-        {
-            anyhow::bail!(
-                "{both} is listed in both VLLM_BACKEND_URLS and VLLM_BACKEND_LONG_CONTEXT_URLS; one pool entry serves one tier"
-            );
-        }
-        let expected_long_probes = if backend_probe_urls.is_empty() {
-            0
-        } else {
-            backend_long_context_urls.len()
-        };
-        if backend_long_context_probe_urls.len() != expected_long_probes {
-            anyhow::bail!(
-                "VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS must list one probe URL per VLLM_BACKEND_LONG_CONTEXT_URLS entry when VLLM_BACKEND_PROBE_URLS is set, and none when it is not"
-            );
-        }
-        if let Some(twice) = backend_long_context_probe_urls
-            .iter()
-            .find(|url| backend_probe_urls.contains(url))
-        {
-            anyhow::bail!(
-                "{twice} is listed in both VLLM_BACKEND_PROBE_URLS and VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS: a host serving both tiers has two pool entries but one engine, which the share and the engine samples would count twice"
-            );
+        // As above: in list mode the tier variables are defaults for the
+        // entries that have a tier, and no tier of this process's own.
+        if !list_mode {
+            check_long_context_tier(&TierKnobs {
+                backend_urls: &backend_urls,
+                backend_probe_urls: &backend_probe_urls,
+                backend_long_context_urls: &backend_long_context_urls,
+                backend_long_context_probe_urls: &backend_long_context_probe_urls,
+                long_context_above_tokens,
+                admission_max_inflight,
+                admission_start_inflight,
+                admission_tier_borrowing,
+                admission_long_max_inflight_per_host,
+                admission_long_reserved_inflight,
+            })?;
         }
         if !backend_long_context_urls.is_empty() && vllm_data_parallel_size.is_some() {
             anyhow::bail!(
@@ -888,7 +1016,11 @@ impl Config {
             );
         }
         let backend_tier_strict = env_bool("VLLM_BACKEND_TIER_STRICT");
+        // What the variable says, before it is dropped for a process without
+        // a tier: a model list entry with a tier defaults to it.
+        let backend_tier_strict_requested = backend_tier_strict;
         if backend_tier_strict
+            && !list_mode
             && !tier_strict_has_something_to_isolate(
                 &backend_long_context_urls,
                 long_context_above_tokens,
@@ -941,7 +1073,8 @@ impl Config {
                     None
                 }
             };
-        let config = Config {
+        let mut config = Config {
+            model_list: None,
             model_name,
             tokens,
             vllm_base_url: vllm_base_url.clone(),
@@ -1185,7 +1318,84 @@ impl Config {
                 "VLLM_BACKEND_LONG_CONTEXT_URLS cannot be combined with FUSION_ENABLED or WEB_CONTEXT_SEARCH_URL: those execution modes place their own backend requests, outside the tier"
             );
         }
+        if let Some(path) = model_list_file {
+            crate::model_list::check_process(&config)?;
+            let defaults = crate::model_list::ModelDefaults {
+                long_context_above_tokens: config.long_context_above_tokens,
+                backend_tier_strict: backend_tier_strict_requested,
+                admission_max_inflight: config.admission_max_inflight,
+                admission_start_inflight: admission_start_inflight_is_set
+                    .then_some(config.admission_start_inflight),
+                admission_queue_saturated_at: config.admission_queue_saturated_at,
+                admission_tier_borrowing: config.admission_tier_borrowing,
+                admission_long_max_inflight_per_host: config.admission_long_max_inflight_per_host,
+                admission_long_reserved_inflight: config.admission_long_reserved_inflight,
+                capacity_requests_per_minute: config.capacity_requests_per_minute,
+                discount_to_user: config.discount_to_user,
+                reasoning_off_effort: config.reasoning_off_effort.clone(),
+                backend_token: config.backend_token.clone(),
+                backend_priority: config.backend_priority,
+            };
+            let process = crate::model_list::ProcessSettings {
+                admission_ramp_step: config.admission_ramp_step,
+                admission_ramp_interval_secs: config.admission_ramp_interval_secs,
+                admission_backpressure_secs: config.admission_backpressure_secs,
+                admission_retry_after_secs: config.admission_retry_after_secs,
+                bills_usage: config.cloud_api_url.is_some()
+                    && config.cloud_api_usage_token.is_some(),
+            };
+            let models =
+                crate::model_list::load(&path, &defaults, &process, &|name| env::var(name).ok())?;
+            config.unset_single_model();
+            config.model_list = Some(crate::model_list::ModelListConfig { path, models });
+        }
         Ok(config)
+    }
+
+    /// List mode: the per-model variables were the defaults of the list's
+    /// entries (`model_list::ModelDefaults`), not a model of this process's
+    /// own. Their fields go back to unset, so nothing outside the list can
+    /// serve, admit or bill as a model.
+    fn unset_single_model(&mut self) {
+        self.backend_token = None;
+        self.backend_priority = None;
+        self.discount_to_user = None;
+        self.capacity_requests_per_minute = 0;
+        self.reasoning_off_effort = "none".to_string();
+        self.admission_max_inflight = 0;
+        self.admission_start_inflight = 0;
+        self.admission_queue_saturated_at = 1;
+        self.admission_tier_borrowing = false;
+        self.admission_long_max_inflight_per_host = 0;
+        self.admission_long_reserved_inflight = 0;
+        self.long_context_above_tokens = 0;
+        self.backend_tier_strict = false;
+    }
+
+    /// The one model of a single-model process, in the shape an entry of a
+    /// model list resolves to: the same values configure the same model
+    /// either way.
+    pub fn single_model(&self) -> crate::model_list::ModelConfig {
+        crate::model_list::ModelConfig {
+            id: self.model_name.clone(),
+            backend_urls: self.backend_urls.clone(),
+            backend_probe_urls: self.backend_probe_urls.clone(),
+            backend_long_context_urls: self.backend_long_context_urls.clone(),
+            backend_long_context_probe_urls: self.backend_long_context_probe_urls.clone(),
+            long_context_above_tokens: self.long_context_above_tokens,
+            backend_tier_strict: self.backend_tier_strict,
+            admission_max_inflight: self.admission_max_inflight,
+            admission_start_inflight: self.admission_start_inflight,
+            admission_queue_saturated_at: self.admission_queue_saturated_at,
+            admission_tier_borrowing: self.admission_tier_borrowing,
+            admission_long_max_inflight_per_host: self.admission_long_max_inflight_per_host,
+            admission_long_reserved_inflight: self.admission_long_reserved_inflight,
+            capacity_requests_per_minute: self.capacity_requests_per_minute,
+            discount_to_user: self.discount_to_user,
+            reasoning_off_effort: self.reasoning_off_effort.clone(),
+            backend_token: self.backend_token.clone(),
+            backend_priority: self.backend_priority,
+        }
     }
 
     /// Engine-load probe URLs in pool order: the base tier, then the
@@ -1206,21 +1416,32 @@ impl Config {
 
     /// Lane admission settings, `None` unless `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` is set.
     pub fn admission(&self) -> Option<crate::admission::AdmissionConfig> {
-        if self.admission_max_inflight == 0 {
+        self.admission_for(&self.single_model())
+    }
+
+    /// Lane admission settings of `model`, `None` while its budget is off:
+    /// the budget, the queue threshold and the tier numbers are the model's,
+    /// the ramp, the time-to-first-token bound, the back-pressure window and
+    /// `Retry-After` are the process's.
+    pub fn admission_for(
+        &self,
+        model: &crate::model_list::ModelConfig,
+    ) -> Option<crate::admission::AdmissionConfig> {
+        if model.admission_max_inflight == 0 {
             return None;
         }
         Some(crate::admission::AdmissionConfig {
-            max_inflight: self.admission_max_inflight,
-            tier_borrowing: self.admission_tier_borrowing,
-            long_max_inflight_per_host: self.admission_long_max_inflight_per_host,
-            long_reserved_inflight: self.admission_long_reserved_inflight,
-            start_inflight: self.admission_start_inflight,
+            max_inflight: model.admission_max_inflight,
+            tier_borrowing: model.admission_tier_borrowing,
+            long_max_inflight_per_host: model.admission_long_max_inflight_per_host,
+            long_reserved_inflight: model.admission_long_reserved_inflight,
+            start_inflight: model.admission_start_inflight,
             ramp_step: self.admission_ramp_step,
             ramp_interval: std::time::Duration::from_secs(self.admission_ramp_interval_secs),
             ttft_p95_max: (self.admission_ttft_p95_max_ms > 0)
                 .then(|| std::time::Duration::from_millis(self.admission_ttft_p95_max_ms)),
             backpressure_ttl: std::time::Duration::from_secs(self.admission_backpressure_secs),
-            queue_saturated_at: self.admission_queue_saturated_at,
+            queue_saturated_at: model.admission_queue_saturated_at,
             retry_after: std::time::Duration::from_secs(self.admission_retry_after_secs),
         })
     }
@@ -2663,6 +2884,440 @@ mod tests {
                 env::remove_var("VLLM_BACKEND_PROBE_URLS");
                 env::remove_var("VLLM_BACKEND_URLS");
                 env::remove_var("VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS");
+            },
+        );
+    }
+
+    /// `with_env_vars` from a clean set of gateway variables, with `vars` on
+    /// top and none of them left behind.
+    fn with_clean_env<R>(
+        restored: &[(&str, &str)],
+        vars: &[(&str, &str)],
+        f: impl FnOnce() -> R,
+    ) -> R {
+        with_env_vars(restored, || {
+            gateway_env_cleanup();
+            for (key, value) in vars {
+                env::set_var(key, value);
+            }
+            let result = f();
+            for (key, _) in vars {
+                env::remove_var(key);
+            }
+            result
+        })
+    }
+
+    /// What list mode needs besides the list.
+    const LIST_MODE_ENV: [(&str, &str); 2] = [
+        ("NON_TEE_DEPLOYMENT", "1"),
+        (
+            "VLLM_PROXY_MODELS_DOCUMENT_URL",
+            "https://catalog.example/v1/models",
+        ),
+    ];
+
+    /// Run `f` in gateway list mode: `list` in a file named by
+    /// `VLLM_PROXY_MODEL_LIST_FILE`, `LIST_MODE_ENV`, and `vars` on top (an
+    /// empty value takes one of those away again).
+    fn with_model_list<R>(
+        list: &serde_json::Value,
+        vars: &[(&str, &str)],
+        f: impl FnOnce() -> R,
+    ) -> R {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), list.to_string()).unwrap();
+        let path = file.path().to_str().unwrap();
+        let vars: Vec<_> = LIST_MODE_ENV.iter().chain(vars).copied().collect();
+        with_clean_env(
+            &[
+                ("MODEL_NAME", ""),
+                ("TOKEN", "t"),
+                (crate::model_list::MODEL_LIST_FILE_ENV, path),
+            ],
+            &vars,
+            f,
+        )
+    }
+
+    fn two_models() -> serde_json::Value {
+        serde_json::json!({"models": [
+            {"id": "example/alpha", "backend_urls": ["https://alpha-b1.example"]},
+            {"id": "example/beta", "backend_urls": ["https://beta-b1.example"]}
+        ]})
+    }
+
+    #[test]
+    fn test_model_list_file_switches_list_mode_on() {
+        // Without the variable there is no list: one model, from MODEL_NAME.
+        with_clean_env(&[("MODEL_NAME", "m"), ("TOKEN", "t")], &[], || {
+            let config = Config::from_env().unwrap();
+            assert!(config.model_list.is_none());
+            assert_eq!(config.model_name, "m");
+        });
+        // An empty value is not a path either.
+        with_clean_env(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                (crate::model_list::MODEL_LIST_FILE_ENV, " "),
+            ],
+            &[],
+            || assert!(Config::from_env().unwrap().model_list.is_none()),
+        );
+
+        with_model_list(
+            &two_models(),
+            &[
+                ("CLOUD_API_URL", "https://cloud-api.example"),
+                ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+                // Defaults for the entries, not a model of the process's own.
+                ("VLLM_BACKEND_TOKEN", "shared-secret"),
+                ("VLLM_BACKEND_PRIORITY", "-1"),
+                ("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", "48"),
+                ("VLLM_PROXY_DISCOUNT_TO_USER", "0.2"),
+                ("VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE", "150"),
+                ("VLLM_PROXY_REASONING_OFF_EFFORT", "low"),
+                // Tier defaults without a tier anywhere: fine in list mode.
+                ("VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS", "100000"),
+                ("VLLM_BACKEND_TIER_STRICT", "1"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                let list = config.model_list.as_ref().expect("list mode");
+                assert!(list.path.ends_with(
+                    env::var(crate::model_list::MODEL_LIST_FILE_ENV)
+                        .unwrap()
+                        .as_str()
+                ));
+                let ids: Vec<_> = list.models.iter().map(|m| m.id.as_str()).collect();
+                assert_eq!(ids, ["example/alpha", "example/beta"]);
+                for model in &list.models {
+                    assert_eq!(model.backend_token.as_deref(), Some("shared-secret"));
+                    assert_eq!(model.backend_priority, Some(-1));
+                    assert_eq!(model.admission_max_inflight, 48);
+                    assert_eq!(model.admission_start_inflight, 48);
+                    assert_eq!(model.discount_to_user, Some(0.2));
+                    assert_eq!(model.capacity_requests_per_minute, 150);
+                    assert_eq!(model.reasoning_off_effort, "low");
+                    assert_eq!(model.long_context_above_tokens, 0);
+                    assert!(!model.backend_tier_strict);
+                    assert!(config.admission_for(model).is_some());
+                }
+
+                // The process itself is no model: nothing to route to, no
+                // bearer, no budget, nothing to bill as.
+                assert_eq!(config.model_name, "");
+                assert_eq!(
+                    config.backend_urls,
+                    [crate::model_list::UNROUTED_BACKEND_URL]
+                );
+                assert!(config
+                    .chat_completions_url
+                    .starts_with(crate::model_list::UNROUTED_BACKEND_URL));
+                assert!(config.backend_token.is_none());
+                assert!(config.backend_priority.is_none());
+                assert!(config.admission().is_none());
+                assert!(config.discount_to_user.is_none());
+                assert_eq!(config.capacity_requests_per_minute, 0);
+                assert_eq!(config.reasoning_off_effort, "none");
+                assert_eq!(config.long_context_above_tokens, 0);
+                assert!(!config.backend_tier_strict);
+                assert!(config.pool_probe_urls().is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn test_a_list_of_one_model_is_the_single_model_configuration() {
+        let hosts = [
+            (
+                "VLLM_BACKEND_URLS",
+                "https://alpha-b1.example,https://alpha-b2.example/",
+            ),
+            (
+                "VLLM_BACKEND_PROBE_URLS",
+                "http://alpha-1.example:8000,http://alpha-2.example:8000",
+            ),
+            (
+                "VLLM_BACKEND_LONG_CONTEXT_URLS",
+                "https://alpha-long-b3.example",
+            ),
+            (
+                "VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS",
+                "http://alpha-3.example:8000",
+            ),
+        ];
+        let per_model = [
+            ("VLLM_BACKEND_PRIORITY", "-1"),
+            ("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", "48"),
+            ("VLLM_PROXY_ADMISSION_START_INFLIGHT", "32"),
+            ("VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT", "4"),
+            ("VLLM_PROXY_ADMISSION_TIER_BORROWING", "1"),
+            ("VLLM_PROXY_ADMISSION_LONG_MAX_INFLIGHT_PER_HOST", "12"),
+            ("VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT", "8"),
+            ("VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS", "100000"),
+            ("VLLM_BACKEND_TIER_STRICT", "1"),
+            ("VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE", "150"),
+            ("VLLM_PROXY_DISCOUNT_TO_USER", "0.3"),
+            ("VLLM_PROXY_REASONING_OFF_EFFORT", "low"),
+        ];
+        // Process-level in both modes.
+        let shared = [
+            ("CLOUD_API_URL", "https://cloud-api.example"),
+            ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+            ("VLLM_PROXY_ADMISSION_RAMP_STEP", "4"),
+            ("VLLM_PROXY_ADMISSION_RAMP_INTERVAL_SECS", "600"),
+            ("VLLM_PROXY_ADMISSION_TTFT_P95_MAX_MS", "20000"),
+            ("VLLM_PROXY_ADMISSION_BACKPRESSURE_SECS", "5"),
+            ("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS", "3"),
+        ];
+        let effective = |config: &Config, model: crate::model_list::ModelConfig| {
+            let admission = config.admission_for(&model);
+            (model, admission)
+        };
+
+        // One model from the environment, as every gateway runs today.
+        let single_env: Vec<_> = LIST_MODE_ENV
+            .iter()
+            .chain(&shared)
+            .chain(&hosts)
+            .chain(&per_model)
+            .chain(&[("VLLM_BACKEND_TOKEN", "backend-secret")])
+            .copied()
+            .collect();
+        let single = with_clean_env(
+            &[("MODEL_NAME", "example/alpha"), ("TOKEN", "t")],
+            &single_env,
+            || {
+                let config = Config::from_env().unwrap();
+                assert!(config.model_list.is_none());
+                assert_eq!(
+                    config.admission(),
+                    config.admission_for(&config.single_model())
+                );
+                effective(&config, config.single_model())
+            },
+        );
+        assert_eq!(single.0.id, "example/alpha");
+        assert_eq!(single.0.backend_urls.len(), 2);
+        assert!(single.0.backend_tier_strict);
+        assert_eq!(single.1.as_ref().unwrap().start_inflight, 32);
+
+        // The same model written out in full, none of its variables set.
+        let written_out = serde_json::json!({"models": [{
+            "id": "example/alpha",
+            "backend_urls": ["https://alpha-b1.example", "https://alpha-b2.example/"],
+            "backend_probe_urls": ["http://alpha-1.example:8000", "http://alpha-2.example:8000"],
+            "long_context": {
+                "backend_urls": ["https://alpha-long-b3.example"],
+                "backend_probe_urls": ["http://alpha-3.example:8000"],
+                "above_tokens": 100000,
+                "strict": true,
+                "borrowing": true,
+                "max_inflight_per_host": 12,
+                "reserved_inflight": 8
+            },
+            "admission_max_inflight": 48,
+            "admission_start_inflight": 32,
+            "admission_queue_saturated_at": 4,
+            "capacity_requests_per_minute": 150,
+            "discount_to_user": 0.3,
+            "reasoning_off_effort": "low",
+            "backend_token_env": "VLLM_BACKEND_TOKEN_ALPHA",
+            "backend_priority": -1
+        }]});
+        let full_env: Vec<_> = shared
+            .iter()
+            .chain(&[("VLLM_BACKEND_TOKEN_ALPHA", "backend-secret")])
+            .copied()
+            .collect();
+        let full = with_model_list(&written_out, &full_env, || {
+            let config = Config::from_env().unwrap();
+            let model = config.model_list.as_ref().unwrap().models[0].clone();
+            effective(&config, model)
+        });
+        assert_eq!(single, full);
+
+        // And as `id` plus its hosts, everything else left to the variables.
+        let hosts_only = serde_json::json!({"models": [{
+            "id": "example/alpha",
+            "backend_urls": ["https://alpha-b1.example", "https://alpha-b2.example/"],
+            "backend_probe_urls": ["http://alpha-1.example:8000", "http://alpha-2.example:8000"],
+            "long_context": {
+                "backend_urls": ["https://alpha-long-b3.example"],
+                "backend_probe_urls": ["http://alpha-3.example:8000"]
+            }
+        }]});
+        let defaulted_env: Vec<_> = shared
+            .iter()
+            .chain(&per_model)
+            .chain(&[("VLLM_BACKEND_TOKEN", "backend-secret")])
+            .copied()
+            .collect();
+        let defaulted = with_model_list(&hosts_only, &defaulted_env, || {
+            let config = Config::from_env().unwrap();
+            let model = config.model_list.as_ref().unwrap().models[0].clone();
+            effective(&config, model)
+        });
+        assert_eq!(single, defaulted);
+    }
+
+    #[test]
+    fn test_list_mode_refuses_what_assumes_one_model() {
+        let list = two_models();
+        let error_with = |vars: &[(&str, &str)]| {
+            with_model_list(&list, vars, || {
+                Config::from_env()
+                    .expect_err("list mode must refuse this")
+                    .to_string()
+            })
+        };
+        // The variables that name the single model and its backends.
+        for (name, value) in [
+            ("MODEL_NAME", "example/alpha"),
+            ("VLLM_BACKEND_URLS", "https://alpha-b1.example"),
+            ("VLLM_BACKEND_PROBE_URLS", "http://alpha-1.example:8000"),
+            (
+                "VLLM_BACKEND_LONG_CONTEXT_URLS",
+                "https://alpha-long.example",
+            ),
+            (
+                "VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS",
+                "http://alpha-2.example:8000",
+            ),
+        ] {
+            let error = error_with(&[(name, value)]);
+            assert!(
+                error.contains(name) && error.contains("VLLM_PROXY_MODEL_LIST_FILE"),
+                "{name}: {error}"
+            );
+        }
+        // What list mode cannot do without.
+        for name in ["NON_TEE_DEPLOYMENT", "VLLM_PROXY_MODELS_DOCUMENT_URL"] {
+            let error = error_with(&[(name, "")]);
+            assert!(
+                error.contains(&format!("VLLM_PROXY_MODEL_LIST_FILE requires {name}")),
+                "{error}"
+            );
+        }
+        // Features built around one model, each otherwise fully configured.
+        let features: [(&str, &[(&str, &str)]); 6] = [
+            (
+                "FUSION_ENABLED",
+                &[
+                    ("FUSION_ENABLED", "1"),
+                    ("FUSION_INTERNAL_BEARER_TOKEN", "fusion-secret"),
+                ],
+            ),
+            (
+                "WEB_CONTEXT_SEARCH_URL",
+                &[
+                    ("WEB_CONTEXT_SEARCH_URL", "https://search.example"),
+                    ("WEB_CONTEXT_SEARCH_API_KEY", "search-secret"),
+                ],
+            ),
+            ("OHTTP_ENABLED", &[("OHTTP_ENABLED", "1")]),
+            (
+                "VLLM_DATA_PARALLEL_SIZE",
+                &[("VLLM_DATA_PARALLEL_SIZE", "2")],
+            ),
+            (
+                "OPENAI_CHAT_COMPATIBILITY_CHECK",
+                &[("OPENAI_CHAT_COMPATIBILITY_CHECK", "true")],
+            ),
+            (
+                "REPLICA_STATE_REDIS_URL",
+                &[
+                    ("REPLICA_STATE_REDIS_URL", "redis://r:6379"),
+                    ("REPLICA_STATE_HOST_ID", "host01"),
+                ],
+            ),
+        ];
+        for (name, vars) in features {
+            let error = error_with(vars);
+            assert!(
+                error.contains(&format!(
+                    "VLLM_PROXY_MODEL_LIST_FILE cannot be combined with {name}"
+                )),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_model_list_file_problems_fail_startup() {
+        let error_of = |list: &serde_json::Value, vars: &[(&str, &str)]| {
+            with_model_list(list, vars, || {
+                Config::from_env()
+                    .expect_err("the list must be refused")
+                    .to_string()
+            })
+        };
+        // Every failure names the variable and the file.
+        let error = error_of(&serde_json::json!({"models": []}), &[]);
+        assert!(
+            error.starts_with("VLLM_PROXY_MODEL_LIST_FILE (")
+                && error.contains("`models` is empty"),
+            "{error}"
+        );
+        let error = error_of(&serde_json::json!("not a list"), &[]);
+        assert!(error.contains("not a valid model list"), "{error}");
+
+        // A token variable the list names has to be set in the environment,
+        // and a model that holds a token needs a process that can bill.
+        let with_token = serde_json::json!({"models": [{
+            "id": "example/alpha",
+            "backend_urls": ["https://alpha-b1.example"],
+            "backend_token_env": "VLLM_BACKEND_TOKEN_ALPHA"
+        }]});
+        let billing = [
+            ("CLOUD_API_URL", "https://cloud-api.example"),
+            ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+        ];
+        let error = error_of(&with_token, &billing);
+        assert!(
+            error.contains("model \"example/alpha\"")
+                && error.contains("VLLM_BACKEND_TOKEN_ALPHA, which is not set"),
+            "{error}"
+        );
+        let error = error_of(&with_token, &[("VLLM_BACKEND_TOKEN_ALPHA", "alpha-secret")]);
+        assert!(
+            error.contains("requires CLOUD_API_URL and CLOUD_API_USAGE_TOKEN"),
+            "{error}"
+        );
+        assert!(!error.contains("alpha-secret"), "{error}");
+        let token_env: Vec<_> = billing
+            .iter()
+            .chain(&[("VLLM_BACKEND_TOKEN_ALPHA", "alpha-secret")])
+            .copied()
+            .collect();
+        with_model_list(&with_token, &token_env, || {
+            let config = Config::from_env().unwrap();
+            let model = &config.model_list.as_ref().unwrap().models[0];
+            assert_eq!(model.backend_token.as_deref(), Some("alpha-secret"));
+            assert!(!format!("{:?}", config.model_list).contains("alpha-secret"));
+        });
+
+        // A file that is not there.
+        with_clean_env(
+            &[
+                ("MODEL_NAME", ""),
+                ("TOKEN", "t"),
+                (
+                    crate::model_list::MODEL_LIST_FILE_ENV,
+                    "/nonexistent/model-list.json",
+                ),
+            ],
+            &LIST_MODE_ENV,
+            || {
+                let error = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    error.contains(
+                        "VLLM_PROXY_MODEL_LIST_FILE: cannot read /nonexistent/model-list.json"
+                    ),
+                    "{error}"
+                );
             },
         );
     }

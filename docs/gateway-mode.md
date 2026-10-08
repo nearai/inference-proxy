@@ -86,6 +86,7 @@ to the current in-CVM behavior.
 | Variable | Gateway value | Purpose |
 | --- | --- | --- |
 | `MODEL_NAME` | `z-ai/glm-5.3-flash` | Must match cloud-api's model name exactly (usage rows are keyed on it). |
+| `VLLM_PROXY_MODEL_LIST_FILE` | unset | Path of a JSON file listing several models for this one process to serve, in place of `MODEL_NAME` and the backend lists (see [Several models in one gateway](#several-models-in-one-gateway)). Unset = one model from the variables in this table. |
 | `TOKEN` | a random secret | Trusted config token for *this* gateway (operators/tests). Customers use `sk-` keys. |
 | `CLOUD_API_URL` / `CLOUD_API_USAGE_TOKEN` | prod values | Key validation and usage reporting. |
 | `VLLM_BACKEND_URLS` | the `-b<handle>` URLs | Fleet membership (see above). |
@@ -410,6 +411,8 @@ back-pressure for the next admission decision
 (the `refused*` outcomes only occur with `VLLM_BACKEND_TIER_STRICT`),
 `request_estimated_prompt_tokens`,
 `backend_tier_output_reserve_capped_total{tier}` (requests whose `max_tokens` counted only up to the reserve cap),
+`request_model_match_total{result}` (how the body's `model` compares with what
+the gateway serves, see [below](#before-switching-it-on)),
 plus the existing usage-report and upstream metrics.
 
 ## Long-context tier
@@ -507,6 +510,296 @@ queueing" refusal. The consequences are deliberate:
   together with `FUSION_ENABLED` or `WEB_CONTEXT_SEARCH_URL` is refused at
   startup: those modes place their own backend requests, which no tier
   restriction reaches.
+
+## Several models in one gateway
+
+A gateway is model-scoped: `MODEL_NAME` is its billing key, it has one backend
+pool and one admission budget, and the `model` in a request body is not read.
+`VLLM_PROXY_MODEL_LIST_FILE` makes the same process serve a list of models
+instead (`src/model_list.rs`), picking the model from the body.
+
+Without the variable nothing changes. That is every CVM proxy and the
+single-model gateway described above: the same routes, responses, metric
+series and labels, and log lines.
+
+### What is per model and what is per process
+
+Each model of the list has its own bundle, and nothing in it is shared with
+another model:
+
+- the backend pool and its health checker;
+- conversation affinity;
+- the admission controller: budget and ramp, per-host share, the
+  time-to-first-token breaker, back-pressure marks, the queue refusal;
+- the engine-load poller;
+- the long-context tier;
+- the HTTP client that carries the model's backend bearer and priority header.
+
+So a model at its budget, with its breaker tripped or with every backend down
+refuses and slows nothing for another model, and a model's backend token is
+only ever sent to that model's backends: not to another model's, and not to
+cloud-api.
+
+One per process, as before: the key check against cloud-api, the organization
+allowlist, the usage-report endpoint and token, the content policy, the models
+document source, the stream timings (keep-alive, commit window, error peek,
+first-token deadline) and the health-check timings. The remaining gateway
+switches are process-level too and apply to every model:
+`VLLM_BACKEND_CONVERSATION_AFFINITY`, `VLLM_BACKEND_CONNECT_FAILOVER`,
+`VLLM_PROXY_MAP_QUEUE_FULL_TO_429`, `VLLM_BACKEND_HEALTH_PATH`,
+`VLLM_BACKEND_PROBE_INTERVAL_SECS`, and the admission ramp
+(`_RAMP_STEP`, `_RAMP_INTERVAL_SECS`), `_TTFT_P95_MAX_MS`,
+`_BACKPRESSURE_SECS` and `_RETRY_AFTER_SECS`.
+
+### The list file
+
+A JSON file rendered by deploy tooling: `{"models": [ … ]}`, one object per
+model. It holds no secrets: a model's backend token is referenced by the *name*
+of the environment variable that carries it. Every key except `id` and
+`backend_urls` is optional and falls back to the process-level variable, so
+the variables act as defaults for the whole list. A key that is not in the
+tables below is refused, so a typo cannot silently become a default.
+
+| Key | When omitted | Meaning |
+| --- | --- | --- |
+| `id` | required | The exact cloud-api model name. Requests select the model by it and usage is billed under it. |
+| `backend_urls` | required | The model's backends, as `VLLM_BACKEND_URLS` lists them. |
+| `backend_probe_urls` | no engine view | One engine-load probe per backend, same order, as `VLLM_BACKEND_PROBE_URLS`. |
+| `long_context` | no tier | The model's long-context tier, see the next table. |
+| `admission_max_inflight` | `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` | The model's in-flight budget; `0` = no admission for it. |
+| `admission_start_inflight` | `VLLM_PROXY_ADMISSION_START_INFLIGHT` when that is set, else the model's own maximum | Budget at start-up. |
+| `admission_queue_saturated_at` | `VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT` | Engine queue depth at which a backend counts as saturated. |
+| `capacity_requests_per_minute` | `VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE` | Requests per minute declared on the model's `/v1/models` entry. |
+| `discount_to_user` | `VLLM_PROXY_DISCOUNT_TO_USER` | A JSON number under the same rules as the variable; `0` = list price. Published on the model's entry and sent on its usage reports. |
+| `reasoning_off_effort` | `VLLM_PROXY_REASONING_OFF_EFFORT` | What "no reasoning" means for this model. |
+| `backend_token_env` | the value of `VLLM_BACKEND_TOKEN` | Name of the variable that holds this model's backend bearer: upper-case letters, digits and underscores, starting with `VLLM_BACKEND_TOKEN` (for example `VLLM_BACKEND_TOKEN_ALPHA`), and set. |
+| `backend_priority` | `VLLM_BACKEND_PRIORITY` | Sent as `X-NearAI-Priority` to this model's backends. |
+
+`long_context`, for a model that has a tier (the tier variables are defaults
+for such a block; a model without one has no tier, whatever they say):
+
+| Key | When omitted | Meaning |
+| --- | --- | --- |
+| `backend_urls` | required | The tier's backends, as `VLLM_BACKEND_LONG_CONTEXT_URLS`. |
+| `backend_probe_urls` | none | One probe per tier backend; required exactly when the model has `backend_probe_urls`. |
+| `above_tokens` | `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` | Estimated input tokens above which a request goes to the tier. |
+| `strict` | `VLLM_BACKEND_TIER_STRICT` | Refuse instead of placing on the other tier. |
+| `borrowing` | `VLLM_PROXY_ADMISSION_TIER_BORROWING` | Base hosts may use the idle shared budget. |
+| `max_inflight_per_host` | `VLLM_PROXY_ADMISSION_LONG_MAX_INFLIGHT_PER_HOST` | Long-host ceiling while borrowing. |
+| `reserved_inflight` | `VLLM_PROXY_ADMISSION_LONG_RESERVED_INFLIGHT` | Budget slots kept for the tier. |
+
+Three models, one with a long-context tier and two plain ones:
+
+```json
+{
+  "models": [
+    {
+      "id": "example/alpha",
+      "backend_urls": [
+        "https://alpha-b1.inference.example",
+        "https://alpha-b2.inference.example",
+        "https://alpha-b3.inference.example"
+      ],
+      "backend_probe_urls": [
+        "http://alpha-1.internal.example:8000",
+        "http://alpha-2.internal.example:8000",
+        "http://alpha-3.internal.example:8000"
+      ],
+      "long_context": {
+        "backend_urls": ["https://alpha-long-b4.inference.example"],
+        "backend_probe_urls": ["http://alpha-4.internal.example:8000"],
+        "above_tokens": 100000,
+        "strict": true,
+        "borrowing": true,
+        "max_inflight_per_host": 12,
+        "reserved_inflight": 12
+      },
+      "admission_max_inflight": 48,
+      "admission_start_inflight": 48,
+      "admission_queue_saturated_at": 4,
+      "capacity_requests_per_minute": 150,
+      "discount_to_user": 0.3,
+      "reasoning_off_effort": "low",
+      "backend_token_env": "VLLM_BACKEND_TOKEN_ALPHA",
+      "backend_priority": -1
+    },
+    {
+      "id": "example/beta",
+      "backend_urls": [
+        "https://beta-b1.inference.example",
+        "https://beta-b2.inference.example"
+      ],
+      "admission_max_inflight": 16,
+      "backend_token_env": "VLLM_BACKEND_TOKEN_BETA"
+    },
+    {
+      "id": "example/gamma",
+      "backend_urls": ["https://gamma-b1.inference.example"]
+    }
+  ]
+}
+```
+
+`example/gamma` is a complete entry: everything it leaves out comes from the
+process-level variables, or from their built-in defaults when those are unset
+too.
+
+The rest of the environment in list mode:
+
+- `MODEL_NAME`, `VLLM_BACKEND_URLS`, `VLLM_BACKEND_PROBE_URLS`,
+  `VLLM_BACKEND_LONG_CONTEXT_URLS` and `VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS`
+  must not be set: they name the one model of a single-model process and its
+  backends, for which a list entry has no fallback. `VLLM_BASE_URL` is not
+  read.
+- `NON_TEE_DEPLOYMENT=1` and `VLLM_PROXY_MODELS_DOCUMENT_URL` are required.
+- `FUSION_ENABLED`, `WEB_CONTEXT_SEARCH_URL`, `OHTTP_ENABLED`,
+  `VLLM_DATA_PARALLEL_SIZE`, `OPENAI_CHAT_COMPATIBILITY_CHECK` and
+  `REPLICA_STATE_REDIS_URL` cannot be combined with a list: each assumes one
+  model per process.
+- A model that ends up with a backend token, its own or the process-level one,
+  requires `CLOUD_API_URL` and `CLOUD_API_USAGE_TOKEN`, as `VLLM_BACKEND_TOKEN`
+  does.
+- The image-validation defaults that depend on the model name do not apply;
+  set the `VLLM_PROXY_IMAGE_VALIDATION_*` variables explicitly where needed.
+
+Anything wrong fails startup rather than serving a partial list: a file that
+cannot be read or is not valid, an empty list, an id listed twice, a model
+without backends, a URL that is not `http(s)`, a probe count that differs from
+the backend count, a `backend_token_env` that is not set, a backend or probe
+URL listed under two models (a backend serves one model), and every rule the
+variables are held to for one model — the admission and long-context tier
+rules above. Those are checked on what each entry resolves to, and their
+messages name the variable a key is named after, prefixed with the model.
+
+### Requests
+
+`/v1/chat/completions` and `/v1/completions` authenticate as before and then
+read the body's `model`. An exact, case-sensitive match against the configured
+ids selects that model's bundle: its pool, affinity, admission, engine view,
+tier, backend token and priority, reasoning-off effort and discount. The body
+is forwarded as it would be for a single model, `model` included.
+
+Anything else — another model, a configured id in a different case, no `model`,
+a `model` that is not a string — is OpenAI's `404`:
+
+```json
+{"error": {"message": "The model `example/delta` does not exist or you do not have access to it.",
+           "type": "invalid_request_error", "param": null, "code": "model_not_found"}}
+```
+
+Without a `model` the message says that one is required; status, type and code
+are the same. Nothing is dispatched, no budget slot is taken and nothing is
+billed. The check comes after authentication, so a caller without a valid key
+gets the same `401` whatever it names and cannot use the answer to enumerate
+models.
+
+Usage reports carry the selected model's `id` and its discount.
+
+Only what is defined for several models is served: `/v1/chat/completions`,
+`/v1/completions`, `/v1/models`, `/healthz`, `/metrics` and `/version`. Every
+other route of the binary (tokenize, embeddings, rerank, score, images, audio,
+privacy, `/v1/metrics`, attestation, signatures, OHTTP, `/`) answers the `404`
+of an undeclared route.
+
+### `/v1/models`
+
+One read of the models document per request. The entries of the configured
+models are kept, in the document's order, each completed with its own model's
+`capacity` (its `admission_max_inflight` and `capacity_requests_per_minute`)
+and `discount_to_user`. A configured model the document does not list is left
+out, so the catalog stays the switch for what is advertised; it is logged
+("Configured model is not in the models document") and counted in
+`models_document_missing_models_total{model}`.
+
+When the document cannot be read the answer is `502` with error type
+`models_document_unavailable`. There is no engine-list fallback in list mode
+and never a partial list: no single engine speaks for the others, and a list
+without the document would advertise models at prices nothing vouches for.
+
+### `/healthz`
+
+`200` while at least one model has a healthy backend, `503` when none has. One
+model's outage does not take the process off its load balancer. The body keeps
+the single-model shape and adds one entry per model, in list order:
+
+```json
+{
+  "status": "ok",
+  "checks": {"dstack": "skipped", "backend": "ok"},
+  "models": [
+    {"id": "example/alpha", "backend": "ok"},
+    {"id": "example/beta", "backend": "unreachable"},
+    {"id": "example/gamma", "backend": "ok"}
+  ]
+}
+```
+
+`checks.backend` is `"ok"` exactly when the status is, `"unhealthy"` otherwise.
+A model's `backend` is the token the single-model probe would report (`ok`,
+`unreachable`, `timeout`, `http_5xx`, …) for one backend picked from its pool,
+all models probed at once. A model whose pool already has no healthy backend
+reads `"unhealthy"` without being probed, so its dead hosts cannot make the
+answer slow for everyone. Deploy tooling that waits for every model should
+check each entry, not the status.
+
+For that reason, and because a host taken out after a failed connect only comes
+back through a probe, list mode runs the pool health checker for every model,
+including one with a single backend (a single-model process starts it only for
+two or more).
+
+### Metrics and logs
+
+In list mode the per-model series carry a `model` label, always the configured
+id, as their last label:
+
+- `admission_*` (budget, in-flight, rejections, TTFT, back-pressure, per-backend
+  limits, selection failures);
+- `backend_pool_size`, `backend_pool_healthy`, `backend_failover_total`,
+  `backend_affinity_*`, `placement_hint_*`;
+- `backend_engine_running`, `backend_engine_queued`,
+  `backend_engine_probe_failures_total`;
+- `backend_tier_requests_total`, `backend_tier_output_reserve_capped_total`,
+  `request_estimated_prompt_tokens`;
+- `first_token_deadline_refusals_total`;
+- `inference_proxy_usage_reports_total`,
+  `inference_proxy_usage_report_duration_seconds`,
+  `inference_proxy_completed_requests_total`,
+  `inference_proxy_input_tokens_total`, `inference_proxy_input_tokens`,
+  `inference_proxy_request_duration_seconds`.
+
+`backend` in these series is an index into that model's own pool, so
+`{backend="0"}` means a different host for each `model`. Everything else is
+process-wide and unlabelled, as before: HTTP and error counters, the key
+check, stream mechanics, content policy and repairs.
+
+With one model there is no `model` label on any series: existing dashboards
+and alerts match on exactly those label sets. `src/model_metrics.rs` is where
+the difference lives.
+
+Startup logs one "Serving model" line per model with its effective settings
+(the backend token only as `backend_token=true|false`) and a "Model list
+enabled" line with the settings every lane shares. The lane log lines of
+`admission.rs`, the first-token refusal and the engine probe carry a `model`
+field in list mode and are unchanged without one.
+
+### Before switching it on
+
+Exact matching refuses requests that a single-model gateway serves today, since
+that gateway does not look at `model` at all. To read the effect from
+production first, a single-model gateway counts how each chat/completions
+request's `model` compares with `MODEL_NAME`:
+
+```text
+request_model_match_total{result="exact" | "case_differs" | "other" | "missing"}
+```
+
+`missing` is an absent `model` or one that is not a string. Nothing else
+changes: every request is served and billed as `MODEL_NAME`, as before. The
+counter exists only where `VLLM_BACKEND_TOKEN` is set, which is what marks a
+gateway lane; a proxy inside a CVM does not emit it. In list mode the same
+counter compares against the configured ids, and everything but `exact` is the
+`404` above. The requested name itself is the caller's string: it is never a
+metric label and never in a log line.
 
 ## What is deliberately not offered here
 

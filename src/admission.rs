@@ -48,6 +48,7 @@ use tracing::{debug, info, warn};
 use crate::backend_pool::BackendPool;
 use crate::context_tier::{ContextTier, TierDecision};
 use crate::engine_load::EngineLoad;
+use crate::model_metrics::{model_counter, model_gauge, model_histogram, ModelLabel};
 
 /// Window over which time-to-first-generation observations are counted, as
 /// one-second buckets of `(samples, breaches)`: bounded memory and work at
@@ -167,6 +168,10 @@ const TTFT_BUCKETS: usize = TTFT_WINDOW.as_secs() as usize;
 /// Fleet-wide admission state shared by every request (`AppState.admission`).
 pub struct AdmissionController {
     config: Option<AdmissionConfig>,
+    /// `model` label of this controller's series and log lines
+    /// (`model_metrics.rs`); `None` unless it is the lane of one entry of a
+    /// model list.
+    model: ModelLabel,
     inflight: AtomicU32,
     /// The part of `inflight` that is not bound for the long tier. Capped at
     /// `budget - long_reserved_inflight` when a reserve is configured.
@@ -196,17 +201,30 @@ impl AdmissionController {
         backend_count: usize,
         engine: Arc<EngineLoad>,
     ) -> Self {
+        Self::for_model(None, config, backend_count, engine)
+    }
+
+    /// `new` for one entry of a model list: the controller's series and log
+    /// lines carry `model`, so each model's lane reads separately.
+    pub fn for_model(
+        model: ModelLabel,
+        config: Option<AdmissionConfig>,
+        backend_count: usize,
+        engine: Arc<EngineLoad>,
+    ) -> Self {
         let now = Instant::now();
         let budget = config.as_ref().map_or(0, |c| c.start_inflight);
         if let Some(config) = &config {
-            metrics::gauge!("admission_budget").set(f64::from(budget));
-            metrics::gauge!("admission_inflight").set(0.0);
-            metrics::gauge!("admission_inflight_base").set(0.0);
-            metrics::gauge!("admission_long_reserve").set(f64::from(config.long_reserved_inflight));
+            model_gauge!(model, "admission_budget").set(f64::from(budget));
+            model_gauge!(model, "admission_inflight").set(0.0);
+            model_gauge!(model, "admission_inflight_base").set(0.0);
+            model_gauge!(model, "admission_long_reserve")
+                .set(f64::from(config.long_reserved_inflight));
             debug_assert!(config.start_inflight <= config.max_inflight);
         }
         Self {
             config,
+            model,
             inflight: AtomicU32::new(0),
             inflight_base: AtomicU32::new(0),
             budget: AtomicU32::new(budget),
@@ -341,8 +359,8 @@ impl AdmissionController {
     pub fn record_backend_metrics(&self, pool: &BackendPool) {
         if let Some(limits) = self.backend_limits(pool) {
             for (index, (backend, limit)) in pool.backends().iter().zip(limits).enumerate() {
-                metrics::gauge!("admission_backend_limit", "backend" => index.to_string(), "tier" => backend.tier.as_str()).set(f64::from(limit));
-                metrics::gauge!("admission_backend_inflight", "backend" => index.to_string(), "tier" => backend.tier.as_str()).set(f64::from(backend.lane_conns.load(Ordering::Acquire)));
+                model_gauge!(self.model, "admission_backend_limit", "backend" => index.to_string(), "tier" => backend.tier.as_str()).set(f64::from(limit));
+                model_gauge!(self.model, "admission_backend_inflight", "backend" => index.to_string(), "tier" => backend.tier.as_str()).set(f64::from(backend.lane_conns.load(Ordering::Acquire)));
             }
         }
     }
@@ -384,8 +402,10 @@ impl AdmissionController {
 
     /// Build (and count) a refusal for `reason`.
     pub fn reject(&self, reason: RejectReason) -> Rejected {
-        metrics::counter!("admission_rejections_total", "reason" => reason.as_str()).increment(1);
+        model_counter!(self.model, "admission_rejections_total", "reason" => reason.as_str())
+            .increment(1);
         debug!(
+            model = self.model,
             reason = reason.as_str(),
             "Lane request refused at admission"
         );
@@ -496,9 +516,9 @@ impl AdmissionController {
         if base && !capped {
             self.inflight_base.fetch_add(1, Ordering::AcqRel);
         }
-        metrics::gauge!("admission_inflight").increment(1.0);
+        model_gauge!(self.model, "admission_inflight").increment(1.0);
         if base {
-            metrics::gauge!("admission_inflight_base").increment(1.0);
+            model_gauge!(self.model, "admission_inflight_base").increment(1.0);
         }
         Ok(Some(Permit {
             controller: Arc::clone(self),
@@ -544,8 +564,9 @@ impl AdmissionController {
                 .saturating_add(config.ramp_step)
                 .min(config.max_inflight);
             self.budget.store(next, Ordering::Relaxed);
-            metrics::gauge!("admission_budget").set(f64::from(next));
+            model_gauge!(self.model, "admission_budget").set(f64::from(next));
             info!(
+                model = self.model,
                 from = budget,
                 to = next,
                 max = config.max_inflight,
@@ -553,6 +574,7 @@ impl AdmissionController {
             );
         } else {
             info!(
+                model = self.model,
                 budget,
                 max = config.max_inflight,
                 "Admission budget held: overload signals during the last interval"
@@ -567,7 +589,7 @@ impl AdmissionController {
     /// One time-to-first-generation observation (or a censored one: the
     /// request ended without a generation event after waiting `ttft`).
     fn record_ttft(&self, now: Instant, ttft: Duration) {
-        metrics::histogram!("admission_ttft_seconds").record(ttft.as_secs_f64());
+        model_histogram!(self.model, "admission_ttft_seconds").record(ttft.as_secs_f64());
         let Some(max) = self.config.as_ref().and_then(|c| c.ttft_p95_max) else {
             return;
         };
@@ -629,12 +651,16 @@ impl AdmissionController {
             if over != breaker.tripped {
                 if over {
                     warn!(
+                        model = self.model,
                         max_ms = max.as_millis(),
                         window_secs = TTFT_WINDOW.as_secs(),
                         "Lane time-to-first-generation above bound, refusing new work"
                     );
                 } else {
-                    info!("Lane time-to-first-generation back under bound");
+                    info!(
+                        model = self.model,
+                        "Lane time-to-first-generation back under bound"
+                    );
                 }
             }
             breaker.tripped = over;
@@ -654,7 +680,7 @@ impl AdmissionController {
                 .unwrap_or(u64::MAX - 1);
             slot.store(millis + 1, Ordering::Relaxed);
         }
-        metrics::counter!("admission_backpressure_total", "backend" => backend.to_string())
+        model_counter!(self.model, "admission_backpressure_total", "backend" => backend.to_string())
             .increment(1);
         self.mark_dirty();
     }
@@ -689,6 +715,7 @@ impl AdmissionController {
             let tier = tier.map_or("any", ContextTier::as_str);
             if queued {
                 warn!(
+                    model = self.model,
                     tier,
                     healthy_backends = healthy,
                     queue_saturated_at = config.queue_saturated_at,
@@ -696,7 +723,11 @@ impl AdmissionController {
                     "Every backend's engine queue is at or above the saturation threshold, or it rejected a lane request at engine admission recently; refusing new work"
                 );
             } else {
-                info!(tier, "A backend accepts lane work again");
+                info!(
+                    tier,
+                    model = self.model,
+                    "A backend accepts lane work again"
+                );
             }
         }
         queued
@@ -739,7 +770,7 @@ impl Permit {
         if self.base.swap(true, Ordering::AcqRel) {
             self.controller.inflight_base.fetch_sub(1, Ordering::AcqRel);
         } else {
-            metrics::gauge!("admission_inflight_base").increment(1.0);
+            model_gauge!(self.controller.model, "admission_inflight_base").increment(1.0);
         }
         Ok(())
     }
@@ -879,10 +910,10 @@ impl Permit {
             self.record_ttft(now);
         }
         self.controller.inflight.fetch_sub(1, Ordering::AcqRel);
-        metrics::gauge!("admission_inflight").decrement(1.0);
+        model_gauge!(self.controller.model, "admission_inflight").decrement(1.0);
         if self.base.load(Ordering::Acquire) {
             self.controller.inflight_base.fetch_sub(1, Ordering::AcqRel);
-            metrics::gauge!("admission_inflight_base").decrement(1.0);
+            model_gauge!(self.controller.model, "admission_inflight_base").decrement(1.0);
         }
     }
 }

@@ -7,8 +7,8 @@ use tracing::info;
 use vllm_proxy_rs::ohttp_gateway::OhttpGateway;
 use vllm_proxy_rs::{
     admission, attestation, backend_affinity, backend_pool, cache, config, engine_load, fusion,
-    metrics_middleware, rate_limit, request_id_middleware, routes, signing, startup_checks,
-    vllm_dp_affinity, AppState,
+    metrics_middleware, model_list, rate_limit, request_id_middleware, routes, signing,
+    startup_checks, vllm_dp_affinity, AppState,
 };
 
 /// DNS resolver that returns only IPv4 addresses.
@@ -62,10 +62,21 @@ async fn main() -> anyhow::Result<()> {
     // Warn if any backend URL points to the proxy's own listen address
     let self_local = format!("://localhost:{listen_port}");
     let self_ip = format!("://127.0.0.1:{listen_port}");
+    // Gateway list mode: every model's backends, which are then the only ones.
+    let listed_models = config
+        .model_list
+        .as_ref()
+        .map_or(&[][..], |list| list.models.as_slice());
     for url in config
         .backend_urls
         .iter()
         .chain(&config.backend_long_context_urls)
+        .chain(listed_models.iter().flat_map(|model| {
+            model
+                .backend_urls
+                .iter()
+                .chain(&model.backend_long_context_urls)
+        }))
     {
         let backend_base = url.trim_end_matches('/');
         if backend_base.contains(&self_local) || backend_base.contains(&self_ip) {
@@ -78,13 +89,22 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    info!(
-        model = %config.model_name,
-        backends = ?config.backend_urls,
-        listen_port,
-        dev_mode = config.dev_mode,
-        "Starting vllm-proxy-rs"
-    );
+    match &config.model_list {
+        Some(list) => info!(
+            models = ?list.models.iter().map(|model| model.id.as_str()).collect::<Vec<_>>(),
+            model_list_file = %list.path,
+            listen_port,
+            dev_mode = config.dev_mode,
+            "Starting vllm-proxy-rs"
+        ),
+        None => info!(
+            model = %config.model_name,
+            backends = ?config.backend_urls,
+            listen_port,
+            dev_mode = config.dev_mode,
+            "Starting vllm-proxy-rs"
+        ),
+    }
 
     // Initialize signing keys
     let signing = signing::SigningPair::init(&config.model_name, config.dev_mode).await?;
@@ -136,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
             max_imbalance = config.backend_affinity_max_imbalance,
             "Backend conversation affinity enabled"
         );
-    } else if config.backend_conversation_affinity {
+    } else if config.backend_conversation_affinity && config.model_list.is_none() {
         info!("VLLM_BACKEND_CONVERSATION_AFFINITY set but only one backend is configured; nothing to pin");
     }
     let attestation_cache = Arc::new(attestation::AttestationCache::new(
@@ -277,6 +297,34 @@ async fn main() -> anyhow::Result<()> {
         info!("Connection fail-over to another backend enabled for chat/completions");
     }
 
+    // Gateway list mode: one client, pool, engine view, admission controller
+    // and affinity map per model, each with its own poller and health
+    // checker. The single-model ones built above stay at their inert defaults
+    // (no bearer, an unroutable backend, admission off) and serve nothing.
+    let models = if config.model_list.is_some() {
+        let models = model_list::ModelList::start(&config, &http_client, &|headers| {
+            Ok(build_http_client(Some(headers))?)
+        })?;
+        // What every model's lane shares; each model's own numbers are on
+        // its "Serving model" line.
+        info!(
+            models = models.len(),
+            admission_ramp_step = config.admission_ramp_step,
+            admission_ramp_interval_secs = config.admission_ramp_interval_secs,
+            admission_ttft_p95_max_ms = config.admission_ttft_p95_max_ms,
+            admission_backpressure_secs = config.admission_backpressure_secs,
+            admission_retry_after_secs = config.admission_retry_after_secs,
+            probe_interval_secs = config.backend_probe_interval_secs,
+            health_check_interval_secs = config.health_check_interval_secs,
+            health_check_max_failures = config.health_check_max_failures,
+            health_path = %config.backend_health_path,
+            "Model list enabled"
+        );
+        Some(Arc::new(models))
+    } else {
+        None
+    };
+
     // Build app state
     let model_name = config.model_name.clone();
     let state = AppState {
@@ -295,6 +343,7 @@ async fn main() -> anyhow::Result<()> {
         vllm_dp_affinity,
         backend_affinity,
         admission,
+        models,
     };
 
     // Spawn background attestation cache refresh task.
@@ -381,7 +430,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Build router
-    let app = routes::build_router()
+    let app = routes::build_router_for(&state)
         .layer(middleware::from_fn(rate_limit::rate_limit_middleware))
         .layer(axum::Extension(rate_limit_state))
         .layer(middleware::from_fn(request_id_middleware))

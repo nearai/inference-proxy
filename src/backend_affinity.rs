@@ -21,6 +21,7 @@ use moka::sync::Cache;
 use serde_json::Value;
 
 use crate::backend_pool::{BackendGuard, BackendPool, Policy, Selection};
+use crate::model_metrics::{model_counter, model_gauge};
 use crate::vllm_dp_affinity::conversation_key;
 
 const MAX_AFFINITY_ASSIGNMENTS: u64 = 100_000;
@@ -148,18 +149,18 @@ impl BackendConversationAffinity {
         match hint {
             ReplicaHint::Absent => {}
             ReplicaHint::Invalid => {
-                metrics::counter!("placement_hint_overridden_total", "reason" => "invalid")
+                model_counter!(pool.model(), "placement_hint_overridden_total", "reason" => "invalid")
                     .increment(1);
             }
             ReplicaHint::Index(i) if i >= pool.len() => {
-                metrics::counter!("placement_hint_overridden_total", "reason" => "invalid")
+                model_counter!(pool.model(), "placement_hint_overridden_total", "reason" => "invalid")
                     .increment(1);
             }
             ReplicaHint::Index(i) => {
                 let sel = pool.select_with_preference_bounded(Some(i), self.max_imbalance, policy);
                 match sel {
                     Some(sel) if sel.index == i => {
-                        metrics::counter!("placement_hint_honored_total").increment(1);
+                        model_counter!(pool.model(), "placement_hint_honored_total").increment(1);
                         if let Some(k) = key {
                             if self.enabled {
                                 self.repin(k, i);
@@ -173,7 +174,7 @@ impl BackendConversationAffinity {
                         } else {
                             "imbalance"
                         };
-                        metrics::counter!("placement_hint_overridden_total", "reason" => reason)
+                        model_counter!(pool.model(), "placement_hint_overridden_total", "reason" => reason)
                             .increment(1);
                         // Drop the probe selection first so its guard releases
                         // the reservation before the existing path runs.
@@ -188,7 +189,7 @@ impl BackendConversationAffinity {
                         } else {
                             "imbalance"
                         };
-                        metrics::counter!("placement_hint_overridden_total", "reason" => reason)
+                        model_counter!(pool.model(), "placement_hint_overridden_total", "reason" => reason)
                             .increment(1);
                         return None;
                     }
@@ -211,18 +212,21 @@ impl BackendConversationAffinity {
             self.assignments.insert(key, selection.index);
         }
 
-        metrics::counter!(
+        model_counter!(
+            pool.model(),
             "backend_affinity_lookups_total",
             "outcome" => if existing.is_some() { "hit" } else { "miss" }
         )
         .increment(1);
-        metrics::counter!(
+        model_counter!(
+            pool.model(),
             "backend_affinity_selections_total",
             "outcome" => selection.outcome.as_str(),
             "backend" => selection.index.to_string()
         )
         .increment(1);
-        metrics::gauge!("backend_affinity_assignments").set(self.assignments.entry_count() as f64);
+        model_gauge!(pool.model(), "backend_affinity_assignments")
+            .set(self.assignments.entry_count() as f64);
 
         Some(Placement::new(selection, path))
     }

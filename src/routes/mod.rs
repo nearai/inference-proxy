@@ -49,6 +49,37 @@ async fn unknown_route() -> AppError {
     AppError::NotFound("Endpoint not found".to_string())
 }
 
+/// The router for `state`: every route for a process that serves one model,
+/// the model-list subset in gateway list mode.
+pub fn build_router_for(state: &AppState) -> Router<AppState> {
+    if state.models.is_some() {
+        build_model_list_router()
+    } else {
+        build_router()
+    }
+}
+
+/// Gateway list mode (`model_list.rs`): only what is defined for several
+/// models — chat completions, completions, the models document, health,
+/// metrics and the version. The other inference routes (tokenize, embeddings,
+/// rerank, score, images, audio, privacy), the engine metrics passthrough,
+/// attestation, signatures and OHTTP all assume the one model, backend pool
+/// and signing identity of a single-model process, so here they are the same
+/// 404 as any undeclared route.
+pub fn build_model_list_router() -> Router<AppState> {
+    Router::new()
+        .route(ROUTE_VERSION, get(health::version))
+        .route(ROUTE_HEALTHZ, get(health::healthz))
+        .route(
+            ROUTE_METRICS,
+            get(crate::metrics_middleware::prometheus_metrics_handler),
+        )
+        .route(ROUTE_V1_MODELS, get(metrics::models))
+        .route(ROUTE_CHAT_COMPLETIONS, post(chat::chat_completions))
+        .route(ROUTE_COMPLETIONS, post(completions::completions))
+        .fallback(unknown_route)
+}
+
 pub fn build_router() -> Router<AppState> {
     Router::new()
         // Unauthenticated health endpoints

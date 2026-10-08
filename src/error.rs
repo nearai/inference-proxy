@@ -61,9 +61,19 @@ pub enum AppError {
     #[error("no healthy backend in the requested context tier")]
     TierUnavailable { retry_after_secs: u64 },
 
+    /// Gateway list mode (`model_list.rs`): the request's `model` is not one
+    /// of the configured ids (`Some`), or is missing or not a string (`None`).
+    /// The message leaves the name out: it is the caller's string and must
+    /// not reach a log line.
+    #[error("model not found")]
+    ModelNotFound { model: Option<String> },
+
     #[error("{0}")]
     Internal(#[from] anyhow::Error),
 }
+
+/// Longest requested model name echoed back in the `model_not_found` message.
+const MODEL_NOT_FOUND_ECHO_MAX_BYTES: usize = 256;
 
 /// `Retry-After` on an engine admission rejection rewritten to 429: the
 /// engine's queue drains in seconds, same as the gateway's own default.
@@ -127,6 +137,33 @@ impl IntoResponse for AppError {
                     }
                 });
                 return (*status, axum::Json(body)).into_response();
+            }
+            AppError::ModelNotFound { model } => {
+                // OpenAI's answer for a model the caller cannot use, `code`
+                // included: clients and aggregators key on it.
+                metrics::counter!("http_errors_total", "error_type" => "model_not_found")
+                    .increment(1);
+                let message = match model.as_deref() {
+                    Some(model) if model.len() <= MODEL_NOT_FOUND_ECHO_MAX_BYTES => format!(
+                        "The model `{model}` does not exist or you do not have access to it."
+                    ),
+                    Some(_) => {
+                        "The requested model does not exist or you do not have access to it."
+                            .to_string()
+                    }
+                    None => "A `model` is required: set it to one of the ids listed by \
+                             /v1/models."
+                        .to_string(),
+                };
+                let body = serde_json::json!({
+                    "error": {
+                        "message": message,
+                        "type": "invalid_request_error",
+                        "param": null,
+                        "code": "model_not_found",
+                    }
+                });
+                return (StatusCode::NOT_FOUND, axum::Json(body)).into_response();
             }
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone(), "bad_request"),
             AppError::Unauthorized => (
@@ -249,6 +286,42 @@ mod tests {
         assert_eq!(json["error"]["type"], "bad_request");
         assert!(json["error"]["param"].is_null());
         assert!(json["error"]["code"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_model_not_found_is_openai_shaped_and_never_displays_the_name() {
+        let err = AppError::ModelNotFound {
+            model: Some("org/unknown".to_string()),
+        };
+        // `Display` is what a log line would carry.
+        assert_eq!(err.to_string(), "model not found");
+        let (status, json) = response_to_json(err.into_response()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            json["error"]["message"],
+            "The model `org/unknown` does not exist or you do not have access to it."
+        );
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert_eq!(json["error"]["code"], "model_not_found");
+        assert!(json["error"]["param"].is_null());
+
+        // Missing or not a string: same status and code, nothing to echo.
+        let (status, json) =
+            response_to_json(AppError::ModelNotFound { model: None }.into_response()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["error"]["code"], "model_not_found");
+
+        // An oversized name is not echoed back.
+        let long = "m".repeat(MODEL_NOT_FOUND_ECHO_MAX_BYTES + 1);
+        let (_, json) = response_to_json(
+            AppError::ModelNotFound {
+                model: Some(long.clone()),
+            }
+            .into_response(),
+        )
+        .await;
+        assert!(!json["error"]["message"].as_str().unwrap().contains(&long));
+        assert_eq!(json["error"]["code"], "model_not_found");
     }
 
     #[tokio::test]

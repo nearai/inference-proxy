@@ -141,7 +141,10 @@ template only honours `low` and `high` (anything else means max), and with
 thinking switched off outright it writes its reasoning as visible content, so
 the lane runs with `low` (about 1-9 reasoning tokens, clean content). `exclude`
 and `max_tokens` have no engine equivalent and are left to the aggregator.
-Applied counts are in `reasoning_switch_applied_total{kind}`.
+Applied counts are in `reasoning_switch_applied_total{kind}`. A model of a
+[model list](#several-models-in-one-gateway) can also replace efforts its
+engine does not accept (`reasoning_effort_map`, see
+[Reasoning efforts a model does not accept](#reasoning-efforts-a-model-does-not-accept)).
 
 The router fails closed: only declared routes exist. The TLS terminator in
 front of the gateway should additionally expose only `/v1/chat/completions`,
@@ -695,8 +698,9 @@ A JSON file rendered by deploy tooling: `{"models": [ … ]}`, one object per
 model. It holds no secrets: a model's backend token is referenced by the *name*
 of the environment variable that carries it. Every key except `id` and
 `backend_urls` is optional and falls back to the process-level variable, so
-the variables act as defaults for the whole list. A key that is not in the
-tables below is refused, so a typo cannot silently become a default.
+the variables act as defaults for the whole list (`reasoning_effort_map` has
+no variable: a model has one only when its entry writes it). A key that is not
+in the tables below is refused, so a typo cannot silently become a default.
 
 | Key | When omitted | Meaning |
 | --- | --- | --- |
@@ -710,6 +714,7 @@ tables below is refused, so a typo cannot silently become a default.
 | `capacity_requests_per_minute` | `VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE` | Requests per minute declared on the model's `/v1/models` entry. |
 | `discount_to_user` | `VLLM_PROXY_DISCOUNT_TO_USER` | A JSON number under the same rules as the variable; `0` = list price. Published on the model's entry and sent on its usage reports. |
 | `reasoning_off_effort` | `VLLM_PROXY_REASONING_OFF_EFFORT` | What "no reasoning" means for this model. |
+| `reasoning_effort_map` | no mapping | An object of effort to effort, for example `{"high": "xhigh"}`: a request's reasoning effort that is one of the keys is sent to this model's engine as the value. For the model of the entry only, with no process-level variable. See [Reasoning efforts a model does not accept](#reasoning-efforts-a-model-does-not-accept). |
 | `backend_token_env` | the value of `VLLM_BACKEND_TOKEN` | Name of the variable that holds this model's backend bearer: upper-case letters, digits and underscores, starting with `VLLM_BACKEND_TOKEN` (for example `VLLM_BACKEND_TOKEN_ALPHA`), and set. |
 | `backend_priority` | `VLLM_BACKEND_PRIORITY` | Sent as `X-NearAI-Priority` to this model's backends. |
 
@@ -758,6 +763,7 @@ Three models, one with a long-context tier and two plain ones:
       "capacity_requests_per_minute": 150,
       "discount_to_user": 0.3,
       "reasoning_off_effort": "low",
+      "reasoning_effort_map": {"high": "xhigh"},
       "backend_token_env": "VLLM_BACKEND_TOKEN_ALPHA",
       "backend_priority": -1
     },
@@ -804,7 +810,8 @@ Anything wrong fails startup rather than serving a partial list: a file that
 cannot be read or is not valid, an empty list, an id listed twice, a model
 without backends, a URL that is not a plain `http(s)` base URL (no query, no
 fragment, no credentials), a probe count that differs from the backend count,
-a `backend_token_env` that is not set, a backend or probe listed under two
+a `backend_token_env` that is not set, a `reasoning_effort_map` that breaks
+one of its rules below, a backend or probe listed under two
 models (a backend serves one model), and every rule the variables are held to
 for one model — the admission and long-context tier rules above. Those are
 checked on what each entry resolves to, and their messages name the variable a
@@ -817,13 +824,71 @@ trailing dot), effective port and normalised path. `https://HOST.example`,
 under two models as well as in both tiers of one. Two names that resolve to
 the same host are still two backends as far as this check can tell.
 
+### Reasoning efforts a model does not accept
+
+Which efforts a model takes is decided by its chat template, and some engines
+answer `400` to any other. A template that knows `low`, `medium` and `xhigh`
+refuses `high`, which callers of an aggregator send routinely, so a valid
+request fails for that model only. `reasoning_effort_map` on the model's entry
+names such efforts and what to send instead:
+
+```json
+"reasoning_effort_map": {"high": "xhigh"}
+```
+
+On `/v1/chat/completions`, after the handling of "no reasoning" described
+[above](#configuration) (`reasoning_off_effort`), a string that is a key of
+the map is replaced by its value in the two places an engine reads an effort
+from:
+
+- the top-level `reasoning_effort`, whether the caller sent it or the gateway
+  copied it there from the `reasoning` object;
+- `reasoning.effort`, when the body has a `reasoning` object with one.
+
+Each of the two is looked up on its own, so an effort the map names reaches
+the engine in neither field, whichever one the engine reads first. A match is
+exact and case-sensitive. Everything else is forwarded as before: an effort
+that is not a key, a value that is not a string, the rest of the `reasoning`
+object, and a body without an effort, to which none is added. Only these two
+fields are read: an effort a caller passes to the template by another route
+(inside `chat_template_kwargs`, say) is not looked at, with a map as without.
+`/v1/completions` is not touched, like the rest of the reasoning handling, and
+neither is another model of the same process.
+
+"Off" stays with `reasoning_off_effort`. `reasoning.enabled: false` and the
+efforts `none` and `minimal` become the model's off effort first, and the map
+is not allowed to interfere with that in either direction. These are refused at
+startup, with the model named:
+
+| Refused | Why |
+| --- | --- |
+| A key or a value that is not 1 to 32 characters of `a-z`, `0-9`, `_` and `-`; an empty one; a value that is not a string; the same key twice; more than 16 entries | The file is rendered, and a value is sent to the engine and is a metric label. |
+| A value that is also a key (`{"high": "xhigh", "xhigh": "max"}`, or `{"high": "high"}`) | Every effort is looked up once. With a chain the result would depend on an order. |
+| `none` or `minimal` as a key | Those mean "off", which is `reasoning_off_effort`. |
+| The model's `reasoning_off_effort` as a key (`{"low": "medium"}` on a model whose off effort is `low`) | The off effort is sent as configured. Mapping it would make "off" something else than that key says. |
+| `none` or `minimal` as a value, unless it is the model's `reasoning_off_effort` | The off handling replaces those values with the model's off effort, and the map runs after it: it must not write one back. |
+| A map on a model without a backend token (`backend_token_env` or `VLLM_BACKEND_TOKEN`) | The reasoning handling runs for a model that has one, and the map is part of it. Without the token the map would never be applied. |
+
+The off effort these rules use is the one the model ends up with: its own
+`reasoning_off_effort`, or the process-level variable when the entry leaves it
+out. An empty object is a model without a map.
+
+A request the map changed is counted once in
+`inference_proxy_model_reasoning_effort_mapped_total{effort, model}`, where
+`effort` is the value that was sent (a value of the map; the `reasoning`
+object's when the two fields were mapped to different ones) and `model` the
+configured id. What the caller sent is not a label, and nothing is logged per
+request. The startup line of each model prints its map.
+
 ### Requests
 
 `/v1/chat/completions` and `/v1/completions` authenticate as before and then
 read the body's `model`. An exact, case-sensitive match against the configured
 ids selects that model's bundle: its pool, affinity, admission, engine view,
-tier, backend token and priority, reasoning-off effort and discount. The body
-is forwarded as it would be for a single model, `model` included.
+tier, backend token and priority, reasoning-off effort, effort map and
+discount. The body is forwarded as it would be for a single model, `model`
+included; for a model with a `reasoning_effort_map`, with the efforts it names
+replaced.
 
 Anything else — another model, a configured id in a different case, no `model`,
 a `model` that is not a string — is OpenAI's `404`:
@@ -945,9 +1010,9 @@ With one model there is no `model` label on any series: existing dashboards
 and alerts match on exactly those label sets. `src/model_metrics.rs` is where
 the difference lives.
 
-Two series exist in list mode only. `http_requests_total` and
-`http_errors_total` stay process-wide, so without these an error rate could
-not be read per model:
+Three series exist in list mode only. Two of them count responses:
+`http_requests_total` and `http_errors_total` stay process-wide, so without
+these an error rate could not be read per model:
 
 - `inference_proxy_model_requests_total{endpoint, status, model}`: one per
   `/v1/chat/completions` or `/v1/completions` response of a request whose
@@ -992,6 +1057,12 @@ sum by (model) (rate(inference_proxy_model_stream_errors_total[5m]))
 
 (The second ratio's denominator also holds the non-streaming `200`s: the
 status series does not tell streams apart.)
+
+The third,
+`inference_proxy_model_reasoning_effort_mapped_total{effort, model}`, exists
+for a model with a `reasoning_effort_map`: one per request whose reasoning
+effort the map replaced, under the effort that was sent instead (see
+[Reasoning efforts a model does not accept](#reasoning-efforts-a-model-does-not-accept)).
 
 Startup logs one "Serving model" line per model with its effective settings
 (the backend token only as `backend_token=true|false`) and a "Model list

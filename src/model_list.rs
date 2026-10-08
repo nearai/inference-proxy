@@ -20,7 +20,8 @@
 //! Every key except `id` and `backend_urls` is optional and falls back to the
 //! process-level variable of the same name, so one model written out in full
 //! and one written as `id` plus `backend_urls` under the same environment are
-//! the same model (`Config::single_model`).
+//! the same model (`Config::single_model`). One key has no variable and so
+//! no fallback, `reasoning_effort_map`: it exists for a list's models only.
 //!
 //! Without the variable nothing here runs: the process serves one model from
 //! its environment, as every CVM proxy and single-model gateway does.
@@ -44,6 +45,7 @@ use crate::config::{
 use crate::engine_load::{self, EngineLoad};
 use crate::error::AppError;
 use crate::model_metrics::ModelLabel;
+use crate::reasoning::EffortMap;
 use crate::AppState;
 
 #[cfg(test)]
@@ -96,6 +98,10 @@ pub struct ModelConfig {
     pub capacity_requests_per_minute: u64,
     pub discount_to_user: Option<f64>,
     pub reasoning_off_effort: String,
+    /// Efforts this model's engine refuses, and what is sent in their place
+    /// (`reasoning_effort_map`). A list key only: empty for the one model of
+    /// a process without a list.
+    pub reasoning_effort_map: EffortMap,
     pub backend_token: Option<String>,
     pub backend_priority: Option<i64>,
 }
@@ -146,6 +152,7 @@ impl std::fmt::Debug for ModelConfig {
             )
             .field("discount_to_user", &self.discount_to_user)
             .field("reasoning_off_effort", &self.reasoning_off_effort)
+            .field("reasoning_effort_map", &self.reasoning_effort_map)
             .field(
                 "backend_token",
                 &self.backend_token.as_ref().map(|_| "<set>"),
@@ -221,9 +228,49 @@ struct ModelEntry {
     capacity_requests_per_minute: Option<u64>,
     discount_to_user: Option<f64>,
     reasoning_off_effort: Option<String>,
+    reasoning_effort_map: Option<EffortPairs>,
     /// Name of the environment variable holding the backend bearer.
     backend_token_env: Option<String>,
     backend_priority: Option<i64>,
+}
+
+/// `reasoning_effort_map` as the file writes it: a JSON object of string to
+/// string, kept as its pairs so that a key written twice is refused like a
+/// duplicate of any other key of the file, not settled by which came last.
+/// What the pairs may say is `EffortMap::new`'s to decide.
+struct EffortPairs(Vec<(String, String)>);
+
+impl<'de> Deserialize<'de> for EffortPairs {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Pairs;
+
+        impl<'de> serde::de::Visitor<'de> for Pairs {
+            type Value = EffortPairs;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an object of effort to effort, both strings")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut entries: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut pairs: Vec<(String, String)> = Vec::new();
+                while let Some((from, to)) = entries.next_entry::<String, String>()? {
+                    // Not echoed: nothing has looked at its shape yet.
+                    if pairs.iter().any(|(seen, _)| *seen == from) {
+                        return Err(serde::de::Error::custom(
+                            "`reasoning_effort_map` has the same key more than once",
+                        ));
+                    }
+                    pairs.push((from, to));
+                }
+                Ok(EffortPairs(pairs))
+            }
+        }
+
+        deserializer.deserialize_map(Pairs)
+    }
 }
 
 /// A model's long-context tier. The tier variables are defaults for the
@@ -343,6 +390,21 @@ fn resolve(
     let admission_max_inflight = entry
         .admission_max_inflight
         .unwrap_or(defaults.admission_max_inflight);
+    let reasoning_off_effort = match entry.reasoning_off_effort {
+        Some(effort) if effort.trim().is_empty() => {
+            anyhow::bail!("`reasoning_off_effort` is empty")
+        }
+        Some(effort) => effort.trim().to_string(),
+        None => defaults.reasoning_off_effort.clone(),
+    };
+    // Checked against the off effort the model ends up with, its own or the
+    // process-level one: the two must not contradict each other.
+    let reasoning_effort_map = EffortMap::new(
+        entry
+            .reasoning_effort_map
+            .map_or_else(Vec::new, |map| map.0),
+        &reasoning_off_effort,
+    )?;
     let mut model = ModelConfig {
         id: entry.id,
         backend_urls,
@@ -369,13 +431,8 @@ fn resolve(
             Some(discount) => validate_discount_to_user(discount, &discount.to_string())?,
             None => defaults.discount_to_user,
         },
-        reasoning_off_effort: match entry.reasoning_off_effort {
-            Some(effort) if effort.trim().is_empty() => {
-                anyhow::bail!("`reasoning_off_effort` is empty")
-            }
-            Some(effort) => effort.trim().to_string(),
-            None => defaults.reasoning_off_effort.clone(),
-        },
+        reasoning_off_effort,
+        reasoning_effort_map,
         backend_token: match entry.backend_token_env {
             Some(name) => Some(backend_token_from_env(&name, lookup)?),
             None => defaults.backend_token.clone(),
@@ -519,6 +576,14 @@ fn validate(model: &ModelConfig, process: &ProcessSettings) -> anyhow::Result<()
             "VLLM_BACKEND_TOKEN requires CLOUD_API_URL and CLOUD_API_USAGE_TOKEN: backends do not bill trusted-token requests"
         );
     }
+    // The reasoning handling runs for a model whose backends trust this
+    // process (`ModelView::trusted_by_backends`), and the map is part of it.
+    // On any other model it would be written down and never applied.
+    if !model.reasoning_effort_map.is_empty() && model.backend_token.is_none() {
+        anyhow::bail!(
+            "`reasoning_effort_map` requires a backend token (`backend_token_env` or VLLM_BACKEND_TOKEN): reasoning controls are only rewritten for a model that has one"
+        );
+    }
     Ok(())
 }
 
@@ -626,6 +691,8 @@ impl ServedModel {
             long_context_above_tokens: self.config.long_context_above_tokens,
             backend_tier_strict: self.config.backend_tier_strict,
             reasoning_off_effort: &self.config.reasoning_off_effort,
+            reasoning_effort_map: (!self.config.reasoning_effort_map.is_empty())
+                .then_some(&self.config.reasoning_effort_map),
             trusted_by_backends: self.config.backend_token.is_some(),
             discount_to_user: self.config.discount_to_user,
         }
@@ -648,6 +715,9 @@ pub struct ModelView<'a> {
     pub long_context_above_tokens: u64,
     pub backend_tier_strict: bool,
     pub reasoning_off_effort: &'a str,
+    /// The model's `reasoning_effort_map` when it has entries. Always `None`
+    /// for the single model: the key exists in a list only.
+    pub reasoning_effort_map: Option<&'a EffortMap>,
     /// A backend token is configured: the backends are inference-proxies
     /// that trust this process, i.e. it runs as a gateway lane.
     pub trusted_by_backends: bool,
@@ -666,6 +736,7 @@ impl<'a> ModelView<'a> {
             long_context_above_tokens: state.config.long_context_above_tokens,
             backend_tier_strict: state.config.backend_tier_strict,
             reasoning_off_effort: &state.config.reasoning_off_effort,
+            reasoning_effort_map: None,
             trusted_by_backends: state.config.backend_token.is_some(),
             discount_to_user: state.config.discount_to_user,
         }
@@ -765,6 +836,7 @@ impl ModelList {
                 capacity_requests_per_minute = model.capacity_requests_per_minute,
                 discount_to_user = model.discount_to_user,
                 reasoning_off_effort = %model.reasoning_off_effort,
+                reasoning_effort_map = ?model.reasoning_effort_map,
                 backend_token = model.backend_token.is_some(),
                 backend_priority = model.backend_priority,
                 "Serving model"

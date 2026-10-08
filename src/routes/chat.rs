@@ -74,6 +74,12 @@ async fn serve(
     // model keeps thinking and the caller pays for it.
     if model.trusted_by_backends {
         crate::reasoning::apply_reasoning_switch(&mut request_json, model.reasoning_off_effort);
+        // List mode: the efforts this model's engine refuses become the ones
+        // configured for it (`reasoning_effort_map`), on what the switch left.
+        // A model with a map always has a backend token (`model_list`).
+        if let Some(map) = model.reasoning_effort_map {
+            crate::reasoning::apply_effort_map(&mut request_json, map, model.label);
+        }
     }
 
     // Extract encryption context from headers

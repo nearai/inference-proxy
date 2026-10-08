@@ -124,6 +124,12 @@ In gateway mode `reasoning.rs` maps an aggregator's `reasoning` object
 (`enabled: false`, `effort`) onto `reasoning_effort`; "off" is
 `VLLM_PROXY_REASONING_OFF_EFFORT` (`low` for GLM-5.3 Flash, whose template only
 knows `low`/`high` and leaks its thinking into `content` when switched off).
+In list mode a model can also replace efforts its engine refuses
+(`reasoning_effort_map`, e.g. `{"high": "xhigh"}`; `reasoning::EffortMap`,
+applied after the off handling to `reasoning_effort` and `reasoning.effort` on
+chat completions). The map never touches "off": `EffortMap::new` refuses off
+values and the model's off effort as keys, other off values as targets, and
+chains.
 
 A gateway can serve several models from one process: `VLLM_PROXY_MODEL_LIST_FILE`
 names a JSON file of models (`model_list.rs`, schema and example in
@@ -131,8 +137,9 @@ docs/gateway-mode.md). Chat/completions then pick the model from the body's
 `model` (exact match, 404 `model_not_found` otherwise, after auth) through
 `model_list::model_for`, which returns a `ModelView`: read everything
 model-specific from it (`backend_client`, `backend_pool`, `backend_affinity`,
-`admission`, tier, discount, reasoning-off effort), never from `AppState` or
-`Config` directly, so the single-model and the list path stay one code path.
+`admission`, tier, discount, reasoning-off effort, effort map), never from
+`AppState` or `Config` directly, so the single-model and the list path stay one
+code path.
 Each model has its own pool, affinity, admission, engine poller and backend
 client (its bearer goes to its backends only). Per-model metric series go
 through the `model_counter!`/`model_gauge!`/`model_histogram!` macros
@@ -142,8 +149,12 @@ without one. Two series exist in list mode only (`ModelRequest`, same file):
 the chat/completions handlers return (`count_response`, so every exit after
 model selection), and `inference_proxy_model_stream_errors_total{endpoint,model}`
 for a stream that failed after its 200 (`count_stream_error`, in the streaming
-task). A new per-model setting needs a `ModelConfig` field, a file key,
-a `ModelDefaults` fallback and `Config::single_model`. `main` builds a list's
+task). A third, `inference_proxy_model_reasoning_effort_mapped_total{effort,model}`,
+counts the requests a model's `reasoning_effort_map` changed
+(`reasoning::apply_effort_map`). A new per-model setting needs a `ModelConfig`
+field, a file key, a `ModelDefaults` fallback and `Config::single_model`
+(`reasoning_effort_map` is the one key without a variable, so without a
+fallback: `single_model` gives the empty map). `main` builds a list's
 whole state with `model_list::app_state` and serves `routes::build_app`, and
 `tests/model_list.rs` starts its gateways through the same two functions (one
 test runs the built binary), so list-mode wiring belongs in the library, not

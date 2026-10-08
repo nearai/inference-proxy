@@ -1482,6 +1482,8 @@ impl Config {
             capacity_requests_per_minute: self.capacity_requests_per_minute,
             discount_to_user: self.discount_to_user,
             reasoning_off_effort: self.reasoning_off_effort.clone(),
+            // A key of the list file only: no variable sets it.
+            reasoning_effort_map: crate::reasoning::EffortMap::default(),
             backend_token: self.backend_token.clone(),
             backend_priority: self.backend_priority,
         }
@@ -3553,6 +3555,117 @@ mod tests {
                     ),
                     "{error}"
                 );
+            },
+        );
+    }
+
+    #[test]
+    fn test_reasoning_effort_map_is_a_list_key_checked_at_startup() {
+        let lane = [
+            ("CLOUD_API_URL", "https://cloud-api.example"),
+            ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+            ("VLLM_BACKEND_TOKEN_ALPHA", "alpha-secret"),
+        ];
+        let list = |alpha: serde_json::Value| {
+            let mut alpha = alpha;
+            alpha["id"] = serde_json::json!("example/alpha");
+            alpha["backend_urls"] = serde_json::json!(["https://alpha-b1.example"]);
+            serde_json::json!({"models": [
+                alpha,
+                {"id": "example/beta", "backend_urls": ["https://beta-b1.example"]}
+            ]})
+        };
+        let mapped = |map: serde_json::Value| {
+            list(serde_json::json!({
+                "backend_token_env": "VLLM_BACKEND_TOKEN_ALPHA",
+                "reasoning_effort_map": map
+            }))
+        };
+
+        // One model's map, and nothing for the model next to it.
+        with_model_list(&mapped(serde_json::json!({"high": "xhigh"})), &lane, || {
+            let config = Config::from_env().unwrap();
+            let models = &config.model_list.as_ref().unwrap().models;
+            assert_eq!(models[0].reasoning_effort_map.get("high"), Some("xhigh"));
+            assert!(models[1].reasoning_effort_map.is_empty());
+            // The process itself is no model and has no map.
+            assert!(config.single_model().reasoning_effort_map.is_empty());
+        });
+
+        // What cannot be served as written fails startup, naming the file
+        // and the model.
+        let low_is_off: Vec<_> = lane
+            .iter()
+            .chain(&[("VLLM_PROXY_REASONING_OFF_EFFORT", "low")])
+            .copied()
+            .collect();
+        for (list, vars, expected) in [
+            (
+                mapped(serde_json::json!({"high": "xhigh", "xhigh": "max"})),
+                &lane[..],
+                "is both a key and a value",
+            ),
+            (
+                mapped(serde_json::json!({"high": ""})),
+                &lane[..],
+                "every key and value must be 1 to 32 characters",
+            ),
+            (
+                mapped(serde_json::json!({"": "xhigh"})),
+                &lane[..],
+                "every key and value must be 1 to 32 characters",
+            ),
+            (
+                mapped(serde_json::json!({"minimal": "low"})),
+                &lane[..],
+                "\"minimal\" cannot be a key",
+            ),
+            // Against the process-level off effort the entry falls back to.
+            (
+                mapped(serde_json::json!({"low": "medium"})),
+                &low_is_off[..],
+                "\"low\" cannot be a key: it is this model's `reasoning_off_effort`",
+            ),
+            (
+                mapped(serde_json::json!({"high": "none"})),
+                &low_is_off[..],
+                "\"high\" cannot become \"none\"",
+            ),
+            (
+                list(serde_json::json!({"reasoning_effort_map": {"high": "xhigh"}})),
+                &lane[..],
+                "`reasoning_effort_map` requires a backend token",
+            ),
+        ] {
+            let error = with_model_list(&list, vars, || {
+                Config::from_env()
+                    .expect_err("the list must be refused")
+                    .to_string()
+            });
+            assert!(
+                error.starts_with("VLLM_PROXY_MODEL_LIST_FILE (")
+                    && error.contains("model \"example/alpha\"")
+                    && error.contains(expected),
+                "{list}: {error}"
+            );
+        }
+
+        // A process without a list has no map, and there is no variable that
+        // gives it one: the key is not a process-level setting.
+        with_clean_env(
+            &[("MODEL_NAME", "example/alpha"), ("TOKEN", "t")],
+            &[
+                ("NON_TEE_DEPLOYMENT", "1"),
+                ("VLLM_BACKEND_URLS", "https://alpha-b1.example"),
+                ("VLLM_BACKEND_TOKEN", "backend-secret"),
+                ("CLOUD_API_URL", "https://cloud-api.example"),
+                ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+                ("VLLM_PROXY_REASONING_EFFORT_MAP", "{\"high\":\"xhigh\"}"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert!(config.model_list.is_none());
+                assert!(config.single_model().reasoning_effort_map.is_empty());
             },
         );
     }

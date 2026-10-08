@@ -23,9 +23,9 @@
 //! - a `system` message's content is not text: anything but a string or an
 //!   array of text parts (an image part, a part of an unknown type, a part
 //!   without a string `text`, `null`, no content at all);
-//! - a text part carries a key other than `type`, `text` and `cache_control`.
-//!   `cache_control` is a caching hint for the part and has no place in a
-//!   string, so it goes with the part; any other key is left to the engine;
+//! - a text part carries a key other than `type` and `text` (a
+//!   `cache_control` breakpoint, say): a string cannot carry it, and whether
+//!   the engine reads it is not for this code to decide;
 //! - two `system` messages give a field other than `role` and `content` (a
 //!   `name`, say) different values. Such a field is otherwise kept on the
 //!   merged message, where it then covers the whole of it.
@@ -44,11 +44,6 @@ use crate::model_metrics::{model_counter, ModelLabel};
 
 /// What goes between the texts of two `system` messages: a blank line.
 const SEPARATOR: &str = "\n\n";
-
-/// The keys a text part may have and still be merged. `cache_control` marks
-/// a cache breakpoint for providers that have them; it is dropped with the
-/// part, which a string cannot carry.
-const TEXT_PART_KEYS: [&str; 3] = ["type", "text", "cache_control"];
 
 /// Rewrite `messages` so that it holds one `system` message, first, with the
 /// text of all of them (module docs). Returns whether the request was
@@ -135,16 +130,11 @@ fn push_text(text: &mut String, content: &Value) -> Option<()> {
     Some(())
 }
 
-/// The text of a `{"type": "text", "text": "..."}` part, and of nothing else.
+/// The text of a `{"type": "text", "text": "..."}` part, and of nothing
+/// else: a part with any other key holds more than a string can carry.
 fn text_of_part(part: &Value) -> Option<&str> {
     let part = part.as_object()?;
-    if part.get("type")?.as_str()? != "text" {
-        return None;
-    }
-    if part
-        .keys()
-        .any(|key| !TEXT_PART_KEYS.contains(&key.as_str()))
-    {
+    if part.len() != 2 || part.get("type")?.as_str()? != "text" {
         return None;
     }
     part.get("text")?.as_str()
@@ -314,6 +304,8 @@ mod tests {
             json!([{"type": "text", "text": 7}]),
             json!([{"type": "text", "text": null}]),
             json!([{"text": "no type"}]),
+            // A text part with more on it than a string can carry.
+            json!([{"type": "text", "text": "stable", "cache_control": {"type": "ephemeral"}}]),
             json!([{"type": "text", "text": "annotated", "annotations": []}]),
             json!(["a bare string"]),
             json!([null]),
@@ -346,21 +338,6 @@ mod tests {
             {"role": "system", "content": "first"},
             {"role": "system"}
         ]));
-    }
-
-    #[test]
-    fn a_cache_breakpoint_on_a_text_part_goes_with_the_part() {
-        let (messages, rewritten) = merged(json!([
-            {"role": "system", "content": [
-                {"type": "text", "text": "stable", "cache_control": {"type": "ephemeral"}}
-            ]},
-            {"role": "system", "content": "volatile"}
-        ]));
-        assert!(rewritten);
-        assert_eq!(
-            messages,
-            json!([{"role": "system", "content": "stable\n\nvolatile"}])
-        );
     }
 
     #[test]

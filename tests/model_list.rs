@@ -1627,6 +1627,16 @@ async fn system_messages_are_merged_for_the_model_that_asks_for_it_and_for_no_ot
                     {"type": "image_url", "image_url": {"url": "https://img.example/a.png"}}
                 ]))
             ]),
+            // So is a text part with more on it than a string can carry.
+            json!([
+                system(json!([{
+                    "type": "text",
+                    "text": FIRST_PROMPT,
+                    "cache_control": {"type": "ephemeral"}
+                }])),
+                user,
+                system(SECOND_PROMPT)
+            ]),
             // What the template takes already: one system message, first, of
             // either shape, or none.
             json!([system(FIRST_PROMPT), user]),

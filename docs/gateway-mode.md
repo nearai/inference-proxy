@@ -934,10 +934,9 @@ That is the case when
 - a system message has a part that is not a text part (an image, any other
   type, a text part without a string `text`), or a content that is neither a
   string nor an array (`null`, or none at all);
-- a text part has a key other than `type`, `text` and `cache_control`.
-  `cache_control` marks a cache breakpoint for providers that have them and
-  cannot be carried by a string, so it goes with the part. Any other key is
-  not this gateway's to judge;
+- a text part has a key other than `type` and `text` (a `cache_control`
+  breakpoint, for instance). A string cannot carry it, and whether the engine
+  reads it is not this gateway's to judge;
 - two system messages give a field other than `role` and `content` different
   values (two different `name`s, say). Such a field is otherwise kept on the
   merged message, whichever system message carried it, and then covers the

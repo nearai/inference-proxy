@@ -601,8 +601,9 @@ fn a_reasoning_effort_map_of_another_shape_is_refused() {
         let error = error_of(one_lane(serde_json::json!({"reasoning_effort_map": map})));
         assert!(error.contains("not a valid model list"), "{map}: {error}");
     }
-    // A key written twice is not settled by which one came last. (Written
-    // out: a `json!` object cannot hold it.)
+    // A key written twice is not settled by which one came last, and is
+    // refused like every other rule of the map, with the model named.
+    // (Written out: a `json!` object cannot hold it.)
     let error = parse(
         r#"{"models": [{
             "id": "m",
@@ -617,8 +618,7 @@ fn a_reasoning_effort_map_of_another_shape_is_refused() {
     .unwrap_err()
     .to_string();
     assert!(
-        error.contains("not a valid model list")
-            && error.contains("`reasoning_effort_map` has the same key more than once"),
+        error.contains("model \"m\": `reasoning_effort_map`: \"high\" is a key more than once"),
         "{error}"
     );
     // It is a key of a model, not of its tier or of the file.
@@ -646,11 +646,11 @@ fn a_reasoning_effort_map_is_validated() {
         // A chain: the result would depend on the order of two lookups.
         (
             serde_json::json!({"high": "xhigh", "xhigh": "max"}),
-            "\"xhigh\" is both a key and a value",
+            "\"high\" becomes \"xhigh\", which is itself a key",
         ),
         (
             serde_json::json!({"high": "high"}),
-            "\"high\" is both a key and a value",
+            "\"high\" becomes \"high\", which is itself a key",
         ),
         (
             serde_json::json!({"": "xhigh"}),

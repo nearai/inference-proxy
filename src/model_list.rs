@@ -235,9 +235,9 @@ struct ModelEntry {
 }
 
 /// `reasoning_effort_map` as the file writes it: a JSON object of string to
-/// string, kept as its pairs so that a key written twice is refused like a
-/// duplicate of any other key of the file, not settled by which came last.
-/// What the pairs may say is `EffortMap::new`'s to decide.
+/// string, kept as its pairs, in file order and with a key written twice
+/// still there twice. A map type would settle that by which came last;
+/// `EffortMap::new` decides what the pairs may say, duplicates included.
 struct EffortPairs(Vec<(String, String)>);
 
 impl<'de> Deserialize<'de> for EffortPairs {
@@ -248,22 +248,16 @@ impl<'de> Deserialize<'de> for EffortPairs {
             type Value = EffortPairs;
 
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("an object of effort to effort, both strings")
+                f.write_str("an object mapping string keys to string values")
             }
 
             fn visit_map<A: serde::de::MapAccess<'de>>(
                 self,
                 mut entries: A,
             ) -> Result<Self::Value, A::Error> {
-                let mut pairs: Vec<(String, String)> = Vec::new();
-                while let Some((from, to)) = entries.next_entry::<String, String>()? {
-                    // Not echoed: nothing has looked at its shape yet.
-                    if pairs.iter().any(|(seen, _)| *seen == from) {
-                        return Err(serde::de::Error::custom(
-                            "`reasoning_effort_map` has the same key more than once",
-                        ));
-                    }
-                    pairs.push((from, to));
+                let mut pairs = Vec::new();
+                while let Some(pair) = entries.next_entry::<String, String>()? {
+                    pairs.push(pair);
                 }
                 Ok(EffortPairs(pairs))
             }

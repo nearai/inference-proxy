@@ -3603,7 +3603,7 @@ mod tests {
             (
                 mapped(serde_json::json!({"high": "xhigh", "xhigh": "max"})),
                 &lane[..],
-                "is both a key and a value",
+                "\"high\" becomes \"xhigh\", which is itself a key",
             ),
             (
                 mapped(serde_json::json!({"high": ""})),

@@ -94,7 +94,9 @@ impl EffortMap {
     /// list entry wrote. Refused, so that a list never starts with one:
     ///
     /// - a key or a target that is not 1 to 32 characters of `a-z`, `0-9`,
-    ///   `_` and `-`, a key written twice, more than 16 entries;
+    ///   `_` and `-`, more than 16 entries;
+    /// - a key written twice. This is the one place that is checked: the
+    ///   list file hands over its pairs as written (`model_list`);
     /// - a chain, i.e. a target that is also a key (`{"a": "b", "b": "c"}`,
     ///   or `{"a": "a"}`): every effort is looked up once, so what a request
     ///   is sent with never depends on an order;
@@ -143,9 +145,9 @@ impl EffortMap {
             }
             map.insert(from, to);
         }
-        if let Some(chained) = map.values().find(|to| map.contains_key(*to)) {
+        if let Some((from, to)) = map.iter().find(|(_, to)| map.contains_key(*to)) {
             anyhow::bail!(
-                "{KEY}: {chained:?} is both a key and a value: an effort is mapped once, never through a chain"
+                "{KEY}: {from:?} becomes {to:?}, which is itself a key: an effort is mapped once, never through a chain"
             );
         }
         Ok(Self(map))
@@ -554,20 +556,24 @@ mod tests {
                 vec![("high", long.as_str())],
                 "every key and value must be 1 to 32",
             ),
-            // A chain, in either order, and the shortest one.
+            // A chain, in either order of writing, a cycle, and the shortest
+            // one. The message names the entry that leads into another.
             (
                 vec![("high", "xhigh"), ("xhigh", "max")],
-                "\"xhigh\" is both a key and a value",
+                "\"high\" becomes \"xhigh\", which is itself a key",
             ),
             (
                 vec![("xhigh", "max"), ("high", "xhigh")],
-                "\"xhigh\" is both a key and a value",
+                "\"high\" becomes \"xhigh\", which is itself a key",
             ),
             (
                 vec![("high", "medium"), ("medium", "high")],
-                "is both a key and a value",
+                "\"high\" becomes \"medium\", which is itself a key",
             ),
-            (vec![("high", "high")], "\"high\" is both a key and a value"),
+            (
+                vec![("high", "high")],
+                "\"high\" becomes \"high\", which is itself a key",
+            ),
             (
                 vec![("high", "xhigh"), ("high", "max")],
                 "\"high\" is a key more than once",

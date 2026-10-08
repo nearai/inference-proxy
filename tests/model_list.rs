@@ -3695,7 +3695,7 @@ async fn the_binary_applies_a_reasoning_effort_map_and_refuses_one_it_cannot_ser
         // A chain.
         (
             json!({"reasoning_effort_map": {"high": "xhigh", "xhigh": "max"}}),
-            "\"xhigh\" is both a key and a value",
+            "\"high\" becomes \"xhigh\", which is itself a key",
         ),
         // An empty key, an empty value.
         (

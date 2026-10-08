@@ -741,6 +741,13 @@ fn a_single_models_log_lines_carry_no_model_field() {
             .reject(crate::admission::RejectReason::Budget);
     };
 
+    // tracing caches a callsite's interest for the whole process, and while
+    // exactly one subscriber is registered it derives that from the calling
+    // thread's default: another test's thread, which has none, would switch
+    // these shared callsites off for this capture too. A second registered
+    // dispatcher makes it ask every registered subscriber instead.
+    let _registered = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+
     let logs = Logs::default();
     let writer = logs.clone();
     let guard = tracing::subscriber::set_default(

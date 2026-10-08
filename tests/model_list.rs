@@ -1456,17 +1456,33 @@ impl std::io::Write for Logs {
     }
 }
 
+/// Keeps a `Logs` capture going until dropped.
+struct LogCapture {
+    _subscriber: tracing::subscriber::DefaultGuard,
+    _registered: tracing::Dispatch,
+}
+
 impl Logs {
     /// Every log line of the proxy itself, at any level, on this thread.
-    fn capture(&self) -> tracing::subscriber::DefaultGuard {
+    fn capture(&self) -> LogCapture {
         let logs = self.clone();
-        tracing::subscriber::set_default(
+        let subscriber = tracing::subscriber::set_default(
             tracing_subscriber::fmt()
                 .with_env_filter(tracing_subscriber::EnvFilter::new("vllm_proxy_rs=trace"))
                 .with_ansi(false)
                 .with_writer(move || logs.clone())
                 .finish(),
-        )
+        );
+        // tracing caches every callsite's interest for the whole process.
+        // While exactly one subscriber is registered it derives that from the
+        // calling thread's default, so a test on another thread, which has
+        // none, would switch a shared callsite off for this capture as well.
+        // With a second one registered it asks every registered subscriber.
+        let registered = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        LogCapture {
+            _subscriber: subscriber,
+            _registered: registered,
+        }
     }
 
     fn contents(&self) -> String {

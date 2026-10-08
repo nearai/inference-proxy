@@ -388,8 +388,7 @@ async fn json_passthrough_encrypted(
     let (forward_body, original_request_hash, response_transform) = if let Some(ctx) = enc_ctx {
         // Hash original client-sent body before decryption for signatures
         let original_hash = hex::encode(sha2::Sha256::digest(&request_body));
-        let mut request_json: serde_json::Value = serde_json::from_slice(&request_body)
-            .map_err(|e| AppError::BadRequest(format!("Invalid JSON: {e}")))?;
+        let mut request_json = proxy::parse_json_object(&request_body)?;
         encryption::decrypt_request_fields(&mut request_json, endpoint, &ctx, &state.signing)?;
         let modified =
             serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?;
@@ -397,8 +396,7 @@ async fn json_passthrough_encrypted(
         (modified, Some(original_hash), Some(transform))
     } else {
         // Validate JSON without re-serializing
-        let _: serde_json::Value = serde_json::from_slice(&request_body)
-            .map_err(|e| AppError::BadRequest(format!("Invalid JSON: {e}")))?;
+        proxy::parse_json_object(&request_body)?;
         (request_body, None, None)
     };
 

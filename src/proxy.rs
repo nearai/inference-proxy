@@ -1970,11 +1970,25 @@ pub async fn proxy_json_request(
         .into_response())
 }
 
+/// Parse a JSON request body, which must be an object. The routes and
+/// `inject_streaming` index the body by key, which panics on any other JSON
+/// value (`[]`, `"x"`, `1`) and silently turns `null` into an object, so
+/// those are a 400 here, before anything is dispatched.
+pub fn parse_json_object(body: &[u8]) -> Result<serde_json::Value, AppError> {
+    let json: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| AppError::BadRequest(format!("Invalid JSON: {e}")))?;
+    if !json.is_object() {
+        return Err(AppError::BadRequest(
+            "Request body must be a JSON object".to_string(),
+        ));
+    }
+    Ok(json)
+}
+
 /// Inject `"stream": true` and `"stream_options": {"include_usage": true}`
 /// into a JSON request body for internal streaming.
 fn inject_streaming(body: &[u8]) -> Result<Vec<u8>, AppError> {
-    let mut json: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|e| AppError::BadRequest(format!("Invalid JSON: {e}")))?;
+    let mut json = parse_json_object(body)?;
     json["stream"] = true.into();
     json["stream_options"] = serde_json::json!({"include_usage": true});
     serde_json::to_vec(&json).map_err(|e| AppError::Internal(e.into()))
@@ -5796,6 +5810,27 @@ data: [DONE]
         assert_eq!(json["stream"], true);
         assert_eq!(json["stream_options"]["include_usage"], true);
         assert_eq!(json["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn test_inject_streaming_rejects_non_object_body() {
+        // Indexing a non-object by key panics, and `null` would silently
+        // become an object: both must be a 400 instead.
+        for body in [
+            "[]",
+            r#"[{"stream":false}]"#,
+            r#""hi""#,
+            "42",
+            "true",
+            "null",
+        ] {
+            match inject_streaming(body.as_bytes()) {
+                Err(AppError::BadRequest(message)) => {
+                    assert_eq!(message, "Request body must be a JSON object", "{body}")
+                }
+                other => panic!("{body}: expected a bad request, got {other:?}"),
+            }
+        }
     }
 
     #[test]

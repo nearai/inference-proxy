@@ -439,9 +439,9 @@ async fn serve(state: AppState, listen_addr: &str, listen_port: u16) -> anyhow::
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
-    // The server has stopped. Give the usage reports still pending their
-    // time (`VLLM_PROXY_USAGE_REPORT_*`; by default nothing is awaited, as
-    // before).
+    // The server has stopped: every open request has ended, however long
+    // that took. Only now do the usage reports still pending get their time
+    // (`VLLM_PROXY_USAGE_REPORT_*`; by default nothing is awaited, as before).
     let _ = usage_report_delivery.drain_at_shutdown().await;
 
     info!("Server shut down");

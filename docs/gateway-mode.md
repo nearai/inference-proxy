@@ -102,9 +102,9 @@ to the current in-CVM behavior.
 | `VLLM_PROXY_REJECTED_CONTENT_PART_TYPES` | `video_url,input_audio,file` | Modalities this deployment does not serve → deterministic `400`. |
 | `VLLM_PROXY_MODELS_DOCUMENT_URL` / `VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE` | `https://cloud-api.near.ai/v1/models` / `150` | `GET /v1/models` serves cloud-api's entry for `MODEL_NAME` (pricing, modalities, `is_ready`, `openrouter.slug`) with `capacity` added: concurrency = `VLLM_PROXY_ADMISSION_MAX_INFLIGHT`, requests per minute = this value. One URL for inference and the listing; `is_ready` stays under cloud-api's catalog control (the kill switch). Source unreadable → the engine's list, as without the variable. |
 | `VLLM_PROXY_DISCOUNT_TO_USER` | unset (list price) | The lane's discount off the list price, a fraction in `[0, 1)` with at most four decimal places (`0.2` = 20 % off): published as `discount_to_user` on the models document entry (in place of any the source carries) and sent with every usage report, so cloud-api bills the price the aggregator shows; empty or `0` = none, an invalid value fails startup, and it requires `VLLM_PROXY_MODELS_DOCUMENT_URL`. While that source is unreadable, the engine list served instead carries the discount on every entry, and an engine answer that is not a model list becomes a 502 rather than going out without it. cloud-api refuses a report whose discount exceeds its `INTERNAL_USAGE_MAX_DISCOUNT` (default `0.5`), leaving that usage unbilled, so keep the value within it. |
-| `VLLM_PROXY_USAGE_REPORT_TIMEOUT_SECS` / `_MAX_ATTEMPTS` / `_DEADLINE_SECS` | `30` / `5` / `300` | How long one attempt at a usage report may take, how many attempts a report gets, and how long after its request it may still be sent (see [Usage report delivery](#usage-report-delivery)). Unset = one attempt of 5 s and no deadline, as in a CVM. |
+| `VLLM_PROXY_USAGE_REPORT_TIMEOUT_SECS` / `_MAX_ATTEMPTS` / `_INITIAL_BACKOFF_MS` / `_DEADLINE_SECS` | `30` / `5` / `5000` / `300` | How long one attempt at a usage report may take, how many attempts a report gets, the backoff before the first retry, and how long after its request a report may still be sent (see [Usage report delivery](#usage-report-delivery)). Unset = one attempt of 5 s and no deadline, as in a CVM. |
 | `VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT` | `8` | Usage reports in flight at once; the others wait in a bounded in-memory queue (`_MAX_QUEUED`, default `10000`). Unset = no cap. Required for a timeout above 5 s or more than one attempt. |
-| `VLLM_PROXY_USAGE_REPORT_SHUTDOWN_DRAIN_SECS` | below the service's stop timeout | On SIGTERM, how long to wait for usage reports still queued or in flight before exiting. Unset = no wait. |
+| `VLLM_PROXY_USAGE_REPORT_SHUTDOWN_DRAIN_SECS` | below the service's stop timeout | On SIGTERM, once every open request has ended, how long to wait for usage reports still queued or in flight before exiting. Unset = no wait. |
 | `VLLM_PROXY_REASONING_OFF_EFFORT` | `low` | What "no reasoning" means for GLM-5.3 Flash (see below). |
 | `VLLM_PROXY_SSE_KEEPALIVE_SECS` | `15` | `: keep-alive` SSE comments while the upstream is silent (long prefill/queueing), so intermediaries with read timeouts do not cancel. Off in CVMs: comments are not part of the signed bytes. |
 | `VLLM_PROXY_MAP_QUEUE_FULL_TO_429` | `1` | The engine's admission rejection (queue full, or a queued request displaced by a higher-priority one) becomes 429 with `Retry-After: 2` and type `overloaded`, the same shape as the gateway's own refusals: back-pressure, not an outage. Off in CVMs: cloud-api's peer fallback keys on the 503. |
@@ -540,22 +540,35 @@ then has to wait for.
 | --- | --- | --- | --- |
 | `VLLM_PROXY_USAGE_REPORT_TIMEOUT_SECS` | `5` | `30` | Timeout of one attempt (1 to 300). Above 5 requires `_MAX_IN_FLIGHT`. |
 | `VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS` | `1` | `5` | Attempts per report, the first one included; `1` = never retried, at most `10`. More than one requires `_MAX_IN_FLIGHT`. |
-| `VLLM_PROXY_USAGE_REPORT_INITIAL_BACKOFF_MS` | `500` | default | Backoff before the first retry (at most 30000); doubled for each later one, at most 30 s. |
+| `VLLM_PROXY_USAGE_REPORT_INITIAL_BACKOFF_MS` | `500` | `5000` | Backoff before the first retry (at most 30000); doubled for each later one, at most 30 s. |
 | `VLLM_PROXY_USAGE_REPORT_DEADLINE_SECS` | `0` (none) | `300` | How long after its request completed a report may still be sent. Above the timeout: the difference is the time a report has to wait and to back off. |
 | `VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT` | `0` (no cap) | `8` | Reports in flight at once, for the whole process (at most 1000). |
 | `VLLM_PROXY_USAGE_REPORT_MAX_QUEUED` | `10000` | default | Reports that may wait for a place when the cap is reached (1 to 100000). Unused without a cap. |
-| `VLLM_PROXY_USAGE_REPORT_SHUTDOWN_DRAIN_SECS` | `0` (no wait) | below the service's stop timeout | How long shutdown waits for pending reports (at most 600). |
+| `VLLM_PROXY_USAGE_REPORT_SHUTDOWN_DRAIN_SECS` | `0` (no wait) | below the service's stop timeout | How long shutdown waits for pending reports once every open request has ended (at most 600). |
 
 A value that cannot work fails startup. A report only gets more than the one
 5 s attempt it has always had under a cap, so whatever is configured, what the
-process holds while cloud-api is down stays bounded. Why the lane values: cloud-api drains
-about 17 reports a second however many are in flight, so a cap of 8 costs no
-throughput. A wave of 200 reports still clears in about 12 s (200 / 17), each
-request waits about half a second for its write (8 / 17), far inside the 30 s
-timeout, and this lane never holds more than 8 of cloud-api's connections, so
-it cannot starve the pool. Five attempts inside five minutes ride out a
-restart of cloud-api; past the deadline a report is dropped rather than sent
-late for ever.
+process holds while cloud-api is down stays bounded.
+
+Why the lane values. cloud-api drains about 17 reports a second however many
+are in flight, so a cap of 8 costs no throughput. A wave of 200 reports still
+clears in about 12 s (200 / 17), each request waits about half a second for
+its write (8 / 17), far inside the 30 s timeout, and this lane never holds
+more than 8 of cloud-api's connections, so it cannot starve the pool.
+
+The backoff is 5000 ms because a failing report runs out of attempts long
+before it runs out of deadline. When cloud-api fails fast (a refused
+connection, an immediate 503) an attempt takes no time, and only the backoff
+spreads the attempts out. With the default 500 ms the five attempts are used
+up 4 to 8 s after the first one, with minutes of the deadline still unused,
+and during an outage every place gives up a report that often. With 5000 ms
+the same five attempts span 33 to 65 s (2.5 to 5 s, 5 to 10 s, 10 to 20 s and
+15 to 30 s between them), which covers a restart of cloud-api of about half a
+minute; the reports behind them wait in the queue, for up to 270 s. An outage
+longer than that still costs the reports whose attempts run out during it
+(`attempts_exhausted`). More attempts buy more time: ten of them span about 2
+to 3.5 minutes. Past the deadline a report is dropped rather than sent late
+for ever.
 
 **Retries.** A timeout, a connection or transport error, a 5xx and a 429 are
 retried. Any other 4xx, and any other answer that is not a success, is final:
@@ -593,6 +606,17 @@ and logs `Usage reports drained before shutdown` or `Usage reports left
 undelivered at shutdown` with how many were pending and how many were left
 (the count, not the ids of the reports). The queue is in memory only: what is
 left at exit, and whatever a process held when it was killed, is lost.
+
+The wait starts only when every open request has ended. One stream that is
+still open keeps the server serving, and when the service's stop timeout runs
+out first the process is killed before any drain and without either line. So
+the setting covers a process that has no open stream left, and it is not what
+makes a planned retirement safe. When a process is taken out of service on
+purpose (a blue/green switch), stop it later than `DEADLINE_SECS` plus one
+`TIMEOUT_SECS` after traffic moved away from it, 330 s with the lane values,
+and count that from the end of its last stream if one was still open then. By
+that time every report it took has been accepted or dropped, and its queue is
+empty whatever the drain does.
 
 **Metrics.** `inference_proxy_usage_reports_total{outcome}` is still the final
 outcome of a report, one count per report: with retries the outcome of its

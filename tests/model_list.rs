@@ -2582,6 +2582,7 @@ async fn usage_report_delivery_series_carry_the_model_label_in_list_mode_only() 
         ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
         ("VLLM_PROXY_USAGE_REPORT_TIMEOUT_SECS", "30"),
         ("VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS", "5"),
+        ("VLLM_PROXY_USAGE_REPORT_INITIAL_BACKOFF_MS", "5000"),
         ("VLLM_PROXY_USAGE_REPORT_DEADLINE_SECS", "300"),
         ("VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT", "8"),
     ];

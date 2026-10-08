@@ -20,6 +20,8 @@ enum Answers {
     /// One write at a time, each taking this long: an intake that serializes
     /// the writes of one organization.
     OneWriteAtATime(Duration),
+    /// 503 at once for this long, counted from the first request, 200 after.
+    DownFor(Duration),
 }
 
 struct Received {
@@ -38,6 +40,7 @@ struct Intake {
     handling: AtomicUsize,
     most_handled_at_once: AtomicUsize,
     writer: tokio::sync::Mutex<()>,
+    first_request_at: std::sync::OnceLock<Instant>,
 }
 
 /// One request being handled; it stops counting when the handler ends or is
@@ -90,6 +93,14 @@ async fn usage(
             tokio::time::sleep(*per_write).await;
             200
         }
+        Answers::DownFor(outage) => {
+            let first_request_at = intake.first_request_at.get_or_init(Instant::now);
+            if first_request_at.elapsed() < *outage {
+                503
+            } else {
+                200
+            }
+        }
     };
     let status = StatusCode::from_u16(status).unwrap();
     if status.is_success() {
@@ -119,6 +130,7 @@ impl Billing {
             handling: AtomicUsize::new(0),
             most_handled_at_once: AtomicUsize::new(0),
             writer: tokio::sync::Mutex::new(()),
+            first_request_at: std::sync::OnceLock::new(),
         });
         let app = axum::Router::new()
             .route("/v1/internal/usage", axum::routing::post(usage))
@@ -152,6 +164,7 @@ impl Billing {
                 handling: AtomicUsize::new(0),
                 most_handled_at_once: AtomicUsize::new(0),
                 writer: tokio::sync::Mutex::new(()),
+                first_request_at: std::sync::OnceLock::new(),
             }),
             client: reqwest::Client::new(),
         }
@@ -555,6 +568,46 @@ async fn rate_limits_server_errors_and_connection_failures_are_retried() {
     );
 }
 
+/// Twenty reports, two places and five attempts each, against an intake that
+/// answers 503 at once for the two seconds after its first request: how many
+/// were written.
+async fn written_through_an_outage(initial_backoff: Duration) -> usize {
+    let billing = Billing::start(Answers::DownFor(Duration::from_secs(2))).await;
+    let delivery = policy(|policy| {
+        policy.max_attempts = 5;
+        policy.initial_backoff = initial_backoff;
+        policy.max_in_flight = 2;
+    });
+    for n in 0..20 {
+        billing.report(&delivery, &format!("chatcmpl-{n}"), None);
+    }
+    delivered(&delivery).await;
+    billing.written().len()
+}
+
+#[tokio::test]
+async fn failures_that_come_at_once_use_up_the_attempts_unless_the_backoff_outlasts_them() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let exhausted = || value(&recorder, DROPPED, &["reason=\"attempts_exhausted\""]);
+
+    // A failed attempt takes no time here, so the backoff is all there is
+    // between two attempts. A short one (15 ms in all) spends the five
+    // attempts of one report after another inside the outage; no deadline
+    // would have saved them.
+    let written = written_through_an_outage(Duration::from_millis(1)).await;
+    assert!(written < 20, "{written}");
+    assert_eq!(exhausted(), (20 - written) as f64);
+
+    // With a backoff whose first three steps outlast the outage (at least
+    // 300 + 600 + 1200 ms), the fourth attempt of every report finds the
+    // intake back, whenever its first one was made.
+    let lost_before = exhausted();
+    let written = written_through_an_outage(Duration::from_millis(600)).await;
+    assert_eq!(written, 20);
+    assert_eq!(exhausted(), lost_before);
+}
+
 #[test]
 fn the_backoff_doubles_from_the_initial_value_is_spread_and_never_immediate() {
     let delivery = UsageReportDelivery::with(UsageReportPolicy {
@@ -824,6 +877,36 @@ async fn every_report_dropped_from_a_full_queue_is_counted_however_many_at_once(
     assert_eq!(value(&recorder, WAITING, &[]), 0.0);
 }
 
+#[tokio::test]
+async fn a_worker_that_panics_gives_its_place_back() {
+    let billing = Billing::answering(200).await;
+    let delivery = policy(|policy| policy.max_in_flight = 1);
+    // The one place is taken, the way `submit` takes it, by a worker that is
+    // about to die, and a report that arrives meanwhile has to wait.
+    delivery.state().in_flight += 1;
+    let place = Place {
+        delivery: delivery.clone(),
+        model: None,
+        held: true,
+    };
+    billing.report(&delivery, "waiting", None);
+    assert_eq!(delivery.pending(), (1, 1));
+    let worker = tokio::spawn(async move {
+        let _place = place;
+        panic!("the worker died");
+    });
+    assert!(worker.await.unwrap_err().is_panic());
+
+    // The place is free again. Had it gone with the worker, nothing would
+    // ever be sent under this cap.
+    assert_eq!(delivery.pending(), (1, 0));
+    // The next report takes it, and its worker goes on with what waited.
+    billing.report(&delivery, "next", None);
+    delivered(&delivery).await;
+    assert_eq!(billing.written(), ["next", "waiting"]);
+    assert_eq!(delivery.pending(), (0, 0));
+}
+
 // ---------------------------------------------------------------------------
 // Shutdown
 // ---------------------------------------------------------------------------
@@ -1003,6 +1086,7 @@ async fn with_the_lane_settings_the_whole_wave_is_accepted_and_the_cap_holds() {
     let delivery = policy(|policy| {
         policy.attempt_timeout = Duration::from_secs(30);
         policy.max_attempts = 5;
+        policy.initial_backoff = Duration::from_secs(5);
         policy.deadline = Some(Duration::from_secs(300));
         policy.max_in_flight = 8;
     });
@@ -1029,4 +1113,316 @@ async fn with_the_lane_settings_the_whole_wave_is_accepted_and_the_cap_holds() {
     // The wave clears at the intake's own pace: 200 writes at 17 a second.
     assert!(took >= PER_WRITE * 200, "{took:?}");
     assert!(took < Duration::from_secs(25), "{took:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Log lines
+// ---------------------------------------------------------------------------
+
+/// The log lines written on this thread, as JSON, the format production uses.
+#[derive(Clone, Default)]
+struct Logs(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Keeps a `Logs` capture going until dropped.
+struct LogCapture {
+    _subscriber: tracing::subscriber::DefaultGuard,
+    _registered: tracing::Dispatch,
+}
+
+impl Logs {
+    fn capture(&self) -> LogCapture {
+        let logs = self.clone();
+        let subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .json()
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(move || logs.clone())
+                .finish(),
+        );
+        // tracing caches every callsite's interest for the whole process.
+        // While exactly one subscriber is registered it derives that from the
+        // calling thread's default, so a test on another thread, which has
+        // none, would switch a shared callsite off for this capture as well.
+        // With a second one registered it asks every registered subscriber.
+        let registered = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        LogCapture {
+            _subscriber: subscriber,
+            _registered: registered,
+        }
+    }
+
+    fn contents(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+
+    /// Every line with this message, oldest first.
+    fn lines(&self, message: &str) -> Vec<serde_json::Value> {
+        self.contents()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|line| line["fields"]["message"] == message)
+            .collect()
+    }
+}
+
+/// The names of a line's fields, its message aside.
+fn field_names(line: &serde_json::Value) -> std::collections::BTreeSet<&str> {
+    line["fields"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .filter(|name| *name != "message")
+        .collect()
+}
+
+/// Whether a line was written inside a span.
+fn in_a_span(line: &serde_json::Value) -> bool {
+    line.get("span").is_some() || line.get("spans").is_some()
+}
+
+/// What every line about one report carries: who it is for and where it came
+/// from, as ids and labels.
+const WHO: [&str; 7] = [
+    "request_id",
+    "org_id",
+    "workspace_id",
+    "api_key_id",
+    "model",
+    "auth_path",
+    "ingress_route",
+];
+
+fn assert_who(line: &serde_json::Value, request_id: &str) {
+    let fields = &line["fields"];
+    assert_eq!(fields["request_id"], request_id, "{line}");
+    assert_eq!(fields["org_id"], "org-1", "{line}");
+    assert_eq!(fields["workspace_id"], "ws-1", "{line}");
+    assert_eq!(fields["api_key_id"], "key-1", "{line}");
+    assert_eq!(fields["model"], "test-model", "{line}");
+    assert_eq!(fields["auth_path"], "cloud_api_key", "{line}");
+    assert_eq!(fields["ingress_route"], "canonical", "{line}");
+}
+
+#[tokio::test]
+async fn the_lines_a_report_ends_with_are_the_old_ones_by_default_and_gain_two_fields_otherwise() {
+    for (delivery, added) in [
+        (Arc::new(UsageReportDelivery::default()), &[][..]),
+        (
+            policy(|policy| policy.max_in_flight = 4),
+            &["attempts", "since_completion_ms"][..],
+        ),
+    ] {
+        let logs = Logs::default();
+        let _capture = logs.capture();
+        let (accepting, refusing) = (Billing::answering(200).await, Billing::answering(503).await);
+        // Handed over inside a request's span, as a handler does it.
+        tracing::info_span!("request", request_id = "the-request").in_scope(|| {
+            accepting.report(&delivery, "accepted", None);
+            refusing.report(&delivery, "refused", None);
+            Billing::unreachable().report(&delivery, "unreachable", None);
+        });
+        delivered(&delivery).await;
+
+        for (message, level, id, own) in [
+            (
+                "Direct-key usage report accepted by Cloud API",
+                "INFO",
+                "accepted",
+                &["status", "duration_ms"][..],
+            ),
+            (
+                "Usage reporting returned non-success",
+                "WARN",
+                "refused",
+                &["status", "duration_ms", "outcome"][..],
+            ),
+            (
+                "Usage reporting failed",
+                "WARN",
+                "unreachable",
+                &["error", "duration_ms", "outcome"][..],
+            ),
+        ] {
+            let lines = logs.lines(message);
+            assert_eq!(lines.len(), 1, "{message}: {}", logs.contents());
+            let line = &lines[0];
+            assert_eq!(line["level"], level, "{line}");
+            // Where `proxy.rs` wrote them, and in no request's span.
+            assert_eq!(line["target"], "vllm_proxy_rs::proxy", "{line}");
+            assert!(!in_a_span(line), "{line}");
+            assert_who(line, &format!("request-{id}"));
+            // Exactly the fields these lines have always had, and under a
+            // changed policy two more.
+            let expected: std::collections::BTreeSet<&str> =
+                WHO.iter().chain(own).chain(added).copied().collect();
+            assert_eq!(field_names(line), expected, "{message}");
+            if !added.is_empty() {
+                assert_eq!(line["fields"]["attempts"], 1, "{line}");
+                assert!(line["fields"]["since_completion_ms"].is_u64(), "{line}");
+            }
+        }
+        assert_eq!(
+            logs.lines("Direct-key usage report accepted by Cloud API")[0]["fields"]["status"],
+            "200 OK"
+        );
+        assert_eq!(
+            logs.lines("Usage reporting returned non-success")[0]["fields"]["outcome"],
+            "http_5xx"
+        );
+        assert_eq!(
+            logs.lines("Usage reporting failed")[0]["fields"]["outcome"],
+            "connect_error"
+        );
+        // The bearer is in no line.
+        assert!(!logs.contents().contains("usage-secret"));
+    }
+}
+
+#[tokio::test]
+async fn a_dropped_report_is_logged_with_its_ids_as_usage_not_billed() {
+    const QUEUE_FULL: &str = "Usage report dropped: the waiting queue is full and this report \
+                              waited longest — usage NOT billed";
+    const DEADLINE: &str =
+        "Usage report dropped: not accepted before its deadline — usage NOT billed";
+    let logs = Logs::default();
+    let _capture = logs.capture();
+    let names = |own: &[&'static str]| -> std::collections::BTreeSet<&'static str> {
+        WHO.iter()
+            .chain(&["outcome", "since_completion_ms"])
+            .chain(own)
+            .copied()
+            .collect()
+    };
+
+    // A full queue: "two" has waited longest when "three" is handed over.
+    let billing = Billing::start(Answers::Script(vec![(Duration::from_millis(50), 200)])).await;
+    let full = policy(|policy| {
+        policy.max_in_flight = 1;
+        policy.max_queued = 1;
+    });
+    tracing::info_span!("request", request_id = "request-three").in_scope(|| {
+        for id in ["one", "two", "three"] {
+            billing.report(&full, id, None);
+        }
+    });
+    delivered(&full).await;
+    let lines = logs.lines(QUEUE_FULL);
+    assert_eq!(lines.len(), 1, "{}", logs.contents());
+    assert_eq!(lines[0]["level"], "WARN");
+    assert_who(&lines[0], "request-two");
+    assert_eq!(lines[0]["fields"]["outcome"], "queue_full");
+    assert_eq!(lines[0]["fields"]["max_queued"], 1);
+    assert_eq!(field_names(&lines[0]), names(&["max_queued"]));
+    // It is about "two", so it is not in the span of the request that
+    // handed "three" over.
+    assert!(!in_a_span(&lines[0]), "{}", lines[0]);
+
+    // A deadline, for a report that was never sent: its turn comes 700 ms
+    // after it was handed over, with less than the 1 s timeout left of its
+    // 1.5 s.
+    let slow = Billing::start(Answers::Script(vec![(Duration::from_millis(700), 200)])).await;
+    let waiting = policy(|policy| {
+        policy.attempt_timeout = Duration::from_secs(1);
+        policy.deadline = Some(Duration::from_millis(1_500));
+        policy.max_in_flight = 1;
+    });
+    slow.report(&waiting, "in-time", None);
+    slow.report(&waiting, "late", None);
+    delivered(&waiting).await;
+    assert_eq!(slow.written(), ["in-time"]);
+    let lines = logs.lines(DEADLINE);
+    assert_eq!(lines.len(), 1, "{}", logs.contents());
+    assert_eq!(lines[0]["level"], "WARN");
+    assert_who(&lines[0], "request-late");
+    assert_eq!(lines[0]["fields"]["outcome"], "deadline_exceeded");
+    assert_eq!(lines[0]["fields"]["attempts"], 0);
+    assert_eq!(field_names(&lines[0]), names(&["attempts"]));
+
+    // A deadline, for a report whose attempts all failed: the line also
+    // says how the last one ended.
+    let down = Billing::answering(503).await;
+    let retrying = policy(|policy| {
+        policy.attempt_timeout = Duration::from_millis(200);
+        policy.max_attempts = 5;
+        policy.initial_backoff = Duration::from_millis(300);
+        policy.deadline = Some(Duration::from_millis(600));
+        policy.max_in_flight = 1;
+    });
+    down.report(&retrying, "failing", None);
+    delivered(&retrying).await;
+    let lines = logs.lines(DEADLINE);
+    assert_eq!(lines.len(), 2, "{}", logs.contents());
+    assert_who(&lines[1], "request-failing");
+    assert_eq!(lines[1]["fields"]["attempts"], down.received());
+    assert_eq!(lines[1]["fields"]["last_attempt"], "http_5xx");
+    assert_eq!(field_names(&lines[1]), names(&["attempts", "last_attempt"]));
+    assert!(!logs.contents().contains("usage-secret"));
+}
+
+#[tokio::test]
+async fn shutdown_says_how_many_reports_it_waited_for_and_how_many_it_left() {
+    let logs = Logs::default();
+    let _capture = logs.capture();
+    let names = |line: &serde_json::Value| -> Vec<String> {
+        field_names(line).into_iter().map(String::from).collect()
+    };
+
+    let billing = Billing::start(Answers::Script(vec![(Duration::from_millis(50), 200)])).await;
+    let delivery = policy(|policy| {
+        policy.max_in_flight = 1;
+        policy.shutdown_drain = Duration::from_secs(30);
+    });
+    for id in ["one", "two", "three"] {
+        billing.report(&delivery, id, None);
+    }
+    delivery.drain_at_shutdown().await.unwrap();
+    let lines = logs.lines("Usage reports drained before shutdown");
+    assert_eq!(lines.len(), 1, "{}", logs.contents());
+    assert_eq!(lines[0]["level"], "INFO");
+    assert_eq!(lines[0]["fields"]["pending"], 3);
+    assert_eq!(names(&lines[0]), ["pending", "waited_ms"]);
+
+    let stuck = Billing::start(Answers::Script(vec![(Duration::from_secs(60), 200)])).await;
+    let delivery = policy(|policy| {
+        policy.attempt_timeout = Duration::from_secs(120);
+        policy.max_in_flight = 1;
+        policy.shutdown_drain = Duration::from_millis(200);
+    });
+    for id in ["one", "two", "three"] {
+        stuck.report(&delivery, id, None);
+    }
+    delivery.drain_at_shutdown().await.unwrap();
+    let lines = logs.lines("Usage reports left undelivered at shutdown — usage NOT billed");
+    assert_eq!(lines.len(), 1, "{}", logs.contents());
+    assert_eq!(lines[0]["level"], "WARN");
+    assert_eq!(lines[0]["fields"]["pending"], 3);
+    assert_eq!(lines[0]["fields"]["left_waiting"], 2);
+    assert_eq!(lines[0]["fields"]["left_in_flight"], 1);
+    assert_eq!(
+        names(&lines[0]),
+        ["left_in_flight", "left_waiting", "pending", "waited_ms"]
+    );
+    // One line for either ending, and none under the default policy.
+    assert_eq!(logs.lines("Usage reports drained before shutdown").len(), 1);
+    let default = Arc::new(UsageReportDelivery::default());
+    stuck.report(&default, "four", None);
+    assert_eq!(default.drain_at_shutdown().await, None);
+    assert_eq!(
+        logs.contents().matches("Usage reports").count(),
+        2,
+        "{}",
+        logs.contents()
+    );
 }

@@ -1757,6 +1757,7 @@ mod tests {
         let lane = [
             (TIMEOUT, "30"),
             (MAX_ATTEMPTS, "5"),
+            (INITIAL_BACKOFF, "5000"),
             (DEADLINE, "300"),
             (MAX_IN_FLIGHT, "8"),
         ];
@@ -1767,7 +1768,7 @@ mod tests {
                 crate::usage_report::UsageReportPolicy {
                     attempt_timeout: Duration::from_secs(30),
                     max_attempts: 5,
-                    initial_backoff: Duration::from_millis(500),
+                    initial_backoff: Duration::from_secs(5),
                     deadline: Some(Duration::from_secs(300)),
                     max_in_flight: 8,
                     max_queued: 10_000,

@@ -18,6 +18,7 @@ pub mod fusion;
 pub mod gpu_evidence_delegate;
 pub mod image_validation;
 pub mod metrics_middleware;
+pub mod model_routes;
 pub mod ohttp_gateway;
 pub mod priority;
 pub mod proxy;

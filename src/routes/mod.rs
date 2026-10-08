@@ -14,8 +14,14 @@ use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use axum::Router;
 
+use crate::config::Config;
 use crate::error::AppError;
+use crate::model_routes::post_by_model;
 use crate::AppState;
+
+fn max_request_size(config: &Config) -> usize {
+    config.max_request_size
+}
 
 pub const ROUTE_ROOT: &str = "/";
 pub const ROUTE_VERSION: &str = "/version";
@@ -68,17 +74,41 @@ pub fn build_router() -> Router<AppState> {
             ROUTE_ATTESTATION_REPORT,
             get(attestation::attestation_report),
         )
-        // Authenticated endpoints
-        .route(ROUTE_CHAT_COMPLETIONS, post(chat::chat_completions))
-        .route(ROUTE_COMPLETIONS, post(completions::completions))
-        .route(ROUTE_TOKENIZE, post(passthrough::tokenize))
-        .route(ROUTE_EMBEDDINGS, post(passthrough::embeddings))
-        .route(ROUTE_RERANK, post(passthrough::rerank))
-        .route(ROUTE_SCORE, post(passthrough::score))
+        // Authenticated endpoints. JSON inference routes go through
+        // `post_by_model`: with `VLLM_PROXY_MODEL_ROUTES` set, a body naming a
+        // routed model is forwarded to that model's gateway before any auth,
+        // admission or billing here; without routes the handler is called
+        // directly, unchanged.
+        .route(
+            ROUTE_CHAT_COMPLETIONS,
+            post_by_model(chat::chat_completions, max_request_size),
+        )
+        .route(
+            ROUTE_COMPLETIONS,
+            post_by_model(completions::completions, max_request_size),
+        )
+        .route(
+            ROUTE_TOKENIZE,
+            post_by_model(passthrough::tokenize, max_request_size),
+        )
+        .route(
+            ROUTE_EMBEDDINGS,
+            post_by_model(passthrough::embeddings, max_request_size),
+        )
+        .route(
+            ROUTE_RERANK,
+            post_by_model(passthrough::rerank, max_request_size),
+        )
+        .route(
+            ROUTE_SCORE,
+            post_by_model(passthrough::score, max_request_size),
+        )
         .route(ROUTE_PRIVACY_CLASSIFY, post(privacy::classify))
         .route(
             ROUTE_IMAGES_GENERATIONS,
-            post(passthrough::images_generations),
+            post_by_model(passthrough::images_generations, |c| {
+                c.max_image_request_size
+            }),
         )
         // Multipart upload routes: axum's `Multipart` extractor enforces the
         // global 2 MiB `DefaultBodyLimit`, which rejects the body before the

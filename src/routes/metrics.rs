@@ -38,12 +38,21 @@ pub async fn metrics(
 /// source cannot be read, the engine's own list is passed through as before;
 /// with `VLLM_PROXY_DISCOUNT_TO_USER` set (which requires the document URL),
 /// that list carries the discount on every entry.
+///
+/// With `VLLM_PROXY_MODEL_ROUTES` set, the routed gateways' entries for their
+/// models are appended (`model_routes::merge_routed_models`).
 pub async fn models(
     State(state): State<AppState>,
     Extension(tracing_ids): Extension<TracingIds>,
 ) -> Result<Response, AppError> {
+    let own = own_models(&state, &tracing_ids).await?;
+    crate::model_routes::merge_routed_models(&state, own).await
+}
+
+/// This lane's own listing, as served before model routes existed.
+async fn own_models(state: &AppState, tracing_ids: &TracingIds) -> Result<Response, AppError> {
     if let Some(source) = state.config.models_document_url.as_deref() {
-        match fetch_models_document(&state, source).await {
+        match fetch_models_document(state, source).await {
             Ok(document) => {
                 return Ok((StatusCode::OK, axum::Json(document)).into_response());
             }
@@ -64,7 +73,7 @@ pub async fn models(
         None,
         "application/json",
         None,
-        Some(&tracing_ids),
+        Some(tracing_ids),
     )
     .await?;
     match state.config.discount_to_user {

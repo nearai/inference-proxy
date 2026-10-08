@@ -113,6 +113,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         capacity_requests_per_minute: 0,
         discount_to_user: None,
         reasoning_off_effort: "none".to_string(),
+        model_routes: Vec::new(),
         allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,
         admission_max_inflight: 0,

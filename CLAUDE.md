@@ -113,7 +113,11 @@ dispatch), the long-context tier (`VLLM_BACKEND_LONG_CONTEXT_URLS` +
 backends registered under the model's `-long` domain, estimated exactly as
 cloud-api's `context_routing::estimate_input` does it) and
 `VLLM_BACKEND_CONNECT_FAILOVER` (one retry on another backend, only when the
-connection itself fails) are the opt-in policies. All default to the
+connection itself fails) and `VLLM_PROXY_MODEL_ROUTES` (`model_routes.rs`: a
+body naming another model is forwarded unchanged to that model's own gateway,
+outside this lane's auth/admission/billing; unknown models 404 only when routes
+are set; `/v1/models` appends the routed gateways' entries) are the opt-in
+policies. All default to the
 in-CVM behavior. Request priority (`priority.rs`, no CVM config): every
 chat/completions body gets `priority` set by the proxy — the `X-NearAI-Priority`
 header value for callers using the config `TOKEN` (a gateway sets it from

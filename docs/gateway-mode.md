@@ -98,6 +98,7 @@ to the current in-CVM behavior.
 | `VLLM_PROXY_REJECTED_CONTENT_PART_TYPES` | `video_url,input_audio,file` | Modalities this deployment does not serve → deterministic `400`. |
 | `VLLM_PROXY_MODELS_DOCUMENT_URL` / `VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE` | `https://cloud-api.near.ai/v1/models` / `150` | `GET /v1/models` serves cloud-api's entry for `MODEL_NAME` (pricing, modalities, `is_ready`, `openrouter.slug`) with `capacity` added: concurrency = `VLLM_PROXY_ADMISSION_MAX_INFLIGHT`, requests per minute = this value. One URL for inference and the listing; `is_ready` stays under cloud-api's catalog control (the kill switch). Source unreadable → the engine's list, as without the variable. |
 | `VLLM_PROXY_DISCOUNT_TO_USER` | unset (list price) | The lane's discount off the list price, a fraction in `[0, 1)` with at most four decimal places (`0.2` = 20 % off): published as `discount_to_user` on the models document entry (in place of any the source carries) and sent with every usage report, so cloud-api bills the price the aggregator shows; empty or `0` = none, an invalid value fails startup, and it requires `VLLM_PROXY_MODELS_DOCUMENT_URL`. While that source is unreadable, the engine list served instead carries the discount on every entry, and an engine answer that is not a model list becomes a 502 rather than going out without it. cloud-api refuses a report whose discount exceeds its `INTERNAL_USAGE_MAX_DISCOUNT` (default `0.5`), leaving that usage unbilled, so keep the value within it. |
+| `VLLM_PROXY_MODEL_ROUTES` | unset | Other models this gateway fronts, as `model_id=base_url` pairs, each served by its own gateway (see [Model routes](#model-routes)). Unset = model-scoped, as before. |
 | `VLLM_PROXY_REASONING_OFF_EFFORT` | `low` | What "no reasoning" means for GLM-5.3 Flash (see below). |
 | `VLLM_PROXY_SSE_KEEPALIVE_SECS` | `15` | `: keep-alive` SSE comments while the upstream is silent (long prefill/queueing), so intermediaries with read timeouts do not cancel. Off in CVMs: comments are not part of the signed bytes. |
 | `VLLM_PROXY_MAP_QUEUE_FULL_TO_429` | `1` | The engine's admission rejection (queue full, or a queued request displaced by a higher-priority one) becomes 429 with `Retry-After: 2` and type `overloaded`, the same shape as the gateway's own refusals: back-pressure, not an outage. Off in CVMs: cloud-api's peer fallback keys on the 503. |
@@ -507,6 +508,79 @@ queueing" refusal. The consequences are deliberate:
   together with `FUSION_ENABLED` or `WEB_CONTEXT_SEARCH_URL` is refused at
   startup: those modes place their own backend requests, which no tier
   restriction reaches.
+
+## Model routes
+
+An aggregator reaches us at one base URL and selects the model in the request
+body, but a gateway is model-scoped: one `MODEL_NAME`, one admission budget,
+one discount, one reasoning-off effort, one backend pool, and usage billed as
+`MODEL_NAME`. Without help, a request for another model would be sent to this
+lane's backends and billed as this model. `VLLM_PROXY_MODEL_ROUTES` lets the
+public gateway front other models without mixing them into its own lane:
+
+```text
+VLLM_PROXY_MODEL_ROUTES=openai/gpt-oss-120b=http://127.0.0.1:31713,Qwen/Qwen3.8-27B=http://127.0.0.1:31723
+```
+
+Comma-separated `model_id=base_url` pairs. Validated at startup: every entry
+needs a non-empty model id and an absolute `http(s)://host[:port][/prefix]`
+URL (no query or fragment), a model may appear once, and `MODEL_NAME` itself
+cannot be routed. Any violation fails startup. Unset or empty = exactly the
+behavior without the variable: the body's `model` is not inspected at all.
+
+With routes configured, the JSON inference routes (`/v1/chat/completions`,
+`/v1/completions`, `/v1/embeddings`, `/v1/rerank`, `/v1/score`,
+`/v1/tokenize`, `/v1/images/generations`) read the body's `model` before
+anything else happens (the body is buffered once, under the route's usual size
+limit, and handed on as is):
+
+1. **No `model`, a non-string or empty one, a body that is not JSON, or
+   `MODEL_NAME`** → this lane, unchanged (its handler judges the body).
+2. **A routed model** → forwarded **unchanged** to `<base_url><path>?<query>`:
+   same method, body bytes and end-to-end headers (`Authorization`,
+   `X-NearAI-*`, ...; hop-by-hop headers dropped, `X-Request-Id` set to this
+   request's id so both gateways log under one id). The response's status,
+   headers and body (SSE included) are streamed back unchanged. Nothing of this
+   lane applies: no key check, no org allowlist, no admission slot, no
+   priority or reasoning rewrite, no usage report. The routed gateway does all
+   of that itself, once. Counted in
+   `model_route_requests_total{model, status}`.
+3. **Any other non-empty model** → `404` with
+   ``{"error":{"message":"The model `X` does not exist or you do not have access to it.","type":"invalid_request_error","code":"model_not_found"}}``,
+   before authentication (counted as `model="unknown", status="404"`).
+4. **Routed gateway unreachable** → `502` (`upstream_unreachable`), or `504`
+   (`upstream_request_timeout`) on the client timeout (`TIMEOUT_SECS`), in
+   the OpenAI error format. There is never a fallback to this lane's backends.
+
+Multipart routes (`/v1/images/edits`, `/v1/audio/transcriptions`) and
+`/v1/privacy/classify` are not routed: their model is not in a JSON body and
+none of them is part of an aggregator lane. Health, metrics and admin routes
+are unchanged.
+
+`GET /v1/models` serves this lane's own listing as before and appends each
+routed gateway's entry for its model, read from `<base_url>/v1/models` in
+parallel with a 3 s timeout and kept verbatim (capacity, `discount_to_user`,
+`openrouter.slug` are that gateway's). A gateway that does not answer, or whose
+list has no entry with the routed model's id, is left out with a warning and
+`model_route_listing_failures_total{model}`; the rest of the document is still
+served. Nothing is cached, as for the own listing.
+
+**Admission.** The front's budget (`VLLM_PROXY_ADMISSION_*`), its declared
+`capacity` and its engine-load signals count only its own model's requests.
+Each routed model's capacity is its own gateway's budget, published on its own
+entry.
+
+**Deployment pattern.** One gateway process per model on the same host: the
+public one (the front door, behind the TLS terminator) serves its own
+`MODEL_NAME` and lists the others in `VLLM_PROXY_MODEL_ROUTES`; each routed
+model gets its own gateway bound to loopback (`LISTEN_ADDR=127.0.0.1`, its
+own `LISTEN_PORT`) with its own `MODEL_NAME`, `VLLM_BACKEND_URLS`,
+`VLLM_BACKEND_TOKEN`, admission budget, `VLLM_PROXY_DISCOUNT_TO_USER`,
+`VLLM_PROXY_REASONING_OFF_EFFORT`, models document and the same cloud-api
+settings (and `VLLM_PROXY_ALLOWED_ORG_IDS`) as the front, since it is the one
+that authenticates and bills. The front's per-IP rate limiter still applies to
+routed requests; a loopback gateway sees every request from `127.0.0.1` plus
+whatever `X-Forwarded-For` the client sent.
 
 ## What is deliberately not offered here
 

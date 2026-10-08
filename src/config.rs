@@ -93,6 +93,59 @@ fn parse_discount_to_user(raw: &str) -> anyhow::Result<Option<f64>> {
     Ok((basis_points > 0.0).then_some(discount))
 }
 
+/// One `VLLM_PROXY_MODEL_ROUTES` entry: requests whose body names `model` are
+/// forwarded unchanged to the gateway at `base_url` (see `model_routes.rs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelRoute {
+    pub model: String,
+    /// `http(s)://host[:port][/prefix]`, without a trailing slash; the
+    /// request's path and query are appended verbatim.
+    pub base_url: String,
+}
+
+/// `VLLM_PROXY_MODEL_ROUTES`: comma-separated `model_id=base_url` pairs.
+/// Empty = no routes (today's behavior). Every entry must name a model and an
+/// absolute http(s) URL; a model may appear once and may not be `MODEL_NAME`
+/// itself (this gateway serves that one). Anything else fails startup: a
+/// route typo would send a model's traffic, and its bill, to the wrong place.
+pub fn parse_model_routes(raw: &str, model_name: &str) -> anyhow::Result<Vec<ModelRoute>> {
+    const NAME: &str = "VLLM_PROXY_MODEL_ROUTES";
+    let mut routes: Vec<ModelRoute> = Vec::new();
+    for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let Some((model, base_url)) = entry.split_once('=') else {
+            anyhow::bail!("{NAME}: expected `model_id=base_url`, got {entry:?}");
+        };
+        let model = model.trim();
+        let base_url = base_url.trim().trim_end_matches('/');
+        if model.is_empty() {
+            anyhow::bail!("{NAME}: empty model id in {entry:?}");
+        }
+        let parsed = url::Url::parse(base_url)
+            .map_err(|e| anyhow::anyhow!("{NAME}: invalid URL for {model:?}: {e}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            anyhow::bail!(
+                "{NAME}: URL for {model:?} must be http(s)://host[:port], got {base_url:?}"
+            );
+        }
+        if parsed.query().is_some() || parsed.fragment().is_some() {
+            anyhow::bail!("{NAME}: URL for {model:?} must not carry a query or fragment");
+        }
+        if model == model_name {
+            anyhow::bail!(
+                "{NAME}: {model:?} is this gateway's MODEL_NAME; it is served here, not routed"
+            );
+        }
+        if routes.iter().any(|r| r.model == model) {
+            anyhow::bail!("{NAME}: duplicate route for {model:?}");
+        }
+        routes.push(ModelRoute {
+            model: model.to_string(),
+            base_url: base_url.to_string(),
+        });
+    }
+    Ok(routes)
+}
+
 fn is_gemma4_model_name(model_name: &str) -> bool {
     let name = model_name.to_ascii_lowercase();
     ["gemma-4", "gemma4"].iter().any(|needle| {
@@ -395,6 +448,11 @@ pub struct Config {
     /// GLM-5.3 Flash needs `low`: its template only knows `low` and `high`,
     /// and switched off outright it writes its reasoning as visible content.
     pub reasoning_off_effort: String,
+    /// Gateway mode: other models this gateway fronts, each served by its
+    /// own gateway (`VLLM_PROXY_MODEL_ROUTES`). A request naming one is
+    /// forwarded there unchanged, outside this lane's admission and billing;
+    /// `/v1/models` lists them too. Empty = model-scoped, as before.
+    pub model_routes: Vec<ModelRoute>,
     /// Organizations whose cloud-api keys may use this deployment
     /// (`VLLM_PROXY_ALLOWED_ORG_IDS`, comma-separated organization ids). Empty
     /// = every valid key. Config-token callers are not affected. Gateway mode
@@ -705,6 +763,13 @@ impl Config {
         let rejected_content_part_types = crate::content_policy::parse_rejected_types(
             &env::var("VLLM_PROXY_REJECTED_CONTENT_PART_TYPES").unwrap_or_default(),
         );
+        let model_routes = match env::var("VLLM_PROXY_MODEL_ROUTES") {
+            Ok(raw) => parse_model_routes(&raw, &model_name)?,
+            Err(env::VarError::NotPresent) => Vec::new(),
+            Err(env::VarError::NotUnicode(_)) => {
+                anyhow::bail!("VLLM_PROXY_MODEL_ROUTES must be valid UTF-8")
+            }
+        };
 
         let git_rev = std::fs::read_to_string("/etc/.GIT_REV")
             .map(|s| s.trim().to_string())
@@ -1031,6 +1096,7 @@ impl Config {
             capacity_requests_per_minute,
             discount_to_user,
             reasoning_off_effort,
+            model_routes,
             allowed_org_ids,
             sse_keepalive_secs: env_int("VLLM_PROXY_SSE_KEEPALIVE_SECS", 0) as u64,
             admission_max_inflight,
@@ -1366,6 +1432,7 @@ mod tests {
             "VLLM_PROXY_REJECTED_CONTENT_PART_TYPES",
             "VLLM_PROXY_MODELS_DOCUMENT_URL",
             "VLLM_PROXY_DISCOUNT_TO_USER",
+            "VLLM_PROXY_MODEL_ROUTES",
             "VLLM_PROXY_ALLOWED_ORG_IDS",
             "VLLM_PROXY_SSE_KEEPALIVE_SECS",
             "VLLM_PROXY_FIRST_TOKEN_DEADLINE_MS",
@@ -1433,6 +1500,7 @@ mod tests {
             assert!(config.first_token_deadline(1_000).is_none());
             assert!(config.rejected_content_part_types.is_empty());
             assert!(config.discount_to_user.is_none());
+            assert!(config.model_routes.is_empty());
             assert!(config.allowed_org_ids.is_empty());
             assert_eq!(config.sse_keepalive_secs, 0);
             assert_eq!(config.admission_max_inflight, 0);
@@ -1580,6 +1648,67 @@ mod tests {
                 gateway_env_cleanup();
             },
         );
+    }
+
+    #[test]
+    fn test_model_routes_parse() {
+        let routes = parse_model_routes(
+            " openai/gpt-oss-120b=http://127.0.0.1:31713/ , Qwen/Qwen3.8-27B = https://q.test:8443/prefix ,",
+            "zai-org/GLM-5.3",
+        )
+        .unwrap();
+        assert_eq!(
+            routes,
+            vec![
+                ModelRoute {
+                    model: "openai/gpt-oss-120b".to_string(),
+                    base_url: "http://127.0.0.1:31713".to_string(),
+                },
+                ModelRoute {
+                    model: "Qwen/Qwen3.8-27B".to_string(),
+                    base_url: "https://q.test:8443/prefix".to_string(),
+                },
+            ]
+        );
+        assert!(parse_model_routes("", "m").unwrap().is_empty());
+        assert!(parse_model_routes(" , ", "m").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_model_routes_reject_bad_entries() {
+        for (raw, needle) in [
+            ("openai/gpt-oss-120b", "expected `model_id=base_url`"),
+            ("=http://127.0.0.1:1", "empty model id"),
+            ("a=", "invalid URL"),
+            ("a=127.0.0.1:31713", "invalid URL"),
+            ("a=ftp://127.0.0.1:1", "must be http(s)"),
+            ("a=http://127.0.0.1:1?x=1", "query or fragment"),
+            ("m=http://127.0.0.1:1", "MODEL_NAME"),
+            (
+                "a=http://127.0.0.1:1,a=http://127.0.0.1:2",
+                "duplicate route",
+            ),
+        ] {
+            let err = parse_model_routes(raw, "m").unwrap_err().to_string();
+            assert!(err.contains("VLLM_PROXY_MODEL_ROUTES"), "{raw}: {err}");
+            assert!(err.contains(needle), "{raw}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_model_routes_from_env() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            gateway_env_cleanup();
+            assert!(Config::from_env().unwrap().model_routes.is_empty());
+            env::set_var("VLLM_PROXY_MODEL_ROUTES", "other=http://127.0.0.1:31713");
+            let routes = Config::from_env().unwrap().model_routes;
+            assert_eq!(routes.len(), 1);
+            assert_eq!(routes[0].model, "other");
+            env::set_var("VLLM_PROXY_MODEL_ROUTES", "m=http://127.0.0.1:31713");
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(err.contains("MODEL_NAME"), "{err}");
+            gateway_env_cleanup();
+        });
     }
 
     #[test]

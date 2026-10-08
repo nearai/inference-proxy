@@ -65,6 +65,8 @@ struct GatewayOptions {
     cloud_api_usage_token: Option<String>,
     /// `VLLM_PROXY_REASONING_OFF_EFFORT` (default `none`).
     reasoning_off_effort: Option<String>,
+    /// `VLLM_PROXY_MODEL_ROUTES`, already validated.
+    model_routes: Vec<config::ModelRoute>,
 }
 
 fn build_gateway(mock_url: &str, options: GatewayOptions) -> axum::Router {
@@ -164,6 +166,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
             .reasoning_off_effort
             .clone()
             .unwrap_or_else(|| "none".to_string()),
+        model_routes: options.model_routes.clone(),
         allowed_org_ids: options.allowed_org_ids,
         sse_keepalive_secs: options.sse_keepalive_secs,
         admission_max_inflight: options.admission_max_inflight,
@@ -4097,4 +4100,301 @@ async fn non_streamed_usage_carries_reasoning_tokens_in_completion_tokens_detail
         body["usage"]["completion_tokens_details"],
         serde_json::json!({"reasoning_tokens": 42})
     );
+}
+
+// ── Model routes (`VLLM_PROXY_MODEL_ROUTES`) ────────────────────────────────
+
+fn model_route(model: &str, base_url: &str) -> config::ModelRoute {
+    config::ModelRoute {
+        model: model.to_string(),
+        base_url: base_url.trim_end_matches('/').to_string(),
+    }
+}
+
+/// A raw POST, so a test can check the routed gateway receives these exact
+/// bytes and headers.
+fn raw_post(uri: &str, body: &'static [u8], authorization: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("authorization", authorization)
+        .header("content-type", "application/json")
+        .header("x-nearai-custom", "kept")
+        .header("connection", "keep-alive")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn model_routes_unset_keeps_any_model_on_the_local_lane() {
+    let backend = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+        .expect(1)
+        .mount(&backend)
+        .await;
+    let app = build_gateway(&backend.uri(), GatewayOptions::default());
+    let response = app
+        .oneshot(chat_request(serde_json::json!({
+            "model": "some-other-model",
+            "messages": [{"role": "user", "content": "hi"}]
+        })))
+        .await
+        .unwrap();
+    // No routes: the body's model is not looked at, exactly as before.
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn model_routes_serve_model_name_locally() {
+    let backend = MockServer::start().await;
+    let routed = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", "Bearer backend-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+        .expect(2)
+        .mount(&backend)
+        .await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&routed)
+        .await;
+    let app = build_gateway(
+        &backend.uri(),
+        GatewayOptions {
+            backend_token: Some("backend-secret".to_string()),
+            model_routes: vec![model_route("other", &routed.uri())],
+            ..Default::default()
+        },
+    );
+    for body in [
+        serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}]}),
+        serde_json::json!({"messages": [{"role": "user", "content": "hi"}]}),
+    ] {
+        let response = app.clone().oneshot(chat_request(body)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
+#[tokio::test]
+async fn model_routes_forward_routed_model_unchanged_and_stream_back() {
+    let backend = MockServer::start().await;
+    let routed = MockServer::start().await;
+    const BODY: &[u8] =
+        br#"{"model":"openai/gpt-oss-120b","stream":true,"messages":[{"role":"user","content":"hi"}],"reasoning":{"enabled":false}}"#;
+    const SSE: &str = "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\ndata: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\n\ndata: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(wiremock::matchers::query_param("trace", "1"))
+        // The customer's own key, not this lane's backend bearer: the routed
+        // gateway authenticates and bills.
+        .and(header("authorization", "Bearer sk-live-customer"))
+        .and(header("x-nearai-custom", "kept"))
+        .and(wiremock::matchers::header_exists("x-request-id"))
+        .and(wiremock::matchers::body_bytes(BODY))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-routed-gateway", "yes")
+                .set_body_raw(SSE, "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&routed)
+        .await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&backend)
+        .await;
+    // No cloud-api is configured: an `sk-` key would be refused here, so a
+    // 200 also proves the front did not authenticate the routed request.
+    let app = build_gateway(
+        &backend.uri(),
+        GatewayOptions {
+            backend_token: Some("backend-secret".to_string()),
+            model_routes: vec![model_route("openai/gpt-oss-120b", &routed.uri())],
+            ..Default::default()
+        },
+    );
+    let response = app
+        .oneshot(raw_post(
+            "/v1/chat/completions?trace=1",
+            BODY,
+            "Bearer sk-live-customer",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "text/event-stream"
+    );
+    assert_eq!(response.headers().get("x-routed-gateway").unwrap(), "yes");
+    assert!(response.headers().get("x-request-id").is_some());
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body, SSE.as_bytes());
+}
+
+#[tokio::test]
+async fn model_routes_cover_completions_and_pass_upstream_errors_through() {
+    let backend = MockServer::start().await;
+    let routed = MockServer::start().await;
+    const BODY: &[u8] = br#"{"model":"Qwen/Qwen3.8-27B","prompt":"hi"}"#;
+    Mock::given(method("POST"))
+        .and(path("/v1/completions"))
+        .and(wiremock::matchers::body_bytes(BODY))
+        .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+            "error": {"message": "slow down", "type": "overloaded", "param": null, "code": null}
+        })))
+        .expect(1)
+        .mount(&routed)
+        .await;
+    let app = build_gateway(
+        &backend.uri(),
+        GatewayOptions {
+            model_routes: vec![model_route("Qwen/Qwen3.8-27B", &routed.uri())],
+            ..Default::default()
+        },
+    );
+    let response = app
+        .oneshot(raw_post("/v1/completions", BODY, "Bearer sk-live-x"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["error"]["message"], "slow down");
+}
+
+#[tokio::test]
+async fn model_routes_refuse_unknown_models_with_model_not_found() {
+    let backend = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&backend)
+        .await;
+    let app = build_gateway(
+        &backend.uri(),
+        GatewayOptions {
+            model_routes: vec![model_route("other", "http://127.0.0.1:9")],
+            ..Default::default()
+        },
+    );
+    let response = app
+        .oneshot(raw_post(
+            "/v1/chat/completions",
+            br#"{"model":"nope","messages":[]}"#,
+            "Bearer test-token",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["error"]["code"], "model_not_found");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        body["error"]["message"],
+        "The model `nope` does not exist or you do not have access to it."
+    );
+}
+
+#[tokio::test]
+async fn model_routes_upstream_down_is_502_without_falling_back() {
+    let backend = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&backend)
+        .await;
+    // Bind and drop a listener: nothing accepts on that port.
+    let dead = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+    let app = build_gateway(
+        &backend.uri(),
+        GatewayOptions {
+            model_routes: vec![model_route("other", &dead)],
+            ..Default::default()
+        },
+    );
+    let response = app
+        .oneshot(raw_post(
+            "/v1/chat/completions",
+            br#"{"model":"other","messages":[]}"#,
+            "Bearer sk-live-x",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["error"]["type"], "upstream_unreachable");
+}
+
+#[tokio::test]
+async fn model_routes_merge_routed_listings_and_skip_failures() {
+    let engine = MockServer::start().await;
+    let source = MockServer::start().await;
+    let gpt = MockServer::start().await;
+    let qwen_wrong = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "test-model", "name": "Test Model"}]
+        })))
+        .mount(&source)
+        .await;
+    let gpt_entry = serde_json::json!({
+        "id": "openai/gpt-oss-120b",
+        "name": "GPT OSS",
+        "capacity": [{"type": "concurrency", "unit": "request", "value": 64}],
+        "discount_to_user": 0.25,
+        "openrouter": {"slug": "openai/gpt-oss-120b"}
+    });
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list",
+            "data": [gpt_entry.clone()]
+        })))
+        .mount(&gpt)
+        .await;
+    // A gateway that answers but does not list its routed model is left out.
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "something-else"}]
+        })))
+        .mount(&qwen_wrong)
+        .await;
+    let dead = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+    let app = build_gateway(
+        &engine.uri(),
+        GatewayOptions {
+            models_document_url: Some(format!("{}/v1/models", source.uri())),
+            model_routes: vec![
+                model_route("openai/gpt-oss-120b", &gpt.uri()),
+                model_route("Qwen/Qwen3.8-27B", &qwen_wrong.uri()),
+                model_route("down/model", &dead),
+            ],
+            ..Default::default()
+        },
+    );
+    let (status, body) = get_models(app).await;
+    assert_eq!(status, StatusCode::OK);
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2, "{body}");
+    assert_eq!(data[0]["id"], "test-model");
+    // The routed entry is carried verbatim.
+    assert_eq!(data[1], gpt_entry);
 }

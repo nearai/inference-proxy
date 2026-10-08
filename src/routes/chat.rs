@@ -125,6 +125,15 @@ async fn serve(
         &request_json,
         &state.config.rejected_content_part_types,
     )?;
+    // List mode: a model whose chat template takes one `system` message,
+    // first, gets a request's system messages merged into that
+    // (`merge_system_messages`). After decryption, the two repairs and the
+    // content policy above, which all read the messages as the caller sent
+    // them. Before everything below: the estimate, the tier, admission and
+    // the affinity keys describe the body that is dispatched.
+    if model.merge_system_messages {
+        crate::system_messages::merge_system_messages(&mut request_json, model.label);
+    }
     let is_stream = request_json
         .get("stream")
         .and_then(|v| v.as_bool())

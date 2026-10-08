@@ -50,6 +50,7 @@ This is a Rust rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-pro
 - Streaming uses `tokio::spawn` + `mpsc` channel: background task hashes chunks and signs on stream completion
 - `strip_empty_tool_calls` in `routes/chat.rs` is a vLLM bug workaround (still needed as of vLLM v0.15.1)
 - `tool_calls::normalize_tool_call_arguments` repairs `tool_calls[].function.arguments` in history (empty, missing, double-encoded, non-object) before dispatch; SGLang otherwise 400s the whole request (nearai/inference-proxy#239)
+- `system_messages::merge_system_messages` (list mode, per model, `merge_system_messages: true`) rewrites a chat request with a `system` message after the first position into one leading `system` message holding all their text, for a chat template that 400s anything else. It never drops anything: a non-text part, an unknown content shape or two values for one extra field leave the request untouched. Runs after decryption, the repairs and the content policy, before the estimate and the affinity keys
 - Signed text format: `"{model_name}:{sha256_request}:{sha256_response}"` signed by both algos
 - `serde_json::to_string` matches Python's `json.dumps(separators=(",",":"))`
 
@@ -129,7 +130,8 @@ In list mode a model can also replace efforts its engine refuses
 applied after the off handling to `reasoning_effort` and `reasoning.effort` on
 chat completions). The map never touches "off": `EffortMap::new` refuses off
 values and the model's off effort as keys, other off values as targets, and
-chains.
+chains. A list model whose template takes a `system` message only first sets
+`merge_system_messages` (`system_messages.rs`, see the patterns above).
 
 A gateway can serve several models from one process: `VLLM_PROXY_MODEL_LIST_FILE`
 names a JSON file of models (`model_list.rs`, schema and example in
@@ -137,9 +139,9 @@ docs/gateway-mode.md). Chat/completions then pick the model from the body's
 `model` (exact match, 404 `model_not_found` otherwise, after auth) through
 `model_list::model_for`, which returns a `ModelView`: read everything
 model-specific from it (`backend_client`, `backend_pool`, `backend_affinity`,
-`admission`, tier, discount, reasoning-off effort, effort map), never from
-`AppState` or `Config` directly, so the single-model and the list path stay one
-code path.
+`admission`, tier, discount, reasoning-off effort, effort map,
+`merge_system_messages`), never from `AppState` or `Config` directly, so the
+single-model and the list path stay one code path.
 Each model has its own pool, affinity, admission, engine poller and backend
 client (its bearer goes to its backends only). Per-model metric series go
 through the `model_counter!`/`model_gauge!`/`model_histogram!` macros
@@ -151,11 +153,13 @@ model selection), and `inference_proxy_model_stream_errors_total{endpoint,model}
 for a stream that failed after its 200 (`count_stream_error`, in the streaming
 task). A third, `inference_proxy_model_reasoning_effort_mapped_total{effort,model}`,
 counts the requests a model's `reasoning_effort_map` changed
-(`reasoning::apply_effort_map`). A new per-model setting needs a `ModelConfig`
+(`reasoning::apply_effort_map`), and a fourth,
+`inference_proxy_model_system_messages_merged_total{model}`, the requests
+`merge_system_messages` rewrote. A new per-model setting needs a `ModelConfig`
 field, a file key, a `ModelDefaults` fallback and `Config::single_model`
-(`reasoning_effort_map` is the one key without a variable, so without a
-fallback: `single_model` gives the empty map). `main` builds a list's
-whole state with `model_list::app_state` and serves `routes::build_app`, and
+(`reasoning_effort_map` and `merge_system_messages` are the two keys without a
+variable, so without a fallback: `single_model` gives the empty map and
+`false`). `main` builds a list's whole state with `model_list::app_state` and serves `routes::build_app`, and
 `tests/model_list.rs` starts its gateways through the same two functions (one
 test runs the built binary), so list-mode wiring belongs in the library, not
 in `main.rs`. Without the variable the process serves one model from env and

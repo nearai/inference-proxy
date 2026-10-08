@@ -1484,6 +1484,8 @@ impl Config {
             reasoning_off_effort: self.reasoning_off_effort.clone(),
             // A key of the list file only: no variable sets it.
             reasoning_effort_map: crate::reasoning::EffortMap::default(),
+            // Likewise: a process without a list never merges.
+            merge_system_messages: false,
             backend_token: self.backend_token.clone(),
             backend_priority: self.backend_priority,
         }
@@ -3666,6 +3668,71 @@ mod tests {
                 let config = Config::from_env().unwrap();
                 assert!(config.model_list.is_none());
                 assert!(config.single_model().reasoning_effort_map.is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn test_merge_system_messages_is_a_list_key_checked_at_startup() {
+        let list = |value: serde_json::Value| {
+            serde_json::json!({"models": [
+                {
+                    "id": "example/alpha",
+                    "backend_urls": ["https://alpha-b1.example"],
+                    "merge_system_messages": value
+                },
+                {"id": "example/beta", "backend_urls": ["https://beta-b1.example"]}
+            ]})
+        };
+
+        // One model's setting, and nothing for the model next to it. It needs
+        // nothing else: no backend token, no other variable.
+        with_model_list(&list(serde_json::json!(true)), &[], || {
+            let config = Config::from_env().unwrap();
+            let models = &config.model_list.as_ref().unwrap().models;
+            assert!(models[0].merge_system_messages);
+            assert!(!models[1].merge_system_messages);
+            // The process itself is no model and merges nothing.
+            assert!(!config.single_model().merge_system_messages);
+        });
+        with_model_list(&list(serde_json::json!(false)), &[], || {
+            let config = Config::from_env().unwrap();
+            assert!(!config.model_list.as_ref().unwrap().models[0].merge_system_messages);
+        });
+
+        // Anything but `true` or `false` fails startup, naming the file.
+        for value in [
+            serde_json::json!("true"),
+            serde_json::json!(1),
+            serde_json::json!(null),
+        ] {
+            let error = with_model_list(&list(value.clone()), &[], || {
+                Config::from_env()
+                    .expect_err("the list must be refused")
+                    .to_string()
+            });
+            assert!(
+                error.starts_with("VLLM_PROXY_MODEL_LIST_FILE (")
+                    && error.contains("not a valid model list")
+                    && error.contains("expected a boolean"),
+                "{value}: {error}"
+            );
+        }
+
+        // A process without a list merges nothing, and there is no variable
+        // that makes it: the key is not a process-level setting.
+        with_clean_env(
+            &[("MODEL_NAME", "example/alpha"), ("TOKEN", "t")],
+            &[
+                ("NON_TEE_DEPLOYMENT", "1"),
+                ("VLLM_BACKEND_URLS", "https://alpha-b1.example"),
+                ("VLLM_PROXY_MERGE_SYSTEM_MESSAGES", "1"),
+                ("MERGE_SYSTEM_MESSAGES", "true"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert!(config.model_list.is_none());
+                assert!(!config.single_model().merge_system_messages);
             },
         );
     }

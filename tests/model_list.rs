@@ -1428,6 +1428,486 @@ async fn a_single_model_process_sends_efforts_as_before_and_has_no_map_series() 
     }
 }
 
+// ---------------------------------------------------------------------------
+// System messages (`merge_system_messages`)
+// ---------------------------------------------------------------------------
+
+/// System prompts as a caller writes them. They reach the engine, and must
+/// never show up in a label or a log line.
+const FIRST_PROMPT: &str = "first-system-prompt-sentinel";
+const SECOND_PROMPT: &str = "second-system-prompt-sentinel";
+
+/// The metric of the requests `merge_system_messages` rewrote.
+const MERGED: &str = "inference_proxy_model_system_messages_merged_total";
+
+/// A backend for the two routes that answers a caller's own stream as one.
+/// The gateway asks the engine for a stream either way, so the mock tells
+/// the two apart by a message that says `STREAMED`, wherever it is.
+async fn messages_backend() -> MockServer {
+    let backend = MockServer::start().await;
+    for route in ROUTES {
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(|request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                let streamed = body["messages"].as_array().is_some_and(|messages| {
+                    messages
+                        .iter()
+                        .any(|message| message["content"] == STREAMED)
+                });
+                if streamed {
+                    sse(ONE_TOKEN_STREAM)
+                } else {
+                    ResponseTemplate::new(200).set_body_json(completion_json())
+                }
+            })
+            .mount(&backend)
+            .await;
+    }
+    backend
+}
+
+/// Post `messages` for `model` on `route`, as a stream when one of them says
+/// `STREAMED`, and return what its backend was sent: the body and its bytes.
+async fn sent_messages(
+    gateway: &Gateway,
+    backend: &MockServer,
+    route: &str,
+    model: &str,
+    messages: &Value,
+) -> (Value, String) {
+    let stream = messages
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message["content"] == STREAMED);
+    let body = json!({"model": model, "messages": messages, "prompt": "hello", "stream": stream});
+    let response = gateway
+        .app
+        .clone()
+        .oneshot(post(route, Some("test-token"), &body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{model} {body}");
+    if stream {
+        let (text, failed) = drain(response).await;
+        assert!(!failed && text.contains("[DONE]"), "{text}");
+    } else {
+        json_body(response).await;
+    }
+    last_body(backend, route).await
+}
+
+fn system(content: impl Into<Value>) -> Value {
+    json!({"role": "system", "content": content.into()})
+}
+
+/// The three shapes a template that takes one leading system message
+/// refuses, around the user message `user`.
+fn refused_shapes(user: &Value) -> [Value; 3] {
+    [
+        json!([system(FIRST_PROMPT), system(SECOND_PROMPT), user]),
+        json!([system(FIRST_PROMPT), user, system(SECOND_PROMPT)]),
+        json!([user, system(SECOND_PROMPT)]),
+    ]
+}
+
+#[tokio::test]
+async fn system_messages_are_merged_for_the_model_that_asks_for_it_and_for_no_other() {
+    let alpha = messages_backend().await;
+    let beta = messages_backend().await;
+    let alpha_without = messages_backend().await;
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let logs = Logs::default();
+    let _logs = logs.capture();
+    // alpha's template takes one system message, first. beta's takes them
+    // anywhere.
+    let gateway = start_list(
+        &json!({"models": [
+            {"id": ALPHA, "backend_urls": [alpha.uri()], "merge_system_messages": true},
+            {"id": BETA, "backend_urls": [beta.uri()]}
+        ]}),
+        &[],
+        Some(handle.clone()),
+    );
+    // The same alpha in a gateway whose list does not have the key.
+    let without = start_list(
+        &json!({"models": [{"id": ALPHA, "backend_urls": [alpha_without.uri()]}]}),
+        &[],
+        None,
+    );
+
+    let both = format!("{FIRST_PROMPT}\n\n{SECOND_PROMPT}");
+    let developer = json!({"role": "developer", "content": "developer instructions"});
+    let picture = json!({"role": "user", "content": [
+        {"type": "text", "text": "what is on this picture?"},
+        {"type": "image_url", "image_url": {"url": "https://img.example/a.png"}}
+    ]});
+    let call = json!({"role": "assistant", "content": null, "tool_calls": [{
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "lookup", "arguments": "{\"q\":\"a\"}"}
+    }]});
+    let tool = json!({"role": "tool", "tool_call_id": "call_1", "content": "found"});
+    let mut rewritten = 0;
+    // A request answered in one piece, and a caller's own stream.
+    for said in ["hello", STREAMED] {
+        let user = json!({"role": "user", "content": said});
+        let [two_first, one_late, only_late] = refused_shapes(&user);
+        // What a caller sends, and what alpha's engine gets.
+        let merged = [
+            (two_first, json!([system(both.as_str()), user])),
+            (one_late, json!([system(both.as_str()), user])),
+            (only_late, json!([system(SECOND_PROMPT), user])),
+            // A string and text parts.
+            (
+                json!([
+                    system(FIRST_PROMPT),
+                    user,
+                    system(json!([
+                        {"type": "text", "text": "part one, "},
+                        {"type": "text", "text": SECOND_PROMPT}
+                    ]))
+                ]),
+                json!([
+                    system(format!("{FIRST_PROMPT}\n\npart one, {SECOND_PROMPT}")),
+                    user
+                ]),
+            ),
+            // Every other role, in the order it was sent and as it was sent.
+            (
+                json!([
+                    developer,
+                    system(FIRST_PROMPT),
+                    picture,
+                    call,
+                    tool,
+                    system(SECOND_PROMPT),
+                    developer,
+                    user
+                ]),
+                json!([
+                    system(both.as_str()),
+                    developer,
+                    picture,
+                    call,
+                    tool,
+                    developer,
+                    user
+                ]),
+            ),
+        ];
+        for (sent, to_alpha) in &merged {
+            let (for_alpha, _) = sent_messages(&gateway, &alpha, CHAT, ALPHA, sent).await;
+            assert_eq!(&for_alpha["messages"], to_alpha, "alpha, sent {sent}");
+            rewritten += 1;
+            let (for_beta, _) = sent_messages(&gateway, &beta, CHAT, BETA, sent).await;
+            assert_eq!(&for_beta["messages"], sent, "beta");
+            // The messages are all that differs between what the two engines
+            // are sent, besides the model's name.
+            let rest = |mut body: Value| {
+                let fields = body.as_object_mut().unwrap();
+                assert!(fields.remove("messages").is_some() && fields.remove("model").is_some());
+                body
+            };
+            assert_eq!(rest(for_alpha), rest(for_beta), "sent {sent}");
+        }
+
+        // What alpha's engine gets exactly as it would without the key.
+        let untouched = [
+            // A system message with a part that is not text: nothing may be
+            // dropped, so nothing is merged, and the engine answers.
+            json!([
+                system(FIRST_PROMPT),
+                user,
+                system(json!([
+                    {"type": "text", "text": SECOND_PROMPT},
+                    {"type": "image_url", "image_url": {"url": "https://img.example/a.png"}}
+                ]))
+            ]),
+            // So is a text part with more on it than a string can carry.
+            json!([
+                system(json!([{
+                    "type": "text",
+                    "text": FIRST_PROMPT,
+                    "cache_control": {"type": "ephemeral"}
+                }])),
+                user,
+                system(SECOND_PROMPT)
+            ]),
+            // What the template takes already: one system message, first, of
+            // either shape, or none.
+            json!([system(FIRST_PROMPT), user]),
+            json!([
+                system(json!([
+                    {"type": "text", "text": FIRST_PROMPT},
+                    {"type": "text", "text": SECOND_PROMPT}
+                ])),
+                developer,
+                picture,
+                call,
+                tool,
+                user
+            ]),
+            json!([user]),
+            json!([developer, user]),
+        ];
+        for sent in &untouched {
+            let (for_alpha, raw) = sent_messages(&gateway, &alpha, CHAT, ALPHA, sent).await;
+            assert_eq!(&for_alpha["messages"], sent, "alpha");
+            let (_, raw_without) = sent_messages(&without, &alpha_without, CHAT, ALPHA, sent).await;
+            assert_eq!(raw, raw_without, "byte for byte, sent {sent}");
+        }
+
+        // A text completion has no messages to merge: one that carries the
+        // key anyway is forwarded as it is.
+        let [two_first, _, _] = refused_shapes(&user);
+        let (for_alpha, raw) = sent_messages(&gateway, &alpha, TEXT, ALPHA, &two_first).await;
+        assert_eq!(for_alpha["messages"], two_first);
+        let (_, raw_without) =
+            sent_messages(&without, &alpha_without, TEXT, ALPHA, &two_first).await;
+        assert_eq!(raw, raw_without);
+    }
+
+    // The requests that were rewritten, under alpha. Nothing for beta,
+    // nothing for a request that was left alone, and no other label.
+    assert_eq!(rewritten, 10);
+    let rendered = handle.render();
+    let counted: Vec<&str> = rendered
+        .lines()
+        .filter(|line| line.starts_with(MERGED))
+        .collect();
+    assert_eq!(
+        counted,
+        [format!("{MERGED}{{model=\"example/alpha\"}} 10")],
+        "{rendered}"
+    );
+    // Each model's startup line says what it does, and nothing of a request's
+    // messages is ever in a label or a log line.
+    let captured = logs.contents();
+    for line in ["merge_system_messages=true", "merge_system_messages=false"] {
+        assert!(captured.contains(line), "{line}: {captured}");
+    }
+    assert!(captured.contains("request completed"), "{captured}");
+    for written in [
+        FIRST_PROMPT,
+        SECOND_PROMPT,
+        "part one",
+        "developer instructions",
+        "hello",
+        STREAMED,
+    ] {
+        assert!(!rendered.contains(written), "{written}: {rendered}");
+        assert!(!captured.contains(written), "{written}: {captured}");
+    }
+}
+
+/// The other things the gateway does to a request still happen, each on what
+/// it needs: the reasoning handling and the two repairs next to the merge,
+/// and the content policy on the parts the caller sent.
+#[tokio::test]
+async fn the_merge_runs_next_to_the_other_rewrites_and_after_the_content_policy() {
+    let alpha = messages_backend().await;
+    let cloud = cloud_api("sk-live-customer").await;
+    let gateway = start_list(
+        &json!({"models": [{
+            "id": ALPHA,
+            "backend_urls": [alpha.uri()],
+            "reasoning_off_effort": "low",
+            "reasoning_effort_map": {"high": "xhigh"},
+            "merge_system_messages": true,
+            "backend_token_env": "VLLM_BACKEND_TOKEN_ALPHA"
+        }]}),
+        &[
+            ("CLOUD_API_URL", &cloud.uri()),
+            ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+            ("VLLM_BACKEND_TOKEN_ALPHA", "alpha-secret"),
+            // A deployment that refuses text parts: only the order of the
+            // policy and the merge decides what happens to one below.
+            ("VLLM_PROXY_REJECTED_CONTENT_PART_TYPES", "text"),
+        ],
+        None,
+    );
+    let user = json!({"role": "user", "content": "hello"});
+    let tool = json!({"role": "tool", "tool_call_id": "call_1", "content": "found"});
+    let call = |arguments: &str| {
+        json!({"role": "assistant", "content": null, "tool_calls": [{
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": arguments}
+        }]})
+    };
+
+    // One request that needs all of it: an effort the engine refuses, a
+    // tool call without arguments, a schema without a name and a late
+    // system message.
+    let response = gateway
+        .app
+        .clone()
+        .oneshot(post(
+            CHAT,
+            Some("test-token"),
+            &json!({
+                "model": ALPHA,
+                "reasoning": {"effort": "high"},
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"schema": {"type": "object"}}
+                },
+                "messages": [system(FIRST_PROMPT), user, call(""), tool, system(SECOND_PROMPT), user]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let (body, _) = last_body(&alpha, CHAT).await;
+    assert_eq!(
+        body["messages"],
+        json!([
+            system(format!("{FIRST_PROMPT}\n\n{SECOND_PROMPT}")),
+            user,
+            call("{}"),
+            tool,
+            user
+        ]),
+        "{body}"
+    );
+    assert_eq!(body["reasoning_effort"], "xhigh", "{body}");
+    assert_eq!(body["reasoning"]["effort"], "xhigh", "{body}");
+    assert_eq!(
+        body["response_format"]["json_schema"]["name"], "response_schema",
+        "{body}"
+    );
+
+    // The policy judges the parts the caller sent. Merged first, this system
+    // message would be a string and the request would be dispatched.
+    let response = gateway
+        .app
+        .clone()
+        .oneshot(post(
+            CHAT,
+            Some("test-token"),
+            &json!({"model": ALPHA, "messages": [
+                system(FIRST_PROMPT),
+                user,
+                system(json!([{"type": "text", "text": SECOND_PROMPT}]))
+            ]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let refusal = json_body(response).await;
+    assert!(
+        refusal["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Content part type 'text'")),
+        "{refusal}"
+    );
+    assert_eq!(requests_to(&alpha, CHAT).await.len(), 1);
+}
+
+/// An encrypted request is merged on its plaintext: two ciphertexts joined
+/// by a blank line would be neither.
+#[tokio::test]
+async fn encrypted_system_messages_are_merged_after_they_are_decrypted() {
+    let alpha = messages_backend().await;
+    let gateway = start_list(
+        &json!({"models": [
+            {"id": ALPHA, "backend_urls": [alpha.uri()], "merge_system_messages": true}
+        ]}),
+        &[],
+        None,
+    );
+    let client = signing::SigningPair {
+        ecdsa: signing::EcdsaContext::from_key_bytes(&[7; 32]).unwrap(),
+        ed25519: signing::Ed25519Context::from_key_bytes(&[9; 32]).unwrap(),
+    };
+    // The client encrypts for the gateway's key.
+    let for_gateway = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: hex::decode(&gateway.state.signing.ed25519.signing_public_key).unwrap(),
+        version: 1,
+        encrypt_all_fields: false,
+    };
+    let encrypted = |text: &str| encryption::encrypt_string(text, &for_gateway, &client).unwrap();
+    let body = json!({"model": ALPHA, "messages": [
+        system(encrypted(FIRST_PROMPT)),
+        {"role": "user", "content": encrypted("hello")},
+        system(encrypted(SECOND_PROMPT))
+    ]});
+    let request = Request::builder()
+        .method("POST")
+        .uri(CHAT)
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test-token")
+        .header("x-signing-algo", "ed25519")
+        .header("x-client-pub-key", &client.ed25519.signing_public_key)
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let response = gateway.app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let (sent, _) = last_body(&alpha, CHAT).await;
+    assert_eq!(
+        sent["messages"],
+        json!([
+            system(format!("{FIRST_PROMPT}\n\n{SECOND_PROMPT}")),
+            {"role": "user", "content": "hello"}
+        ]),
+        "{sent}"
+    );
+}
+
+#[tokio::test]
+async fn a_single_model_process_sends_system_messages_as_before_and_has_no_merge_series() {
+    let cloud = cloud_api("sk-live-customer").await;
+    let cloud_url = cloud.uri();
+    // A gateway lane (a backend token), and a proxy as it runs in a CVM.
+    let lane = vec![
+        ("VLLM_BACKEND_TOKEN", "backend-secret"),
+        ("CLOUD_API_URL", cloud_url.as_str()),
+        ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+    ];
+    for (env, is_lane) in [(lane, true), (vec![], false)] {
+        let backend = messages_backend().await;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let backend_url = backend.uri();
+        let mut vars = vec![
+            ("MODEL_NAME", ALPHA),
+            ("VLLM_BACKEND_URLS", backend_url.as_str()),
+            // No variable switches it on: these are not read.
+            ("VLLM_PROXY_MERGE_SYSTEM_MESSAGES", "1"),
+            ("MERGE_SYSTEM_MESSAGES", "true"),
+        ];
+        vars.extend(env);
+        let gateway = start_single(&vars, Some(handle.clone()));
+        assert!(gateway.state.models.is_none());
+        assert!(!gateway.state.config.single_model().merge_system_messages);
+
+        // The shapes a list model can have merged reach the engine as sent.
+        for said in ["hello", STREAMED] {
+            let user = json!({"role": "user", "content": said});
+            for sent in &refused_shapes(&user) {
+                let (body, _) = sent_messages(&gateway, &backend, CHAT, ALPHA, sent).await;
+                assert_eq!(&body["messages"], sent, "lane: {is_lane}");
+            }
+        }
+
+        let rendered = handle.render();
+        assert!(
+            !rendered.contains("system_messages_merged"),
+            "lane: {is_lane}: {rendered}"
+        );
+        assert!(
+            !rendered.contains("model=\""),
+            "lane: {is_lane}: {rendered}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_tier_is_strict_for_the_model_that_says_so_on_both_routes() {
     // alpha isolates its tiers, beta does not, gamma leaves it to the
@@ -3802,6 +4282,98 @@ async fn the_binary_applies_a_reasoning_effort_map_and_refuses_one_it_cannot_ser
     let serving = binary.logged("Serving model");
     assert_eq!(serving[0]["reasoning_effort_map"], r#"{"high": "xhigh"}"#);
     assert_eq!(serving[1]["reasoning_effort_map"], "{}");
+    alpha.verify().await;
+}
+
+/// `main` itself with `merge_system_messages`: served as written, or not
+/// started at all.
+#[tokio::test]
+async fn the_binary_merges_system_messages_and_refuses_a_value_that_is_not_a_boolean() {
+    let alpha = MockServer::start().await;
+    mount_completions(&alpha, CHAT, 2).await;
+    let alpha_url = alpha.uri();
+    let list = |value: Value| {
+        json!({"models": [
+            {"id": ALPHA, "backend_urls": [alpha_url], "merge_system_messages": value},
+            {"id": BETA, "backend_urls": ["http://beta.invalid"]}
+        ]})
+    };
+
+    for value in [
+        json!("true"),
+        json!("false"),
+        json!(1),
+        json!(null),
+        json!([true]),
+        json!({"enabled": true}),
+    ] {
+        let printed = refused_at_startup(&list(value.clone()), &[]).await;
+        assert!(
+            printed.contains("VLLM_PROXY_MODEL_LIST_FILE (")
+                && printed.contains("not a valid model list")
+                && printed.contains("expected a boolean"),
+            "{value}: {printed}"
+        );
+        assert!(!printed.contains("Serving model"), "{value}: {printed}");
+    }
+    // Nothing was asked of a backend by a process that did not start.
+    assert!(alpha.received_requests().await.unwrap().is_empty());
+
+    let binary = Binary::start(
+        &list(json!(true)),
+        &[
+            (
+                "VLLM_PROXY_MODELS_DOCUMENT_URL",
+                "http://catalog.invalid/v1/models",
+            ),
+            ("HEALTH_CHECK_INTERVAL_SECS", "3600"),
+        ],
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let user = json!({"role": "user", "content": "hello"});
+    let late = json!([system(FIRST_PROMPT), user, system(SECOND_PROMPT)]);
+    let in_place = json!([system(FIRST_PROMPT), user]);
+    for messages in [&late, &in_place] {
+        let response = client
+            .post(format!("{}{CHAT}", binary.base))
+            .bearer_auth("test-token")
+            .json(&json!({"model": ALPHA, "messages": messages}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+    }
+    let sent = requests_to(&alpha, CHAT).await;
+    assert_eq!(sent.len(), 2);
+    let body: Value = serde_json::from_slice(&sent[0].body).unwrap();
+    assert_eq!(
+        body["messages"],
+        json!([system(format!("{FIRST_PROMPT}\n\n{SECOND_PROMPT}")), user]),
+        "{body}"
+    );
+    let body: Value = serde_json::from_slice(&sent[1].body).unwrap();
+    assert_eq!(body["messages"], in_place, "{body}");
+
+    let rendered = client
+        .get(format!("{}{}", binary.base, routes::ROUTE_METRICS))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        rendered.contains(&format!("{MERGED}{{model=\"example/alpha\"}} 1")),
+        "{rendered}"
+    );
+    let serving = binary.logged("Serving model");
+    assert_eq!(serving[0]["merge_system_messages"], true);
+    assert_eq!(serving[1]["merge_system_messages"], false);
+    let log = binary.log();
+    for prompt in [FIRST_PROMPT, SECOND_PROMPT] {
+        assert!(!log.contains(prompt), "{prompt} in the log");
+    }
     alpha.verify().await;
 }
 

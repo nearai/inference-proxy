@@ -20,8 +20,9 @@
 //! Every key except `id` and `backend_urls` is optional and falls back to the
 //! process-level variable of the same name, so one model written out in full
 //! and one written as `id` plus `backend_urls` under the same environment are
-//! the same model (`Config::single_model`). One key has no variable and so
-//! no fallback, `reasoning_effort_map`: it exists for a list's models only.
+//! the same model (`Config::single_model`). Two keys have no variable and so
+//! no fallback, `reasoning_effort_map` and `merge_system_messages`: they
+//! exist for a list's models only.
 //!
 //! Without the variable nothing here runs: the process serves one model from
 //! its environment, as every CVM proxy and single-model gateway does.
@@ -102,6 +103,11 @@ pub struct ModelConfig {
     /// (`reasoning_effort_map`). A list key only: empty for the one model of
     /// a process without a list.
     pub reasoning_effort_map: EffortMap,
+    /// This model's chat template takes one `system` message, first: a
+    /// request with one anywhere else gets them merged into that
+    /// (`merge_system_messages`, `system_messages.rs`). A list key only:
+    /// `false` for the one model of a process without a list.
+    pub merge_system_messages: bool,
     pub backend_token: Option<String>,
     pub backend_priority: Option<i64>,
 }
@@ -153,6 +159,7 @@ impl std::fmt::Debug for ModelConfig {
             .field("discount_to_user", &self.discount_to_user)
             .field("reasoning_off_effort", &self.reasoning_off_effort)
             .field("reasoning_effort_map", &self.reasoning_effort_map)
+            .field("merge_system_messages", &self.merge_system_messages)
             .field(
                 "backend_token",
                 &self.backend_token.as_ref().map(|_| "<set>"),
@@ -229,6 +236,10 @@ struct ModelEntry {
     discount_to_user: Option<f64>,
     reasoning_off_effort: Option<String>,
     reasoning_effort_map: Option<EffortPairs>,
+    /// `true` or `false`. Not an `Option`: `null` is not a boolean either,
+    /// and is refused like any other value that is not one.
+    #[serde(default)]
+    merge_system_messages: bool,
     /// Name of the environment variable holding the backend bearer.
     backend_token_env: Option<String>,
     backend_priority: Option<i64>,
@@ -427,6 +438,7 @@ fn resolve(
         },
         reasoning_off_effort,
         reasoning_effort_map,
+        merge_system_messages: entry.merge_system_messages,
         backend_token: match entry.backend_token_env {
             Some(name) => Some(backend_token_from_env(&name, lookup)?),
             None => defaults.backend_token.clone(),
@@ -687,6 +699,7 @@ impl ServedModel {
             reasoning_off_effort: &self.config.reasoning_off_effort,
             reasoning_effort_map: (!self.config.reasoning_effort_map.is_empty())
                 .then_some(&self.config.reasoning_effort_map),
+            merge_system_messages: self.config.merge_system_messages,
             trusted_by_backends: self.config.backend_token.is_some(),
             discount_to_user: self.config.discount_to_user,
         }
@@ -712,6 +725,9 @@ pub struct ModelView<'a> {
     /// The model's `reasoning_effort_map` when it has entries. Always `None`
     /// for the single model: the key exists in a list only.
     pub reasoning_effort_map: Option<&'a EffortMap>,
+    /// The model's `merge_system_messages`. Always `false` for the single
+    /// model: the key exists in a list only.
+    pub merge_system_messages: bool,
     /// A backend token is configured: the backends are inference-proxies
     /// that trust this process, i.e. it runs as a gateway lane.
     pub trusted_by_backends: bool,
@@ -731,6 +747,7 @@ impl<'a> ModelView<'a> {
             backend_tier_strict: state.config.backend_tier_strict,
             reasoning_off_effort: &state.config.reasoning_off_effort,
             reasoning_effort_map: None,
+            merge_system_messages: false,
             trusted_by_backends: state.config.backend_token.is_some(),
             discount_to_user: state.config.discount_to_user,
         }
@@ -831,6 +848,7 @@ impl ModelList {
                 discount_to_user = model.discount_to_user,
                 reasoning_off_effort = %model.reasoning_off_effort,
                 reasoning_effort_map = ?model.reasoning_effort_map,
+                merge_system_messages = model.merge_system_messages,
                 backend_token = model.backend_token.is_some(),
                 backend_priority = model.backend_priority,
                 "Serving model"

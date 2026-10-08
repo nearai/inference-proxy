@@ -13,8 +13,9 @@
 //!
 //! Two series exist in list mode only (`ModelRequest`): the responses and the
 //! failed streams of each model. A process that serves one model emits
-//! neither. (A third list-only series, the requests a model's
-//! `reasoning_effort_map` changed, is `reasoning::apply_effort_map`'s.)
+//! neither. (Two more list-only series count requests a per-model setting
+//! rewrote: `reasoning::apply_effort_map`'s for a `reasoning_effort_map`, and
+//! `system_messages::merge_system_messages`'s for `merge_system_messages`.)
 
 use axum::response::{IntoResponse, Response};
 

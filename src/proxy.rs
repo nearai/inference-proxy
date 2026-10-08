@@ -2742,6 +2742,13 @@ pub async fn proxy_streaming_request(
             return;
         }
 
+        // List mode: what a failure of this stream is counted under
+        // (`model_metrics::count_stream_error`), decided once, as the
+        // upstream answers. Nothing when the client is already gone by then:
+        // it left on its 200 or before any status was sent, and that is a
+        // disconnect, not a failed stream.
+        let stream_errors = opts.model_request.filter(|_| !tx.is_closed());
+
         let byte_stream = match opened {
             Ok(stream) => {
                 let delivered = start_tx
@@ -2766,12 +2773,7 @@ pub async fn proxy_streaming_request(
                     }
                     // Too late for a status line: the client already has a 200.
                     metrics::counter!("stream_late_upstream_errors_total").increment(1);
-                    // List mode: a failed stream, unless the body channel is
-                    // already closed. That is a client that left, on its 200
-                    // or before any status was sent, and not a stream error.
-                    crate::model_metrics::count_stream_error(
-                        opts.model_request.filter(|_| !tx.is_closed()),
-                    );
+                    crate::model_metrics::count_stream_error(stream_errors);
                     let _ = tx.send(Ok(late_error_event(err).await)).await;
                 }
                 return;
@@ -2781,11 +2783,6 @@ pub async fn proxy_streaming_request(
         // Capture log fields before any partial moves from opts.
         let (log_request_id, log_org_id, log_workspace_id) = log_ids_or_empty(&opts.tracing_ids);
         let completion_tracing_ids = opts.tracing_ids.clone();
-        // List mode: what a failure of this stream is counted under
-        // (`model_metrics::count_stream_error`). Nothing when the client is
-        // already gone as the upstream answers: it left on its 200 or before
-        // any status was sent, which is a disconnect and not a failed stream.
-        let stream_errors = opts.model_request.filter(|_| !tx.is_closed());
 
         let signing = opts.signing;
         let cache = opts.cache;
@@ -4399,6 +4396,56 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    /// A client that is gone before the upstream answers is a disconnect, in
+    /// list mode too: an upstream failure that then arrives for it is not a
+    /// failed stream of its model.
+    #[tokio::test]
+    async fn an_upstream_failure_for_a_client_that_already_left_is_not_a_stream_error() {
+        use std::future::Future;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+
+        let mut opts = test_proxy_opts();
+        opts.model_request =
+            crate::model_metrics::ModelRequest::of(Some("org/model-a"), "/v1/chat/completions");
+        let client = reqwest::Client::new();
+        // Not a URL, so the upstream attempt fails the first time it is
+        // polled: nothing here depends on a socket or on timing.
+        let mut handler = Box::pin(proxy_streaming_request(
+            &client,
+            "not a url",
+            b"{}".to_vec(),
+            opts,
+        ));
+        // One poll: the streaming task is spawned and the handler waits for
+        // the upstream's verdict. The task has not run yet, because this
+        // runtime has one thread and the test has not yielded.
+        let polled =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(handler.as_mut().poll(cx))).await;
+        assert!(polled.is_pending());
+        // The client hangs up before any status was sent.
+        drop(handler);
+
+        // The task's first run finds the handler gone and the upstream
+        // failed, both at once: too late for a status, so a late error.
+        let late_error = "stream_late_upstream_errors_total 1";
+        for _ in 0..400 {
+            if handle.render().contains(late_error) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let rendered = handle.render();
+        assert!(rendered.contains(late_error), "{rendered}");
+        // ... and not a stream error of the model: nobody was sent a 200.
+        assert!(
+            !rendered.contains("inference_proxy_model_stream_errors_total"),
+            "{rendered}"
+        );
     }
 
     /// Verifies that the streaming task exits promptly when the client disconnects

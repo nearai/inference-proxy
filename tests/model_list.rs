@@ -374,11 +374,21 @@ async fn usage_reports(cloud: &MockServer, expected: usize) -> Vec<Value> {
     panic!("expected {expected} usage reports");
 }
 
+/// The URL of a backend that refuses every connection, for the rest of the
+/// test process. Its port stays bound, so it is handed to nobody else, and
+/// never listens, so a connection to it is refused at once. (A port that is
+/// only picked and released can be given to a listener of another test, in
+/// this process or another one, before the gateway connects to it.)
 fn unreachable_backend_url() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    format!("http://127.0.0.1:{port}")
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = socket.local_addr().unwrap();
+    // Refused, and immediately: neither accepted nor left to time out.
+    let refused = std::net::TcpStream::connect(address).unwrap_err();
+    assert_eq!(refused.kind(), std::io::ErrorKind::ConnectionRefused);
+    // Never closed: no test holds a value to tie the socket's life to.
+    std::mem::forget(socket);
+    format!("http://{address}")
 }
 
 /// Poll `ready` until it holds, for at most `secs` seconds.

@@ -63,9 +63,14 @@ It runs after the two repairs above. A process without a list never does it.
    idempotent on the provider completion id. The report is handed over when
    the request completes and sent off the request path: once, with a 5 s
    timeout, unless `VLLM_PROXY_USAGE_REPORT_*` says otherwise (see
-   [Usage report delivery](#usage-report-delivery)).
+   [Usage report delivery](#usage-report-delivery)). With
+   `VLLM_PROXY_USAGE_REPORT_OUTBOX_PATH` it is written to a file first and
+   kept there until cloud-api has accepted it
+   ([The outbox on disk](#the-outbox-on-disk)).
 
 Nothing about request or response content is logged or stored at any hop.
+(A gateway with an outbox keeps its usage reports in a file until cloud-api has
+accepted them: ids and token counts, no content.)
 
 ## Backend membership: static handle URLs
 
@@ -113,6 +118,7 @@ to the current in-CVM behavior.
 | `VLLM_PROXY_USAGE_REPORT_TIMEOUT_SECS` / `_MAX_ATTEMPTS` / `_INITIAL_BACKOFF_MS` / `_DEADLINE_SECS` | `30` / `5` / `5000` / `300` | How long one attempt at a usage report may take, how many attempts a report gets, the backoff before the first retry, and how long after its request a report may still be sent (see [Usage report delivery](#usage-report-delivery)). Unset = one attempt of 5 s and no deadline, as in a CVM. |
 | `VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT` | `8` | Usage reports in flight at once; the others wait in a bounded in-memory queue (`_MAX_QUEUED`, default `10000`). Unset = no cap. Required for a timeout above 5 s or more than one attempt. |
 | `VLLM_PROXY_USAGE_REPORT_SHUTDOWN_DRAIN_SECS` | below the service's stop timeout | On SIGTERM, once every open request has ended, how long to wait for usage reports still queued or in flight before exiting. Unset = no wait. |
+| `VLLM_PROXY_USAGE_REPORT_OUTBOX_PATH` | a file on a volume that outlives the process | Keep every usage report in this SQLite file from the completion of its request until cloud-api has accepted it, across restarts and cloud-api outages (see [The outbox on disk](#the-outbox-on-disk)). `_OUTBOX_MAX_PENDING` (default `1000000`) and `_OUTBOX_MAX_REJECTED` (default `10000`) bound it. Unset = no file, reports live in memory only. |
 | `VLLM_PROXY_REASONING_OFF_EFFORT` | `low` | What "no reasoning" means for GLM-5.3 Flash (see below). |
 | `VLLM_PROXY_SSE_KEEPALIVE_SECS` | `15` | `: keep-alive` SSE comments while the upstream is silent (long prefill/queueing), so intermediaries with read timeouts do not cancel. Off in CVMs: comments are not part of the signed bytes. |
 | `VLLM_PROXY_MAP_QUEUE_FULL_TO_429` | `1` | The engine's admission rejection (queue full, or a queued request displaced by a higher-priority one) becomes 429 with `Retry-After: 2` and type `overloaded`, the same shape as the gateway's own refusals: back-pressure, not an outage. Off in CVMs: cloud-api's peer fallback keys on the 503. |
@@ -616,7 +622,8 @@ waits up to `SHUTDOWN_DRAIN_SECS` for the reports still queued or in flight
 and logs `Usage reports drained before shutdown` or `Usage reports left
 undelivered at shutdown` with how many were pending and how many were left
 (the count, not the ids of the reports). The queue is in memory only: what is
-left at exit, and whatever a process held when it was killed, is lost.
+left at exit, and whatever a process held when it was killed, is lost, unless
+the reports are kept in [the outbox on disk](#the-outbox-on-disk).
 
 The wait starts only when every open request has ended. One stream that is
 still open keeps the server serving, and when the service's stop timeout runs
@@ -658,6 +665,265 @@ lines are unchanged. Log
 lines carry ids only (request, organization, workspace, key, model), never a
 report's content.
 
+### The outbox on disk
+
+Everything above keeps a report in memory. A report dropped from a full queue
+or at its deadline, one whose attempts ran out while cloud-api was down, and
+whatever a process held when it was killed are usage that was served and is
+never billed. `VLLM_PROXY_USAGE_REPORT_OUTBOX_PATH` names a SQLite file to keep
+reports in instead (`src/usage_outbox.rs`). A report is then written to the
+file first and sent from it, and it stays there until cloud-api accepts it or
+refuses it for good: across a restart, a crash, and an outage of any length.
+
+It is for a gateway; a CVM proxy never sets it. Without the variable there is
+no file, no extra series, no extra log line and no change to any request.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `VLLM_PROXY_USAGE_REPORT_OUTBOX_PATH` | unset (no outbox) | The SQLite file. It is created, with mode `0600`, when it is not there. Its directory must exist, be writable by the proxy and outlive the process and its container (a mounted volume). SQLite keeps two more files beside it, `-wal` and `-shm`, with the same mode. |
+| `VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_PENDING` | `1000000` | Reports the file may hold while they wait to be accepted (1 to 10000000; a row is about half a kilobyte). Past it the report that has waited longest is dropped, logged with its ids and counted as `queue_full`. |
+| `VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_REJECTED` | `10000` | Rows kept in the `rejected` table (1 to 1000000). Past it the oldest is removed and counted. |
+
+**What the other settings mean with an outbox.** The settings of the table
+further up still apply, and what is not set starts from different values:
+
+- `MAX_ATTEMPTS` not set: no cap, a report is sent until it is accepted. Set
+  (1 to 10), it is the cap it always was, and a report that uses it up moves
+  to the `rejected` table instead of being dropped.
+- `MAX_IN_FLIGHT` not set, or `0`: `8`. An outbox is always delivered under a
+  cap. "No cap" would send the whole backlog of an outage at once when
+  cloud-api came back, so it is not offered, and the rule that a longer
+  timeout or retries need a cap is met without setting one.
+- `DEADLINE_SECS` not set: none, as always. Set, it is the maximum age of a
+  report, counted from the completion of its request whichever process served
+  it. A report past it is dropped, logged and counted as `deadline`.
+- `TIMEOUT_SECS` keeps its default of 5 s. A lane whose reports wait for
+  cloud-api's write wants the 30 s of the table further up here too: a report
+  is sent again for as long as it takes, but an attempt cloud-api cannot
+  answer in time is never accepted however often it is made.
+- `INITIAL_BACKOFF_MS` is the backoff of a report and of a place, see below.
+  `0` cannot work and is replaced by the default.
+- `MAX_QUEUED` bounds what waits in memory: the reports not written to the
+  file yet, and the queue reports fall back to while the file cannot be used.
+- `SHUTDOWN_DRAIN_SECS` is the time the attempts in flight get at shutdown.
+
+The effective values are logged at startup (`Usage report outbox enabled`,
+`Usage report delivery configured`). Nothing about the outbox fails startup: an
+outbox size that cannot be read is replaced by its default with an error
+line, and a path that cannot be used costs the durability of the reports and
+nothing else (see "When the file cannot be used"). The delivery settings of
+the table further up still fail startup on a value that cannot work, with or
+without an outbox, as they did.
+
+**Written first.** Handing a report over is still a lock and a push: the
+request path never touches the file and never waits for it. One thread, which
+owns the SQLite connection, writes what was handed over, and it gathers the
+reports that complete within 50 ms of each other into one transaction (at most
+2000 per transaction). So a report is in the file about 50 ms after its
+request completed; later only while the other process on the file holds the
+write lock or the disk is slow. Until then it waits in memory, at most
+`MAX_QUEUED` of them, and a report beyond that is delivered from memory
+without being kept. A report is not sent before it is written.
+
+That is the durability window: **a report handed over less than 50 ms before
+the process is killed (`kill -9`, an out-of-memory kill, a crash) may be
+lost.** A process that is stopped in good order writes everything first.
+
+The file is in WAL mode with `synchronous=NORMAL`. A commit is then one append
+to the write-ahead log that is not flushed to the disk by itself. It survives
+the process, whatever ends it, because the operating system has the bytes, and
+the file cannot be corrupted by a crash of either. It does not necessarily
+survive the host: after a host crash or a power loss, the commits since the
+log was last flushed can be gone. The log is flushed at every checkpoint, and
+the proxy runs one every 5 s while something was written, so that is a few
+seconds of reports. `synchronous=FULL` would close that gap with a disk flush
+on every commit. What the outbox is there for is restarts, deploys and
+cloud-api outages, where `NORMAL` loses nothing, so the flush per commit was
+not taken.
+
+**What is in the file.** One row per report, in `pending`:
+
+| Column | What it holds |
+| --- | --- |
+| `body` | The report as it is sent, the JSON of `POST /v1/internal/usage`: organization, workspace and key ids, model, token counts, completion id, discount. |
+| `request_id` | The request id, sent again as `x-request-id` and logged. |
+| `model_label`, `auth_path`, `ingress_route` | The labels of the report's metric series and log lines. |
+| `completed_at_ms` | When its request completed (Unix time, ms). |
+| `attempts`, `last_outcome` | Attempts made so far, by any process, and why the last one failed (`timeout`, `connect_error`, `transport_error`, `http_5xx`, `http_429`). |
+| `next_attempt_at_ms` | When it is due (again). |
+| `lease_until_ms`, `lease_owner` | While a process is sending it: until when it is that process's, and which process. |
+
+The bearer token is never written: it is read from `CLOUD_API_USAGE_TOKEN`
+when a report is sent, and so is the URL, from `CLOUD_API_URL`. A token that
+was rotated, or a cloud-api that moved, applies to the whole backlog at the
+next start. Nothing of a request or a response is in the file either. What is
+in it is who used how many tokens of which model, which is billing data:
+hence mode `0600`, and it belongs on a volume only the gateway reads.
+
+**Delivery.** At most `MAX_IN_FLIGHT` places send at once. A free place takes
+the report that has been due longest, by marking it with a lease: the process
+holding it and a time, two attempt timeouts and 30 s ahead, until which nobody
+else takes it. Then, on the answer:
+
+- accepted: the row is deleted;
+- a failure that can pass (timeout, connection or transport error, 5xx, 429):
+  `attempts` goes up, the report is due again after the backoff
+  (`INITIAL_BACKOFF_MS × 2^(attempts-1)`, at most 30 s, half of it random) and
+  its lease is given back;
+- any other answer: the row moves to `rejected` (next paragraph) and the place
+  goes on with the next report. A report cloud-api will never take holds
+  nothing up.
+
+After a failure that can pass, the place that met it also stays taken for a
+while before it takes another report: the backoff of the number of such
+failures in a row across the process, so it doubles while nothing gets
+through, up to 30 s, and starts over with the first report that gets an
+answer of its own. A cloud-api that is down therefore gets `MAX_IN_FLIGHT`
+attempts every half minute, not the backlog in a loop, and each of them is on
+a different report, so an outage uses up nobody's attempts. When it is back
+the places resume as their pauses end, within 30 s.
+
+**Reports cloud-api refuses.** A 4xx other than 429, or any other answer that
+is neither a success nor a failure that can pass, means cloud-api refused the
+report itself (an unknown model, a discount above its maximum, a body it
+cannot read). The row moves to the `rejected` table with `reason`
+(`rejected`, or `attempts_exhausted` under an explicit `MAX_ATTEMPTS`), the
+HTTP `status`, the number of `attempts`, the time and everything the row
+held. It is counted once, as the outcome it ended with and as dropped, and it
+is logged with its ids. Nothing sends it again by itself. Look at the table
+with the `sqlite3` CLI, on the host that has the volume (the image has none):
+
+```sql
+-- sqlite3 /path/to/usage-outbox.db
+-- the backlog
+SELECT COUNT(*) FROM pending;
+-- the reports that were refused, newest first
+SELECT id, datetime(rejected_at_ms / 1000, 'unixepoch') AS rejected_at,
+       reason, status, attempts,
+       json_extract(body, '$.id') AS completion,
+       json_extract(body, '$.organization_id') AS organization,
+       json_extract(body, '$.model') AS model
+FROM rejected ORDER BY id DESC LIMIT 20;
+```
+
+Once what was wrong is fixed on cloud-api's side, a report is sent again by
+moving its row back (here the one with `id` 42; drop the `WHERE` clauses to
+move them all):
+
+```sql
+BEGIN IMMEDIATE;
+INSERT INTO pending (body, request_id, model_label, auth_path, ingress_route, completed_at_ms)
+  SELECT body, request_id, model_label, auth_path, ingress_route, completed_at_ms
+  FROM rejected WHERE id = 42;
+DELETE FROM rejected WHERE id = 42;
+COMMIT;
+```
+
+This is safe while the proxy runs: it finds the row within two seconds and
+sends it like any other, and cloud-api deduplicates on the completion id.
+With `DEADLINE_SECS` set, a row older than the deadline is dropped again;
+give it a later `completed_at_ms` in that case. Do not leave a transaction
+open in the CLI: the proxy waits 5 s for the write lock and then treats the
+file as unusable until it gets it.
+
+**Two processes on one file.** A blue/green switch overlaps the old process
+and the new one, and both may have the file open: WAL mode lets one write
+while the other reads, and a write waits up to 5 s for the other's lock. The
+leases keep them apart. A report is sent by whichever process holds its lease,
+and a report written by one may well be sent by the other. A process that
+stops gives its leases back; one that dies leaves them to run out, after
+which its reports are anybody's. So the reports a killed process was sending
+or about to send, at most twice `MAX_IN_FLIGHT` of them, wait for two attempt
+timeouts and 30 s (40 s by default, 90 s with a 30 s timeout) before the next
+process sends them. A report can be sent twice when a lease runs out under an
+attempt that is still in flight, or when a process is stopped without a drain
+while it is sending; cloud-api deduplicates those. Nothing is lost either way.
+
+Run the two processes of a switch with the same file. A file of its own for
+each would leave the backlog of the old one where no process reads it.
+
+**Shutdown and restart.** On SIGTERM, once every open request has ended, the
+reports still in memory are written to the file, the attempts in flight get
+`SHUTDOWN_DRAIN_SECS`, and the leases of the process are given back, so the
+next process can send what is left at once. The process logs `Usage report
+outbox closed for shutdown` with how many reports the file holds. Nothing has
+to be delivered before it exits, so with an outbox a process can be retired
+without waiting out its queue (the rule of "Shutdown" above). A new process
+creates the file or brings its schema up to date (`PRAGMA user_version`),
+reads the backlog and delivers it, oldest first, at the pace of
+`MAX_IN_FLIGHT`. A file written by a newer version of the proxy than the one
+that opens it is refused and left alone (a rollback): reports are then
+delivered from memory, and the newer version finds its backlog when it is
+back.
+
+**When the file cannot be used.** The outbox never keeps the gateway from
+starting or serving, and never slows a request. If the file cannot be opened
+at startup (a directory that is not there, permissions, a file that is not a
+database, a file from a newer version), or a transaction fails later (a full
+disk, an I/O error, a write lock that is not free within 5 s), then:
+
+- the reports of the failed transaction, and every report after it, are
+  delivered from memory, as without an outbox and under the same settings.
+  They are sent; they are just not kept across a restart;
+- `inference_proxy_usage_report_outbox_available` reads 0,
+  `inference_proxy_usage_report_outbox_errors_total{op}` goes up and
+  `inference_proxy_usage_report_outbox_bypassed_total{reason}` counts the
+  reports that went around the file;
+- the log says `Usage report outbox unavailable`, once, at error level, with
+  the step that failed and the reason;
+- opening is tried again every 5 s. When it works the log says `Usage report
+  outbox available again`, the reports still waiting in memory are written to
+  the file after all, and what the file already held is delivered.
+
+The outcome of an attempt that could not be written (an accepted report whose
+row is still there) is written when the file is back. If the process ends
+before that, the report is sent once more by the next one.
+
+With the path set and `CLOUD_API_URL` or `CLOUD_API_USAGE_TOKEN` missing,
+nothing can be reported, so the file is not opened (an error line says so and
+the gauge reads 0).
+
+**Metrics.** A process with an outbox has every series of "Metrics" above,
+whatever its other settings, and they keep their meaning:
+
+- `inference_proxy_usage_reports_total{outcome}` counts a report once, at its
+  final outcome, in the process that got it: `accepted`, the answer it was
+  refused with, `queue_full` for a report dropped at `MAX_PENDING`,
+  `deadline_exceeded` under a deadline. A report that is being sent again is
+  not counted yet.
+- `inference_proxy_usage_report_attempts_total`, `..._retries_total` and
+  `inference_proxy_usage_reports_dropped_total{reason}` as above. `rejected`
+  and `attempts_exhausted` are the rows that moved to the `rejected` table.
+- `inference_proxy_usage_report_time_to_accepted_seconds` counts from the
+  completion of the request as the file has it, so it is right for a report
+  that an earlier process served.
+- `inference_proxy_usage_report_queue_depth` is what waits: the rows of the
+  file nobody in this process is sending, and what waits in memory.
+  `inference_proxy_usage_reports_in_flight` is the places taken.
+
+And these, which exist only with an outbox:
+
+- `inference_proxy_usage_report_outbox_available`: 1 while the last thing
+  tried on the file worked;
+- `inference_proxy_usage_report_outbox_pending`: rows of `pending`, waiting or
+  being sent (with `model` in list mode);
+- `inference_proxy_usage_report_outbox_oldest_pending_age_seconds`: how long
+  ago the request of the oldest of them completed, 0 when there is none;
+- `inference_proxy_usage_report_outbox_rejected`: rows of `rejected`;
+- `inference_proxy_usage_report_outbox_rejected_evicted_total`: rows removed
+  from `rejected` to keep it within `MAX_REJECTED`;
+- `inference_proxy_usage_report_outbox_errors_total{op}`: failures of the
+  file, by the step that failed (`open`, `begin`, `insert`, `settle`, `evict`,
+  `claim`, `release`, `stats`, `commit`, `checkpoint`);
+- `inference_proxy_usage_report_outbox_bypassed_total{reason}`: reports
+  delivered from memory because the file could not take them (`unavailable`,
+  `write_failed`, `buffer_full`).
+
+The gauges describe the file, not the process: two processes on one file each
+report the same backlog, so take the maximum over them, not the sum. Worth an
+alert: `available` at 0, the age of the oldest report above what an outage of
+cloud-api is allowed to last, and anything in `rejected`.
+
 ## Several models in one gateway
 
 A gateway is model-scoped: `MODEL_NAME` is its billing key, it has one backend
@@ -689,8 +955,9 @@ cloud-api.
 
 One per process, as before: the key check against cloud-api, the organization
 allowlist, the usage-report endpoint and token and the delivery of the reports
-(`VLLM_PROXY_USAGE_REPORT_*`: one cap and one queue for all models, since they
-report to the same cloud-api), the content policy, the models document source,
+(`VLLM_PROXY_USAGE_REPORT_*`: one cap, one queue and one outbox for all models,
+since they report to the same cloud-api), the content policy, the models
+document source,
 the stream timings (keep-alive, commit window, error peek, first-token
 deadline) and the health-check timings. The remaining gateway
 switches are process-level too and apply to every model:
@@ -1094,7 +1361,9 @@ id, as their last label:
   `inference_proxy_usage_reports_dropped_total`,
   `inference_proxy_usage_report_queue_depth`,
   `inference_proxy_usage_reports_in_flight`,
-  `inference_proxy_usage_report_time_to_accepted_seconds`),
+  `inference_proxy_usage_report_time_to_accepted_seconds`,
+  `inference_proxy_usage_report_outbox_pending`,
+  `inference_proxy_usage_report_outbox_bypassed_total`),
   `inference_proxy_completed_requests_total`,
   `inference_proxy_input_tokens_total`, `inference_proxy_input_tokens`,
   `inference_proxy_request_duration_seconds`.

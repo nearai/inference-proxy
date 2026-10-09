@@ -102,12 +102,79 @@ pub(crate) fn validate_discount_to_user(discount: f64, raw: &str) -> anyhow::Res
     Ok((basis_points > 0.0).then_some(discount))
 }
 
+/// `VLLM_PROXY_USAGE_REPORT_OUTBOX_*`: the outbox on disk that usage reports
+/// are kept in until the billing API has accepted them (`usage_outbox.rs`).
+/// `None` without `VLLM_PROXY_USAGE_REPORT_OUTBOX_PATH`, and then nothing of
+/// it exists.
+///
+/// Nothing here fails startup, unlike the settings below: the outbox must
+/// never be why a process does not serve. A size that cannot be read is
+/// replaced by its default and said so; a path that cannot be used is found
+/// out when the file is opened, where it costs the durability of the reports
+/// and nothing else.
+fn usage_report_outbox() -> Option<crate::usage_outbox::UsageOutboxConfig> {
+    use crate::usage_outbox::UsageOutboxConfig;
+
+    const PATH: &str = "VLLM_PROXY_USAGE_REPORT_OUTBOX_PATH";
+    const MAX_PENDING: &str = "VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_PENDING";
+    const MAX_REJECTED: &str = "VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_REJECTED";
+    /// A row is about half a kilobyte, so this bounds the file to a few
+    /// gigabytes.
+    const MAX_PENDING_LIMIT: usize = 10_000_000;
+    const MAX_REJECTED_LIMIT: usize = 1_000_000;
+
+    let path = env::var(PATH).ok().filter(|path| !path.trim().is_empty())?;
+    let size = |name: &str, default: usize, limit: usize| match env_parse(name, default) {
+        Ok(size) if (1..=limit).contains(&size) => size,
+        other => {
+            tracing::error!(
+                variable = name,
+                default,
+                problem = %other.map_or_else(
+                    |error| error.to_string(),
+                    |size| format!("{size} is not between 1 and {limit}"),
+                ),
+                "Invalid usage report outbox setting: using its default"
+            );
+            default
+        }
+    };
+    let mut outbox = UsageOutboxConfig::at(path.trim());
+    outbox.max_pending = size(
+        MAX_PENDING,
+        UsageOutboxConfig::DEFAULT_MAX_PENDING,
+        MAX_PENDING_LIMIT,
+    );
+    outbox.max_rejected = size(
+        MAX_REJECTED,
+        UsageOutboxConfig::DEFAULT_MAX_REJECTED,
+        MAX_REJECTED_LIMIT,
+    );
+    Some(outbox)
+}
+
 /// `VLLM_PROXY_USAGE_REPORT_*`: how usage reports are delivered to the
 /// billing API (`usage_report.rs`). With none of them set delivery is what it
 /// has always been: one attempt, 5 seconds, no cap on reports in flight,
 /// nothing awaited at shutdown. A value that cannot work fails startup: these
 /// settings decide whether usage is billed, so a typo must not be guessed at.
-fn usage_report_policy() -> anyhow::Result<crate::usage_report::UsageReportPolicy> {
+///
+/// `outbox`: the process keeps its reports in an outbox on disk
+/// (`usage_report_outbox`). What is not set then starts from
+/// `UsageReportPolicy::durable` instead:
+///
+/// - `MAX_ATTEMPTS` not set: a report is sent until it is accepted. Set, it
+///   is the cap it always was, and a report that uses it up is kept in the
+///   outbox's `rejected` table.
+/// - `MAX_IN_FLIGHT` not set, or 0: 8. An outbox is always delivered under a
+///   cap, so "no cap" is not offered, and the rule that a longer timeout or
+///   retries need one is met without it.
+/// - `DEADLINE_SECS` not set: none, as always. Set, it is the maximum age of
+///   a report, whichever process kept it.
+/// - `INITIAL_BACKOFF_MS` 0: the default. A report that is sent again needs
+///   a backoff, and the outbox must not be why startup fails.
+fn usage_report_policy(outbox: bool) -> anyhow::Result<crate::usage_report::UsageReportPolicy> {
+    use crate::usage_report::UsageReportPolicy;
     use std::time::Duration;
 
     const TIMEOUT: &str = "VLLM_PROXY_USAGE_REPORT_TIMEOUT_SECS";
@@ -127,21 +194,37 @@ fn usage_report_policy() -> anyhow::Result<crate::usage_report::UsageReportPolic
     const MAX_QUEUED_LIMIT: usize = 100_000;
     const SHUTDOWN_DRAIN_LIMIT_SECS: u64 = 600;
 
-    let default = crate::usage_report::UsageReportPolicy::default();
+    let default = if outbox {
+        UsageReportPolicy::durable()
+    } else {
+        UsageReportPolicy::default()
+    };
     let default_timeout_secs = default.attempt_timeout.as_secs();
+    let default_initial_backoff_ms = default.initial_backoff.as_millis() as u64;
     let timeout_secs: u64 = env_parse(TIMEOUT, default_timeout_secs)?;
     let max_attempts: u32 = env_parse(MAX_ATTEMPTS, default.max_attempts)?;
-    let initial_backoff_ms: u64 =
-        env_parse(INITIAL_BACKOFF, default.initial_backoff.as_millis() as u64)?;
+    let mut initial_backoff_ms: u64 = env_parse(INITIAL_BACKOFF, default_initial_backoff_ms)?;
     let deadline_secs: u64 = env_parse(DEADLINE, 0)?;
-    let max_in_flight: usize = env_parse(MAX_IN_FLIGHT, default.max_in_flight)?;
+    let mut max_in_flight: usize = env_parse(MAX_IN_FLIGHT, default.max_in_flight)?;
     let max_queued: usize = env_parse(MAX_QUEUED, default.max_queued)?;
     let shutdown_drain_secs: u64 = env_parse(SHUTDOWN_DRAIN, 0)?;
+    // Sent until accepted: only ever the default of a process with an outbox.
+    let until_accepted = outbox && max_attempts == UsageReportPolicy::UNTIL_ACCEPTED;
+    if outbox && max_in_flight == 0 {
+        max_in_flight = UsageReportPolicy::OUTBOX_MAX_IN_FLIGHT;
+    }
+    if outbox && initial_backoff_ms == 0 {
+        tracing::warn!(
+            default_ms = default_initial_backoff_ms,
+            "{INITIAL_BACKOFF} is 0, which a usage report outbox cannot work with: using the default"
+        );
+        initial_backoff_ms = default_initial_backoff_ms;
+    }
 
     if !(1..=TIMEOUT_LIMIT_SECS).contains(&timeout_secs) {
         anyhow::bail!("{TIMEOUT} must be between 1 and {TIMEOUT_LIMIT_SECS}");
     }
-    if !(1..=MAX_ATTEMPTS_LIMIT).contains(&max_attempts) {
+    if !until_accepted && !(1..=MAX_ATTEMPTS_LIMIT).contains(&max_attempts) {
         anyhow::bail!("{MAX_ATTEMPTS} must be between 1 and {MAX_ATTEMPTS_LIMIT}");
     }
     if initial_backoff_ms > INITIAL_BACKOFF_LIMIT_MS {
@@ -173,7 +256,7 @@ fn usage_report_policy() -> anyhow::Result<crate::usage_report::UsageReportPolic
     if shutdown_drain_secs > SHUTDOWN_DRAIN_LIMIT_SECS {
         anyhow::bail!("{SHUTDOWN_DRAIN} must be at most {SHUTDOWN_DRAIN_LIMIT_SECS}");
     }
-    Ok(crate::usage_report::UsageReportPolicy {
+    Ok(UsageReportPolicy {
         attempt_timeout: Duration::from_secs(timeout_secs),
         max_attempts,
         initial_backoff: Duration::from_millis(initial_backoff_ms),
@@ -482,6 +565,12 @@ pub struct Config {
     /// a bounded queue behind it, and a drain at shutdown. The default is one
     /// attempt with a 5 second timeout and none of the rest.
     pub usage_report: crate::usage_report::UsageReportPolicy,
+    /// The outbox on disk that usage reports are kept in until cloud-api has
+    /// accepted them (`VLLM_PROXY_USAGE_REPORT_OUTBOX_PATH`, see
+    /// `usage_outbox.rs`). `None` = reports are delivered from memory, as
+    /// they always were. With an outbox `usage_report` starts from
+    /// `UsageReportPolicy::durable` (see `usage_report_policy`).
+    pub usage_report_outbox: Option<crate::usage_outbox::UsageOutboxConfig>,
 
     // Compose-manager attestation (deployment actions attestation)
     pub compose_manager_url: Option<String>,
@@ -1161,6 +1250,7 @@ impl Config {
                     None
                 }
             };
+        let usage_report_outbox = usage_report_outbox();
         let mut config = Config {
             model_list: None,
             model_name,
@@ -1185,7 +1275,8 @@ impl Config {
             cloud_api_usage_token: env::var("CLOUD_API_USAGE_TOKEN")
                 .ok()
                 .filter(|s| !s.is_empty()),
-            usage_report: usage_report_policy()?,
+            usage_report: usage_report_policy(usage_report_outbox.is_some())?,
+            usage_report_outbox,
             compose_manager_url,
             gpu_evidence_delegate_url: env::var("GPU_EVIDENCE_DELEGATE_URL")
                 .ok()
@@ -1852,6 +1943,140 @@ mod tests {
             assert!(config.model_list.is_some());
             assert_eq!(config.usage_report.max_in_flight, 8);
             assert_eq!(config.usage_report.max_attempts, 5);
+        });
+    }
+
+    #[test]
+    fn test_usage_report_outbox_is_opt_in_and_never_fails_startup() {
+        use crate::usage_outbox::UsageOutboxConfig;
+        use crate::usage_report::UsageReportPolicy;
+        use std::time::Duration;
+        const PATH: &str = "VLLM_PROXY_USAGE_REPORT_OUTBOX_PATH";
+        const MAX_PENDING: &str = "VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_PENDING";
+        const MAX_REJECTED: &str = "VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_REJECTED";
+        const TIMEOUT: &str = "VLLM_PROXY_USAGE_REPORT_TIMEOUT_SECS";
+        const MAX_ATTEMPTS: &str = "VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS";
+        const INITIAL_BACKOFF: &str = "VLLM_PROXY_USAGE_REPORT_INITIAL_BACKOFF_MS";
+        const DEADLINE: &str = "VLLM_PROXY_USAGE_REPORT_DEADLINE_SECS";
+        const MAX_IN_FLIGHT: &str = "VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT";
+        // Set here and there below; none may be left behind for another test.
+        let sizes = [(MAX_PENDING, ""), (MAX_REJECTED, "")];
+
+        // Without the path there is no outbox, whatever else is set, and the
+        // policy is the one a process has always had.
+        with_clean_env(&[("MODEL_NAME", "m"), ("TOKEN", "t")], &sizes, || {
+            for path in [None, Some(""), Some("  ")] {
+                match path {
+                    Some(path) => env::set_var(PATH, path),
+                    None => env::remove_var(PATH),
+                }
+                env::set_var(MAX_PENDING, "5000");
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.usage_report_outbox, None, "{path:?}");
+                assert_eq!(config.usage_report, UsageReportPolicy::default());
+            }
+            env::remove_var(PATH);
+            gateway_env_cleanup();
+        });
+
+        let path = [(PATH, " /var/lib/gateway/usage-outbox.db ")];
+        let vars: Vec<_> = path.iter().chain(&sizes).copied().collect();
+        with_clean_env(&[("MODEL_NAME", "m"), ("TOKEN", "t")], &vars, || {
+            // The path alone: every default, and a report is sent until it is
+            // accepted, 8 at a time.
+            let config = Config::from_env().unwrap();
+            assert_eq!(
+                config.usage_report_outbox,
+                Some(UsageOutboxConfig::at("/var/lib/gateway/usage-outbox.db"))
+            );
+            let outbox = config.usage_report_outbox.unwrap();
+            assert_eq!(
+                (outbox.max_pending, outbox.max_rejected),
+                (1_000_000, 10_000)
+            );
+            assert_eq!(config.usage_report, UsageReportPolicy::durable());
+            assert_eq!(config.usage_report.attempt_cap(), None);
+            assert_eq!(config.usage_report.max_in_flight, 8);
+            assert_eq!(config.usage_report.deadline, None);
+
+            // The sizes, and what is not a size: the default is used and the
+            // process starts.
+            env::set_var(MAX_PENDING, "250000");
+            env::set_var(MAX_REJECTED, "500");
+            let outbox = Config::from_env().unwrap().usage_report_outbox.unwrap();
+            assert_eq!((outbox.max_pending, outbox.max_rejected), (250_000, 500));
+            for bad in ["0", "-1", "many", "10000001"] {
+                env::set_var(MAX_PENDING, bad);
+                let outbox = Config::from_env().unwrap().usage_report_outbox.unwrap();
+                assert_eq!(outbox.max_pending, 1_000_000, "{bad}");
+            }
+            for bad in ["0", "1.5", "1000001"] {
+                env::set_var(MAX_REJECTED, bad);
+                let outbox = Config::from_env().unwrap().usage_report_outbox.unwrap();
+                assert_eq!(outbox.max_rejected, 10_000, "{bad}");
+            }
+
+            // An explicit attempt cap is the cap it always was (a report that
+            // uses it up goes to `rejected`), and so is a deadline.
+            env::set_var(MAX_ATTEMPTS, "5");
+            env::set_var(DEADLINE, "3600");
+            let policy = Config::from_env().unwrap().usage_report;
+            assert_eq!(policy.attempt_cap(), Some(5));
+            assert_eq!(policy.deadline, Some(Duration::from_secs(3600)));
+            env::set_var(MAX_ATTEMPTS, "1");
+            assert_eq!(
+                Config::from_env().unwrap().usage_report.attempt_cap(),
+                Some(1)
+            );
+            env::set_var(MAX_ATTEMPTS, "");
+            env::set_var(DEADLINE, "");
+
+            // There is always a cap: 0 means 8 here, not "no cap", so a
+            // longer timeout needs nothing else set.
+            env::set_var(MAX_IN_FLIGHT, "0");
+            env::set_var(TIMEOUT, "30");
+            let policy = Config::from_env().unwrap().usage_report;
+            assert_eq!(policy.max_in_flight, 8);
+            assert_eq!(policy.attempt_timeout, Duration::from_secs(30));
+            env::set_var(MAX_IN_FLIGHT, "3");
+            assert_eq!(Config::from_env().unwrap().usage_report.max_in_flight, 3);
+
+            // A backoff of 0 cannot be: the default, and the process starts.
+            env::set_var(INITIAL_BACKOFF, "0");
+            assert_eq!(
+                Config::from_env().unwrap().usage_report.initial_backoff,
+                Duration::from_millis(500)
+            );
+            env::set_var(INITIAL_BACKOFF, "5000");
+            assert_eq!(
+                Config::from_env().unwrap().usage_report.initial_backoff,
+                Duration::from_secs(5)
+            );
+
+            // What was a startup failure before the outbox still is one: a
+            // delivery setting that cannot work, outbox or not.
+            for (name, bad, restored) in [
+                (TIMEOUT, "0", "30"),
+                (MAX_ATTEMPTS, "11", ""),
+                (MAX_ATTEMPTS, "0", ""),
+                (MAX_IN_FLIGHT, "1001", "3"),
+                (DEADLINE, "30", ""),
+            ] {
+                env::set_var(name, bad);
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains(name), "{name}={bad}: {err}");
+                env::set_var(name, restored);
+            }
+            assert!(Config::from_env().is_ok());
+            gateway_env_cleanup();
+        });
+
+        // One delivery per process: a model list takes the outbox too.
+        with_model_list(&two_models(), &vars, || {
+            let config = Config::from_env().unwrap();
+            assert!(config.model_list.is_some());
+            assert!(config.usage_report_outbox.is_some());
+            assert_eq!(config.usage_report, UsageReportPolicy::durable());
         });
     }
 

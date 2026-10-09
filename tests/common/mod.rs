@@ -76,6 +76,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         cloud_api_auth_timeout_secs: 5,
         cloud_api_usage_token: Some("test-usage-token".to_string()),
         usage_report: Default::default(),
+        usage_report_outbox: None,
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,

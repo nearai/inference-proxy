@@ -138,7 +138,7 @@ pub struct UsageOutboxConfig {
     /// it the report that has waited longest is dropped and counted.
     pub max_pending: usize,
     /// Rows kept in `rejected` (`VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_REJECTED`,
-    /// default 10000). Past it the oldest is removed and counted.
+    /// default 100000). Past it the oldest is removed and counted.
     pub max_rejected: usize,
     /// How long the writer gathers reports before it commits them: a report
     /// handed over less than this before the process is killed may be lost.
@@ -162,7 +162,7 @@ pub struct UsageOutboxConfig {
 
 impl UsageOutboxConfig {
     pub const DEFAULT_MAX_PENDING: usize = 1_000_000;
-    pub const DEFAULT_MAX_REJECTED: usize = 10_000;
+    pub const DEFAULT_MAX_REJECTED: usize = 100_000;
 
     /// The outbox at `path` with every default.
     pub fn at(path: impl Into<PathBuf>) -> Self {

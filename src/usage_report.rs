@@ -785,7 +785,9 @@ impl UsageReportDelivery {
         let attempts = row.attempts.saturating_add(1);
         let status = attempt.answer.as_ref().ok().map(|status| status.as_u16());
 
-        let Some(reason) = retry_reason(attempt.outcome, &attempt.answer) else {
+        let reason = retry_reason(attempt.outcome, &attempt.answer)
+            .or_else(|| caller_refused(&attempt.answer));
+        let Some(reason) = reason else {
             // An answer about this report: the billing API is there.
             if let Some(kept) = &mut self.state().outbox {
                 kept.failing_streak = 0;
@@ -1800,13 +1802,34 @@ type StoreEvent = usage_outbox::Event<Job>;
 /// The failures an attempt may be made again after: the `reason` of
 /// `inference_proxy_usage_report_retries_total`, which is also what a row of
 /// the outbox keeps as its `last_outcome`, and the outcome each stands for.
-const PASSING_FAILURES: [(&str, UsageReportOutcome); 5] = [
+const PASSING_FAILURES: [(&str, UsageReportOutcome); 7] = [
     ("timeout", UsageReportOutcome::Timeout),
     ("connect_error", UsageReportOutcome::ConnectError),
     ("transport_error", UsageReportOutcome::TransportError),
     ("http_5xx", UsageReportOutcome::Http5xx),
     ("http_429", UsageReportOutcome::Http4xx),
+    // With an outbox only (`caller_refused`).
+    ("http_401", UsageReportOutcome::Http4xx),
+    ("http_403", UsageReportOutcome::Http4xx),
 ];
+
+/// With an outbox, two more answers leave a report where it is: a 401 and a
+/// 403 say that the billing API does not accept this process (a usage token
+/// that is wrong, or was rotated under a running process), not that anything
+/// is wrong with the report. Every report gets that answer until the token
+/// is put right, so ending them would move the whole traffic of that time to
+/// `rejected` and, past its bound, lose it. They wait instead, and are sent
+/// with the right token.
+///
+/// Without an outbox both are final, as they always were (`retry_reason`):
+/// nothing in memory outlives the restart that puts a token right.
+fn caller_refused(answer: &Result<reqwest::StatusCode, reqwest::Error>) -> Option<&'static str> {
+    match answer {
+        Ok(reqwest::StatusCode::UNAUTHORIZED) => Some("http_401"),
+        Ok(reqwest::StatusCode::FORBIDDEN) => Some("http_403"),
+        _ => None,
+    }
+}
 
 /// The entry of `PASSING_FAILURES` a row's `last_outcome` names.
 fn passing_failure(label: &str) -> Option<(&'static str, UsageReportOutcome)> {
@@ -1842,7 +1865,8 @@ fn ingress_route_from(label: &str) -> IngressRouteKind {
 /// Why an attempt with this result may be made again, `None` when the result
 /// is final: a 4xx other than 429 means the billing API refused the report
 /// itself, and sending the same bytes again would get the same answer. Every
-/// reason given here is in `PASSING_FAILURES`.
+/// reason given here is in `PASSING_FAILURES`. (A report of the outbox is
+/// also sent again after a 401 or a 403: `caller_refused`.)
 fn retry_reason(
     outcome: UsageReportOutcome,
     answer: &Result<reqwest::StatusCode, reqwest::Error>,

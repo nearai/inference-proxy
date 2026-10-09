@@ -118,7 +118,7 @@ to the current in-CVM behavior.
 | `VLLM_PROXY_USAGE_REPORT_TIMEOUT_SECS` / `_MAX_ATTEMPTS` / `_INITIAL_BACKOFF_MS` / `_DEADLINE_SECS` | `30` / `5` / `5000` / `300` | How long one attempt at a usage report may take, how many attempts a report gets, the backoff before the first retry, and how long after its request a report may still be sent (see [Usage report delivery](#usage-report-delivery)). Unset = one attempt of 5 s and no deadline, as in a CVM. |
 | `VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT` | `8` | Usage reports in flight at once; the others wait in a bounded in-memory queue (`_MAX_QUEUED`, default `10000`). Unset = no cap. Required for a timeout above 5 s or more than one attempt. |
 | `VLLM_PROXY_USAGE_REPORT_SHUTDOWN_DRAIN_SECS` | below the service's stop timeout | On SIGTERM, once every open request has ended, how long to wait for usage reports still queued or in flight before exiting. Unset = no wait. |
-| `VLLM_PROXY_USAGE_REPORT_OUTBOX_PATH` | a file on a volume that outlives the process | Keep every usage report in this SQLite file from the completion of its request until cloud-api has accepted it, across restarts and cloud-api outages (see [The outbox on disk](#the-outbox-on-disk)). `_OUTBOX_MAX_PENDING` (default `1000000`) and `_OUTBOX_MAX_REJECTED` (default `10000`) bound it. Unset = no file, reports live in memory only. |
+| `VLLM_PROXY_USAGE_REPORT_OUTBOX_PATH` | a file on a volume that outlives the process | Keep every usage report in this SQLite file from the completion of its request until cloud-api has accepted it, across restarts and cloud-api outages (see [The outbox on disk](#the-outbox-on-disk)). `_OUTBOX_MAX_PENDING` (default `1000000`) and `_OUTBOX_MAX_REJECTED` (default `100000`) bound it. Unset = no file, reports live in memory only. |
 | `VLLM_PROXY_REASONING_OFF_EFFORT` | `low` | What "no reasoning" means for GLM-5.3 Flash (see below). |
 | `VLLM_PROXY_SSE_KEEPALIVE_SECS` | `15` | `: keep-alive` SSE comments while the upstream is silent (long prefill/queueing), so intermediaries with read timeouts do not cancel. Off in CVMs: comments are not part of the signed bytes. |
 | `VLLM_PROXY_MAP_QUEUE_FULL_TO_429` | `1` | The engine's admission rejection (queue full, or a queued request displaced by a higher-priority one) becomes 429 with `Retry-After: 2` and type `overloaded`, the same shape as the gateway's own refusals: back-pressure, not an outage. Off in CVMs: cloud-api's peer fallback keys on the 503. |
@@ -682,7 +682,7 @@ no file, no extra series, no extra log line and no change to any request.
 | --- | --- | --- |
 | `VLLM_PROXY_USAGE_REPORT_OUTBOX_PATH` | unset (no outbox) | The SQLite file. It is created, with mode `0600`, when it is not there. Its directory must exist, be writable by the proxy and outlive the process and its container (a mounted volume). SQLite keeps two more files beside it, `-wal` and `-shm`, with the same mode. |
 | `VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_PENDING` | `1000000` | Reports the file may hold while they wait to be accepted (1 to 10000000; a row is about half a kilobyte). Past it the report that has waited longest is dropped, logged with its ids and counted as `queue_full`. |
-| `VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_REJECTED` | `10000` | Rows kept in the `rejected` table (1 to 1000000). Past it the oldest is removed and counted. |
+| `VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_REJECTED` | `100000` | Rows kept in the `rejected` table (1 to 1000000, about half a kilobyte each). Past it the oldest is removed and counted. |
 
 **What the other settings mean with an outbox.** The settings of the table
 further up still apply, and what is not set starts from different values:
@@ -749,7 +749,7 @@ not taken.
 | `request_id` | The request id, sent again as `x-request-id` and logged. |
 | `model_label`, `auth_path`, `ingress_route` | The labels of the report's metric series and log lines. |
 | `completed_at_ms` | When its request completed (Unix time, ms). |
-| `attempts`, `last_outcome` | Attempts made so far, by any process, and why the last one failed (`timeout`, `connect_error`, `transport_error`, `http_5xx`, `http_429`). |
+| `attempts`, `last_outcome` | Attempts made so far, by any process, and why the last one failed (`timeout`, `connect_error`, `transport_error`, `http_5xx`, `http_429`, `http_401`, `http_403`). |
 | `next_attempt_at_ms` | When it is due (again). |
 | `lease_until_ms`, `lease_owner` | While a process is sending it: until when it is that process's, and which process. |
 
@@ -766,10 +766,10 @@ holding it and a time, two attempt timeouts and 30 s ahead, until which nobody
 else takes it. Then, on the answer:
 
 - accepted: the row is deleted;
-- a failure that can pass (timeout, connection or transport error, 5xx, 429):
-  `attempts` goes up, the report is due again after the backoff
-  (`INITIAL_BACKOFF_MS × 2^(attempts-1)`, at most 30 s, half of it random) and
-  its lease is given back;
+- a failure that can pass (timeout, connection or transport error, 5xx, 429,
+  and here also 401 and 403, see below): `attempts` goes up, the report is
+  due again after the backoff (`INITIAL_BACKOFF_MS × 2^(attempts-1)`, at most
+  30 s, half of it random) and its lease is given back;
 - any other answer: the row moves to `rejected` (next paragraph) and the place
   goes on with the next report. A report cloud-api will never take holds
   nothing up.
@@ -783,10 +783,18 @@ attempts every half minute, not the backlog in a loop, and each of them is on
 a different report, so an outage uses up nobody's attempts. When it is back
 the places resume as their pauses end, within 30 s.
 
-**Reports cloud-api refuses.** A 4xx other than 429, or any other answer that
-is neither a success nor a failure that can pass, means cloud-api refused the
-report itself (an unknown model, a discount above its maximum, a body it
-cannot read). The row moves to the `rejected` table with `reason`
+**Reports cloud-api refuses.** A 401 or a 403 is not a refusal of a report:
+it says that cloud-api does not accept this gateway (a usage token that is
+wrong, or was rotated under a running process), and every report gets it
+until that is put right. With an outbox those reports wait like any other
+that failed, counted as retries with reason `http_401` or `http_403`, and
+are sent once the token is right; nothing has to be put back by hand. (From
+memory both still end a report, as they always did.)
+
+Any other 4xx except 429, and any other answer that is neither a success nor
+a failure that can pass, means cloud-api refused the report itself (an
+unknown model, a discount above its maximum, a body it cannot read). The row
+moves to the `rejected` table with `reason`
 (`rejected`, or `attempts_exhausted` under an explicit `MAX_ATTEMPTS`), the
 HTTP `status`, the number of `attempts`, the time and everything the row
 held. It is counted once, as the outcome it ended with and as dropped, and it

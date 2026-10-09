@@ -1992,7 +1992,7 @@ mod tests {
             let outbox = config.usage_report_outbox.unwrap();
             assert_eq!(
                 (outbox.max_pending, outbox.max_rejected),
-                (1_000_000, 10_000)
+                (1_000_000, 100_000)
             );
             assert_eq!(config.usage_report, UsageReportPolicy::durable());
             assert_eq!(config.usage_report.attempt_cap(), None);
@@ -2013,7 +2013,7 @@ mod tests {
             for bad in ["0", "1.5", "1000001"] {
                 env::set_var(MAX_REJECTED, bad);
                 let outbox = Config::from_env().unwrap().usage_report_outbox.unwrap();
-                assert_eq!(outbox.max_rejected, 10_000, "{bad}");
+                assert_eq!(outbox.max_rejected, 100_000, "{bad}");
             }
 
             // An explicit attempt cap is the cap it always was (a report that

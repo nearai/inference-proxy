@@ -835,6 +835,70 @@ async fn a_report_refused_for_good_moves_to_rejected_is_counted_once_and_holds_n
 }
 
 #[tokio::test]
+async fn a_usage_token_the_billing_api_does_not_accept_keeps_every_report_until_it_does() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let (_dir, path) = file();
+    // The token was rotated on the other side: every report gets a 401,
+    // which says nothing about the report.
+    let billing = Billing::start(401).await;
+    let delivery = billing.delivery(durable(|policy| policy.max_in_flight = 2), outbox(&path));
+    for id in ids("report", 12) {
+        billing.report(&delivery, &id, None);
+    }
+    eventually("every report was refused at least once", || {
+        read::<i64>(&path, "SELECT COUNT(*) FROM pending WHERE attempts > 0") == 12
+    })
+    .await;
+    // None of them is given up on: they wait.
+    assert_eq!(read::<i64>(&path, "SELECT COUNT(*) FROM rejected"), 0);
+    assert_eq!(pending_rows(&path), 12);
+    assert_eq!(value(&recorder, REPORTS, &[]), 0.0);
+    assert_eq!(value(&recorder, DROPPED, &[]), 0.0);
+    assert!(value(&recorder, ATTEMPTS, &["outcome=\"http_4xx\""]) >= 12.0);
+    assert_eq!(
+        read::<String>(
+            &path,
+            "SELECT group_concat(DISTINCT last_outcome) FROM pending"
+        ),
+        "http_401"
+    );
+    // A gateway in front that forbids the caller is the same case.
+    billing.answer(403);
+    eventually("attempts that were forbidden", || {
+        value(&recorder, RETRIES, &["reason=\"http_401\""]) >= 1.0
+            && read::<i64>(
+                &path,
+                "SELECT COUNT(*) FROM pending WHERE last_outcome = 'http_403'",
+            ) >= 1
+    })
+    .await;
+    assert_eq!(read::<i64>(&path, "SELECT COUNT(*) FROM rejected"), 0);
+
+    // The token is put right. Nothing has to be put back by hand.
+    billing.answer(200);
+    delivered(&delivery).await;
+    assert_eq!(billing.written_sorted(), ids("report", 12));
+    assert_eq!(value(&recorder, REPORTS, &["outcome=\"accepted\""]), 12.0);
+    assert_eq!(value(&recorder, DROPPED, &[]), 0.0);
+
+    // From memory, a 401 ends a report as it always has: nothing there
+    // outlives the restart that puts a token right.
+    billing.answer(401);
+    let before = billing.received();
+    let in_memory = UsageReportDelivery::new(UsageReportPolicy {
+        max_attempts: 5,
+        initial_backoff: Duration::from_millis(5),
+        max_in_flight: 2,
+        ..UsageReportPolicy::default()
+    });
+    billing.report(&in_memory, "in-memory", None);
+    delivered(&in_memory).await;
+    assert_eq!(billing.received(), before + 1);
+    assert_eq!(value(&recorder, DROPPED, &["reason=\"rejected\""]), 1.0);
+}
+
+#[tokio::test]
 async fn an_explicit_attempt_cap_ends_in_rejected_and_the_table_keeps_the_newest() {
     let recorder = PrometheusBuilder::new().build_recorder();
     let _metrics = metrics::set_default_local_recorder(&recorder);
@@ -1486,6 +1550,13 @@ fn the_labels_a_row_is_written_with_are_read_back_as_they_were() {
         assert_eq!(passing_failure(reason), Some((reason, outcome)));
     }
     assert_eq!(passing_failure("http_4xx"), None);
+    // The two an outbox adds, and nothing else of the 4xx.
+    let answer = |status: u16| Ok(reqwest::StatusCode::from_u16(status).unwrap());
+    assert_eq!(caller_refused(&answer(401)), Some("http_401"));
+    assert_eq!(caller_refused(&answer(403)), Some("http_403"));
+    for status in [200, 400, 402, 404, 409, 422, 429, 500, 503] {
+        assert_eq!(caller_refused(&answer(status)), None, "{status}");
+    }
 }
 
 // ---------------------------------------------------------------------------

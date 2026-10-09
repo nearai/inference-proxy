@@ -645,10 +645,11 @@ fn a_process_that_dies_leaves_its_reports_to_the_next_once_its_leases_run_out() 
     // Whatever the first process sends is never answered in its lifetime.
     billing.take(Duration::from_secs(120));
 
-    // Two places, so four reports are leased: two being sent, two next.
+    // Two places, so four reports are leased: two being sent, two next. A
+    // lease lasts two attempt timeouts and the margin, 4.4 s here.
     let policy = || {
         durable(|policy| {
-            policy.attempt_timeout = Duration::from_millis(600);
+            policy.attempt_timeout = Duration::from_secs(2);
             policy.max_in_flight = 2;
         })
     };
@@ -665,21 +666,24 @@ fn a_process_that_dies_leaves_its_reports_to_the_next_once_its_leases_run_out() 
         eventually("its attempts are in flight", || billing.received() == 2).await;
         eventually("all of them are written", || pending_rows(&path) == 10).await;
     });
-    const LEASED: &str = "SELECT COUNT(*) FROM pending WHERE lease_owner IS NOT NULL";
+    // What the process that is about to die holds, by its name in the file.
+    let dead = first.outbox.as_ref().unwrap().store.owner().to_string();
+    let its_leases = format!("SELECT COUNT(*) FROM pending WHERE lease_owner = '{dead}'");
     dying.block_on(eventually("four reports are leased", || {
-        read::<i64>(&path, LEASED) == 4
+        read::<i64>(&path, &its_leases) == 4
     }));
     // The first of them is anybody's at this time, and not before.
     let free_at_ms: i64 = read(
         &path,
-        "SELECT MIN(lease_until_ms) FROM pending WHERE lease_owner IS NOT NULL",
+        &format!("SELECT MIN(lease_until_ms) FROM pending WHERE lease_owner = '{dead}'"),
     );
+    assert_eq!(billing.received(), 2, "none of its attempts had ended");
     dying.shutdown_background();
     drop(first);
 
     // The next process sends at once what nobody holds, and the rest when
-    // the dead holder's leases have run out: 2 × 600 ms and the margin after
-    // it took them.
+    // the dead holder's leases have run out: two attempt timeouts and the
+    // margin after it took them.
     billing.take(Duration::ZERO);
     let second = surviving.block_on(async { billing.delivery(policy(), outbox(&path)) });
     let first_orphan_at_ms = surviving.block_on(async {
@@ -687,9 +691,11 @@ fn a_process_that_dies_leaves_its_reports_to_the_next_once_its_leases_run_out() 
             billing.written().len() >= 6
         })
         .await;
+        // Read first, then the clock: if the leases had not run out after
+        // these were read, they had not when they were read.
+        let (written, still_leased) = (billing.written().len(), read::<i64>(&path, &its_leases));
         if usage_outbox::now_ms() < free_at_ms {
-            assert_eq!(billing.written().len(), 6);
-            assert_eq!(read::<i64>(&path, LEASED), 4);
+            assert_eq!((written, still_leased), (6, 4));
         }
         eventually("a leased report is delivered", || {
             billing.written().len() > 6

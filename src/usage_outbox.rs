@@ -599,6 +599,11 @@ struct Writer<J> {
     /// here keeps the inbox lock, which a request may be waiting for, to a
     /// swap of two pointers.
     backlog: VecDeque<J>,
+    /// The emptied buffer of the round before, with room for two
+    /// transactions' worth of reports, handed to the inbox in exchange for
+    /// the one it filled: handing a report over then finds room, and the
+    /// growing is done on this thread.
+    spare: Vec<J>,
     /// Outcomes a failed transaction did not write. They are written by the
     /// next one that succeeds; until then their reports stay leased, so at
     /// worst they are sent once more when the lease runs out. Never more
@@ -619,6 +624,7 @@ impl<J: Persist> Writer<J> {
             shared,
             conn: None,
             backlog: VecDeque::new(),
+            spare: Vec::new(),
             unwritten: Vec::new(),
             retry_at: Instant::now(),
             rejected: None,
@@ -686,7 +692,8 @@ impl<J: Persist> Writer<J> {
                     }
                 }
             }
-            self.backlog = std::mem::take(&mut inbox.reports).into();
+            let spare = std::mem::take(&mut self.spare);
+            self.backlog = std::mem::replace(&mut inbox.reports, spare).into();
             inbox.first_report_at = None;
         } else if inbox.stop.is_some() {
             self.backlog.extend(std::mem::take(&mut inbox.reports));
@@ -706,8 +713,19 @@ impl<J: Persist> Writer<J> {
             inbox.stop.take(),
         );
         drop(inbox);
+        let reports = self.backlog.drain(..take).collect();
+        if self.backlog.is_empty() {
+            // Its buffer is the next one the inbox gets, unless a burst left
+            // it far larger than that takes.
+            let mut spare: Vec<J> = std::mem::take(&mut self.backlog).into();
+            if spare.capacity() > 8 * MAX_BATCH {
+                spare = Vec::new();
+            }
+            spare.reserve(2 * MAX_BATCH);
+            self.spare = spare;
+        }
         Work {
-            reports: self.backlog.drain(..take).collect(),
+            reports,
             settles,
             claim,
             stop,

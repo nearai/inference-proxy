@@ -1599,6 +1599,10 @@ async fn throughput_of_the_outbox() {
     delivered(&delivery).await;
     let through = started_at.elapsed();
 
+    // Where in the burst the slowest ones were.
+    let mut slowest: Vec<(Duration, usize)> = took.iter().copied().zip(0..).collect();
+    slowest.sort_by(|a, b| b.cmp(a));
+    println!("slowest (time, position): {:?}", &slowest[..5]);
     took.sort();
     let at = |quantile: f64| took[((REPORTS - 1) as f64 * quantile) as usize];
     println!(

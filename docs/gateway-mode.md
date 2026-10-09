@@ -914,7 +914,9 @@ And these, which exist only with an outbox:
 - `inference_proxy_usage_report_outbox_available`: 1 while the last thing
   tried on the file worked;
 - `inference_proxy_usage_report_outbox_pending`: rows of `pending`, waiting or
-  being sent (with `model` in list mode);
+  being sent (with `model` in list mode; the series of a model is there from
+  its first report on, and stays at 0 when the file holds none of its
+  reports);
 - `inference_proxy_usage_report_outbox_oldest_pending_age_seconds`: how long
   ago the request of the oldest of them completed, 0 when there is none;
 - `inference_proxy_usage_report_outbox_rejected`: rows of `rejected`;

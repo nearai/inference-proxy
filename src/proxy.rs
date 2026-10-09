@@ -922,7 +922,7 @@ pub(crate) fn spawn_usage_report(reporter: &UsageReporter, mut body: serde_json:
         body: payload,
         completed_at: std::time::Instant::now(),
         reporter: reporter.clone(),
-        stored: None,
+        completed_before: std::time::Duration::ZERO,
     });
 }
 

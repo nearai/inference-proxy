@@ -5,14 +5,16 @@
 //!
 //! Everything a single delivery does is tested next to it
 //! (`src/usage_report_outbox_tests.rs`). What is here needs real processes:
-//! one that is killed, one that is stopped in good order, two on one file.
+//! one that is killed, one that is stopped in good order, two on one file,
+//! one whose file is damaged under it and one whose volume fills up, which
+//! must both go on serving and never end with a signal.
 
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
@@ -25,6 +27,15 @@ const KEY: &str = "sk-live-customer";
 const USAGE_TOKEN: &str = "usage-secret";
 const OUTBOX_PATH: &str = "VLLM_PROXY_USAGE_REPORT_OUTBOX_PATH";
 const ACCEPTED: &str = "Direct-key usage report accepted by Cloud API";
+const ENABLED: &str = "Usage report outbox enabled: a report is kept on disk until the billing \
+                       API accepts it or refuses it for good";
+const CLOSED: &str =
+    "Usage report outbox closed for shutdown: what it holds is sent by the next process";
+const UNAVAILABLE: &str = "Usage report outbox unavailable: reports are held in memory, sent \
+                           from there, and written to the file when it is back";
+const AVAILABLE_AGAIN: &str = "Usage report outbox available again";
+/// The name of the thread that owns the outbox file.
+const WRITER_THREAD: &str = "usage-outbox";
 
 /// An engine that gives every completion an id of its own, as engines do.
 struct Engine(AtomicUsize);
@@ -145,8 +156,14 @@ async fn cloud_api(status: u16, delay_ms: u64) -> (MockServer, Intake) {
 struct Gateway {
     child: std::process::Child,
     base: String,
+    /// The client of its customers: one, as a customer has.
+    client: reqwest::Client,
     log: tempfile::NamedTempFile,
     _list: tempfile::NamedTempFile,
+    /// Its working directory, its home and where its temporary files go:
+    /// empty when it starts, so that whatever it creates without being told
+    /// where is found here.
+    home: tempfile::TempDir,
 }
 
 impl Drop for Gateway {
@@ -161,6 +178,18 @@ impl Gateway {
     /// with `cloud` as its cloud-api and `env` on top, and wait until it
     /// answers.
     async fn start(engine: &MockServer, cloud: &MockServer, env: &[(&str, &str)]) -> Gateway {
+        Self::start_in(engine, cloud, env, None).await
+    }
+
+    /// `start`, with the binary run by `sh -c "<setup> && exec <binary>"`
+    /// under `unshare` when `setup` is given: in mount and user namespaces of
+    /// its own, where `setup` can mount a small volume for it.
+    async fn start_in(
+        engine: &MockServer,
+        cloud: &MockServer,
+        env: &[(&str, &str)],
+        setup: Option<&str>,
+    ) -> Gateway {
         let list = json!({"models": [{"id": MODEL, "backend_urls": [engine.uri()]}]});
         let mut last_log = String::new();
         // The port is picked by binding and releasing it; if something else
@@ -173,8 +202,26 @@ impl Gateway {
             let mut list_file = tempfile::NamedTempFile::new().unwrap();
             list_file.write_all(list.to_string().as_bytes()).unwrap();
             let log = tempfile::NamedTempFile::new().unwrap();
-            let child = std::process::Command::new(env!("CARGO_BIN_EXE_vllm-proxy-rs"))
-                .env_clear()
+            let home = tempfile::tempdir().unwrap();
+            let binary = env!("CARGO_BIN_EXE_vllm-proxy-rs");
+            let mut command = match setup {
+                Some(setup) => {
+                    let mut command = std::process::Command::new("unshare");
+                    command.args(["-Urm", "sh", "-c"]);
+                    command.arg(format!("{setup} && exec {binary}"));
+                    command
+                }
+                None => std::process::Command::new(binary),
+            };
+            command.env_clear();
+            if setup.is_some() {
+                // For the commands of `setup`; the binary reads none of it.
+                command.env("PATH", std::env::var_os("PATH").unwrap_or_default());
+            }
+            let child = command
+                .current_dir(home.path())
+                .env("HOME", home.path())
+                .env("TMPDIR", home.path())
                 .envs([
                     ("TOKEN", "test-token"),
                     ("NON_TEE_DEPLOYMENT", "1"),
@@ -183,6 +230,9 @@ impl Gateway {
                     ("LOG_FORMAT", "json"),
                     ("LISTEN_ADDR", "127.0.0.1"),
                     ("CLOUD_API_AUTH_MAX_ATTEMPTS", "1"),
+                    // The tests are one client, and some ask a lot of it.
+                    ("RATE_LIMIT_PER_SECOND", "100000"),
+                    ("RATE_LIMIT_BURST_SIZE", "100000"),
                     ("VLLM_PROXY_IMAGE_VALIDATION_DISABLED", "1"),
                     ("CLOUD_API_USAGE_TOKEN", USAGE_TOKEN),
                 ])
@@ -201,9 +251,11 @@ impl Gateway {
                 .expect("the binary starts");
             let mut gateway = Gateway {
                 child,
+                client: reqwest::Client::new(),
                 base: format!("http://127.0.0.1:{port}"),
                 log,
                 _list: list_file,
+                home,
             };
             let client = reqwest::Client::new();
             for _ in 0..400 {
@@ -225,6 +277,19 @@ impl Gateway {
         std::fs::read_to_string(self.log.path()).unwrap()
     }
 
+    /// What the log says about the outbox itself, with the time of each line.
+    fn outbox_lines(&self) -> Vec<String> {
+        self.log()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|line| {
+                let message = line["fields"]["message"].as_str().unwrap_or_default();
+                message.starts_with("Usage report outbox") || message.starts_with("The billing API")
+            })
+            .map(|line| format!("{} {}", line["timestamp"], line["fields"]))
+            .collect()
+    }
+
     /// The `fields` of every JSON log line with this message.
     fn logged(&self, message: &str) -> Vec<Value> {
         self.log()
@@ -235,9 +300,50 @@ impl Gateway {
             .collect()
     }
 
+    /// The names of the threads of the process.
+    #[cfg(target_os = "linux")]
+    fn threads(&self) -> BTreeSet<String> {
+        std::fs::read_dir(format!("/proc/{}/task", self.child.id()))
+            .unwrap()
+            .filter_map(|task| std::fs::read_to_string(task.ok()?.path().join("comm")).ok())
+            .map(|name| name.trim().to_string())
+            .collect()
+    }
+
+    /// The files the process has open, and those it has mapped into its
+    /// memory, by path, as far as they could be a database or belong to one.
+    #[cfg(target_os = "linux")]
+    fn database_files(&self) -> (BTreeSet<String>, BTreeSet<String>) {
+        let pid = self.child.id();
+        let of_a_database = |path: &String| {
+            [".db", "-journal", "-wal", "-shm"]
+                .iter()
+                .any(|end| path.ends_with(end) || path.ends_with(&format!("{end} (deleted)")))
+        };
+        let open = std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .unwrap()
+            .filter_map(|fd| std::fs::read_link(fd.ok()?.path()).ok())
+            .map(|target| target.to_string_lossy().into_owned())
+            .filter(of_a_database)
+            .collect();
+        let mapped = std::fs::read_to_string(format!("/proc/{pid}/maps"))
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.split_once('/').map(|(_, path)| format!("/{path}")))
+            .filter(of_a_database)
+            .collect();
+        (open, mapped)
+    }
+
+    /// Whether the process is still running, and how it ended if not.
+    fn ended(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().unwrap()
+    }
+
     /// One customer request, answered whatever becomes of its report.
     async fn chat(&self) {
-        let response = reqwest::Client::new()
+        let response = self
+            .client
             .post(format!("{}{}", self.base, routes::ROUTE_CHAT_COMPLETIONS))
             .bearer_auth(KEY)
             .json(&json!({
@@ -260,6 +366,19 @@ impl Gateway {
             .unwrap()
     }
 
+    /// `/metrics`, once it says `done`, waited for at most 60 seconds.
+    async fn metrics_until(&self, what: &str, done: impl Fn(&str) -> bool) -> String {
+        let mut metrics = String::new();
+        for _ in 0..2_400 {
+            metrics = self.metrics().await;
+            if done(&metrics) {
+                return metrics;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("never happened: {what}: {metrics}\n{}", self.log());
+    }
+
     /// Send the process `signal` and wait for it to end.
     async fn stop(&mut self, signal: &str) -> std::process::ExitStatus {
         let sent = std::process::Command::new("kill")
@@ -278,11 +397,13 @@ impl Gateway {
 }
 
 /// One value read from the outbox; 0 or empty while the file or its tables
-/// are not there.
+/// are not there. The connection may write, as the `sqlite3` shell's does:
+/// the journal a killed process left in the middle of a transaction is
+/// played back by whoever opens the file next, and that takes writing.
 fn read<T: rusqlite::types::FromSql + Default>(outbox: &Path, sql: &str) -> T {
     let Ok(conn) = rusqlite::Connection::open_with_flags(
         outbox,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     ) else {
         return T::default();
     };
@@ -325,12 +446,14 @@ async fn reports_survive_a_kill_a_restart_and_an_outage_of_the_billing_api() {
     let (cloud, intake) = cloud_api(503, 0).await;
     let dir = tempfile::tempdir().unwrap();
     let outbox = dir.path().join("usage-outbox.db");
-    // One report in flight at a time and a pause of a second or more after a
-    // failure, so that the moment a process is killed can be picked.
+    // One report in flight at a time and a backoff of a second or more after
+    // a failure, so that the moment a process is killed can be picked.
     let env = [
         (OUTBOX_PATH, outbox.to_str().unwrap()),
         ("VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT", "1"),
         ("VLLM_PROXY_USAGE_REPORT_INITIAL_BACKOFF_MS", "2000"),
+        // Ignored with an outbox, and said to be.
+        ("VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS", "3"),
     ];
 
     // The first process serves three requests whose reports cloud-api does
@@ -339,28 +462,64 @@ async fn reports_survive_a_kill_a_restart_and_an_outage_of_the_billing_api() {
     for _ in 0..3 {
         first.chat().await;
     }
-    eventually("three reports in the file, one of them tried", || {
-        pending_rows(&outbox) == 3 && intake.attempts() >= 1
+    eventually("three reports in the file, each of them tried", || {
+        read::<i64>(&outbox, "SELECT COUNT(*) FROM pending WHERE attempts > 0") == 3
     })
     .await;
-    eventually("no lease is held while the place pauses", || {
-        read::<i64>(
-            &outbox,
-            "SELECT COUNT(*) FROM pending WHERE lease_owner IS NOT NULL",
-        ) == 0
-    })
+    eventually(
+        "no lease is held while they wait for their next attempt",
+        || {
+            read::<i64>(
+                &outbox,
+                "SELECT COUNT(*) FROM pending WHERE lease_owner IS NOT NULL",
+            ) == 0
+        },
+    )
     .await;
-    let enabled = first.logged(
-        "Usage report outbox enabled: a report is kept on disk until the billing API accepts \
-         it or refuses it for good",
-    );
+    let enabled = first.logged(ENABLED);
     assert_eq!(enabled.len(), 1, "{}", first.log());
-    assert_eq!(enabled[0]["until_accepted"], true);
+    assert_eq!(enabled[0]["max_bytes"], 1u64 << 30);
+    assert_eq!(enabled[0]["max_age_secs"], 7 * 24 * 3600);
+    assert_eq!(enabled[0]["max_in_flight"], 1);
+    assert_eq!(
+        first
+            .logged(
+                "VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS has no effect with a usage report outbox: \
+                 a report is sent until it is accepted, refused for good or older than \
+                 VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_AGE_SECS"
+            )
+            .len(),
+        1,
+        "{}",
+        first.log()
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&outbox).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+    // The file has a rollback journal beside it and nothing else, and the
+    // process, which has both open, maps neither into its memory: a mapped
+    // file that is damaged ends a process with a signal.
+    let mut beside: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    beside.sort();
+    assert_eq!(beside, ["usage-outbox.db", "usage-outbox.db-journal"]);
+    #[cfg(target_os = "linux")]
+    {
+        // (The journal is open only while a transaction runs.)
+        let (mut open, mapped) = first.database_files();
+        open.remove(&format!("{}-journal", outbox.display()));
+        assert_eq!(open, BTreeSet::from([outbox.display().to_string()]));
+        assert_eq!(mapped, BTreeSet::new());
+        assert!(
+            first.threads().contains(WRITER_THREAD),
+            "{:?}",
+            first.threads()
+        );
     }
 
     // It is killed outright: no shutdown code runs.
@@ -378,21 +537,24 @@ async fn reports_survive_a_kill_a_restart_and_an_outage_of_the_billing_api() {
     eventually("five reports in the file", || pending_rows(&outbox) == 5).await;
     let stopped = second.stop("-TERM").await;
     assert!(stopped.success(), "{}", second.log());
-    let closed = second.logged(
-        "Usage report outbox closed for shutdown: what it holds is sent by the next process",
-    );
+    let closed = second.logged(CLOSED);
     assert_eq!(closed.len(), 1, "{}", second.log());
     assert_eq!(closed[0]["in_outbox"], 5);
+    assert_eq!(closed[0]["left_unwritten"], 0);
     assert_eq!(second.logged("Server shut down").len(), 1);
     assert_eq!(pending_rows(&outbox), 5);
     assert_eq!(
         read::<i64>(
             &outbox,
-            "SELECT COUNT(*) FROM pending WHERE lease_until_ms > 0"
+            "SELECT COUNT(*) FROM pending WHERE lease_owner IS NOT NULL"
         ),
         0
     );
     assert_eq!(intake.accepted(), Vec::<String>::new());
+    // More than three attempts were made on the first three by now, and none
+    // of them was given up on.
+    assert!(intake.attempts() > 3, "{}", intake.attempts());
+    assert_eq!(read::<i64>(&outbox, "SELECT COUNT(*) FROM rejected"), 0);
 
     // cloud-api is back, and so is a third process. Every report is taken,
     // once.
@@ -425,10 +587,23 @@ async fn reports_survive_a_kill_a_restart_and_an_outage_of_the_billing_api() {
          ingress_route=\"other\",model=\"{MODEL}\"}}"
     );
     assert_eq!(metric(&metrics, &accepted_series), Some(5.0), "{metrics}");
-    assert_eq!(
-        metric(&metrics, "inference_proxy_usage_report_outbox_available "),
-        Some(1.0)
-    );
+    for (series, value) in [
+        ("inference_proxy_usage_report_outbox_available ", 1.0),
+        ("inference_proxy_usage_report_outbox_full ", 0.0),
+        ("inference_proxy_usage_report_outbox_billing_paused ", 0.0),
+        ("inference_proxy_usage_report_outbox_unwritten ", 0.0),
+        ("inference_proxy_usage_report_outbox_in_memory ", 0.0),
+        (
+            "inference_proxy_usage_report_outbox_rejected{reason=\"rejected\"} ",
+            0.0,
+        ),
+        (
+            "inference_proxy_usage_report_outbox_rejected{reason=\"max_age\"} ",
+            0.0,
+        ),
+    ] {
+        assert_eq!(metric(&metrics, series), Some(value), "{series}: {metrics}");
+    }
     assert_eq!(
         metric(
             &metrics,
@@ -515,8 +690,6 @@ async fn two_gateways_on_one_outbox_deliver_every_report_once() {
 /// cannot be opened starts, answers and bills, and says what it is missing.
 #[tokio::test]
 async fn a_gateway_whose_outbox_cannot_be_opened_serves_and_reports_all_the_same() {
-    const UNAVAILABLE: &str = "Usage report outbox unavailable: reports are delivered from memory \
-                               and not kept across a restart until it is back";
     let engine = engine().await;
     let (cloud, intake) = cloud_api(200, 0).await;
     let dir = tempfile::tempdir().unwrap();
@@ -563,26 +736,24 @@ async fn a_gateway_whose_outbox_cannot_be_opened_serves_and_reports_all_the_same
         Some(1.0),
         "{metrics}"
     );
-    assert_eq!(
-        gateway.logged("Usage report outbox available again").len(),
-        1
-    );
+    assert_eq!(gateway.logged(AVAILABLE_AGAIN).len(), 1);
     intake.answer(503);
     gateway.chat().await;
     eventually("the report is in the file", || pending_rows(&outbox) == 1).await;
     assert!(gateway.stop("-TERM").await.success(), "{}", gateway.log());
     assert_eq!(pending_rows(&outbox), 1);
+    // Said when it began and when it ended, not once per try in between.
     assert_eq!(gateway.logged(UNAVAILABLE).len(), 1);
+    assert_eq!(gateway.logged(AVAILABLE_AGAIN).len(), 1);
 }
 
-/// Without the variable there is no outbox: no file, no series, no line.
-/// And with it but without what sending takes, the file is not opened.
+/// Without the variable there is no outbox: no thread, no file, no series, no
+/// line. And with it but without what sending takes, the file is not opened.
 #[tokio::test]
 async fn nothing_of_the_outbox_exists_unless_it_is_configured() {
     let engine = engine().await;
     let (cloud, intake) = cloud_api(200, 0).await;
     let dir = tempfile::tempdir().unwrap();
-
     let mut gateway = Gateway::start(&engine, &cloud, &[]).await;
     gateway.chat().await;
     eventually("the report is accepted", || intake.accepted().len() == 1).await;
@@ -603,6 +774,17 @@ async fn nothing_of_the_outbox_exists_unless_it_is_configured() {
             "inference_proxy_usage_reports_total",
         ])
     );
+    // No thread for the file, no file open or mapped, and nothing written
+    // where a process puts what it was not told where to put.
+    #[cfg(target_os = "linux")]
+    {
+        assert!(
+            !gateway.threads().contains(WRITER_THREAD),
+            "{:?}",
+            gateway.threads()
+        );
+        assert_eq!(gateway.database_files(), (BTreeSet::new(), BTreeSet::new()));
+    }
     assert!(gateway.stop("-TERM").await.success());
     assert!(
         !gateway.log().to_lowercase().contains("outbox"),
@@ -610,10 +792,36 @@ async fn nothing_of_the_outbox_exists_unless_it_is_configured() {
         gateway.log()
     );
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(gateway.home.path()).unwrap().count(), 0);
+
+    // The same checks find the outbox of a process that has one: a thread by
+    // that name, the file open, the file where it was told to be.
+    let outbox = dir.path().join("usage-outbox.db");
+    let mut with_outbox =
+        Gateway::start(&engine, &cloud, &[(OUTBOX_PATH, outbox.to_str().unwrap())]).await;
+    with_outbox.chat().await;
+    eventually("the report is accepted", || intake.accepted().len() == 2).await;
+    #[cfg(target_os = "linux")]
+    {
+        assert!(with_outbox.threads().contains(WRITER_THREAD));
+        let (open, mapped) = with_outbox.database_files();
+        assert!(open.contains(&outbox.display().to_string()), "{open:?}");
+        assert_eq!(mapped, BTreeSet::new());
+    }
+    assert!(with_outbox.metrics().await.contains("outbox"));
+    assert!(with_outbox.stop("-TERM").await.success());
+    assert!(with_outbox.log().to_lowercase().contains("outbox"));
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    assert_eq!(
+        std::fs::read_dir(with_outbox.home.path()).unwrap().count(),
+        0
+    );
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        std::fs::remove_file(entry.unwrap().path()).unwrap();
+    }
 
     // A path, and no usage token: nothing can be reported, so nothing is
     // kept, and the process starts and says so.
-    let outbox = dir.path().join("usage-outbox.db");
     let mut gateway = Gateway::start(
         &engine,
         &cloud,
@@ -636,6 +844,664 @@ async fn nothing_of_the_outbox_exists_unless_it_is_configured() {
         ),
         Some(0.0)
     );
+    #[cfg(target_os = "linux")]
+    assert!(!gateway.threads().contains(WRITER_THREAD));
     assert!(gateway.stop("-TERM").await.success());
     assert!(!outbox.exists());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+/// What is done to the file under a running gateway, by a person, a script
+/// or a disk. None of it may end the process or cost a request.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Damage {
+    /// Cut to nothing, which to SQLite is a database without tables.
+    Emptied,
+    /// Cut in half.
+    Truncated,
+    /// Everything after its header overwritten.
+    Scribbled,
+    /// The file and its journal deleted.
+    Deleted,
+    /// Made unreadable and unwritable.
+    #[cfg(unix)]
+    Forbidden,
+}
+
+impl Damage {
+    fn apply(self, outbox: &Path) {
+        use std::io::{Read, Seek, SeekFrom};
+        let open = || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(outbox)
+                .unwrap()
+        };
+        match self {
+            Self::Emptied => open().set_len(0).unwrap(),
+            Self::Truncated => {
+                let file = open();
+                let len = file.metadata().unwrap().len();
+                file.set_len(len / 2 / 4096 * 4096 + 1000).unwrap();
+            }
+            Self::Scribbled => {
+                // With the change counter of the header moved on, as any
+                // writer would leave it: what the gateway remembers of the
+                // file is then read again, and is not there.
+                let mut file = open();
+                let len = file.metadata().unwrap().len();
+                let mut counter = [0u8; 4];
+                file.seek(SeekFrom::Start(24)).unwrap();
+                file.read_exact(&mut counter).unwrap();
+                let changed = (u32::from_be_bytes(counter) + 1).to_be_bytes();
+                for offset in [24, 92] {
+                    file.seek(SeekFrom::Start(offset)).unwrap();
+                    file.write_all(&changed).unwrap();
+                }
+                file.seek(SeekFrom::Start(100)).unwrap();
+                file.write_all(&vec![0xA5u8; (len - 100) as usize]).unwrap();
+            }
+            Self::Deleted => {
+                for entry in std::fs::read_dir(outbox.parent().unwrap()).unwrap() {
+                    std::fs::remove_file(entry.unwrap().path()).unwrap();
+                }
+            }
+            #[cfg(unix)]
+            Self::Forbidden => {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(outbox, std::fs::Permissions::from_mode(0o000)).unwrap();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_file_damaged_under_a_running_gateway_never_ends_it_or_costs_a_request() {
+    for damage in [
+        Damage::Emptied,
+        Damage::Truncated,
+        Damage::Scribbled,
+        Damage::Deleted,
+        #[cfg(unix)]
+        Damage::Forbidden,
+    ] {
+        // An engine of its own, so that the completions are numbered from 0.
+        let engine = engine().await;
+        let (cloud, intake) = cloud_api(503, 0).await;
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = dir.path().join("usage-outbox.db");
+        let env = [
+            (OUTBOX_PATH, outbox.to_str().unwrap()),
+            ("VLLM_PROXY_USAGE_REPORT_INITIAL_BACKOFF_MS", "100"),
+        ];
+        let mut gateway = Gateway::start(&engine, &cloud, &env).await;
+        // A backlog cloud-api does not take, so that the file is in use.
+        for _ in 0..40 {
+            gateway.chat().await;
+        }
+        eventually("the backlog is in the file", || pending_rows(&outbox) == 40).await;
+
+        damage.apply(&outbox);
+        // Every request is answered, before and after cloud-api is back...
+        for _ in 0..40 {
+            gateway.chat().await;
+        }
+        intake.answer(200);
+        for _ in 0..10 {
+            gateway.chat().await;
+        }
+        // ... and the report of every request that completed since the file
+        // was damaged is delivered.
+        let since: BTreeSet<String> = (40..90).map(|n| format!("chatcmpl-{n}")).collect();
+        let accepted = || intake.accepted().into_iter().collect::<BTreeSet<String>>();
+        eventually(
+            &format!("{damage:?}: the reports since are accepted"),
+            || since.is_subset(&accepted()),
+        )
+        .await;
+        assert_eq!(
+            gateway.ended(),
+            None,
+            "{damage:?}: it ended: {}",
+            gateway.log()
+        );
+
+        // What became of the backlog depends on what was done to the file,
+        // and is said either way.
+        let replaced = |why: &'static str| {
+            let series =
+                format!("inference_proxy_usage_report_outbox_replaced_total{{why=\"{why}\"}}");
+            move |metrics: &str| metric(metrics, &series) == Some(1.0)
+        };
+        match damage {
+            // The gateway still had all of it, and wrote the file back.
+            Damage::Deleted => {
+                gateway
+                    .metrics_until("it is written back", replaced("deleted"))
+                    .await;
+                eventually("the whole backlog is accepted", || accepted().len() == 90).await;
+            }
+            // The database is gone, and a new one is started in the file.
+            Damage::Emptied => {
+                gateway
+                    .metrics_until("a new one is started", replaced("lost"))
+                    .await;
+            }
+            // What is left of it is moved aside for a person to look at.
+            Damage::Truncated | Damage::Scribbled => {
+                gateway
+                    .metrics_until("it is moved aside", replaced("corrupt"))
+                    .await;
+                let aside = std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                    .filter(|name| name.starts_with("usage-outbox.db.corrupt-"))
+                    .count();
+                assert!(aside >= 1, "{damage:?}");
+            }
+            // A file that is open stays usable, whatever its mode says.
+            #[cfg(unix)]
+            Damage::Forbidden => {
+                eventually("the whole backlog is accepted", || accepted().len() == 90).await;
+            }
+        }
+        let metrics = gateway
+            .metrics_until("the file is in use again", |metrics| {
+                metric(metrics, "inference_proxy_usage_report_outbox_available ") == Some(1.0)
+            })
+            .await;
+        println!(
+            "{damage:?}: alive, 90 requests answered, {} of 90 reports accepted ({} sends); {:?}",
+            accepted().len(),
+            intake.accepted().len(),
+            metrics
+                .lines()
+                .filter(|line| line.contains("outbox_replaced_total{"))
+                .collect::<Vec<_>>()
+        );
+        // And the outbox works: a report is kept in it again.
+        #[cfg(unix)]
+        if damage == Damage::Forbidden {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&outbox, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        intake.answer(503);
+        gateway.chat().await;
+        eventually(&format!("{damage:?}: a new report is kept"), || {
+            read::<i64>(
+                &outbox,
+                "SELECT COUNT(*) FROM pending WHERE json_extract(body, '$.id') = 'chatcmpl-90'",
+            ) == 1
+        })
+        .await;
+        let stopped = gateway.stop("-TERM").await;
+        assert!(
+            stopped.success(),
+            "{damage:?}: {stopped:?} {}",
+            gateway.log()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(stopped.signal(), None);
+        }
+    }
+}
+
+/// `requests` customer requests, sixteen at a time, each of them answered.
+async fn many_chats(gateway: &Gateway, requests: usize) {
+    let left = AtomicUsize::new(requests);
+    futures_util::future::join_all((0..16).map(|_| async {
+        while left
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            gateway.chat().await;
+        }
+    }))
+    .await;
+}
+
+/// The file reaches the size it was given (`MAX_BYTES`) on a volume that has
+/// room: it takes no new report, and goes on with the ones it holds.
+///
+/// The smallest size there is takes more than ten thousand requests to fill,
+/// which is minutes in a debug build: run by hand, like the measurements
+/// below. What a delivery does with a file at its size is tested next to it
+/// on every run (`a_file_at_its_size_keeps_sending_what_it_holds...`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "ten thousand requests, run by hand"]
+async fn a_gateway_whose_outbox_is_at_its_size_keeps_serving_and_sending() {
+    let engine = engine().await;
+    let (cloud, intake) = cloud_api(503, 10).await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = dir.path().join("usage-outbox.db");
+    // The smallest size there is, 4 MiB: some seven thousand reports.
+    let max_bytes = 4 << 20;
+    let env = [
+        (OUTBOX_PATH, outbox.to_str().unwrap()),
+        ("VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_BYTES", "4194304"),
+        ("VLLM_PROXY_USAGE_REPORT_INITIAL_BACKOFF_MS", "100"),
+    ];
+    let mut gateway = Gateway::start(&engine, &cloud, &env).await;
+    let gauge = |metrics: &str, name: &str| {
+        metric(
+            metrics,
+            &format!("inference_proxy_usage_report_outbox_{name}"),
+        )
+    };
+
+    // cloud-api is down and requests keep completing, until the file is
+    // full. Every one of them is answered.
+    let mut requests = 0;
+    let mut metrics = String::new();
+    while gauge(&metrics, "full ") != Some(1.0) {
+        many_chats(&gateway, 1_000).await;
+        requests += 1_000;
+        assert!(requests <= 40_000, "the file never filled up: {metrics}");
+        metrics = gateway.metrics().await;
+    }
+    many_chats(&gateway, 500).await;
+    requests += 500;
+    let metrics = gateway
+        .metrics_until("every report is somewhere", |metrics| {
+            gauge(metrics, "unwritten ") == Some(0.0)
+        })
+        .await;
+    let in_memory = gauge(&metrics, "in_memory ").unwrap();
+    let in_file = pending_rows(&outbox);
+    println!(
+        "at its size: {requests} requests answered; {in_file} reports in the file ({} bytes of \
+         {max_bytes}), {in_memory} held in memory",
+        std::fs::metadata(&outbox).unwrap().len()
+    );
+    assert!(in_memory >= 500.0, "{metrics}");
+    assert_eq!(in_file as f64 + in_memory, requests as f64, "{metrics}");
+    assert!(std::fs::metadata(&outbox).unwrap().len() <= max_bytes);
+    // Full is not unavailable: the file works.
+    assert_eq!(gauge(&metrics, "available "), Some(1.0), "{metrics}");
+    assert_eq!(gauge(&metrics, "full "), Some(1.0), "{metrics}");
+    assert_eq!(gateway.ended(), None);
+
+    // cloud-api is back. The rows of the file are sent and removed while it
+    // is still full, and in the end every report is accepted, once.
+    intake.answer(200);
+    let mut sent_while_full = false;
+    let started_at = Instant::now();
+    loop {
+        let metrics = gateway.metrics().await;
+        let rows = pending_rows(&outbox);
+        sent_while_full |= gauge(&metrics, "full ") == Some(1.0) && rows < in_file;
+        if rows == 0 && gauge(&metrics, "in_memory ") == Some(0.0) {
+            break;
+        }
+        assert!(started_at.elapsed() < Duration::from_secs(240), "{metrics}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        sent_while_full,
+        "rows of the file were sent only once it had room"
+    );
+    eventually("every report is accepted", || {
+        intake.accepted().len() >= requests
+    })
+    .await;
+    let accepted = intake.accepted();
+    let distinct: BTreeSet<&String> = accepted.iter().collect();
+    assert_eq!((accepted.len(), distinct.len()), (requests, requests));
+    let metrics = gateway
+        .metrics_until("it has room again", |metrics| {
+            gauge(metrics, "full ") == Some(0.0)
+        })
+        .await;
+    assert_eq!(gauge(&metrics, "available "), Some(1.0));
+    // Said once each way, and never that it was unavailable.
+    const FULL: &str = "Usage report outbox is full: new reports are held in memory and sent \
+                        from there until it has room. What it holds is still sent";
+    assert_eq!(
+        gateway.logged(FULL).len(),
+        1,
+        "{:#?}",
+        gateway.outbox_lines()
+    );
+    assert_eq!(
+        gateway.logged("Usage report outbox has room again").len(),
+        1
+    );
+    assert!(gateway.logged(UNAVAILABLE).is_empty());
+    assert!(!gateway.log().contains("usage NOT billed"));
+    assert!(gateway.stop("-TERM").await.success());
+}
+
+/// `unshare` can give a process a mount namespace of its own here (and so a
+/// small volume, without root). Where it cannot, the tests that need a full
+/// volume say so and are skipped.
+fn can_mount_a_volume() -> bool {
+    std::process::Command::new("unshare")
+        .args(["-Urm", "sh", "-c"])
+        .arg("d=$(mktemp -d) && mount -t tmpfs -o size=1m tmpfs \"$d\"")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// Something else fills the volume the outbox is on, to the last block, and
+/// later frees it again. The gateway serves throughout, delivers from memory
+/// what the file cannot take, and uses the file again when there is space,
+/// without a restart.
+#[tokio::test]
+async fn a_gateway_whose_volume_fills_up_keeps_serving_and_recovers_when_there_is_space() {
+    if !can_mount_a_volume() {
+        eprintln!(
+            "SKIPPED a_gateway_whose_volume_fills_up_keeps_serving_and_recovers_when_there_is_space: \
+             `unshare -Urm` with a tmpfs mount does not work here, so no volume could be filled"
+        );
+        return;
+    }
+    let engine = engine().await;
+    let (cloud, intake) = cloud_api(503, 0).await;
+    // The volume: 2 MiB, mounted where only the gateway (and the helper
+    // beside it) sees it, gone with them. The helper fills it up and frees
+    // it when told to through files in `control`, which both sides see.
+    let dir = tempfile::tempdir().unwrap();
+    let volume = dir.path().join("volume");
+    let control = dir.path().join("control");
+    std::fs::create_dir(&volume).unwrap();
+    std::fs::create_dir(&control).unwrap();
+    let outbox = volume.join("usage-outbox.db");
+    let (volume, control) = (volume.to_str().unwrap(), control.to_str().unwrap());
+    let setup = format!(
+        "mount -t tmpfs -o size=2m tmpfs '{volume}' && {{ ( \
+           while kill -0 $$ 2>/dev/null; do \
+             if [ -e '{control}/fill' ] && [ ! -e '{control}/filled' ]; then \
+               dd if=/dev/zero of='{volume}/ballast' bs=4096 2>/dev/null; touch '{control}/filled'; fi; \
+             if [ -e '{control}/free' ] && [ ! -e '{control}/freed' ]; then \
+               rm -f '{volume}/ballast'; touch '{control}/freed'; fi; \
+             sleep 0.1; \
+           done ) > /dev/null 2>&1 & }}"
+    );
+    let env = [
+        (OUTBOX_PATH, outbox.to_str().unwrap()),
+        ("VLLM_PROXY_USAGE_REPORT_INITIAL_BACKOFF_MS", "100"),
+    ];
+    let mut gateway = Gateway::start_in(&engine, &cloud, &env, Some(&setup)).await;
+    let gauge = |metrics: &str, name: &str| {
+        metric(
+            metrics,
+            &format!("inference_proxy_usage_report_outbox_{name}"),
+        )
+    };
+    let pending =
+        |metrics: &str| gauge(metrics, &format!("pending{{model=\"{MODEL}\"}}")).unwrap_or(0.0);
+    let told = |what: &str| {
+        std::fs::write(Path::new(control).join(what), b"").unwrap();
+    };
+    let done = |what: &'static str| {
+        let done = Path::new(control).join(what);
+        move || done.exists()
+    };
+
+    // A backlog in the file, while cloud-api is down.
+    many_chats(&gateway, 300).await;
+    gateway
+        .metrics_until("the backlog is in the file", |metrics| {
+            pending(metrics) == 300.0
+        })
+        .await;
+
+    // The volume fills up. Requests go on being answered.
+    told("fill");
+    eventually("the volume is full", done("filled")).await;
+    many_chats(&gateway, 400).await;
+    let metrics = gateway
+        .metrics_until("the reports are held in memory", |metrics| {
+            gauge(metrics, "in_memory ").is_some_and(|held| held >= 390.0)
+                && gauge(metrics, "full ") == Some(1.0)
+        })
+        .await;
+    println!(
+        "volume full: 700 requests answered; available {:?}, full {:?}, rows {}, in memory {:?}, \
+         unwritten {:?}",
+        gauge(&metrics, "available "),
+        gauge(&metrics, "full "),
+        pending(&metrics),
+        gauge(&metrics, "in_memory "),
+        gauge(&metrics, "unwritten "),
+    );
+    assert_eq!(gateway.ended(), None, "{}", gateway.log());
+
+    // cloud-api is back while the volume is still full: what memory holds
+    // is delivered from there.
+    intake.answer(200);
+    eventually("the reports held in memory are accepted", || {
+        intake.accepted().len() >= 400
+    })
+    .await;
+    let metrics = gateway.metrics().await;
+    println!(
+        "volume full, cloud-api back: {} of 700 accepted; available {:?}, full {:?}, rows {}, in \
+         memory {:?}",
+        intake.accepted().len(),
+        gauge(&metrics, "available "),
+        gauge(&metrics, "full "),
+        pending(&metrics),
+        gauge(&metrics, "in_memory "),
+    );
+    assert_eq!(gateway.ended(), None, "{}", gateway.log());
+
+    // Space returns. The file is found usable again within its retry
+    // interval, without a restart, and every report is accepted, once.
+    told("free");
+    eventually("there is space again", done("freed")).await;
+    let freed_at = Instant::now();
+    eventually("every report is accepted", || {
+        intake.accepted().len() >= 700
+    })
+    .await;
+    let metrics = gateway
+        .metrics_until("the file is in use again and has room", |metrics| {
+            gauge(metrics, "available ") == Some(1.0)
+                && gauge(metrics, "full ") == Some(0.0)
+                && gauge(metrics, "in_memory ") == Some(0.0)
+                && pending(metrics) == 0.0
+        })
+        .await;
+    println!(
+        "space back: everything accepted and the file in use {:?} later",
+        freed_at.elapsed()
+    );
+    let accepted = intake.accepted();
+    let distinct: BTreeSet<&String> = accepted.iter().collect();
+    assert_eq!(distinct.len(), 700);
+    // A report whose outcome could not be written while the volume was full
+    // may have been sent once more; cloud-api tells those apart.
+    assert!(
+        accepted.len() <= 700 + 40,
+        "{} sends for 700 reports",
+        accepted.len()
+    );
+    assert_eq!(gauge(&metrics, "unwritten "), Some(0.0));
+    // And a new report is kept in the file again.
+    intake.answer(503);
+    gateway.chat().await;
+    gateway
+        .metrics_until("a new report is kept", |metrics| pending(metrics) == 1.0)
+        .await;
+    assert!(!gateway.log().contains("usage NOT billed"));
+    let stopped = gateway.stop("-TERM").await;
+    assert!(stopped.success(), "{stopped:?} {}", gateway.log());
+}
+
+// ---------------------------------------------------------------------------
+// Measurements, run by hand:
+//   cargo test --release --test usage_outbox -- --ignored --nocapture --test-threads 1
+// ---------------------------------------------------------------------------
+
+/// What `kill -9` costs: a gateway that serves as fast as eight clients ask
+/// is killed at some moment, again and again, and the reports of the requests
+/// it had answered are counted in its file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement, run by hand"]
+async fn what_a_kill_loses() {
+    let rounds: usize = std::env::var("ROUNDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(20);
+    let engine = engine().await;
+    // cloud-api takes nothing: every report stays where it was written.
+    let (cloud, _intake) = cloud_api(503, 0).await;
+    let (mut answered_in_all, mut lost_in_all, mut most_lost) = (0, 0, 0);
+    for round in 0..rounds {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = dir.path().join("usage-outbox.db");
+        let mut gateway =
+            Gateway::start(&engine, &cloud, &[(OUTBOX_PATH, outbox.to_str().unwrap())]).await;
+        let gateway_ref = &gateway;
+        // When each request was answered, as its client saw it.
+        let answered = Mutex::new(Vec::<Instant>::new());
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let kill_after = Duration::from_millis(400 + 97 * (round as u64 % 7));
+        let pid = gateway.child.id().to_string();
+        let killed_at = {
+            let clients = futures_util::future::join_all((0..8).map(|_| async {
+                while !stop.load(Ordering::SeqCst) {
+                    let response = gateway_ref
+                        .client
+                        .post(format!(
+                            "{}{}",
+                            gateway_ref.base,
+                            routes::ROUTE_CHAT_COMPLETIONS
+                        ))
+                        .bearer_auth(KEY)
+                        .json(&json!({
+                            "model": MODEL,
+                            "messages": [{"role": "user", "content": "hello"}]
+                        }))
+                        .send()
+                        .await;
+                    let Ok(response) = response else { break };
+                    if response.status().is_success() && response.bytes().await.is_ok() {
+                        answered.lock().unwrap().push(Instant::now());
+                    }
+                }
+            }));
+            let killer = async {
+                tokio::time::sleep(kill_after).await;
+                let killed_at = Instant::now();
+                std::process::Command::new("kill")
+                    .args(["-KILL", &pid])
+                    .status()
+                    .unwrap();
+                stop.store(true, Ordering::SeqCst);
+                killed_at
+            };
+            tokio::join!(clients, killer).1
+        };
+        while gateway.ended().is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let answered = answered.into_inner().unwrap();
+        let before_kill = answered.iter().filter(|at| **at <= killed_at).count();
+        let in_last = |window: Duration| {
+            answered
+                .iter()
+                .filter(|at| **at <= killed_at && killed_at.duration_since(**at) <= window)
+                .count()
+        };
+        let in_file = pending_rows(&outbox) as usize;
+        let lost = before_kill.saturating_sub(in_file);
+        println!(
+            "round {round:>2}: killed after {kill_after:?}; answered before the kill {before_kill} \
+             (in its last 50 ms {}, last 100 ms {}), reports in the file {in_file}, lost {lost}",
+            in_last(Duration::from_millis(50)),
+            in_last(Duration::from_millis(100)),
+        );
+        answered_in_all += before_kill;
+        lost_in_all += lost;
+        most_lost = most_lost.max(lost);
+        // The file a killed process leaves is a database the next one opens.
+        assert_eq!(
+            read::<String>(&outbox, "PRAGMA integrity_check"),
+            "ok",
+            "round {round}"
+        );
+    }
+    println!(
+        "{rounds} kills: {answered_in_all} requests answered before them, {lost_in_all} reports \
+         lost ({:.3} %), at most {most_lost} by one kill",
+        100.0 * lost_in_all as f64 / answered_in_all.max(1) as f64
+    );
+}
+
+/// Two gateways on one file, serving as fast as their clients ask, with a
+/// cloud-api that fails now and then, and one of them stopped and started
+/// again in the middle of it: every report is accepted, and how many were
+/// sent twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement, run by hand"]
+async fn two_gateways_under_load() {
+    let requests: usize = std::env::var("REQUESTS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(5_000);
+    let engine = engine().await;
+    let (cloud, intake) = cloud_api(200, 5).await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = dir.path().join("usage-outbox.db");
+    let env = [(OUTBOX_PATH, outbox.to_str().unwrap())];
+    let old = Gateway::start(&engine, &cloud, &env).await;
+    let mut new = Gateway::start(&engine, &cloud, &env).await;
+    let started_at = Instant::now();
+
+    // cloud-api fails for 300 ms out of every two seconds.
+    let flapping = async {
+        for _ in 0..1_000 {
+            tokio::time::sleep(Duration::from_millis(1_700)).await;
+            intake.answer(503);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            intake.answer(200);
+        }
+    };
+    let load = async {
+        tokio::join!(many_chats(&old, requests), async {
+            many_chats(&new, requests / 2).await;
+            // A deploy: the new one is stopped in good order and started
+            // again, on the same file, while the old one serves.
+            assert!(new.stop("-TERM").await.success());
+            new = Gateway::start(&engine, &cloud, &env).await;
+            many_chats(&new, requests - requests / 2).await;
+        });
+    };
+    tokio::select! {
+        _ = flapping => unreachable!("the load ends first"),
+        _ = load => {}
+    }
+    let served_in = started_at.elapsed();
+    intake.answer(200);
+    eventually("every report is accepted", || {
+        intake.accepted().into_iter().collect::<BTreeSet<_>>().len() >= 2 * requests
+            && pending_rows(&outbox) == 0
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let accepted = intake.accepted();
+    let distinct: BTreeSet<&String> = accepted.iter().collect();
+    println!(
+        "two gateways on one file, {} requests in {served_in:?} ({:.0} a second): {} reports \
+         accepted, {} sent twice, {} attempts in all; rows left {}, rejected {}; the file was \
+         unavailable to: old {}, new {}",
+        2 * requests,
+        2.0 * requests as f64 / served_in.as_secs_f64(),
+        distinct.len(),
+        accepted.len() - distinct.len(),
+        intake.attempts(),
+        pending_rows(&outbox),
+        read::<i64>(&outbox, "SELECT COUNT(*) FROM rejected"),
+        old.logged(UNAVAILABLE).len(),
+        new.logged(UNAVAILABLE).len(),
+    );
+    assert_eq!(distinct.len(), 2 * requests);
+    assert_eq!(read::<String>(&outbox, "PRAGMA integrity_check"), "ok");
 }

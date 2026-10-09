@@ -26,29 +26,26 @@
 //!
 //! All of that is in memory: a report dropped from the queue, past its
 //! deadline or held by a process that dies is usage served and never billed.
-//! `VLLM_PROXY_USAGE_REPORT_OUTBOX_PATH` adds an outbox on disk
-//! (`usage_outbox.rs`). A report is then written to it first and delivered
-//! from it: it stays there until the billing API accepts it or refuses it for
-//! good, across restarts, a billing API outage of any length and a second
-//! process on the same file. `submit` is still a lock and a push; the file is
-//! only ever touched by the outbox's own thread. When the file cannot be
-//! used, reports are delivered from memory as above until it can.
+//! `VLLM_PROXY_USAGE_REPORT_OUTBOX_PATH` keeps reports in a file instead
+//! (`usage_outbox.rs` is the file, `usage_report_outbox.rs` the delivery from
+//! it). A process with an outbox takes none of the paths below after
+//! `submit`: its reports are scheduled by the outbox, by other rules.
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc, watch};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
-use crate::auth::{AuthPath, IngressRouteKind, RequestSource};
 use crate::model_metrics::{model_gauge, ModelLabel};
 use crate::proxy::{
     classify_usage_http_status, classify_usage_request_error, record_usage_report_outcome,
     UsageReportOutcome, UsageReporter,
 };
-use crate::usage_outbox::{self, Persist, Refused, Settle, Store, UsageOutboxConfig};
+use crate::usage_outbox::UsageOutboxConfig;
+
+#[path = "usage_report_outbox.rs"]
+mod outbox;
 
 /// Ceiling of the backoff between two attempts, whatever the attempt number.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -61,15 +58,6 @@ const FINAL_OUTCOME_TARGET: &str = "vllm_proxy_rs::proxy";
 /// be written, each in a task of its own. Past it the line is written where
 /// the drop happens, so these tasks cannot pile up without bound either.
 const MAX_DROPS_BEING_LOGGED: usize = 1_000;
-
-/// How long shutdown waits for the outbox to write what is left and give its
-/// leases back. The disk may be the reason the process is being stopped.
-const OUTBOX_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Model labels read back from the outbox are kept for the life of the
-/// process, like those of a model list. There are as many as models were ever
-/// served from the file; a file that claims more gets no label for the rest.
-const MAX_STORED_MODEL_LABELS: usize = 256;
 
 /// How usage reports are delivered. `Default` is the delivery every
 /// deployment had before these settings existed.
@@ -118,9 +106,9 @@ impl Default for UsageReportPolicy {
 }
 
 impl UsageReportPolicy {
-    /// `max_attempts` of a report that is sent until it is accepted: what a
-    /// process with an outbox gets when
-    /// `VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS` is not set.
+    /// `max_attempts` of a report that is sent until it is accepted or too
+    /// old: what a process with an outbox has, whatever
+    /// `VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS` says.
     pub const UNTIL_ACCEPTED: u32 = u32::MAX;
 
     /// `max_in_flight` of a process with an outbox when
@@ -146,7 +134,7 @@ impl UsageReportPolicy {
 }
 
 /// A report on its way to the billing API: what `proxy::spawn_usage_report`
-/// hands over, or a row of the outbox made into one (`job_from`).
+/// hands over.
 pub(crate) struct Job {
     /// Who the report is for and where it came from: ids and labels for the
     /// log lines and the metrics, and the HTTP client.
@@ -156,45 +144,20 @@ pub(crate) struct Job {
     /// The serialized report. Every attempt sends these bytes.
     pub body: bytes::Bytes,
     /// When the request completed and its report was handed over. For a
-    /// report taken from the outbox, when it was taken: its request
-    /// completed `Stored::age` before that.
+    /// report read back from the outbox, when it was read: its request
+    /// completed `completed_before` earlier.
     pub completed_at: Instant,
-    /// The row this report is, when it was taken from the outbox.
-    pub stored: Option<Stored>,
-}
-
-/// What the outbox knows about a report it leased to this process.
-pub(crate) struct Stored {
-    id: i64,
-    /// Attempts made before this lease, by any process.
-    attempts: u32,
-    /// Why the last of them failed, when there was one.
-    last_failure: Option<(&'static str, UsageReportOutcome)>,
-    /// How long before the lease its request completed.
-    age: Duration,
-    /// Until when the report is this process's to send.
-    lease_until: Instant,
+    /// Zero, except for a report read back from the outbox, whose request
+    /// completed in an earlier life of the process, or in another process.
+    pub completed_before: Duration,
 }
 
 impl Job {
     /// Time since the request completed, whichever process served it.
     fn since_completion(&self) -> Duration {
-        let before = self.stored.as_ref().map_or(Duration::ZERO, |row| row.age);
-        self.completed_at.elapsed().saturating_add(before)
-    }
-}
-
-impl Persist for Job {
-    fn row(&self) -> usage_outbox::NewRow<'_> {
-        let reporter = &self.reporter;
-        usage_outbox::NewRow {
-            body: &self.body,
-            request_id: reporter.request_id.as_deref(),
-            model_label: reporter.model_label,
-            auth_path: reporter.request_source.auth_path.as_label(),
-            ingress_route: reporter.request_source.ingress_route.as_label(),
-            age: self.since_completion(),
-        }
+        self.completed_at
+            .elapsed()
+            .saturating_add(self.completed_before)
     }
 }
 
@@ -207,94 +170,11 @@ struct State {
     in_flight: usize,
     /// Reports dropped from a full queue whose line is still to be written.
     drops_being_logged: usize,
-    /// `None` without an outbox.
-    outbox: Option<OutboxState>,
 }
 
 impl State {
     fn is_idle(&self) -> bool {
-        self.waiting.is_empty()
-            && self.in_flight == 0
-            && self.drops_being_logged == 0
-            && self.outbox.as_ref().is_none_or(OutboxState::is_empty)
-    }
-}
-
-/// What a process with an outbox keeps in memory about it.
-struct OutboxState {
-    /// Reports leased to this process and waiting for a place, longest due
-    /// first.
-    claimed: VecDeque<Job>,
-    /// How many reports the claim on its way to the store asked for.
-    asked: Option<usize>,
-    /// The file may hold a report that is due: worth a claim.
-    look: bool,
-    /// When that becomes true by itself: the retry of a report is due.
-    look_at: Option<Instant>,
-    /// Attempts in a row, across the process, that failed in a way that can
-    /// pass, since the billing API last gave a report an answer of its own.
-    failing_streak: u32,
-    /// Places taken by reports from the file.
-    sending: usize,
-    /// Shutdown has begun: no report is claimed or started any more.
-    stopping: bool,
-    /// The last thing the store tried worked.
-    available: bool,
-    /// The store has said what the file holds.
-    synced: bool,
-    /// Rows of the file per model, waiting or being sent by anyone.
-    stored: Vec<(ModelLabel, u64)>,
-    /// When the request of the oldest of them completed.
-    oldest_completed_at_ms: Option<i64>,
-    rejected: u64,
-    /// Per model, what `queue_depth` is beside the rows of the file: the
-    /// reports waiting in memory, less the rows this process is sending.
-    beside: HashMap<ModelLabel, i64>,
-}
-
-impl OutboxState {
-    fn new() -> Self {
-        Self {
-            claimed: VecDeque::new(),
-            asked: None,
-            look: true,
-            look_at: None,
-            failing_streak: 0,
-            sending: 0,
-            stopping: false,
-            available: true,
-            synced: false,
-            stored: Vec::new(),
-            oldest_completed_at_ms: None,
-            rejected: 0,
-            beside: HashMap::new(),
-        }
-    }
-
-    fn stored_total(&self) -> u64 {
-        self.stored.iter().map(|(_, rows)| rows).sum()
-    }
-
-    /// Nothing is known to wait in the file or on its way from it.
-    fn is_empty(&self) -> bool {
-        self.synced && self.claimed.is_empty() && self.stored_total() == 0
-    }
-
-    /// The next leased report, for a place that is free. The file counts its
-    /// row among the pending ones until the outcome is written, so from here
-    /// until `sent` it is taken off what `queue_depth` and `pending` call
-    /// waiting.
-    fn start_next(&mut self) -> Option<Job> {
-        let job = self.claimed.pop_front()?;
-        self.sending += 1;
-        *self.beside.entry(job.reporter.model_label).or_default() -= 1;
-        Some(job)
-    }
-
-    /// The attempt at a report of `model` taken with `start_next` has ended.
-    fn sent(&mut self, model: ModelLabel) {
-        self.sending = self.sending.saturating_sub(1);
-        *self.beside.entry(model).or_default() += 1;
+        self.waiting.is_empty() && self.in_flight == 0 && self.drops_being_logged == 0
     }
 }
 
@@ -303,15 +183,11 @@ impl OutboxState {
 enum GiveUp {
     /// Pushed out of a full queue; it was never sent.
     QueueFull,
-    /// Removed from an outbox at its bound, where it had waited longest.
-    OutboxFull,
     /// No attempt fits before its deadline any more, after this many
-    /// attempts, the last of which ended like this and took this long (a
-    /// report taken from the outbox past its deadline had its last attempt
-    /// under an earlier lease, and how long that took is not kept).
+    /// attempts, the last of which ended like this and took this long.
     Deadline {
         attempts: u32,
-        last_attempt: Option<(UsageReportOutcome, Option<Duration>)>,
+        last_attempt: Option<(UsageReportOutcome, Duration)>,
     },
 }
 
@@ -320,65 +196,6 @@ struct Attempt {
     answer: Result<reqwest::StatusCode, reqwest::Error>,
     outcome: UsageReportOutcome,
     elapsed: Duration,
-}
-
-/// Where the reports of the outbox are sent. Read from the configuration of
-/// the running process, never from the file: neither the URL nor the bearer
-/// is written to disk.
-struct Endpoint {
-    client: reqwest::Client,
-    cloud_api_url: String,
-    url: String,
-    authorization: String,
-}
-
-/// The durable outbox of a delivery and what goes with it.
-struct Outbox {
-    store: Store<Job>,
-    endpoint: Endpoint,
-    /// How long a claimed report is this process's: two attempt timeouts
-    /// (waiting for a place, then the attempt) and a margin.
-    lease: Duration,
-    /// What must be left of a lease, beyond the attempt timeout, for the
-    /// attempt to start.
-    lease_slack: Duration,
-    /// Reports handed to the store whose transaction has not been heard of.
-    in_transit: AtomicUsize,
-    /// Wakes the dispatcher: a place is free, or a report was settled.
-    wake: tokio::sync::Notify,
-    /// True from shutdown on. Ends the pauses of the places.
-    stopping: watch::Sender<bool>,
-    /// The model labels read back from the file (`MAX_STORED_MODEL_LABELS`).
-    labels: Mutex<HashSet<&'static str>>,
-}
-
-impl Outbox {
-    /// Hand `job` to the store. `None` when the store took it; otherwise the
-    /// job back, and why.
-    fn keep(&self, job: Job, max_buffered: usize) -> Option<(Job, Refused)> {
-        // Counted before the store has it, so that it is never out of sight.
-        self.in_transit.fetch_add(1, Ordering::SeqCst);
-        let refused = self.store.offer(job, max_buffered).err();
-        if refused.is_some() {
-            self.in_transit.fetch_sub(1, Ordering::SeqCst);
-        }
-        refused
-    }
-
-    /// `label` as a `ModelLabel`. A label is leaked once and reused.
-    fn label(&self, label: Option<String>) -> ModelLabel {
-        let label = label?;
-        let mut labels = self.labels.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(known) = labels.get(label.as_str()) {
-            return Some(known);
-        }
-        if labels.len() >= MAX_STORED_MODEL_LABELS {
-            return None;
-        }
-        let leaked: &'static str = Box::leak(label.into_boxed_str());
-        labels.insert(leaked);
-        Some(leaked)
-    }
 }
 
 /// What was pending when `drain` started and what it left behind.
@@ -408,9 +225,10 @@ pub struct UsageReportDelivery {
     state: Mutex<State>,
     /// Notified whenever nothing is pending any more.
     idle: tokio::sync::Notify,
-    /// The outbox on disk (`VLLM_PROXY_USAGE_REPORT_OUTBOX_PATH`). `None`:
-    /// reports are delivered from memory and nothing below it is used.
-    outbox: Option<Outbox>,
+    /// The outbox on disk (`VLLM_PROXY_USAGE_REPORT_OUTBOX_PATH`) and the
+    /// delivery from it. `None`: reports are delivered from memory, by what
+    /// is in this file, and nothing of the outbox exists.
+    outbox: Option<outbox::Outbox>,
 }
 
 impl Default for UsageReportDelivery {
@@ -460,8 +278,10 @@ impl UsageReportDelivery {
     /// fails here: while the file cannot be used, reports are delivered from
     /// memory. Must be called inside a Tokio runtime.
     ///
-    /// The outbox is always delivered under a cap, so a `max_in_flight` of 0
-    /// becomes `UsageReportPolicy::OUTBOX_MAX_IN_FLIGHT`.
+    /// An outbox is always delivered under a cap, so a `max_in_flight` of 0
+    /// becomes `UsageReportPolicy::OUTBOX_MAX_IN_FLIGHT`, and its reports are
+    /// sent until they are accepted or too old, whatever `max_attempts` says
+    /// (`usage_report_outbox.rs`).
     pub fn with_outbox(
         mut policy: UsageReportPolicy,
         outbox: UsageOutboxConfig,
@@ -472,38 +292,16 @@ impl UsageReportDelivery {
         if policy.max_in_flight == 0 {
             policy.max_in_flight = UsageReportPolicy::OUTBOX_MAX_IN_FLIGHT;
         }
-        let lease = policy.attempt_timeout * 2 + outbox.lease_margin;
-        info!(
-            path = %outbox.path.display(),
-            max_pending = outbox.max_pending,
-            max_rejected = outbox.max_rejected,
-            commit_interval_ms = outbox.commit_interval.as_millis() as u64,
-            lease_secs = lease.as_secs(),
-            until_accepted = policy.attempt_cap().is_none(),
-            "Usage report outbox enabled: a report is kept on disk until the billing API \
-             accepts it or refuses it for good"
-        );
-        let (events, from_store) = mpsc::unbounded_channel();
+        policy.max_attempts = UsageReportPolicy::UNTIL_ACCEPTED;
         let mut delivery = Self::with(policy);
-        delivery.state = Mutex::new(State {
-            outbox: Some(OutboxState::new()),
-            ..State::default()
-        });
-        delivery.outbox = Some(Outbox {
-            lease,
-            lease_slack: outbox.lease_margin / 4,
-            store: Store::start(outbox, events),
-            endpoint: Endpoint {
-                client: http_client,
-                cloud_api_url: cloud_api_url.to_string(),
-                url: format!("{cloud_api_url}/v1/internal/usage"),
-                authorization: format!("Bearer {usage_token}"),
-            },
-            in_transit: AtomicUsize::new(0),
-            wake: tokio::sync::Notify::new(),
-            stopping: watch::Sender::new(false),
-            labels: Mutex::default(),
-        });
+        let (outbox, from_store) = outbox::Outbox::start(
+            &delivery.policy,
+            outbox,
+            http_client,
+            cloud_api_url,
+            usage_token,
+        );
+        delivery.outbox = Some(outbox);
         delivery.say_configured();
         let delivery = Arc::new(delivery);
         tokio::spawn(Arc::clone(&delivery).dispatch(from_store));
@@ -542,29 +340,24 @@ impl UsageReportDelivery {
     }
 
     /// Reports waiting for a place, and reports holding one. With an outbox
-    /// the waiting ones are those in memory and the rows of the file nobody
-    /// here is sending, whichever process wrote them.
+    /// the waiting ones are the rows of the file nobody here is sending,
+    /// whichever process wrote them, and what this process holds in memory.
     pub fn pending(&self) -> (usize, usize) {
-        let state = self.state();
-        let mut waiting = state.waiting.len();
-        if let (Some(outbox), Some(kept)) = (&self.outbox, &state.outbox) {
-            let stored = usize::try_from(kept.stored_total()).unwrap_or(usize::MAX);
-            waiting = waiting
-                .saturating_add(stored.saturating_sub(kept.sending))
-                .saturating_add(outbox.in_transit.load(Ordering::SeqCst));
+        if let Some(outbox) = &self.outbox {
+            return outbox.pending();
         }
-        (waiting, state.in_flight)
+        let state = self.state();
+        (state.waiting.len(), state.in_flight)
     }
 
     /// Nothing waits, nothing is in flight, and every drop has been logged.
-    /// With an outbox, the file holds nothing either and nothing is on its
+    /// With an outbox: the file holds nothing either, and nothing is on its
     /// way into it.
     fn is_idle(&self) -> bool {
-        self.state().is_idle()
-            && self
-                .outbox
-                .as_ref()
-                .is_none_or(|outbox| outbox.in_transit.load(Ordering::SeqCst) == 0)
+        match &self.outbox {
+            Some(outbox) => outbox.is_idle(),
+            None => self.state().is_idle(),
+        }
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -579,24 +372,9 @@ impl UsageReportDelivery {
     /// a push as well: the file is written by the store's own thread.
     /// Must be called inside a Tokio runtime.
     pub(crate) fn submit(self: &Arc<Self>, job: Job) {
-        let Some(outbox) = &self.outbox else {
-            return self.hold(job);
-        };
-        if let Some((job, why)) = outbox.keep(job, self.policy.max_queued) {
-            // The file cannot take it now. It is delivered all the same, from
-            // memory, and not kept across a restart.
-            self.count(
-                "inference_proxy_usage_report_outbox_bypassed_total",
-                &job.reporter,
-                ("reason", why.as_label()),
-            );
-            self.hold(job);
+        if let Some(outbox) = &self.outbox {
+            return outbox.submit(self, job);
         }
-    }
-
-    /// Deliver `job` from memory: at once while there is a place, from the
-    /// queue otherwise.
-    fn hold(self: &Arc<Self>, job: Job) {
         let model = job.reporter.model_label;
         let evicted = {
             let mut state = self.state();
@@ -680,8 +458,6 @@ impl UsageReportDelivery {
 
     /// Send `job` until the billing API accepts it, answers something final,
     /// the attempts run out or no attempt fits before its deadline any more.
-    /// (A report taken from the outbox gets one attempt at a time instead,
-    /// and what follows is written to its row: `deliver_stored`.)
     async fn deliver(&self, job: &Job) {
         let reporter = &job.reporter;
         let timeout = self.policy.attempt_timeout;
@@ -712,7 +488,7 @@ impl UsageReportDelivery {
             }
             attempts = attempts.saturating_add(1);
             let attempt = self.attempt(job).await;
-            last_attempt = Some((attempt.outcome, Some(attempt.elapsed)));
+            last_attempt = Some((attempt.outcome, attempt.elapsed));
 
             let retry_reason = retry_reason(attempt.outcome, &attempt.answer);
             if let (Some(reason), true) = (retry_reason, attempts < self.policy.max_attempts) {
@@ -736,156 +512,6 @@ impl UsageReportDelivery {
                 continue;
             }
             return self.end(job, &attempt, attempts, retry_reason);
-        }
-    }
-
-    /// One attempt at a report taken from the outbox, and its outcome
-    /// written to the row: accepted and the row is deleted; refused for good
-    /// and it moves to `rejected`; failed in a way that can pass and it is
-    /// due again after the backoff, its lease given back, for whichever
-    /// process is next.
-    ///
-    /// True after such a failure: the place is then to stay taken for a while
-    /// (`pause`), so that a billing API that is down or struggling gets fewer
-    /// requests, not the whole backlog one report after the other.
-    async fn deliver_stored(&self, outbox: &Outbox, job: &Job, row: &Stored) -> bool {
-        let reporter = &job.reporter;
-        let timeout = self.policy.attempt_timeout;
-        // The report waited for its place longer than its lease allows for:
-        // another process may take it while this one is still sending. It is
-        // given back and claimed again, with a new lease.
-        let lease_left = row.lease_until.saturating_duration_since(Instant::now());
-        if lease_left < timeout + outbox.lease_slack {
-            outbox.store.settle(Settle::Release { id: row.id });
-            if let Some(kept) = &mut self.state().outbox {
-                kept.look = true;
-            }
-            return false;
-        }
-        // With a deadline, a report has a maximum age, whoever kept it.
-        if self.time_left(job).is_some_and(|left| left < timeout) {
-            self.give_up(
-                job,
-                GiveUp::Deadline {
-                    attempts: row.attempts,
-                    last_attempt: row.last_failure.map(|(_, outcome)| (outcome, None)),
-                },
-            );
-            outbox.store.settle(Settle::Delete { id: row.id });
-            return false;
-        }
-        if let Some((reason, _)) = row.last_failure {
-            self.count(
-                "inference_proxy_usage_report_retries_total",
-                reporter,
-                ("reason", reason),
-            );
-        }
-        let attempt = self.attempt(job).await;
-        let attempts = row.attempts.saturating_add(1);
-        let status = attempt.answer.as_ref().ok().map(|status| status.as_u16());
-
-        let reason = retry_reason(attempt.outcome, &attempt.answer)
-            .or_else(|| caller_refused(&attempt.answer));
-        let Some(reason) = reason else {
-            // An answer about this report: the billing API is there.
-            if let Some(kept) = &mut self.state().outbox {
-                kept.failing_streak = 0;
-            }
-            self.end(job, &attempt, attempts, None);
-            outbox
-                .store
-                .settle(if attempt.outcome == UsageReportOutcome::Accepted {
-                    Settle::Delete { id: row.id }
-                } else {
-                    Settle::Reject {
-                        id: row.id,
-                        reason: "rejected",
-                        status,
-                        outcome: attempt.outcome.as_label(),
-                        attempts,
-                    }
-                });
-            return false;
-        };
-        if attempts >= self.policy.max_attempts {
-            // An explicit cap is used up. The report is kept where a person
-            // can look at it and send it again.
-            self.end(job, &attempt, attempts, Some(reason));
-            outbox.store.settle(Settle::Reject {
-                id: row.id,
-                reason: "attempts_exhausted",
-                status,
-                outcome: attempt.outcome.as_label(),
-                attempts,
-            });
-        } else {
-            let delay = self.backoff(attempts);
-            if self
-                .time_left(job)
-                .is_some_and(|left| left < delay + timeout)
-            {
-                self.give_up(
-                    job,
-                    GiveUp::Deadline {
-                        attempts,
-                        last_attempt: Some((attempt.outcome, Some(attempt.elapsed))),
-                    },
-                );
-                outbox.store.settle(Settle::Delete { id: row.id });
-            } else {
-                self.say_retrying(job, &attempt, attempts, delay);
-                outbox.store.settle(Settle::Retry {
-                    id: row.id,
-                    attempts,
-                    next_attempt_at_ms: usage_outbox::now_ms()
-                        .saturating_add(delay.as_millis() as i64),
-                    last_outcome: reason,
-                });
-                // The dispatcher looks again when the retry is due.
-                let due_at = Instant::now() + delay;
-                if let Some(kept) = &mut self.state().outbox {
-                    kept.look_at = Some(kept.look_at.map_or(due_at, |at| at.min(due_at)));
-                }
-            }
-        }
-        true
-    }
-
-    /// Keep a place taken after an attempt failed in a way that can pass.
-    /// The pause is the backoff of the number of such failures in a row
-    /// across the process, so it doubles while nothing gets through and is
-    /// back to the shortest after the first report that does. Shutdown ends
-    /// it at once.
-    ///
-    /// The reports leased ahead and not started are given back: nothing may
-    /// start them for a while, and a lease nobody uses only keeps another
-    /// process from sending them.
-    async fn pause(&self, outbox: &Outbox) {
-        let (delay, unstarted) = {
-            let mut state = self.state();
-            let Some(kept) = &mut state.outbox else {
-                return;
-            };
-            if kept.stopping {
-                return;
-            }
-            kept.failing_streak = kept.failing_streak.saturating_add(1);
-            kept.look |= !kept.claimed.is_empty();
-            let delay = self
-                .backoff(kept.failing_streak)
-                .min(outbox.store.config().max_pause);
-            (delay, std::mem::take(&mut kept.claimed))
-        };
-        for job in unstarted {
-            if let Some(row) = &job.stored {
-                outbox.store.settle(Settle::Release { id: row.id });
-            }
-        }
-        let mut stopping = outbox.stopping.subscribe();
-        tokio::select! {
-            _ = tokio::time::sleep(delay) => {}
-            _ = stopping.wait_for(|stopping| *stopping) => {}
         }
     }
 
@@ -1040,32 +666,6 @@ impl UsageReportDelivery {
         let reporter = &job.reporter;
         let since_completion_ms = job.since_completion().as_millis() as u64;
         match why {
-            GiveUp::OutboxFull => {
-                let outcome = UsageReportOutcome::QueueFull;
-                record_usage_report_outcome(reporter, outcome, None);
-                self.count(
-                    "inference_proxy_usage_reports_dropped_total",
-                    reporter,
-                    ("reason", "queue_full"),
-                );
-                warn!(
-                    request_id = %reporter.request_id.as_deref().unwrap_or(""),
-                    org_id = %reporter.org_id.as_deref().unwrap_or(""),
-                    workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
-                    api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
-                    model = %reporter.model_name,
-                    auth_path = reporter.request_source.auth_path.as_label(),
-                    ingress_route = reporter.request_source.ingress_route.as_label(),
-                    outcome = outcome.as_label(),
-                    since_completion_ms,
-                    max_pending = self
-                        .outbox
-                        .as_ref()
-                        .map(|outbox| outbox.store.config().max_pending),
-                    "Usage report dropped: the outbox is full and this report waited \
-                     longest — usage NOT billed"
-                );
-            }
             GiveUp::QueueFull => {
                 let outcome = UsageReportOutcome::QueueFull;
                 record_usage_report_outcome(reporter, outcome, None);
@@ -1098,7 +698,7 @@ impl UsageReportDelivery {
                 record_usage_report_outcome(
                     reporter,
                     outcome,
-                    last_attempt.and_then(|(_, elapsed)| elapsed),
+                    last_attempt.map(|(_, elapsed)| elapsed),
                 );
                 self.count(
                     "inference_proxy_usage_reports_dropped_total",
@@ -1155,7 +755,7 @@ impl UsageReportDelivery {
     /// With an outbox nothing has to be delivered before the process ends:
     /// what is still in memory is written to the file, the attempts in
     /// flight get `shutdown_drain`, and the leases are given back so that the
-    /// next process can send what is left at once (`close`).
+    /// next process can send what is left at once.
     pub async fn drain_at_shutdown(&self) -> Option<Drained> {
         if let Some(outbox) = &self.outbox {
             return Some(self.close(outbox).await);
@@ -1182,432 +782,6 @@ impl UsageReportDelivery {
         Some(drained)
     }
 
-    /// Shutdown with an outbox. Reports waiting in memory are handed to the
-    /// store, the attempts in flight get `shutdown_drain` to end, and the
-    /// store then writes what it was handed, gives back every lease this
-    /// process holds and closes the file. `Drained` counts what this process
-    /// still held itself; `left_waiting` is what stayed in memory only.
-    async fn close(&self, outbox: &Outbox) -> Drained {
-        let started_at = Instant::now();
-        let (in_memory, unstarted, in_flight) = {
-            let mut state = self.state();
-            let state = &mut *state;
-            let kept = state.outbox.get_or_insert_with(OutboxState::new);
-            kept.stopping = true;
-            // Leased and not started: given back with every other lease.
-            let unstarted = std::mem::take(&mut kept.claimed);
-            let in_memory = std::mem::take(&mut state.waiting);
-            (in_memory, unstarted, state.in_flight)
-        };
-        drop(unstarted);
-        // Ends the pause of every place, and keeps new ones from starting.
-        outbox.stopping.send_replace(true);
-        let pending = in_memory.len() + outbox.in_transit.load(Ordering::SeqCst) + in_flight;
-
-        // A report the file cannot take goes back to waiting for a place.
-        let mut refused = VecDeque::new();
-        for job in in_memory {
-            let model = job.reporter.model_label;
-            match outbox.keep(job, usize::MAX) {
-                None => self.waiting_gauge(model, Step::Down),
-                Some((job, _)) => refused.push_back(job),
-            }
-        }
-        if !refused.is_empty() {
-            let mut state = self.state();
-            refused.append(&mut state.waiting);
-            state.waiting = refused;
-        }
-
-        let give_up_at = tokio::time::Instant::now() + self.policy.shutdown_drain;
-        loop {
-            // Registered before the state is read, as in `drain`.
-            let ended = self.idle.notified();
-            tokio::pin!(ended);
-            ended.as_mut().enable();
-            let none_left = {
-                let state = self.state();
-                state.in_flight == 0 && state.waiting.is_empty()
-            };
-            if none_left || tokio::time::timeout_at(give_up_at, ended).await.is_err() {
-                break;
-            }
-        }
-        let (left_waiting, left_in_flight, left_sending) = {
-            let state = self.state();
-            let sending = state.outbox.as_ref().map_or(0, |kept| kept.sending);
-            (state.waiting.len(), state.in_flight, sending)
-        };
-
-        // The disk may be why the process is stopping: this is not waited
-        // for without end either.
-        let closed = tokio::time::timeout(OUTBOX_CLOSE_TIMEOUT, outbox.store.close()).await;
-        let waited = started_at.elapsed();
-        match closed {
-            Ok(Ok(Some(left))) => info!(
-                pending,
-                in_outbox = left.pending_total(),
-                left_in_flight,
-                waited_ms = waited.as_millis() as u64,
-                "Usage report outbox closed for shutdown: what it holds is sent by the next \
-                 process"
-            ),
-            _ => warn!(
-                pending,
-                left_in_flight,
-                waited_ms = waited.as_millis() as u64,
-                "Usage report outbox could not be closed for shutdown: what was not written \
-                 is lost, and the leases of this process are left to run out"
-            ),
-        }
-        // Reports that were only ever in memory, because the file could not
-        // take them, end with the process as they do without an outbox.
-        let left_in_memory = left_waiting + left_in_flight.saturating_sub(left_sending);
-        if left_in_memory > 0 {
-            warn!(
-                pending,
-                left_waiting,
-                left_in_flight = left_in_flight.saturating_sub(left_sending),
-                waited_ms = waited.as_millis() as u64,
-                "Usage reports left undelivered at shutdown — usage NOT billed"
-            );
-        }
-        Drained {
-            pending,
-            left_waiting,
-            left_in_flight,
-            waited,
-        }
-    }
-
-    /// The task that moves reports from the store to the places: it hears
-    /// what the store did, starts the reports it leased as places come free
-    /// and claims more. It also publishes the outbox gauges, here rather than
-    /// on the store's thread so that every series of this module is written
-    /// on the runtime. One per delivery, for the life of the process.
-    async fn dispatch(self: Arc<Self>, mut from_store: mpsc::UnboundedReceiver<StoreEvent>) {
-        let Some(outbox) = &self.outbox else {
-            return;
-        };
-        let mut recheck = tokio::time::interval(outbox.store.config().recheck_interval);
-        recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            let look_at = self.state().outbox.as_ref().and_then(|kept| kept.look_at);
-            let retry_due = async {
-                match look_at {
-                    Some(at) => tokio::time::sleep_until(at.into()).await,
-                    None => std::future::pending().await,
-                }
-            };
-            let mut rechecking = false;
-            tokio::select! {
-                event = from_store.recv() => match event {
-                    Some(event) => self.on_store_event(outbox, event),
-                    None => return,
-                },
-                _ = outbox.wake.notified() => {}
-                _ = recheck.tick() => rechecking = true,
-                _ = retry_due => {}
-            }
-            while let Ok(event) = from_store.try_recv() {
-                self.on_store_event(outbox, event);
-            }
-            self.advance(outbox, rechecking);
-            self.publish(outbox);
-            if self.is_idle() {
-                self.idle.notify_waiters();
-            }
-        }
-    }
-
-    /// Take in what the store did.
-    fn on_store_event(self: &Arc<Self>, outbox: &Outbox, event: StoreEvent) {
-        match event {
-            usage_outbox::Event::Committed(committed) => {
-                let usage_outbox::Committed {
-                    stored,
-                    evicted,
-                    rejected_evicted,
-                    claimed,
-                    next_due_ms,
-                    stats,
-                } = committed;
-                let (now, now_ms) = (Instant::now(), usage_outbox::now_ms());
-                let claimed = claimed.map(|rows| {
-                    rows.into_iter()
-                        .map(|row| self.job_from(outbox, row, now, now_ms))
-                        .collect::<Vec<_>>()
-                });
-                let pending = stats
-                    .pending
-                    .into_iter()
-                    .map(|(label, rows)| (outbox.label(label), rows))
-                    .collect();
-                let (back, in_memory) = {
-                    let mut state = self.state();
-                    let state = &mut *state;
-                    let kept = state.outbox.get_or_insert_with(OutboxState::new);
-                    let back = !kept.available;
-                    kept.available = true;
-                    kept.synced = true;
-                    kept.stored = pending;
-                    kept.oldest_completed_at_ms = stats.oldest_completed_at_ms;
-                    kept.rejected = stats.rejected;
-                    if stored > 0 {
-                        kept.look = true;
-                    }
-                    if let Some(claimed) = claimed {
-                        // As many as asked for: there may be more.
-                        let asked = kept.asked.take().unwrap_or(0);
-                        kept.look |= claimed.len() >= asked;
-                        if let Some(due_ms) = next_due_ms {
-                            let wait = u64::try_from(due_ms.saturating_sub(now_ms)).unwrap_or(0);
-                            let due_at = now + Duration::from_millis(wait);
-                            kept.look_at = Some(kept.look_at.map_or(due_at, |at| at.min(due_at)));
-                        }
-                        if kept.stopping {
-                            // Too late to start them; `close` gives every
-                            // lease back.
-                            drop(claimed);
-                        } else {
-                            kept.claimed.extend(claimed);
-                        }
-                    }
-                    // The file is usable again: what waited in memory in the
-                    // meantime is written to it after all.
-                    let in_memory = if back && !kept.stopping {
-                        std::mem::take(&mut state.waiting)
-                    } else {
-                        VecDeque::new()
-                    };
-                    (back, in_memory)
-                };
-                outbox.in_transit.fetch_sub(stored, Ordering::SeqCst);
-                if back {
-                    info!(
-                        path = %outbox.store.config().path.display(),
-                        moved_from_memory = in_memory.len(),
-                        "Usage report outbox available again"
-                    );
-                }
-                for job in in_memory {
-                    self.waiting_gauge(job.reporter.model_label, Step::Down);
-                    if let Some((job, _)) = outbox.keep(job, usize::MAX) {
-                        self.hold(job);
-                    }
-                }
-                for row in evicted {
-                    let job = self.job_from(outbox, row, now, now_ms);
-                    self.give_up(&job, GiveUp::OutboxFull);
-                }
-                if rejected_evicted > 0 {
-                    metrics::counter!("inference_proxy_usage_report_outbox_rejected_evicted_total")
-                        .increment(rejected_evicted as u64);
-                }
-            }
-            usage_outbox::Event::Failed {
-                error,
-                reports,
-                claim,
-            } => {
-                let was_available = {
-                    let mut state = self.state();
-                    let kept = state.outbox.get_or_insert_with(OutboxState::new);
-                    kept.synced = true;
-                    if claim {
-                        kept.asked = None;
-                        kept.look = true;
-                    }
-                    std::mem::replace(&mut kept.available, false)
-                };
-                if let Some((op, error)) = error {
-                    metrics::counter!("inference_proxy_usage_report_outbox_errors_total", "op" => op)
-                        .increment(1);
-                    let path = outbox.store.config().path.display();
-                    if was_available {
-                        error!(
-                            path = %path,
-                            op,
-                            error = %error,
-                            unstored = reports.len(),
-                            "Usage report outbox unavailable: reports are delivered from memory \
-                             and not kept across a restart until it is back"
-                        );
-                    } else {
-                        // Said once; the counter has every later try.
-                        debug!(path = %path, op, error = %error, "Usage report outbox still unavailable");
-                    }
-                }
-                outbox.in_transit.fetch_sub(reports.len(), Ordering::SeqCst);
-                for job in reports {
-                    self.count(
-                        "inference_proxy_usage_report_outbox_bypassed_total",
-                        &job.reporter,
-                        ("reason", "write_failed"),
-                    );
-                    self.hold(job);
-                }
-            }
-            usage_outbox::Event::Warning { op, error } => {
-                metrics::counter!("inference_proxy_usage_report_outbox_errors_total", "op" => op)
-                    .increment(1);
-                warn!(op, error = %error, "Usage report outbox: a maintenance step failed");
-            }
-        }
-    }
-
-    /// Start leased reports in the places that are free, and claim more when
-    /// there is room for them. `rechecking`: the file is looked at whether
-    /// or not anything here says it changed.
-    fn advance(self: &Arc<Self>, outbox: &Outbox, rechecking: bool) {
-        let cap = self.policy.max_in_flight.max(1);
-        let (start, ask) = {
-            let mut state = self.state();
-            let state = &mut *state;
-            let Some(kept) = &mut state.outbox else {
-                return;
-            };
-            if kept.stopping {
-                return;
-            }
-            let mut start = Vec::new();
-            while state.in_flight < cap {
-                let Some(job) = kept.start_next() else {
-                    break;
-                };
-                state.in_flight += 1;
-                start.push(job);
-            }
-            if kept.look_at.is_some_and(|at| at <= Instant::now()) {
-                kept.look_at = None;
-                kept.look = true;
-            }
-            kept.look |= rechecking;
-            // One round of reports is leased ahead, so that a place that
-            // comes free finds its next report here. Not while attempts are
-            // failing: a leased report nobody starts is a lease running out.
-            let free = cap.saturating_sub(state.in_flight);
-            let ahead = if kept.failing_streak == 0 { cap } else { 0 };
-            let want = (free + ahead).saturating_sub(kept.claimed.len());
-            let ask =
-                (want > 0 && kept.look && kept.asked.is_none() && kept.available).then_some(want);
-            if ask.is_some() {
-                kept.asked = ask;
-                kept.look = false;
-            }
-            (start, ask)
-        };
-        for job in start {
-            let model = job.reporter.model_label;
-            let place = Place {
-                delivery: Arc::clone(self),
-                model,
-                held: true,
-            };
-            self.in_flight_gauge(model, Step::Up);
-            tokio::spawn(place.work(job));
-        }
-        match ask {
-            Some(want) => outbox.store.claim(want, outbox.lease),
-            // Fresh numbers, and the way an unavailable store is tried again.
-            None if rechecking => outbox.store.sync(),
-            None => {}
-        }
-    }
-
-    /// The outbox gauges, and `queue_depth`, which with an outbox is set
-    /// from the rows of the file rather than counted up and down: the file
-    /// is shared, and a row another process sent never passed through here.
-    fn publish(&self, outbox: &Outbox) {
-        let (available, stored, mut waiting, oldest_completed_at_ms, rejected) = {
-            let state = self.state();
-            let Some(kept) = &state.outbox else {
-                return;
-            };
-            (
-                kept.available && outbox.store.is_available(),
-                kept.stored.clone(),
-                kept.beside.clone(),
-                kept.oldest_completed_at_ms,
-                kept.rejected,
-            )
-        };
-        metrics::gauge!("inference_proxy_usage_report_outbox_available").set(if available {
-            1.0
-        } else {
-            0.0
-        });
-        for (model, rows) in stored {
-            model_gauge!(model, "inference_proxy_usage_report_outbox_pending").set(rows as f64);
-            *waiting.entry(model).or_default() += i64::try_from(rows).unwrap_or(i64::MAX);
-        }
-        for (model, waiting) in waiting {
-            model_gauge!(model, "inference_proxy_usage_report_queue_depth")
-                .set(waiting.max(0) as f64);
-        }
-        let oldest_age_ms =
-            oldest_completed_at_ms.map_or(0, |at| usage_outbox::now_ms().saturating_sub(at).max(0));
-        metrics::gauge!("inference_proxy_usage_report_outbox_oldest_pending_age_seconds")
-            .set(oldest_age_ms as f64 / 1000.0);
-        metrics::gauge!("inference_proxy_usage_report_outbox_rejected").set(rejected as f64);
-    }
-
-    /// A row of the outbox as a report to send. Who it is for is read from
-    /// the report itself; where it goes and the bearer are the running
-    /// process's.
-    fn job_from(
-        self: &Arc<Self>,
-        outbox: &Outbox,
-        row: usage_outbox::Row,
-        now: Instant,
-        now_ms: i64,
-    ) -> Job {
-        #[derive(Default, serde::Deserialize)]
-        struct Subject {
-            organization_id: Option<String>,
-            workspace_id: Option<String>,
-            api_key_id: Option<String>,
-            model: Option<String>,
-        }
-        let subject: Subject = serde_json::from_str(&row.body).unwrap_or_default();
-        let age = Duration::from_millis(
-            u64::try_from(now_ms.saturating_sub(row.completed_at_ms)).unwrap_or(0),
-        );
-        Job {
-            reporter: UsageReporter {
-                http_client: outbox.endpoint.client.clone(),
-                cloud_api_url: outbox.endpoint.cloud_api_url.clone(),
-                model_name: subject.model.unwrap_or_default(),
-                // The bearer is on the job; the reporter of a stored report
-                // is only read for ids and labels.
-                cloud_api_usage_token: None,
-                org_id: subject.organization_id,
-                workspace_id: subject.workspace_id,
-                api_key_id: subject.api_key_id,
-                // Already in the report, when the request had one.
-                discount_to_user: None,
-                model_label: outbox.label(row.model_label),
-                request_id: row.request_id,
-                request_source: RequestSource {
-                    auth_path: auth_path_from(&row.auth_path),
-                    ingress_route: ingress_route_from(&row.ingress_route),
-                },
-                delivery: Arc::clone(self),
-            },
-            url: outbox.endpoint.url.clone(),
-            authorization: outbox.endpoint.authorization.clone(),
-            body: bytes::Bytes::from(row.body),
-            completed_at: now,
-            stored: Some(Stored {
-                id: row.id,
-                attempts: row.attempts,
-                last_failure: row.last_outcome.as_deref().and_then(passing_failure),
-                age,
-                lease_until: now + outbox.lease,
-            }),
-        }
-    }
-
     /// One more on a per-report delivery counter.
     fn count(
         &self,
@@ -1622,21 +796,7 @@ impl UsageReportDelivery {
 
     /// One more (`Step::Up`) or one fewer report of `model` waiting for a
     /// place; `Step::None` only makes the series exist.
-    ///
-    /// With an outbox the gauge is not stepped: it is set from the rows of
-    /// the file (`publish`), and what happens here is kept as the difference
-    /// to that count.
     fn waiting_gauge(&self, model: ModelLabel, step: Step) {
-        if self.outbox.is_some() {
-            if let Some(kept) = &mut self.state().outbox {
-                *kept.beside.entry(model).or_default() += match step {
-                    Step::Up => 1,
-                    Step::Down => -1,
-                    Step::None => 0,
-                };
-            }
-            return;
-        }
         if self.extended {
             step.apply(model_gauge!(
                 model,
@@ -1687,21 +847,7 @@ impl Place {
     async fn work(mut self, first: Job) {
         let mut job = first;
         loop {
-            match (&self.delivery.outbox, &job.stored) {
-                (Some(outbox), Some(row)) => {
-                    let failed = {
-                        let _sending = Sending {
-                            delivery: &self.delivery,
-                            model: self.model,
-                        };
-                        self.delivery.deliver_stored(outbox, &job, row).await
-                    };
-                    if failed {
-                        self.delivery.pause(outbox).await;
-                    }
-                }
-                _ => self.delivery.deliver(&job).await,
-            }
+            self.delivery.deliver(&job).await;
             match self.next() {
                 Some(next) => job = next,
                 None => return,
@@ -1715,43 +861,24 @@ impl Place {
     /// The next report to deliver in this place, or `None` after giving the
     /// place back because nothing waits. One lock for both, so a report
     /// queued in between cannot be left waiting with a place free.
-    ///
-    /// With an outbox, a report waiting in memory goes first (the file could
-    /// not take it, so it is not kept anywhere else), then the reports
-    /// leased from the file.
     fn next(&mut self) -> Option<Job> {
         let (next, idle) = {
             let mut state = self.delivery.state();
-            let state = &mut *state;
-            let mut next = state.waiting.pop_front();
-            if let (None, Some(kept)) = (&next, &mut state.outbox) {
-                if !kept.stopping {
-                    next = kept.start_next();
-                }
-            }
+            let next = state.waiting.pop_front();
             if next.is_none() {
                 state.in_flight -= 1;
                 self.held = false;
             }
-            // With an outbox, shutdown waits for the places alone.
-            let idle = state.is_idle() || (state.outbox.is_some() && state.in_flight == 0);
-            (next, idle)
+            (next, state.is_idle())
         };
         self.delivery.in_flight_gauge(self.model, Step::Down);
         if let Some(next) = &next {
             self.model = next.reporter.model_label;
-            // A report from the file was never counted as waiting in memory
-            // (`OutboxState::start_next` did its accounting).
-            if next.stored.is_none() {
-                self.delivery.waiting_gauge(self.model, Step::Down);
-            }
+            self.delivery.waiting_gauge(self.model, Step::Down);
             self.delivery.in_flight_gauge(self.model, Step::Up);
         }
         if idle {
             self.delivery.idle.notify_waiters();
-        }
-        if let Some(outbox) = &self.delivery.outbox {
-            outbox.wake.notify_one();
         }
         next
     }
@@ -1767,106 +894,19 @@ impl Drop for Place {
             let idle = {
                 let mut state = self.delivery.state();
                 state.in_flight -= 1;
-                state.is_idle() || (state.outbox.is_some() && state.in_flight == 0)
+                state.is_idle()
             };
             self.delivery.in_flight_gauge(self.model, Step::Down);
             if idle {
                 self.delivery.idle.notify_waiters();
             }
-            if let Some(outbox) = &self.delivery.outbox {
-                outbox.wake.notify_one();
-            }
         }
     }
-}
-
-/// A report from the outbox while a place is sending it: what
-/// `OutboxState::start_next` began ends when this is dropped, with the
-/// attempt, however that ends.
-struct Sending<'a> {
-    delivery: &'a UsageReportDelivery,
-    model: ModelLabel,
-}
-
-impl Drop for Sending<'_> {
-    fn drop(&mut self) {
-        if let Some(kept) = &mut self.delivery.state().outbox {
-            kept.sent(self.model);
-        }
-    }
-}
-
-/// What the store of a delivery reports back.
-type StoreEvent = usage_outbox::Event<Job>;
-
-/// The failures an attempt may be made again after: the `reason` of
-/// `inference_proxy_usage_report_retries_total`, which is also what a row of
-/// the outbox keeps as its `last_outcome`, and the outcome each stands for.
-const PASSING_FAILURES: [(&str, UsageReportOutcome); 7] = [
-    ("timeout", UsageReportOutcome::Timeout),
-    ("connect_error", UsageReportOutcome::ConnectError),
-    ("transport_error", UsageReportOutcome::TransportError),
-    ("http_5xx", UsageReportOutcome::Http5xx),
-    ("http_429", UsageReportOutcome::Http4xx),
-    // With an outbox only (`caller_refused`).
-    ("http_401", UsageReportOutcome::Http4xx),
-    ("http_403", UsageReportOutcome::Http4xx),
-];
-
-/// With an outbox, two more answers leave a report where it is: a 401 and a
-/// 403 say that the billing API does not accept this process (a usage token
-/// that is wrong, or was rotated under a running process), not that anything
-/// is wrong with the report. Every report gets that answer until the token
-/// is put right, so ending them would move the whole traffic of that time to
-/// `rejected` and, past its bound, lose it. They wait instead, and are sent
-/// with the right token.
-///
-/// Without an outbox both are final, as they always were (`retry_reason`):
-/// nothing in memory outlives the restart that puts a token right.
-fn caller_refused(answer: &Result<reqwest::StatusCode, reqwest::Error>) -> Option<&'static str> {
-    match answer {
-        Ok(reqwest::StatusCode::UNAUTHORIZED) => Some("http_401"),
-        Ok(reqwest::StatusCode::FORBIDDEN) => Some("http_403"),
-        _ => None,
-    }
-}
-
-/// The entry of `PASSING_FAILURES` a row's `last_outcome` names.
-fn passing_failure(label: &str) -> Option<(&'static str, UsageReportOutcome)> {
-    PASSING_FAILURES
-        .into_iter()
-        .find(|(reason, _)| *reason == label)
-}
-
-/// The `auth_path` a row was written with. Only requests made with a cloud
-/// API key are reported, so that is what an unknown label is read as.
-fn auth_path_from(label: &str) -> AuthPath {
-    [AuthPath::TrustedConfigToken, AuthPath::CloudApiKey]
-        .into_iter()
-        .find(|path| path.as_label() == label)
-        .unwrap_or(AuthPath::CloudApiKey)
-}
-
-/// The `ingress_route` a row was written with; `other` for an unknown label.
-fn ingress_route_from(label: &str) -> IngressRouteKind {
-    [
-        IngressRouteKind::Canonical,
-        IngressRouteKind::Indexed,
-        IngressRouteKind::Long,
-        IngressRouteKind::LongIndexed,
-        IngressRouteKind::Other,
-        IngressRouteKind::Missing,
-    ]
-    .into_iter()
-    .find(|route| route.as_label() == label)
-    .unwrap_or(IngressRouteKind::Other)
 }
 
 /// Why an attempt with this result may be made again, `None` when the result
 /// is final: a 4xx other than 429 means the billing API refused the report
-/// itself, and sending the same bytes again would get the same answer. Every
-/// reason given here is in `PASSING_FAILURES`. (A report of the outbox is
-/// also sent again after a 401 or a 403: `caller_refused`.)
+/// itself, and sending the same bytes again would get the same answer.
 fn retry_reason(
     outcome: UsageReportOutcome,
     answer: &Result<reqwest::StatusCode, reqwest::Error>,
@@ -1913,7 +953,3 @@ fn source_labels(
 #[cfg(test)]
 #[path = "usage_report_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "usage_report_outbox_tests.rs"]
-mod outbox_tests;

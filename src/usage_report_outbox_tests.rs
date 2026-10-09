@@ -2849,6 +2849,90 @@ async fn a_file_that_is_no_database_is_moved_aside_counted_and_said_once() {
 }
 
 #[tokio::test]
+async fn a_file_emptied_under_the_running_process_is_started_anew_and_its_gauges_follow() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let logs = Logs::default();
+    let _capture = logs.capture();
+    let (_dir, path) = file();
+    let billing = Billing::start(503).await;
+    let delivery = billing.delivery(
+        durable(|_| {}),
+        UsageOutboxConfig {
+            // A report may wait an hour for its next attempt here, so one
+            // that does is not taken for a row of another clock.
+            max_backoff: Duration::from_secs(3_600),
+            ..outbox(&path)
+        },
+    );
+    opened(&path).await;
+    // Twelve reports an earlier process left, which failed and are due again
+    // in an hour: in the file, and in nobody's hands.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.busy_timeout(Duration::from_secs(5)).unwrap();
+        let now_ms = Clock::default().now_ms();
+        for id in ids("held", 12) {
+            conn.execute(
+                "INSERT INTO pending (body, request_id, auth_path, ingress_route, \
+                 completed_at_ms, attempts, next_attempt_at_ms, last_outcome) \
+                 VALUES (?1, ?2, 'cloud_api_key', 'long', ?3, 4, ?4, 'http_5xx')",
+                rusqlite::params![
+                    serde_json::json!({"id": id, "model": "test-model"}).to_string(),
+                    format!("request-{id}"),
+                    now_ms - 60_000,
+                    now_ms + 3_600_000
+                ],
+            )
+            .unwrap();
+        }
+    }
+    eventually("the gauges say what the file holds", || {
+        value(&recorder, PENDING, &[]) == 12.0 && value(&recorder, OLDEST_AGE, &[]) >= 60.0
+    })
+    .await;
+
+    // Somebody cuts the file to nothing. To SQLite that is a database
+    // without tables: what it held is gone, and nothing can bring it back.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    eventually("a new database is started in it", || {
+        value(&recorder, REPLACED, &["why=\"lost\""]) == 1.0
+    })
+    .await;
+    const LOST: &str = "Usage report outbox was deleted or emptied under the running process \
+                        and could not be written back: a new one was started, and the reports \
+                        it held are lost, except those this process was sending";
+    assert_eq!(logs.lines(LOST).len(), 1, "{}", logs.contents());
+    eventually("the file is in use again", || {
+        value(&recorder, AVAILABLE, &[]) == 1.0
+    })
+    .await;
+
+    // The new database has never heard of the reports the old one held, nor
+    // of whose they were. The gauges do not stay at what the old one said:
+    // they say what the file holds now, which is nothing, without a report
+    // having to come in first.
+    eventually("the gauges say the file holds nothing", || {
+        value(&recorder, PENDING, &[]) == 0.0 && value(&recorder, OLDEST_AGE, &[]) == 0.0
+    })
+    .await;
+    assert_eq!(pending_rows(&path), 0);
+    assert_eq!(delivery.pending(), (0, 0));
+    assert_eq!(billing.received(), 0, "none of them was ever in a place");
+    // And reports are kept in it like in any other.
+    billing.report(&delivery, "after", None);
+    eventually("a new report is kept and counted", || {
+        pending_rows(&path) == 1 && value(&recorder, PENDING, &[]) == 1.0
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_file_deleted_under_the_running_process_is_put_back_with_what_it_held() {
     let recorder = PrometheusBuilder::new().build_recorder();
     let _metrics = metrics::set_default_local_recorder(&recorder);

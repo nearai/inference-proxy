@@ -1051,14 +1051,10 @@ async fn a_file_damaged_under_a_running_gateway_never_ends_it_or_costs_a_request
 
 /// `requests` customer requests, sixteen at a time, each of them answered.
 async fn many_chats(gateway: &Gateway, requests: usize) {
-    let left = AtomicUsize::new(requests);
+    // Each of the sixteen takes the next number until they run out.
+    let started = AtomicUsize::new(0);
     futures_util::future::join_all((0..16).map(|_| async {
-        while left
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                left.checked_sub(1)
-            })
-            .is_ok()
-        {
+        while started.fetch_add(1, Ordering::SeqCst) < requests {
             gateway.chat().await;
         }
     }))

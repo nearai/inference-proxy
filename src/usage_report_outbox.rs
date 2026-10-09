@@ -857,7 +857,7 @@ impl UsageReportDelivery {
                         claimed.next_retry_ms,
                     )
                 });
-                let pending = stats
+                let mut pending: Vec<(ModelLabel, u64)> = stats
                     .pending
                     .into_iter()
                     .map(|(label, rows)| (outbox.label(label), rows))
@@ -868,6 +868,18 @@ impl UsageReportDelivery {
                     kept.health = health;
                     kept.stalled = false;
                     kept.synced = true;
+                    // A database keeps a model it holds no report of any
+                    // more, with 0. One started in its place (the file was
+                    // lost, or moved aside) knows nothing of it: the model
+                    // is kept here, with 0, or its gauge would stay at what
+                    // the old database held.
+                    let gone: Vec<ModelLabel> = kept
+                        .stored
+                        .iter()
+                        .map(|(model, _)| *model)
+                        .filter(|model| !pending.iter().any(|(listed, _)| listed == model))
+                        .collect();
+                    pending.extend(gone.into_iter().map(|model| (model, 0)));
                     kept.stored = pending;
                     kept.oldest_completed_at_ms = stats.oldest_completed_at_ms;
                     kept.rejected = stats.rejected;

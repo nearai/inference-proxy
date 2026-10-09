@@ -1272,6 +1272,37 @@ async fn a_gateway_whose_volume_fills_up_keeps_serving_and_recovers_when_there_i
     );
     assert_eq!(gateway.ended(), None, "{}", gateway.log());
 
+    // Nothing can be written to the file now. The first write tried on it
+    // (a lease, an outcome) says so, and from then on it is tried again
+    // every five seconds, each time in vain. That is one state: `available`
+    // never goes back to 1 while the volume is full, and the log says it
+    // once, however long it lasts. (A transaction that writes nothing still
+    // succeeds on a full volume, and proves nothing.)
+    let mut seen_unavailable = false;
+    let watched_from = Instant::now();
+    while watched_from.elapsed() < Duration::from_secs(12) {
+        let metrics = gateway.metrics().await;
+        let available = gauge(&metrics, "available ") == Some(1.0);
+        assert!(
+            !(seen_unavailable && available),
+            "available again on a volume that is full: {:#?}",
+            gateway.outbox_lines()
+        );
+        seen_unavailable |= !available;
+        assert_eq!(gauge(&metrics, "full "), Some(1.0), "{metrics}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        gateway.logged(UNAVAILABLE).len() <= 1,
+        "{:#?}",
+        gateway.outbox_lines()
+    );
+    assert!(
+        gateway.logged(AVAILABLE_AGAIN).is_empty(),
+        "{:#?}",
+        gateway.outbox_lines()
+    );
+
     // cloud-api is back while the volume is still full: what memory holds
     // is delivered from there.
     intake.answer(200);
@@ -1330,8 +1361,144 @@ async fn a_gateway_whose_volume_fills_up_keeps_serving_and_recovers_when_there_i
         .metrics_until("a new report is kept", |metrics| pending(metrics) == 1.0)
         .await;
     assert!(!gateway.log().contains("usage NOT billed"));
+    // The rows of the file could not be leased once cloud-api was back and
+    // the volume still full: unavailable, said once, and once that it ended.
+    assert_eq!(
+        (
+            gateway.logged(UNAVAILABLE).len(),
+            gateway.logged(AVAILABLE_AGAIN).len()
+        ),
+        (1, 1),
+        "{:#?}",
+        gateway.outbox_lines()
+    );
     let stopped = gateway.stop("-TERM").await;
     assert!(stopped.success(), "{stopped:?} {}", gateway.log());
+}
+
+/// The outbox is given a volume far smaller than the size its file may grow
+/// to (a megabyte, and nothing said about the size: a gigabyte). Left to
+/// fill the volume, the file could never be written to again, not even to
+/// remove a report cloud-api accepted, because every change needs room for
+/// its journal first. So the file is kept to what the volume has room for:
+/// it is full by its own size, the volume keeps room, and what the file
+/// holds is sent as soon as cloud-api takes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gateway_on_a_volume_smaller_than_its_outbox_may_grow_keeps_sending_what_it_holds() {
+    if !can_mount_a_volume() {
+        eprintln!(
+            "SKIPPED a_gateway_on_a_volume_smaller_than_its_outbox_may_grow_keeps_sending_what_it_holds: \
+             `unshare -Urm` with a tmpfs mount does not work here, so there is no small volume"
+        );
+        return;
+    }
+    const LIMITED: &str = "The volume of the usage report outbox has no room for \
+                           VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_BYTES and the journal beside it: \
+                           the file is kept to what the volume has room for";
+    const FULL: &str = "Usage report outbox is full: new reports are held in memory and sent \
+                        from there until it has room. What it holds is still sent";
+    let engine = engine().await;
+    let (cloud, intake) = cloud_api(503, 0).await;
+    let dir = tempfile::tempdir().unwrap();
+    let volume = dir.path().join("volume");
+    std::fs::create_dir(&volume).unwrap();
+    let outbox = volume.join("usage-outbox.db");
+    let setup = format!(
+        "mount -t tmpfs -o size=1m tmpfs '{}'",
+        volume.to_str().unwrap()
+    );
+    let env = [
+        (OUTBOX_PATH, outbox.to_str().unwrap()),
+        ("VLLM_PROXY_USAGE_REPORT_INITIAL_BACKOFF_MS", "100"),
+    ];
+    let mut gateway = Gateway::start_in(&engine, &cloud, &env, Some(&setup)).await;
+    let gauge = |metrics: &str, name: &str| {
+        metric(
+            metrics,
+            &format!("inference_proxy_usage_report_outbox_{name}"),
+        )
+    };
+    let pending =
+        |metrics: &str| gauge(metrics, &format!("pending{{model=\"{MODEL}\"}}")).unwrap_or(0.0);
+
+    // It says so when it opens the file: three quarters of the megabyte are
+    // the file's, the rest is the journal's.
+    let limited = gateway.logged(LIMITED);
+    assert_eq!(limited.len(), 1, "{:#?}", gateway.outbox_lines());
+    assert_eq!(limited[0]["max_bytes"], 1_u64 << 30);
+    let limited_to = limited[0]["limited_to"].as_u64().unwrap();
+    assert!(
+        (512 << 10..=768 << 10).contains(&limited_to),
+        "{limited_to}"
+    );
+
+    // cloud-api is down and requests keep completing, until the file is
+    // full: at its own size, on a volume that still has room.
+    let mut requests = 0;
+    let mut metrics = String::new();
+    while gauge(&metrics, "full ") != Some(1.0) {
+        many_chats(&gateway, 500).await;
+        requests += 500;
+        assert!(requests <= 20_000, "the file never filled up: {metrics}");
+        metrics = gateway.metrics().await;
+    }
+    many_chats(&gateway, 300).await;
+    requests += 300;
+    let metrics = gateway
+        .metrics_until("every report is somewhere", |metrics| {
+            gauge(metrics, "unwritten ") == Some(0.0)
+        })
+        .await;
+    let (in_file, in_memory, bytes) = (
+        pending(&metrics),
+        gauge(&metrics, "in_memory ").unwrap(),
+        gauge(&metrics, "bytes ").unwrap(),
+    );
+    println!(
+        "a 1 MiB volume: {requests} requests answered; {in_file} reports in the file ({bytes} \
+         bytes, it may have {limited_to}), {in_memory} held in memory"
+    );
+    assert!(in_file >= 500.0 && in_memory >= 300.0, "{metrics}");
+    assert_eq!(in_file + in_memory, requests as f64, "{metrics}");
+    assert!(bytes <= limited_to as f64, "{metrics}");
+    // Full is not unavailable: the file works.
+    assert_eq!(gauge(&metrics, "available "), Some(1.0), "{metrics}");
+    assert_eq!(gateway.ended(), None, "{}", gateway.log());
+
+    // cloud-api is back. What the file holds is sent, and what memory
+    // holds: every report is accepted, once, and nothing had to be done to
+    // the volume for it.
+    intake.answer(200);
+    eventually("every report is accepted", || {
+        intake.accepted().len() >= requests
+    })
+    .await;
+    let accepted = intake.accepted();
+    let distinct: BTreeSet<&String> = accepted.iter().collect();
+    assert_eq!((accepted.len(), distinct.len()), (requests, requests));
+    let metrics = gateway
+        .metrics_until("the file is empty and has room", |metrics| {
+            gauge(metrics, "full ") == Some(0.0)
+                && gauge(metrics, "in_memory ") == Some(0.0)
+                && pending(metrics) == 0.0
+        })
+        .await;
+    assert_eq!(gauge(&metrics, "available "), Some(1.0), "{metrics}");
+    // It was never unavailable, it was full once, and it said once what
+    // its volume is.
+    assert!(
+        gateway.logged(UNAVAILABLE).is_empty(),
+        "{:#?}",
+        gateway.outbox_lines()
+    );
+    assert_eq!(
+        (gateway.logged(FULL).len(), gateway.logged(LIMITED).len()),
+        (1, 1),
+        "{:#?}",
+        gateway.outbox_lines()
+    );
+    assert!(!gateway.log().contains("usage NOT billed"));
+    assert!(gateway.stop("-TERM").await.success());
 }
 
 // ---------------------------------------------------------------------------

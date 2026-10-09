@@ -683,7 +683,7 @@ request.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `VLLM_PROXY_USAGE_REPORT_OUTBOX_PATH` | unset (no outbox) | The SQLite file. It is created, with mode `0600`, when it is not there. Its directory must exist, outlive the process and its container (a mounted volume), and be writable by the proxy and by nobody else (mode `0700`, see "Who can write to the file"). SQLite keeps one more file beside it, `-journal`, with the same mode. |
-| `VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_BYTES` | `1073741824` (1 GiB) | The size the file may grow to (4194304 to 1099511627776). At that size new reports are held in memory until it has room again; what it holds is still sent. The volume must be larger than this, see "When the file is full". |
+| `VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_BYTES` | `1073741824` (1 GiB) | The size the file may grow to (4194304 to 1099511627776). At that size new reports are held in memory until it has room again; what it holds is still sent. The volume must be larger than this, see "When the file is full"; on a smaller one the file is kept to what the volume has room for. |
 | `VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_AGE_SECS` | `604800` (7 days) | How old a report may grow, counted from the completion of its request (60 to 7776000). Past it the report moves to the `rejected` table with reason `max_age`: nothing is tried for ever. |
 | `VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_PENDING` | `1000000` | Reports the file may hold while they wait to be accepted (1 to 10000000; a row is about half a kilobyte, so the default fits in half of `MAX_BYTES`). Past it the report that has waited longest is dropped, logged with its ids and counted as `queue_full`. |
 | `VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_REJECTED` | `100000` | Rows kept in the `rejected` table (1 to 1000000, about half a kilobyte each). Past it the oldest is removed and counted. |
@@ -981,16 +981,34 @@ own size first, and everything above applies. With the defaults, 1 GiB holds
 about two million reports, twice `MAX_PENDING`. Give the outbox a volume of
 its own, so that nothing else can fill it.
 
-If something else does fill the volume, to the last block, the file cannot
-grow although it is below its size, and no transaction can even start,
-because its journal needs a few pages first. New reports are then held in
+A file that filled its volume could never be written to again, not even to
+remove a report cloud-api accepted: every change needs room for its journal
+first, and nothing would ever free any. So the gateway does not let it. When
+it opens the file, and every 5 s after that, it looks at how large the volume
+is and what is free on it, and keeps the file to what it has plus what is
+free, less a margin for the journal: 64 MiB, or a quarter of a volume smaller
+than 256 MiB. On a volume that is too small for `MAX_BYTES` that is the
+file's size from the start, said once at warning level (`The volume of the
+usage report outbox has no room for VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_BYTES
+and the journal beside it`, with `limited_to`), and everything above applies
+at that size. Take the line as what it is, a volume that was made too small
+or `MAX_BYTES` left too large for it. The same look keeps the file back when
+something else is filling the volume, as long as it does so slowly enough to
+be seen, and gives the file its size back when there is room again (`has room
+for ... again`).
+
+If something else fills the volume to the last block faster than that, the
+file cannot grow although it is below its size, and no transaction can even
+start, because its journal needs a few pages first. New reports are then held in
 memory and sent from there as above (`full` at 1). What the file holds waits:
 its rows cannot be leased, and the outcome of an attempt that was under way
-cannot be written, so `available` reads 0 as well. The gateway keeps serving
-and does not end. Every 5 s the file is tried again, and when there is space
-it is found within those 5 s, without a restart: the outcomes are written,
-the rows of the file are sent, what memory holds goes into the file, and the
-log says `available again` and `has room again`.
+cannot be written. The first of those that is tried fails, and from then on
+`available` reads 0 as well (until then it stays 1: nothing has shown that
+the file does not work). The gateway keeps serving and does not end. Every
+5 s the file is tried again, and the volume looked at, and when there is
+space it is found within two of those looks, without a restart: the outcomes
+are written, the rows of the file are sent, what memory holds goes into the
+file, and the log says `available again` and `has room again`.
 
 **When the file cannot be used.** The outbox never keeps the gateway from
 starting or serving, never slows a request, and never ends the process. If
@@ -1048,7 +1066,10 @@ checks that the file at the path is still the one it has open.
   file.
 - Deleted under the running process: the connection still has the whole
   database, and writes it back to the path as it was, rows, attempts and
-  leases (`why="deleted"`).
+  leases (`why="deleted"`). It is written under a name of its own
+  (`<path>.restore-…`) and given the path's name once it is whole, and only
+  if nothing is there yet, so that a second process on the file never finds
+  half a database, and the one that is quicker to put it back wins.
 - Emptied (cut to nothing, which to SQLite is a database without tables), or
   deleted and impossible to write back: a new database is started in it
   (`why="lost"`, at error level). What it held is gone, except the reports

@@ -315,6 +315,9 @@ struct Kept {
     oldest_completed_at_ms: Option<i64>,
     rejected: Vec<(String, u64)>,
     used_bytes: u64,
+    /// The file may grow to less than `max_bytes`: its volume has no room
+    /// for that.
+    limited_by_volume: bool,
     /// Per model, what `queue_depth` is beside the rows of the file: the
     /// reports waiting in memory, less the rows this process is sending.
     beside: HashMap<ModelLabel, i64>,
@@ -529,6 +532,7 @@ impl Outbox {
                 oldest_completed_at_ms: None,
                 rejected: Vec::new(),
                 used_bytes: 0,
+                limited_by_volume: false,
                 beside: HashMap::new(),
                 stopping: false,
                 closed: false,
@@ -769,10 +773,13 @@ impl UsageReportDelivery {
         };
         let mut recheck = tokio::time::interval(outbox.config().recheck_interval);
         recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The moment as of which `advance` last looked at what is due.
+        let mut looked_at = Instant::now();
         loop {
-            // Only ever a time still to come: whatever is due already was
-            // seen by `advance`, and is waiting for something else.
-            let timer = self.next_timer(outbox);
+            // Only ever a time `advance` has not seen pass: whatever was due
+            // when it looked is waiting for something else, a place or an
+            // answer of the store, and that wakes this loop when it comes.
+            let timer = self.next_timer(outbox, looked_at);
             let due = async {
                 match timer {
                     Some(at) => tokio::time::sleep_until(at.into()).await,
@@ -792,7 +799,7 @@ impl UsageReportDelivery {
             while let Ok(event) = from_store.try_recv() {
                 self.on_store_event(outbox, event);
             }
-            self.advance(outbox, rechecking);
+            looked_at = self.advance(outbox, rechecking);
             self.publish(outbox);
             if outbox.is_idle() {
                 self.idle.notify_waiters();
@@ -801,14 +808,16 @@ impl UsageReportDelivery {
     }
 
     /// When the dispatcher has something to do that nothing will wake it
-    /// for: a report due again, the next probe, the next look at a full
-    /// file.
-    fn next_timer(&self, outbox: &Outbox) -> Option<Instant> {
+    /// for: a report due again, the next probe. `looked_at` is the moment
+    /// `advance` last looked as of. A time before it was seen then, and
+    /// asking for it again would only run the loop without end; a time after
+    /// it was not, even when it has passed by now, and must not be left to
+    /// the next look at the file.
+    fn next_timer(&self, outbox: &Outbox, looked_at: Instant) -> Option<Instant> {
         let kept = outbox.kept();
         if kept.stopping && !kept.closed {
             return None;
         }
-        let now = Instant::now();
         [
             kept.retry_at,
             kept.memory_due.first().map(|(due_at, _)| *due_at),
@@ -816,7 +825,7 @@ impl UsageReportDelivery {
         ]
         .into_iter()
         .flatten()
-        .filter(|at| *at > now)
+        .filter(|at| *at > looked_at)
         .min()
     }
 
@@ -853,7 +862,7 @@ impl UsageReportDelivery {
                     .into_iter()
                     .map(|(label, rows)| (outbox.label(label), rows))
                     .collect();
-                let (was, unstarted) = {
+                let (was, unstarted, limited) = {
                     let mut kept = outbox.kept();
                     let was = (kept.health, kept.stalled);
                     kept.health = health;
@@ -863,6 +872,9 @@ impl UsageReportDelivery {
                     kept.oldest_completed_at_ms = stats.oldest_completed_at_ms;
                     kept.rejected = stats.rejected;
                     kept.used_bytes = stats.used_bytes;
+                    let limited = (stats.limited_by_volume != kept.limited_by_volume)
+                        .then_some(stats.limited_by_volume);
+                    kept.limited_by_volume = stats.limited_by_volume;
                     if stored > 0 || !overtaken.is_empty() {
                         kept.look_fresh = true;
                         kept.look_retries = true;
@@ -926,8 +938,28 @@ impl UsageReportDelivery {
                             kept.retries.extend(retries);
                         }
                     }
-                    (was, unstarted)
+                    (was, unstarted, limited)
                 };
+                // Said when it begins and when it ends: a volume like that
+                // is a mistake in how the outbox was set up, or a volume
+                // something else is filling.
+                match limited {
+                    Some(true) => warn!(
+                        path = %path,
+                        max_bytes = outbox.config().max_bytes,
+                        limited_to = stats.max_bytes,
+                        "The volume of the usage report outbox has no room for \
+                         VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_BYTES and the journal beside it: the \
+                         file is kept to what the volume has room for"
+                    ),
+                    Some(false) => info!(
+                        path = %path,
+                        max_bytes = outbox.config().max_bytes,
+                        "The volume of the usage report outbox has room for \
+                         VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_BYTES again"
+                    ),
+                    None => {}
+                }
                 // The file had no room for these: they are held in memory
                 // and sent from there.
                 for item in no_room {
@@ -1098,8 +1130,9 @@ impl UsageReportDelivery {
     /// Start attempts in the places that are free, claim reports for the
     /// places to come, write to the file what memory holds, and look after
     /// what only time changes. `rechecking`: the file is looked at whether
-    /// or not anything here says it changed.
-    fn advance(self: &Arc<Self>, outbox: &Outbox, rechecking: bool) {
+    /// or not anything here says it changed. Returns the moment as of which
+    /// it looked at what is due.
+    fn advance(self: &Arc<Self>, outbox: &Outbox, rechecking: bool) -> Instant {
         let config = outbox.config();
         let cap = self.policy.max_in_flight.max(1);
         let max_held = self.policy.max_queued;
@@ -1345,16 +1378,12 @@ impl UsageReportDelivery {
                     kept.asked_for_a_probe = kept.breaker.engaged;
                     kept.look_fresh &= fresh == 0;
                     kept.look_retries &= retries == 0;
-                    let before_ms = config
-                        .clock
-                        .now_ms()
-                        .saturating_sub(i64::try_from(limit.as_millis()).unwrap_or(i64::MAX));
                     ask = Some(Claim {
                         fresh,
                         newest_first: kept.breaker.engaged,
                         retries,
                         lease: outbox.lease,
-                        expire: Some((before_ms, limit_reason)),
+                        expire: Some((limit, limit_reason)),
                     });
                 }
             }
@@ -1390,6 +1419,7 @@ impl UsageReportDelivery {
             None => {}
         }
         gave_up_lines(self, outbox, gave_up);
+        now
     }
 
     /// Count `item` as a report the file did not take, for `why`, unless it
@@ -1642,11 +1672,16 @@ impl UsageReportDelivery {
                 // held here, and written to the file when the file takes it.
                 _ => {
                     place.unsettled = None;
-                    if let Some(seq) = place.held.take() {
-                        // (It is marked as being sent, so it waits nowhere.)
-                        kept.release(seq);
-                    }
-                    let next = next.map(|next| match next.home {
+                    // (It is marked as being sent, so it waits nowhere.) A
+                    // report that is no longer there was handed to the store
+                    // when shutdown began (`close`): what is written there,
+                    // or came back from there, is the report now, and this
+                    // attempt has nothing more to say about it.
+                    let handed_on = place
+                        .held
+                        .take()
+                        .is_some_and(|seq| kept.release(seq).is_none());
+                    let next = next.filter(|_| !handed_on).map(|next| match next.home {
                         Home::File { .. } => next.out_of_the_file(),
                         Home::Memory { .. } => next,
                     });
@@ -1906,28 +1941,19 @@ impl UsageReportDelivery {
         }
         let left_in_flight = outbox.kept().in_flight();
 
-        // Everything memory holds, the reports still being sent included: a
-        // copy of those is written, and the billing API tells the two apart
-        // by their completion id should both arrive.
+        // Everything memory holds, the reports still being sent included.
+        // From here on what is handed to the store is the report: an attempt
+        // that ends after this finds its report gone from memory and leaves
+        // it at that (`settle`), so a report is in one place only and is
+        // counted once, as written or as left. Should the attempt be
+        // accepted after all, the next process sends the report once more,
+        // and the billing API tells the two apart by their completion id.
         let in_memory: Vec<Item> = {
             let mut kept = outbox.kept();
-            let sending: Vec<Item> = kept
-                .memory
-                .values()
-                .filter(|held| held.sending)
-                .map(|held| held.item.clone())
-                .collect();
-            let waiting: Vec<u64> = kept
-                .memory
-                .iter()
-                .filter(|(_, held)| !held.sending)
-                .map(|(seq, _)| *seq)
-                .collect();
-            waiting
-                .into_iter()
+            let all: Vec<u64> = kept.memory.keys().copied().collect();
+            all.into_iter()
                 .filter_map(|seq| kept.release(seq))
                 .map(|held| held.item)
-                .chain(sending)
                 .collect()
         };
         for item in in_memory {

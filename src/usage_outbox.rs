@@ -41,7 +41,8 @@
 //! - The file has a size of its own (`max_bytes`) below that of its volume,
 //!   so that it is full while the volume still has room for the journal:
 //!   leasing and removing reports then go on, and only new reports are
-//!   refused.
+//!   refused. On a volume too small for `max_bytes` the size is what the
+//!   volume has room for (`fitting`), looked at again as the volume changes.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -445,9 +446,13 @@ pub(crate) struct Claim {
     pub retries: usize,
     /// How long they are this process's.
     pub lease: Duration,
-    /// Reports whose request completed before this are moved to `rejected`
-    /// with this reason instead of being sent.
-    pub expire: Option<(i64, &'static str)>,
+    /// Reports whose request completed longer ago than this are moved to
+    /// `rejected` with this reason instead of being sent. An age, not a
+    /// time: how old a report is is judged with the clock as the
+    /// transaction reads it, like everything else in it. A time worked out
+    /// when the claim was made would be of a clock that may have been put
+    /// right since.
+    pub expire: Option<(Duration, &'static str)>,
 }
 
 /// What a claim found.
@@ -475,6 +480,9 @@ pub(crate) struct Stats {
     /// What the file holds, in bytes, and what it may grow to.
     pub used_bytes: u64,
     pub max_bytes: u64,
+    /// It may grow to less than `UsageOutboxConfig::max_bytes`, because its
+    /// volume has no room for that.
+    pub limited_by_volume: bool,
 }
 
 impl Stats {
@@ -625,6 +633,10 @@ struct Shared<J> {
     /// Makes every insert fail as on a full volume.
     #[cfg(test)]
     volume_full: AtomicBool,
+    /// The size of the volume and what everything but the outbox takes of
+    /// it, in bytes, in place of what the system says.
+    #[cfg(test)]
+    volume: Mutex<Option<(u64, u64)>>,
     /// Makes every commit take this many milliseconds longer, as a disk that
     /// is slow to flush would.
     #[cfg(test)]
@@ -654,6 +666,17 @@ impl<J> Shared<J> {
         return self.volume_full.load(Ordering::Relaxed);
         #[cfg(not(test))]
         false
+    }
+
+    /// The size of the volume the file is on and what is free on it, in
+    /// bytes. `None` where the system does not say.
+    fn volume(&self) -> Option<(u64, u64)> {
+        #[cfg(test)]
+        if let Some((total, others)) = *self.volume.lock().unwrap_or_else(|e| e.into_inner()) {
+            let file = std::fs::metadata(&self.config.path).map_or(0, |file| file.len());
+            return Some((total, total.saturating_sub(others).saturating_sub(file)));
+        }
+        volume(&self.config.path)
     }
 }
 
@@ -698,6 +721,8 @@ impl<J: Persist> Store<J> {
             fault: AtomicBool::new(false),
             #[cfg(test)]
             volume_full: AtomicBool::new(false),
+            #[cfg(test)]
+            volume: Mutex::new(None),
             #[cfg(test)]
             commit_delay_ms: AtomicU64::new(0),
         });
@@ -880,6 +905,13 @@ impl<J: Persist> Store<J> {
         self.shared.volume_full.store(on, Ordering::Relaxed);
     }
 
+    /// The volume is `total` bytes, of which everything but the outbox takes
+    /// `others`, whatever the system says; `None` ends that.
+    #[cfg(test)]
+    pub fn inject_volume(&self, volume: Option<(u64, u64)>) {
+        *self.shared.volume.lock().unwrap() = volume;
+    }
+
     #[cfg(test)]
     pub fn inject_commit_delay(&self, delay: Duration) {
         self.shared
@@ -973,6 +1005,8 @@ struct Db {
     max_pages: i64,
     headroom_pages: i64,
     page_size: i64,
+    /// `max_pages` is what the volume has room for, less than `max_bytes`.
+    limited_by_volume: bool,
 }
 
 /// The thread that owns the connection.
@@ -995,6 +1029,9 @@ struct Writer<J> {
     volume_full: bool,
     /// Not before this is that tried again.
     room_probe_at: Instant,
+    /// Not before this is the volume looked at again, for the size the file
+    /// may have on it.
+    volume_check_at: Instant,
 }
 
 impl<J: Persist> Writer<J> {
@@ -1008,6 +1045,7 @@ impl<J: Persist> Writer<J> {
             health: Health::default(),
             volume_full: false,
             room_probe_at: Instant::now(),
+            volume_check_at: Instant::now(),
         }
     }
 
@@ -1186,6 +1224,7 @@ impl<J: Persist> Writer<J> {
         let mut replaced = false;
         loop {
             let tried = self.ready().and_then(|()| {
+                self.fit_the_volume();
                 self.find_room();
                 self.transact(work, reports, release_leases, takeovers)
             });
@@ -1240,18 +1279,9 @@ impl<J: Persist> Writer<J> {
             // were. When another file is there, somebody put it there:
             // another process that put the database back, or a person.
             let gone = identity(&path).is_none();
-            let restored = gone
-                && create_private(&path, true).is_ok()
-                && db
-                    .conn
-                    .execute("VACUUM INTO ?1", [path.to_string_lossy()])
-                    .is_ok();
-            if gone && !restored {
-                // Half a copy is not a database: a new one is started.
-                let _ = std::fs::remove_file(&path);
-            }
+            let restored = gone && self.put_back(db, &path);
             self.db = None;
-            let db = open(&self.shared.config)?;
+            let db = open(&self.shared.config, self.shared.volume())?;
             let why = self.adopt(db);
             let _ = self.shared.events.send(Event::Replaced {
                 why: if restored {
@@ -1264,7 +1294,7 @@ impl<J: Persist> Writer<J> {
             });
             return Ok(());
         }
-        let db = open(&self.shared.config)?;
+        let db = open(&self.shared.config, self.shared.volume())?;
         // The file was opened anew after a failure, and is not the database
         // it was: emptied, or exchanged, while it could not be used.
         if let Some(why) = self.adopt(db) {
@@ -1275,6 +1305,61 @@ impl<J: Persist> Writer<J> {
             });
         }
         Ok(())
+    }
+
+    /// Write the database of the open connection back to `path`, where its
+    /// file was deleted. It is written under a name of its own and given the
+    /// path's name only once it is complete, and only if there is still no
+    /// file there: the other process on the outbox may be doing the same at
+    /// this moment, and must never find half a database at the path, nor
+    /// have the one it put there taken away. `false`: the path is not this
+    /// connection's database (it could not be written, or the other process
+    /// was quicker); whatever is there is opened like any other file.
+    fn put_back(&self, db: &Db, path: &Path) -> bool {
+        let mut copy = path.as_os_str().to_os_string();
+        copy.push(format!(".restore-{}", self.shared.owner));
+        let copy = PathBuf::from(copy);
+        let written = create_private(&copy, true).is_ok()
+            && db
+                .conn
+                .execute("VACUUM INTO ?1", [copy.to_string_lossy()])
+                .is_ok();
+        let restored = written
+            && match std::fs::hard_link(&copy, path) {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+                // A file system without hard links: the name is given by a
+                // rename, which would replace a file put there meanwhile, so
+                // only when there is none.
+                Err(_) => identity(path).is_none() && std::fs::rename(&copy, path).is_ok(),
+            };
+        let _ = std::fs::remove_file(&copy);
+        restored
+    }
+
+    /// The size the file may have follows its volume: looked at when the
+    /// file is opened, and again every `reopen_interval`. A volume that has
+    /// no room for `max_bytes` (too small, or filling up with something
+    /// else) lowers it, so that the file is full, by its own size, while the
+    /// volume still has room for the journal; room that returns raises it
+    /// again. (Never below what the file already has: SQLite does not set
+    /// that.)
+    fn fit_the_volume(&mut self) {
+        if Instant::now() < self.volume_check_at {
+            return;
+        }
+        self.volume_check_at = Instant::now() + self.shared.config.reopen_interval;
+        let volume = self.shared.volume();
+        let Some(db) = self.db.as_mut() else {
+            return;
+        };
+        if let Ok((max_pages, limited_by_volume)) =
+            set_size(&db.conn, &self.shared.config, db.page_size, volume)
+        {
+            db.max_pages = max_pages;
+            db.headroom_pages = headroom(max_pages);
+            db.limited_by_volume = limited_by_volume;
+        }
     }
 
     /// A volume that was full may have room again, and with no report waiting
@@ -1381,7 +1466,6 @@ impl<J: Persist> Writer<J> {
         let owner = self.shared.owner.as_str();
         let generation = self.shared.generation.load(Ordering::Relaxed);
         let db = self.db.as_mut().expect("opened by `ready`");
-        let now = config.clock.now_ms();
         let changes_before = db.conn.total_changes();
         // The write lock is taken at once: a transaction that started by
         // reading could not wait for it later (SQLite fails such an upgrade
@@ -1390,6 +1474,10 @@ impl<J: Persist> Writer<J> {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(failed("begin"))?;
+        // The time of this transaction, read once it has the file to itself:
+        // the wait for the lock may have been long, and every time written
+        // or compared below is of the same moment as what is read.
+        let now = config.clock.now_ms();
         let mut committed = Committed {
             stored: 0,
             no_room: Vec::new(),
@@ -1505,7 +1593,8 @@ impl<J: Persist> Writer<J> {
         // see them and put them back: nothing is tried for ever, and nothing
         // is destroyed for its age (a clock set forward makes everything
         // look old).
-        if let Some((before_ms, reason)) = work.claim.as_ref().and_then(|claim| claim.expire) {
+        if let Some((max_age, reason)) = work.claim.as_ref().and_then(|claim| claim.expire) {
+            let before_ms = now.saturating_sub(millis(max_age));
             let expired = tx
                 .prepare_cached(&format!(
                     "DELETE FROM pending WHERE id IN (SELECT id FROM pending \
@@ -1769,6 +1858,7 @@ impl<J: Persist> Writer<J> {
             - integer("SELECT freelist_count FROM pragma_freelist_count", "stats")?;
         committed.stats.used_bytes = (used.max(0) * db.page_size) as u64;
         committed.stats.max_bytes = (db.max_pages * db.page_size) as u64;
+        committed.stats.limited_by_volume = db.limited_by_volume;
 
         // The reports of this transaction are being delivered from memory:
         // the writer was given up on while it waited. They must not be in
@@ -1829,7 +1919,8 @@ fn identity(path: &Path) -> Option<(u64, u64)> {
 }
 
 /// Open the file, creating it and its schema when they are not there.
-fn open(config: &UsageOutboxConfig) -> Result<Db, Failure> {
+/// `volume`: the size of its volume and what is free on it, when known.
+fn open(config: &UsageOutboxConfig, volume: Option<(u64, u64)>) -> Result<Db, Failure> {
     create_private(&config.path, false).map_err(|error| Failure::new("open", error))?;
     let conn = Connection::open_with_flags(
         &config.path,
@@ -1879,11 +1970,7 @@ fn open(config: &UsageOutboxConfig) -> Result<Db, Failure> {
     let page_size: i64 = conn
         .pragma_query_value(None, "page_size", |row| row.get(0))
         .map_err(failed("open"))?;
-    let wanted = i64::try_from(config.max_bytes).unwrap_or(i64::MAX) / page_size.max(1);
-    // SQLite answers with what it set: never less than the file has.
-    let max_pages: i64 = conn
-        .pragma_update_and_check(None, "max_page_count", wanted.max(1), |row| row.get(0))
-        .map_err(failed("open"))?;
+    let (max_pages, limited_by_volume) = set_size(&conn, config, page_size, volume)?;
     let id: String = conn
         .query_row("SELECT value FROM meta WHERE key = 'db_id'", [], |row| {
             row.get(0)
@@ -1894,10 +1981,86 @@ fn open(config: &UsageOutboxConfig) -> Result<Db, Failure> {
         created: made.as_deref() == Some(id.as_str()),
         id,
         max_pages,
-        headroom_pages: (max_pages / 8).clamp(16, 4_096),
+        headroom_pages: headroom(max_pages),
         page_size,
+        limited_by_volume,
         conn,
     })
+}
+
+/// Of `max_pages`, the pages new reports may not take.
+fn headroom(max_pages: i64) -> i64 {
+    (max_pages / 8).clamp(16, 4_096)
+}
+
+/// Tell SQLite the most pages the file may have: `max_bytes`, or what its
+/// volume has room for when that is less. Returns what it set, and whether
+/// the volume is why.
+fn set_size(
+    conn: &Connection,
+    config: &UsageOutboxConfig,
+    page_size: i64,
+    volume: Option<(u64, u64)>,
+) -> Result<(i64, bool), Failure> {
+    let file_bytes = std::fs::metadata(&config.path).map_or(0, |file| file.len());
+    let fits = volume.map(|(total, available)| fitting(file_bytes, total, available));
+    let limited = fits.is_some_and(|fits| fits < config.max_bytes);
+    let max_bytes = fits.map_or(config.max_bytes, |fits| fits.min(config.max_bytes));
+    let wanted = i64::try_from(max_bytes).unwrap_or(i64::MAX) / page_size.max(1);
+    // SQLite answers with what it set: never less than the file has.
+    let max_pages: i64 = conn
+        .pragma_update_and_check(None, "max_page_count", wanted.max(1), |row| row.get(0))
+        .map_err(failed("open"))?;
+    Ok((max_pages, limited))
+}
+
+/// The size a file of `file_bytes` may grow to on a volume of `total` bytes
+/// of which `available` are free: all of it but a margin for the rollback
+/// journal, `VOLUME_MARGIN_BYTES`, or a quarter of a volume smaller than
+/// four times that.
+fn fitting(file_bytes: u64, total: u64, available: u64) -> u64 {
+    let margin = UsageOutboxConfig::VOLUME_MARGIN_BYTES.min(total / 4);
+    file_bytes.saturating_add(available).saturating_sub(margin)
+}
+
+/// The size of the volume `path` is on and what is free on it for this
+/// process, in bytes. `None` when the system does not say (or says the
+/// volume has no size, as some do that have no limit of their own).
+fn volume(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let directory = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let directory = std::ffi::CString::new(directory.as_os_str().as_bytes()).ok()?;
+        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: `directory` is a NUL-terminated string that outlives the
+        // call, and `stat` is room for one `statvfs`, which the call fills
+        // when it returns 0.
+        let stat = unsafe {
+            if libc::statvfs(directory.as_ptr(), stat.as_mut_ptr()) != 0 {
+                return None;
+            }
+            stat.assume_init()
+        };
+        // (The integer types of these fields differ from one system to
+        // another.)
+        #[allow(clippy::unnecessary_cast)]
+        let (block, blocks, available) = (
+            stat.f_frsize as u64,
+            stat.f_blocks as u64,
+            stat.f_bavail as u64,
+        );
+        let total = blocks.saturating_mul(block);
+        (total > 0).then(|| (total, available.saturating_mul(block)))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 /// Bring the schema to `SCHEMA_VERSION`, and give a new database its name,

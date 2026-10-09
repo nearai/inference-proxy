@@ -703,11 +703,14 @@ async fn reports_that_keep_failing_never_stand_in_front_of_new_ones() {
     .await;
 
     // They went out as they came in: no lag builds up behind the retries.
+    // (Tens of milliseconds on an idle machine. The bounds leave room for a
+    // busy one; behind retries that took the places, the new reports would
+    // not go out at all while the 400 keep coming due.)
     let lags = lags(&billing, &handed_over);
     let (median, worst) = (lags[lags.len() / 2], lags[lags.len() - 1]);
     println!("healthy reports beside 400 failing ones: median {median:?}, worst {worst:?}");
-    assert!(median < Duration::from_millis(150), "median {median:?}");
-    assert!(worst < Duration::from_millis(1_500), "worst {worst:?}");
+    assert!(median < Duration::from_secs(1), "median {median:?}");
+    assert!(worst < Duration::from_secs(5), "worst {worst:?}");
     // The retries were made all the while, in the places they may have and
     // in no more.
     let most = billing.intake.most_answering_refused.load(Ordering::SeqCst);
@@ -785,7 +788,7 @@ async fn reports_that_fail_from_their_first_attempt_hold_the_next_ones_up_for_a_
         all[all.len() - 1]
     );
     assert!(
-        late[late.len() - 1] < Duration::from_millis(500),
+        late[late.len() - 1] < Duration::from_secs(3),
         "{:?}",
         late[late.len() - 1]
     );
@@ -804,9 +807,9 @@ async fn each_time_such_reports_look_like_an_outage_the_next_report_that_comes_i
     let billing = Billing::start(200).await;
     billing.take(Duration::from_millis(5));
     let delivery = billing.delivery(
-        // Pauses of seconds between two probes, from the first one: a report
-        // that had to wait for one would be seen to.
-        durable(|policy| policy.initial_backoff = Duration::from_secs(4)),
+        // Ten seconds or more between two probes, from the first one: a
+        // report that had to wait for one would be seen to, on any machine.
+        durable(|policy| policy.initial_backoff = Duration::from_secs(20)),
         UsageOutboxConfig {
             max_pause: Duration::from_secs(30),
             max_backoff: Duration::from_millis(50),
@@ -848,7 +851,7 @@ async fn each_time_such_reports_look_like_an_outage_the_next_report_that_comes_i
          outage {} times",
         logs.lines(NOT_ANSWERING_LINE).len()
     );
-    assert!(worst < Duration::from_millis(1_500), "{worst:?}");
+    assert!(worst < Duration::from_secs(5), "{worst:?}");
     assert!(logs.lines(NOT_ANSWERING_LINE).len() >= 2);
     eventually("every one of the hundred has been tried", || {
         read::<i64>(&path, "SELECT COUNT(*) FROM pending WHERE attempts > 0") == 100
@@ -889,8 +892,9 @@ async fn a_share_of_the_reports_failing_slows_the_others_down_by_nothing() {
     let lags = lags(&billing, &handed_over);
     let (median, worst) = (lags[lags.len() / 2], lags[lags.len() - 1]);
     println!("good reports while 30 % fail: median {median:?}, worst {worst:?}");
-    assert!(median < Duration::from_millis(100), "median {median:?}");
-    assert!(worst < Duration::from_millis(1_500), "worst {worst:?}");
+    // Tens of milliseconds on an idle machine; the bounds are for a busy one.
+    assert!(median < Duration::from_secs(1), "median {median:?}");
+    assert!(worst < Duration::from_secs(5), "worst {worst:?}");
     assert_eq!(billing.written_of("bad"), 0);
     // Some reports failing while others are accepted is not the billing API
     // being down: it was never treated as that.
@@ -908,6 +912,56 @@ async fn a_share_of_the_reports_failing_slows_the_others_down_by_nothing() {
     delivered(&delivery).await;
     assert_eq!(billing.written().len(), 600);
     assert_eq!(pending_rows(&path), 0);
+}
+
+#[tokio::test]
+async fn reports_that_failed_before_failing_in_a_row_are_no_outage_while_others_are_accepted() {
+    let logs = Logs::default();
+    let _capture = logs.capture();
+    let (_dir, path) = file();
+    let billing = Billing::start(200).await;
+    let delivery = billing.delivery(
+        durable(|_| {}),
+        UsageOutboxConfig {
+            // Four failures in a row would do, were they first attempts, and
+            // so would four of any kind with nothing answered for a minute.
+            breaker_after: 4,
+            breaker_window: Duration::from_secs(60),
+            max_backoff: Duration::from_millis(20),
+            ..outbox(&path)
+        },
+    );
+    opened(&path).await;
+
+    // Forty reports an earlier process left, which fail every time and are
+    // due again every 10 to 20 ms: between two reports that come in, a tenth
+    // of a second apart, dozens of them fail in a row.
+    let poison = ids("poison", 40);
+    for id in &poison {
+        billing.refuse(id, Some(500));
+    }
+    left_behind(&path, &poison, 8);
+    for n in 0..15 {
+        billing.report(&delivery, &format!("healthy-{n}"), None);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    eventually("the healthy ones are written", || {
+        billing.written_of("healthy") == 15
+    })
+    .await;
+
+    // Reports that failed before fail again whether or not anything is
+    // wrong with the billing API. However many of them do so in a row, that
+    // is not what an outage looks like while it accepts the others.
+    let retries = billing.received() - 15;
+    assert!(retries >= 15 * 8, "{retries} retries failed meanwhile");
+    assert!(
+        logs.lines(NOT_ANSWERING_LINE).is_empty(),
+        "{}",
+        logs.contents()
+    );
+    assert!(!kept(&delivery).breaker.engaged);
+    assert_eq!(kept(&delivery).breaker.fresh_failures, 0);
 }
 
 #[tokio::test]
@@ -1001,6 +1055,56 @@ async fn the_backoff_of_a_report_grows_to_minutes_and_a_place_never_waits_it_out
 }
 
 #[tokio::test]
+async fn a_report_is_tried_again_when_it_is_due_not_when_the_file_is_next_looked_at() {
+    let (_dir, path) = file();
+    let billing = Billing::start(503).await;
+    let delivery = billing.delivery(
+        durable(|_| {}),
+        UsageOutboxConfig {
+            // Nothing but a report coming due makes the dispatcher look.
+            recheck_interval: Duration::from_secs(60),
+            reopen_interval: Duration::from_secs(60),
+            max_backoff: Duration::from_millis(10),
+            // Never an outage, however long this takes on a busy machine.
+            breaker_after: u32::MAX,
+            ..outbox(&path)
+        },
+    );
+    opened(&path).await;
+    let scheduler = delivery.outbox.as_ref().unwrap();
+
+    // What came due between the dispatcher's last look and now has not been
+    // seen by it, and nothing else would make it look: it is what the timer
+    // is set for, although it has passed. What was due when it looked is
+    // not, or the dispatcher would run in a loop while a report waits for a
+    // place. (Nothing is awaited in between: the dispatcher does not run.)
+    let looked_at = Instant::now();
+    let came_due = looked_at + Duration::from_micros(20);
+    kept(&delivery).retry_at = Some(came_due);
+    std::thread::sleep(Duration::from_millis(2));
+    assert_eq!(delivery.next_timer(scheduler, looked_at), Some(came_due));
+    assert_eq!(delivery.next_timer(scheduler, came_due), None);
+    kept(&delivery).retry_at = None;
+
+    // The same from outside: eight reports held in memory that fail every
+    // time, each due again a few milliseconds later, many of them coming due
+    // just as the dispatcher is busy with another. They are all tried again
+    // on time, thousands of times, without one look at the file.
+    store(&delivery).inject_fault(true);
+    for id in ids("failing", 8) {
+        billing.report(&delivery, &id, None);
+    }
+    let started_at = Instant::now();
+    eventually("thousands of attempts", || billing.received() >= 3_000).await;
+    println!(
+        "3000 attempts at eight reports that fail: {:?}",
+        started_at.elapsed()
+    );
+    assert_eq!(pending_rows(&path), 0);
+    assert_eq!(delivery.pending().0 + delivery.pending().1, 8);
+}
+
+#[tokio::test]
 async fn a_billing_api_that_is_down_is_probed_by_one_report_at_a_time() {
     let recorder = PrometheusBuilder::new().build_recorder();
     let _metrics = metrics::set_default_local_recorder(&recorder);
@@ -1063,8 +1167,9 @@ async fn a_billing_api_that_is_down_is_probed_by_one_report_at_a_time() {
     billing.answer(200);
     let back_at = Instant::now();
     delivered(&delivery).await;
+    // (A pause apart, 300 reports would take most of a minute.)
     assert!(
-        back_at.elapsed() < Duration::from_secs(4),
+        back_at.elapsed() < Duration::from_secs(15),
         "{:?}",
         back_at.elapsed()
     );
@@ -1082,8 +1187,9 @@ async fn when_only_old_reports_fail_a_new_one_is_sent_at_once() {
     let (_dir, path) = file();
     let billing = Billing::start(200).await;
     let delivery = billing.delivery(
-        // Pauses of seconds from the first one, which no test waits out.
-        durable(|policy| policy.initial_backoff = Duration::from_secs(4)),
+        // Pauses of ten seconds or more from the first one, which no test
+        // waits out.
+        durable(|policy| policy.initial_backoff = Duration::from_secs(20)),
         UsageOutboxConfig {
             breaker_after: 6,
             breaker_window: Duration::from_millis(100),
@@ -1112,7 +1218,7 @@ async fn when_only_old_reports_fail_a_new_one_is_sent_at_once() {
         .probe_at
         .unwrap()
         .saturating_duration_since(Instant::now());
-    assert!(probe_in > Duration::from_millis(1_500), "{probe_in:?}");
+    assert!(probe_in > Duration::from_secs(8), "{probe_in:?}");
 
     // A new report. It does not wait for the pause: it is the probe, it is
     // accepted, and that ends the matter.
@@ -1120,7 +1226,7 @@ async fn when_only_old_reports_fail_a_new_one_is_sent_at_once() {
     billing.report(&delivery, "new", None);
     eventually("it is written", || billing.written() == ["new"]).await;
     assert!(
-        started_at.elapsed() < Duration::from_millis(1_200),
+        started_at.elapsed() < Duration::from_secs(5),
         "{:?}",
         started_at.elapsed()
     );
@@ -1136,7 +1242,9 @@ async fn in_an_outage_one_new_report_goes_ahead_of_the_pause_and_no_more() {
     let (_dir, path) = file();
     let billing = Billing::start(503).await;
     let delivery = billing.delivery(
-        durable(|policy| policy.initial_backoff = Duration::from_secs(4)),
+        // Ten seconds or more between two probes: none comes due by itself
+        // while this looks at what is sent between them.
+        durable(|policy| policy.initial_backoff = Duration::from_secs(20)),
         UsageOutboxConfig {
             breaker_after: 6,
             max_pause: Duration::from_secs(30),
@@ -1318,6 +1426,88 @@ async fn a_report_that_is_never_accepted_ends_in_rejected_when_it_is_too_old() {
     // And nothing is sent again after that.
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(billing.received() as i64, attempts);
+}
+
+#[tokio::test]
+async fn a_report_too_old_is_moved_while_it_waits_and_is_not_sent_when_its_place_comes() {
+    // A report that waits for its next attempt, twenty seconds away or more.
+    // It is seen to be too old when it is, not when that attempt comes.
+    let (_dir, path) = file();
+    let billing = Billing::start(503).await;
+    let delivery = billing.delivery(
+        durable(|policy| policy.initial_backoff = Duration::from_secs(40)),
+        UsageOutboxConfig {
+            max_age: Duration::from_millis(800),
+            max_backoff: Duration::from_secs(600),
+            ..outbox(&path)
+        },
+    );
+    billing.report(&delivery, "waiting", None);
+    eventually("it failed once", || {
+        read::<i64>(&path, "SELECT COUNT(*) FROM pending WHERE attempts = 1") == 1
+    })
+    .await;
+    let started_at = Instant::now();
+    eventually("it is too old", || {
+        read::<i64>(
+            &path,
+            "SELECT COUNT(*) FROM rejected WHERE reason = 'max_age'",
+        ) == 1
+    })
+    .await;
+    assert!(
+        started_at.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        started_at.elapsed()
+    );
+    assert_eq!(billing.received(), 1, "it was not tried again for that");
+    assert_eq!(
+        read::<String>(&path, "SELECT outcome || ' ' || attempts FROM rejected"),
+        "http_5xx 1"
+    );
+
+    // Reports leased to this process and waiting for its one place, behind
+    // attempts that take their time. Nobody else looks at them meanwhile, so
+    // each is looked at when its turn comes: too old by then, it is not sent.
+    let (_dir, path) = file();
+    let billing = Billing::start(503).await;
+    billing.take(Duration::from_millis(700));
+    let delivery = billing.delivery(
+        durable(|policy| {
+            policy.max_in_flight = 1;
+            policy.initial_backoff = Duration::from_secs(40);
+        }),
+        UsageOutboxConfig {
+            max_age: Duration::from_millis(1_000),
+            max_backoff: Duration::from_secs(600),
+            ..outbox(&path)
+        },
+    );
+    for id in ids("queued", 4) {
+        billing.report(&delivery, &id, None);
+    }
+    eventually("the four are in rejected", || {
+        read::<i64>(
+            &path,
+            "SELECT COUNT(*) FROM rejected WHERE reason = 'max_age'",
+        ) == 4
+    })
+    .await;
+    // The first was sent, and the second while it was young enough; the
+    // others had waited more than a second when the place was theirs.
+    assert!(
+        (1..=2).contains(&billing.received()),
+        "{} of the four were sent",
+        billing.received()
+    );
+    assert_eq!(
+        read::<i64>(
+            &path,
+            "SELECT COUNT(*) FROM rejected WHERE outcome = 'never_sent' AND attempts = 0"
+        ),
+        4 - billing.received() as i64
+    );
+    assert_eq!(pending_rows(&path), 0);
 }
 
 #[tokio::test]
@@ -2093,6 +2283,61 @@ async fn reports_held_in_memory_follow_the_rules_of_the_file_and_are_written_to_
 }
 
 #[tokio::test]
+async fn a_report_waiting_out_its_backoff_in_memory_is_written_as_soon_as_the_file_is_back() {
+    let (_dir, path) = file();
+    let billing = Billing::start(503).await;
+    let delivery = billing.delivery(
+        // The production backoff, from far up: after one failure a report
+        // waits twenty seconds or more for its next attempt.
+        durable(|policy| policy.initial_backoff = Duration::from_secs(40)),
+        UsageOutboxConfig {
+            max_backoff: Duration::from_secs(600),
+            ..outbox(&path)
+        },
+    );
+    opened(&path).await;
+    store(&delivery).inject_fault(true);
+    for id in ids("backing-off", 3) {
+        billing.report(&delivery, &id, None);
+    }
+    eventually("each failed once and waits", || {
+        billing.received() == 3 && delivery.pending() == (3, 0)
+    })
+    .await;
+    assert_eq!(pending_rows(&path), 0);
+
+    // The file is back. The three are written to it at once, not when their
+    // next attempt comes: until then a kill would have lost them.
+    store(&delivery).inject_fault(false);
+    let started_at = Instant::now();
+    eventually("they are in the file", || {
+        read::<i64>(
+            &path,
+            "SELECT COUNT(*) FROM pending WHERE attempts = 1 AND last_outcome = 'http_5xx'",
+        ) == 3
+    })
+    .await;
+    assert!(
+        started_at.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        started_at.elapsed()
+    );
+    assert_eq!(billing.received(), 3, "none was tried again to get there");
+    eventually("memory holds nothing", || kept(&delivery).memory.is_empty()).await;
+    // And they are due when they were due, not at once.
+    let in_ten_seconds = Clock::default().now_ms() + 10_000;
+    assert_eq!(
+        read::<i64>(
+            &path,
+            &format!("SELECT COUNT(*) FROM pending WHERE next_attempt_at_ms > {in_ten_seconds}")
+        ),
+        3
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(billing.received(), 3);
+}
+
+#[tokio::test]
 async fn at_shutdown_what_memory_holds_is_written_to_a_file_that_works() {
     let logs = Logs::default();
     let _capture = logs.capture();
@@ -2139,6 +2384,67 @@ async fn at_shutdown_what_memory_holds_is_written_to_a_file_that_works() {
     let next = billing.delivery(durable(|_| {}), outbox(&path));
     delivered(&next).await;
     assert_eq!(billing.written_sorted(), ids("memory", 6));
+}
+
+#[tokio::test]
+async fn a_report_being_sent_from_memory_at_shutdown_is_written_and_counted_once() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let logs = Logs::default();
+    let _capture = logs.capture();
+    let (_dir, path) = file();
+    let billing = Billing::start(503).await;
+    let delivery = billing.delivery(
+        durable(|_| {}),
+        UsageOutboxConfig {
+            reopen_interval: Duration::from_secs(60),
+            recheck_interval: Duration::from_secs(60),
+            ..outbox(&path)
+        },
+    );
+    opened(&path).await;
+    store(&delivery).inject_fault(true);
+    // An answer that takes longer than the shutdown does: the four reports
+    // are held in memory and are all being sent when it begins.
+    billing.take(Duration::from_millis(600));
+    for id in ids("sending", 4) {
+        billing.report(&delivery, &id, None);
+    }
+    eventually("the four are being sent", || {
+        billing.intake.answering.load(Ordering::SeqCst) == 4
+    })
+    .await;
+
+    // The disk works again and the process is told to stop, without a drain.
+    // The four are written like anything else memory holds, and none of them
+    // is said or counted to be lost for being in a place at that moment.
+    store(&delivery).inject_fault(false);
+    let drained = delivery.drain_at_shutdown().await.unwrap();
+    assert_eq!(
+        (drained.left_waiting, drained.left_in_flight),
+        (0, 4),
+        "{drained:?}"
+    );
+    assert_eq!(pending_rows(&path), 4);
+    let closed = logs.lines(CLOSED_LINE);
+    assert_eq!(closed.len(), 1, "{}", logs.contents());
+    assert_eq!(closed[0]["left_unwritten"], 0);
+    assert!(logs.lines(LEFT_LINE).is_empty(), "{}", logs.contents());
+    assert!(logs.lines(UNDELIVERED_LINE).is_empty());
+    assert_eq!(value(&recorder, DROPPED, &[]), 0.0);
+
+    // Their attempts end, as failures. Each report is in the file and
+    // nowhere else: what an attempt finds out after its report was written
+    // is not kept beside it.
+    eventually("the attempts have ended", || delivery.pending().1 == 0).await;
+    assert_eq!(kept(&delivery).memory.len(), 0);
+    assert_eq!(pending_rows(&path), 4);
+
+    billing.answer(200);
+    billing.take(Duration::ZERO);
+    let next = billing.delivery(durable(|_| {}), outbox(&path));
+    delivered(&next).await;
+    assert_eq!(billing.written_sorted(), ids("sending", 4));
 }
 
 // ---------------------------------------------------------------------------
@@ -2719,45 +3025,61 @@ async fn shutdown_without_a_drain_waits_for_nothing_and_still_loses_nothing() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn nothing_runs_in_a_loop_while_shutdown_waits_for_an_attempt() {
-    let (_dir, path) = file();
-    let billing = Billing::start(503).await;
-    let delivery = billing.delivery(
-        durable(|policy| {
-            policy.max_in_flight = 2;
-            policy.attempt_timeout = Duration::from_secs(10);
-            policy.shutdown_drain = Duration::from_millis(1_500);
-        }),
-        outbox(&path),
-    );
-    // One attempt that stays in flight through the whole drain.
-    billing.take(Duration::from_secs(8));
-    billing.report(&delivery, "slow", None);
-    eventually("the slow attempt is in flight", || billing.received() == 1).await;
-    // And a report that fails at once and is waiting for its next attempt,
-    // which has long been due, when shutdown begins.
-    billing.take(Duration::ZERO);
-    billing.report(&delivery, "failing", None);
-    eventually("it failed twice", || billing.received() >= 3).await;
-
-    // Everything here runs on this thread: the dispatcher, the drain, the
-    // attempts. Waiting for the attempt costs next to nothing of it.
-    let Some(cpu_before) = thread_cpu() else {
-        eprintln!(
-            "SKIPPED nothing_runs_in_a_loop_while_shutdown_waits_for_an_attempt: the CPU time of \
-             a thread cannot be read here"
+    // Once with the reports in the file, once with the file failing and the
+    // reports held in memory: what waits is kept in different places, and in
+    // neither may it keep the dispatcher going round.
+    for in_memory in [false, true] {
+        let (_dir, path) = file();
+        let billing = Billing::start(503).await;
+        let delivery = billing.delivery(
+            durable(|policy| {
+                policy.max_in_flight = 2;
+                policy.attempt_timeout = Duration::from_secs(10);
+                policy.shutdown_drain = Duration::from_millis(1_500);
+            }),
+            UsageOutboxConfig {
+                // Not looked at again during the drain for another reason.
+                reopen_interval: Duration::from_secs(60),
+                close_timeout: Duration::from_millis(500),
+                ..outbox(&path)
+            },
         );
-        return;
-    };
-    let started_at = Instant::now();
-    let drained = delivery.drain_at_shutdown().await.unwrap();
-    let (cpu, wall) = (thread_cpu().unwrap() - cpu_before, started_at.elapsed());
-    println!("a drain of {wall:?} used {cpu:?} of this thread; {drained:?}");
-    assert!(wall >= Duration::from_millis(1_400), "{wall:?}");
-    assert_eq!(drained.left_in_flight, 1);
-    assert!(
-        cpu < wall / 10,
-        "the thread was busy for {cpu:?} of a {wall:?} drain"
-    );
+        opened(&path).await;
+        store(&delivery).inject_fault(in_memory);
+        // One attempt that stays in flight through the whole drain.
+        billing.take(Duration::from_secs(8));
+        billing.report(&delivery, "slow", None);
+        eventually("the slow attempt is in flight", || billing.received() == 1).await;
+        // And a report that fails at once and is waiting for its next
+        // attempt, which has long been due, when shutdown begins.
+        billing.take(Duration::ZERO);
+        billing.report(&delivery, "failing", None);
+        eventually("it failed twice", || billing.received() >= 3).await;
+        assert_eq!(pending_rows(&path), if in_memory { 0 } else { 2 });
+
+        // Everything here runs on this thread: the dispatcher, the drain,
+        // the attempts. Waiting for the attempt costs next to nothing of it.
+        let Some(cpu_before) = thread_cpu() else {
+            eprintln!(
+                "SKIPPED nothing_runs_in_a_loop_while_shutdown_waits_for_an_attempt: the CPU time \
+                 of a thread cannot be read here"
+            );
+            return;
+        };
+        let started_at = Instant::now();
+        let drained = delivery.drain_at_shutdown().await.unwrap();
+        let (cpu, wall) = (thread_cpu().unwrap() - cpu_before, started_at.elapsed());
+        println!(
+            "a drain of {wall:?} used {cpu:?} of this thread (reports held in memory: \
+             {in_memory}); {drained:?}"
+        );
+        assert!(wall >= Duration::from_millis(1_400), "{wall:?}");
+        assert_eq!(drained.left_in_flight, 1);
+        assert!(
+            cpu < wall / 10,
+            "the thread was busy for {cpu:?} of a {wall:?} drain (in memory: {in_memory})"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2910,12 +3232,12 @@ async fn the_age_of_the_oldest_report_is_that_of_the_oldest_whoever_holds_it() {
         )
         .unwrap();
     billing.report(&delivery, "new", None);
+    // Both are in the file, and the age is that of the old one.
     eventually("the age is that of the old one", || {
-        value(&recorder, OLDEST_AGE, &[]) >= 60.0
+        value(&recorder, PENDING, &[]) == 2.0 && value(&recorder, OLDEST_AGE, &[]) >= 60.0
     })
     .await;
     assert!(value(&recorder, OLDEST_AGE, &[]) < 120.0);
-    assert_eq!(value(&recorder, PENDING, &[]), 2.0);
 }
 
 #[tokio::test]

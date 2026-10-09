@@ -997,6 +997,91 @@ fn a_file_at_its_size_takes_no_new_report_and_goes_on_with_the_ones_it_holds() {
 }
 
 #[test]
+fn a_volume_too_small_for_the_size_the_file_may_have_limits_it_while_it_is() {
+    const MIB: u64 = 1 << 20;
+    // All of the volume but a margin for the journal: 64 MiB, or a quarter
+    // of a volume smaller than four times that.
+    assert_eq!(fitting(0, 16_384 * MIB, 10_000 * MIB), 9_936 * MIB);
+    assert_eq!(fitting(0, 256 * MIB, 256 * MIB), 192 * MIB);
+    assert_eq!(fitting(0, 12 * MIB, 12 * MIB), 9 * MIB);
+    // What the file already has counts as its own, not as taken.
+    assert_eq!(fitting(5 * MIB, 12 * MIB, 6 * MIB), 8 * MIB);
+    // And a volume that is full leaves it less than it has: it cannot grow.
+    assert_eq!(fitting(5 * MIB, 12 * MIB, 0), 2 * MIB);
+    assert_eq!(fitting(MIB, 12 * MIB, 0), 0);
+
+    let (_dir, path) = file();
+    // What the system says of a real volume: a size, and no more free than
+    // that.
+    #[cfg(unix)]
+    {
+        let (total, available) = volume(&path).expect("the volume of a temporary directory");
+        assert!(total > 0 && available <= total, "{available} of {total}");
+    }
+    // A gigabyte, as a process has that was told nothing else.
+    let configured = UsageOutboxConfig::DEFAULT_MAX_BYTES;
+    let mut handle = Handle::opened(config(&path));
+    let stats = handle.stats();
+    assert_eq!(
+        (stats.max_bytes, stats.limited_by_volume),
+        (configured, false)
+    );
+
+    // The volume turns out to be 12 MiB, with nothing else on it. The file
+    // is given the size that leaves the volume room for its journal, 9 MiB,
+    // and it is full at that size, by itself, like a file at the size it
+    // was told.
+    handle.store.inject_volume(Some((12 * MIB, 0)));
+    std::thread::sleep(Duration::from_millis(60));
+    let stats = handle.stats();
+    assert_eq!((stats.max_bytes, stats.limited_by_volume), (9 * MIB, true));
+    let limited_to = stats.max_bytes;
+    let (mut stored, mut no_room) = (0, 0);
+    while handle.store.is_accepting() {
+        let committed = handle.keep((0..300).map(|_| bulky("filling")));
+        stored += committed.stored;
+        no_room += committed.no_room.len();
+        assert!(stored < 200_000, "the file never filled up");
+    }
+    assert!(stored > 2_000 && no_room > 0, "{stored} stored");
+    let stats = handle.stats();
+    assert!(std::fs::metadata(&path).unwrap().len() <= limited_to);
+    assert!(stats.used_bytes <= limited_to - limited_to / 8, "{stats:?}");
+    // What is done to the reports it holds goes on, and frees room.
+    let rows = handle.claim(60, 0, LEASE).fresh;
+    assert_eq!(rows.len(), 60);
+    for row in &rows {
+        handle.store.settle(Settle {
+            id: row.id,
+            generation: row.generation,
+            outcome: Outcome::Delete,
+        });
+    }
+    assert_eq!(handle.stats().pending_total(), stored as u64 - 60);
+
+    // Something else fills the volume to the last block: the file may not
+    // grow at all, whatever is free in it.
+    handle.store.inject_volume(Some((12 * MIB, 12 * MIB)));
+    std::thread::sleep(Duration::from_millis(60));
+    let stats = handle.stats();
+    assert!(stats.limited_by_volume);
+    assert_eq!(stats.max_bytes, std::fs::metadata(&path).unwrap().len());
+
+    // The volume is made larger. The file may have the size it was told
+    // again, and takes reports again, without being opened anew.
+    handle.store.inject_volume(Some((4_096 * MIB, 0)));
+    std::thread::sleep(Duration::from_millis(60));
+    let committed = handle.sync();
+    assert_eq!(
+        (committed.stats.max_bytes, committed.stats.limited_by_volume),
+        (configured, false)
+    );
+    assert!(!committed.health.full);
+    assert!(handle.store.is_accepting());
+    assert_eq!(handle.keep((0..300).map(|_| bulky("more"))).stored, 300);
+}
+
+#[test]
 fn a_full_volume_stops_new_reports_and_nothing_else_of_the_transaction() {
     let (_dir, path) = file();
     let mut handle = Handle::opened(config(&path));
@@ -1397,6 +1482,9 @@ fn a_file_deleted_under_the_running_store_is_put_back_as_it_was() {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
     }
+    // It was written under a name of its own first, and given its name once
+    // it was whole. Nothing of that is left: the file and its journal.
+    assert_eq!(names(dir.path()), ["outbox.db", "outbox.db-journal"]);
 }
 
 #[test]
@@ -1658,7 +1746,7 @@ fn a_report_too_old_to_send_is_moved_to_rejected_not_destroyed() {
     assert_eq!(ids(&other.claim(1, 0, LEASE).fresh), ["being-sent"]);
 
     handle.store.claim(Claim {
-        expire: Some((clock.now_ms() - 3_600_000, "max_age")),
+        expire: Some((Duration::from_secs(3_600), "max_age")),
         ..all(5, 5, LEASE)
     });
     let committed = handle.committed();
@@ -1691,7 +1779,7 @@ fn a_report_too_old_to_send_is_moved_to_rejected_not_destroyed() {
     clock.step(365 * 24 * 3_600_000);
     handle.settle(&committed_young(&path), Outcome::Release);
     handle.store.claim(Claim {
-        expire: Some((clock.now_ms() - 7 * 24 * 3_600_000, "max_age")),
+        expire: Some((Duration::from_secs(7 * 24 * 3_600), "max_age")),
         ..all(5, 5, LEASE)
     });
     let committed = handle.committed();
@@ -1699,6 +1787,48 @@ fn a_report_too_old_to_send_is_moved_to_rejected_not_destroyed() {
     assert_eq!(committed.expired.len(), 2);
     assert_eq!(committed.stats.rejected, [("max_age".to_string(), 4)]);
     assert_eq!(committed.stats.pending_total(), 0);
+}
+
+#[test]
+fn how_old_a_report_is_is_judged_by_the_clock_when_the_file_is_written() {
+    let (_dir, path) = file();
+    let clock = Clock::default();
+    let mut handle = Handle::opened(UsageOutboxConfig {
+        clock: clock.clone(),
+        ..config(&path)
+    });
+    handle.keep([report("one"), report("two")]);
+
+    // The clock is a year ahead, by mistake, when the store is asked for
+    // reports, and somebody else has the file for a moment: the store waits.
+    let other = Connection::open(&path).unwrap();
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    clock.step(365 * 24 * 3_600_000);
+    handle.store.claim(Claim {
+        expire: Some((Duration::from_secs(7 * 24 * 3_600), "max_age")),
+        ..all(5, 5, LEASE)
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(handle.events.try_recv().is_err(), "it is waiting");
+
+    // The clock is put right before the store gets to the file. What it was
+    // asked is how old a report may be, not which reports were too old at
+    // the time: by the clock as it is now, none is.
+    clock.step(-365 * 24 * 3_600_000);
+    other.execute_batch("COMMIT").unwrap();
+    let committed = handle.committed();
+    assert!(committed.expired.is_empty(), "{:?}", committed.expired);
+    assert_eq!(ids(&committed.claimed.unwrap().fresh), ["one", "two"]);
+    assert_eq!(committed.stats.rejected, []);
+    // And their leases are of the clock as it is now, too.
+    let lease_in: i64 = read(
+        &path,
+        &format!(
+            "SELECT MAX(lease_until_ms) - {} FROM pending",
+            clock.now_ms()
+        ),
+    );
+    assert!((0..=60_000).contains(&lease_in), "{lease_in} ms");
 }
 
 /// The row of the report "young", as leased.

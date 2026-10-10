@@ -17,7 +17,8 @@
 //!   taken for the attempt and for nothing else: a report that waits for its
 //!   next attempt holds none.
 //! - A failure that can pass (timeout, connection or transport error, 5xx,
-//!   429, 401) makes the report due again after a backoff that doubles up to
+//!   429, and 401 and 403, which are about this process and not about the
+//!   report) makes the report due again after a backoff that doubles up to
 //!   `max_backoff`. Any other answer is final: the report moves to the
 //!   `rejected` table. So does a report older than `max_age`: nothing is
 //!   tried for ever, and nothing is destroyed for its age.
@@ -35,7 +36,7 @@
 //! neither.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -47,7 +48,7 @@ use crate::auth::{AuthPath, IngressRouteKind, RequestSource};
 use crate::model_metrics::{model_gauge, ModelLabel};
 use crate::proxy::{record_usage_report_outcome, UsageReportOutcome, UsageReporter};
 use crate::usage_outbox::{
-    Claim, Committed, Event, Health, Outcome, Persist, Rejection, Row, Settle, Store,
+    Claim, Committed, Event, Evicted, Health, Outcome, Persist, Rejection, Row, Settle, Store,
     UsageOutboxConfig,
 };
 
@@ -70,14 +71,23 @@ const RETRY_EVERY: u32 = 4;
 const NEVER_SENT: &str = "never_sent";
 
 /// Why a row is in `rejected`: the billing API refused the report for good,
-/// or the report grew older than `MAX_AGE_SECS`, or than `DEADLINE_SECS`,
-/// allow.
-const REJECTED_REASONS: [&str; 3] = ["rejected", "max_age", "deadline"];
+/// or the report grew older than `MAX_AGE_SECS` allows.
+const REJECTED_REASONS: [&str; 2] = ["rejected", "max_age"];
+
+/// Reports held in memory that are written to the file by one pass of the
+/// dispatcher, when the file takes reports again. The rest follows in the
+/// passes after it, with everything else the runtime has to do in between.
+const FLUSH_BATCH: usize = 500;
+
+/// Rows removed from `rejected` to make room that are said one by one, in
+/// any ten seconds. Past that a line says how many more, and which.
+const EVICTION_LINES: u32 = 100;
+const EVICTION_WINDOW: Duration = Duration::from_secs(10);
 
 /// The failures an attempt may be made again after: the `reason` of
 /// `inference_proxy_usage_report_retries_total`, which is also what a row of
 /// the outbox keeps as its `last_outcome`, and the outcome each stands for.
-const PASSING_FAILURES: [(&str, UsageReportOutcome); 6] = [
+const PASSING_FAILURES: [(&str, UsageReportOutcome); 7] = [
     ("timeout", UsageReportOutcome::Timeout),
     ("connect_error", UsageReportOutcome::ConnectError),
     ("transport_error", UsageReportOutcome::TransportError),
@@ -85,6 +95,7 @@ const PASSING_FAILURES: [(&str, UsageReportOutcome); 6] = [
     ("http_429", UsageReportOutcome::Http4xx),
     // With an outbox only (`caller_refused`).
     ("http_401", UsageReportOutcome::Http4xx),
+    ("http_403", UsageReportOutcome::Http4xx),
 ];
 
 /// A failure an attempt may be made again after.
@@ -226,8 +237,8 @@ struct Endpoint {
 /// not anything is wrong with the billing API, and there can be many of them
 /// while most reports are accepted. So failures that are not all first
 /// attempts count only once nothing has been answered for `window` as well,
-/// which with any report being accepted never happens. A 401 tells at once:
-/// it is about this process, and so about every report.
+/// which with any report being accepted never happens. A 401 or a 403 tells
+/// at once: it is about this process, and so about every report.
 ///
 /// While it is engaged one report at a time is sent, `pause` apart, the
 /// pause doubling up to `max_pause`. The report is the newest there is: if
@@ -265,6 +276,95 @@ struct Held {
     sending: bool,
 }
 
+/// How many reports this process holds that are not in the file: those on
+/// their way into it (handed to the writer, whose transaction has not been
+/// heard of) and those held in memory. Two counts in one number, so that the
+/// bound on their sum, `max_queued`, is looked at and a place taken in one
+/// step, by whichever of the two takes it: they never add up to more, at
+/// any moment, whoever races whom. Read without a lock.
+#[derive(Default)]
+struct Load(AtomicU64);
+
+impl Load {
+    /// (on their way to the writer, held in memory)
+    fn both(&self) -> (usize, usize) {
+        let both = self.0.load(Ordering::SeqCst);
+        ((both >> 32) as usize, (both & 0xFFFF_FFFF) as usize)
+    }
+
+    fn in_transit(&self) -> usize {
+        self.both().0
+    }
+
+    /// `change` applied to the two counts as they are at one moment; `false`
+    /// when it refuses them.
+    fn change(&self, change: impl Fn(usize, usize) -> Option<(usize, usize)>) -> bool {
+        let mut both = self.0.load(Ordering::SeqCst);
+        loop {
+            let counts = ((both >> 32) as usize, (both & 0xFFFF_FFFF) as usize);
+            let Some((in_transit, in_memory)) = change(counts.0, counts.1) else {
+                return false;
+            };
+            let next = ((in_transit as u64) << 32) | (in_memory as u64 & 0xFFFF_FFFF);
+            match self
+                .0
+                .compare_exchange_weak(both, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return true,
+                Err(now) => both = now,
+            }
+        }
+    }
+
+    /// A place for a report on its way to the writer, while fewer than
+    /// `max` reports are held in all.
+    fn to_the_writer(&self, max: usize) -> bool {
+        self.change(|in_transit, in_memory| {
+            (in_transit + in_memory < max).then_some((in_transit + 1, in_memory))
+        })
+    }
+
+    /// A report handed to the writer whatever the bound says: at shutdown,
+    /// when memory was emptied for it.
+    fn to_the_writer_anyway(&self) {
+        self.change(|in_transit, in_memory| Some((in_transit + 1, in_memory)));
+    }
+
+    /// The writer said what became of `reports` it was handed.
+    fn back_from_the_writer(&self, reports: usize) {
+        self.change(|in_transit, in_memory| Some((in_transit.saturating_sub(reports), in_memory)));
+    }
+
+    /// A place in memory, while fewer than `max` reports are held in all.
+    fn hold_in_memory(&self, max: usize) -> bool {
+        self.change(|in_transit, in_memory| {
+            (in_transit + in_memory < max).then_some((in_transit, in_memory + 1))
+        })
+    }
+
+    fn out_of_memory(&self, reports: usize) {
+        self.change(|in_transit, in_memory| Some((in_transit, in_memory.saturating_sub(reports))));
+    }
+}
+
+/// Reports taken out of memory together (`Kept::take_before`), as memory
+/// held them.
+struct Taken {
+    memory: BTreeMap<u64, Held>,
+    /// Which of them had never been tried: only kept to be dropped with
+    /// the rest.
+    fresh: BTreeSet<u64>,
+}
+
+impl Taken {
+    /// The reports, longest held first. Those that were being sent are not
+    /// among them: they stayed in memory.
+    fn reports(self) -> impl Iterator<Item = Held> {
+        drop(self.fresh);
+        self.memory.into_values().filter(|held| !held.sending)
+    }
+}
+
 /// What a process with an outbox keeps in memory about it.
 struct Kept {
     /// Reports leased from the file and not started, longest waiting first.
@@ -273,9 +373,17 @@ struct Kept {
     /// Reports the file does not hold, by the order they came in.
     memory: BTreeMap<u64, Held>,
     next_seq: u64,
-    /// Of those, the ones never tried and the ones due again, by when.
-    memory_fresh: VecDeque<u64>,
+    /// Of those, the ones never tried and the ones due again, by when. (Sets,
+    /// so that taking one report out of the many costs the same wherever it
+    /// is: a hundred thousand of them are written to the file one after the
+    /// other when it is back.)
+    memory_fresh: BTreeSet<u64>,
     memory_due: BTreeSet<(Instant, u64)>,
+    /// How many `memory` holds, and how many reports are on their way to
+    /// the writer: every report into or out of `memory` is counted here.
+    load: Arc<Load>,
+    /// Not before this are the reports in memory looked at for their age.
+    aged_at: Instant,
     /// Reports pushed out of `memory`, whose line is still to be written.
     dropped: Vec<(Item, GaveUp)>,
     /// Places taken, by what is in them.
@@ -309,6 +417,11 @@ struct Kept {
     stalled: bool,
     /// The database the leased rows belong to.
     generation: u64,
+    /// Rows removed from `rejected` to make room: how many were said one by
+    /// one since `said_at`, and those that were not, yet to be summed up
+    /// (how many, and their first and last id).
+    evictions_said: (Instant, u32),
+    evictions_unsaid: Option<(u64, i64, i64)>,
     /// Rows of the file per model, waiting or being sent by anyone.
     stored: Vec<(ModelLabel, u64)>,
     /// When the request of the oldest of them completed.
@@ -347,17 +460,33 @@ impl Kept {
         *self.beside.entry(model).or_default() += by;
     }
 
-    /// Hold `item` in memory, where the dispatcher finds it. Past
-    /// `max_held` the one that came in first is pushed out.
-    fn hold(&mut self, item: Item, max_held: usize) {
+    /// Hold `item` in memory, where the dispatcher finds it. When this
+    /// process holds `max_queued` reports already (in memory and on their
+    /// way to the writer together), the one memory has held longest is
+    /// pushed out for it; when memory has none to push out, `item` is.
+    fn hold(&mut self, item: Item, max_queued: usize) {
         let Home::Memory { due_at, ended } = &item.home else {
             return;
         };
+        while !self.load.hold_in_memory(max_queued) {
+            let oldest = self
+                .memory
+                .iter()
+                .find(|(_, held)| !held.sending)
+                .map(|(seq, _)| *seq);
+            match oldest.and_then(|seq| self.release(seq)) {
+                Some(held) => self.dropped.push((held.item, GaveUp::MemoryFull)),
+                None => {
+                    self.dropped.push((item, GaveUp::MemoryFull));
+                    return;
+                }
+            }
+        }
         let (seq, model) = (self.next_seq, item.model());
         self.next_seq += 1;
         if ended.is_none() {
             if item.attempts == 0 {
-                self.memory_fresh.push_back(seq);
+                self.memory_fresh.insert(seq);
             } else {
                 self.memory_due.insert((*due_at, seq));
             }
@@ -370,17 +499,67 @@ impl Kept {
                 sending: false,
             },
         );
-        while self.memory.len() > max_held {
-            let oldest = self
-                .memory
-                .iter()
-                .find(|(_, held)| !held.sending)
-                .map(|(seq, _)| *seq);
-            let Some(held) = oldest.and_then(|seq| self.release(seq)) else {
-                break;
-            };
-            self.dropped.push((held.item, GaveUp::MemoryFull));
+    }
+
+    /// Take everything out of memory at once, whatever it waits for, as it
+    /// is: three moves, however much there is. (`Outbox::empty_memory` puts
+    /// `beside` right afterwards, without this lock held meanwhile.)
+    #[allow(clippy::type_complexity)]
+    fn take_all(&mut self) -> (BTreeMap<u64, Held>, BTreeSet<u64>, BTreeSet<(Instant, u64)>) {
+        self.load.out_of_memory(self.memory.len());
+        (
+            std::mem::take(&mut self.memory),
+            std::mem::take(&mut self.memory_fresh),
+            std::mem::take(&mut self.memory_due),
+        )
+    }
+
+    /// Take every report held before `rest` out of memory (all of them
+    /// without one), but for those that are being sent. In one piece: what
+    /// memory is made of is not given back to the allocator one report at a
+    /// time here, under the lock, but when what was taken is dropped.
+    fn take_before(&mut self, rest: Option<u64>) -> Taken {
+        let (memory, fresh) = match rest {
+            Some(rest) => {
+                let later = self.memory.split_off(&rest);
+                let later_fresh = self.memory_fresh.split_off(&rest);
+                (
+                    std::mem::replace(&mut self.memory, later),
+                    std::mem::replace(&mut self.memory_fresh, later_fresh),
+                )
+            }
+            None => (
+                std::mem::take(&mut self.memory),
+                std::mem::take(&mut self.memory_fresh),
+            ),
+        };
+        let mut taken = 0;
+        for (seq, held) in &memory {
+            if held.sending {
+                // It stays where its attempt will look for it.
+                self.memory.insert(
+                    *seq,
+                    Held {
+                        item: held.item.clone(),
+                        sending: true,
+                    },
+                );
+                continue;
+            }
+            taken += 1;
+            if let Home::Memory {
+                due_at,
+                ended: None,
+            } = &held.item.home
+            {
+                if held.item.attempts > 0 {
+                    self.memory_due.remove(&(*due_at, *seq));
+                }
+                self.beside(held.item.model(), -1);
+            }
         }
+        self.load.out_of_memory(taken);
+        Taken { memory, fresh }
     }
 
     /// Take the report `seq` out of memory, wherever it waits there.
@@ -389,13 +568,14 @@ impl Kept {
         if let Home::Memory { due_at, ended } = &held.item.home {
             if !held.sending && ended.is_none() {
                 if held.item.attempts == 0 {
-                    self.memory_fresh.retain(|waiting| *waiting != seq);
+                    self.memory_fresh.remove(&seq);
                 } else {
                     self.memory_due.remove(&(*due_at, seq));
                 }
                 self.beside(held.item.model(), -1);
             }
         }
+        self.load.out_of_memory(1);
         Some(held)
     }
 
@@ -405,8 +585,8 @@ impl Kept {
     /// last (a probe), not the one that waited longest.
     fn next(&mut self, class: Class, now: Instant, newest: bool) -> Option<(Item, Option<u64>)> {
         let seq = match class {
-            Class::Fresh if newest => self.memory_fresh.pop_back(),
-            Class::Fresh => self.memory_fresh.pop_front(),
+            Class::Fresh if newest => self.memory_fresh.pop_last(),
+            Class::Fresh => self.memory_fresh.pop_first(),
             Class::Retry => match self.memory_due.first().copied() {
                 Some((due_at, seq)) if due_at <= now => {
                     self.memory_due.remove(&(due_at, seq));
@@ -460,8 +640,9 @@ pub(super) struct Outbox {
     /// The places reports that failed before may take.
     retry_places: usize,
     kept: Mutex<Kept>,
-    /// Reports handed to the store whose transaction has not been heard of.
-    in_transit: AtomicUsize,
+    /// Reports handed to the store whose transaction has not been heard
+    /// of, and reports held in memory (`Kept::memory`).
+    load: Arc<Load>,
     /// `Breaker::engaged`, and whether a report was handed over since: read
     /// and written by `submit`, which takes no lock for it.
     paused: AtomicBool,
@@ -483,7 +664,7 @@ impl Outbox {
         usage_token: &str,
     ) -> (Self, mpsc::UnboundedReceiver<Event<Item>>) {
         let lease = policy.attempt_timeout * 2 + config.lease_margin;
-        let max_age = max_age(policy, &config);
+        let max_age = max_age(&config);
         info!(
             path = %config.path.display(),
             max_pending = config.max_pending,
@@ -497,6 +678,7 @@ impl Outbox {
         );
         warn_about_the_directory(&config);
         let (events, from_store) = mpsc::unbounded_channel();
+        let load = Arc::new(Load::default());
         let outbox = Self {
             lease,
             lease_slack: config.lease_margin / 4,
@@ -506,8 +688,10 @@ impl Outbox {
                 retries: VecDeque::new(),
                 memory: BTreeMap::new(),
                 next_seq: 0,
-                memory_fresh: VecDeque::new(),
+                memory_fresh: BTreeSet::new(),
                 memory_due: BTreeSet::new(),
+                load: Arc::clone(&load),
+                aged_at: Instant::now(),
                 dropped: Vec::new(),
                 sending_fresh: 0,
                 sending_retries: 0,
@@ -528,6 +712,8 @@ impl Outbox {
                 synced: false,
                 stalled: false,
                 generation: 0,
+                evictions_said: (Instant::now(), 0),
+                evictions_unsaid: None,
                 stored: Vec::new(),
                 oldest_completed_at_ms: None,
                 rejected: Vec::new(),
@@ -544,7 +730,7 @@ impl Outbox {
                 url: format!("{cloud_api_url}/v1/internal/usage"),
                 authorization: format!("Bearer {usage_token}"),
             },
-            in_transit: AtomicUsize::new(0),
+            load,
             paused: AtomicBool::new(false),
             newcomer: AtomicBool::new(false),
             wake: tokio::sync::Notify::new(),
@@ -574,11 +760,12 @@ impl Outbox {
             self.newcomer.store(true, Ordering::Relaxed);
         }
         let item = Item::in_memory(Arc::new(job), 0, None);
-        if let Some((item, why)) = self.keep(item, delivery.policy.max_queued) {
+        let max_queued = delivery.policy.max_queued;
+        if let Some((item, why)) = self.keep(item, max_queued) {
             // The file cannot take it now. It is delivered all the same,
             // from memory, and written to the file when the file takes it.
             let item = delivery.bypassed(item, why);
-            self.kept().hold(item, delivery.policy.max_queued);
+            self.kept().hold(item, max_queued);
             self.wake.notify_one();
         } else if news {
             self.wake.notify_one();
@@ -587,14 +774,42 @@ impl Outbox {
 
     /// Hand `item` to the store. `None` when the store took it; otherwise
     /// the item back, and why.
-    fn keep(&self, item: Item, max_buffered: usize) -> Option<(Item, &'static str)> {
+    ///
+    /// What this process holds of reports that are not in the file is
+    /// bounded by `max_queued` as a whole: those waiting for the writer and
+    /// those held in memory together (`Load`).
+    fn keep(&self, item: Item, max_queued: usize) -> Option<(Item, &'static str)> {
         // Counted before the store has it, so that it is never out of sight.
-        self.in_transit.fetch_add(1, Ordering::SeqCst);
-        let refused = self.store.offer(item, max_buffered).err();
-        if refused.is_some() {
-            self.in_transit.fetch_sub(1, Ordering::SeqCst);
+        let counted = self.load.to_the_writer(max_queued);
+        let refused = self
+            .store
+            .offer(item, if counted { usize::MAX } else { 0 })
+            .err();
+        if counted && refused.is_some() {
+            self.load.back_from_the_writer(1);
         }
         refused.map(|(item, why)| (item, why.as_label()))
+    }
+
+    /// Everything memory holds, taken out of it: what shutdown does. The
+    /// lock is held for the taking and for the counts, not for the hundred
+    /// thousand reports there may be.
+    fn empty_memory(&self) -> Vec<Item> {
+        let (memory, fresh, due) = self.kept().take_all();
+        drop((fresh, due));
+        let mut waiting: HashMap<ModelLabel, i64> = HashMap::new();
+        let mut items = Vec::with_capacity(memory.len());
+        for held in memory.into_values() {
+            if !held.sending && matches!(held.item.home, Home::Memory { ended: None, .. }) {
+                *waiting.entry(held.item.model()).or_default() += 1;
+            }
+            items.push(held.item);
+        }
+        let mut kept = self.kept();
+        for (model, count) in waiting {
+            kept.beside(model, -count);
+        }
+        items
     }
 
     /// Reports waiting, and reports being sent.
@@ -604,7 +819,7 @@ impl Outbox {
         let waiting = stored
             .saturating_sub(kept.sending_from_file)
             .saturating_add(kept.waiting_in_memory())
-            .saturating_add(self.in_transit.load(Ordering::SeqCst));
+            .saturating_add(self.load.in_transit());
         (waiting, kept.in_flight())
     }
 
@@ -619,7 +834,7 @@ impl Outbox {
             && kept.waiting_in_memory() == 0
             && kept.in_flight() == 0
             && kept.dropped.is_empty()
-            && self.in_transit.load(Ordering::SeqCst) == 0
+            && self.load.in_transit() == 0
     }
 
     /// `label` as a `ModelLabel`. A label is leaked once and reused.
@@ -668,16 +883,11 @@ fn doubling(initial: Duration, times: u32, ceiling: Duration) -> Duration {
     Duration::from_millis(fixed_ms + rand::random_range(0..=ceiling_ms - fixed_ms))
 }
 
-/// How old a report may grow before it is moved to `rejected`, and which
-/// setting says so. With `DEADLINE_SECS` an attempt only starts while its
-/// whole timeout fits before the deadline, as without an outbox.
-fn max_age(policy: &UsageReportPolicy, config: &UsageOutboxConfig) -> (Duration, &'static str) {
-    match policy.deadline {
-        Some(deadline) if deadline.saturating_sub(policy.attempt_timeout) < config.max_age => {
-            (deadline.saturating_sub(policy.attempt_timeout), "deadline")
-        }
-        _ => (config.max_age, "max_age"),
-    }
+/// How old a report may grow before it is moved to `rejected`, and the
+/// reason that row gets. `DEADLINE_SECS` plays no part in it: an outbox is
+/// there to wait out an outage of the billing API, however long.
+fn max_age(config: &UsageOutboxConfig) -> (Duration, &'static str) {
+    (config.max_age, "max_age")
 }
 
 /// Whoever can write to the directory can replace the file, and a row of the
@@ -743,8 +953,7 @@ impl Drop for Place {
             }
             // Not settled: it goes back to where it waited.
             if let Some(held) = self.held.and_then(|seq| kept.release(seq)) {
-                let max_held = self.delivery.policy.max_queued;
-                kept.hold(held.item, max_held);
+                kept.hold(held.item, self.delivery.policy.max_queued);
             }
         }
         if let Some((id, generation)) = self.unsettled {
@@ -804,6 +1013,11 @@ impl UsageReportDelivery {
             if outbox.is_idle() {
                 self.idle.notify_waiters();
             }
+            // A pass may leave work for the next one and wake it at once
+            // (memory is written to the file a few hundred reports at a
+            // time). Whatever else waits for this thread of the runtime
+            // comes first.
+            tokio::task::yield_now().await;
         }
     }
 
@@ -974,12 +1188,11 @@ impl UsageReportDelivery {
                 }
                 // The file had no room for these: they are held in memory
                 // and sent from there.
+                outbox.load.back_from_the_writer(stored + no_room.len());
                 for item in no_room {
                     let item = self.bypassed(item, "full");
                     outbox.kept().hold(item, self.policy.max_queued);
-                    outbox.in_transit.fetch_sub(1, Ordering::SeqCst);
                 }
-                outbox.in_transit.fetch_sub(stored, Ordering::SeqCst);
                 self.give_back(outbox, unstarted);
                 self.say_health(outbox, was, (health, false), None);
                 for row in evicted {
@@ -988,10 +1201,7 @@ impl UsageReportDelivery {
                 for (row, reason) in expired {
                     self.say_gave_up(outbox, &item(row), GaveUp::TooOld(reason));
                 }
-                if rejected_evicted > 0 {
-                    metrics::counter!("inference_proxy_usage_report_outbox_rejected_evicted_total")
-                        .increment(rejected_evicted as u64);
-                }
+                self.say_evicted(outbox, rejected_evicted);
             }
             Event::Failed {
                 error,
@@ -1014,7 +1224,7 @@ impl UsageReportDelivery {
                     metrics::counter!("inference_proxy_usage_report_outbox_errors_total", "op" => *op)
                         .increment(1);
                 }
-                outbox.in_transit.fetch_sub(reports.len(), Ordering::SeqCst);
+                outbox.load.back_from_the_writer(reports.len());
                 let unstored = reports.len();
                 for item in reports {
                     let item = self.bypassed(item, "write_failed");
@@ -1031,56 +1241,152 @@ impl UsageReportDelivery {
                 why,
                 kept_as,
                 generation,
+                error,
+                held,
             } => {
                 metrics::counter!("inference_proxy_usage_report_outbox_replaced_total", "why" => why)
                     .increment(1);
-                // The rows leased from a database that is no longer at the
-                // path are not in the one that is: they are held in memory,
-                // and written to it with the rest.
-                let strangers: Vec<Item> = {
+                // The rows leased from a database that is no longer the one
+                // at the path mean nothing in the one that is: their reports
+                // are held in memory, and written to it with the rest.
+                let (strangers, in_hand): (Vec<Item>, u64) = {
                     let mut kept = outbox.kept();
                     let changed = kept.generation != generation;
                     kept.generation = generation;
                     kept.look_fresh = true;
                     kept.look_retries = true;
+                    let mut strangers: Vec<Item> = Vec::new();
                     if changed {
-                        let mut strangers: Vec<Item> = kept.fresh.drain(..).collect();
+                        strangers.extend(kept.fresh.drain(..));
                         strangers.extend(kept.retries.drain(..));
-                        strangers
-                    } else {
-                        Vec::new()
                     }
+                    // Those, and the rows that are being sent: an attempt
+                    // that fails is written to the new file as well.
+                    let in_hand = strangers.len() + kept.sending_from_file;
+                    (strangers, in_hand as u64)
                 };
                 for item in strangers {
                     let item = item.out_of_the_file();
                     outbox.kept().hold(item, self.policy.max_queued);
                 }
+                // What that database held is in nobody's hands, but for the
+                // reports this process has: counted, as many as the file
+                // held when this process last wrote to it, less those.
+                let lost = held.map_or(0, |held| held.saturating_sub(in_hand));
+                if lost > 0 {
+                    metrics::counter!("inference_proxy_usage_report_outbox_lost_reports_total", "why" => why)
+                        .increment(lost);
+                }
                 match why {
                     "corrupt" => error!(
                         path = %path,
                         kept_as = %kept_as.as_deref().unwrap_or(outbox.config().path.as_path()).display(),
-                        "Usage report outbox was not a readable database any more: it was moved \
-                         aside for a person to look at, and a new file started. The reports it \
-                         held are not sent unless they are put back"
+                        error = error.as_deref(),
+                        held,
+                        in_hand,
+                        "Usage report outbox was not a readable database: it was moved aside for \
+                         a person to look at, and a new file started. Whatever reports the file \
+                         that was moved aside held are not sent unless they are put back"
                     ),
-                    "deleted" => warn!(
+                    "deleted" => error!(
                         path = %path,
-                        "Usage report outbox was deleted under the running process: it has been \
-                         written back as it was"
+                        held,
+                        in_hand,
+                        "Usage report outbox was deleted under the running process: a new file \
+                         was started, and the reports the deleted one held are lost, except \
+                         those this process was sending — usage NOT billed"
                     ),
                     "lost" => error!(
                         path = %path,
-                        "Usage report outbox was deleted or emptied under the running process \
-                         and could not be written back: a new one was started, and the reports \
-                         it held are lost, except those this process was sending"
+                        held,
+                        in_hand,
+                        "Usage report outbox was emptied, or exchanged while it could not be \
+                         used: a new one was started, and the reports the old one held are lost, \
+                         except those this process was sending — usage NOT billed"
                     ),
-                    _ => warn!(
+                    _ => error!(
                         path = %path,
-                        "Usage report outbox is another file than the one that was open: it has \
-                         been opened in its place"
+                        held,
+                        in_hand,
+                        "Usage report outbox is another file than the one that was open: it is \
+                         used from now on, and the reports the file that was open held are not \
+                         sent unless that file is put back, except those this process was \
+                         sending — usage NOT billed"
                     ),
                 }
             }
+        }
+    }
+
+    /// The lines of rows removed from `rejected` to make room. What is
+    /// removed there is the last there was of a report, so each is said with
+    /// what it takes to bill it by hand: who, which model, how many tokens.
+    /// Never more than `EVICTION_LINES` of them in `EVICTION_WINDOW`: past
+    /// that the rows are summed up (`say_unsaid_evictions`).
+    fn say_evicted(&self, outbox: &Outbox, rows: Vec<Evicted>) {
+        if rows.is_empty() {
+            return;
+        }
+        metrics::counter!("inference_proxy_usage_report_outbox_rejected_evicted_total")
+            .increment(rows.len() as u64);
+        let said = {
+            let mut kept = outbox.kept();
+            let now = Instant::now();
+            if now.saturating_duration_since(kept.evictions_said.0) >= EVICTION_WINDOW {
+                kept.evictions_said = (now, 0);
+            }
+            let said = (EVICTION_LINES - kept.evictions_said.1).min(rows.len() as u32);
+            kept.evictions_said.1 += said;
+            if let (Some(first), Some(last)) = (rows.get(said as usize), rows.last()) {
+                let more = (rows.len() - said as usize) as u64;
+                kept.evictions_unsaid = Some(match kept.evictions_unsaid {
+                    Some((count, from, _)) => (count + more, from, last.id),
+                    None => (more, first.id, last.id),
+                });
+            }
+            said as usize
+        };
+        for row in &rows[..said] {
+            let report = ReportedUsage::of(&row.body);
+            warn!(
+                rejected_id = row.id,
+                request_id = %row.request_id.as_deref().unwrap_or(""),
+                org_id = %report.organization_id.as_deref().unwrap_or(""),
+                workspace_id = %report.workspace_id.as_deref().unwrap_or(""),
+                api_key_id = %report.api_key_id.as_deref().unwrap_or(""),
+                model = %report.model.as_deref().unwrap_or(""),
+                completion_id = %report.completion_id.as_deref().unwrap_or(""),
+                usage = %report.numbers,
+                reason = %row.reason,
+                status = row.status,
+                attempts = row.attempts,
+                completed_at_ms = row.completed_at_ms,
+                "Usage report removed from rejected to make room: this line is all there is \
+                 of it now — usage NOT billed"
+            );
+        }
+    }
+
+    /// One line for the rows removed from `rejected` that were not said one
+    /// by one, once the window they fell in is over (or at shutdown).
+    fn say_unsaid_evictions(&self, outbox: &Outbox, now_or_never: bool) {
+        let unsaid = {
+            let mut kept = outbox.kept();
+            let over = kept.evictions_said.0.elapsed() >= EVICTION_WINDOW;
+            if over || now_or_never {
+                kept.evictions_unsaid.take()
+            } else {
+                None
+            }
+        };
+        if let Some((count, first_rejected_id, last_rejected_id)) = unsaid {
+            warn!(
+                count,
+                first_rejected_id,
+                last_rejected_id,
+                "Usage reports removed from rejected to make room, more than are said one by \
+                 one: nothing is left of them — usage NOT billed"
+            );
         }
     }
 
@@ -1121,7 +1427,7 @@ impl UsageReportDelivery {
         }
         let full = {
             let mut kept = outbox.kept();
-            let held = !kept.memory.is_empty() || outbox.in_transit.load(Ordering::SeqCst) > 0;
+            let held = !kept.memory.is_empty() || outbox.load.in_transit() > 0;
             let full = is.0.full || (kept.full && held);
             let changed = full != kept.full;
             kept.full = full;
@@ -1147,9 +1453,9 @@ impl UsageReportDelivery {
     fn advance(self: &Arc<Self>, outbox: &Outbox, rechecking: bool) -> Instant {
         let config = outbox.config();
         let cap = self.policy.max_in_flight.max(1);
-        let max_held = self.policy.max_queued;
+        let max_queued = self.policy.max_queued;
         let now = Instant::now();
-        let (limit, limit_reason) = max_age(&self.policy, config);
+        let (limit, limit_reason) = max_age(config);
 
         // A writer that does not come back from a transaction: what it was
         // handed is taken over and sent from memory, and the file counts as
@@ -1162,7 +1468,7 @@ impl UsageReportDelivery {
             };
             if stalled && !was.1 {
                 let taken = outbox.store.take_over();
-                outbox.in_transit.fetch_sub(taken.len(), Ordering::SeqCst);
+                outbox.load.back_from_the_writer(taken.len());
                 metrics::counter!("inference_proxy_usage_report_outbox_errors_total", "op" => "stalled")
                     .increment(1);
                 let unstored = taken.len();
@@ -1173,7 +1479,7 @@ impl UsageReportDelivery {
                 }
                 for item in taken {
                     let item = self.bypassed(item, "stalled");
-                    outbox.kept().hold(item, max_held);
+                    outbox.kept().hold(item, max_queued);
                 }
                 let reason = format!(
                     "the writer has been in one transaction for more than {} s",
@@ -1191,7 +1497,8 @@ impl UsageReportDelivery {
         let mut start = Vec::new();
         let mut gave_up = Vec::new();
         let mut give_back = Vec::new();
-        let mut write = Vec::new();
+        let mut write: Option<Taken> = None;
+        let mut more_to_write = false;
         let mut ask = None;
         // A report was handed over since the billing API stopped answering,
         // and none that was has been tried.
@@ -1204,8 +1511,12 @@ impl UsageReportDelivery {
             let usable = kept.health.available && !kept.stalled && !kept.stopping;
 
             // Reports in memory too old to be sent end there, and wait for
-            // the file to keep them in `rejected`.
-            if rechecking && !kept.stopping {
+            // the file to keep them in `rejected`. Every one of them is
+            // looked at for that, so not at every pass: often enough for an
+            // age that is counted in days.
+            if rechecking && !kept.stopping && kept.aged_at <= now {
+                kept.aged_at =
+                    now + (limit / 20).clamp(config.recheck_interval, Duration::from_secs(60));
                 let too_old: Vec<u64> = kept
                     .memory
                     .iter()
@@ -1233,22 +1544,29 @@ impl UsageReportDelivery {
                             ..held.item
                         };
                         gave_up.push((ended.clone(), GaveUp::TooOld(limit_reason)));
-                        kept.hold(ended, max_held);
+                        kept.hold(ended, max_queued);
                     }
                 }
             }
 
             // What memory holds is written to the file as soon as the file
             // takes reports: those that wait, those that wait for their next
-            // attempt, and those that ended.
-            if usable && !kept.health.full && outbox.store.is_accepting() {
-                let waiting: Vec<u64> = kept
+            // attempt, and those that ended. The longest held first, and no
+            // more than `FLUSH_BATCH` in one pass: memory may hold a hundred
+            // thousand, and this runs on the runtime, with the lock `submit`
+            // may need. (A report that goes from memory to the writer is
+            // one of those this process holds before and after.)
+            if usable && !kept.health.full && outbox.store.is_accepting() && !kept.memory.is_empty()
+            {
+                // Where the reports after the first `FLUSH_BATCH` begin.
+                let rest = kept
                     .memory
                     .iter()
                     .filter(|(_, held)| !held.sending)
                     .map(|(seq, _)| *seq)
-                    .collect();
-                write.extend(waiting.into_iter().filter_map(|seq| kept.release(seq)));
+                    .nth(FLUSH_BATCH);
+                more_to_write = rest.is_some();
+                write = Some(kept.take_before(rest));
             }
 
             // The retry of a report of the file is due.
@@ -1320,13 +1638,14 @@ impl UsageReportDelivery {
                 let Some((item, held)) = kept.next(class, now, kept.breaker.engaged) else {
                     break;
                 };
-                // A row of a database that is no longer at the path.
+                // A row of a database that is no longer the one at the
+                // path: its report is held here, and written to that one.
                 if let Home::File { generation, .. } = item.home {
                     if generation != kept.generation {
                         kept.sending_from_file -= 1;
                         kept.beside(item.model(), 1);
                         let item = item.out_of_the_file();
-                        kept.hold(item, max_held);
+                        kept.hold(item, max_queued);
                         continue;
                     }
                 }
@@ -1418,10 +1737,20 @@ impl UsageReportDelivery {
             tokio::spawn(Arc::clone(self).send(item, place, probe));
         }
         self.give_back(outbox, give_back);
-        for held in write {
-            if let Some((item, _)) = outbox.keep(held.item, usize::MAX) {
-                outbox.kept().hold(item, max_held);
+        // (Without the lock: this is where the memory they took is given
+        // back, which can take the allocator milliseconds at a time.)
+        for held in write.into_iter().flat_map(Taken::reports) {
+            if let Some((item, _)) = outbox.keep(held.item, max_queued) {
+                outbox.kept().hold(item, max_queued);
             }
+        }
+        // The rest of what memory holds follows in the next pass, once the
+        // runtime has done what else it has to do.
+        if more_to_write {
+            outbox.wake.notify_one();
+        }
+        if rechecking {
+            self.say_unsaid_evictions(outbox, false);
         }
         match ask {
             Some(claim) => outbox.store.claim(claim),
@@ -1480,7 +1809,7 @@ impl UsageReportDelivery {
     async fn try_once(&self, outbox: &Outbox, item: &Item) -> Verdict {
         let job = &item.job;
         let timeout = self.policy.attempt_timeout;
-        let (limit, reason) = max_age(&self.policy, outbox.config());
+        let (limit, reason) = max_age(outbox.config());
         if job.since_completion() > limit {
             return Verdict::TooOld(reason);
         }
@@ -1622,8 +1951,9 @@ impl UsageReportDelivery {
                         breaker.fresh_failures = breaker.fresh_failures.saturating_add(1);
                     }
                     let since = *breaker.since.get_or_insert(now);
-                    // A 401 is about this process, so about every report.
-                    let at_once = failure.0 == "http_401";
+                    // A 401 and a 403 are about this process, so about every
+                    // report.
+                    let at_once = matches!(failure.0, "http_401" | "http_403");
                     let first_attempts = breaker.fresh_failures >= config.breaker_after;
                     let nothing_answered = breaker.failures >= config.breaker_after
                         && now.saturating_duration_since(since) >= config.breaker_window;
@@ -1708,7 +2038,7 @@ impl UsageReportDelivery {
             }
         }
         if let Some(item) = write {
-            if let Some((item, _)) = outbox.keep(item, usize::MAX) {
+            if let Some((item, _)) = outbox.keep(item, self.policy.max_queued) {
                 outbox.kept().hold(item, self.policy.max_queued);
             }
         }
@@ -1784,6 +2114,40 @@ impl UsageReportDelivery {
     fn say_gave_up(&self, outbox: &Outbox, item: &Item, why: GaveUp) {
         let reporter = &item.job.reporter;
         let since_completion_ms = item.job.since_completion().as_millis() as u64;
+        // A report that had ended already (refused for good, or too old) and
+        // was waiting in memory for the file to keep it in `rejected`: it
+        // was counted and said when it ended. What is lost now is its row,
+        // the last there was of it, as if it had been removed from
+        // `rejected` to make room: counted as that, and said with what it
+        // takes to bill it by hand.
+        if let (
+            GaveUp::MemoryFull | GaveUp::Shutdown,
+            Home::Memory {
+                ended: Some(ended), ..
+            },
+        ) = (why, &item.home)
+        {
+            metrics::counter!("inference_proxy_usage_report_outbox_rejected_evicted_total")
+                .increment(1);
+            let report = ReportedUsage::of(&String::from_utf8_lossy(&item.job.body));
+            warn!(
+                request_id = %reporter.request_id.as_deref().unwrap_or(""),
+                org_id = %report.organization_id.as_deref().unwrap_or(""),
+                workspace_id = %report.workspace_id.as_deref().unwrap_or(""),
+                api_key_id = %report.api_key_id.as_deref().unwrap_or(""),
+                model = %report.model.as_deref().unwrap_or(""),
+                completion_id = %report.completion_id.as_deref().unwrap_or(""),
+                usage = %report.numbers,
+                reason = ended.reason,
+                status = ended.status,
+                attempts = item.attempts,
+                since_completion_ms,
+                "Usage report that had ended was not written to rejected before memory was \
+                 full, or the process stopped: this line is all there is of it now — usage \
+                 NOT billed"
+            );
+            return;
+        }
         let (outcome, reason) = match why {
             GaveUp::FileFull | GaveUp::MemoryFull => (UsageReportOutcome::QueueFull, "queue_full"),
             GaveUp::TooOld(reason) => (UsageReportOutcome::DeadlineExceeded, reason),
@@ -1913,7 +2277,7 @@ impl UsageReportDelivery {
         }
         metrics::gauge!("inference_proxy_usage_report_outbox_bytes").set(used_bytes as f64);
         metrics::gauge!("inference_proxy_usage_report_outbox_unwritten")
-            .set(outbox.in_transit.load(Ordering::SeqCst) as f64);
+            .set(outbox.load.in_transit() as f64);
         metrics::gauge!("inference_proxy_usage_report_outbox_in_memory").set(in_memory as f64);
     }
 
@@ -1926,7 +2290,7 @@ impl UsageReportDelivery {
     pub(super) async fn close(&self, outbox: &Outbox) -> Drained {
         let config = outbox.config();
         let started_at = Instant::now();
-        let max_held = self.policy.max_queued;
+        let max_queued = self.policy.max_queued;
         let (pending, unstarted) = {
             let mut kept = outbox.kept();
             kept.stopping = true;
@@ -1935,9 +2299,7 @@ impl UsageReportDelivery {
             unstarted.extend(kept.retries.drain(..));
             // What this process holds itself: in memory, on its way to the
             // file, and the rows of the file it is sending.
-            let pending = kept.memory.len()
-                + outbox.in_transit.load(Ordering::SeqCst)
-                + kept.sending_from_file;
+            let pending = kept.memory.len() + outbox.load.in_transit() + kept.sending_from_file;
             (pending, unstarted)
         };
         drop(unstarted);
@@ -1960,19 +2322,11 @@ impl UsageReportDelivery {
         // counted once, as written or as left. Should the attempt be
         // accepted after all, the next process sends the report once more,
         // and the billing API tells the two apart by their completion id.
-        let in_memory: Vec<Item> = {
-            let mut kept = outbox.kept();
-            let all: Vec<u64> = kept.memory.keys().copied().collect();
-            all.into_iter()
-                .filter_map(|seq| kept.release(seq))
-                .map(|held| held.item)
-                .collect()
-        };
-        for item in in_memory {
-            outbox.in_transit.fetch_add(1, Ordering::SeqCst);
+        for item in outbox.empty_memory() {
+            outbox.load.to_the_writer_anyway();
             if let Err((item, _)) = outbox.store.offer_anyway(item) {
-                outbox.in_transit.fetch_sub(1, Ordering::SeqCst);
-                outbox.kept().hold(item, max_held);
+                outbox.load.back_from_the_writer(1);
+                outbox.kept().hold(item, max_queued);
             }
         }
 
@@ -1984,9 +2338,9 @@ impl UsageReportDelivery {
             // The writer did not come back. What it was handed is here.
             _ => {
                 let taken = outbox.store.take_over();
-                outbox.in_transit.fetch_sub(taken.len(), Ordering::SeqCst);
+                outbox.load.back_from_the_writer(taken.len());
                 for item in taken {
-                    outbox.kept().hold(item, max_held);
+                    outbox.kept().hold(item, max_queued);
                 }
                 None
             }
@@ -1994,17 +2348,10 @@ impl UsageReportDelivery {
         // What the last transaction could not write comes back through the
         // dispatcher, which is still running.
         let settled_by = Instant::now() + Duration::from_secs(1);
-        while outbox.in_transit.load(Ordering::SeqCst) > 0 && Instant::now() < settled_by {
+        while outbox.load.in_transit() > 0 && Instant::now() < settled_by {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        let unwritten: Vec<Item> = {
-            let mut kept = outbox.kept();
-            let all: Vec<u64> = kept.memory.keys().copied().collect();
-            all.into_iter()
-                .filter_map(|seq| kept.release(seq))
-                .map(|held| held.item)
-                .collect()
-        };
+        let unwritten = outbox.empty_memory();
         outbox.kept().closed = true;
         let waited = started_at.elapsed();
         match &left {
@@ -2040,6 +2387,7 @@ impl UsageReportDelivery {
                 "Usage reports left undelivered at shutdown — usage NOT billed"
             );
         }
+        self.say_unsaid_evictions(outbox, true);
         Drained {
             pending,
             left_waiting: unwritten.len(),
@@ -2056,6 +2404,47 @@ fn gave_up_lines(delivery: &UsageReportDelivery, outbox: &Outbox, gave_up: Vec<(
     }
 }
 
+/// What a report says, for a line about a report of which nothing else is
+/// left: who it is for, which model, and every number in it (the token
+/// counts, the discount). Strings other than the ids are left out: a report
+/// holds none, and a row written by hand might hold anything.
+struct ReportedUsage {
+    organization_id: Option<String>,
+    workspace_id: Option<String>,
+    api_key_id: Option<String>,
+    model: Option<String>,
+    completion_id: Option<String>,
+    /// The numbers of the report, as a JSON object.
+    numbers: String,
+}
+
+impl ReportedUsage {
+    fn of(body: &str) -> Self {
+        let report: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+        let text = |key: &str| {
+            report
+                .get(key)
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        };
+        let numbers: serde_json::Map<String, serde_json::Value> = report
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(_, value)| value.is_number())
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        Self {
+            organization_id: text("organization_id"),
+            workspace_id: text("workspace_id"),
+            api_key_id: text("api_key_id"),
+            model: text("model"),
+            completion_id: text("id"),
+            numbers: serde_json::Value::Object(numbers).to_string(),
+        }
+    }
+}
+
 /// The entry of `PASSING_FAILURES` a reason, or a row's `last_outcome`, names.
 fn passing_failure(label: &str) -> Option<Passing> {
     PASSING_FAILURES
@@ -2063,20 +2452,24 @@ fn passing_failure(label: &str) -> Option<Passing> {
         .find(|(reason, _)| *reason == label)
 }
 
-/// With an outbox, one more answer leaves a report where it is: a 401 says
-/// that the billing API does not accept this process (a usage token that is
-/// wrong, or was rotated under a running process), not that anything is
-/// wrong with the report. Every report gets that answer until the token is
-/// put right, so ending them would move the whole traffic of that time to
-/// `rejected`. They wait instead, and are sent with the right token.
+/// With an outbox, two more answers leave a report where it is, because they
+/// are about this process and not about the report, and every report gets
+/// them until what is wrong is put right. Ending the reports for them would
+/// move the whole traffic of that time to `rejected`; they wait instead.
 ///
-/// A 403 is not that: the billing API's handler never answers one for the
-/// token, so it is about the report and final like any other 4xx. Without an
-/// outbox a 401 is final too, as it always was (`retry_reason`): nothing in
-/// memory outlives the restart that puts a token right.
+/// A 401 is the billing API saying that it does not accept this process: a
+/// usage token that is wrong, or was rotated under a running process.
+///
+/// A 403 is never the billing API's on this route. It can only come from
+/// something in front of it (a firewall, an allowlist this process is not
+/// on), and such a thing does not look at the report.
+///
+/// Without an outbox both are final, as they always were (`retry_reason`):
+/// nothing in memory outlives the restart that puts them right.
 fn caller_refused(answer: &Result<reqwest::StatusCode, reqwest::Error>) -> Option<&'static str> {
     match answer {
         Ok(reqwest::StatusCode::UNAUTHORIZED) => Some("http_401"),
+        Ok(reqwest::StatusCode::FORBIDDEN) => Some("http_403"),
         _ => None,
     }
 }

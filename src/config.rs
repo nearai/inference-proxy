@@ -187,13 +187,14 @@ fn usage_report_outbox() -> Option<crate::usage_outbox::UsageOutboxConfig> {
 ///   an outbox a report waits up to ten minutes between two attempts, so a
 ///   number of attempts would be a few minutes of a billing API outage and
 ///   then `rejected`. What ends a report that is never accepted is its age
-///   (`VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_AGE_SECS`, and `DEADLINE_SECS`).
+///   (`VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_AGE_SECS`).
 /// - `MAX_IN_FLIGHT` not set, or 0: 8. An outbox is always delivered under a
 ///   cap, so "no cap" is not offered, and the rule that a longer timeout or
 ///   retries need one is met without it.
-/// - `DEADLINE_SECS` not set: none, as always. Set, it is a maximum age for
-///   a report, whichever process kept it, on top of the outbox's own, and a
-///   report past it moves to `rejected` instead of being dropped.
+/// - `DEADLINE_SECS` has no effect either, and a line says so when it is
+///   set. An outbox is there to wait out an outage of the billing API; a
+///   deadline of an hour would move the whole backlog of a longer one to
+///   `rejected`. `MAX_AGE_SECS` is the one age that ends a report.
 /// - `INITIAL_BACKOFF_MS` 0: the default. A report that is sent again needs
 ///   a backoff, and the outbox must not be why startup fails.
 fn usage_report_policy(outbox: bool) -> anyhow::Result<crate::usage_report::UsageReportPolicy> {
@@ -238,7 +239,18 @@ fn usage_report_policy(outbox: bool) -> anyhow::Result<crate::usage_report::Usag
         env_parse(MAX_ATTEMPTS, default.max_attempts)?
     };
     let mut initial_backoff_ms: u64 = env_parse(INITIAL_BACKOFF, default_initial_backoff_ms)?;
-    let deadline_secs: u64 = env_parse(DEADLINE, 0)?;
+    let deadline_secs: u64 = if outbox {
+        if env::var(DEADLINE).is_ok_and(|value| !value.trim().is_empty()) {
+            tracing::warn!(
+                "{DEADLINE} has no effect with a usage report outbox: an outbox is there to \
+                 wait out an outage, and the only age that ends a report is \
+                 VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_AGE_SECS"
+            );
+        }
+        0
+    } else {
+        env_parse(DEADLINE, 0)?
+    };
     let mut max_in_flight: usize = env_parse(MAX_IN_FLIGHT, default.max_in_flight)?;
     let max_queued: usize = env_parse(MAX_QUEUED, default.max_queued)?;
     let shutdown_drain_secs: u64 = env_parse(SHUTDOWN_DRAIN, 0)?;
@@ -2088,16 +2100,22 @@ mod tests {
             // a few minutes of an outage, and then `rejected`. A report is
             // sent until it is accepted, refused for good or too old, whatever
             // the variable says, and whatever it says is not why startup
-            // fails. A deadline is the maximum age it always was.
+            // fails.
             for ignored in ["5", "1", "10", "0", "11", "many"] {
                 env::set_var(MAX_ATTEMPTS, ignored);
                 let policy = Config::from_env().unwrap().usage_report;
                 assert_eq!(policy.attempt_cap(), None, "{ignored}");
                 assert_eq!(policy.max_attempts, UsageReportPolicy::UNTIL_ACCEPTED);
             }
-            env::set_var(DEADLINE, "3600");
-            let policy = Config::from_env().unwrap().usage_report;
-            assert_eq!(policy.deadline, Some(Duration::from_secs(3600)));
+            // A deadline has none either: an hour of it would move the
+            // backlog of any longer outage to `rejected`, which is what the
+            // outbox is there to wait out. Whatever it says, even what
+            // without an outbox could not work (shorter than the timeout).
+            for ignored in ["3600", "30", "1", "0", "soon"] {
+                env::set_var(DEADLINE, ignored);
+                let policy = Config::from_env().unwrap().usage_report;
+                assert_eq!(policy.deadline, None, "{ignored}");
+            }
             env::set_var(MAX_ATTEMPTS, "");
             env::set_var(DEADLINE, "");
 
@@ -2125,11 +2143,7 @@ mod tests {
 
             // What was a startup failure before the outbox still is one: a
             // delivery setting that cannot work, outbox or not.
-            for (name, bad, restored) in [
-                (TIMEOUT, "0", "30"),
-                (MAX_IN_FLIGHT, "1001", "3"),
-                (DEADLINE, "30", ""),
-            ] {
+            for (name, bad, restored) in [(TIMEOUT, "0", "30"), (MAX_IN_FLIGHT, "1001", "3")] {
                 env::set_var(name, bad);
                 let err = Config::from_env().unwrap_err().to_string();
                 assert!(err.contains(name), "{name}={bad}: {err}");

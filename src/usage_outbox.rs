@@ -36,8 +36,18 @@
 //! - When the file cannot be opened or written, the reports of that
 //!   transaction are handed back to be delivered from memory, and the file
 //!   is tried again every `reopen_interval`. A file that is corrupt is moved
-//!   aside for a person and a new one started. A file deleted under the
-//!   process is noticed and put back.
+//!   aside for a person and a new one started.
+//! - A file deleted or replaced under the process is noticed before every
+//!   transaction, and by SQLite when one is under way (it does not write to
+//!   a database whose file was moved). The connection is let go of at once
+//!   and never used again, not even to read what it still holds: SQLite
+//!   finds a rollback journal by the path of its database, so a connection
+//!   whose file is no longer at the path takes the journal of whatever is
+//!   there now for its own, and plays it into its file, which ruins both.
+//!   What the file held is said and counted as lost (`Writer::let_go`), the
+//!   reports this process has in hand are written to the file that is
+//!   started or found at the path, and nothing is ever copied back to the
+//!   path as a file.
 //! - The file has a size of its own (`max_bytes`) below that of its volume,
 //!   so that it is full while the volume still has room for the journal:
 //!   leasing and removing reports then go on, and only new reports are
@@ -65,6 +75,13 @@ const MAX_BATCH: usize = 2_000;
 /// transaction at most.
 const SWEEP_BATCH: usize = 500;
 
+/// Rows removed from `rejected` at its bound by one transaction at most:
+/// more than one transaction can add to it (new reports that had ended in
+/// memory, reports too old), so the table is back at its bound however fast
+/// it is filled, and what a transaction hands out to be said row by row
+/// stays a megabyte or two.
+const EVICT_BATCH: usize = MAX_BATCH + SWEEP_BATCH + 500;
+
 /// New pages one report can take at the very worst, besides those its body
 /// overflows into: a page of the table and one of each index it is in, when
 /// they all split at once. A report takes a fraction of one page as a rule;
@@ -82,8 +99,11 @@ const ROOM_PAGES: i64 = 32;
 const ROOM_PROBE_PAGES: i64 = 16;
 
 /// `pending`: one row per report not yet accepted. `id` is never reused
-/// (`AUTOINCREMENT`), so an outcome written late cannot land on another
-/// report. A report never tried (`attempts = 0`) is due from the moment it
+/// within a database (`AUTOINCREMENT`), and an outcome is written only to a
+/// row its sender still holds the lease of, handed out by the database that
+/// is open now (`Settle::generation`): so an outcome written late cannot
+/// land on another report, in this database or in the one that took its
+/// place. A report never tried (`attempts = 0`) is due from the moment it
 /// is written; one that failed is due again at `next_attempt_at_ms`. The two
 /// are asked for separately (`pending_fresh`, `pending_retry`), because a
 /// retry must never stand in front of a first attempt.
@@ -96,10 +116,9 @@ const ROOM_PROBE_PAGES: i64 = 16;
 /// means counting a million rows, and so that a row moved by hand is counted
 /// like any other.
 ///
-/// `meta`: `db_id` names this database, whichever file holds it (a file put
-/// back after it was deleted is the same database; one started after a
-/// corrupt file was moved aside is another), and `probed_at_ms` is the row
-/// written to find out whether the file takes writes.
+/// `meta`: `db_id` names this database, whichever file holds it (one started
+/// after a file was deleted or moved aside is another), and `probed_at_ms`
+/// is the row written to find out whether the file takes writes.
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS pending (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -374,37 +393,42 @@ impl Row {
     /// by hand, and a row that could not be read would fail the transaction
     /// it is part of: every claim after it, for every other report.
     fn read(row: &rusqlite::Row<'_>, generation: u64) -> rusqlite::Result<Self> {
-        use rusqlite::types::ValueRef;
-        let text = |column: usize| -> rusqlite::Result<Option<String>> {
-            Ok(match row.get_ref(column)? {
-                ValueRef::Null => None,
-                ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
-                    Some(String::from_utf8_lossy(bytes).into_owned())
-                }
-                ValueRef::Integer(number) => Some(number.to_string()),
-                ValueRef::Real(number) => Some(number.to_string()),
-            })
-        };
-        let integer = |column: usize| -> rusqlite::Result<i64> {
-            Ok(match row.get_ref(column)? {
-                ValueRef::Integer(number) => number,
-                _ => 0,
-            })
-        };
         Ok(Self {
             id: row.get(0)?,
             generation,
-            body: text(1)?.unwrap_or_default(),
-            request_id: text(2)?,
-            model_label: text(3)?,
-            auth_path: text(4)?.unwrap_or_default(),
-            ingress_route: text(5)?.unwrap_or_default(),
-            completed_at_ms: integer(6)?,
-            attempts: integer(7)?.clamp(0, i64::from(u32::MAX)) as u32,
-            last_outcome: text(8)?,
-            next_attempt_at_ms: integer(9)?,
+            body: text_of(row, 1)?.unwrap_or_default(),
+            request_id: text_of(row, 2)?,
+            model_label: text_of(row, 3)?,
+            auth_path: text_of(row, 4)?.unwrap_or_default(),
+            ingress_route: text_of(row, 5)?.unwrap_or_default(),
+            completed_at_ms: number_of(row, 6)?,
+            attempts: number_of(row, 7)?.clamp(0, i64::from(u32::MAX)) as u32,
+            last_outcome: text_of(row, 8)?,
+            next_attempt_at_ms: number_of(row, 9)?,
         })
     }
+}
+
+/// A column as text, whatever is in it.
+fn text_of(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<Option<String>> {
+    use rusqlite::types::ValueRef;
+    Ok(match row.get_ref(column)? {
+        ValueRef::Null => None,
+        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
+            Some(String::from_utf8_lossy(bytes).into_owned())
+        }
+        ValueRef::Integer(number) => Some(number.to_string()),
+        ValueRef::Real(number) => Some(number.to_string()),
+    })
+}
+
+/// A column as a number, 0 when it holds something else.
+fn number_of(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<i64> {
+    use rusqlite::types::ValueRef;
+    Ok(match row.get_ref(column)? {
+        ValueRef::Integer(number) => number,
+        _ => 0,
+    })
 }
 
 /// What became of a report this process held a lease on.
@@ -490,7 +514,6 @@ impl Stats {
         self.pending.iter().map(|(_, count)| count).sum()
     }
 
-    #[cfg(test)]
     pub fn rejected_total(&self) -> u64 {
         self.rejected.iter().map(|(_, count)| count).sum()
     }
@@ -524,8 +547,9 @@ pub(crate) struct Committed<J> {
     pub evicted: Vec<Row>,
     /// Reports moved to `rejected` for their age, with the reason.
     pub expired: Vec<(Row, &'static str)>,
-    /// Rows removed from `rejected` to keep it within its bound.
-    pub rejected_evicted: usize,
+    /// Rows removed from `rejected` to keep it within its bound, oldest
+    /// first: the last there was of these reports.
+    pub rejected_evicted: Vec<Evicted>,
     /// What the claim found, when the transaction carried one.
     pub claimed: Option<Claimed>,
     pub stats: Stats,
@@ -547,19 +571,40 @@ pub(crate) enum Event<J> {
         claim: bool,
         health: Health,
     },
-    /// The file at the path is not the one the writer had open.
+    /// The file at the path is not the one the writer had open, or cannot be
+    /// read as a database.
     Replaced {
-        /// `corrupt`: it could not be read and was moved aside. `deleted`: it
-        /// was gone and has been put back as it was. `lost`: it was gone, or
-        /// empty, and a new database was made. `replaced`: another database
-        /// is there now.
+        /// `deleted`: it is gone from the path. `replaced`: another file is
+        /// there. In both the connection to the old file was let go of.
+        /// `corrupt`: what is at the path cannot be read as a database, and
+        /// was moved aside (`kept_as`). `lost`: the file was emptied, or
+        /// exchanged while the writer did not have it open.
         why: &'static str,
-        /// Where the old file is now, when it was moved aside.
+        /// Where the file is now, when it was moved aside.
         kept_as: Option<PathBuf>,
-        /// The database changed with the file: the ids of rows handed out
-        /// before mean nothing in it.
+        /// The ids of rows handed out before mean nothing from here on.
         generation: u64,
+        /// What was wrong with the file, when something was.
+        error: Option<String>,
+        /// Reports the file held when this process last wrote to it, which
+        /// are in nobody's hands now: an upper bound on what is lost with
+        /// it (the reports this process is sending are still sent).
+        held: Option<u64>,
     },
+}
+
+/// A row removed from `rejected` to make room: what there was of the report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Evicted {
+    /// Its id in `rejected`.
+    pub id: i64,
+    pub reason: String,
+    pub status: Option<u16>,
+    pub attempts: u32,
+    pub body: String,
+    pub request_id: Option<String>,
+    pub model_label: Option<String>,
+    pub completed_at_ms: i64,
 }
 
 /// Why `offer` did not take a report.
@@ -637,6 +682,9 @@ struct Shared<J> {
     /// it, in bytes, in place of what the system says.
     #[cfg(test)]
     volume: Mutex<Option<(u64, u64)>>,
+    /// Deletes the file once, between the look at it and the transaction.
+    #[cfg(test)]
+    unlink: AtomicBool,
     /// Makes every commit take this many milliseconds longer, as a disk that
     /// is slow to flush would.
     #[cfg(test)]
@@ -723,6 +771,8 @@ impl<J: Persist> Store<J> {
             volume_full: AtomicBool::new(false),
             #[cfg(test)]
             volume: Mutex::new(None),
+            #[cfg(test)]
+            unlink: AtomicBool::new(false),
             #[cfg(test)]
             commit_delay_ms: AtomicU64::new(0),
         });
@@ -912,6 +962,13 @@ impl<J: Persist> Store<J> {
         *self.shared.volume.lock().unwrap() = volume;
     }
 
+    /// The file is deleted under the writer's next transaction, after the
+    /// writer has looked at it.
+    #[cfg(test)]
+    pub fn inject_unlink(&self) {
+        self.shared.unlink.store(true, Ordering::Relaxed);
+    }
+
     #[cfg(test)]
     pub fn inject_commit_delay(&self, delay: Duration) {
         self.shared
@@ -996,9 +1053,6 @@ struct Db {
     identity: Option<(u64, u64)>,
     /// `meta.db_id` of the database in it.
     id: String,
-    /// The database was made by this `open`: the file was not there, or was
-    /// empty.
-    created: bool,
     /// The most pages the file may have, and of those the ones new reports
     /// may not take: what leasing, retrying and rejecting need to go on in a
     /// file that is full.
@@ -1032,6 +1086,9 @@ struct Writer<J> {
     /// Not before this is the volume looked at again, for the size the file
     /// may have on it.
     volume_check_at: Instant,
+    /// Rows of `pending` and of `rejected` as of the last transaction: what
+    /// a file held, when all that can be said of it is that it is gone.
+    last_held: Option<u64>,
 }
 
 impl<J: Persist> Writer<J> {
@@ -1046,6 +1103,7 @@ impl<J: Persist> Writer<J> {
             volume_full: false,
             room_probe_at: Instant::now(),
             volume_check_at: Instant::now(),
+            last_held: None,
         }
     }
 
@@ -1221,11 +1279,15 @@ impl<J: Persist> Writer<J> {
         }
         // How many of the reports this try writes, at the most.
         let mut reports = work.reports.len();
-        let mut replaced = false;
+        let (mut moved_aside, mut let_go) = (false, false);
         loop {
             let tried = self.ready().and_then(|()| {
                 self.fit_the_volume();
                 self.find_room();
+                #[cfg(test)]
+                if self.shared.unlink.swap(false, Ordering::Relaxed) {
+                    let _ = std::fs::remove_file(&self.shared.config.path);
+                }
                 self.transact(work, reports, release_leases, takeovers)
             });
             match tried {
@@ -1243,16 +1305,36 @@ impl<J: Persist> Writer<J> {
                     self.room_probe_at = Instant::now() + self.shared.config.reopen_interval;
                     reports /= 2;
                 }
-                Err(failure) if failure.corrupt && !replaced => {
-                    replaced = true;
-                    self.db = None;
-                    if let Err(error) = self.move_aside() {
-                        return Err(Some(Failure::new("replace", error)));
-                    }
-                }
                 Err(failure) => {
+                    // The file was taken from under this very transaction
+                    // (after it was last looked at): SQLite does not write
+                    // to a database whose file was moved, and says so. That
+                    // comes before anything else the error may seem to say:
+                    // a connection whose file is gone can find its database
+                    // damaged, and what is at the path is not that database.
+                    // It is let go of, and the transaction is made on the
+                    // file at the path. (Once: a file that goes away again
+                    // meanwhile is left to the next transaction.)
+                    if self.left_the_path() {
+                        if let_go {
+                            return Err(Some(failure));
+                        }
+                        let_go = true;
+                        continue;
+                    }
+                    // What this process had open and can no longer read, or
+                    // what it found at the path and cannot read at all.
+                    if failure.corrupt && !moved_aside {
+                        moved_aside = true;
+                        self.db = None;
+                        if let Err(error) = self.move_aside(failure.error) {
+                            return Err(Some(Failure::new("replace", error)));
+                        }
+                        continue;
+                    }
                     // Whatever state the connection is in, the next try
-                    // starts from a new one.
+                    // starts from a new one. The file is at the path, and
+                    // what it holds with it.
                     self.db = None;
                     return Err(Some(failure));
                 }
@@ -1261,8 +1343,8 @@ impl<J: Persist> Writer<J> {
     }
 
     /// Have the file open, and the right one: a file deleted or replaced
-    /// under the connection is noticed before anything more is written to
-    /// what is no longer at the path.
+    /// under the connection is noticed before a transaction is begun on what
+    /// is no longer at the path.
     fn ready(&mut self) -> Result<(), Failure> {
         if self.shared.fault() {
             self.db = None;
@@ -1270,71 +1352,95 @@ impl<J: Persist> Writer<J> {
         }
         let path = self.shared.config.path.clone();
         if let Some(db) = &self.db {
-            if db.identity == identity(&path) {
-                return Ok(());
-            }
-            // Gone, or another file. When it is gone, the connection still
-            // has the whole database (the file lives on until it is closed)
-            // and writes it back to the path, rows, leases and ids as they
-            // were. When another file is there, somebody put it there:
-            // another process that put the database back, or a person.
-            let gone = identity(&path).is_none();
-            let restored = gone && self.put_back(db, &path);
-            self.db = None;
-            let db = open(&self.shared.config, self.shared.volume())?;
-            let why = self.adopt(db);
-            let _ = self.shared.events.send(Event::Replaced {
-                why: if restored {
+            match whereabouts(&path) {
+                Ok(there) if there == db.identity => return Ok(()),
+                Ok(there) => self.let_go(if there.is_none() {
                     "deleted"
                 } else {
-                    why.unwrap_or("replaced")
-                },
-                kept_as: None,
-                generation: self.shared.generation.load(Ordering::Relaxed),
-            });
-            return Ok(());
+                    "replaced"
+                }),
+                // The path cannot be looked at: nothing is known, and the
+                // connection is left as it is until it can.
+                Err(error) => {
+                    return Err(Failure::new(
+                        "open",
+                        format!("cannot look at {}: {error}", path.display()),
+                    ))
+                }
+            }
         }
         let db = open(&self.shared.config, self.shared.volume())?;
-        // The file was opened anew after a failure, and is not the database
-        // it was: emptied, or exchanged, while it could not be used.
-        if let Some(why) = self.adopt(db) {
-            let _ = self.shared.events.send(Event::Replaced {
-                why,
-                kept_as: None,
-                generation: self.shared.generation.load(Ordering::Relaxed),
-            });
-        }
+        self.adopt(db);
         Ok(())
     }
 
-    /// Write the database of the open connection back to `path`, where its
-    /// file was deleted. It is written under a name of its own and given the
-    /// path's name only once it is complete, and only if there is still no
-    /// file there: the other process on the outbox may be doing the same at
-    /// this moment, and must never find half a database at the path, nor
-    /// have the one it put there taken away. `false`: the path is not this
-    /// connection's database (it could not be written, or the other process
-    /// was quicker); whatever is there is opened like any other file.
-    fn put_back(&self, db: &Db, path: &Path) -> bool {
-        let mut copy = path.as_os_str().to_os_string();
-        copy.push(format!(".restore-{}", self.shared.owner));
-        let copy = PathBuf::from(copy);
-        let written = create_private(&copy, true).is_ok()
-            && db
-                .conn
-                .execute("VACUUM INTO ?1", [copy.to_string_lossy()])
-                .is_ok();
-        let restored = written
-            && match std::fs::hard_link(&copy, path) {
-                Ok(()) => true,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
-                // A file system without hard links: the name is given by a
-                // rename, which would replace a file put there meanwhile, so
-                // only when there is none.
-                Err(_) => identity(path).is_none() && std::fs::rename(&copy, path).is_ok(),
-            };
-        let _ = std::fs::remove_file(&copy);
-        restored
+    /// The file of the open connection is no longer the one at the path:
+    /// it is let go of, and `true`.
+    fn left_the_path(&mut self) -> bool {
+        let Some(db) = &self.db else {
+            return false;
+        };
+        match whereabouts(&self.shared.config.path) {
+            Ok(there) if there != db.identity => {
+                self.let_go(if there.is_none() {
+                    "deleted"
+                } else {
+                    "replaced"
+                });
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The file of the open connection is no longer at the path. The
+    /// connection is closed, and nothing is done with it first: SQLite
+    /// finds the journal of a database by the path the database was opened
+    /// under, which for this one is now the journal of whatever is at the
+    /// path, or will be. A connection that so much as begins to read then
+    /// takes a transaction another process has under way on that file for
+    /// one of its own that was interrupted, plays it into its own file and
+    /// clears the journal. So what this database still holds is not read:
+    /// it is said, with how many reports that was when it was last written
+    /// to, and they are lost with the file. The rows handed out of it mean
+    /// nothing in whatever is opened at the path next; their reports are
+    /// still in this process, and are written there.
+    fn let_go(&mut self, why: &'static str) {
+        if self.db.take().is_none() {
+            return;
+        }
+        let generation = self.shared.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        // Outcomes not yet written cannot be written there any more.
+        self.unwritten.clear();
+        self.db_id = None;
+        let _ = self.shared.events.send(Event::Replaced {
+            why,
+            kept_as: None,
+            generation,
+            error: None,
+            held: self.last_held.take(),
+        });
+    }
+
+    /// Take `db`, just opened, as the file at the path. When this process
+    /// had another database open before and no longer has it (the file was
+    /// emptied under it, or exchanged while it could not be used), the rows
+    /// handed out of that one mean nothing in this one, and what it held is
+    /// in nobody's hands.
+    fn adopt(&mut self, db: Db) {
+        if self.db_id.as_deref().is_some_and(|known| known != db.id) {
+            let generation = self.shared.generation.fetch_add(1, Ordering::Relaxed) + 1;
+            self.unwritten.clear();
+            let _ = self.shared.events.send(Event::Replaced {
+                why: "lost",
+                kept_as: None,
+                generation,
+                error: None,
+                held: self.last_held.take(),
+            });
+        }
+        self.db_id = Some(db.id.clone());
+        self.db = Some(db);
     }
 
     /// The size the file may have follows its volume: looked at when the
@@ -1395,27 +1501,12 @@ impl<J: Persist> Writer<J> {
         }
     }
 
-    /// Take `db` as the open file. When the database in it is not the one
-    /// rows were handed out of, their ids mean nothing in it: outcomes kept
-    /// for them are dropped, and the answer says what happened, for whoever
-    /// holds such rows: `lost` when the database had to be made anew (the
-    /// file was gone or empty), `replaced` when another one was there.
-    fn adopt(&mut self, db: Db) -> Option<&'static str> {
-        let changed = self.db_id.as_deref().is_some_and(|known| known != db.id);
-        let why = changed.then_some(if db.created { "lost" } else { "replaced" });
-        if changed {
-            self.shared.generation.fetch_add(1, Ordering::Relaxed);
-            self.unwritten.clear();
-        }
-        self.db_id = Some(db.id.clone());
-        self.db = Some(db);
-        why
-    }
-
-    /// The file is not a database any more. It is kept for a person under
-    /// another name, with its journal, and a new file is started at the path
-    /// by the next `ready`.
-    fn move_aside(&mut self) -> std::io::Result<()> {
+    /// What is at the path cannot be read as a database. It is kept for a
+    /// person under another name, with its journal, and a new file is
+    /// started at the path by the next `ready`. When it is the file this
+    /// process last wrote to, the reports that held then go with it, and
+    /// are said to.
+    fn move_aside(&mut self, error: String) -> std::io::Result<()> {
         let path = &self.shared.config.path;
         let stamp = self.shared.config.clock.now_ms() / 1000;
         let name = |suffix: u32, journal: bool| {
@@ -1440,13 +1531,15 @@ impl<J: Persist> Writer<J> {
             std::fs::rename(&journal, name(suffix, true))?;
         }
         // The database that follows is another one.
-        self.shared.generation.fetch_add(1, Ordering::Relaxed);
+        let generation = self.shared.generation.fetch_add(1, Ordering::Relaxed) + 1;
         self.unwritten.clear();
         self.db_id = None;
         let _ = self.shared.events.send(Event::Replaced {
             why: "corrupt",
             kept_as: Some(name(suffix, false)),
-            generation: self.shared.generation.load(Ordering::Relaxed),
+            generation,
+            error: Some(error),
+            held: self.last_held.take(),
         });
         Ok(())
     }
@@ -1484,7 +1577,7 @@ impl<J: Persist> Writer<J> {
             overtaken: Vec::new(),
             evicted: Vec::new(),
             expired: Vec::new(),
-            rejected_evicted: 0,
+            rejected_evicted: Vec::new(),
             claimed: None,
             stats: Stats::default(),
             health: self.health,
@@ -1516,15 +1609,16 @@ impl<J: Persist> Writer<J> {
                 continue;
             }
             let id = settle.id;
+            // An outcome is written to the row its sender leased, and to no
+            // other: only while this process is still the one named on it.
+            // Once its lease ran out and somebody else took the report, the
+            // row is theirs, and what they find out is what is written.
             match &settle.outcome {
                 Outcome::Delete => {
-                    tx.prepare_cached("DELETE FROM pending WHERE id = ?1")
-                        .and_then(|mut statement| statement.execute([id]))
+                    tx.prepare_cached("DELETE FROM pending WHERE id = ?1 AND lease_owner = ?2")
+                        .and_then(|mut statement| statement.execute(params![id, owner]))
                         .map_err(failed("settle"))?;
                 }
-                // Only while this process still holds the lease: once it ran
-                // out the report may be another process's, and its lease is
-                // not ours to give back.
                 Outcome::Retry {
                     attempts,
                     next_attempt_at_ms,
@@ -1552,7 +1646,8 @@ impl<J: Persist> Writer<J> {
                          attempts, body, request_id, model_label, auth_path, ingress_route, \
                          completed_at_ms) \
                          SELECT ?2, ?3, ?4, ?5, ?6, body, request_id, model_label, auth_path, \
-                         ingress_route, completed_at_ms FROM pending WHERE id = ?1",
+                         ingress_route, completed_at_ms FROM pending \
+                         WHERE id = ?1 AND lease_owner = ?7",
                     )
                     .and_then(|mut statement| {
                         statement.execute(params![
@@ -1561,12 +1656,13 @@ impl<J: Persist> Writer<J> {
                             why.reason,
                             why.status,
                             why.outcome,
-                            attempts
+                            attempts,
+                            owner
                         ])
                     })
                     .map_err(failed("settle"))?;
-                    tx.prepare_cached("DELETE FROM pending WHERE id = ?1")
-                        .and_then(|mut statement| statement.execute([id]))
+                    tx.prepare_cached("DELETE FROM pending WHERE id = ?1 AND lease_owner = ?2")
+                        .and_then(|mut statement| statement.execute(params![id, owner]))
                         .map_err(failed("settle"))?;
                 }
                 Outcome::Release => {
@@ -1634,6 +1730,34 @@ impl<J: Persist> Writer<J> {
                 .sort_by_key(|(row, _)| (row.completed_at_ms, row.id));
         }
 
+        // New reports stay out of the last pages the file may have: what is
+        // done to the reports already in it must never want for room. The
+        // room is measured, and measured again before the reports written
+        // since could have used up half of it at the very worst: so the
+        // file fills up to that line and not beyond, whatever the size of a
+        // report, without a look at its size per report.
+        let room = || -> Result<i64, Failure> {
+            let used = integer("SELECT page_count FROM pragma_page_count", "insert")?
+                - integer("SELECT freelist_count FROM pragma_freelist_count", "insert")?;
+            Ok((db.max_pages - db.headroom_pages - used).max(0))
+        };
+        let mut may_take: Option<i64> = None;
+        let mut fits = |body: usize| -> Result<bool, Failure> {
+            let worst = WORST_PAGES_PER_REPORT
+                + i64::try_from(body).unwrap_or(i64::MAX) / db.page_size.max(1);
+            let mut left = match may_take {
+                Some(left) => left,
+                None => room()? / 2,
+            };
+            if left < worst {
+                left = room()? / 2;
+            }
+            may_take = Some(if left < worst { left } else { left - worst });
+            Ok(left >= worst)
+        };
+        let insert_pending = "INSERT INTO pending (body, request_id, model_label, auth_path, \
+                              ingress_route, completed_at_ms, attempts, next_attempt_at_ms, \
+                              last_outcome) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
         if reports > 0 {
             if self.shared.volume_full() {
                 return Err(Failure {
@@ -1641,39 +1765,17 @@ impl<J: Persist> Writer<J> {
                     ..Failure::new("insert", "injected: database or disk is full")
                 });
             }
-            // New reports stay out of the last pages the file may have: what
-            // is done to the reports already in it must never want for room.
-            // The room is measured, and measured again before the reports
-            // written since could have used up half of it at the very worst:
-            // so the file fills up to that line and not beyond, whatever the
-            // size of a report, without a look at its size per report.
-            let room = || -> Result<i64, Failure> {
-                let used = integer("SELECT page_count FROM pragma_page_count", "insert")?
-                    - integer("SELECT freelist_count FROM pragma_freelist_count", "insert")?;
-                Ok((db.max_pages - db.headroom_pages - used).max(0))
-            };
-            let mut may_take = room()? / 2;
             // Due from the moment its request completed, so that reports
             // come up in the order they completed.
             let mut insert = tx
-                .prepare_cached(
-                    "INSERT INTO pending (body, request_id, model_label, auth_path, \
-                     ingress_route, completed_at_ms, attempts, next_attempt_at_ms, last_outcome) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                )
+                .prepare_cached(insert_pending)
                 .map_err(failed("insert"))?;
             let mut insert_rejected = tx.prepare_cached(reject).map_err(failed("insert"))?;
             for report in work.reports.iter().take(reports) {
                 let row = report.row();
-                let worst = WORST_PAGES_PER_REPORT
-                    + i64::try_from(row.body.len()).unwrap_or(i64::MAX) / db.page_size.max(1);
-                if may_take < worst {
-                    may_take = room()? / 2;
-                    if may_take < worst {
-                        break;
-                    }
+                if !fits(row.body.len())? {
+                    break;
                 }
-                may_take -= worst;
                 let completed_at_ms = now.saturating_sub(millis(row.age));
                 let body = String::from_utf8_lossy(row.body);
                 match row.rejected {
@@ -1743,13 +1845,33 @@ impl<J: Persist> Writer<J> {
         let rejected = integer("SELECT COALESCE(SUM(n), 0) FROM rejected_counts", "evict")?;
         let excess = rejected - i64::try_from(config.max_rejected).unwrap_or(i64::MAX);
         if excess > 0 {
+            // What is removed here is the last there was of these reports:
+            // it is handed out, to be said row by row.
             committed.rejected_evicted = tx
                 .prepare_cached(
                     "DELETE FROM rejected WHERE id IN \
-                     (SELECT id FROM rejected ORDER BY id LIMIT ?1)",
+                     (SELECT id FROM rejected ORDER BY id LIMIT ?1) \
+                     RETURNING id, reason, status, attempts, body, request_id, model_label, \
+                     completed_at_ms",
                 )
-                .and_then(|mut statement| statement.execute([excess]))
+                .and_then(|mut statement| {
+                    statement
+                        .query_map([excess.min(EVICT_BATCH as i64)], |row| {
+                            Ok(Evicted {
+                                id: row.get(0)?,
+                                reason: text_of(row, 1)?.unwrap_or_default(),
+                                status: u16::try_from(number_of(row, 2)?).ok().filter(|s| *s > 0),
+                                attempts: number_of(row, 3)?.clamp(0, i64::from(u32::MAX)) as u32,
+                                body: text_of(row, 4)?.unwrap_or_default(),
+                                request_id: text_of(row, 5)?,
+                                model_label: text_of(row, 6)?,
+                                completed_at_ms: number_of(row, 7)?,
+                            })
+                        })
+                        .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+                })
                 .map_err(failed("evict"))?;
+            committed.rejected_evicted.sort_by_key(|row| row.id);
         }
 
         if let Some(claim) = &work.claim {
@@ -1884,6 +2006,7 @@ impl<J: Persist> Writer<J> {
         if committed.stored > 0 {
             self.volume_full = false;
         }
+        self.last_held = Some(committed.stats.pending_total() + committed.stats.rejected_total());
         let left_out = reports > 0 && committed.stored < work.reports.len();
         let room = db.max_pages - db.headroom_pages - used;
         let at_its_size =
@@ -1918,10 +2041,30 @@ fn identity(path: &Path) -> Option<(u64, u64)> {
     }
 }
 
+/// What is at `path` now: the device and inode of the file there, `None`
+/// when there is none. An error when that cannot be found out, which says
+/// nothing about the file.
+fn whereabouts(path: &Path) -> std::io::Result<Option<(u64, u64)>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::metadata(path) {
+            Ok(metadata) => Ok(Some((metadata.dev(), metadata.ino()))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(None)
+    }
+}
+
 /// Open the file, creating it and its schema when they are not there.
 /// `volume`: the size of its volume and what is free on it, when known.
 fn open(config: &UsageOutboxConfig, volume: Option<(u64, u64)>) -> Result<Db, Failure> {
-    create_private(&config.path, false).map_err(|error| Failure::new("open", error))?;
+    create_private(&config.path).map_err(|error| Failure::new("open", error))?;
     let conn = Connection::open_with_flags(
         &config.path,
         // One thread ever uses the connection, so SQLite need not lock it.
@@ -1963,7 +2106,7 @@ fn open(config: &UsageOutboxConfig, volume: Option<(u64, u64)>) -> Result<Db, Fa
     // Nothing of a statement is ever spilled to a file of its own.
     conn.pragma_update(None, "temp_store", "MEMORY")
         .map_err(failed("open"))?;
-    let made = migrate(&conn)?;
+    migrate(&conn)?;
 
     // The file's own size: it is full while its volume still has room for
     // the journal, so what is done to the reports in it goes on.
@@ -1978,7 +2121,6 @@ fn open(config: &UsageOutboxConfig, volume: Option<(u64, u64)>) -> Result<Db, Fa
         .map_err(failed("open"))?;
     Ok(Db {
         identity: identity(&config.path),
-        created: made.as_deref() == Some(id.as_str()),
         id,
         max_pages,
         headroom_pages: headroom(max_pages),
@@ -2063,10 +2205,10 @@ fn volume(path: &Path) -> Option<(u64, u64)> {
     }
 }
 
-/// Bring the schema to `SCHEMA_VERSION`, and give a new database its name,
-/// which is returned when the schema was made here. A file written by a
-/// newer version of the proxy is refused rather than guessed at.
-fn migrate(conn: &Connection) -> Result<Option<String>, Failure> {
+/// Bring the schema to `SCHEMA_VERSION`, and give a new database its name.
+/// A file written by a newer version of the proxy is refused rather than
+/// guessed at.
+fn migrate(conn: &Connection) -> Result<(), Failure> {
     let found: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(failed("open"))?;
@@ -2077,7 +2219,7 @@ fn migrate(conn: &Connection) -> Result<Option<String>, Failure> {
         ));
     }
     if found == SCHEMA_VERSION {
-        return Ok(None);
+        return Ok(());
     }
     // Two processes may get here together; the second finds everything
     // made, and the name the first gave it.
@@ -2090,30 +2232,44 @@ fn migrate(conn: &Connection) -> Result<Option<String>, Failure> {
         let _ = conn.execute_batch("ROLLBACK");
         failed("open")(error)
     })?;
-    Ok(Some(db_id))
+    Ok(())
 }
 
 /// Make sure the file exists and nobody but its owner can read it. SQLite
-/// gives the journal beside it the mode of the file itself. `new`: there must
-/// be no file yet.
-fn create_private(path: &Path, new: bool) -> std::io::Result<()> {
+/// gives the journal beside it the mode of the file itself.
+///
+/// A file that is there is not opened for this, only looked at by its path:
+/// a process that closes any descriptor of a file gives up every lock it
+/// holds on that file (the rule of POSIX locks), and SQLite may have this one
+/// open and locked in this very process.
+fn create_private(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).mode(0o600);
-        if new {
-            options.create_new(true);
-        } else {
-            options.create(true).truncate(false);
+        let private = std::fs::Permissions::from_mode(0o600);
+        match std::fs::metadata(path) {
+            Ok(file) if file.permissions().mode() & 0o077 != 0 => {
+                return std::fs::set_permissions(path, private);
+            }
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
-        let file = options.open(path)?;
-        if file.metadata()?.permissions().mode() & 0o077 != 0 {
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        // A file made here is new: nobody holds a lock on it yet.
+        let made = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path);
+        match made {
+            Ok(_) => {}
+            // The other process on the outbox made it at this very moment.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
         }
     }
     #[cfg(not(unix))]
-    let _ = (path, new);
+    let _ = path;
     Ok(())
 }
 

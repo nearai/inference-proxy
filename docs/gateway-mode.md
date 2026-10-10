@@ -686,7 +686,7 @@ request.
 | `VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_BYTES` | `1073741824` (1 GiB) | The size the file may grow to (4194304 to 1099511627776). At that size new reports are held in memory until it has room again; what it holds is still sent. The volume must be larger than this, see "When the file is full"; on a smaller one the file is kept to what the volume has room for. |
 | `VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_AGE_SECS` | `604800` (7 days) | How old a report may grow, counted from the completion of its request (60 to 7776000). Past it the report moves to the `rejected` table with reason `max_age`: nothing is tried for ever. |
 | `VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_PENDING` | `1000000` | Reports the file may hold while they wait to be accepted (1 to 10000000; a row is about half a kilobyte, so the default fits in half of `MAX_BYTES`). Past it the report that has waited longest is dropped, logged with its ids and counted as `queue_full`. |
-| `VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_REJECTED` | `100000` | Rows kept in the `rejected` table (1 to 1000000, about half a kilobyte each). Past it the oldest is removed and counted. |
+| `VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_REJECTED` | `100000` | Rows kept in the `rejected` table (1 to 1000000, about half a kilobyte each). Past it the oldest is removed, which is the end of that report: it is counted and logged with what it takes to bill it by hand (see "Reports that are not sent again"). |
 
 **What the other settings mean with an outbox.** The settings of the table
 further up still apply, with these differences:
@@ -700,10 +700,11 @@ further up still apply, with these differences:
   cap. "No cap" would send the whole backlog of an outage at once when
   cloud-api came back, so it is not offered, and the rule that a longer
   timeout needs a cap is met without setting one.
-- `DEADLINE_SECS` not set: none, as always. Set, it is a maximum age like
-  `MAX_AGE_SECS`, and the shorter of the two applies: an attempt only starts
-  while its whole timeout fits before the deadline, and a report past that
-  moves to `rejected` with reason `deadline`. It is not dropped.
+- `DEADLINE_SECS` has no effect either, and a warning at startup says so
+  when it is set. A deadline of minutes is what a lane without an outbox
+  wants, and with one it would move every report of a longer cloud-api
+  outage to `rejected`: again the very reports the outbox is there to keep.
+  `MAX_AGE_SECS` is the only age that ends a report.
 - `TIMEOUT_SECS` keeps its default of 5 s. A lane whose reports wait for
   cloud-api's write wants the 30 s of the table further up here too: a report
   is sent again for as long as it takes, but an attempt cloud-api cannot
@@ -711,9 +712,10 @@ further up still apply, with these differences:
 - `INITIAL_BACKOFF_MS` is where the backoff of a report and the pause between
   two probes of a cloud-api that is down start, see below. `0` cannot work and
   is replaced by the default.
-- `MAX_QUEUED` bounds what the process holds in memory: the reports not
-  written to the file yet, and the reports held there while the file cannot
-  take them.
+- `MAX_QUEUED` bounds what the process holds of reports that are not in the
+  file, all of them together: those handed over and not written yet, and
+  those held in memory because the file cannot take them; see "Written
+  first".
 - `SHUTDOWN_DRAIN_SECS` is the time the attempts in flight get at shutdown.
 
 The effective values are logged at startup (`Usage report outbox enabled`,
@@ -731,8 +733,15 @@ handed over, and it gathers the reports that complete within 50 ms of each
 other into one transaction (at most 2000 per transaction). So a report is in
 the file about 50 ms after its request completed; later only while the other
 process on the file holds the write lock or the disk is slow. Until then it
-waits in memory, at most `MAX_QUEUED` of them. A report is not sent before it
-is written, unless the file cannot take it.
+waits in memory. A report is not sent before it is written, unless the file
+cannot take it.
+
+What the process holds of reports that are not in the file is bounded as a
+whole: those waiting for the writer and those held in memory (below) never
+add up to more than `MAX_QUEUED`. Past it a report that comes in takes the
+place of the one memory has held longest, or is itself the one that goes
+when memory holds none that could: dropped, logged with its ids and counted
+as `queue_full`.
 
 That is the durability window: **a report handed over less than 50 ms before
 the process is killed (`kill -9`, an out-of-memory kill, a crash) may be
@@ -762,7 +771,7 @@ thousands of reports a second on an ordinary disk.
 | `request_id` | The request id, sent again as `x-request-id` and logged. |
 | `model_label`, `auth_path`, `ingress_route` | The labels of the report's metric series and log lines. |
 | `completed_at_ms` | When its request completed (Unix time, ms). Its age counts from here. |
-| `attempts`, `last_outcome` | Attempts made so far, by any process, and why the last one failed (`timeout`, `connect_error`, `transport_error`, `http_5xx`, `http_429`, `http_401`). |
+| `attempts`, `last_outcome` | Attempts made so far, by any process, and why the last one failed (`timeout`, `connect_error`, `transport_error`, `http_5xx`, `http_429`, `http_401`, `http_403`). |
 | `next_attempt_at_ms` | For a report that failed, when it is due again. |
 | `lease_until_ms`, `lease_owner` | While a process is sending it: until when it is that process's, and which process. |
 
@@ -794,7 +803,8 @@ which nobody else takes it. Then, on the answer:
 
 - accepted: the row is deleted;
 - a failure that can pass (timeout, connection or transport error, 5xx, 429,
-  and here also 401, see below): `attempts` goes up, its lease is given back,
+  and here also 401 and 403, see below): `attempts` goes up, its lease is
+  given back,
   and the report is due again after its backoff: `INITIAL_BACKOFF_MS ×
   2^(attempts-1)`, half of it random, at most **ten minutes** (not the 30 s
   of a report in memory). A report that keeps failing then costs one attempt
@@ -820,8 +830,8 @@ as not answering (`The billing API is not answering usage reports`,
 `inference_proxy_usage_report_outbox_billing_paused` reads 1). Reports that
 failed before say less, because they fail again whether or not anything is
 wrong with cloud-api: 20 failures in a row that are not all first attempts
-count only when nothing at all has been answered for 5 s as well. A 401 counts
-at once (below). From then on:
+count only when nothing at all has been answered for 5 s as well. A 401 or a
+403 counts at once (below). From then on:
 
 - one report at a time is sent, as a probe, and nothing is leased beyond it.
   The pause before the next probe doubles from `INITIAL_BACKOFF_MS` up to
@@ -843,35 +853,78 @@ at once (below). From then on:
 Some reports failing while others are accepted never starts this: every
 accepted report clears the count.
 
-**A usage token cloud-api does not accept.** A 401 is not a refusal of a
-report: it says that cloud-api does not accept this gateway (a usage token
-that is wrong, or was rotated under a running process), and every report gets
-it until that is put right. With an outbox those reports are kept, in the file
-or in memory, counted as retries with reason `http_401`; the first 401 makes
-cloud-api count as not answering, so the gateway probes with one report every
-few seconds instead of sending each report once; and when the token is right
-the probe is accepted and everything is sent. Nothing has to be put back by
-hand. A 403 is different: cloud-api never answers one for the usage token, so
-it is about the report, and final like any other 4xx. (Without an outbox a
-401 still ends a report, as it always did.)
+**Answers that are about the gateway, not about the report.** A 401 is not a
+refusal of a report: it says that cloud-api does not accept this gateway (a
+usage token that is wrong, or was rotated under a running process), and every
+report gets it until that is put right. A 403 is never cloud-api's on this
+route: it comes from something in front of it (a firewall, a list of allowed
+callers this gateway is not on), which does not look at the report either.
+With an outbox the reports that get one of the two are kept, in the file or in
+memory, counted as retries with reason `http_401` or `http_403`; the first
+such answer makes cloud-api count as not answering, so the gateway probes with
+one report every few seconds instead of sending each report once; and when
+what was wrong is put right the probe is accepted and everything is sent.
+Nothing has to be put back by hand. (Without an outbox both still end a
+report, as they always did: nothing in memory outlives the restart that puts
+them right.)
 
-**Reports that are not sent again.** Three things move a row from `pending`
-to the `rejected` table, with a `reason`, the HTTP `status` when there was
-one, the number of `attempts`, the time and everything the row held:
+What each answer does to a report in the outbox:
 
-- `rejected`: cloud-api refused the report itself: any 4xx except 429 and
-  401, and any other answer that is neither a success nor a failure that can
-  pass (an unknown model, a discount above its maximum, a body it cannot
-  read);
+| Answer | Who gives it, and when | What the gateway does |
+| --- | --- | --- |
+| 2xx | The billing API (cloud-api) recorded the usage, or had recorded it before (it deduplicates on the completion id). | The row is deleted. |
+| 400 | The billing API cannot read the body, an id in it is not one, or it refuses what the report says. | Final: the row moves to `rejected`. |
+| 404 | The billing API does not know the model. Or `CLOUD_API_URL` points at something that does not have this route, and then every report gets it. | Final: `rejected`. |
+| 409, 413, 422, any other 4xx | Not the billing API on this route: something in front of it, about this one request (a body it finds too large, for instance). | Final: `rejected`. |
+| 401 | The billing API: the usage token is missing or not the one it has. | Kept. Counts as an outage at once; sent again when a probe is accepted. |
+| 403 | Never the billing API on this route: something in front of it that refuses this gateway. | Kept, like a 401. |
+| 429 | Something in front of the billing API that limits requests. | Kept, with the backoff of the report. |
+| 500 | The billing API could not record the usage (its database). | Kept, with backoff. |
+| 503 | The billing API has no usage token configured, or something in front of it has nothing to send the request to. | Kept, with backoff. |
+| 502, 504, any other 5xx | Something in front of the billing API while it is down, restarting or slow. | Kept, with backoff. |
+| No answer (timeout, connection or transport error) | Nobody. | Kept, with backoff. |
+
+An answer that is final for one report and wrong for all of them (a 404 from
+a mistyped `CLOUD_API_URL`) moves the traffic of that time to `rejected`,
+which keeps the newest `MAX_REJECTED` rows. That is why a row in `rejected`
+is worth an alert the moment there is one.
+
+**Reports that are not sent again.** Two things move a row from `pending` to
+the `rejected` table, with a `reason`, the HTTP `status` when there was one,
+the number of `attempts`, the time and everything the row held:
+
+- `rejected`: an answer that is final (the table above): any 4xx except 401,
+  403 and 429, and any other answer that is neither a success nor a failure
+  that can pass;
 - `max_age`: the report is older than `MAX_AGE_SECS`. Whatever keeps it from
-  being accepted has lasted a week;
-- `deadline`: the same under `DEADLINE_SECS`.
+  being accepted has lasted a week. A report held in memory ends the same way
+  at that age, and its row is written to `rejected` when the file takes it.
 
 Each is counted once, as the outcome it ended with and as dropped, and logged
 with its ids. Nothing is destroyed for its age: a clock that is set forward
 by mistake makes every report look old, and they are all still there to be
-put back. Look at the table with the `sqlite3` shell, on the host that has
-the volume (the image has none):
+put back.
+
+`rejected` holds `MAX_REJECTED` rows. When a row is added past that, the
+oldest is removed, and with it the last trace of a report that was served and
+not billed. So each such row leaves a line at warning level, `Usage report
+removed from rejected to make room`, with the row's `rejected_id`, the request
+id, the organization, workspace and key ids, the model, the completion id,
+`reason`, `status`, `attempts`, `completed_at_ms`, and `usage`: the numbers of
+the report (token counts, discount) as JSON. That is what billing it by hand
+takes; nothing of a request or a response is in a report, and the usage token
+is in no line. At most 100 such lines are written in 10 s. Rows removed beyond
+that are summed up in one line, `Usage reports removed from rejected to make
+room, more than are said one by one`, with their `count` and the first and
+last `rejected_id`: for those, the numbers are gone. Every removed row counts
+in `inference_proxy_usage_report_outbox_rejected_evicted_total`. A report that
+had ended while the file could not be written, and is pushed out of memory or
+left there at shutdown before the file took its row, is counted and said the
+same way (`Usage report that had ended was not written to rejected`), not as
+a second dropped report.
+
+Look at the table with the `sqlite3` shell, on the host that has the volume
+(the image has none):
 
 ```sh
 sqlite3 /path/to/usage-outbox.db <<'SQL'
@@ -896,8 +949,10 @@ replay.sql`; a status other than 0 means nothing was changed:
 .bail on
 .timeout 5000
 BEGIN IMMEDIATE;
-INSERT INTO pending (body, request_id, model_label, auth_path, ingress_route, completed_at_ms)
+INSERT INTO pending (body, request_id, model_label, auth_path, ingress_route,
+                     completed_at_ms, next_attempt_at_ms)
   SELECT body, request_id, model_label, auth_path, ingress_route,
+         CAST(strftime('%s', 'now') AS INTEGER) * 1000,
          CAST(strftime('%s', 'now') AS INTEGER) * 1000
   FROM rejected WHERE reason = 'rejected';
 DELETE FROM rejected WHERE reason = 'rejected';
@@ -915,9 +970,18 @@ This is safe while the proxy runs: it finds the rows within two seconds and
 sends them like any other, and cloud-api deduplicates on the completion id. A
 report put back is as old as the moment it was put back, so that it is not
 moved to `rejected` again for the age it had (and its time to acceptance is
-measured from there). Do not leave a transaction open in the shell: the proxy
-waits 5 s for the write lock, then holds its reports in memory until it gets
-it.
+measured from there), and it is due from that moment, so that it takes its
+turn behind the reports that wait already instead of going ahead of them. Do
+not leave a transaction open in the shell: the proxy waits 5 s for the write
+lock, then holds its reports in memory until it gets it.
+
+The shell is not bound by `MAX_BYTES`: the limit is set by each connection
+for itself, and the shell sets none. Moving a row from one table to the other
+takes next to no room, so this does not matter for the statements above. It
+does for anything that adds rows (rows put back from a file that was moved
+aside, say): what a shell writes past the room the gateway keeps free leaves
+the file full for the gateway, with new reports held in memory, until enough
+of it has been accepted.
 
 **Two processes on one file.** A blue/green switch overlaps the old process
 and the new one, and both may have the file open. One writes at a time, and
@@ -962,9 +1026,10 @@ already in the file, so leasing them, recording a failed attempt and moving
 them to `rejected` go on in a full file, and accepting them makes room. While
 it is full:
 
-- new reports are held in memory, at most `MAX_QUEUED`, and sent from there by
-  the same rules as the reports of the file; past `MAX_QUEUED` the one that
-  came in first is dropped, logged and counted as `queue_full`;
+- new reports are held in memory and sent from there by the same rules as
+  the reports of the file; past `MAX_QUEUED` (which counts them together
+  with the reports that wait for the writer) the one that came in first is
+  dropped, logged and counted as `queue_full`;
 - `inference_proxy_usage_report_outbox_full` reads 1 and the log says `Usage
   report outbox is full`, once; `..._outbox_available` stays 1, because the
   file works;
@@ -1055,27 +1120,68 @@ that was being sent at that moment is sent once more from the file, which
 cloud-api deduplicates.)
 
 **A file that is not the file any more.** Before every transaction the writer
-checks that the file at the path is still the one it has open.
+checks that the file at the path is still the one it has open (the same
+device and inode), and SQLite itself refuses to write to a file that was
+taken from under it. Each case below is logged once at error level, counted
+in `inference_proxy_usage_report_outbox_replaced_total{why}`, and says how
+many reports the file held when this process last wrote to it (`held`) and
+how many of those this process was sending or about to send (`in_hand`),
+which it still has. The difference is counted in
+`inference_proxy_usage_report_outbox_lost_reports_total{why}`.
 
-- Not a database any more (overwritten, truncated, a damaged disk): the file
-  is moved aside as `<path>.corrupt-<unix time>`, with its journal, for a
-  person to look at, and a new file is started. Logged once at error level,
-  counted in `inference_proxy_usage_report_outbox_replaced_total{why="corrupt"}`.
-  The reports the old file held are not sent unless they are put back; the
-  ones this process was sending are kept in memory and written to the new
-  file.
-- Deleted under the running process: the connection still has the whole
-  database, and writes it back to the path as it was, rows, attempts and
-  leases (`why="deleted"`). It is written under a name of its own
-  (`<path>.restore-…`) and given the path's name once it is whole, and only
-  if nothing is there yet, so that a second process on the file never finds
-  half a database, and the one that is quicker to put it back wins.
-- Emptied (cut to nothing, which to SQLite is a database without tables), or
-  deleted and impossible to write back: a new database is started in it
-  (`why="lost"`, at error level). What it held is gone, except the reports
-  this process was sending.
-- Another file in its place: it is opened (`why="replaced"`), and what this
-  process had leased from the old one is held in memory and written to it.
+- **Deleted** (`why="deleted"`) or **another file put in its place**
+  (`why="replaced"`): the gateway lets go of the file it had open and uses
+  the one at the path, a new one when there is none. The reports the old
+  file held are **lost with it** when it was deleted, and stay in it when it
+  was moved away (they are sent again if that file is put back). The reports
+  this process was sending or about to send at that moment are not lost:
+  they are written to the file at the path with their attempts.
+- **Not a database** (overwritten, truncated, a damaged disk; `why="corrupt"`):
+  what is at the path is moved aside as `<path>.corrupt-<unix time>`, with
+  its journal, for a person to look at, and a new file is started. The line
+  has the error SQLite gave. The reports in the file that was moved aside
+  are not sent unless they are put back from it; the ones this process was
+  sending are written to the new file. Only a file that is at the path is
+  ever moved aside: never the one the process had open when that is no
+  longer there.
+- **Emptied** (cut to nothing, which to SQLite is a database without
+  tables), or exchanged while this process had no connection to it
+  (`why="lost"`): a new database is started in it, and what the old one held
+  is gone, except the reports this process was sending.
+
+The count is what one process knows, and an upper bound on what is lost:
+two processes on one file each count what they saw of it, neither knows what
+the other has in hand, and a report that was accepted after the file was
+last written to is still in it. On a lane whose reports are being accepted,
+what a deleted file really costs is what a killed process costs, the reports
+of its last transaction or so; with cloud-api down it costs the backlog.
+
+A file that is cut or overwritten in the very moment the gateway is in a
+transaction on it is not always seen at once: the transaction writes its own
+pages over the damage, and SQLite goes on from the pages it has in memory.
+The damage is then found when those pages are read from the file again, by
+this process or by the next one that opens it, and is handled then as
+above.
+
+Why a deleted file is not put back, although the process that had it open
+could still read all of it: SQLite finds the rollback journal of a database
+by the path the database was opened under. For a file that is no longer at
+its path, that is the journal of whatever is at the path now. A connection
+to the old file that so much as begins to read while another process is
+writing to the new one takes that process's transaction for one of its own
+that was interrupted, plays it into the old file and clears the journal,
+which can ruin both files. With one process nothing else writes there; with
+two (a blue/green switch) it happens. So the old connection is closed
+without a look, the loss is said with its size, and nothing is ever copied
+back to the path as a file. Deleting or exchanging the file of a running
+gateway is a mistake this limits; it is not a way to do anything.
+
+What is left of that hazard: the writer looks at the path and then begins
+its transaction, and a file that is exchanged between the two, for one that
+another process is writing to at that very moment, is not seen in time. The
+old file, which is being let go of anyway, is then the one that is harmed;
+the new one is harmed only if the process writing to it fails in the middle
+of that transaction, and is then moved aside as above.
 
 **Clocks.** Rows are stamped with the system's wall clock, which is what two
 processes, and two runs of one, have in common. A clock that jumps does no
@@ -1101,11 +1207,10 @@ whatever its other settings, and they keep their meaning:
   what memory holds, `deadline_exceeded` for one that grew too old. A report
   that is being sent again is not counted yet.
 - `inference_proxy_usage_report_attempts_total`, `..._retries_total` (with
-  `http_401` as one more reason) and
+  `http_401` and `http_403` as two more reasons) and
   `inference_proxy_usage_reports_dropped_total{reason}` as above. The reasons
-  with an outbox: `rejected`, `max_age` and `deadline` are the rows that moved
-  to the `rejected` table; `queue_full` and `shutdown` are reports that are
-  gone.
+  with an outbox: `rejected` and `max_age` are the rows that moved to the
+  `rejected` table; `queue_full` and `shutdown` are reports that are gone.
 - `inference_proxy_usage_report_time_to_accepted_seconds` counts from the
   completion of the request as the file has it, so it is right for a report
   that an earlier process served.
@@ -1135,12 +1240,19 @@ And these, which exist only with an outbox:
   ago the request of the oldest of them completed, whoever holds it and
   whenever it is due, 0 when there is none;
 - `inference_proxy_usage_report_outbox_rejected{reason}`: rows of `rejected`,
-  by `rejected`, `max_age` and `deadline`;
+  by `rejected` and `max_age`;
 - `inference_proxy_usage_report_outbox_rejected_evicted_total`: rows removed
-  from `rejected` to keep it within `MAX_REJECTED`;
+  from `rejected` to keep it within `MAX_REJECTED`, and reports that had ended
+  and were lost before the file took their row: each the last trace of a
+  report that was not billed;
 - `inference_proxy_usage_report_outbox_replaced_total{why}`: times the file
-  at the path was not the one that was open (`corrupt`, `deleted`, `lost`,
-  `replaced`);
+  at the path was not the one that was open, or was no database (`corrupt`,
+  `deleted`, `lost`, `replaced`);
+- `inference_proxy_usage_report_outbox_lost_reports_total{why}`: the reports
+  such a file held when this process last wrote to it, less those the
+  process had in hand, which it still sends (the same `why`). Over two
+  processes an upper bound, see "A file that is not the file any more". The
+  series is there from the first such report on;
 - `inference_proxy_usage_report_outbox_errors_total{op}`: failures of the
   file, by the step that failed (`open`, `begin`, `probe`, `insert`, `settle`,
   `expire`, `evict`, `claim`, `release`, `stats`, `commit`, `replace`,
@@ -1159,9 +1271,21 @@ that is slow without being given up on. So also: `full` at 1; `in_memory`
 above 0 for more than a few minutes (reports that a kill would lose);
 `unwritten` not back to 0 within seconds; `billing_paused` at 1 for longer
 than a cloud-api restart takes; the age of the oldest report above what an
-outage of cloud-api is allowed to last; anything in `rejected`; any increase
-of `replaced_total`; and `reports_dropped_total` for `queue_full` or
-`shutdown`, which is usage that is gone.
+outage of cloud-api is allowed to last; any increase of `replaced_total`;
+and `reports_dropped_total` for `queue_full` or `shutdown`, which is usage
+that is gone.
+
+Two of them mean usage that was served and will not be billed unless a
+person acts, and want an alert at the first count, not at a threshold:
+
+- **`outbox_rejected` above 0.** A row there waits to be looked at and put
+  back, and the table keeps only the newest `MAX_REJECTED`.
+- **Any increase of `outbox_rejected_evicted_total`, or of
+  `outbox_lost_reports_total`.** Those reports are gone from the file. The
+  log has a line for each evicted row with what it takes to bill it by hand
+  (the first hundred in ten seconds; a summary for the rest), and one line
+  with the count when a file was deleted, emptied, exchanged or moved
+  aside.
 
 ## Several models in one gateway
 

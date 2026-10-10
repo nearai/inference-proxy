@@ -280,8 +280,8 @@ impl UsageReportDelivery {
     ///
     /// An outbox is always delivered under a cap, so a `max_in_flight` of 0
     /// becomes `UsageReportPolicy::OUTBOX_MAX_IN_FLIGHT`, and its reports are
-    /// sent until they are accepted or too old, whatever `max_attempts` says
-    /// (`usage_report_outbox.rs`).
+    /// sent until they are accepted or too old for the outbox, whatever
+    /// `max_attempts` and `deadline` say (`usage_report_outbox.rs`).
     pub fn with_outbox(
         mut policy: UsageReportPolicy,
         outbox: UsageOutboxConfig,
@@ -293,6 +293,7 @@ impl UsageReportDelivery {
             policy.max_in_flight = UsageReportPolicy::OUTBOX_MAX_IN_FLIGHT;
         }
         policy.max_attempts = UsageReportPolicy::UNTIL_ACCEPTED;
+        policy.deadline = None;
         let mut delivery = Self::with(policy);
         let (outbox, from_store) = outbox::Outbox::start(
             &delivery.policy,

@@ -452,8 +452,10 @@ async fn reports_survive_a_kill_a_restart_and_an_outage_of_the_billing_api() {
         (OUTBOX_PATH, outbox.to_str().unwrap()),
         ("VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT", "1"),
         ("VLLM_PROXY_USAGE_REPORT_INITIAL_BACKOFF_MS", "2000"),
-        // Ignored with an outbox, and said to be.
+        // Ignored with an outbox, and said to be: neither three attempts
+        // nor a second ends a report that is kept to wait an outage out.
         ("VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS", "3"),
+        ("VLLM_PROXY_USAGE_REPORT_DEADLINE_SECS", "1"),
     ];
 
     // The first process serves three requests whose reports cloud-api does
@@ -487,6 +489,18 @@ async fn reports_survive_a_kill_a_restart_and_an_outage_of_the_billing_api() {
                 "VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS has no effect with a usage report outbox: \
                  a report is sent until it is accepted, refused for good or older than \
                  VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_AGE_SECS"
+            )
+            .len(),
+        1,
+        "{}",
+        first.log()
+    );
+    assert_eq!(
+        first
+            .logged(
+                "VLLM_PROXY_USAGE_REPORT_DEADLINE_SECS has no effect with a usage report outbox: \
+                 an outbox is there to wait out an outage, and the only age that ends a report \
+                 is VLLM_PROXY_USAGE_REPORT_OUTBOX_MAX_AGE_SECS"
             )
             .len(),
         1,
@@ -529,12 +543,18 @@ async fn reports_survive_a_kill_a_restart_and_an_outage_of_the_billing_api() {
     assert_eq!(pending_rows(&outbox), 3);
 
     // The second process finds them, takes two more requests, and is stopped
-    // the way a deploy stops a process.
+    // the way a deploy stops a process: once it has tried a report itself
+    // (on a busy machine it has five rows in the file well before that).
+    let tried_by_the_first = intake.attempts();
     let mut second = Gateway::start(&engine, &cloud, &env).await;
     for _ in 0..2 {
         second.chat().await;
     }
     eventually("five reports in the file", || pending_rows(&outbox) == 5).await;
+    eventually("the second process has tried a report", || {
+        intake.attempts() > tried_by_the_first
+    })
+    .await;
     let stopped = second.stop("-TERM").await;
     assert!(stopped.success(), "{}", second.log());
     let closed = second.logged(CLOSED);
@@ -551,8 +571,9 @@ async fn reports_survive_a_kill_a_restart_and_an_outage_of_the_billing_api() {
         0
     );
     assert_eq!(intake.accepted(), Vec::<String>::new());
-    // More than three attempts were made on the first three by now, and none
-    // of them was given up on.
+    // More attempts were made by now than the three reports of the first
+    // process had when the second began, and none of them was given up on.
+    assert!(tried_by_the_first >= 3, "{tried_by_the_first}");
     assert!(intake.attempts() > 3, "{}", intake.attempts());
     assert_eq!(read::<i64>(&outbox, "SELECT COUNT(*) FROM rejected"), 0);
 
@@ -863,6 +884,9 @@ enum Damage {
     Scribbled,
     /// The file and its journal deleted.
     Deleted,
+    /// Moved away, whole, and something that is no database put in its
+    /// place.
+    Exchanged,
     /// Made unreadable and unwritable.
     #[cfg(unix)]
     Forbidden,
@@ -877,6 +901,24 @@ impl Damage {
                 .write(true)
                 .open(outbox)
                 .unwrap()
+        };
+        // What is done to the bytes of the file is done between two
+        // transactions of the gateway, with the write lock held here
+        // meanwhile. Done in the middle of one, it is not seen for as long
+        // as SQLite has the pages it needs in its cache: the transaction
+        // writes its own pages and the header over the damage, and nothing
+        // tells the connection that the rest of the file is not what it
+        // remembers. The damage is then found when those pages are read
+        // again, by this process or the next, and what this test waits for
+        // comes then and not within its minute.
+        let _between_transactions = match self {
+            Self::Emptied | Self::Truncated | Self::Scribbled => {
+                let conn = rusqlite::Connection::open(outbox).unwrap();
+                conn.busy_timeout(Duration::from_secs(10)).unwrap();
+                conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                Some(conn)
+            }
+            _ => None,
         };
         match self {
             Self::Emptied => open().set_len(0).unwrap(),
@@ -907,6 +949,10 @@ impl Damage {
                     std::fs::remove_file(entry.unwrap().path()).unwrap();
                 }
             }
+            Self::Exchanged => {
+                std::fs::rename(outbox, outbox.with_extension("moved-away")).unwrap();
+                std::fs::write(outbox, b"not an SQLite file, whatever its name says").unwrap();
+            }
             #[cfg(unix)]
             Self::Forbidden => {
                 use std::os::unix::fs::PermissionsExt;
@@ -923,6 +969,7 @@ async fn a_file_damaged_under_a_running_gateway_never_ends_it_or_costs_a_request
         Damage::Truncated,
         Damage::Scribbled,
         Damage::Deleted,
+        Damage::Exchanged,
         #[cfg(unix)]
         Damage::Forbidden,
     ] {
@@ -974,31 +1021,65 @@ async fn a_file_damaged_under_a_running_gateway_never_ends_it_or_costs_a_request
                 format!("inference_proxy_usage_report_outbox_replaced_total{{why=\"{why}\"}}");
             move |metrics: &str| metric(metrics, &series) == Some(1.0)
         };
+        // The reports that are in nobody's hands any more are counted: the
+        // forty the file held, less the few the gateway was sending at that
+        // moment, which it still has.
+        let lost = |metrics: &str, why: &str| {
+            let series =
+                format!("inference_proxy_usage_report_outbox_lost_reports_total{{why=\"{why}\"}}");
+            metric(metrics, &series)
+        };
+        let most_of_forty =
+            |lost: Option<f64>| lost.is_some_and(|lost| (20.0..=40.0).contains(&lost));
+        let aside = || {
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("usage-outbox.db.corrupt-"))
+                .filter(|name| !name.ends_with("-journal"))
+                .count()
+        };
         match damage {
-            // The gateway still had all of it, and wrote the file back.
+            // A new file is started. The gateway still had the old one
+            // open, and lets go of it without a look: the forty reports it
+            // held are lost, and said to be.
             Damage::Deleted => {
-                gateway
-                    .metrics_until("it is written back", replaced("deleted"))
+                let metrics = gateway
+                    .metrics_until("a new file is started", replaced("deleted"))
                     .await;
-                eventually("the whole backlog is accepted", || accepted().len() == 90).await;
+                assert!(most_of_forty(lost(&metrics, "deleted")), "{metrics}");
             }
-            // The database is gone, and a new one is started in the file.
-            Damage::Emptied => {
+            // The same, and the thing that was put there is moved aside.
+            // The file that was open is where it was moved to, untouched,
+            // with the forty reports for a person to put back.
+            Damage::Exchanged => {
                 gateway
-                    .metrics_until("a new one is started", replaced("lost"))
+                    .metrics_until("it is seen to be another file", replaced("replaced"))
                     .await;
-            }
-            // What is left of it is moved aside for a person to look at.
-            Damage::Truncated | Damage::Scribbled => {
-                gateway
+                let metrics = gateway
                     .metrics_until("it is moved aside", replaced("corrupt"))
                     .await;
-                let aside = std::fs::read_dir(dir.path())
-                    .unwrap()
-                    .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-                    .filter(|name| name.starts_with("usage-outbox.db.corrupt-"))
-                    .count();
-                assert!(aside >= 1, "{damage:?}");
+                assert!(most_of_forty(lost(&metrics, "replaced")), "{metrics}");
+                assert_eq!(lost(&metrics, "corrupt"), None, "{metrics}");
+                assert_eq!(aside(), 1);
+                assert_eq!(pending_rows(&outbox.with_extension("moved-away")), 40);
+            }
+            // The database is gone, and a new one is started in the file.
+            // The forty reports it held are lost, and said to be.
+            Damage::Emptied => {
+                let metrics = gateway
+                    .metrics_until("a new one is started", replaced("lost"))
+                    .await;
+                assert!(most_of_forty(lost(&metrics, "lost")), "{metrics}");
+            }
+            // What is left of it is moved aside for a person to look at,
+            // with the forty reports it held.
+            Damage::Truncated | Damage::Scribbled => {
+                let metrics = gateway
+                    .metrics_until("it is moved aside", replaced("corrupt"))
+                    .await;
+                assert!(aside() >= 1, "{damage:?}");
+                assert!(most_of_forty(lost(&metrics, "corrupt")), "{metrics}");
             }
             // A file that is open stays usable, whatever its mode says.
             #[cfg(unix)]

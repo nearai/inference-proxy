@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 
 use axum::extract::State as Shared;
 use axum::http::{HeaderMap, StatusCode};
@@ -425,6 +425,7 @@ const BYTES: &str = "inference_proxy_usage_report_outbox_bytes";
 const UNWRITTEN: &str = "inference_proxy_usage_report_outbox_unwritten";
 const IN_MEMORY: &str = "inference_proxy_usage_report_outbox_in_memory";
 const REPLACED: &str = "inference_proxy_usage_report_outbox_replaced_total";
+const LOST_REPORTS: &str = "inference_proxy_usage_report_outbox_lost_reports_total";
 
 const UNAVAILABLE_LINE: &str = "Usage report outbox unavailable: reports are held in memory, \
                                 sent from there, and written to the file when it is back";
@@ -449,6 +450,27 @@ const FILE_FULL_LINE: &str = "Usage report dropped: the outbox is full and this 
                               longest — usage NOT billed";
 const ENABLED_LINE: &str = "Usage report outbox enabled: a report is kept on disk until the \
                             billing API accepts it or refuses it for good";
+const MOVED_ASIDE_LINE: &str = "Usage report outbox was not a readable database: it was moved \
+                                aside for a person to look at, and a new file started. Whatever \
+                                reports the file that was moved aside held are not sent unless \
+                                they are put back";
+const DELETED_LINE: &str = "Usage report outbox was deleted under the running process: a new file \
+                            was started, and the reports the deleted one held are lost, except \
+                            those this process was sending — usage NOT billed";
+const EXCHANGED_LINE: &str = "Usage report outbox is another file than the one that was open: it \
+                              is used from now on, and the reports the file that was open held \
+                              are not sent unless that file is put back, except those this \
+                              process was sending — usage NOT billed";
+const LOST_LINE: &str = "Usage report outbox was emptied, or exchanged while it could not be \
+                         used: a new one was started, and the reports the old one held are lost, \
+                         except those this process was sending — usage NOT billed";
+const EVICTED_LINE: &str = "Usage report removed from rejected to make room: this line is all \
+                            there is of it now — usage NOT billed";
+const MORE_EVICTED_LINE: &str = "Usage reports removed from rejected to make room, more than are \
+                                 said one by one: nothing is left of them — usage NOT billed";
+const ENDED_AND_LOST_LINE: &str = "Usage report that had ended was not written to rejected before \
+                                   memory was full, or the process stopped: this line is all \
+                                   there is of it now — usage NOT billed";
 
 /// CPU time this thread has used so far, as the kernel accounts for it:
 /// to the nanosecond where it keeps scheduler statistics, to the clock tick
@@ -469,6 +491,11 @@ fn thread_cpu() -> Option<Duration> {
             fields.next()?.parse::<u64>().ok()? + fields.next()?.parse::<u64>().ok()?;
         Some(Duration::from_millis(ticks * 10))
     })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn thread_cpu() -> Option<Duration> {
+    None
 }
 
 /// The log lines written on this thread, as JSON, the format production uses.
@@ -725,6 +752,40 @@ async fn reports_that_keep_failing_never_stand_in_front_of_new_ones() {
         "{}",
         logs.contents()
     );
+}
+
+#[tokio::test]
+async fn new_reports_that_keep_coming_never_keep_a_report_that_failed_out_of_every_place() {
+    let (_dir, path) = file();
+    let billing = Billing::start(200).await;
+    billing.take(Duration::from_millis(40));
+    // Two places, of which reports that failed before may hold one.
+    let delivery = billing.delivery(durable(|policy| policy.max_in_flight = 2), outbox(&path));
+    opened(&path).await;
+
+    // Three reports an earlier process left, which failed once and are due,
+    // and new reports for five seconds of both places: there is always a
+    // new one to send.
+    left_behind(&path, &ids("failed-before", 3), 1);
+    for id in ids("new", 250) {
+        billing.report(&delivery, &id, None);
+    }
+    // The last free place is left to a report that failed while none of
+    // them is in one. So the three go out among the first new ones, one
+    // after the other, and not when the new ones are through.
+    eventually("the three are sent", || {
+        billing.written_of("failed-before") == 3
+    })
+    .await;
+    let new_by_then = billing.written_of("new");
+    assert!(
+        new_by_then < 60,
+        "{new_by_then} new reports were sent first"
+    );
+    // And they never held more than their one place.
+    delivered(&delivery).await;
+    assert_eq!(billing.written_of("new"), 250);
+    assert_eq!(billing.intake.most_answering.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -1299,16 +1360,15 @@ async fn in_an_outage_one_new_report_goes_ahead_of_the_pause_and_no_more() {
     eventually("it is tried at once", || billing.received() == before + 5).await;
 }
 
-#[tokio::test]
-async fn a_usage_token_the_billing_api_does_not_accept_keeps_every_report_until_it_does() {
+/// Every report is answered `status`, which is about this process and not
+/// about any of them.
+async fn refused_whatever_the_report(status: u16, reason: &str) {
     let recorder = PrometheusBuilder::new().build_recorder();
     let _metrics = metrics::set_default_local_recorder(&recorder);
     let logs = Logs::default();
     let _capture = logs.capture();
     let (_dir, path) = file();
-    // The token was rotated on the other side: every report gets a 401,
-    // which says nothing about the report.
-    let billing = Billing::start(401).await;
+    let billing = Billing::start(status).await;
     let delivery = billing.delivery(
         durable(|policy| {
             policy.max_in_flight = 2;
@@ -1322,7 +1382,7 @@ async fn a_usage_token_the_billing_api_does_not_accept_keeps_every_report_until_
     for id in ids("report", 12) {
         billing.report(&delivery, &id, None);
     }
-    // It is about this process, so about every report: the first 401 is
+    // It is about this process, so about every report: the first answer is
     // enough to stop sending them one after the other.
     eventually("the first answers", || value(&recorder, PAUSED, &[]) == 1.0).await;
     assert!(billing.received() <= 2, "{}", billing.received());
@@ -1338,32 +1398,86 @@ async fn a_usage_token_the_billing_api_does_not_accept_keeps_every_report_until_
             &path,
             "SELECT group_concat(DISTINCT last_outcome) FROM pending WHERE attempts > 0"
         ),
-        "http_401"
+        reason
     );
 
-    // The token is put right. Nothing has to be put back by hand.
+    // What was wrong is put right. Nothing has to be put back by hand.
     billing.answer(200);
     delivered(&delivery).await;
     assert_eq!(billing.written_sorted(), ids("report", 12));
     assert_eq!(value(&recorder, REPORTS, &["outcome=\"accepted\""]), 12.0);
     assert_eq!(value(&recorder, DROPPED, &[]), 0.0);
-    assert!(value(&recorder, RETRIES, &["reason=\"http_401\""]) >= 1.0);
+    assert!(value(&recorder, RETRIES, &[&format!("reason=\"{reason}\"")]) >= 1.0);
+    assert_eq!(logs.lines(NOT_ANSWERING_LINE).len(), 1);
+    assert_eq!(read::<i64>(&path, "SELECT COUNT(*) FROM rejected"), 0);
+}
 
-    // A 403 is not that. The billing API never answers one for the token:
-    // it is about the report, and final.
-    billing.refuse("forbidden", Some(403));
-    billing.report(&delivery, "forbidden", None);
-    billing.report(&delivery, "after", None);
+#[tokio::test]
+async fn a_usage_token_the_billing_api_does_not_accept_keeps_every_report_until_it_does() {
+    // The token was rotated on the other side: every report gets a 401.
+    refused_whatever_the_report(401, "http_401").await;
+}
+
+#[tokio::test]
+async fn something_in_front_of_the_billing_api_that_forbids_keeps_every_report_until_it_does_not() {
+    // The billing API never answers a 403 on this route. Something in front
+    // of it does (a firewall, a list this process is not on), to every
+    // report alike: a day of that must not be a day of reports in
+    // `rejected`, of which only the newest are kept.
+    refused_whatever_the_report(403, "http_403").await;
+}
+
+#[tokio::test]
+async fn the_answers_that_are_about_the_report_end_it_and_the_others_do_not() {
+    let (_dir, path) = file();
+    let billing = Billing::start(200).await;
+    let delivery = billing.delivery(durable(|_| {}), outbox(&path));
+    for status in [400, 404, 409, 413, 422] {
+        let id = format!("final-{status}");
+        billing.refuse(&id, Some(status));
+        billing.report(&delivery, &id, None);
+    }
     delivered(&delivery).await;
     assert_eq!(
         read::<String>(
             &path,
-            "SELECT reason || ' ' || status || ' ' || json_extract(body, '$.id') FROM rejected"
+            "SELECT group_concat(status) FROM (SELECT status FROM rejected ORDER BY status)"
         ),
-        "rejected 403 forbidden"
+        "400,404,409,413,422"
     );
-    assert!(billing.written().contains(&"after".to_string()));
-    assert_eq!(logs.lines(NOT_ANSWERING_LINE).len(), 1);
+    assert_eq!(
+        read::<i64>(
+            &path,
+            "SELECT COUNT(*) FROM rejected WHERE reason = 'rejected' AND attempts = 1"
+        ),
+        5
+    );
+    assert_eq!(billing.received(), 5);
+
+    // The others say nothing about the report: it stays where it is, with
+    // what was answered, and is sent again until it is accepted.
+    for (status, outcome) in [
+        (401, "http_401"),
+        (403, "http_403"),
+        (429, "http_429"),
+        (500, "http_5xx"),
+        (502, "http_5xx"),
+        (503, "http_5xx"),
+        (504, "http_5xx"),
+    ] {
+        let id = format!("kept-{status}");
+        billing.refuse(&id, Some(status));
+        billing.report(&delivery, &id, None);
+        eventually("it failed and was kept", || {
+            read::<String>(&path, "SELECT last_outcome FROM pending WHERE attempts > 0") == outcome
+        })
+        .await;
+        assert_eq!(read::<i64>(&path, "SELECT COUNT(*) FROM rejected"), 5);
+        billing.refuse(&id, None);
+        eventually("it is accepted", || billing.written_of(&id) == 1).await;
+    }
+    delivered(&delivery).await;
+    assert_eq!(read::<i64>(&path, "SELECT COUNT(*) FROM rejected"), 5);
 }
 
 #[tokio::test]
@@ -1511,45 +1625,43 @@ async fn a_report_too_old_is_moved_while_it_waits_and_is_not_sent_when_its_place
 }
 
 #[tokio::test]
-async fn with_a_deadline_a_report_too_old_goes_to_rejected_whichever_process_kept_it() {
+async fn the_deadline_of_delivery_without_an_outbox_ends_no_report_that_has_one() {
     let recorder = PrometheusBuilder::new().build_recorder();
     let _metrics = metrics::set_default_local_recorder(&recorder);
     let (_dir, path) = file();
     let billing = Billing::start(503).await;
+    // Without an outbox a report this old is given up on. An outbox is
+    // there to wait an outage out: the deadline is not looked at, by the
+    // process that kept the report or by the next one, and the only age
+    // that ends a report is the one the outbox has (a week).
     let policy = || {
         durable(|policy| {
             policy.attempt_timeout = Duration::from_millis(200);
-            policy.deadline = Some(Duration::from_millis(2_000));
+            policy.deadline = Some(Duration::from_millis(300));
         })
     };
     let first = billing.delivery(policy(), outbox(&path));
-    billing.report(&first, "too-old", None);
+    assert_eq!(first.policy().deadline, None);
+    billing.report(&first, "waited-out", None);
     eventually("it was tried", || billing.received() >= 1).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let attempts = billing.received();
+    eventually("it is still tried", || billing.received() > attempts).await;
     first.drain_at_shutdown().await.unwrap();
     assert_eq!(pending_rows(&path), 1);
 
-    // Past its deadline when the next process finds it: even a billing API
-    // that would take it is not asked. But it is not destroyed either.
-    tokio::time::sleep(Duration::from_millis(2_000)).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
     billing.answer(200);
-    let attempts = billing.received();
     let second = billing.delivery(policy(), outbox(&path));
     delivered(&second).await;
-    assert_eq!(billing.received(), attempts);
-    assert_eq!(billing.written(), Vec::<String>::new());
+    assert_eq!(billing.written(), ["waited-out"]);
     assert_eq!(pending_rows(&path), 0);
+    assert_eq!(read::<i64>(&path, "SELECT COUNT(*) FROM rejected"), 0);
     assert_eq!(
-        read::<String>(
-            &path,
-            "SELECT reason || ' ' || json_extract(body, '$.id') FROM rejected"
-        ),
-        "deadline too-old"
+        value(&recorder, REPORTS, &["outcome=\"deadline_exceeded\""]),
+        0.0
     );
-    eventually("it is counted", || {
-        value(&recorder, REPORTS, &["outcome=\"deadline_exceeded\""]) == 1.0
-    })
-    .await;
-    assert_eq!(value(&recorder, DROPPED, &["reason=\"deadline\""]), 1.0);
+    assert_eq!(value(&recorder, DROPPED, &[]), 0.0);
 }
 
 #[tokio::test]
@@ -1892,9 +2004,11 @@ async fn a_report_refused_for_good_moves_to_rejected_is_counted_once_and_holds_n
 }
 
 #[tokio::test]
-async fn rejected_keeps_the_newest_and_says_how_many_made_room() {
+async fn rejected_keeps_the_newest_and_says_each_report_that_made_room() {
     let recorder = PrometheusBuilder::new().build_recorder();
     let _metrics = metrics::set_default_local_recorder(&recorder);
+    let logs = Logs::default();
+    let _capture = logs.capture();
     let (_dir, path) = file();
     let billing = Billing::start(400).await;
     let delivery = billing.delivery(
@@ -1926,6 +2040,84 @@ async fn rejected_keeps_the_newest_and_says_how_many_made_room() {
     .await;
     assert_eq!(value(&recorder, REJECTED, &[]), 2.0);
     assert_eq!(value(&recorder, DROPPED, &["reason=\"rejected\""]), 3.0);
+
+    // Its row was the last there was of it. What it takes to bill it by
+    // hand is in a line: whose it was, the model, and the numbers. Nothing
+    // else of the report, and nothing that is a secret.
+    let said = logs.lines(EVICTED_LINE);
+    assert_eq!(said.len(), 1, "{}", logs.contents());
+    let line = &said[0];
+    assert_eq!(line["rejected_id"], 1);
+    assert_eq!(line["request_id"], "request-one");
+    assert_eq!(line["org_id"], "org-1");
+    assert_eq!(line["workspace_id"], "ws-1");
+    assert_eq!(line["api_key_id"], "key-1");
+    assert_eq!(line["model"], "test-model");
+    assert_eq!(line["completion_id"], "one");
+    assert_eq!(
+        (&line["reason"], &line["status"]),
+        (&"rejected".into(), &400.into())
+    );
+    assert_eq!(line["attempts"], 1);
+    assert!(line["completed_at_ms"].as_i64().unwrap() > 0);
+    let usage: serde_json::Value = serde_json::from_str(line["usage"].as_str().unwrap()).unwrap();
+    assert_eq!(usage["input_tokens"], 1200);
+    assert_eq!(usage["output_tokens"], 340);
+    assert_eq!(usage["cache_read_tokens"], 800);
+    assert!(usage
+        .as_object()
+        .unwrap()
+        .values()
+        .all(|value| value.is_number()));
+    assert!(!logs.contents().contains(TOKEN));
+    assert!(logs.lines(MORE_EVICTED_LINE).is_empty());
+}
+
+#[tokio::test]
+async fn a_storm_of_evictions_from_rejected_is_said_row_by_row_up_to_a_rate_and_summed_up_beyond() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let logs = Logs::default();
+    let _capture = logs.capture();
+    let (_dir, path) = file();
+    let billing = Billing::start(400).await;
+    let delivery = billing.delivery(
+        durable(|_| {}),
+        UsageOutboxConfig {
+            max_rejected: 5,
+            ..outbox(&path)
+        },
+    );
+    for id in ids("refused", 180) {
+        billing.report(&delivery, &id, None);
+    }
+    delivered(&delivery).await;
+    eventually("175 made room", || {
+        value(&recorder, REJECTED_EVICTED, &[]) == 175.0
+    })
+    .await;
+    assert_eq!(read::<i64>(&path, "SELECT COUNT(*) FROM rejected"), 5);
+    // A line for each of the first hundred, and no more of those in ten
+    // seconds: a table that turns over at the rate of the traffic must not
+    // turn the log over with it.
+    let said = logs.lines(EVICTED_LINE);
+    assert_eq!(said.len(), EVICTION_LINES as usize);
+    let ids_said: Vec<i64> = said
+        .iter()
+        .map(|line| line["rejected_id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids_said, (1..=100).collect::<Vec<i64>>());
+    assert!(logs.lines(MORE_EVICTED_LINE).is_empty());
+
+    // The others are summed up, with how many they were and which rows:
+    // when the ten seconds are over, or when the process stops before.
+    delivery.drain_at_shutdown().await.unwrap();
+    let summed = logs.lines(MORE_EVICTED_LINE);
+    assert_eq!(summed.len(), 1, "{}", logs.contents());
+    assert_eq!(summed[0]["count"], 75);
+    assert_eq!(summed[0]["first_rejected_id"], 101);
+    assert_eq!(summed[0]["last_rejected_id"], 175);
+    assert_eq!(logs.lines(EVICTED_LINE).len(), 100);
 }
 
 #[tokio::test]
@@ -2335,6 +2527,547 @@ async fn a_report_waiting_out_its_backoff_in_memory_is_written_as_soon_as_the_fi
     );
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(billing.received(), 3);
+}
+
+#[tokio::test]
+async fn a_report_held_in_memory_ends_there_when_it_is_too_old_and_is_written_to_rejected_later() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let logs = Logs::default();
+    let _capture = logs.capture();
+    let (_dir, path) = file();
+    let billing = Billing::start(503).await;
+    let delivery = billing.delivery(
+        // After one failure a report waits five minutes or more for its
+        // next attempt: nothing is tried while this one grows too old, and
+        // nothing will be for as long as this test waits.
+        durable(|policy| policy.initial_backoff = Duration::from_secs(600)),
+        UsageOutboxConfig {
+            max_age: Duration::from_millis(800),
+            max_backoff: Duration::from_secs(600),
+            ..outbox(&path)
+        },
+    );
+    opened(&path).await;
+    store(&delivery).inject_fault(true);
+    billing.report(&delivery, "held", None);
+    eventually("it failed once and waits in memory", || {
+        billing.received() == 1 && delivery.pending() == (1, 0)
+    })
+    .await;
+
+    // The file stays away for longer than a report may wait. The age that
+    // ends a report in the file ends it in memory as well: it is counted
+    // and said when it is that old, not when its next attempt comes or the
+    // file is back, and it is not tried again.
+    let started_at = Instant::now();
+    eventually("it is too old, and counted", || {
+        value(&recorder, DROPPED, &["reason=\"max_age\""]) == 1.0
+    })
+    .await;
+    assert!(
+        started_at.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started_at.elapsed()
+    );
+    assert_eq!(
+        value(&recorder, REPORTS, &["outcome=\"deadline_exceeded\""]),
+        1.0
+    );
+    let said = logs.lines(TOO_OLD_LINE);
+    assert_eq!(said.len(), 1, "{}", logs.contents());
+    assert_eq!(said[0]["request_id"], "request-held");
+    assert_eq!(said[0]["last_attempt"], "http_5xx");
+    assert_eq!(said[0]["attempts"], 1);
+    assert_eq!(delivery.pending(), (0, 0));
+    assert_eq!(value(&recorder, IN_MEMORY, &[]), 1.0, "kept for `rejected`");
+    assert_eq!(pending_rows(&path), 0);
+
+    // The file is back: the report is kept in `rejected`, where a person
+    // finds it, as it would be had the file held it all along.
+    store(&delivery).inject_fault(false);
+    eventually("it is in rejected", || {
+        read::<String>(
+            &path,
+            "SELECT reason || ' ' || outcome || ' ' || attempts || ' ' || \
+             json_extract(body, '$.id') FROM rejected",
+        ) == "max_age http_5xx 1 held"
+    })
+    .await;
+    eventually("memory holds nothing", || {
+        value(&recorder, IN_MEMORY, &[]) == 0.0
+    })
+    .await;
+    assert_eq!(pending_rows(&path), 0);
+    assert_eq!(billing.received(), 1);
+    assert_eq!(value(&recorder, DROPPED, &[]), 1.0, "counted once");
+    assert_eq!(logs.lines(TOO_OLD_LINE).len(), 1);
+}
+
+#[tokio::test]
+async fn a_report_that_had_ended_in_memory_and_is_then_lost_is_counted_once() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let logs = Logs::default();
+    let _capture = logs.capture();
+    let (_dir, path) = file();
+    let billing = Billing::start(400).await;
+    let delivery = billing.delivery(
+        durable(|policy| {
+            policy.max_queued = 4;
+            policy.initial_backoff = Duration::from_secs(40);
+        }),
+        UsageOutboxConfig {
+            max_backoff: Duration::from_secs(600),
+            ..outbox(&path)
+        },
+    );
+    opened(&path).await;
+    // The file is away, and the billing API refuses four reports for good:
+    // they have ended, are counted as that, and wait in memory for the file
+    // to keep them in `rejected`.
+    store(&delivery).inject_fault(true);
+    for id in ids("refused", 4) {
+        billing.report(&delivery, &id, None);
+    }
+    eventually("the four are refused", || {
+        value(&recorder, DROPPED, &["reason=\"rejected\""]) == 4.0
+    })
+    .await;
+    assert_eq!(value(&recorder, REPORTS, &["outcome=\"http_4xx\""]), 4.0);
+    assert_eq!(value(&recorder, IN_MEMORY, &[]), 4.0);
+
+    // Memory is full of them when three more reports come, which push
+    // three of them out. What is lost with each is its row in `rejected`,
+    // and that is what is counted and said: the report was counted when it
+    // ended, and is not dropped a second time.
+    billing.answer(503);
+    for id in ids("kept", 3) {
+        billing.report(&delivery, &id, None);
+    }
+    eventually("three were pushed out", || {
+        value(&recorder, REJECTED_EVICTED, &[]) == 3.0
+    })
+    .await;
+    let said = logs.lines(ENDED_AND_LOST_LINE);
+    assert_eq!(said.len(), 3, "{}", logs.contents());
+    let lost: BTreeSet<&str> = said
+        .iter()
+        .map(|line| line["completion_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(lost.len(), 3, "{lost:?}");
+    assert!(lost.iter().all(|id| id.starts_with("refused-")), "{lost:?}");
+    let line = &said[0];
+    assert_eq!(
+        line["request_id"].as_str().unwrap(),
+        format!("request-{}", line["completion_id"].as_str().unwrap())
+    );
+    assert_eq!(
+        (&line["reason"], &line["status"]),
+        (&"rejected".into(), &400.into())
+    );
+    assert_eq!(line["org_id"], "org-1");
+    let usage: serde_json::Value = serde_json::from_str(line["usage"].as_str().unwrap()).unwrap();
+    assert_eq!(usage["input_tokens"], 1200);
+    assert_eq!(value(&recorder, DROPPED, &[]), 4.0);
+    assert_eq!(value(&recorder, DROPPED, &["reason=\"queue_full\""]), 0.0);
+    assert_eq!(value(&recorder, REPORTS, &["outcome=\"queue_full\""]), 0.0);
+
+    // The process stops, and the file is still away: the fourth is lost
+    // the same way, and counted the same way. The three that had not ended
+    // are left undelivered, as reports are without an outbox.
+    eventually("the three were tried", || billing.received() == 7).await;
+    delivery.drain_at_shutdown().await.unwrap();
+    assert_eq!(value(&recorder, REJECTED_EVICTED, &[]), 4.0);
+    assert_eq!(logs.lines(ENDED_AND_LOST_LINE).len(), 4);
+    assert_eq!(value(&recorder, DROPPED, &["reason=\"rejected\""]), 4.0);
+    assert_eq!(value(&recorder, DROPPED, &["reason=\"shutdown\""]), 3.0);
+    assert_eq!(value(&recorder, DROPPED, &[]), 7.0);
+    assert_eq!(logs.lines(LEFT_LINE).len(), 3);
+}
+
+#[tokio::test]
+async fn a_report_that_finds_memory_full_of_reports_being_sent_is_the_one_that_is_dropped() {
+    const DROPPED_LINE: &str = "Usage report dropped: the outbox could not take it, and what \
+                                waits in memory is full — usage NOT billed";
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let logs = Logs::default();
+    let _capture = logs.capture();
+    let (_dir, path) = file();
+    let billing = Billing::start(200).await;
+    billing.take(Duration::from_millis(400));
+    let delivery = billing.delivery(durable(|policy| policy.max_queued = 2), outbox(&path));
+    opened(&path).await;
+    // The file is away, memory may hold two reports, and both are being
+    // sent when a third comes. A report that is being sent is not pushed
+    // out for another (its answer is on its way), so the third has no
+    // place: it is dropped, and said and counted like any other.
+    store(&delivery).inject_fault(true);
+    billing.report(&delivery, "first", None);
+    billing.report(&delivery, "second", None);
+    eventually("the two are being sent", || {
+        billing.intake.answering.load(Ordering::SeqCst) == 2
+    })
+    .await;
+    billing.report(&delivery, "third", None);
+    eventually("the third is counted as dropped", || {
+        value(&recorder, DROPPED, &["reason=\"queue_full\""]) == 1.0
+    })
+    .await;
+    let said = logs.lines(DROPPED_LINE);
+    assert_eq!(said.len(), 1, "{}", logs.contents());
+    assert_eq!(said[0]["request_id"], "request-third");
+    assert_eq!(value(&recorder, REPORTS, &["outcome=\"queue_full\""]), 1.0);
+    eventually("the two are accepted", || billing.written().len() == 2).await;
+    assert_eq!(billing.written_sorted(), ["first", "second"]);
+    assert_eq!(value(&recorder, DROPPED, &[]), 1.0);
+}
+
+#[tokio::test]
+async fn memory_and_the_writer_together_never_hold_more_than_the_bound() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let (_dir, path) = file();
+    let billing = Billing::start(503).await;
+    // (Four times what one pass hands from memory to the writer.)
+    const BOUND: usize = 2_000;
+    let delivery = billing.delivery(
+        durable(|policy| policy.max_queued = BOUND),
+        UsageOutboxConfig {
+            stall_timeout: Duration::from_secs(60),
+            ..outbox(&path)
+        },
+    );
+    opened(&path).await;
+
+    // What this process holds of reports that are not in the file, looked
+    // at all the while from a thread of its own: those handed to the
+    // writer and those in memory, at one moment.
+    let stop = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let (delivery, stop) = (delivery.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let (mut most, mut most_in_transit, mut looks) = (0, 0, 0u64);
+            while !stop.load(Ordering::Relaxed) {
+                let (in_transit, in_memory) = {
+                    let kept = kept(&delivery);
+                    let in_memory = kept.memory.len();
+                    (
+                        delivery.outbox.as_ref().unwrap().load.in_transit(),
+                        in_memory,
+                    )
+                };
+                most = most.max(in_transit + in_memory);
+                most_in_transit = most_in_transit.max(in_transit);
+                looks += 1;
+                std::thread::sleep(Duration::from_micros(50));
+            }
+            (most, most_in_transit, looks)
+        })
+    };
+
+    // Another connection holds the write lock: the writer waits for it with
+    // what it was handed, up to the bound. Memory holds nothing then, so a
+    // report that comes after that has no place to take: it is dropped, and
+    // counted.
+    let other = rusqlite::Connection::open(&path).unwrap();
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    for id in ids("locked", 3 * BOUND) {
+        billing.report(&delivery, &id, None);
+    }
+    eventually("two in three were dropped", || {
+        value(&recorder, DROPPED, &["reason=\"queue_full\""]) == (2 * BOUND) as f64
+    })
+    .await;
+    assert_eq!(delivery.outbox.as_ref().unwrap().load.both(), (BOUND, 0));
+    assert_eq!(kept(&delivery).memory.len(), 0);
+    other.execute_batch("COMMIT").unwrap();
+    billing.answer(200);
+    delivered(&delivery).await;
+    assert_eq!(billing.written().len(), BOUND);
+    assert_eq!(delivery.outbox.as_ref().unwrap().load.both(), (0, 0));
+
+    // A file that takes reports, slowly: every commit takes a tenth of a
+    // second, and reports come faster than that writes them. At no moment
+    // does the writer hold more than the bound.
+    store(&delivery).inject_commit_delay(Duration::from_millis(100));
+    let before = billing.written().len();
+    for (n, id) in ids("slow", 3 * BOUND).iter().enumerate() {
+        billing.report(&delivery, id, None);
+        if n % 10 == 9 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+    store(&delivery).inject_commit_delay(Duration::ZERO);
+    delivered(&delivery).await;
+    // None went missing without being counted: accepted, or dropped for
+    // the bound.
+    let dropped = |recorder: &PrometheusRecorder| {
+        value(recorder, DROPPED, &["reason=\"queue_full\""]) as usize
+    };
+    let written: BTreeSet<String> = billing.written().into_iter().skip(before).collect();
+    let dropped_slow = dropped(&recorder) - 2 * BOUND;
+    assert_eq!(
+        written.len() + dropped_slow,
+        3 * BOUND,
+        "{dropped_slow} dropped"
+    );
+
+    // A file that was away, with memory at the bound, and that comes back
+    // while reports keep coming. What memory holds is handed to the writer
+    // a few hundred reports at a time, and a report that comes in meanwhile
+    // takes the place of the one that waited longest: the writer does not
+    // take it on top of what memory still holds.
+    billing.answer(503);
+    store(&delivery).inject_fault(true);
+    let (before, dropped_before) = (billing.written().len(), dropped(&recorder));
+    for id in ids("away", 2 * BOUND) {
+        billing.report(&delivery, &id, None);
+    }
+    eventually("memory is at the bound", || {
+        kept(&delivery).memory.len() == BOUND && dropped(&recorder) == dropped_before + BOUND
+    })
+    .await;
+    store(&delivery).inject_commit_delay(Duration::from_millis(200));
+    store(&delivery).inject_fault(false);
+    for (n, id) in ids("back", BOUND).iter().enumerate() {
+        billing.report(&delivery, id, None);
+        if n % 10 == 9 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+    store(&delivery).inject_commit_delay(Duration::ZERO);
+    billing.answer(200);
+    delivered(&delivery).await;
+    let written: BTreeSet<String> = billing.written().into_iter().skip(before).collect();
+    let dropped_back = dropped(&recorder) - dropped_before;
+    assert_eq!(
+        written.len() + dropped_back,
+        3 * BOUND,
+        "{dropped_back} dropped"
+    );
+    assert_eq!(
+        value(&recorder, DROPPED, &[]) as usize,
+        2 * BOUND + dropped_slow + dropped_back
+    );
+
+    stop.store(true, Ordering::Relaxed);
+    let (most, most_in_transit, looks) = watcher.join().unwrap();
+    println!("{looks} looks: at most {most} held, {most_in_transit} of them by the writer");
+    assert!(looks > 1_000, "{looks}");
+    assert!(most <= BOUND, "{most} reports held at once");
+    assert!(most_in_transit <= BOUND, "{most_in_transit}");
+    assert_eq!(most, BOUND, "the bound was never reached");
+}
+
+#[tokio::test]
+async fn writing_a_hundred_thousand_held_reports_to_the_file_stalls_neither_the_runtime_nor_a_request(
+) {
+    const HELD: usize = 100_000;
+    let (_dir, path) = file();
+    let billing = Billing::start(503).await;
+    let delivery = billing.delivery(
+        durable(|policy| {
+            policy.max_queued = 2 * HELD;
+            policy.initial_backoff = Duration::from_secs(40);
+        }),
+        UsageOutboxConfig {
+            max_backoff: Duration::from_secs(600),
+            ..outbox(&path)
+        },
+    );
+    opened(&path).await;
+    store(&delivery).inject_fault(true);
+    for n in 0..HELD {
+        billing.report(&delivery, &format!("held-{n}"), None);
+    }
+    eventually("they are all held in memory", || {
+        kept(&delivery).memory.len() == HELD
+    })
+    .await;
+
+    // A request hands a report over every half millisecond, on a thread of
+    // its own as a request is. And a task takes its turn on the runtime
+    // that does the writing whenever it is given one, and looks at how long
+    // it waited for it: by the clock, and by the time this thread was busy
+    // meanwhile, which no other load on the machine adds to.
+    let stop = Arc::new(AtomicBool::new(false));
+    let requests = {
+        let (delivery, stop) = (delivery.clone(), stop.clone());
+        let (client, url) = (billing.client.clone(), billing.url.clone());
+        let intake = billing.intake.clone();
+        let runtime = tokio::runtime::Handle::current();
+        std::thread::spawn(move || {
+            let _in_runtime = runtime.enter();
+            let billing = Billing {
+                url,
+                intake,
+                client,
+            };
+            let (mut worst, mut handed_over) = (Duration::ZERO, 0usize);
+            while !stop.load(Ordering::Relaxed) {
+                let started_at = Instant::now();
+                billing.report(&delivery, &format!("live-{handed_over}"), None);
+                worst = worst.max(started_at.elapsed());
+                handed_over += 1;
+                std::thread::sleep(Duration::from_micros(500));
+            }
+            (worst, handed_over)
+        })
+    };
+    let turns = {
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            let (mut longest, mut busiest) = (Duration::ZERO, Duration::ZERO);
+            let (mut at, mut cpu) = (Instant::now(), thread_cpu());
+            while !stop.load(Ordering::Relaxed) {
+                tokio::task::yield_now().await;
+                let (now, cpu_now) = (Instant::now(), thread_cpu());
+                longest = longest.max(now - at);
+                if let (Some(before), Some(now)) = (cpu, cpu_now) {
+                    busiest = busiest.max(now.saturating_sub(before));
+                }
+                (at, cpu) = (now, cpu_now);
+            }
+            (longest, busiest, cpu.is_some())
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The file is back, and all of it is handed to the writer: a few
+    // hundred reports at a time, between which the runtime does what else
+    // it has to do.
+    let back_at = Instant::now();
+    store(&delivery).inject_fault(false);
+    let give_up_at = Instant::now() + Duration::from_secs(300);
+    while kept(&delivery).memory.len() > 50 {
+        assert!(Instant::now() < give_up_at, "memory was never written");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let emptied_in = back_at.elapsed();
+    stop.store(true, Ordering::Relaxed);
+    let (longest, busiest, measured) = turns.await.unwrap();
+    let (worst, handed_over) = requests.join().unwrap();
+    println!(
+        "{HELD} held reports handed to the writer {emptied_in:?} after the file was back; a \
+         task of the runtime waited at most {longest:?} for its turn, during which the thread \
+         was busy for at most {busiest:?}; handing a report over took at most {worst:?} \
+         ({handed_over} handed over meanwhile)"
+    );
+    // Milliseconds, and less. Taking them one by one out of a queue, with
+    // the lock held throughout, took the runtime seconds and a request as
+    // long as one pass; and passes that follow each other without a pause
+    // are one long pass to everything else on the thread.
+    assert!(longest < Duration::from_millis(500), "a turn: {longest:?}");
+    if measured {
+        assert!(busiest < Duration::from_millis(50), "busy: {busiest:?}");
+    }
+    assert!(worst < Duration::from_millis(100), "a request: {worst:?}");
+    assert!(handed_over > 100, "{handed_over}");
+    let give_up_at = Instant::now() + Duration::from_secs(300);
+    while pending_rows(&path) < (HELD + handed_over) as i64 - 60 {
+        assert!(Instant::now() < give_up_at, "they were never in the file");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn pushing_a_report_out_of_a_full_memory_costs_the_same_however_much_memory_holds() {
+    const HELD: usize = 50_000;
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let (_dir, path) = file();
+    let billing = Billing::start(503).await;
+    let delivery = billing.delivery(
+        durable(|policy| {
+            policy.max_queued = HELD;
+            policy.initial_backoff = Duration::from_secs(600);
+        }),
+        UsageOutboxConfig {
+            max_backoff: Duration::from_secs(600),
+            ..outbox(&path)
+        },
+    );
+    opened(&path).await;
+    store(&delivery).inject_fault(true);
+    for n in 0..HELD {
+        billing.report(&delivery, &format!("held-{n}"), None);
+    }
+    eventually("memory is at its bound", || {
+        kept(&delivery).memory.len() == HELD
+    })
+    .await;
+
+    // Every report that comes now pushes out the one held longest. That is
+    // a look at one end of what memory holds, not at all of it: twenty
+    // thousand of them take milliseconds of this thread, where a search
+    // through fifty thousand for each would take seconds.
+    let (cpu_before, started_at) = (thread_cpu(), Instant::now());
+    for n in 0..20_000 {
+        billing.report(&delivery, &format!("pushing-{n}"), None);
+    }
+    let took = match (cpu_before, thread_cpu()) {
+        (Some(before), Some(after)) => after.saturating_sub(before),
+        _ => started_at.elapsed(),
+    };
+    println!("20,000 reports each pushed one of {HELD} out of memory in {took:?} of this thread");
+    assert!(took < Duration::from_secs(2), "{took:?}");
+    assert_eq!(kept(&delivery).memory.len(), HELD);
+    eventually("each one pushed out is counted", || {
+        value(&recorder, DROPPED, &["reason=\"queue_full\""]) >= 20_000.0
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_report_being_sent_from_memory_when_the_file_is_back_stays_there_until_its_attempt_ends()
+{
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let (_dir, path) = file();
+    let billing = Billing::start(503).await;
+    billing.take(Duration::from_millis(500));
+    let delivery = billing.delivery(durable(|policy| policy.max_in_flight = 2), outbox(&path));
+    opened(&path).await;
+    // The file is away. Two reports are being sent from memory, and three
+    // wait there for a place.
+    store(&delivery).inject_fault(true);
+    for id in ids("held", 5) {
+        billing.report(&delivery, &id, None);
+    }
+    eventually("two are being sent", || {
+        billing.intake.answering.load(Ordering::SeqCst) == 2 && delivery.pending() == (3, 2)
+    })
+    .await;
+
+    // The file is back while the two attempts are under way. The three
+    // that wait are written to it; the two stay in memory, where their
+    // attempts will look for them.
+    store(&delivery).inject_fault(false);
+    eventually("the three are in the file", || pending_rows(&path) == 3).await;
+    assert_eq!(billing.intake.answering.load(Ordering::SeqCst), 2);
+    assert_eq!(kept(&delivery).memory.len(), 2);
+    assert_eq!(value(&recorder, IN_MEMORY, &[]), 2.0);
+
+    // The two attempts fail, and their reports are written with what they
+    // found: none of the five is lost, in memory or anywhere.
+    eventually("all five are in the file", || pending_rows(&path) == 5).await;
+    eventually("memory holds nothing", || {
+        kept(&delivery).memory.is_empty() && delivery.outbox.as_ref().unwrap().load.both() == (0, 0)
+    })
+    .await;
+    assert!(
+        read::<i64>(
+            &path,
+            "SELECT COUNT(*) FROM pending WHERE attempts >= 1 AND last_outcome = 'http_5xx'"
+        ) >= 2
+    );
+    billing.answer(200);
+    billing.take(Duration::ZERO);
+    delivered(&delivery).await;
+    assert_eq!(billing.written_sorted(), ids("held", 5));
+    assert_eq!(value(&recorder, DROPPED, &[]), 0.0);
 }
 
 #[tokio::test]
@@ -2829,11 +3562,13 @@ async fn a_file_that_is_no_database_is_moved_aside_counted_and_said_once() {
     })
     .await;
     assert_eq!(value(&recorder, AVAILABLE, &[]), 1.0);
-    const MOVED: &str = "Usage report outbox was not a readable database any more: it was moved \
-                         aside for a person to look at, and a new file started. The reports it \
-                         held are not sent unless they are put back";
-    let said = logs.lines(MOVED);
+    let said = logs.lines(MOVED_ASIDE_LINE);
     assert_eq!(said.len(), 1, "{}", logs.contents());
+    // With what SQLite said of it, and no count of reports: this process
+    // never had any in it.
+    assert_eq!(said[0]["error"], "file is not a database");
+    assert!(said[0]["held"].is_null(), "{}", said[0]);
+    assert_eq!(value(&recorder, LOST_REPORTS, &[]), 0.0);
     // What was there is kept beside it, under a name that says when.
     let kept_as = said[0]["kept_as"].as_str().unwrap();
     assert!(kept_as.contains("outbox.db.corrupt-"), "{kept_as}");
@@ -2904,10 +3639,15 @@ async fn a_file_emptied_under_the_running_process_is_started_anew_and_its_gauges
         value(&recorder, REPLACED, &["why=\"lost\""]) == 1.0
     })
     .await;
-    const LOST: &str = "Usage report outbox was deleted or emptied under the running process \
-                        and could not be written back: a new one was started, and the reports \
-                        it held are lost, except those this process was sending";
-    assert_eq!(logs.lines(LOST).len(), 1, "{}", logs.contents());
+    // Said once, with how many reports the file held when it was last
+    // written, which are counted as lost.
+    let said = logs.lines(LOST_LINE);
+    assert_eq!(said.len(), 1, "{}", logs.contents());
+    assert_eq!(
+        (&said[0]["held"], &said[0]["in_hand"]),
+        (&12.into(), &0.into())
+    );
+    assert_eq!(value(&recorder, LOST_REPORTS, &["why=\"lost\""]), 12.0);
     eventually("the file is in use again", || {
         value(&recorder, AVAILABLE, &[]) == 1.0
     })
@@ -2932,48 +3672,290 @@ async fn a_file_emptied_under_the_running_process_is_started_anew_and_its_gauges
     .await;
 }
 
+/// Put `ids` into the file as reports an earlier process left, which failed
+/// and are due again in an hour: in the file, and in nobody's hands. (The
+/// outbox must allow a backoff that long, or they count as due.)
+fn left_waiting(path: &Path, ids: &[String]) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.busy_timeout(Duration::from_secs(5)).unwrap();
+    let now_ms = Clock::default().now_ms();
+    for id in ids {
+        conn.execute(
+            "INSERT INTO pending (body, request_id, auth_path, ingress_route, \
+             completed_at_ms, attempts, next_attempt_at_ms, last_outcome) \
+             VALUES (?1, ?2, 'cloud_api_key', 'long', ?3, 4, ?4, 'http_5xx')",
+            rusqlite::params![
+                serde_json::json!({"id": id, "model": "test-model"}).to_string(),
+                format!("request-{id}"),
+                now_ms - 60_000,
+                now_ms + 3_600_000
+            ],
+        )
+        .unwrap();
+    }
+}
+
 #[tokio::test]
-async fn a_file_deleted_under_the_running_process_is_put_back_with_what_it_held() {
+async fn a_file_deleted_under_the_running_process_is_started_anew_and_what_it_held_is_counted() {
     let recorder = PrometheusBuilder::new().build_recorder();
     let _metrics = metrics::set_default_local_recorder(&recorder);
     let logs = Logs::default();
     let _capture = logs.capture();
     let (dir, path) = file();
     let billing = Billing::start(503).await;
-    let delivery = billing.delivery(durable(|_| {}), outbox(&path));
-    for id in ids("before", 10) {
+    billing.take(Duration::from_millis(300));
+    let delivery = billing.delivery(
+        durable(|_| {}),
+        UsageOutboxConfig {
+            max_backoff: Duration::from_secs(3_600),
+            ..outbox(&path)
+        },
+    );
+    opened(&path).await;
+    // Ten reports wait in the file for an attempt an hour away. Twenty
+    // more are in this process's hands, each with a row of the file and its
+    // lease: eight are being sent, and twelve are next.
+    left_waiting(&path, &ids("waiting", 10));
+    for id in ids("in-hand", 20) {
         billing.report(&delivery, &id, None);
     }
-    eventually("they are in the file", || pending_rows(&path) == 10).await;
+    eventually("eight are being sent and the others are leased", || {
+        billing.intake.answering.load(Ordering::SeqCst) == 8
+            && read::<i64>(
+                &path,
+                "SELECT COUNT(*) FROM pending WHERE lease_owner IS NOT NULL",
+            ) == 20
+    })
+    .await;
+    eventually("the gauge says what the file holds", || {
+        value(&recorder, PENDING, &[]) == 30.0
+    })
+    .await;
 
     for entry in std::fs::read_dir(dir.path()).unwrap() {
         std::fs::remove_file(entry.unwrap().path()).unwrap();
     }
-    for id in ids("after", 10) {
-        billing.report(&delivery, &id, None);
-    }
     // The next transaction notices, before it writes to a file nobody can
-    // open any more, and writes the database back to the path.
-    eventually("the file is back with everything", || {
-        pending_rows(&path) == 20
-    })
-    .await;
+    // open any more. A new file is started, and what the deleted one held
+    // is said and counted, once: thirty reports.
     eventually("it is counted", || {
         value(&recorder, REPLACED, &["why=\"deleted\""]) == 1.0
     })
     .await;
-    assert_eq!(value(&recorder, AVAILABLE, &[]), 1.0);
-    const PUT_BACK: &str = "Usage report outbox was deleted under the running process: it has \
-                            been written back as it was";
-    assert_eq!(logs.lines(PUT_BACK).len(), 1, "{}", logs.contents());
+    let said = logs.lines(DELETED_LINE);
+    assert_eq!(said.len(), 1, "{}", logs.contents());
+    // It held thirty, of which this process has twenty in hand: the ten
+    // that waited in it are lost, and counted.
+    assert_eq!(
+        (&said[0]["held"], &said[0]["in_hand"]),
+        (&30.into(), &20.into())
+    );
+    assert_eq!(value(&recorder, LOST_REPORTS, &["why=\"deleted\""]), 10.0);
+    eventually("the file is in use again", || {
+        value(&recorder, AVAILABLE, &[]) == 1.0
+    })
+    .await;
 
+    // The twenty this process had in hand are not lost with it: the
+    // attempts under way end, and all twenty are written to the new file,
+    // with what happened to them. So are the reports that come after.
+    for id in ids("after", 10) {
+        billing.report(&delivery, &id, None);
+    }
+    eventually("the twenty and the ten are in the new file", || {
+        pending_rows(&path) == 30
+            && read::<i64>(
+                &path,
+                "SELECT COUNT(*) FROM pending WHERE attempts >= 1 AND last_outcome = 'http_5xx'",
+            ) >= 8
+    })
+    .await;
     billing.answer(200);
+    billing.take(Duration::ZERO);
     delivered(&delivery).await;
-    let mut expected = ids("before", 10);
+    let mut expected = ids("in-hand", 20);
     expected.extend(ids("after", 10));
     expected.sort();
     assert_eq!(billing.written_sorted(), expected);
     assert_eq!(value(&recorder, REPLACED, &[]), 1.0);
+    assert_eq!(value(&recorder, DROPPED, &[]), 0.0);
+    assert_eq!(pending_rows(&path), 0);
+    // The file and its journal, and nothing left beside them.
+    let mut names: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["outbox.db", "outbox.db-journal"]);
+}
+
+/// The file is deleted while another process on it is in a transaction that
+/// keeps a report. `claim_with_the_report`: that transaction leases reports
+/// as well, as it mostly does under load, so the report is in that process's
+/// hands when the transaction ends.
+async fn deleted_under_two_processes(claim_with_the_report: bool) {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let (_dir, path) = file();
+    let billing = Billing::start(200).await;
+    // The first process looks at the file every five seconds only: between
+    // two reports it is in no transaction.
+    let lazy = || UsageOutboxConfig {
+        recheck_interval: Duration::from_secs(5),
+        ..outbox(&path)
+    };
+    let first = billing.delivery(durable(|_| {}), lazy());
+    let second = billing.delivery(
+        durable(|_| {}),
+        if claim_with_the_report {
+            // A report waits up to 150 ms for its transaction, and a claim
+            // (one every 20 ms) is made by the same one.
+            UsageOutboxConfig {
+                commit_interval: Duration::from_millis(150),
+                ..outbox(&path)
+            }
+        } else {
+            lazy()
+        },
+    );
+    billing.report(&first, "warm-first", None);
+    billing.report(&second, "warm-second", None);
+    delivered(&first).await;
+    delivered(&second).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // The second process's next commit takes half a second, and the file is
+    // deleted meanwhile.
+    store(&second).inject_commit_delay(Duration::from_millis(500));
+    billing.report(&second, "late", None);
+    tokio::time::sleep(Duration::from_millis(220)).await;
+    store(&second).inject_commit_delay(Duration::ZERO);
+    std::fs::remove_file(&path).unwrap();
+    // The first one notices at its next transaction and starts a new file.
+    // Its own new report is answered 500 for now: its row stays.
+    billing.refuse("kept", Some(500));
+    billing.report(&first, "kept", None);
+    eventually("it is in a new file", || {
+        read::<i64>(
+            &path,
+            "SELECT COUNT(*) FROM pending WHERE json_extract(body, '$.id') = 'kept'",
+        ) == 1
+    })
+    .await;
+
+    // The second one's transaction commits, to the file that was deleted:
+    // its report is in no file anybody can open. Either that process has it
+    // in hand (it leased it with the same transaction) and sends it, or it
+    // counts it as lost when it finds the file gone. Never neither.
+    store(&second).sync();
+    eventually("the second process has found the file gone", || {
+        value(&recorder, REPLACED, &[]) == 2.0
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let (sent, counted) = (
+        billing.written_of("late"),
+        value(&recorder, LOST_REPORTS, &[]),
+    );
+    assert!(
+        sent == 1 || counted >= 1.0,
+        "sent {sent}, counted {counted}"
+    );
+    // And what the second process says of the rows it had from the old
+    // file (number 1 and 2 of it) is not done to the row with that number
+    // in the new one, which is another report.
+    assert_eq!(
+        read::<i64>(
+            &path,
+            "SELECT COUNT(*) FROM pending WHERE json_extract(body, '$.id') = 'kept'",
+        ),
+        1
+    );
+    billing.refuse("kept", None);
+    eventually("it is sent once the billing API takes it", || {
+        billing.written_of("kept") == 1
+    })
+    .await;
+    delivered(&first).await;
+    delivered(&second).await;
+    assert_eq!(pending_rows(&path), 0);
+    assert_eq!(value(&recorder, DROPPED, &[]), 0.0);
+}
+
+#[tokio::test]
+async fn a_file_deleted_while_another_process_commits_a_report_costs_no_report_uncounted() {
+    deleted_under_two_processes(false).await;
+}
+
+#[tokio::test]
+async fn a_file_deleted_while_another_process_commits_a_report_and_a_claim_costs_none_either() {
+    deleted_under_two_processes(true).await;
+}
+
+#[tokio::test]
+async fn something_put_where_the_file_was_is_moved_aside_and_what_the_file_held_is_counted() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let logs = Logs::default();
+    let _capture = logs.capture();
+    let (dir, path) = file();
+    let billing = Billing::start(503).await;
+    let delivery = billing.delivery(
+        durable(|_| {}),
+        UsageOutboxConfig {
+            max_backoff: Duration::from_secs(3_600),
+            ..outbox(&path)
+        },
+    );
+    opened(&path).await;
+    left_waiting(&path, &ids("held", 30));
+    eventually("the gauge says what the file holds", || {
+        value(&recorder, PENDING, &[]) == 30.0
+    })
+    .await;
+
+    // The file is moved away, and something that is no database is put
+    // where it was (a copy that went wrong).
+    let away = dir.path().join("moved-away.db");
+    std::fs::rename(&path, &away).unwrap();
+    std::fs::write(&path, b"this is not an SQLite file, whatever its name says").unwrap();
+    for id in ids("after", 5) {
+        billing.report(&delivery, &id, None);
+    }
+
+    // Two things are said, each of what it is true of. The file that was
+    // open is no longer at the path, with the thirty reports it held: they
+    // are counted. And what is at the path cannot be read, and is moved
+    // aside: that line speaks of no report, because this process never had
+    // one in that thing.
+    eventually("the new reports are in a new file", || {
+        pending_rows(&path) == 5
+    })
+    .await;
+    eventually("both are said", || {
+        logs.lines(EXCHANGED_LINE).len() + logs.lines(MOVED_ASIDE_LINE).len() == 2
+    })
+    .await;
+    let exchanged = logs.lines(EXCHANGED_LINE);
+    assert_eq!(exchanged.len(), 1, "{}", logs.contents());
+    assert_eq!(
+        (&exchanged[0]["held"], &exchanged[0]["in_hand"]),
+        (&30.into(), &0.into())
+    );
+    assert_eq!(value(&recorder, LOST_REPORTS, &["why=\"replaced\""]), 30.0);
+    let aside = logs.lines(MOVED_ASIDE_LINE);
+    assert_eq!(aside.len(), 1, "{}", logs.contents());
+    assert!(aside[0]["held"].is_null(), "{}", aside[0]);
+    assert_eq!(aside[0]["error"], "file is not a database");
+    assert_eq!(value(&recorder, LOST_REPORTS, &[]), 30.0);
+    // The file that was open was not touched: it is where it was moved to,
+    // with every report, for a person to put back.
+    assert_eq!(pending_rows(&away), 30);
+
+    billing.answer(200);
+    delivered(&delivery).await;
+    assert_eq!(billing.written_sorted(), ids("after", 5));
+    assert_eq!(value(&recorder, DROPPED, &[]), 0.0);
 }
 
 #[tokio::test]
@@ -3446,17 +4428,16 @@ fn the_labels_a_row_is_written_with_are_read_back_as_they_were() {
         assert_eq!(passing_failure(reason), Some((reason, outcome)));
     }
     assert_eq!(passing_failure("http_4xx"), None);
-    // The one answer an outbox adds to those, and nothing else of the 4xx:
-    // a 403 is about the report, and final.
+    // The two answers an outbox adds to those, and nothing else of the 4xx:
+    // they are about this process, the others about the report.
     let answer = |status: u16| Ok(reqwest::StatusCode::from_u16(status).unwrap());
     assert_eq!(caller_refused(&answer(401)), Some("http_401"));
-    for status in [200, 400, 402, 403, 404, 409, 422, 429, 500, 503] {
+    assert_eq!(caller_refused(&answer(403)), Some("http_403"));
+    for status in [200, 400, 402, 404, 409, 413, 422, 429, 500, 503] {
         assert_eq!(caller_refused(&answer(status)), None, "{status}");
     }
     // Every reason a row is in `rejected` for has its series.
-    for reason in ["rejected", "max_age", "deadline"] {
-        assert!(REJECTED_REASONS.contains(&reason));
-    }
+    assert_eq!(REJECTED_REASONS, ["rejected", "max_age"]);
 }
 
 // ---------------------------------------------------------------------------
@@ -3598,6 +4579,12 @@ async fn the_documented_way_to_put_reports_back_works_as_printed() {
         (now_ms - completed_at_ms).abs() < 60_000,
         "{completed_at_ms} at {now_ms}"
     );
+    // And it is due from that moment, like a report whose request completes
+    // then: it takes its turn behind the reports that wait already.
+    assert_eq!(
+        read::<i64>(&path, "SELECT next_attempt_at_ms FROM pending"),
+        completed_at_ms
+    );
     assert_eq!(
         read::<String>(
             &path,
@@ -3665,13 +4652,7 @@ async fn throughput_of_the_outbox() {
     }
     let handing_over = started_at.elapsed();
     eventually("they are all in the file or out", || {
-        delivery
-            .outbox
-            .as_ref()
-            .unwrap()
-            .in_transit
-            .load(Ordering::SeqCst)
-            == 0
+        delivery.outbox.as_ref().unwrap().load.in_transit() == 0
     })
     .await;
     let written_in = started_at.elapsed();

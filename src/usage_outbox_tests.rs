@@ -52,6 +52,16 @@ struct Handle {
     events: mpsc::UnboundedReceiver<Event<Report>>,
 }
 
+/// What a writer said of the file being another one (`Event::Replaced`).
+#[derive(Debug)]
+struct Replaced {
+    why: &'static str,
+    kept_as: Option<PathBuf>,
+    generation: u64,
+    error: Option<String>,
+    held: Option<u64>,
+}
+
 /// Timings a test does not have to wait for.
 fn config(path: &Path) -> UsageOutboxConfig {
     UsageOutboxConfig {
@@ -134,16 +144,33 @@ impl Handle {
     }
 
     /// The next thing said, which must be that the file was replaced.
-    fn replaced(&mut self) -> (&'static str, Option<PathBuf>, u64) {
+    fn replaced(&mut self) -> Replaced {
         match self.next() {
             Event::Replaced {
                 why,
                 kept_as,
                 generation,
-            } => (why, kept_as, generation),
+                error,
+                held,
+            } => Replaced {
+                why,
+                kept_as,
+                generation,
+                error,
+                held,
+            },
             Event::Committed(committed) => panic!("a transaction committed: {committed:?}"),
             Event::Failed { error, .. } => panic!("a transaction failed: {error:?}"),
         }
+    }
+
+    /// A transaction now, which must find the file replaced for `why`, with
+    /// `held` reports in the one that was open, and then commit.
+    fn sync_replaced_then_committed(&mut self, why: &str, held: Option<u64>) {
+        self.store.sync();
+        let replaced = self.replaced();
+        assert_eq!((replaced.why, replaced.held), (why, held));
+        self.committed();
     }
 
     /// Hand `reports` over and have them written now, with whatever else
@@ -638,9 +665,31 @@ fn an_outcome_written_after_the_lease_ran_out_does_not_undo_the_next_holders_lea
         next.store.owner()
     );
     assert_eq!(read::<i64>(&path, "SELECT attempts FROM pending"), 0);
-    // An acceptance, though, is an acceptance whoever got it.
+    // Nor does a refusal, or an acceptance: an outcome is written to the
+    // row its sender leased, while it is the one named on it, and to no
+    // other. The second holder sends the report once more, and the billing
+    // API tells the two apart by the completion id.
+    slow.settle(
+        &row,
+        Outcome::Reject {
+            why: REFUSED,
+            attempts: 1,
+        },
+    );
     slow.settle(&row, Outcome::Delete);
-    assert_eq!(next.stats().pending, [(None, 0)]);
+    let stats = next.stats();
+    assert_eq!((stats.pending_total(), stats.rejected_total()), (1, 0));
+    assert_eq!(
+        read::<String>(&path, "SELECT lease_owner FROM pending"),
+        next.store.owner()
+    );
+    // What the second holder finds out is what is written.
+    let theirs = Row {
+        generation: row.generation,
+        ..row
+    };
+    next.settle(&theirs, Outcome::Delete);
+    assert_eq!(next.stats().pending_total(), 0);
 }
 
 #[test]
@@ -698,18 +747,39 @@ fn rejected_keeps_the_newest_rows_and_counts_them_by_reason_without_reading_them
     handle.keep(["one", "two", "three", "four"].map(report));
     let rows = handle.claim(4, 0, LEASE).fresh;
 
-    let mut evicted = 0;
+    let mut evicted = Vec::new();
     for (n, row) in rows.iter().enumerate() {
         let why = Rejection {
             reason: if n % 2 == 0 { "rejected" } else { "max_age" },
-            status: None,
+            status: (n == 0).then_some(422),
             outcome: "timeout",
         };
-        evicted += handle
-            .settle(row, Outcome::Reject { why, attempts: 3 })
-            .rejected_evicted;
+        evicted.extend(
+            handle
+                .settle(row, Outcome::Reject { why, attempts: 3 })
+                .rejected_evicted,
+        );
     }
-    assert_eq!(evicted, 2);
+    // What is removed is the last there was of the report: it is handed
+    // out, whole, to be said before it is gone.
+    assert_eq!(evicted.len(), 2);
+    assert_eq!(
+        evicted[0],
+        Evicted {
+            id: 1,
+            reason: "rejected".to_string(),
+            status: Some(422),
+            attempts: 3,
+            body: r#"{"type":"chat_completion","id":"one"}"#.to_string(),
+            request_id: Some("one".to_string()),
+            model_label: None,
+            completed_at_ms: evicted[0].completed_at_ms,
+        }
+    );
+    assert_eq!(
+        (evicted[1].id, evicted[1].reason.as_str(), evicted[1].status),
+        (2, "max_age", None)
+    );
     let stats = handle.stats();
     assert_eq!(stats.rejected_total(), 2);
     assert_eq!(stats.pending_total(), 0);
@@ -1365,9 +1435,13 @@ fn a_file_that_is_not_a_database_is_moved_aside_and_a_new_one_started() {
     std::fs::write(&path, junk).unwrap();
     let mut handle = Handle::open(config(&path));
 
-    let (why, kept_as, generation) = handle.replaced();
-    let kept_as = kept_as.expect("where the old file is now");
-    assert_eq!((why, generation), ("corrupt", 1));
+    let replaced = handle.replaced();
+    let kept_as = replaced.kept_as.expect("where the old file is now");
+    assert_eq!((replaced.why, replaced.generation), ("corrupt", 1));
+    // Why, in SQLite's words; and nothing is said of reports it held, for
+    // this process never had it open.
+    assert_eq!(replaced.error.as_deref(), Some("file is not a database"));
+    assert_eq!(replaced.held, None);
     // Kept as it was, under a name that says when, for a person to look at.
     assert_eq!(std::fs::read(&kept_as).unwrap(), junk);
     let name = kept_as.file_name().unwrap().to_string_lossy().into_owned();
@@ -1380,6 +1454,53 @@ fn a_file_that_is_not_a_database_is_moved_aside_and_a_new_one_started() {
     assert_eq!(names(dir.path()).len(), 3, "{:?}", names(dir.path()));
 }
 
+/// Overwrite everything after the header of the database at `path`, and
+/// have the header say that the file changed, so that what a connection
+/// remembers of it is not trusted any more.
+fn scribble(path: &Path) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let len = file.metadata().unwrap().len();
+    let mut counter = [0u8; 4];
+    file.seek(SeekFrom::Start(24)).unwrap();
+    file.read_exact(&mut counter).unwrap();
+    let changed = (u32::from_be_bytes(counter) + 1).to_be_bytes();
+    for offset in [24, 92] {
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&changed).unwrap();
+    }
+    file.seek(SeekFrom::Start(100)).unwrap();
+    file.write_all(&vec![0xA5u8; (len - 100) as usize]).unwrap();
+}
+
+#[test]
+fn a_file_that_is_damaged_and_gone_is_let_go_of_and_nothing_at_the_path_is_moved_aside() {
+    let (dir, path) = file();
+    let mut handle = Handle::opened(config(&path));
+    handle.keep((0..400).map(|_| bulky("before")));
+
+    // The connection finds its database damaged, and its file is no longer
+    // at the path either. (A connection whose file is gone can come to see
+    // it damaged for that very reason.) The second is what counts: what is
+    // moved aside for being damaged is the file at the path, and that is
+    // not this file. It may be somebody else's, and in good order.
+    scribble(&path);
+    handle.store.inject_unlink();
+    handle.store.offer(report("after"), usize::MAX).unwrap();
+    handle.store.sync();
+    let replaced = handle.replaced();
+    assert_eq!(
+        (replaced.why, replaced.held, replaced.kept_as),
+        ("deleted", Some(400), None)
+    );
+    assert_eq!(handle.committed().stored, 1);
+    assert_eq!(names(dir.path()), ["outbox.db", "outbox.db-journal"]);
+}
+
 #[test]
 fn a_file_damaged_under_the_running_store_is_moved_aside_and_what_was_in_hand_is_kept() {
     let (dir, path) = file();
@@ -1387,33 +1508,16 @@ fn a_file_damaged_under_the_running_store_is_moved_aside_and_what_was_in_hand_is
     handle.keep((0..400).map(|_| bulky("before")));
     let leased = handle.claim(1, 0, LEASE).fresh.remove(0);
 
-    // Everything after the header is overwritten, and the header says the
-    // file changed, so that what the connection remembers of it is not
-    // trusted any more.
-    {
-        use std::io::{Read, Seek, SeekFrom, Write};
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        let len = file.metadata().unwrap().len();
-        let mut counter = [0u8; 4];
-        file.seek(SeekFrom::Start(24)).unwrap();
-        file.read_exact(&mut counter).unwrap();
-        let changed = (u32::from_be_bytes(counter) + 1).to_be_bytes();
-        for offset in [24, 92] {
-            file.seek(SeekFrom::Start(offset)).unwrap();
-            file.write_all(&changed).unwrap();
-        }
-        file.seek(SeekFrom::Start(100)).unwrap();
-        file.write_all(&vec![0xA5u8; (len - 100) as usize]).unwrap();
-    }
+    scribble(&path);
     handle.store.offer(report("after"), usize::MAX).unwrap();
     handle.store.sync();
-    let (why, kept_as, generation) = handle.replaced();
-    assert_eq!((why, generation), ("corrupt", 1));
-    assert!(kept_as.unwrap().exists());
+    let replaced = handle.replaced();
+    assert_eq!((replaced.why, replaced.generation), ("corrupt", 1));
+    assert!(replaced.kept_as.unwrap().exists());
+    // It was this process's file: what it held when it was last looked at
+    // went with it, and that is said, with what was wrong.
+    assert_eq!(replaced.held, Some(400));
+    assert!(replaced.error.is_some());
     // The report that was in hand is written to the new file.
     let committed = handle.committed();
     assert_eq!(committed.stored, 1);
@@ -1421,8 +1525,10 @@ fn a_file_damaged_under_the_running_store_is_moved_aside_and_what_was_in_hand_is
     assert!(committed.health.available);
 
     // An outcome for a row of the file that is gone is not written to the
-    // new one, where its id is another report's.
-    assert_eq!(leased.id, 1);
+    // new one, where its id is another report's, which this process has
+    // leased by now.
+    let new = handle.claim(1, 0, LEASE).fresh.remove(0);
+    assert_eq!((leased.id, new.id, new.generation), (1, 1, 1));
     handle.settle(&leased, Outcome::Delete);
     assert_eq!(
         read::<String>(
@@ -1431,7 +1537,6 @@ fn a_file_damaged_under_the_running_store_is_moved_aside_and_what_was_in_hand_is
         ),
         "after"
     );
-    assert_eq!(handle.claim(1, 0, LEASE).fresh[0].generation, 1);
     // The old file and its journal are there for a person, side by side.
     let kept: Vec<String> = names(dir.path())
         .into_iter()
@@ -1441,60 +1546,166 @@ fn a_file_damaged_under_the_running_store_is_moved_aside_and_what_was_in_hand_is
     assert_eq!(format!("{}-journal", kept[0]), kept[1]);
 }
 
+/// The reports of the file at `path`, lowest id first, each as
+/// "completion id:attempts:leased".
+fn rows_of(path: &Path) -> String {
+    let rows: Option<String> = read(
+        path,
+        "SELECT group_concat(json_extract(body, '$.id') || ':' || attempts || ':' || \
+         (lease_owner IS NOT NULL)) FROM (SELECT * FROM pending ORDER BY id)",
+    );
+    rows.unwrap_or_default()
+}
+
 #[test]
-fn a_file_deleted_under_the_running_store_is_put_back_as_it_was() {
+fn a_file_deleted_under_the_running_store_is_let_go_of_and_what_it_held_is_said() {
     let (dir, path) = file();
     let mut handle = Handle::opened(config(&path));
     let clock = Clock::default();
     handle.keep(["one", "two", "three"].map(report));
     let rows = handle.claim(2, 0, LEASE).fresh;
     handle.settle(&rows[0], failing(1, 60_000, &clock));
+    handle.keep([Report {
+        ended: Some(REFUSED),
+        ..report("refused")
+    }]);
 
     for name in names(dir.path()) {
         std::fs::remove_file(dir.path().join(name)).unwrap();
     }
-    // Noticed by the next transaction, before anything is written to a file
-    // nobody can open any more.
+    // Noticed by the next transaction, before it is begun on a file nobody
+    // can open any more. The connection still has the whole database, and
+    // is let go of without a look at it (see `Writer::let_go` for why): what
+    // it held when it was last written to is said, three reports waiting
+    // and one refused, and the transaction is made on a new file.
     handle.store.offer(report("four"), usize::MAX).unwrap();
     handle.store.sync();
-    let (why, kept_as, generation) = handle.replaced();
-    assert_eq!((why, kept_as, generation), ("deleted", None, 0));
+    let replaced = handle.replaced();
+    assert_eq!(
+        (replaced.why, replaced.generation, replaced.kept_as),
+        ("deleted", 1, None)
+    );
+    assert_eq!((replaced.held, replaced.error), (Some(4), None));
     let committed = handle.committed();
     assert_eq!(committed.stored, 1);
-    assert_eq!(committed.stats.pending, [(None, 4)]);
-
-    // The same database: rows, attempts, leases and ids. So the outcome of a
-    // report that was being sent finds its row.
-    assert!(path.exists());
-    assert_eq!(
-        read::<String>(
-            &path,
-            "SELECT group_concat(json_extract(body, '$.id') || ':' || attempts || ':' || \
-             (lease_owner IS NOT NULL)) FROM (SELECT * FROM pending ORDER BY id)"
-        ),
-        "one:1:0,two:0:1,three:0:0,four:0:0"
-    );
-    handle.settle(&rows[1], Outcome::Delete);
-    assert_eq!(handle.stats().pending, [(None, 3)]);
+    assert!(committed.health.available);
+    assert_eq!(rows_of(&path), "four:0:0");
+    let stats = handle.stats();
+    assert_eq!((stats.pending_total(), stats.rejected_total()), (1, 0));
+    // Nothing is copied to the path as a file: there is the new file and
+    // its journal, private like the old one.
+    assert_eq!(names(dir.path()), ["outbox.db", "outbox.db-journal"]);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
     }
-    // It was written under a name of its own first, and given its name once
-    // it was whole. Nothing of that is left: the file and its journal.
-    assert_eq!(names(dir.path()), ["outbox.db", "outbox.db-journal"]);
+
+    // The rows handed out of the old file mean nothing in the new one. Its
+    // one report has the id the first of them had, and is leased by this
+    // very process: what is said of that old row is not done to it.
+    let new = handle.claim(1, 0, LEASE).fresh.remove(0);
+    assert_eq!((new.id, new.generation), (rows[0].id, 1));
+    assert_eq!(rows[0].generation, 0);
+    handle.settle(&rows[0], Outcome::Delete);
+    assert_eq!(rows_of(&path), "four:0:1");
+    handle.settle(
+        &rows[0],
+        Outcome::Reject {
+            why: REFUSED,
+            attempts: 1,
+        },
+    );
+    assert_eq!(rows_of(&path), "four:0:1");
+    assert_eq!(handle.stats().rejected_total(), 0);
+    // What is said of the row itself is.
+    handle.settle(&new, Outcome::Delete);
+    assert_eq!(rows_of(&path), "");
 }
 
 #[test]
-fn a_file_emptied_under_the_running_store_is_started_anew_and_the_old_rows_mean_nothing_in_it() {
+fn a_file_deleted_after_it_was_looked_at_is_not_written_to_and_is_let_go_of_the_same_way() {
+    let (_dir, path) = file();
+    let mut handle = Handle::opened(config(&path));
+    handle.keep(["one", "two"].map(report));
+
+    // The file is there when the writer looks, and gone when it writes.
+    // SQLite does not write to a database whose file was taken away, and
+    // says so. That is the file being gone, not the file being unusable:
+    // the transaction is made on a new file at once, the report is in it,
+    // and what the old one held is said.
+    handle.store.inject_unlink();
+    handle.store.offer(report("three"), usize::MAX).unwrap();
+    handle.store.sync();
+    let replaced = handle.replaced();
+    assert_eq!((replaced.why, replaced.held), ("deleted", Some(2)));
+    let committed = handle.committed();
+    assert_eq!(committed.stored, 1);
+    assert!(committed.health.available);
+    assert_eq!(rows_of(&path), "three:0:0");
+}
+
+#[test]
+fn a_report_committed_to_a_file_that_was_just_deleted_is_counted_by_the_process_that_wrote_it() {
+    let (_dir, path) = file();
+    let mut first = Handle::opened(config(&path));
+    let mut second = Handle::opened(config(&path));
+    first.keep([report("old")]);
+    second.sync();
+
+    // The second process is in a transaction, about to commit, when the file
+    // is deleted. The first one notices, says what the file held when it
+    // last wrote to it, and starts a new one.
+    second.store.inject_commit_delay(Duration::from_millis(400));
+    second.store.offer(report("late"), usize::MAX).unwrap();
+    second.store.sync();
+    std::thread::sleep(Duration::from_millis(150));
+    second.store.inject_commit_delay(Duration::ZERO);
+    std::fs::remove_file(&path).unwrap();
+    first.store.offer(report("new"), usize::MAX).unwrap();
+    first.store.sync();
+    let replaced = first.replaced();
+    assert_eq!((replaced.why, replaced.held), ("deleted", Some(1)));
+    assert_eq!(first.committed().stored, 1);
+    assert_eq!(rows_of(&path), "new:0:0");
+
+    // The second one's transaction commits, to the file that is gone: its
+    // report is in no file anybody can open. The process that wrote it is
+    // the one that knows, and says so with its next transaction: two
+    // reports were in that file when it last wrote to it.
+    assert_eq!(second.committed().stored, 1);
+    second.store.sync();
+    let replaced = second.replaced();
+    assert_eq!((replaced.why, replaced.held), ("replaced", Some(2)));
+    assert_eq!(replaced.generation, 1);
+    second.committed();
+    assert_eq!(rows_of(&path), "new:0:0");
+
+    // A row the second process had leased from the old file, whose outcome
+    // comes now, names another report in the new one, which that process
+    // may well have leased by now. It is not written.
+    let leased = second.claim(1, 0, LEASE).fresh.remove(0);
+    assert_eq!((leased.id, leased.generation), (1, 1));
+    let stale = Row {
+        generation: 0,
+        ..leased.clone()
+    };
+    second.settle(&stale, Outcome::Delete);
+    assert_eq!(rows_of(&path), "new:0:1");
+    second.settle(&leased, Outcome::Delete);
+    assert_eq!(rows_of(&path), "");
+}
+
+#[test]
+fn a_file_emptied_under_the_running_store_is_started_anew_and_what_it_held_is_said_to_be_lost() {
     let (_dir, path) = file();
     let mut handle = Handle::opened(config(&path));
     handle.keep(["old-one", "old-two"].map(report));
     let leased = handle.claim(1, 0, LEASE).fresh.remove(0);
 
     // Truncated to nothing, which to SQLite is a database with no tables.
+    // It is the same file, and nobody has what was in it.
     std::fs::OpenOptions::new()
         .write(true)
         .open(&path)
@@ -1510,29 +1721,35 @@ fn a_file_emptied_under_the_running_store_is_started_anew_and_the_old_rows_mean_
     assert!(!health.available);
 
     // The next try makes the database anew, and says that it is another
-    // one: whoever holds rows of the old one must not look for them here.
+    // one, and how many reports the old one held when it was last looked
+    // at: whoever holds rows of the old one must not look for them here.
     std::thread::sleep(Duration::from_millis(60));
     handle
         .store
         .offer(reports.into_iter().next().unwrap(), usize::MAX)
         .unwrap_err();
     handle.store.sync();
-    let (why, kept_as, generation) = handle.replaced();
-    assert_eq!((why, kept_as, generation), ("lost", None, 1));
+    let replaced = handle.replaced();
+    assert_eq!(
+        (replaced.why, replaced.kept_as, replaced.generation),
+        ("lost", None, 1)
+    );
+    assert_eq!(replaced.held, Some(2));
     let committed = handle.committed();
     assert!(committed.health.available);
     assert_eq!(committed.stats.pending, []);
     assert_eq!(handle.keep([report("new-one")]).stored, 1);
     // The outcome of the report leased from the old database names a row of
-    // the new one by its id. It is not written.
-    assert_eq!(leased.id, 1);
+    // the new one by its id, which this process holds the lease of by now.
+    // It is not written.
+    let new = handle.claim(1, 0, LEASE).fresh.remove(0);
+    assert_eq!((new.id, new.generation), (leased.id, 1));
     handle.settle(&leased, Outcome::Delete);
-    assert_eq!(handle.stats().pending, [(None, 1)]);
-    assert_eq!(handle.claim(1, 0, LEASE).fresh[0].generation, 1);
+    assert_eq!(rows_of(&path), "new-one:0:1");
 }
 
 #[test]
-fn another_file_put_in_its_place_is_opened_and_the_old_rows_mean_nothing_in_it() {
+fn another_file_put_in_its_place_is_opened_and_what_the_old_one_held_is_said() {
     let (dir, path) = file();
     let mut handle = Handle::opened(config(&path));
     handle.keep(["old-one", "old-two"].map(report));
@@ -1549,16 +1766,81 @@ fn another_file_put_in_its_place_is_opened_and_the_old_rows_mean_nothing_in_it()
     std::fs::rename(&path, dir.path().join("moved-away.db")).unwrap();
     std::fs::rename(&elsewhere, &path).unwrap();
 
-    handle.store.sync();
-    let (why, _, generation) = handle.replaced();
-    assert_eq!((why, generation), ("replaced", 1));
-    assert_eq!(handle.committed().stats.pending, [(None, 3)]);
-    // The outcome of the report leased from the old database names a row of
-    // the new one by its id. It is not written.
-    assert_eq!(leased.id, 1);
+    // The file at the path is used as it is. The one that was open is let
+    // go of as it is, too: it is whole, where it was moved to, with the two
+    // reports this says it held.
+    handle.sync_replaced_then_committed("replaced", Some(2));
+    assert_eq!(rows_of(&path), "new-one:0:0,new-two:0:0,new-three:0:0");
+    assert_eq!(
+        rows_of(&dir.path().join("moved-away.db")),
+        "old-one:0:1,old-two:0:0"
+    );
+    // The outcome of the report leased from the old file names a row of
+    // the new one by its id, which this process has leased by now. It is
+    // not written there.
+    let new = handle.claim(1, 0, LEASE).fresh.remove(0);
+    assert_eq!((new.id, new.generation), (leased.id, 1));
     handle.settle(&leased, Outcome::Delete);
-    assert_eq!(handle.stats().pending, [(None, 3)]);
-    assert_eq!(ids(&handle.claim(1, 0, LEASE).fresh), ["new-one"]);
+    assert_eq!(rows_of(&path), "new-one:0:1,new-two:0:0,new-three:0:0");
+}
+
+#[test]
+fn something_that_is_no_database_put_in_its_place_is_moved_aside_and_not_the_file_that_was_open() {
+    let (dir, path) = file();
+    let mut handle = Handle::opened(config(&path));
+    handle.keep(["one", "two", "three"].map(report));
+
+    // The file is moved away, whole, and something that is not a database
+    // at all is put where it was.
+    let away = dir.path().join("moved-away.db");
+    std::fs::rename(&path, &away).unwrap();
+    let junk = b"this is not an SQLite file, whatever its name says";
+    std::fs::write(&path, junk).unwrap();
+
+    handle.store.offer(report("four"), usize::MAX).unwrap();
+    handle.store.sync();
+    // First: the file at the path is another one, and what the one that was
+    // open held is said. Then: what is there cannot be read, and is moved
+    // aside, which is said of that thing and not of any report: this
+    // process never had one in it.
+    let replaced = handle.replaced();
+    assert_eq!((replaced.why, replaced.held), ("replaced", Some(3)));
+    let aside = handle.replaced();
+    assert_eq!((aside.why, aside.held), ("corrupt", None));
+    assert_eq!(aside.error.as_deref(), Some("file is not a database"));
+    assert_eq!(std::fs::read(aside.kept_as.unwrap()).unwrap(), junk);
+    let committed = handle.committed();
+    assert_eq!(committed.stored, 1);
+    assert_eq!(rows_of(&path), "four:0:0");
+    // The file that was open is where it was moved to, untouched.
+    assert_eq!(rows_of(&away), "one:0:0,two:0:0,three:0:0");
+}
+
+#[test]
+fn a_file_that_looks_damaged_because_it_is_gone_is_not_what_is_moved_aside() {
+    let (dir, path) = file();
+    let mut first = Handle::opened(config(&path));
+    let mut second = Handle::opened(config(&path));
+    first.keep(["one", "two"].map(report));
+    second.sync();
+
+    // The file is gone when the first process writes, and by then another
+    // process has started a new one at the path. Whatever the first one's
+    // connection says of its own file from here on (SQLite refuses the
+    // write; it could as well find the file damaged), the file at the path
+    // is not that file, and is left alone: not moved aside, not emptied.
+    std::fs::remove_file(&path).unwrap();
+    second.store.offer(report("theirs"), usize::MAX).unwrap();
+    second.store.sync();
+    assert_eq!(second.replaced().why, "deleted");
+    assert_eq!(second.committed().stored, 1);
+    first.store.offer(report("ours"), usize::MAX).unwrap();
+    first.store.sync();
+    let replaced = first.replaced();
+    assert_eq!((replaced.why, replaced.held), ("replaced", Some(2)));
+    assert_eq!(first.committed().stored, 1);
+    assert_eq!(rows_of(&path), "theirs:0:0,ours:0:0");
+    assert_eq!(names(dir.path()), ["outbox.db", "outbox.db-journal"]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1952,7 +2234,9 @@ fn a_handle_that_is_dropped_writes_what_it_was_handed_and_leaves_its_leases() {
     handle.keep([report("one")]);
     assert_eq!(ids(&handle.claim(1, 0, LEASE).fresh), ["one"]);
     handle.store.offer(report("two"), usize::MAX).unwrap();
-    let Handle { store, mut events } = handle;
+    let Handle {
+        store, mut events, ..
+    } = handle;
     drop(store);
 
     // The writer ends by itself: its side of the channel closes.

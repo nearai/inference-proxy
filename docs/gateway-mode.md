@@ -875,7 +875,8 @@ What each answer does to a report in the outbox:
 | 2xx | The billing API (cloud-api) recorded the usage, or had recorded it before (it deduplicates on the completion id). | The row is deleted. |
 | 400 | The billing API cannot read the body, an id in it is not one, or it refuses what the report says. | Final: the row moves to `rejected`. |
 | 404 | The billing API does not know the model. Or `CLOUD_API_URL` points at something that does not have this route, and then every report gets it. | Final: `rejected`. |
-| 409, 413, 422, any other 4xx | Not the billing API on this route: something in front of it, about this one request (a body it finds too large, for instance). | Final: `rejected`. |
+| 413 | The billing API takes no body larger than 2 MB, and a report is a few hundred bytes; something in front of it may have a smaller limit. | Final: `rejected`. |
+| 409, 422, any other 4xx | Not the billing API on this route: something in front of it, about this one request. | Final: `rejected`. |
 | 401 | The billing API: the usage token is missing or not the one it has. | Kept. Counts as an outage at once; sent again when a probe is accepted. |
 | 403 | Never the billing API on this route: something in front of it that refuses this gateway. | Kept, like a 401. |
 | 429 | Something in front of the billing API that limits requests. | Kept, with the backoff of the report. |
@@ -909,11 +910,13 @@ put back.
 oldest is removed, and with it the last trace of a report that was served and
 not billed. So each such row leaves a line at warning level, `Usage report
 removed from rejected to make room`, with the row's `rejected_id`, the request
-id, the organization, workspace and key ids, the model, the completion id,
-`reason`, `status`, `attempts`, `completed_at_ms`, and `usage`: the numbers of
-the report (token counts, discount) as JSON. That is what billing it by hand
-takes; nothing of a request or a response is in a report, and the usage token
-is in no line. At most 100 such lines are written in 10 s. Rows removed beyond
+id, the `type` of the report (`chat_completion`, `image_generation` or
+`privacy_classify`), the organization, workspace and key ids, the model, the
+completion id, `reason`, `status`, `attempts`, `completed_at_ms`, and
+`usage`: the numbers of the report (token counts, discount) as JSON. That is
+what billing it by hand takes; nothing of a request or a response is in a
+report, and the usage token is in no line. At most 100 such lines are
+written in 10 s. Rows removed beyond
 that are summed up in one line, `Usage reports removed from rejected to make
 room, more than are said one by one`, with their `count` and the first and
 last `rejected_id`: for those, the numbers are gone. Every removed row counts
@@ -1149,12 +1152,21 @@ which it still has. The difference is counted in
   (`why="lost"`): a new database is started in it, and what the old one held
   is gone, except the reports this process was sending.
 
-The count is what one process knows, and an upper bound on what is lost:
-two processes on one file each count what they saw of it, neither knows what
-the other has in hand, and a report that was accepted after the file was
-last written to is still in it. On a lane whose reports are being accepted,
-what a deleted file really costs is what a killed process costs, the reports
-of its last transaction or so; with cloud-api down it costs the backlog.
+The count is what one process knows: what the file held when that process
+last wrote to it. It covers the loss in every case where each process on the
+file lives to its next transaction, and it can then say too much, about
+twice with two processes: each counts what it saw of the file, neither
+knows what the other has in hand, and a report that was accepted after the
+file was last written to is still in it. It says too little when a process
+that wrote to the file dies before its next transaction: what it wrote
+after the other process's last write is in nobody's count (measured with
+two gateways, the file deleted and one of them killed at once: 66 of 1,099
+lost reports in one round of ten), and a single gateway that is killed
+between the deletion and its next transaction counts nothing at all. The
+loss itself is still said at error level by a process that survives. On a
+lane whose reports are being accepted, what a deleted file really costs is
+what a killed process costs, the reports of its last transaction or so;
+with cloud-api down it costs the backlog.
 
 A file that is cut or overwritten in the very moment the gateway is in a
 transaction on it is not always seen at once: the transaction writes its own
@@ -1250,9 +1262,9 @@ And these, which exist only with an outbox:
   `deleted`, `lost`, `replaced`);
 - `inference_proxy_usage_report_outbox_lost_reports_total{why}`: the reports
   such a file held when this process last wrote to it, less those the
-  process had in hand, which it still sends (the same `why`). Over two
-  processes an upper bound, see "A file that is not the file any more". The
-  series is there from the first such report on;
+  process had in hand, which it still sends (the same `why`). Too high or
+  too low in the cases given under "A file that is not the file any more".
+  The series is there from the first such report on;
 - `inference_proxy_usage_report_outbox_errors_total{op}`: failures of the
   file, by the step that failed (`open`, `begin`, `probe`, `insert`, `settle`,
   `expire`, `evict`, `claim`, `release`, `stats`, `commit`, `replace`,

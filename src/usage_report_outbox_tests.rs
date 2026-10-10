@@ -2049,6 +2049,8 @@ async fn rejected_keeps_the_newest_and_says_each_report_that_made_room() {
     let line = &said[0];
     assert_eq!(line["rejected_id"], 1);
     assert_eq!(line["request_id"], "request-one");
+    // (What kind of report it was: sending it by hand takes that too.)
+    assert_eq!(line["type"], "chat_completion");
     assert_eq!(line["org_id"], "org-1");
     assert_eq!(line["workspace_id"], "ws-1");
     assert_eq!(line["api_key_id"], "key-1");
@@ -2667,6 +2669,7 @@ async fn a_report_that_had_ended_in_memory_and_is_then_lost_is_counted_once() {
         (&"rejected".into(), &400.into())
     );
     assert_eq!(line["org_id"], "org-1");
+    assert_eq!(line["type"], "chat_completion");
     let usage: serde_json::Value = serde_json::from_str(line["usage"].as_str().unwrap()).unwrap();
     assert_eq!(usage["input_tokens"], 1200);
     assert_eq!(value(&recorder, DROPPED, &[]), 4.0);

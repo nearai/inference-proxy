@@ -586,9 +586,8 @@ pub(crate) enum Event<J> {
         generation: u64,
         /// What was wrong with the file, when something was.
         error: Option<String>,
-        /// Reports the file held when this process last wrote to it, which
-        /// are in nobody's hands now: an upper bound on what is lost with
-        /// it (the reports this process is sending are still sent).
+        /// Reports the file held when this process last wrote to it. What
+        /// another process wrote to it since is not among them.
         held: Option<u64>,
     },
 }
@@ -1359,8 +1358,9 @@ impl<J: Persist> Writer<J> {
                 } else {
                     "replaced"
                 }),
-                // The path cannot be looked at: nothing is known, and the
-                // connection is left as it is until it can.
+                // The path cannot be looked at: nothing is known of the
+                // file. This try fails as any other does, which closes the
+                // connection, and the file is opened anew at the next one.
                 Err(error) => {
                     return Err(Failure::new(
                         "open",

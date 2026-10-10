@@ -1351,6 +1351,7 @@ impl UsageReportDelivery {
             warn!(
                 rejected_id = row.id,
                 request_id = %row.request_id.as_deref().unwrap_or(""),
+                r#type = %report.kind.as_deref().unwrap_or(""),
                 org_id = %report.organization_id.as_deref().unwrap_or(""),
                 workspace_id = %report.workspace_id.as_deref().unwrap_or(""),
                 api_key_id = %report.api_key_id.as_deref().unwrap_or(""),
@@ -2132,6 +2133,7 @@ impl UsageReportDelivery {
             let report = ReportedUsage::of(&String::from_utf8_lossy(&item.job.body));
             warn!(
                 request_id = %reporter.request_id.as_deref().unwrap_or(""),
+                r#type = %report.kind.as_deref().unwrap_or(""),
                 org_id = %report.organization_id.as_deref().unwrap_or(""),
                 workspace_id = %report.workspace_id.as_deref().unwrap_or(""),
                 api_key_id = %report.api_key_id.as_deref().unwrap_or(""),
@@ -2405,10 +2407,14 @@ fn gave_up_lines(delivery: &UsageReportDelivery, outbox: &Outbox, gave_up: Vec<(
 }
 
 /// What a report says, for a line about a report of which nothing else is
-/// left: who it is for, which model, and every number in it (the token
-/// counts, the discount). Strings other than the ids are left out: a report
-/// holds none, and a row written by hand might hold anything.
+/// left: what kind of report it is, who it is for, which model, and every
+/// number in it (the token counts, the discount). Strings other than the
+/// kind and the ids are left out: a report holds none, and a row written by
+/// hand might hold anything.
 struct ReportedUsage {
+    /// `type`: `chat_completion`, `image_generation` or `privacy_classify`.
+    /// Sending the report by hand takes it.
+    kind: Option<String>,
     organization_id: Option<String>,
     workspace_id: Option<String>,
     api_key_id: Option<String>,
@@ -2435,6 +2441,7 @@ impl ReportedUsage {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
         Self {
+            kind: text("type"),
             organization_id: text("organization_id"),
             workspace_id: text("workspace_id"),
             api_key_id: text("api_key_id"),

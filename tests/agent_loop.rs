@@ -82,6 +82,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
         cloud_api_auth_timeout_secs: 5,
         cloud_api_usage_token: Some("test-usage-token".to_string()),
         usage_report: Default::default(),
+        usage_report_outbox: None,
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,

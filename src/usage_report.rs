@@ -23,18 +23,29 @@
 //! The billing API deduplicates on the completion id, so sending a report
 //! again is safe. A report is still only ever sent by one task, one attempt
 //! at a time, and every attempt carries the bytes of the first.
+//!
+//! All of that is in memory: a report dropped from the queue, past its
+//! deadline or held by a process that dies is usage served and never billed.
+//! `VLLM_PROXY_USAGE_REPORT_OUTBOX_PATH` keeps reports in a file instead
+//! (`usage_outbox.rs` is the file, `usage_report_outbox.rs` the delivery from
+//! it). A process with an outbox takes none of the paths below after
+//! `submit`: its reports are scheduled by the outbox, by other rules.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::model_metrics::{model_gauge, ModelLabel};
 use crate::proxy::{
     classify_usage_http_status, classify_usage_request_error, record_usage_report_outcome,
     UsageReportOutcome, UsageReporter,
 };
+use crate::usage_outbox::UsageOutboxConfig;
+
+#[path = "usage_report_outbox.rs"]
+mod outbox;
 
 /// Ceiling of the backoff between two attempts, whatever the attempt number.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -94,6 +105,34 @@ impl Default for UsageReportPolicy {
     }
 }
 
+impl UsageReportPolicy {
+    /// `max_attempts` of a report that is sent until it is accepted or too
+    /// old: what a process with an outbox has, whatever
+    /// `VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS` says.
+    pub const UNTIL_ACCEPTED: u32 = u32::MAX;
+
+    /// `max_in_flight` of a process with an outbox when
+    /// `VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT` is not set. An outbox is
+    /// always delivered under a cap: without one, the whole backlog of an
+    /// outage would be sent at once when the billing API came back.
+    pub const OUTBOX_MAX_IN_FLIGHT: usize = 8;
+
+    /// The policy of a process with an outbox and no other setting: a report
+    /// is sent until it is accepted, `OUTBOX_MAX_IN_FLIGHT` at a time.
+    pub fn durable() -> Self {
+        Self {
+            max_attempts: Self::UNTIL_ACCEPTED,
+            max_in_flight: Self::OUTBOX_MAX_IN_FLIGHT,
+            ..Self::default()
+        }
+    }
+
+    /// The attempts a report gets, `None` when it is sent until accepted.
+    pub fn attempt_cap(&self) -> Option<u32> {
+        (self.max_attempts != Self::UNTIL_ACCEPTED).then_some(self.max_attempts)
+    }
+}
+
 /// A report on its way to the billing API: what `proxy::spawn_usage_report`
 /// hands over.
 pub(crate) struct Job {
@@ -104,8 +143,22 @@ pub(crate) struct Job {
     pub authorization: String,
     /// The serialized report. Every attempt sends these bytes.
     pub body: bytes::Bytes,
-    /// When the request completed and its report was handed over.
+    /// When the request completed and its report was handed over. For a
+    /// report read back from the outbox, when it was read: its request
+    /// completed `completed_before` earlier.
     pub completed_at: Instant,
+    /// Zero, except for a report read back from the outbox, whose request
+    /// completed in an earlier life of the process, or in another process.
+    pub completed_before: Duration,
+}
+
+impl Job {
+    /// Time since the request completed, whichever process served it.
+    fn since_completion(&self) -> Duration {
+        self.completed_at
+            .elapsed()
+            .saturating_add(self.completed_before)
+    }
 }
 
 #[derive(Default)]
@@ -138,6 +191,13 @@ enum GiveUp {
     },
 }
 
+/// One attempt at a report and what it met.
+struct Attempt {
+    answer: Result<reqwest::StatusCode, reqwest::Error>,
+    outcome: UsageReportOutcome,
+    elapsed: Duration,
+}
+
 /// What was pending when `drain` started and what it left behind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Drained {
@@ -165,6 +225,10 @@ pub struct UsageReportDelivery {
     state: Mutex<State>,
     /// Notified whenever nothing is pending any more.
     idle: tokio::sync::Notify,
+    /// The outbox on disk (`VLLM_PROXY_USAGE_REPORT_OUTBOX_PATH`) and the
+    /// delivery from it. `None`: reports are delivered from memory, by what
+    /// is in this file, and nothing of the outbox exists.
+    outbox: Option<outbox::Outbox>,
 }
 
 impl Default for UsageReportDelivery {
@@ -176,20 +240,73 @@ impl Default for UsageReportDelivery {
 impl UsageReportDelivery {
     pub fn new(policy: UsageReportPolicy) -> Arc<Self> {
         let delivery = Self::with(policy);
-        if delivery.extended {
-            let policy = &delivery.policy;
-            info!(
-                attempt_timeout_secs = policy.attempt_timeout.as_secs(),
-                max_attempts = policy.max_attempts,
-                initial_backoff_ms = policy.initial_backoff.as_millis() as u64,
-                deadline_secs = policy.deadline.map_or(0, |deadline| deadline.as_secs()),
-                max_in_flight = policy.max_in_flight,
-                max_queued = policy.max_queued,
-                shutdown_drain_secs = policy.shutdown_drain.as_secs(),
-                "Usage report delivery configured"
-            );
-        }
+        delivery.say_configured();
         Arc::new(delivery)
+    }
+
+    /// The delivery of a process as configured: with the outbox when
+    /// `VLLM_PROXY_USAGE_REPORT_OUTBOX_PATH` is set, `new` otherwise.
+    /// `http_client` is the client that talks to the billing API. With an
+    /// outbox this must be called inside a Tokio runtime.
+    pub fn from_config(config: &crate::config::Config, http_client: &reqwest::Client) -> Arc<Self> {
+        let policy = config.usage_report.clone();
+        let Some(outbox) = &config.usage_report_outbox else {
+            return Self::new(policy);
+        };
+        match (&config.cloud_api_url, &config.cloud_api_usage_token) {
+            (Some(url), Some(token)) => {
+                Self::with_outbox(policy, outbox.clone(), http_client.clone(), url, token)
+            }
+            // Nothing is reported without them, so there is nothing to keep,
+            // and what an earlier process left in the file could not be sent.
+            // The file is left as it is.
+            _ => {
+                error!(
+                    path = %outbox.path.display(),
+                    "Usage report outbox not opened: CLOUD_API_URL and CLOUD_API_USAGE_TOKEN \
+                     are both needed to send what it holds"
+                );
+                metrics::gauge!("inference_proxy_usage_report_outbox_available").set(0.0);
+                Self::new(policy)
+            }
+        }
+    }
+
+    /// A delivery that writes every report to the outbox at `outbox.path`
+    /// and sends it from there, to `cloud_api_url` with `usage_token` as its
+    /// bearer. Opening the file is left to the outbox's own thread and never
+    /// fails here: while the file cannot be used, reports are delivered from
+    /// memory. Must be called inside a Tokio runtime.
+    ///
+    /// An outbox is always delivered under a cap, so a `max_in_flight` of 0
+    /// becomes `UsageReportPolicy::OUTBOX_MAX_IN_FLIGHT`, and its reports are
+    /// sent until they are accepted or too old for the outbox, whatever
+    /// `max_attempts` and `deadline` say (`usage_report_outbox.rs`).
+    pub fn with_outbox(
+        mut policy: UsageReportPolicy,
+        outbox: UsageOutboxConfig,
+        http_client: reqwest::Client,
+        cloud_api_url: &str,
+        usage_token: &str,
+    ) -> Arc<Self> {
+        if policy.max_in_flight == 0 {
+            policy.max_in_flight = UsageReportPolicy::OUTBOX_MAX_IN_FLIGHT;
+        }
+        policy.max_attempts = UsageReportPolicy::UNTIL_ACCEPTED;
+        policy.deadline = None;
+        let mut delivery = Self::with(policy);
+        let (outbox, from_store) = outbox::Outbox::start(
+            &delivery.policy,
+            outbox,
+            http_client,
+            cloud_api_url,
+            usage_token,
+        );
+        delivery.outbox = Some(outbox);
+        delivery.say_configured();
+        let delivery = Arc::new(delivery);
+        tokio::spawn(Arc::clone(&delivery).dispatch(from_store));
+        delivery
     }
 
     fn with(policy: UsageReportPolicy) -> Self {
@@ -198,6 +315,24 @@ impl UsageReportDelivery {
             policy,
             state: Mutex::default(),
             idle: tokio::sync::Notify::new(),
+            outbox: None,
+        }
+    }
+
+    fn say_configured(&self) {
+        if self.extended {
+            let policy = &self.policy;
+            info!(
+                attempt_timeout_secs = policy.attempt_timeout.as_secs(),
+                // Absent for a report that is sent until it is accepted.
+                max_attempts = policy.attempt_cap(),
+                initial_backoff_ms = policy.initial_backoff.as_millis() as u64,
+                deadline_secs = policy.deadline.map_or(0, |deadline| deadline.as_secs()),
+                max_in_flight = policy.max_in_flight,
+                max_queued = policy.max_queued,
+                shutdown_drain_secs = policy.shutdown_drain.as_secs(),
+                "Usage report delivery configured"
+            );
         }
     }
 
@@ -205,15 +340,25 @@ impl UsageReportDelivery {
         &self.policy
     }
 
-    /// Reports waiting for a place, and reports holding one.
+    /// Reports waiting for a place, and reports holding one. With an outbox
+    /// the waiting ones are the rows of the file nobody here is sending,
+    /// whichever process wrote them, and what this process holds in memory.
     pub fn pending(&self) -> (usize, usize) {
+        if let Some(outbox) = &self.outbox {
+            return outbox.pending();
+        }
         let state = self.state();
         (state.waiting.len(), state.in_flight)
     }
 
     /// Nothing waits, nothing is in flight, and every drop has been logged.
+    /// With an outbox: the file holds nothing either, and nothing is on its
+    /// way into it.
     fn is_idle(&self) -> bool {
-        self.state().is_idle()
+        match &self.outbox {
+            Some(outbox) => outbox.is_idle(),
+            None => self.state().is_idle(),
+        }
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -224,8 +369,13 @@ impl UsageReportDelivery {
 
     /// Take a report for delivery. Never blocks and never waits: the report
     /// starts at once while there is a place, waits in the queue otherwise.
+    /// With an outbox it is handed to the store instead, which is a lock and
+    /// a push as well: the file is written by the store's own thread.
     /// Must be called inside a Tokio runtime.
     pub(crate) fn submit(self: &Arc<Self>, job: Job) {
+        if let Some(outbox) = &self.outbox {
+            return outbox.submit(self, job);
+        }
         let model = job.reporter.model_label;
         let evicted = {
             let mut state = self.state();
@@ -289,7 +439,7 @@ impl UsageReportDelivery {
     fn time_left(&self, job: &Job) -> Option<Duration> {
         self.policy
             .deadline
-            .map(|deadline| deadline.saturating_sub(job.completed_at.elapsed()))
+            .map(|deadline| deadline.saturating_sub(job.since_completion()))
     }
 
     /// Backoff after `attempts` failed attempts: half of
@@ -337,33 +487,11 @@ impl UsageReportDelivery {
                     ("reason", reason),
                 );
             }
-            attempts += 1;
-            let started_at = Instant::now();
-            let mut request = reporter
-                .http_client
-                .post(&job.url)
-                .header("authorization", &job.authorization)
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(job.body.clone())
-                .timeout(timeout);
-            if let Some(request_id) = reporter.request_id.as_deref() {
-                request = request.header("x-request-id", request_id);
-            }
-            // The body is not read, as before: only the status decides.
-            let answer = request.send().await.map(|response| response.status());
-            let elapsed = started_at.elapsed();
-            let outcome = match &answer {
-                Ok(status) => classify_usage_http_status(*status),
-                Err(error) => classify_usage_request_error(error),
-            };
-            last_attempt = Some((outcome, elapsed));
-            self.count(
-                "inference_proxy_usage_report_attempts_total",
-                reporter,
-                ("outcome", outcome.as_label()),
-            );
+            attempts = attempts.saturating_add(1);
+            let attempt = self.attempt(job).await;
+            last_attempt = Some((attempt.outcome, attempt.elapsed));
 
-            let retry_reason = retry_reason(outcome, &answer);
+            let retry_reason = retry_reason(attempt.outcome, &attempt.answer);
             if let (Some(reason), true) = (retry_reason, attempts < self.policy.max_attempts) {
                 let delay = self.backoff(attempts);
                 // No use backing off for an attempt that could not start.
@@ -379,120 +507,165 @@ impl UsageReportDelivery {
                         },
                     );
                 }
-                warn!(
+                self.say_retrying(job, &attempt, attempts, delay);
+                retrying = Some(reason);
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            return self.end(job, &attempt, attempts, retry_reason);
+        }
+    }
+
+    /// Send `job` once.
+    async fn attempt(&self, job: &Job) -> Attempt {
+        let reporter = &job.reporter;
+        let started_at = Instant::now();
+        let mut request = reporter
+            .http_client
+            .post(&job.url)
+            .header("authorization", &job.authorization)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(job.body.clone())
+            .timeout(self.policy.attempt_timeout);
+        if let Some(request_id) = reporter.request_id.as_deref() {
+            request = request.header("x-request-id", request_id);
+        }
+        // The body is not read, as before: only the status decides.
+        let answer = request.send().await.map(|response| response.status());
+        let elapsed = started_at.elapsed();
+        let outcome = match &answer {
+            Ok(status) => classify_usage_http_status(*status),
+            Err(error) => classify_usage_request_error(error),
+        };
+        self.count(
+            "inference_proxy_usage_report_attempts_total",
+            reporter,
+            ("outcome", outcome.as_label()),
+        );
+        Attempt {
+            answer,
+            outcome,
+            elapsed,
+        }
+    }
+
+    /// The line of an attempt that failed and will be made again in `delay`.
+    fn say_retrying(&self, job: &Job, attempt: &Attempt, attempts: u32, delay: Duration) {
+        let reporter = &job.reporter;
+        warn!(
+            request_id = %reporter.request_id.as_deref().unwrap_or(""),
+            org_id = %reporter.org_id.as_deref().unwrap_or(""),
+            workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
+            api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
+            model = %reporter.model_name,
+            status = attempt.answer.as_ref().ok().map(tracing::field::display),
+            error = attempt.answer.as_ref().err().map(tracing::field::display),
+            duration_ms = attempt.elapsed.as_millis() as u64,
+            auth_path = reporter.request_source.auth_path.as_label(),
+            ingress_route = reporter.request_source.ingress_route.as_label(),
+            outcome = attempt.outcome.as_label(),
+            attempt = attempts,
+            // Absent for a report that is sent until it is accepted.
+            max_attempts = self.policy.attempt_cap(),
+            retry_in_ms = delay.as_millis() as u64,
+            "Usage report attempt failed, retrying"
+        );
+    }
+
+    /// The report's final outcome: the series and the log lines a report has
+    /// always ended with. `attempts` and `since_completion_ms` are absent
+    /// under the default policy. `retry_reason` is why another attempt could
+    /// have been made, had any been left.
+    fn end(&self, job: &Job, attempt: &Attempt, attempts: u32, retry_reason: Option<&'static str>) {
+        let reporter = &job.reporter;
+        let (outcome, elapsed) = (attempt.outcome, attempt.elapsed);
+        record_usage_report_outcome(reporter, outcome, Some(elapsed));
+        let attempts = self.extended.then_some(attempts);
+        let since_completion_ms = self
+            .extended
+            .then(|| job.since_completion().as_millis() as u64);
+        match &attempt.answer {
+            Ok(status) if outcome == UsageReportOutcome::Accepted => {
+                if self.extended {
+                    metrics::histogram!(
+                        "inference_proxy_usage_report_time_to_accepted_seconds",
+                        source_labels(reporter, None)
+                    )
+                    .record(job.since_completion().as_secs_f64());
+                }
+                info!(
+                    target: FINAL_OUTCOME_TARGET,
                     request_id = %reporter.request_id.as_deref().unwrap_or(""),
                     org_id = %reporter.org_id.as_deref().unwrap_or(""),
                     workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
                     api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
                     model = %reporter.model_name,
-                    status = answer.as_ref().ok().map(tracing::field::display),
-                    error = answer.as_ref().err().map(tracing::field::display),
+                    status = %status,
+                    duration_ms = elapsed.as_millis() as u64,
+                    auth_path = reporter.request_source.auth_path.as_label(),
+                    ingress_route = reporter.request_source.ingress_route.as_label(),
+                    attempts,
+                    since_completion_ms,
+                    "Direct-key usage report accepted by Cloud API"
+                );
+                return;
+            }
+            Ok(status) => {
+                warn!(
+                    target: FINAL_OUTCOME_TARGET,
+                    request_id = %reporter.request_id.as_deref().unwrap_or(""),
+                    org_id = %reporter.org_id.as_deref().unwrap_or(""),
+                    workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
+                    api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
+                    model = %reporter.model_name,
+                    status = %status,
                     duration_ms = elapsed.as_millis() as u64,
                     auth_path = reporter.request_source.auth_path.as_label(),
                     ingress_route = reporter.request_source.ingress_route.as_label(),
                     outcome = outcome.as_label(),
-                    attempt = attempts,
-                    max_attempts = self.policy.max_attempts,
-                    retry_in_ms = delay.as_millis() as u64,
-                    "Usage report attempt failed, retrying"
+                    attempts,
+                    since_completion_ms,
+                    "Usage reporting returned non-success"
                 );
-                retrying = Some(reason);
-                tokio::time::sleep(delay).await;
-                continue;
             }
-
-            // The report's final outcome: the series and the log lines a
-            // report has always ended with. `attempts` and
-            // `since_completion_ms` are absent under the default policy.
-            record_usage_report_outcome(reporter, outcome, Some(elapsed));
-            let attempts = self.extended.then_some(attempts);
-            let since_completion_ms = self
-                .extended
-                .then(|| job.completed_at.elapsed().as_millis() as u64);
-            match &answer {
-                Ok(status) if outcome == UsageReportOutcome::Accepted => {
-                    if self.extended {
-                        metrics::histogram!(
-                            "inference_proxy_usage_report_time_to_accepted_seconds",
-                            source_labels(reporter, None)
-                        )
-                        .record(job.completed_at.elapsed().as_secs_f64());
-                    }
-                    info!(
-                        target: FINAL_OUTCOME_TARGET,
-                        request_id = %reporter.request_id.as_deref().unwrap_or(""),
-                        org_id = %reporter.org_id.as_deref().unwrap_or(""),
-                        workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
-                        api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
-                        model = %reporter.model_name,
-                        status = %status,
-                        duration_ms = elapsed.as_millis() as u64,
-                        auth_path = reporter.request_source.auth_path.as_label(),
-                        ingress_route = reporter.request_source.ingress_route.as_label(),
-                        attempts,
-                        since_completion_ms,
-                        "Direct-key usage report accepted by Cloud API"
-                    );
-                    return;
-                }
-                Ok(status) => {
-                    warn!(
-                        target: FINAL_OUTCOME_TARGET,
-                        request_id = %reporter.request_id.as_deref().unwrap_or(""),
-                        org_id = %reporter.org_id.as_deref().unwrap_or(""),
-                        workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
-                        api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
-                        model = %reporter.model_name,
-                        status = %status,
-                        duration_ms = elapsed.as_millis() as u64,
-                        auth_path = reporter.request_source.auth_path.as_label(),
-                        ingress_route = reporter.request_source.ingress_route.as_label(),
-                        outcome = outcome.as_label(),
-                        attempts,
-                        since_completion_ms,
-                        "Usage reporting returned non-success"
-                    );
-                }
-                Err(error) => {
-                    warn!(
-                        target: FINAL_OUTCOME_TARGET,
-                        request_id = %reporter.request_id.as_deref().unwrap_or(""),
-                        org_id = %reporter.org_id.as_deref().unwrap_or(""),
-                        workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
-                        api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
-                        model = %reporter.model_name,
-                        error = %error,
-                        duration_ms = elapsed.as_millis() as u64,
-                        auth_path = reporter.request_source.auth_path.as_label(),
-                        ingress_route = reporter.request_source.ingress_route.as_label(),
-                        outcome = outcome.as_label(),
-                        attempts,
-                        since_completion_ms,
-                        "Usage reporting failed"
-                    );
-                }
+            Err(error) => {
+                warn!(
+                    target: FINAL_OUTCOME_TARGET,
+                    request_id = %reporter.request_id.as_deref().unwrap_or(""),
+                    org_id = %reporter.org_id.as_deref().unwrap_or(""),
+                    workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
+                    api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
+                    model = %reporter.model_name,
+                    error = %error,
+                    duration_ms = elapsed.as_millis() as u64,
+                    auth_path = reporter.request_source.auth_path.as_label(),
+                    ingress_route = reporter.request_source.ingress_route.as_label(),
+                    outcome = outcome.as_label(),
+                    attempts,
+                    since_completion_ms,
+                    "Usage reporting failed"
+                );
             }
-            // Not accepted, and no attempt follows: either the answer is
-            // final, or it could have passed but the attempts are used up.
-            let reason = if retry_reason.is_some() {
-                "attempts_exhausted"
-            } else {
-                "rejected"
-            };
-            self.count(
-                "inference_proxy_usage_reports_dropped_total",
-                reporter,
-                ("reason", reason),
-            );
-            return;
         }
+        // Not accepted, and no attempt follows: either the answer is final,
+        // or it could have passed but the attempts are used up.
+        let reason = if retry_reason.is_some() {
+            "attempts_exhausted"
+        } else {
+            "rejected"
+        };
+        self.count(
+            "inference_proxy_usage_reports_dropped_total",
+            reporter,
+            ("reason", reason),
+        );
     }
 
     /// Drop `job` without a (further) attempt: counted as the report's final
     /// outcome and as a drop, and logged with its ids.
     fn give_up(&self, job: &Job, why: GiveUp) {
         let reporter = &job.reporter;
-        let since_completion_ms = job.completed_at.elapsed().as_millis() as u64;
+        let since_completion_ms = job.since_completion().as_millis() as u64;
         match why {
             GiveUp::QueueFull => {
                 let outcome = UsageReportOutcome::QueueFull;
@@ -579,7 +752,15 @@ impl UsageReportDelivery {
     /// `shutdown_drain` to finish and say how many were left. A process with
     /// the default policy exits as it always has, without waiting or logging
     /// (`None`).
+    ///
+    /// With an outbox nothing has to be delivered before the process ends:
+    /// what is still in memory is written to the file, the attempts in
+    /// flight get `shutdown_drain`, and the leases are given back so that the
+    /// next process can send what is left at once.
     pub async fn drain_at_shutdown(&self) -> Option<Drained> {
+        if let Some(outbox) = &self.outbox {
+            return Some(self.close(outbox).await);
+        }
         if !self.extended {
             return None;
         }

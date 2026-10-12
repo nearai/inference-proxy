@@ -71,6 +71,16 @@ fn tier_strict_has_something_to_isolate(long_context_urls: &[String], above_toke
 /// number in `[0, 1)` with at most four decimal places (cloud-api bills in
 /// basis points), or startup fails: this value changes what customers are
 /// shown and charged, so a typo must not be guessed at.
+/// Whether `url` is under cloud-api's service-token routes
+/// (`{CLOUD_API_URL}/v1/internal/...`). The prefix is matched on the whole
+/// origin, so a look-alike host is not cloud-api.
+pub(crate) fn is_cloud_api_internal_url(cloud_api_url: Option<&str>, url: &str) -> bool {
+    cloud_api_url
+        .map(|base| base.trim_end_matches('/'))
+        .and_then(|base| url.strip_prefix(base))
+        .is_some_and(|path| path.starts_with("/v1/internal/"))
+}
+
 fn parse_discount_to_user(raw: &str) -> anyhow::Result<Option<f64>> {
     const NAME: &str = "VLLM_PROXY_DISCOUNT_TO_USER";
     let raw = raw.trim();
@@ -994,6 +1004,18 @@ impl Config {
             .ok()
             .filter(|s| !s.is_empty())
             .map(|s| s.trim_end_matches('/').to_string());
+        // cloud-api's internal catalog answers 401 without the service token,
+        // so a lane told to read it has to hold one: fail at startup instead
+        // of serving a models document that can never be read.
+        if let Some(source) = models_document_url.as_deref() {
+            let has_usage_token =
+                env::var("CLOUD_API_USAGE_TOKEN").is_ok_and(|v| !v.trim().is_empty());
+            if is_cloud_api_internal_url(cloud_api_url.as_deref(), source) && !has_usage_token {
+                anyhow::bail!(
+                    "VLLM_PROXY_MODELS_DOCUMENT_URL points at cloud-api's internal catalog, which requires CLOUD_API_USAGE_TOKEN"
+                );
+            }
+        }
 
         let compose_manager_url = env::var("COMPOSE_MANAGER_URL")
             .ok()
@@ -2084,6 +2106,60 @@ mod tests {
             assert!(err.contains("[0, 1)"), "{err}");
             gateway_env_cleanup();
         });
+    }
+
+    #[test]
+    fn test_internal_models_document_requires_the_usage_token() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            gateway_env_cleanup();
+            env::set_var("CLOUD_API_URL", "https://cloud-api.test/");
+            env::set_var(
+                "VLLM_PROXY_MODELS_DOCUMENT_URL",
+                "https://cloud-api.test/v1/internal/models",
+            );
+            env::remove_var("CLOUD_API_USAGE_TOKEN");
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(err.contains("requires CLOUD_API_USAGE_TOKEN"), "{err}");
+
+            env::set_var("CLOUD_API_USAGE_TOKEN", "usage-secret");
+            assert!(Config::from_env().is_ok());
+
+            // The public document needs no token.
+            env::remove_var("CLOUD_API_USAGE_TOKEN");
+            env::set_var(
+                "VLLM_PROXY_MODELS_DOCUMENT_URL",
+                "https://cloud-api.test/v1/models",
+            );
+            assert!(Config::from_env().is_ok());
+
+            env::remove_var("CLOUD_API_URL");
+            gateway_env_cleanup();
+        });
+    }
+
+    #[test]
+    fn test_cloud_api_internal_url_matches_the_whole_origin() {
+        let base = Some("https://cloud-api.test");
+        assert!(is_cloud_api_internal_url(
+            base,
+            "https://cloud-api.test/v1/internal/models"
+        ));
+        assert!(is_cloud_api_internal_url(
+            Some("https://cloud-api.test/"),
+            "https://cloud-api.test/v1/internal/models"
+        ));
+        for other in [
+            "https://cloud-api.test/v1/models",
+            "https://cloud-api.test.example.org/v1/internal/models",
+            "https://other.test/v1/internal/models",
+            "http://cloud-api.test/v1/internal/models",
+        ] {
+            assert!(!is_cloud_api_internal_url(base, other), "{other}");
+        }
+        assert!(!is_cloud_api_internal_url(
+            None,
+            "https://cloud-api.test/v1/internal/models"
+        ));
     }
 
     #[test]

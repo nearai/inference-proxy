@@ -186,14 +186,30 @@ async fn models_document_for_list(
     Ok((StatusCode::OK, axum::Json(document)).into_response())
 }
 
+/// The service token for a read of the models document source, when the
+/// source is cloud-api's internal catalog (`{CLOUD_API_URL}/v1/internal/...`).
+///
+/// cloud-api's public `/v1/models` leaves out the models it does not list in
+/// its own catalog, and a lane's models can be among them. The internal
+/// document lists them all and takes the token usage reports already carry.
+/// The token goes to that origin and path prefix only: a source configured
+/// anywhere else is read without credentials, as before.
+fn models_source_token<'a>(config: &'a crate::config::Config, source: &str) -> Option<&'a str> {
+    crate::config::is_cloud_api_internal_url(config.cloud_api_url.as_deref(), source)
+        .then_some(config.cloud_api_usage_token.as_deref())
+        .flatten()
+}
+
 /// One read of the models document source, as JSON.
 async fn read_models_source(state: &AppState, source: &str) -> anyhow::Result<Value> {
-    let response = state
+    let mut request = state
         .http_client
         .get(source)
-        .timeout(Duration::from_secs(MODELS_DOCUMENT_TIMEOUT_SECS))
-        .send()
-        .await?;
+        .timeout(Duration::from_secs(MODELS_DOCUMENT_TIMEOUT_SECS));
+    if let Some(token) = models_source_token(&state.config, source) {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
     if !response.status().is_success() {
         anyhow::bail!("source answered {}", response.status());
     }

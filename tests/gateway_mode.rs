@@ -2529,6 +2529,84 @@ async fn models_document_is_reduced_to_this_model_and_carries_capacity() {
 }
 
 #[tokio::test]
+async fn internal_models_document_is_read_with_the_usage_token() {
+    let engine = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    // cloud-api's internal catalog: only a read that carries the service token
+    // is answered. It lists a model the public document leaves out.
+    Mock::given(method("GET"))
+        .and(path("/v1/internal/models"))
+        .and(header("authorization", "Bearer usage-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "test-model", "name": "Test Model", "is_ready": true}]
+        })))
+        .expect(1)
+        .mount(&cloud_api)
+        .await;
+
+    let app = build_gateway(
+        &engine.uri(),
+        GatewayOptions {
+            models_document_url: Some(format!("{}/v1/internal/models", cloud_api.uri())),
+            cloud_api_url: Some(cloud_api.uri()),
+            cloud_api_usage_token: Some("usage-secret".to_string()),
+            ..Default::default()
+        },
+    );
+    let (status, body) = get_models(app).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"][0]["id"], "test-model");
+}
+
+#[tokio::test]
+async fn usage_token_is_sent_to_cloud_api_internal_routes_only() {
+    let engine = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    let elsewhere = MockServer::start().await;
+    let document = serde_json::json!({
+        "object": "list",
+        "data": [{"id": "test-model", "name": "Test Model"}]
+    });
+    let without_credentials =
+        |request: &wiremock::Request| !request.headers.contains_key("authorization");
+    // The public document on cloud-api, and an internal-looking path on
+    // another origin: neither read may carry the token.
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .and(without_credentials)
+        .respond_with(ResponseTemplate::new(200).set_body_json(document.clone()))
+        .expect(1)
+        .mount(&cloud_api)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/internal/models"))
+        .and(without_credentials)
+        .respond_with(ResponseTemplate::new(200).set_body_json(document))
+        .expect(1)
+        .mount(&elsewhere)
+        .await;
+
+    for source in [
+        format!("{}/v1/models", cloud_api.uri()),
+        format!("{}/v1/internal/models", elsewhere.uri()),
+    ] {
+        let app = build_gateway(
+            &engine.uri(),
+            GatewayOptions {
+                models_document_url: Some(source.clone()),
+                cloud_api_url: Some(cloud_api.uri()),
+                cloud_api_usage_token: Some("usage-secret".to_string()),
+                ..Default::default()
+            },
+        );
+        let (status, body) = get_models(app).await;
+        assert_eq!(status, StatusCode::OK, "{source}: {body}");
+        assert_eq!(body["data"][0]["id"], "test-model", "{source}");
+    }
+}
+
+#[tokio::test]
 async fn models_document_without_a_budget_or_rate_declares_no_capacity() {
     let engine = MockServer::start().await;
     let source = MockServer::start().await;

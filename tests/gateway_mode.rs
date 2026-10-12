@@ -73,6 +73,9 @@ struct GatewayOptions {
     /// `ModelAccess::refresh`, or with `model_access::start` as a process
     /// does before it serves.
     model_access_refresh_secs: u64,
+    /// Other intervals and another read timeout for that document than the
+    /// process's, for a test that cannot wait seconds.
+    model_access_timing: Option<model_access::Timing>,
 }
 
 fn build_gateway(mock_url: &str, options: GatewayOptions) -> axum::Router {
@@ -287,10 +290,21 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         config.backend_affinity_max_imbalance,
         1_200,
     ));
+    // Mirror main.rs: the model access document is read by a client that
+    // follows no redirect.
+    let mut access = model_access::ModelAccess::new(&config, &|| {
+        Ok(reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?)
+    })
+    .expect("valid model access configuration");
+    if let Some(timing) = options.model_access_timing {
+        access = access.with_timing(timing);
+    }
     let state = AppState {
         models: None,
         usage_report_delivery: usage_report::UsageReportDelivery::new(config.usage_report.clone()),
-        model_access: Arc::new(model_access::ModelAccess::new(&config)),
+        model_access: Arc::new(access),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(cache::ChatCache::new("test-model", 1200)),
@@ -817,10 +831,7 @@ struct AccessLane {
 impl AccessLane {
     /// One read of cloud-api's document, as the refresh task makes it.
     async fn refresh(&self) {
-        self.state
-            .model_access
-            .refresh(&self.state.http_client)
-            .await;
+        self.state.model_access.refresh().await;
     }
 
     /// A chat request for `test-model` with `key` as its bearer.
@@ -950,11 +961,27 @@ fn refusing_origin() -> (tokio::net::TcpSocket, String) {
     (socket, origin)
 }
 
-/// An answer of cloud-api's route that makes the read fail on the
-/// connection: a redirect to `origin`, which refuses it.
+/// An answer of cloud-api's route that redirects the read to `origin`.
 fn redirect_to(origin: &str) -> ResponseTemplate {
     ResponseTemplate::new(307)
         .insert_header("location", format!("{origin}{MODEL_ACCESS_ROUTE}").as_str())
+}
+
+/// An answer that comes long after a test's read timeout: a cloud-api that
+/// hangs.
+fn hung() -> ResponseTemplate {
+    model_access_document("test-model", &[]).set_delay(Duration::from_secs(2))
+}
+
+/// The process's timing with what a test cannot wait for made short: 100 ms
+/// between two reads while there is no document, and a read timeout of
+/// 200 ms.
+fn short_timing(refresh: Duration) -> Option<model_access::Timing> {
+    Some(model_access::Timing {
+        retry_without_document: Duration::from_millis(100),
+        read_timeout: Duration::from_millis(200),
+        ..model_access::Timing::new(refresh)
+    })
 }
 
 /// `access_lane` with the setting on and nothing else.
@@ -962,6 +989,19 @@ async fn model_access_lane(answers: Vec<ResponseTemplate>) -> AccessLane {
     access_lane(
         GatewayOptions {
             model_access_refresh_secs: 60,
+            ..Default::default()
+        },
+        answers,
+    )
+    .await
+}
+
+/// `model_access_lane` with `short_timing`.
+async fn impatient_lane(answers: Vec<ResponseTemplate>) -> AccessLane {
+    access_lane(
+        GatewayOptions {
+            model_access_refresh_secs: 60,
+            model_access_timing: short_timing(Duration::from_secs(60)),
             ..Default::default()
         },
         answers,
@@ -994,6 +1034,7 @@ async fn model_access_serves_a_granted_organization_and_refuses_the_others() {
         "model_access_rejections_total 2",
         "http_errors_total{error_type=\"model_not_found\"} 2",
         "model_access_last_refresh_timestamp_seconds ",
+        "model_access_enforcing 1",
     ] {
         assert!(rendered.contains(line), "{line}: {rendered}");
     }
@@ -1051,42 +1092,74 @@ async fn a_failed_model_access_refresh_keeps_the_previous_snapshot() {
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     let _metrics = metrics::set_default_local_recorder(&recorder);
-    let (_refusing, down) = refusing_origin();
-    let lane = model_access_lane(vec![
-        model_access_document("test-model", &["org-granted"]),
+    // Where a redirect points. Nothing may arrive there.
+    let elsewhere = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(model_access_document("test-model", &["org-other"]))
+        .mount(&elsewhere)
+        .await;
+    // A valid document that would open the model to `org-other`, and is
+    // larger than a document may be.
+    let padding = "x".repeat(1024 * 1024);
+    let too_large = serde_json::json!({
+        "object": "model_access",
+        "models": [{"id": "test-model", "organization_ids": ["org-granted", "org-other", padding]}]
+    });
+    let opening = |models: serde_json::Value| {
+        ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({"object": "model_access", "models": models}))
+    };
+    let failures = vec![
         ResponseTemplate::new(503),
-        // A connection that is refused.
-        redirect_to(&down),
-        // Not the document: a body without `models`, and an entry without
-        // its list, next to one that would have opened the model.
+        // No answer within the read timeout.
+        hung(),
+        // A redirect is not followed.
+        redirect_to(&elsewhere.uri()),
+        // The token is refused. At startup that stops the process; later
+        // it is a failed read like another.
+        ResponseTemplate::new(401),
+        ResponseTemplate::new(403),
+        // Not the document: a body without `models`, an entry without its
+        // list next to one that would have opened the model, the model
+        // listed twice, and a document past the size limit.
         ResponseTemplate::new(200).set_body_json(serde_json::json!({"object": "list", "data": []})),
-        ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "object": "model_access",
-            "models": [
-                {"id": "test-model", "organization_ids": ["org-granted", "org-other"]},
-                {"id": "other-model"}
-            ]
-        })),
+        opening(serde_json::json!([
+            {"id": "test-model", "organization_ids": ["org-granted", "org-other"]},
+            {"id": "other-model"}
+        ])),
+        opening(serde_json::json!([
+            {"id": "test-model", "organization_ids": ["org-granted"]},
+            {"id": "test-model", "organization_ids": ["org-other"]}
+        ])),
+        ResponseTemplate::new(200).set_body_json(too_large),
         // The route is gone again (a cloud-api rolled back).
         ResponseTemplate::new(404),
-    ])
-    .await;
+    ];
+    let failed = failures.len();
+    let mut answers = vec![model_access_document("test-model", &["org-granted"])];
+    answers.extend(failures);
+    let lane = impatient_lane(answers).await;
     lane.refresh().await;
-    for _failed in 0..5 {
+    for _ in 0..failed {
         lane.refresh().await;
         assert!(lane.state.model_access.has_snapshot());
         lane.served("sk-live-granted").await;
         lane.not_served("sk-live-other").await;
     }
-    assert_eq!(lane.reads().await, 6);
+    assert_eq!(lane.reads().await, 1 + failed);
+    assert!(elsewhere.received_requests().await.unwrap().is_empty());
 
     let rendered = handle.render();
     for line in [
         "model_access_refresh_failures_total{reason=\"status\"} 1",
         "model_access_refresh_failures_total{reason=\"transport\"} 1",
-        "model_access_refresh_failures_total{reason=\"malformed\"} 2",
+        "model_access_refresh_failures_total{reason=\"redirect\"} 1",
+        "model_access_refresh_failures_total{reason=\"unauthorized\"} 2",
+        "model_access_refresh_failures_total{reason=\"malformed\"} 4",
         "model_access_refresh_failures_total{reason=\"route_missing\"} 1",
-        "model_access_rejections_total 5",
+        "model_access_rejections_total 10",
+        // A document stays in force through all of it.
+        "model_access_enforcing 1",
     ] {
         assert!(rendered.contains(line), "{line}: {rendered}");
     }
@@ -1094,17 +1167,20 @@ async fn a_failed_model_access_refresh_keeps_the_previous_snapshot() {
 
 #[tokio::test]
 async fn until_a_model_access_document_is_read_nothing_is_restricted() {
-    // A cloud-api that does not have the route yet, one that fails, one
-    // whose connection is refused and one that answers something else: none
-    // of them blocks a request.
-    let (_refusing, down) = refusing_origin();
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    // A cloud-api that does not have the route yet, one that fails, one that
+    // redirects, one that hangs and one that answers something else: none of
+    // them blocks a request.
     for first in [
         ResponseTemplate::new(404),
         ResponseTemplate::new(503),
-        redirect_to(&down),
+        redirect_to("http://elsewhere.invalid"),
+        hung(),
         ResponseTemplate::new(200).set_body_string("<html>not the document</html>"),
     ] {
-        let lane = model_access_lane(vec![
+        let lane = impatient_lane(vec![
             first,
             model_access_document("test-model", &["org-granted"]),
         ])
@@ -1113,11 +1189,14 @@ async fn until_a_model_access_document_is_read_nothing_is_restricted() {
         lane.served("sk-live-other").await;
         lane.refresh().await;
         assert!(!lane.state.model_access.has_snapshot());
+        // The state that can be alerted on.
+        assert!(handle.render().contains("model_access_enforcing 0"));
         lane.served("sk-live-other").await;
         lane.served("sk-live-noorg").await;
 
-        // Polling goes on, and the first document that arrives applies.
+        // The first document that arrives applies.
         lane.refresh().await;
+        assert!(handle.render().contains("model_access_enforcing 1"));
         lane.not_served("sk-live-other").await;
         lane.served("sk-live-granted").await;
     }
@@ -1167,7 +1246,7 @@ async fn without_the_setting_model_access_is_never_read_or_checked() {
     assert!(!lane.state.model_access.is_enabled());
     // What the process does before it serves, for this configuration:
     // nothing. A read that is asked for anyway does nothing either.
-    model_access::start(&lane.state).await;
+    model_access::start(&lane.state).await.unwrap();
     lane.refresh().await;
 
     for key in ["sk-live-granted", "sk-live-other", "sk-live-noorg"] {
@@ -1194,27 +1273,30 @@ async fn trusted_token_requests_are_not_checked_for_model_access() {
     assert_eq!(lane.billed().await, 0);
 }
 
-/// A request to `route` as `key`. The two upload routes take a multipart
-/// body, every other one JSON.
-fn inference_request(route: &str, key: &str) -> Request<Body> {
-    let builder = Request::builder()
-        .method("POST")
-        .uri(route)
-        .header("authorization", format!("Bearer {key}"));
-    if [
-        routes::ROUTE_IMAGES_EDITS,
-        routes::ROUTE_AUDIO_TRANSCRIPTIONS,
-    ]
-    .contains(&route)
-    {
-        let body = "--part\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ntest-model\r\n--part--\r\n";
+/// A request to `path` as `key` with a body a route can read: a JSON object
+/// or a multipart form, both naming `model`.
+fn probe(
+    method: &axum::http::Method,
+    path: &str,
+    key: Option<&str>,
+    multipart: bool,
+    model: &str,
+) -> Request<Body> {
+    let mut builder = Request::builder().method(method.clone()).uri(path);
+    if let Some(key) = key {
+        builder = builder.header("authorization", format!("Bearer {key}"));
+    }
+    if multipart {
+        let body = format!(
+            "--part\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n--part--\r\n"
+        );
         return builder
             .header("content-type", "multipart/form-data; boundary=part")
             .body(Body::from(body))
             .unwrap();
     }
     let body = serde_json::json!({
-        "model": "test-model",
+        "model": model,
         "messages": [{"role": "user", "content": "hello"}],
         "prompt": "hello",
         "input": ["hello"]
@@ -1225,52 +1307,287 @@ fn inference_request(route: &str, key: &str) -> Request<Body> {
         .unwrap()
 }
 
+/// The status and the JSON body (`null` when it is not JSON) of `request`.
+async fn answer(app: &axum::Router, request: Request<Body>) -> (StatusCode, serde_json::Value) {
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+/// The routes that take a customer key and serve no model, so that there is
+/// nothing to check, each with the reason. A route that answers a customer
+/// key is in this list or passes the test below. None today.
+const TAKES_NO_MODEL: [(&str, &str); 0] = [];
+
 #[tokio::test]
-async fn model_access_covers_every_inference_route_of_the_model() {
-    // Every route of the router that authenticates a caller and reaches the
-    // model's backends.
-    let inference_routes = [
-        routes::ROUTE_CHAT_COMPLETIONS,
-        routes::ROUTE_COMPLETIONS,
-        routes::ROUTE_TOKENIZE,
-        routes::ROUTE_EMBEDDINGS,
-        routes::ROUTE_RERANK,
-        routes::ROUTE_SCORE,
-        routes::ROUTE_PRIVACY_CLASSIFY,
-        routes::ROUTE_IMAGES_GENERATIONS,
-        routes::ROUTE_IMAGES_EDITS,
-        routes::ROUTE_AUDIO_TRANSCRIPTIONS,
-    ];
+async fn every_route_that_takes_a_customer_key_applies_model_access() {
     let lane = model_access_lane(vec![model_access_document("test-model", &["org-granted"])]).await;
     lane.refresh().await;
+    // A chat of the granted organization, for the route that reads one back.
+    let response = lane.chat("sk-live-granted").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let chat_id = json_body(response).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
-    for route in inference_routes {
-        let request = inference_request(route, "sk-live-other");
+    // Every route there is: the list the router is built from.
+    let routes: Vec<&str> = routes::single_model_routes()
+        .into_iter()
+        .map(|(route, _)| route)
+        .collect();
+    // The name the probes send is not the configured one: a refusal has to
+    // echo what the caller sent.
+    const SENT: &str = "caller/sent-this";
+    let model_not_found = serde_json::json!({"error": {
+        "message": format!("The model `{SENT}` does not exist or you do not have access to it."),
+        "type": "invalid_request_error",
+        "param": null,
+        "code": "model_not_found"
+    }});
+    // The signature route names no model. Its refusal is its own answer for
+    // a chat it does not have.
+    let unknown_chat = serde_json::json!({"error": {
+        "message": "Chat id not found or expired",
+        "type": "not_found",
+        "param": null,
+        "code": null
+    }});
+
+    let mut checked = Vec::new();
+    for route in routes {
+        let path = route.replace("{chat_id}", &chat_id);
+        for method in ["GET", "POST", "PUT", "PATCH", "DELETE"] {
+            let method: axum::http::Method = method.parse().unwrap();
+            // A route that takes a customer key answers 401 without
+            // credentials and something else with a valid key. Anything else
+            // is a method the route does not have, a route that
+            // authenticates nobody (there is no organization to check) or
+            // one for the operator's token only.
+            let (anonymous, _) = answer(&lane.app, probe(&method, &path, None, false, SENT)).await;
+            if anonymous != StatusCode::UNAUTHORIZED {
+                continue;
+            }
+            let as_other =
+                |multipart| probe(&method, &path, Some("sk-live-other"), multipart, SENT);
+            if answer(&lane.app, as_other(false)).await.0 == StatusCode::UNAUTHORIZED {
+                continue;
+            }
+            let name = format!("{method} {route}");
+            if let Some((_, reason)) = TAKES_NO_MODEL.iter().find(|(exempt, _)| *exempt == route) {
+                assert!(!reason.is_empty(), "{name}");
+                continue;
+            }
+
+            // An organization without access is refused, whichever body it
+            // sends, and its request never reaches the engine or the bill.
+            let (dispatched, billed) = (lane.dispatched().await, lane.billed().await);
+            let mut refused = false;
+            for multipart in [false, true] {
+                let (status, body) = answer(&lane.app, as_other(multipart)).await;
+                assert!(!status.is_success(), "{name} was served: {body}");
+                refused |= status == StatusCode::NOT_FOUND
+                    && (body == model_not_found
+                        || (route == routes::ROUTE_SIGNATURE && body == unknown_chat));
+            }
+            assert!(
+                refused,
+                "{name} takes a customer key and does not apply model access: \
+                 call the check, or list it in TAKES_NO_MODEL with the reason"
+            );
+            assert_eq!(lane.dispatched().await, dispatched, "{name}");
+            assert_eq!(lane.billed().await, billed, "{name}");
+
+            // The granted organization and a trusted caller are not.
+            for key in ["sk-live-granted", "test-token"] {
+                for multipart in [false, true] {
+                    let request = probe(&method, &path, Some(key), multipart, SENT);
+                    let (_, body) = answer(&lane.app, request).await;
+                    assert!(
+                        body != model_not_found && body != unknown_chat,
+                        "{key} {name}"
+                    );
+                }
+            }
+            checked.push(name);
+        }
+    }
+    // The walk found the routes it is about, among them one of each kind.
+    for expected in [
+        "POST /v1/chat/completions",
+        "POST /v1/tokenize",
+        "POST /v1/images/edits",
+        "GET /v1/signature/{chat_id}",
+    ] {
+        assert!(checked.iter().any(|name| name == expected), "{checked:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_refusal_names_the_model_the_caller_sent_and_never_the_configured_one() {
+    let lane = model_access_lane(vec![model_access_document("test-model", &["org-granted"])]).await;
+    lane.refresh().await;
+    let post = axum::http::Method::POST;
+    let chat = |body: serde_json::Value| {
+        let mut request = probe(&post, routes::ROUTE_CHAT_COMPLETIONS, None, false, "");
+        request
+            .headers_mut()
+            .insert("authorization", "Bearer sk-live-other".parse().unwrap());
+        *request.body_mut() = Body::from(serde_json::to_vec(&body).unwrap());
+        request
+    };
+    let messages = serde_json::json!([{"role": "user", "content": "hello"}]);
+
+    // Another name than the configured one, as a list gateway answers for a
+    // model it does not serve.
+    for sent in ["some/other-name", "Test-Model", ""] {
+        let request = chat(serde_json::json!({"model": sent, "messages": messages}));
+        let (status, body) = answer(&lane.app, request).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            body["error"]["message"],
+            format!("The model `{sent}` does not exist or you do not have access to it.")
+        );
+        assert_eq!(body["error"]["code"], "model_not_found");
+        assert!(!body.to_string().contains("test-model"), "{body}");
+    }
+    // No `model`, or one that is not a string: that answer's other message.
+    for body in [
+        serde_json::json!({"messages": messages}),
+        serde_json::json!({"model": 7, "messages": messages}),
+    ] {
+        let (status, body) = answer(&lane.app, chat(body)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            body["error"]["message"],
+            "A `model` is required: set it to one of the ids listed by /v1/models."
+        );
+        assert_eq!(body["error"]["code"], "model_not_found");
+        assert!(!body.to_string().contains("test-model"), "{body}");
+    }
+    assert_eq!(lane.dispatched().await, 0);
+}
+
+#[tokio::test]
+async fn a_refused_request_leaves_admission_untouched() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let lane = access_lane(
+        GatewayOptions {
+            model_access_refresh_secs: 60,
+            admission_max_inflight: 1,
+            ..Default::default()
+        },
+        vec![model_access_document("test-model", &["org-granted"])],
+    )
+    .await;
+    lane.refresh().await;
+
+    // The lane's one slot is taken. A request that needed one is a 429.
+    let held = lane
+        .state
+        .admission
+        .try_admit(&lane.state.backend_pool, None)
+        .unwrap()
+        .expect("admission is on");
+    assert_overloaded(lane.chat("sk-live-granted").await).await;
+    // The refusal comes before admission: it is the 404, not a 429.
+    lane.not_served("sk-live-other").await;
+    lane.not_served("sk-live-noorg").await;
+
+    // With the slot free again, refusals take none and leave none behind.
+    drop(held);
+    assert_eq!(lane.state.admission.inflight(), 0);
+    for _ in 0..3 {
+        lane.not_served("sk-live-other").await;
+        assert_eq!(lane.state.admission.inflight(), 0);
+    }
+    lane.served("sk-live-granted").await;
+    assert_eq!(lane.dispatched().await, 1);
+
+    // One admission refusal was counted: the granted organization's.
+    let rendered = handle.render();
+    for line in [
+        "admission_rejections_total{reason=\"budget\"} 1",
+        "model_access_rejections_total 5",
+    ] {
+        assert!(rendered.contains(line), "{line}: {rendered}");
+    }
+}
+
+#[tokio::test]
+async fn a_streaming_request_is_refused_like_any_other() {
+    let lane = model_access_lane(vec![model_access_document("test-model", &["org-granted"])]).await;
+    lane.refresh().await;
+    for route in COMPLETION_ROUTES {
+        let request = Request::builder()
+            .method("POST")
+            .uri(route)
+            .header("authorization", "Bearer sk-live-other")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "test-model",
+                    "stream": true,
+                    "stream_options": {"include_usage": true},
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "prompt": "hello"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
         let response = lane.app.clone().oneshot(request).await.unwrap();
+        // A status and a JSON body, not an event stream that fails.
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/json"
+        );
         assert_model_not_found(response, route).await;
     }
     assert_eq!(lane.dispatched().await, 0);
     assert_eq!(lane.billed().await, 0);
+}
 
-    // The same requests from the granted organization and from a trusted
-    // caller all reach the engine, whatever it then answers.
+#[tokio::test]
+async fn the_signature_route_answers_unknown_chat_without_access_to_the_model() {
+    let lane = model_access_lane(vec![model_access_document("test-model", &["org-granted"])]).await;
+    lane.refresh().await;
+    let response = lane.chat("sk-live-granted").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let chat_id = json_body(response).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let signature = |key: &'static str, chat_id: &str| {
+        let request = Request::builder()
+            .uri(format!("/v1/signature/{chat_id}"))
+            .header("authorization", format!("Bearer {key}"))
+            .body(Body::empty())
+            .unwrap();
+        answer(&lane.app, request)
+    };
+
+    // The organization that may use the model, and a trusted caller, read
+    // the signature: text that names the model.
     for key in ["sk-live-granted", "test-token"] {
-        let before = lane.dispatched().await;
-        for route in inference_routes {
-            let request = inference_request(route, key);
-            let response = lane.app.clone().oneshot(request).await.unwrap();
-            let status = response.status();
-            let body = response.into_body().collect().await.unwrap().to_bytes();
-            assert!(
-                !String::from_utf8_lossy(&body).contains("model_not_found"),
-                "{key} {route}: {status}"
-            );
-        }
-        assert_eq!(
-            lane.dispatched().await - before,
-            inference_routes.len(),
-            "{key}"
-        );
+        let (status, body) = signature(key, &chat_id).await;
+        assert_eq!(status, StatusCode::OK, "{key}");
+        assert!(body["text"].as_str().unwrap().starts_with("test-model:"));
+    }
+    // Another organization gets what anyone gets for a chat that is not
+    // there, so the answer says nothing about the chat or the model.
+    let (status, unknown) = signature("sk-live-granted", "chatcmpl-not-there").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    for key in ["sk-live-other", "sk-live-noorg"] {
+        let (status, body) = signature(key, &chat_id).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{key}");
+        assert_eq!(body, unknown, "{key}");
+        assert!(!body.to_string().contains("test-model"));
     }
 }
 
@@ -1283,7 +1600,7 @@ async fn startup_waits_for_the_first_model_access_document() {
         .await;
     // What a process does before it binds its listener. The document is in
     // force when this returns, so the first request it accepts is checked.
-    model_access::start(&lane.state).await;
+    model_access::start(&lane.state).await.unwrap();
     assert!(lane.state.model_access.has_snapshot());
     assert_eq!(lane.reads().await, 1);
     lane.not_served("sk-live-other").await;
@@ -1291,25 +1608,27 @@ async fn startup_waits_for_the_first_model_access_document() {
 }
 
 #[tokio::test]
-async fn startup_goes_on_without_a_document_and_the_next_read_applies() {
-    let lane = access_lane(
-        GatewayOptions {
-            model_access_refresh_secs: 1,
-            ..Default::default()
-        },
-        vec![
-            ResponseTemplate::new(503),
-            model_access_document("test-model", &["org-granted"]),
-        ],
-    )
+async fn without_a_document_the_read_is_retried_sooner_than_the_interval() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    // The interval is a minute. Without a document the next read comes after
+    // the retry interval (100 ms here, 5 s in a process).
+    let lane = impatient_lane(vec![
+        ResponseTemplate::new(503),
+        ResponseTemplate::new(404),
+        model_access_document("test-model", &["org-granted"]),
+    ])
     .await;
     // The first read fails: the process starts all the same, with nothing
-    // restricted.
-    model_access::start(&lane.state).await;
+    // restricted, and says so.
+    model_access::start(&lane.state).await.unwrap();
     assert!(!lane.state.model_access.has_snapshot());
+    assert!(handle.render().contains("model_access_enforcing 0"));
     lane.served("sk-live-other").await;
 
-    // It keeps polling: one interval later the document is read and applies.
+    // Two retries later the document is read and applies: far sooner than a
+    // minute.
     for _ in 0..250 {
         if lane.state.model_access.has_snapshot() {
             break;
@@ -1317,7 +1636,12 @@ async fn startup_goes_on_without_a_document_and_the_next_read_applies() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     lane.not_served("sk-live-other").await;
-    assert_eq!(lane.reads().await, 2);
+    assert_eq!(lane.reads().await, 3);
+    assert!(handle.render().contains("model_access_enforcing 1"));
+
+    // From then on the interval is the configured one: no read follows.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(lane.reads().await, 3);
 }
 
 #[tokio::test]
@@ -1344,7 +1668,7 @@ async fn a_cloud_api_that_is_down_does_not_hold_startup_back() {
     // The connection is refused, so the read fails at once: startup waits
     // for a read, not for its 5 second timeout.
     let asked = std::time::Instant::now();
-    model_access::start(&state).await;
+    model_access::start(&state).await.unwrap();
     assert!(asked.elapsed() < Duration::from_secs(4));
     assert!(!state.model_access.has_snapshot());
 
@@ -1355,13 +1679,75 @@ async fn a_cloud_api_that_is_down_does_not_hold_startup_back() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let rendered = handle.render();
+    for line in [
+        "model_access_refresh_failures_total{reason=\"transport\"} 1",
+        "model_access_enforcing 0",
+    ] {
+        assert!(rendered.contains(line), "{line}: {rendered}");
+    }
+}
+
+#[tokio::test]
+async fn a_hung_cloud_api_holds_startup_for_one_read_timeout_at_most() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    // The read timeout is 200 ms here (5 s in a process), and cloud-api
+    // answers after 2 s.
+    let lane = impatient_lane(vec![hung()]).await;
+    let asked = std::time::Instant::now();
+    model_access::start(&lane.state).await.unwrap();
+    let waited = asked.elapsed();
+    assert!(waited >= Duration::from_millis(200), "{waited:?}");
+    assert!(waited < Duration::from_millis(1500), "{waited:?}");
+    // Not blocked: the process starts without a document, and serves.
+    assert!(!lane.state.model_access.has_snapshot());
+    lane.served("sk-live-other").await;
+    let rendered = handle.render();
     let line = "model_access_refresh_failures_total{reason=\"transport\"} 1";
     assert!(rendered.contains(line), "{rendered}");
 }
 
 #[tokio::test]
+async fn a_usage_token_cloud_api_refuses_stops_startup() {
+    for status in [401, 403] {
+        let lane = impatient_lane(vec![
+            ResponseTemplate::new(status),
+            model_access_document("test-model", &["org-granted"]),
+        ])
+        .await;
+        let error = model_access::start(&lane.state)
+            .await
+            .expect_err("startup goes on with a token cloud-api refuses")
+            .to_string();
+        for expected in [
+            "VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS",
+            "CLOUD_API_USAGE_TOKEN",
+            &status.to_string(),
+            "would never enforce model access",
+        ] {
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
+        // The token is not in the message.
+        assert!(!error.contains("usage-secret"), "{error}");
+        // Nothing keeps reading for a process that does not start.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(lane.reads().await, 1);
+        assert!(!lane.state.model_access.has_snapshot());
+    }
+}
+
+#[tokio::test]
 async fn the_model_access_refresh_task_keeps_polling() {
-    let lane = model_access_lane(Vec::new()).await;
+    let lane = access_lane(
+        GatewayOptions {
+            model_access_refresh_secs: 60,
+            model_access_timing: short_timing(Duration::from_millis(50)),
+            ..Default::default()
+        },
+        Vec::new(),
+    )
+    .await;
     let first = Mock::given(method("GET"))
         .and(path(MODEL_ACCESS_ROUTE))
         .respond_with(model_access_document("test-model", &["org-granted"]))
@@ -1371,11 +1757,7 @@ async fn the_model_access_refresh_task_keeps_polling() {
 
     // The task alone, on a short interval. (Its first read comes one
     // interval in: the one at startup is `start`'s.)
-    model_access::spawn_refresh(
-        lane.state.model_access.clone(),
-        lane.state.http_client.clone(),
-        Duration::from_millis(50),
-    );
+    model_access::spawn_refresh(lane.state.model_access.clone());
     for _ in 0..250 {
         if lane.state.model_access.has_snapshot() {
             break;
@@ -1433,23 +1815,32 @@ async fn the_usage_token_is_sent_to_cloud_api_only() {
         assert_eq!(carries_the_token(request), expected, "{}", request.url);
     }
 
-    // A redirect to another origin is followed without the token.
+    // A redirect is not followed, to another origin or to cloud-api's own:
+    // nothing is asked where it points, with the token or without it, and
+    // what is served there is not taken for the document.
     let elsewhere = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(MODEL_ACCESS_ROUTE))
+    Mock::given(wiremock::matchers::any())
         .respond_with(model_access_document("test-model", &[]))
         .mount(&elsewhere)
         .await;
-    let redirected = model_access_lane(vec![ResponseTemplate::new(307).insert_header(
-        "location",
-        format!("{}{MODEL_ACCESS_ROUTE}", elsewhere.uri()).as_str(),
-    )])
+    for status in [301, 302, 303, 307, 308] {
+        let redirected = model_access_lane(vec![ResponseTemplate::new(status).insert_header(
+            "location",
+            format!("{}{MODEL_ACCESS_ROUTE}", elsewhere.uri()).as_str(),
+        )])
+        .await;
+        redirected.refresh().await;
+        assert!(!redirected.state.model_access.has_snapshot(), "{status}");
+        assert_eq!(redirected.reads().await, 1, "{status}");
+    }
+    let same_origin = model_access_lane(vec![
+        ResponseTemplate::new(307).insert_header("location", MODEL_ACCESS_ROUTE)
+    ])
     .await;
-    redirected.refresh().await;
-    let followed = elsewhere.received_requests().await.unwrap_or_default();
-    assert_eq!(followed.len(), 1);
-    assert!(!followed[0].headers.contains_key("authorization"));
-    assert!(!followed.iter().any(carries_the_token));
+    same_origin.refresh().await;
+    assert!(!same_origin.state.model_access.has_snapshot());
+    assert_eq!(same_origin.reads().await, 1);
+    assert!(elsewhere.received_requests().await.unwrap().is_empty());
 }
 
 // ---------------------------------------------------------------------------

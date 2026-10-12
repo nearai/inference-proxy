@@ -9320,7 +9320,14 @@ async fn start_ohttp_server_with(
     let state = AppState {
         models: None,
         usage_report_delivery: Default::default(),
-        model_access: Arc::new(model_access::ModelAccess::new(&config)),
+        model_access: Arc::new(
+            model_access::ModelAccess::new(&config, &|| {
+                Ok(reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()?)
+            })
+            .unwrap(),
+        ),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(cache::ChatCache::new("test-model", 1200)),
@@ -9947,7 +9954,7 @@ async fn test_ohttp_inner_request_is_checked_for_model_access() {
 
     let (base_url, server_handle, config_bytes, state) =
         start_ohttp_server_with(&mock.uri(), Some(&mock.uri())).await;
-    state.model_access.refresh(&state.http_client).await;
+    state.model_access.refresh().await;
     assert!(state.model_access.has_snapshot());
 
     let client = reqwest::Client::new();

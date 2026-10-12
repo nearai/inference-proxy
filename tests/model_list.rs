@@ -135,6 +135,12 @@ fn start(list: Option<&Value>, env: &[(&str, &str)], metrics: Option<PrometheusH
                 .timeout(timeout)
                 .build()?)
         },
+        no_redirect_client: &|| {
+            Ok(reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(timeout)
+                .build()?)
+        },
     };
     let state = if process.config.model_list.is_some() {
         model_list::app_state(process).expect("the list starts")
@@ -157,6 +163,7 @@ fn single_model_state(process: model_list::Process<'_>) -> AppState {
         http_client,
         metrics_handle,
         backend_client,
+        no_redirect_client,
     } = process;
     let mut backend_headers = reqwest::header::HeaderMap::new();
     if let Some(token) = &config.backend_token {
@@ -191,7 +198,9 @@ fn single_model_state(process: model_list::Process<'_>) -> AppState {
         } else {
             backend_client(backend_headers).unwrap()
         },
-        model_access: Arc::new(model_access::ModelAccess::new(&config)),
+        model_access: Arc::new(
+            model_access::ModelAccess::new(&config, no_redirect_client).unwrap(),
+        ),
         http_client,
         metrics_handle,
         tls_cert_fingerprint: Arc::new(attestation::TlsCertTracker::new(None).unwrap()),
@@ -596,16 +605,24 @@ async fn model_access_restricts_one_model_of_a_list_and_not_the_others() {
         ],
         Some(handle.clone()),
     );
+    // Nothing says that access is enforced before a document was read.
+    assert!(!logs.contents().to_lowercase().contains("model access"));
     // What `main` does with the state before it binds its listener: the
     // document has been read when this returns.
-    model_access::start(&gateway.state).await;
+    model_access::start(&gateway.state).await.unwrap();
     assert!(gateway.state.model_access.has_snapshot());
+    // The log says what the document means here: which served models it
+    // restricts, to how many organizations, and no organization id.
     let logged = logs.contents();
-    assert!(
-        logged.contains("Per-organization model access enforced"),
-        "{logged}"
-    );
-    assert!(logged.contains("Model access document read"), "{logged}");
+    for line in [
+        "Model access: reading cloud-api's document before serving",
+        "Model access document applied: it restricts these models served here",
+        "restricted=example/alpha (organizations: 1)",
+    ] {
+        assert!(logged.contains(line), "{line}: {logged}");
+    }
+    assert!(!logged.contains("another-org"), "{logged}");
+    assert!(!logged.contains("example/beta ("), "{logged}");
 
     for route in ROUTES {
         let ask = |bearer: &str, model: &str| {
@@ -682,6 +699,149 @@ async fn model_access_restricts_one_model_of_a_list_and_not_the_others() {
             .count(),
         2
     );
+
+    // To the caller, the refusal is the answer of a gateway that does not
+    // serve the model at all: the same request to one that has only beta
+    // gets the same status, headers and body.
+    let without_alpha = start_list(
+        &json!({"models": [{"id": BETA, "backend_urls": [beta.uri()]}]}),
+        &[
+            ("CLOUD_API_URL", &cloud.uri()),
+            ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+        ],
+        None,
+    );
+    for route in ROUTES {
+        let mut answers = Vec::new();
+        for app in [&gateway.app, &without_alpha.app] {
+            let request = post(
+                route,
+                Some("sk-live-customer"),
+                &body_for(Some(json!(ALPHA))),
+            );
+            let response = app.clone().oneshot(request).await.unwrap();
+            let mut headers: Vec<(String, String)> = response
+                .headers()
+                .iter()
+                .filter(|(name, _)| name.as_str() != "x-request-id")
+                .map(|(name, value)| (name.to_string(), value.to_str().unwrap().to_string()))
+                .collect();
+            headers.sort();
+            answers.push((response.status(), headers, text_body(response).await));
+        }
+        assert_eq!(answers[0].0, StatusCode::NOT_FOUND);
+        assert_eq!(answers[0], answers[1], "{route}");
+    }
+}
+
+#[tokio::test]
+async fn a_document_that_names_none_of_the_served_models_says_so() {
+    let alpha = MockServer::start().await;
+    mount_completions(&alpha, routes::ROUTE_CHAT_COMPLETIONS, 1).await;
+    // The document restricts the model under another spelling than the id
+    // this gateway is configured with: nothing matches, nothing is
+    // restricted here, and the log is where that shows.
+    let cloud = cloud_api("sk-live-customer").await;
+    Mock::given(method("GET"))
+        .and(path(model_access::MODEL_ACCESS_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "model_access",
+            "models": [{"id": "Example/Alpha", "organization_ids": ["another-org"]}]
+        })))
+        .mount(&cloud)
+        .await;
+    let logs = Logs::default();
+    let _logs = logs.capture();
+    let gateway = start_list(
+        &json!({"models": [{"id": ALPHA, "backend_urls": [alpha.uri()]}]}),
+        &[
+            ("CLOUD_API_URL", &cloud.uri()),
+            ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+            ("VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS", "30"),
+        ],
+        None,
+    );
+    model_access::start(&gateway.state).await.unwrap();
+    let logged = logs.contents();
+    for line in [
+        "Model access document applied: none of the models served here is in it, so none is restricted",
+        "document_models=1",
+        "served=[\"example/alpha\"]",
+    ] {
+        assert!(logged.contains(line), "{line}: {logged}");
+    }
+    let request = post(
+        routes::ROUTE_CHAT_COMPLETIONS,
+        Some("sk-live-customer"),
+        &body_for(Some(json!(ALPHA))),
+    );
+    let response = gateway.app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    json_body(response).await;
+
+    // The same document read again is not logged again.
+    gateway.state.model_access.refresh().await;
+    assert_eq!(logs.contents().matches("Model access document").count(), 1);
+}
+
+#[tokio::test]
+async fn every_list_route_that_takes_a_customer_key_applies_model_access() {
+    let alpha = MockServer::start().await;
+    let cloud = cloud_api("sk-live-customer").await;
+    Mock::given(method("GET"))
+        .and(path(model_access::MODEL_ACCESS_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "model_access",
+            "models": [{"id": ALPHA, "organization_ids": ["another-org"]}]
+        })))
+        .mount(&cloud)
+        .await;
+    let gateway = start_list(
+        &json!({"models": [{"id": ALPHA, "backend_urls": [alpha.uri()]}]}),
+        &[
+            ("CLOUD_API_URL", &cloud.uri()),
+            ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+            ("VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS", "30"),
+        ],
+        None,
+    );
+    model_access::start(&gateway.state).await.unwrap();
+
+    // Every route of a list gateway, from the list its router is built
+    // from. One that answers 401 without credentials and something else to
+    // a customer key has to refuse an organization without access.
+    let mut checked = Vec::new();
+    for (route, _) in routes::model_list_routes() {
+        for verb in ["GET", "POST", "PUT", "PATCH", "DELETE"] {
+            let probe = |bearer: Option<&str>| {
+                let mut request = post(route, bearer, &body_for(Some(json!(ALPHA))));
+                *request.method_mut() = verb.parse().unwrap();
+                gateway.app.clone().oneshot(request)
+            };
+            if probe(None).await.unwrap().status() != StatusCode::UNAUTHORIZED {
+                continue;
+            }
+            let response = probe(Some("sk-live-customer")).await.unwrap();
+            if response.status() == StatusCode::UNAUTHORIZED {
+                continue;
+            }
+            let body = assert_model_not_found(response).await;
+            assert_eq!(
+                body["error"]["message"],
+                format!("The model `{ALPHA}` does not exist or you do not have access to it."),
+                "{verb} {route}"
+            );
+            checked.push(format!("{verb} {route}"));
+        }
+    }
+    assert_eq!(
+        checked,
+        ["POST /v1/chat/completions", "POST /v1/completions"]
+    );
+    // No inference request reached the backend. (`/healthz` probes it.)
+    for route in ROUTES {
+        assert!(requests_to(&alpha, route).await.is_empty(), "{route}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4050,9 +4210,148 @@ async fn the_binary_reads_the_model_access_document_before_it_accepts_requests()
     );
     // The document was read before the listener was bound.
     let log = binary.log();
-    let read = log.find("Model access document read").expect("read");
+    let read = log.find("Model access document applied").expect("read");
     let listening = log.find("Listening on").expect("listening");
     assert!(read < listening, "{log}");
+}
+
+/// `main` itself: what stops it when model access is configured, and what
+/// does not.
+#[tokio::test]
+async fn the_binary_refuses_to_start_when_it_could_never_enforce_model_access() {
+    let list = json!({"models": [{"id": ALPHA, "backend_urls": ["http://alpha.invalid"]}]});
+    // cloud-api does not accept the token: no later read would do better.
+    for status in [401, 403] {
+        let cloud = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(model_access::MODEL_ACCESS_PATH))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&cloud)
+            .await;
+        let printed = refused_at_startup(
+            &list,
+            &[
+                ("CLOUD_API_URL", &cloud.uri()),
+                ("CLOUD_API_USAGE_TOKEN", "not-the-token"),
+                ("VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS", "30"),
+            ],
+        )
+        .await;
+        for expected in [
+            "VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS: cloud-api answered",
+            &status.to_string(),
+            "would never enforce model access",
+        ] {
+            assert!(printed.contains(expected), "{expected}: {printed}");
+        }
+        assert!(!printed.contains("not-the-token"), "{printed}");
+        assert!(!printed.contains("Listening on"), "{printed}");
+        // Nothing says the read will be tried again: the process is gone.
+        assert!(!printed.contains("until it can"), "{printed}");
+    }
+
+    // Settings that cannot work together, or at all: refused before anything
+    // is read.
+    let cloud = MockServer::start().await;
+    let on = [
+        ("CLOUD_API_URL", cloud.uri()),
+        ("CLOUD_API_USAGE_TOKEN", "usage-secret".to_string()),
+        ("VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS", "30".to_string()),
+    ];
+    for (name, value, expected) in [
+        (
+            "CLOUD_API_USAGE_TOKEN",
+            "usage\nsecret",
+            "CLOUD_API_USAGE_TOKEN is not a valid HTTP header value",
+        ),
+        (
+            "CLOUD_API_URL",
+            "",
+            "VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS requires CLOUD_API_URL and CLOUD_API_USAGE_TOKEN",
+        ),
+    ] {
+        let env: Vec<(&str, &str)> = on
+            .iter()
+            .map(|(key, set)| (*key, if *key == name { value } else { set.as_str() }))
+            .collect();
+        let printed = refused_at_startup(&list, &env).await;
+        assert!(printed.contains(expected), "{expected}: {printed}");
+        assert!(!printed.contains("usage\nsecret"), "{printed}");
+    }
+    assert!(cloud.received_requests().await.unwrap().is_empty());
+}
+
+/// `main` itself: its client for the model access read follows no redirect,
+/// and a read that fails does not stop the process.
+#[tokio::test]
+async fn the_binary_follows_no_redirect_on_the_model_access_read() {
+    let alpha = MockServer::start().await;
+    mount_completions(&alpha, routes::ROUTE_CHAT_COMPLETIONS, 1).await;
+    let elsewhere = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "model_access",
+            "models": [{"id": ALPHA, "organization_ids": []}]
+        })))
+        .mount(&elsewhere)
+        .await;
+    let cloud = cloud_api("sk-live-customer").await;
+    Mock::given(method("GET"))
+        .and(path(model_access::MODEL_ACCESS_PATH))
+        .respond_with(ResponseTemplate::new(307).insert_header(
+            "location",
+            format!("{}{}", elsewhere.uri(), model_access::MODEL_ACCESS_PATH).as_str(),
+        ))
+        .mount(&cloud)
+        .await;
+    let binary = Binary::start(
+        &json!({"models": [{"id": ALPHA, "backend_urls": [alpha.uri()]}]}),
+        &[
+            ("CLOUD_API_URL", &cloud.uri()),
+            ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+            (
+                "VLLM_PROXY_MODELS_DOCUMENT_URL",
+                "http://catalog.invalid/v1/models",
+            ),
+            ("VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS", "30"),
+        ],
+    )
+    .await;
+
+    // The process is up without a document, says so once, and serves: what
+    // the redirect points at would have closed the model to everyone.
+    let failed = binary.logged(
+        "Model access document could not be read: model access is NOT enforced until it can",
+    );
+    assert_eq!(failed.len(), 1, "{}", binary.log());
+    assert_eq!(failed[0]["reason"], "redirect");
+    assert!(binary
+        .logged("Model access document applied: it restricts these models served here")
+        .is_empty());
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{}{}", binary.base, routes::ROUTE_CHAT_COMPLETIONS))
+        .bearer_auth("sk-live-customer")
+        .json(&body_for(Some(json!(ALPHA))))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let rendered = client
+        .get(format!("{}{}", binary.base, routes::ROUTE_METRICS))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    for line in [
+        "model_access_enforcing 0",
+        "model_access_refresh_failures_total{reason=\"redirect\"} 1",
+    ] {
+        assert!(rendered.contains(line), "{line}: {rendered}");
+    }
+    assert!(elsewhere.received_requests().await.unwrap().is_empty());
 }
 
 /// `main` itself, in list mode: the process the deploy starts, with the

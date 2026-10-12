@@ -62,9 +62,11 @@ async fn serve(
     let model = crate::model_list::model_for(&state, &request_json)?;
     // Per-organization model access (`model_access.rs`): a customer key
     // whose organization may not use this model gets the answer of a model
-    // that is not served, before anything is counted for the model,
-    // admitted, dispatched or billed.
-    state.model_access.check(&auth, model.id, model.label)?;
+    // that is not served, naming the `model` it sent, before anything is
+    // counted for the model, admitted, dispatched or billed.
+    state.model_access.check(&auth, model.id, model.label, || {
+        crate::model_list::requested_model(&request_json).map(str::to_string)
+    })?;
     *counted_as = ModelRequest::of(model.label, ROUTE_CHAT_COMPLETIONS);
 
     // Strip empty tool_calls (vLLM bug workaround)

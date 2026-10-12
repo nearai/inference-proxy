@@ -664,7 +664,8 @@ pub struct Config {
     /// from `{CLOUD_API_URL}/v1/internal/model-access` with
     /// `CLOUD_API_USAGE_TOKEN` at startup and then every this many seconds,
     /// so both are required with it, and a revocation takes up to that long
-    /// to apply. See `model_access.rs`.
+    /// plus one read to apply. Refused with `FUSION_ENABLED`. See
+    /// `model_access.rs`.
     pub model_access_refresh_secs: u64,
     /// Emit an SSE comment (`: keep-alive`) on client streams whenever the
     /// upstream has been silent for this many seconds
@@ -1042,6 +1043,17 @@ impl Config {
             if !set("CLOUD_API_URL") || !set("CLOUD_API_USAGE_TOKEN") {
                 anyhow::bail!(
                     "VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS requires CLOUD_API_URL and CLOUD_API_USAGE_TOKEN: the model access document is read from cloud-api with the service token"
+                );
+            }
+            // The token is sent as a bearer on that read. One that cannot be
+            // a header value would fail every read, so it fails startup.
+            crate::model_access::bearer(&env::var("CLOUD_API_USAGE_TOKEN").unwrap_or_default())?;
+            // A fusion request names its panel and judge models itself, and
+            // this proxy calls them with a trusted token, which no access
+            // check sees: the two cannot run together.
+            if env_bool("FUSION_ENABLED") {
+                anyhow::bail!(
+                    "VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS cannot be combined with FUSION_ENABLED: a fusion request names the panel and judge models it calls, with a trusted token the model access check does not see"
                 );
             }
         }
@@ -2188,7 +2200,11 @@ mod tests {
                     }
                     let config = Config::from_env().unwrap();
                     assert_eq!(config.model_access_refresh_secs, 0, "{off:?}");
-                    assert!(!crate::model_access::ModelAccess::new(&config).is_enabled());
+                    // No client is built for a read that is never made.
+                    let access = crate::model_access::ModelAccess::new(&config, &|| {
+                        panic!("a client was asked for with the setting off")
+                    });
+                    assert!(!access.unwrap().is_enabled());
                 }
 
                 // On: both the URL and the service token, or no startup.
@@ -2215,7 +2231,44 @@ mod tests {
                 env::set_var("CLOUD_API_USAGE_TOKEN", "usage-secret");
                 let config = Config::from_env().unwrap();
                 assert_eq!(config.model_access_refresh_secs, 30);
-                assert!(crate::model_access::ModelAccess::new(&config).is_enabled());
+                let client = || Ok(reqwest::Client::new());
+                let access = crate::model_access::ModelAccess::new(&config, &client);
+                assert!(access.unwrap().is_enabled());
+
+                // The token is sent as a bearer: white space around it is
+                // dropped, and one that cannot be a header value is refused
+                // at startup, without being printed.
+                env::set_var("CLOUD_API_USAGE_TOKEN", "usage-secret\n");
+                assert!(Config::from_env().is_ok());
+                env::set_var("CLOUD_API_USAGE_TOKEN", "usage\nsecret");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("CLOUD_API_USAGE_TOKEN is not a valid HTTP header value"),
+                    "{err}"
+                );
+                assert!(!err.contains("secret"), "{err}");
+                // Without the setting that token is no concern of this check.
+                env::remove_var(SETTING);
+                assert!(Config::from_env().is_ok());
+                env::set_var(SETTING, "30");
+                env::set_var("CLOUD_API_USAGE_TOKEN", "usage-secret");
+
+                // Fusion calls models the request names, with a trusted
+                // token: the two are refused together.
+                env::set_var("FUSION_ENABLED", "1");
+                env::set_var("FUSION_INTERNAL_BEARER_TOKEN", "panel-secret");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains(
+                        "VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS cannot be combined with FUSION_ENABLED"
+                    ),
+                    "{err}"
+                );
+                env::set_var(SETTING, "0");
+                assert!(Config::from_env().is_ok(), "fusion alone still starts");
+                env::remove_var("FUSION_ENABLED");
+                env::remove_var("FUSION_INTERNAL_BEARER_TOKEN");
+                env::set_var(SETTING, "30");
 
                 // Not a number of seconds: refused, not read as "off".
                 for invalid in ["soon", "-1", "1.5"] {

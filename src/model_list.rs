@@ -969,7 +969,7 @@ pub fn app_state(process: Process<'_>) -> anyhow::Result<AppState> {
         usage_report_delivery: crate::usage_report::UsageReportDelivery::new(
             config.usage_report.clone(),
         ),
-        model_access: crate::model_access::start(&config, &http_client),
+        model_access: Arc::new(crate::model_access::ModelAccess::new(&config)),
         signing: Arc::new(signing),
         cache: Arc::new(crate::cache::ChatCache::new(
             &config.model_name,

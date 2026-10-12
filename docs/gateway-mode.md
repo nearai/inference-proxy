@@ -109,7 +109,7 @@ to the current in-CVM behavior.
 | `VLLM_BACKEND_CONVERSATION_AFFINITY` | `1` | Fleet-level conversation affinity (the CVM proxy still does its own across its replicas). |
 | `HEALTH_CHECK_INTERVAL_SECS` / `_TIMEOUT_SECS` / `_MAX_FAILURES` | `5` / `4` / `3` | The timeout must exceed the CVM proxy's own 3 s backend probe. |
 | `VLLM_PROXY_ALLOWED_ORG_IDS` | the partner's organization id | Only that organization's keys are served; any other valid key gets 403. Without it any cloud-api key works here, same as the direct `*.completions.near.ai` endpoints. |
-| `VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS` | unset (off) | Enforce cloud-api's per-organization model access: the restricted models and who may use each are read from `{CLOUD_API_URL}/v1/internal/model-access` every this many seconds, and a key of any other organization gets the 404 of a model that is not served (see [Per-organization model access](#per-organization-model-access)). Unset or `0` = off. |
+| `VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS` | unset (off) | Enforce cloud-api's per-organization model access: the restricted models and who may use each are read from `{CLOUD_API_URL}/v1/internal/model-access` before the gateway accepts requests and then every this many seconds, and a key of any other organization gets the 404 of a model that is not served (see [Per-organization model access](#per-organization-model-access)). A revocation takes up to this long to apply. Unset or `0` = off. |
 | `VLLM_PROXY_REJECTED_CONTENT_PART_TYPES` | `video_url,input_audio,file` | Modalities this deployment does not serve → deterministic `400`. |
 | `VLLM_PROXY_MODELS_DOCUMENT_URL` / `VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE` | `https://cloud-api.near.ai/v1/models` / `150` | `GET /v1/models` serves cloud-api's entry for `MODEL_NAME` (pricing, modalities, `is_ready`, `openrouter.slug`) with `capacity` added: concurrency = `VLLM_PROXY_ADMISSION_MAX_INFLIGHT`, requests per minute = this value. One URL for inference and the listing; `is_ready` stays under cloud-api's catalog control (the kill switch). Source unreadable → the engine's list, as without the variable. To serve a model that cloud-api keeps out of its public catalog, point this at `{CLOUD_API_URL}/v1/internal/models`: a URL under `{CLOUD_API_URL}/v1/internal/` is read with `CLOUD_API_USAGE_TOKEN` (startup fails without it), and the token is sent to no other URL. |
 | `VLLM_PROXY_DISCOUNT_TO_USER` | unset (list price) | The lane's discount off the list price, a fraction in `[0, 1)` with at most four decimal places (`0.2` = 20 % off): published as `discount_to_user` on the models document entry (in place of any the source carries) and sent with every usage report, so cloud-api bills the price the aggregator shows; empty or `0` = none, an invalid value fails startup, and it requires `VLLM_PROXY_MODELS_DOCUMENT_URL`. While that source is unreadable, the engine list served instead carries the discount on every entry, and an engine answer that is not a model list becomes a 502 rather than going out without it. cloud-api refuses a report whose discount exceeds its `INTERNAL_USAGE_MAX_DISCOUNT` (default `0.5`), leaving that usage unbilled, so keep the value within it. |
@@ -681,13 +681,15 @@ Authorization: Bearer <CLOUD_API_USAGE_TOKEN>
 ```
 
 It lists the restricted models, each with the organizations that may use it,
-possibly none. A model that is not in the document is not restricted. Fields
-the gateway does not know are ignored.
+possibly none. An `id` is the model's canonical catalog name, the same string
+as the gateway's `MODEL_NAME` or a list entry's `id`. A model that is not in
+the document is not restricted. Fields the gateway does not know are ignored.
 
-The gateway reads the document at startup and then every
-`VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS` seconds, with a 5 second timeout, in a
-background task, and keeps the last one in memory. A request never waits for
-cloud-api: it is checked against the document in memory.
+The gateway reads the document once before it accepts requests, and then
+every `VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS` seconds in a background task.
+Each read has a 5 second timeout, and the last document is kept in memory. A
+request never waits for cloud-api: it is checked against the document in
+memory.
 
 ### What is checked
 
@@ -721,8 +723,9 @@ trusted caller that applies the rule itself.
 organization that is not on the lane gets its `403` at the key check, whatever
 the document says. An organization has to pass both.
 
-`/v1/models` is not filtered. It is unauthenticated, so there is no
-organization to check, and it lists what the models document lists.
+`/v1/models` is not filtered, on purpose. That document is the lane's own
+listing of what it serves, a restricted model included, and it is
+unauthenticated, so there is no organization to check.
 
 ### When the document cannot be read
 
@@ -736,10 +739,16 @@ A document counts as read only when all of it is valid. One entry without its
 `id` or its `organization_ids` makes the whole read a failure, and the last
 document stays.
 
-The first read is started at startup and not waited for, so a request that
-arrives before it has ended is not checked. A grant or a revocation in
-cloud-api takes effect at the next read, so up to
-`VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS` seconds later.
+Startup waits for the first read. The listener is bound only when that read
+has ended, so the first request the gateway accepts is already checked. The
+wait is one read, at most its 5 second timeout. If that read fails or times
+out, the gateway starts all the same, with nothing restricted (the last two
+rows above), and keeps polling.
+
+A grant or a revocation in cloud-api takes effect at the next read. A revoked
+organization therefore keeps its access for up to
+`VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS` seconds. The setting has no upper
+bound: set it to the longest delay a revocation may take.
 
 ### Settings and rollout
 
@@ -752,6 +761,9 @@ the token to `{CLOUD_API_URL}/v1/internal/model-access` only.
 Roll out cloud-api first, then set the variable on the lane. A lane that is
 switched on in front of a cloud-api without the route keeps serving as
 before (the `404` row above) and starts enforcing when the route appears.
+
+This is a gateway setting. Running it on the proxies inside a CVM is out of
+scope for now.
 
 ### Metrics and logs
 

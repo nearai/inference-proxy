@@ -663,7 +663,8 @@ pub struct Config {
     /// restricted models and the organizations allowed to use each are read
     /// from `{CLOUD_API_URL}/v1/internal/model-access` with
     /// `CLOUD_API_USAGE_TOKEN` at startup and then every this many seconds,
-    /// so both are required with it. See `model_access.rs`.
+    /// so both are required with it, and a revocation takes up to that long
+    /// to apply. See `model_access.rs`.
     pub model_access_refresh_secs: u64,
     /// Emit an SSE comment (`: keep-alive`) on client streams whenever the
     /// upstream has been silent for this many seconds

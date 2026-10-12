@@ -191,7 +191,7 @@ fn single_model_state(process: model_list::Process<'_>) -> AppState {
         } else {
             backend_client(backend_headers).unwrap()
         },
-        model_access: model_access::start(&config, &http_client),
+        model_access: Arc::new(model_access::ModelAccess::new(&config)),
         http_client,
         metrics_handle,
         tls_cert_fingerprint: Arc::new(attestation::TlsCertTracker::new(None).unwrap()),
@@ -596,11 +596,10 @@ async fn model_access_restricts_one_model_of_a_list_and_not_the_others() {
         ],
         Some(handle.clone()),
     );
-    // The task `app_state` started reads the document at startup.
-    eventually(5, "the model access document", || {
-        gateway.state.model_access.has_snapshot()
-    })
-    .await;
+    // What `main` does with the state before it binds its listener: the
+    // document has been read when this returns.
+    model_access::start(&gateway.state).await;
+    assert!(gateway.state.model_access.has_snapshot());
     let logged = logs.contents();
     assert!(
         logged.contains("Per-organization model access enforced"),
@@ -3989,6 +3988,71 @@ impl Binary {
             .map(|mut line| line["fields"].take())
             .collect()
     }
+}
+
+/// `main` itself: the first read of cloud-api's model access document is over
+/// before the process accepts a request.
+#[tokio::test]
+async fn the_binary_reads_the_model_access_document_before_it_accepts_requests() {
+    let alpha = MockServer::start().await;
+    mount_completions(&alpha, routes::ROUTE_CHAT_COMPLETIONS, 0).await;
+    // The customer's key belongs to organization `org`, and alpha is
+    // restricted to another one. cloud-api takes half a second to say so: a
+    // process that listened without waiting would serve the request below.
+    let cloud = cloud_api("sk-live-customer").await;
+    Mock::given(method("GET"))
+        .and(path(model_access::MODEL_ACCESS_PATH))
+        .and(header("authorization", "Bearer usage-secret"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(500))
+                .set_body_json(json!({
+                    "object": "model_access",
+                    "models": [{"id": ALPHA, "organization_ids": ["another-org"]}]
+                })),
+        )
+        .mount(&cloud)
+        .await;
+    let binary = Binary::start(
+        &json!({"models": [{"id": ALPHA, "backend_urls": [alpha.uri()]}]}),
+        &[
+            ("CLOUD_API_URL", &cloud.uri()),
+            ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+            (
+                "VLLM_PROXY_MODELS_DOCUMENT_URL",
+                "http://catalog.invalid/v1/models",
+            ),
+            ("VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS", "30"),
+        ],
+    )
+    .await;
+
+    // `Binary::start` returns as soon as the port answers, and the request
+    // that follows at once is already checked.
+    let response = reqwest::Client::new()
+        .post(format!("{}{}", binary.base, routes::ROUTE_CHAT_COMPLETIONS))
+        .bearer_auth("sk-live-customer")
+        .json(&body_for(Some(json!(ALPHA))))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"]["code"],
+        "model_not_found"
+    );
+    alpha.verify().await;
+    assert_eq!(
+        requests_to(&cloud, model_access::MODEL_ACCESS_PATH)
+            .await
+            .len(),
+        1
+    );
+    // The document was read before the listener was bound.
+    let log = binary.log();
+    let read = log.find("Model access document read").expect("read");
+    let listening = log.find("Listening on").expect("listening");
+    assert!(read < listening, "{log}");
 }
 
 /// `main` itself, in list mode: the process the deploy starts, with the

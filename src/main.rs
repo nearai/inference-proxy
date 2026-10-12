@@ -320,16 +320,13 @@ async fn main() -> anyhow::Result<()> {
         info!("Connection fail-over to another backend enabled for chat/completions");
     }
 
-    // Per-organization model access (gateway mode): inert unless configured.
-    // Its refresh task starts here, and nothing is restricted until the
-    // first read of cloud-api's document has completed.
-    let model_access = model_access::start(&config, &http_client);
-
     // Build app state
     let model_name = config.model_name.clone();
     let state = AppState {
         usage_report_delivery: usage_report::UsageReportDelivery::new(config.usage_report.clone()),
-        model_access,
+        // Per-organization model access (gateway mode): inert unless
+        // configured, and read for the first time in `serve`.
+        model_access: Arc::new(model_access::ModelAccess::new(&config)),
         config: Arc::new(config),
         signing: Arc::new(signing),
         cache: Arc::new(chat_cache),
@@ -426,6 +423,14 @@ async fn serve(state: AppState, listen_addr: &str, listen_port: u16) -> anyhow::
         trust_proxy_headers = state.config.rate_limit_trust_proxy_headers,
         "Rate limiter configured"
     );
+
+    // Per-organization model access (`VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS`,
+    // nothing happens without it): the first read of cloud-api's document is
+    // waited for here, for at most its 5 second timeout, so the listener
+    // below never accepts a request the check cannot see yet. A read that
+    // fails does not stop the process: it starts with nothing restricted
+    // and keeps polling.
+    model_access::start(&state).await;
 
     // The routes for this state behind the rate limiter, the request id and
     // the HTTP metrics.

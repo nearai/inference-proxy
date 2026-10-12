@@ -16,10 +16,14 @@
 //! ```
 //!
 //! The document lists the restricted models, each with the organizations that
-//! may use it, possibly none. A model it does not list is open to every valid
-//! key. It is read at startup and then on the configured interval, off the
-//! request path, and the latest one is kept in memory: a request only ever
-//! reads that snapshot.
+//! may use it, possibly none. An `id` is the model's canonical catalog name,
+//! the string a gateway is configured with (`MODEL_NAME`, a list entry's
+//! `id`). A model the document does not list is open to every valid key.
+//!
+//! It is read once before the process accepts its first request (`start`),
+//! and then on the configured interval, off the request path. The latest one
+//! is kept in memory: a request only ever reads that snapshot. A revocation
+//! in cloud-api therefore takes up to one interval to apply here.
 //!
 //! A request made with a cloud-api key for a restricted model, from an
 //! organization that is not on the model's list, gets the answer of a model
@@ -31,8 +35,9 @@
 //! A read that fails leaves the last snapshot in force, however old it is: an
 //! outage of cloud-api must not open a restricted model, nor close one to the
 //! organizations that have it. Until a first document has been read nothing
-//! is restricted. That is the case of a cloud-api that does not have the
-//! route yet (a 404) and of any other failure at startup; the static
+//! is restricted. That is the case when the read at startup fails: a
+//! cloud-api that does not have the route yet (a 404), or any other failure.
+//! The process starts all the same and keeps polling; the static
 //! `VLLM_PROXY_ALLOWED_ORG_IDS` list applies throughout.
 //!
 //! Unset or `0`, the default, none of this runs: no request to cloud-api, no
@@ -191,8 +196,8 @@ pub struct ModelAccess {
 impl ModelAccess {
     /// Off unless `VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS` is set, in which
     /// case startup has required `CLOUD_API_URL` and `CLOUD_API_USAGE_TOKEN`.
-    /// Nothing is read here: `refresh` does that, and `start` runs it on the
-    /// configured interval.
+    /// Nothing is read here: `refresh` does that, and `start` runs it before
+    /// the process serves and then on the configured interval.
     pub fn new(config: &Config) -> Self {
         let source = match (&config.cloud_api_url, &config.cloud_api_usage_token) {
             (Some(base), Some(token)) if config.model_access_refresh_secs > 0 => Some(Source {
@@ -346,35 +351,45 @@ async fn read_document(client: &reqwest::Client, source: &Source) -> Result<Snap
     Snapshot::parse(&body).map_err(Failure::Malformed)
 }
 
-/// Read the document now, and again `interval` after each read has ended, for
-/// the life of the process. A slow cloud-api is therefore never asked twice
-/// at once, nor again the moment it has answered.
+/// Read the document again every `interval`, counted from the end of the read
+/// before it, for the life of the process. A slow cloud-api is therefore
+/// never asked twice at once, nor again the moment it has answered. The first
+/// read is `start`'s: this task begins with a wait.
 pub fn spawn_refresh(access: Arc<ModelAccess>, client: reqwest::Client, interval: Duration) {
     tokio::spawn(async move {
         loop {
-            access.refresh(&client).await;
             tokio::time::sleep(interval).await;
+            access.refresh(&client).await;
         }
     });
 }
 
-/// The process's model access state, with its refresh task running when
-/// `VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS` is set. `client` is the general
-/// client, the one that talks to cloud-api. Must run inside a Tokio runtime.
-pub fn start(config: &Config, client: &reqwest::Client) -> Arc<ModelAccess> {
-    let access = Arc::new(ModelAccess::new(config));
-    if access.is_enabled() {
-        info!(
-            refresh_secs = config.model_access_refresh_secs,
-            "Per-organization model access enforced from cloud-api's document"
-        );
-        spawn_refresh(
-            access.clone(),
-            client.clone(),
-            Duration::from_secs(config.model_access_refresh_secs),
-        );
+/// What a process does before it accepts requests, when
+/// `VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS` is set: read the document once and
+/// wait for the answer, so that the first request is already checked against
+/// it, then start the task that keeps it fresh. The wait is one read, so at
+/// most the read's timeout.
+///
+/// A first read that fails or times out does not hold the process back or
+/// stop it: it starts with nothing restricted, as before any document has
+/// been read, and the task keeps trying. Does nothing when the setting is
+/// off. Must run inside a Tokio runtime.
+pub async fn start(state: &AppState) {
+    let access = &state.model_access;
+    if !access.is_enabled() {
+        return;
     }
-    access
+    let refresh_secs = state.config.model_access_refresh_secs;
+    info!(
+        refresh_secs,
+        "Per-organization model access enforced from cloud-api's document"
+    );
+    access.refresh(&state.http_client).await;
+    spawn_refresh(
+        access.clone(),
+        state.http_client.clone(),
+        Duration::from_secs(refresh_secs),
+    );
 }
 
 /// `ModelAccess::check` for a route only a single-model process serves: the

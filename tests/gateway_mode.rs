@@ -69,8 +69,9 @@ struct GatewayOptions {
     /// `VLLM_PROXY_REASONING_OFF_EFFORT` (default `none`).
     reasoning_off_effort: Option<String>,
     /// `VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS`: nonzero enforces cloud-api's
-    /// model access document. Nothing polls it here: a test reads it with
-    /// `ModelAccess::refresh`, or starts `model_access::spawn_refresh`.
+    /// model access document. Nothing reads it here: a test does, with
+    /// `ModelAccess::refresh`, or with `model_access::start` as a process
+    /// does before it serves.
     model_access_refresh_secs: u64,
 }
 
@@ -896,7 +897,7 @@ async fn assert_model_not_found(response: axum::response::Response, what: &str) 
 /// organization), takes usage reports and answers the reads of its model
 /// access document with `answers`, in turn. Only a read that carries the
 /// service token is answered, and a read past the last answer gets
-/// wiremock's own 404. Nothing polls: a test reads with `refresh`.
+/// wiremock's own 404. Nothing is read until a test asks for it.
 async fn access_lane(options: GatewayOptions, answers: Vec<ResponseTemplate>) -> AccessLane {
     let engine = MockServer::start().await;
     let cloud_api = MockServer::start().await;
@@ -938,6 +939,22 @@ async fn access_lane(options: GatewayOptions, answers: Vec<ResponseTemplate>) ->
         engine,
         cloud_api,
     }
+}
+
+/// A base URL that refuses every connection for as long as the socket is
+/// kept: its port is bound and never listens.
+fn refusing_origin() -> (tokio::net::TcpSocket, String) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let origin = format!("http://{}", socket.local_addr().unwrap());
+    (socket, origin)
+}
+
+/// An answer of cloud-api's route that makes the read fail on the
+/// connection: a redirect to `origin`, which refuses it.
+fn redirect_to(origin: &str) -> ResponseTemplate {
+    ResponseTemplate::new(307)
+        .insert_header("location", format!("{origin}{MODEL_ACCESS_ROUTE}").as_str())
 }
 
 /// `access_lane` with the setting on and nothing else.
@@ -1034,9 +1051,12 @@ async fn a_failed_model_access_refresh_keeps_the_previous_snapshot() {
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     let _metrics = metrics::set_default_local_recorder(&recorder);
+    let (_refusing, down) = refusing_origin();
     let lane = model_access_lane(vec![
         model_access_document("test-model", &["org-granted"]),
         ResponseTemplate::new(503),
+        // A connection that is refused.
+        redirect_to(&down),
         // Not the document: a body without `models`, and an entry without
         // its list, next to one that would have opened the model.
         ResponseTemplate::new(200).set_body_json(serde_json::json!({"object": "list", "data": []})),
@@ -1052,20 +1072,21 @@ async fn a_failed_model_access_refresh_keeps_the_previous_snapshot() {
     ])
     .await;
     lane.refresh().await;
-    for _failed in 0..4 {
+    for _failed in 0..5 {
         lane.refresh().await;
         assert!(lane.state.model_access.has_snapshot());
         lane.served("sk-live-granted").await;
         lane.not_served("sk-live-other").await;
     }
-    assert_eq!(lane.reads().await, 5);
+    assert_eq!(lane.reads().await, 6);
 
     let rendered = handle.render();
     for line in [
         "model_access_refresh_failures_total{reason=\"status\"} 1",
+        "model_access_refresh_failures_total{reason=\"transport\"} 1",
         "model_access_refresh_failures_total{reason=\"malformed\"} 2",
         "model_access_refresh_failures_total{reason=\"route_missing\"} 1",
-        "model_access_rejections_total 4",
+        "model_access_rejections_total 5",
     ] {
         assert!(rendered.contains(line), "{line}: {rendered}");
     }
@@ -1073,11 +1094,14 @@ async fn a_failed_model_access_refresh_keeps_the_previous_snapshot() {
 
 #[tokio::test]
 async fn until_a_model_access_document_is_read_nothing_is_restricted() {
-    // A cloud-api that does not have the route yet, one that fails, and one
-    // that answers something else: none of them blocks a request.
+    // A cloud-api that does not have the route yet, one that fails, one
+    // whose connection is refused and one that answers something else: none
+    // of them blocks a request.
+    let (_refusing, down) = refusing_origin();
     for first in [
         ResponseTemplate::new(404),
         ResponseTemplate::new(503),
+        redirect_to(&down),
         ResponseTemplate::new(200).set_body_string("<html>not the document</html>"),
     ] {
         let lane = model_access_lane(vec![
@@ -1141,11 +1165,9 @@ async fn without_the_setting_model_access_is_never_read_or_checked() {
         .mount(&lane.cloud_api)
         .await;
     assert!(!lane.state.model_access.is_enabled());
-    // What `main` starts for this configuration: no task, and a read that
-    // is asked for anyway does nothing.
-    let started = model_access::start(&lane.state.config, &lane.state.http_client);
-    assert!(!started.is_enabled());
-    started.refresh(&lane.state.http_client).await;
+    // What the process does before it serves, for this configuration:
+    // nothing. A read that is asked for anyway does nothing either.
+    model_access::start(&lane.state).await;
     lane.refresh().await;
 
     for key in ["sk-live-granted", "sk-live-other", "sk-live-noorg"] {
@@ -1253,7 +1275,92 @@ async fn model_access_covers_every_inference_route_of_the_model() {
 }
 
 #[tokio::test]
-async fn the_model_access_refresh_task_reads_at_startup_and_keeps_polling() {
+async fn startup_waits_for_the_first_model_access_document() {
+    // A cloud-api that takes its time to answer.
+    let lane =
+        model_access_lane(vec![model_access_document("test-model", &["org-granted"])
+            .set_delay(Duration::from_millis(300))])
+        .await;
+    // What a process does before it binds its listener. The document is in
+    // force when this returns, so the first request it accepts is checked.
+    model_access::start(&lane.state).await;
+    assert!(lane.state.model_access.has_snapshot());
+    assert_eq!(lane.reads().await, 1);
+    lane.not_served("sk-live-other").await;
+    lane.served("sk-live-granted").await;
+}
+
+#[tokio::test]
+async fn startup_goes_on_without_a_document_and_the_next_read_applies() {
+    let lane = access_lane(
+        GatewayOptions {
+            model_access_refresh_secs: 1,
+            ..Default::default()
+        },
+        vec![
+            ResponseTemplate::new(503),
+            model_access_document("test-model", &["org-granted"]),
+        ],
+    )
+    .await;
+    // The first read fails: the process starts all the same, with nothing
+    // restricted.
+    model_access::start(&lane.state).await;
+    assert!(!lane.state.model_access.has_snapshot());
+    lane.served("sk-live-other").await;
+
+    // It keeps polling: one interval later the document is read and applies.
+    for _ in 0..250 {
+        if lane.state.model_access.has_snapshot() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    lane.not_served("sk-live-other").await;
+    assert_eq!(lane.reads().await, 2);
+}
+
+#[tokio::test]
+async fn a_cloud_api_that_is_down_does_not_hold_startup_back() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let engine = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+        .mount(&engine)
+        .await;
+    let (_refusing, down) = refusing_origin();
+    let (app, state) = build_gateway_with_state(
+        &engine.uri(),
+        GatewayOptions {
+            cloud_api_url: Some(down),
+            cloud_api_usage_token: Some("usage-secret".to_string()),
+            model_access_refresh_secs: 60,
+            ..Default::default()
+        },
+    );
+    // The connection is refused, so the read fails at once: startup waits
+    // for a read, not for its 5 second timeout.
+    let asked = std::time::Instant::now();
+    model_access::start(&state).await;
+    assert!(asked.elapsed() < Duration::from_secs(4));
+    assert!(!state.model_access.has_snapshot());
+
+    // The process serves what does not need cloud-api.
+    let response = app
+        .oneshot(chat_request_with("test-token", None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let rendered = handle.render();
+    let line = "model_access_refresh_failures_total{reason=\"transport\"} 1";
+    assert!(rendered.contains(line), "{rendered}");
+}
+
+#[tokio::test]
+async fn the_model_access_refresh_task_keeps_polling() {
     let lane = model_access_lane(Vec::new()).await;
     let first = Mock::given(method("GET"))
         .and(path(MODEL_ACCESS_ROUTE))
@@ -1262,12 +1369,13 @@ async fn the_model_access_refresh_task_reads_at_startup_and_keeps_polling() {
         .await;
     lane.served("sk-live-other").await;
 
+    // The task alone, on a short interval. (Its first read comes one
+    // interval in: the one at startup is `start`'s.)
     model_access::spawn_refresh(
         lane.state.model_access.clone(),
         lane.state.http_client.clone(),
         Duration::from_millis(50),
     );
-    // The first read is made at once, not one interval in.
     for _ in 0..250 {
         if lane.state.model_access.has_snapshot() {
             break;

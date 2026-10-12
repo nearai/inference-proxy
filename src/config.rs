@@ -66,11 +66,6 @@ fn tier_strict_has_something_to_isolate(long_context_urls: &[String], above_toke
     !long_context_urls.is_empty() && above_tokens != 0
 }
 
-/// `VLLM_PROXY_DISCOUNT_TO_USER`: the lane's discount off the list price, as
-/// a fraction. Empty or zero means none. Anything else must be a finite
-/// number in `[0, 1)` with at most four decimal places (cloud-api bills in
-/// basis points), or startup fails: this value changes what customers are
-/// shown and charged, so a typo must not be guessed at.
 /// Whether `url` is under cloud-api's service-token routes
 /// (`{CLOUD_API_URL}/v1/internal/...`). Both URLs are parsed and compared by
 /// origin (scheme, host, port) and then by path, so a look-alike host is not
@@ -90,6 +85,11 @@ pub(crate) fn is_cloud_api_internal_url(cloud_api_url: Option<&str>, url: &str) 
             .is_some_and(|path| path.starts_with("/v1/internal/"))
 }
 
+/// `VLLM_PROXY_DISCOUNT_TO_USER`: the lane's discount off the list price, as
+/// a fraction. Empty or zero means none. Anything else must be a finite
+/// number in `[0, 1)` with at most four decimal places (cloud-api bills in
+/// basis points), or startup fails: this value changes what customers are
+/// shown and charged, so a typo must not be guessed at.
 fn parse_discount_to_user(raw: &str) -> anyhow::Result<Option<f64>> {
     const NAME: &str = "VLLM_PROXY_DISCOUNT_TO_USER";
     let raw = raw.trim();

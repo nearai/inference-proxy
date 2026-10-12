@@ -72,13 +72,22 @@ fn tier_strict_has_something_to_isolate(long_context_urls: &[String], above_toke
 /// basis points), or startup fails: this value changes what customers are
 /// shown and charged, so a typo must not be guessed at.
 /// Whether `url` is under cloud-api's service-token routes
-/// (`{CLOUD_API_URL}/v1/internal/...`). The prefix is matched on the whole
-/// origin, so a look-alike host is not cloud-api.
+/// (`{CLOUD_API_URL}/v1/internal/...`). Both URLs are parsed and compared by
+/// origin (scheme, host, port) and then by path, so a look-alike host is not
+/// cloud-api, and an equivalent spelling of the same origin (an explicit
+/// default port, another host casing) still is.
 pub(crate) fn is_cloud_api_internal_url(cloud_api_url: Option<&str>, url: &str) -> bool {
-    cloud_api_url
-        .map(|base| base.trim_end_matches('/'))
-        .and_then(|base| url.strip_prefix(base))
-        .is_some_and(|path| path.starts_with("/v1/internal/"))
+    let Some(base) = cloud_api_url.and_then(|base| reqwest::Url::parse(base).ok()) else {
+        return false;
+    };
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    url.origin() == base.origin()
+        && url
+            .path()
+            .strip_prefix(base.path().trim_end_matches('/'))
+            .is_some_and(|path| path.starts_with("/v1/internal/"))
 }
 
 fn parse_discount_to_user(raw: &str) -> anyhow::Result<Option<f64>> {
@@ -2148,11 +2157,24 @@ mod tests {
             Some("https://cloud-api.test/"),
             "https://cloud-api.test/v1/internal/models"
         ));
+        // Equivalent spellings of the same origin.
+        assert!(is_cloud_api_internal_url(
+            Some("https://cloud-api.test:443"),
+            "https://Cloud-API.test/v1/internal/models"
+        ));
+        // A base URL with a path prefix.
+        assert!(is_cloud_api_internal_url(
+            Some("https://cloud-api.test/api/"),
+            "https://cloud-api.test/api/v1/internal/models"
+        ));
         for other in [
             "https://cloud-api.test/v1/models",
             "https://cloud-api.test.example.org/v1/internal/models",
             "https://other.test/v1/internal/models",
             "http://cloud-api.test/v1/internal/models",
+            "https://cloud-api.test:8443/v1/internal/models",
+            "https://cloud-api.test/v1/internal/../models",
+            "not a url",
         ] {
             assert!(!is_cloud_api_internal_url(base, other), "{other}");
         }

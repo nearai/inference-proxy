@@ -658,6 +658,13 @@ pub struct Config {
     /// = every valid key. Config-token callers are not affected. Gateway mode
     /// uses it to keep a partner lane to that partner.
     pub allowed_org_ids: Vec<String>,
+    /// Gateway mode: enforce cloud-api's per-organization model access
+    /// (`VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS`, 0 = off, the default). The
+    /// restricted models and the organizations allowed to use each are read
+    /// from `{CLOUD_API_URL}/v1/internal/model-access` with
+    /// `CLOUD_API_USAGE_TOKEN` at startup and then every this many seconds,
+    /// so both are required with it. See `model_access.rs`.
+    pub model_access_refresh_secs: u64,
     /// Emit an SSE comment (`: keep-alive`) on client streams whenever the
     /// upstream has been silent for this many seconds
     /// (`VLLM_PROXY_SSE_KEEPALIVE_SECS`, 0 = off). Comments are not hashed into
@@ -1025,6 +1032,18 @@ impl Config {
                 );
             }
         }
+        // Per-organization model access (`model_access.rs`): the document is
+        // cloud-api's and is read with the service token. Without either the
+        // setting would be on and enforce nothing, so that fails startup.
+        let model_access_refresh_secs: u64 = env_parse("VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS", 0)?;
+        if model_access_refresh_secs > 0 {
+            let set = |name: &str| env::var(name).is_ok_and(|v| !v.trim().is_empty());
+            if !set("CLOUD_API_URL") || !set("CLOUD_API_USAGE_TOKEN") {
+                anyhow::bail!(
+                    "VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS requires CLOUD_API_URL and CLOUD_API_USAGE_TOKEN: the model access document is read from cloud-api with the service token"
+                );
+            }
+        }
 
         let compose_manager_url = env::var("COMPOSE_MANAGER_URL")
             .ok()
@@ -1285,6 +1304,7 @@ impl Config {
             discount_to_user,
             reasoning_off_effort,
             allowed_org_ids,
+            model_access_refresh_secs,
             sse_keepalive_secs: env_int("VLLM_PROXY_SSE_KEEPALIVE_SECS", 0) as u64,
             admission_max_inflight,
             admission_tier_borrowing,
@@ -1712,6 +1732,7 @@ mod tests {
             "VLLM_PROXY_MODELS_DOCUMENT_URL",
             "VLLM_PROXY_DISCOUNT_TO_USER",
             "VLLM_PROXY_ALLOWED_ORG_IDS",
+            "VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS",
             "VLLM_PROXY_SSE_KEEPALIVE_SECS",
             "VLLM_PROXY_FIRST_TOKEN_DEADLINE_MS",
             "VLLM_PROXY_FIRST_TOKEN_DEADLINE_PER_1K_TOKENS_MS",
@@ -2144,6 +2165,66 @@ mod tests {
             env::remove_var("CLOUD_API_URL");
             gateway_env_cleanup();
         });
+    }
+
+    #[test]
+    fn test_model_access_is_off_by_default_and_requires_cloud_api_when_on() {
+        const SETTING: &str = "VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS";
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                ("CLOUD_API_URL", ""),
+                ("CLOUD_API_USAGE_TOKEN", ""),
+            ],
+            || {
+                gateway_env_cleanup();
+                // Unset, empty or 0: off, and nothing is required for it.
+                for off in [None, Some(""), Some("0")] {
+                    match off {
+                        Some(value) => env::set_var(SETTING, value),
+                        None => env::remove_var(SETTING),
+                    }
+                    let config = Config::from_env().unwrap();
+                    assert_eq!(config.model_access_refresh_secs, 0, "{off:?}");
+                    assert!(!crate::model_access::ModelAccess::new(&config).is_enabled());
+                }
+
+                // On: both the URL and the service token, or no startup.
+                env::set_var(SETTING, "30");
+                let cloud_api = [
+                    ("", ""),
+                    ("https://cloud-api.test", ""),
+                    ("", "usage-secret"),
+                    ("https://cloud-api.test", " "),
+                    (" ", "usage-secret"),
+                ];
+                for (url, token) in cloud_api {
+                    env::set_var("CLOUD_API_URL", url);
+                    env::set_var("CLOUD_API_USAGE_TOKEN", token);
+                    let err = Config::from_env().unwrap_err().to_string();
+                    assert!(
+                        err.contains(
+                            "VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS requires CLOUD_API_URL and CLOUD_API_USAGE_TOKEN"
+                        ),
+                        "{url:?} {token:?}: {err}"
+                    );
+                }
+                env::set_var("CLOUD_API_URL", "https://cloud-api.test/");
+                env::set_var("CLOUD_API_USAGE_TOKEN", "usage-secret");
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.model_access_refresh_secs, 30);
+                assert!(crate::model_access::ModelAccess::new(&config).is_enabled());
+
+                // Not a number of seconds: refused, not read as "off".
+                for invalid in ["soon", "-1", "1.5"] {
+                    env::set_var(SETTING, invalid);
+                    let err = Config::from_env().unwrap_err().to_string();
+                    assert!(err.contains(SETTING), "{invalid}: {err}");
+                }
+                gateway_env_cleanup();
+            },
+        );
     }
 
     #[test]

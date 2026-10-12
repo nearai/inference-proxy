@@ -10,6 +10,7 @@ use crate::auth::RequireAuth;
 use crate::backend_pool::BackendGuard;
 use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
+use crate::model_access::check_single_model;
 use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageReporter, UsageType};
 use crate::routes::chat::read_body_with_limit;
 use crate::{AppState, TracingIds};
@@ -52,6 +53,9 @@ pub async fn tokenize(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
+    // Per-organization model access (`model_access.rs`), as on the chat
+    // route. Every route of this file is the configured model's.
+    check_single_model(&state, &auth)?;
     let request_body = read_body_with_limit(body, state.config.max_request_size).await?;
     let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
 
@@ -78,6 +82,7 @@ pub async fn embeddings(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
+    check_single_model(&state, &auth)?;
     let reporter = make_usage_reporter(&auth, &state);
     let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
@@ -106,6 +111,7 @@ pub async fn rerank(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
+    check_single_model(&state, &auth)?;
     let reporter = make_usage_reporter(&auth, &state);
     let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
@@ -135,6 +141,7 @@ pub async fn score(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
+    check_single_model(&state, &auth)?;
     let reporter = make_usage_reporter(&auth, &state);
     let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
@@ -164,6 +171,7 @@ pub async fn images_generations(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
+    check_single_model(&state, &auth)?;
     let reporter = make_usage_reporter(&auth, &state);
     let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
@@ -193,6 +201,7 @@ pub async fn images_edits(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Response, AppError> {
+    check_single_model(&state, &auth)?;
     let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
     let max_size = state.config.max_image_request_size;
@@ -282,6 +291,7 @@ pub async fn audio_transcriptions(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Response, AppError> {
+    check_single_model(&state, &auth)?;
     let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
     let max_size = state.config.max_audio_request_size;

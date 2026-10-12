@@ -6,7 +6,7 @@ use tracing::info;
 use vllm_proxy_rs::ohttp_gateway::OhttpGateway;
 use vllm_proxy_rs::{
     admission, attestation, backend_affinity, backend_pool, cache, config, engine_load, fusion,
-    metrics_middleware, model_list, routes, signing, startup_checks, usage_report,
+    metrics_middleware, model_access, model_list, routes, signing, startup_checks, usage_report,
     vllm_dp_affinity, AppState,
 };
 
@@ -320,10 +320,16 @@ async fn main() -> anyhow::Result<()> {
         info!("Connection fail-over to another backend enabled for chat/completions");
     }
 
+    // Per-organization model access (gateway mode): inert unless configured.
+    // Its refresh task starts here, and nothing is restricted until the
+    // first read of cloud-api's document has completed.
+    let model_access = model_access::start(&config, &http_client);
+
     // Build app state
     let model_name = config.model_name.clone();
     let state = AppState {
         usage_report_delivery: usage_report::UsageReportDelivery::new(config.usage_report.clone()),
+        model_access,
         config: Arc::new(config),
         signing: Arc::new(signing),
         cache: Arc::new(chat_cache),

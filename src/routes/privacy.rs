@@ -51,6 +51,9 @@ pub async fn classify(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
+    // Per-organization model access (`model_access.rs`), as on the chat
+    // route: this route is the configured model's.
+    crate::model_access::check_single_model(&state, &auth)?;
     let request_body = read_body_with_limit(body, state.config.max_request_size).await?;
     let request_sha256 = hex::encode(Sha256::digest(&request_body));
     let path_with_query = match uri.query() {

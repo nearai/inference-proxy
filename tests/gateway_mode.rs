@@ -68,6 +68,10 @@ struct GatewayOptions {
     usage_report: usage_report::UsageReportPolicy,
     /// `VLLM_PROXY_REASONING_OFF_EFFORT` (default `none`).
     reasoning_off_effort: Option<String>,
+    /// `VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS`: nonzero enforces cloud-api's
+    /// model access document. Nothing polls it here: a test reads it with
+    /// `ModelAccess::refresh`, or starts `model_access::spawn_refresh`.
+    model_access_refresh_secs: u64,
 }
 
 fn build_gateway(mock_url: &str, options: GatewayOptions) -> axum::Router {
@@ -170,6 +174,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
             .clone()
             .unwrap_or_else(|| "none".to_string()),
         allowed_org_ids: options.allowed_org_ids,
+        model_access_refresh_secs: options.model_access_refresh_secs,
         sse_keepalive_secs: options.sse_keepalive_secs,
         admission_max_inflight: options.admission_max_inflight,
         admission_tier_borrowing: options.admission_tier_borrowing,
@@ -284,6 +289,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
     let state = AppState {
         models: None,
         usage_report_delivery: usage_report::UsageReportDelivery::new(config.usage_report.clone()),
+        model_access: Arc::new(model_access::ModelAccess::new(&config)),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(cache::ChatCache::new("test-model", 1200)),
@@ -781,6 +787,561 @@ async fn empty_org_allowlist_admits_every_valid_key() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     mock.verify().await;
+}
+
+// ---------------------------------------------------------------------------
+// VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS: cloud-api's per-organization model
+// access
+// ---------------------------------------------------------------------------
+
+const MODEL_ACCESS_ROUTE: &str = model_access::MODEL_ACCESS_PATH;
+
+/// cloud-api's document with one restricted model.
+fn model_access_document(model: &str, organizations: &[&str]) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "object": "model_access",
+        "models": [{"id": model, "organization_ids": organizations}]
+    }))
+}
+
+/// A lane and its two neighbours. The engine and cloud-api are separate
+/// servers, so what reaches each can be told apart.
+struct AccessLane {
+    app: axum::Router,
+    state: AppState,
+    engine: MockServer,
+    cloud_api: MockServer,
+}
+
+impl AccessLane {
+    /// One read of cloud-api's document, as the refresh task makes it.
+    async fn refresh(&self) {
+        self.state
+            .model_access
+            .refresh(&self.state.http_client)
+            .await;
+    }
+
+    /// A chat request for `test-model` with `key` as its bearer.
+    async fn chat(&self, key: &str) -> axum::response::Response {
+        self.app
+            .clone()
+            .oneshot(chat_request_with(key, None))
+            .await
+            .unwrap()
+    }
+
+    /// `chat`, for a request that has to be served.
+    async fn served(&self, key: &str) {
+        let response = self.chat(key).await;
+        assert_eq!(response.status(), StatusCode::OK, "key={key}");
+        json_body(response).await;
+    }
+
+    /// `chat`, for a request that has to get the answer of a model the
+    /// gateway does not serve (`AppError::ModelNotFound`), to the byte.
+    async fn not_served(&self, key: &str) {
+        assert_model_not_found(self.chat(key).await, key).await;
+    }
+
+    /// How many requests the engine has been sent.
+    async fn dispatched(&self) -> usize {
+        self.engine
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .len()
+    }
+
+    /// How many usage reports cloud-api has been sent, once none is pending.
+    async fn billed(&self) -> usize {
+        let drained = self
+            .state
+            .usage_report_delivery
+            .drain(Duration::from_secs(30))
+            .await;
+        assert_eq!(drained.left(), 0);
+        usage_reports(&self.cloud_api).await.len()
+    }
+
+    /// How many times the document has been read.
+    async fn reads(&self) -> usize {
+        self.cloud_api
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| request.url.path() == MODEL_ACCESS_ROUTE)
+            .count()
+    }
+}
+
+async fn assert_model_not_found(response: axum::response::Response, what: &str) {
+    assert_eq!(response.status(), StatusCode::NOT_FOUND, "{what}");
+    assert_eq!(
+        json_body(response).await,
+        serde_json::json!({"error": {
+            "message": "The model `test-model` does not exist or you do not have access to it.",
+            "type": "invalid_request_error",
+            "param": null,
+            "code": "model_not_found"
+        }}),
+        "{what}"
+    );
+}
+
+/// A lane for `test-model` built from `options`, with an engine that answers
+/// chat completions and a cloud-api that knows three keys (`sk-live-granted`
+/// of `org-granted`, `sk-live-other` of `org-other`, `sk-live-noorg` of no
+/// organization), takes usage reports and answers the reads of its model
+/// access document with `answers`, in turn. Only a read that carries the
+/// service token is answered, and a read past the last answer gets
+/// wiremock's own 404. Nothing polls: a test reads with `refresh`.
+async fn access_lane(options: GatewayOptions, answers: Vec<ResponseTemplate>) -> AccessLane {
+    let engine = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+        .mount(&engine)
+        .await;
+    mount_key_check(&cloud_api, "sk-live-granted", Some("org-granted")).await;
+    mount_key_check(&cloud_api, "sk-live-other", Some("org-other")).await;
+    mount_key_check(&cloud_api, "sk-live-noorg", None).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/internal/usage"))
+        .and(header("authorization", "Bearer usage-secret"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_api)
+        .await;
+    // wiremock answers with the first mounted mock that still has turns left.
+    for answer in answers {
+        Mock::given(method("GET"))
+            .and(path(MODEL_ACCESS_ROUTE))
+            .and(header("authorization", "Bearer usage-secret"))
+            .respond_with(answer)
+            .up_to_n_times(1)
+            .mount(&cloud_api)
+            .await;
+    }
+    let (app, state) = build_gateway_with_state(
+        &engine.uri(),
+        GatewayOptions {
+            cloud_api_url: Some(cloud_api.uri()),
+            cloud_api_usage_token: Some("usage-secret".to_string()),
+            ..options
+        },
+    );
+    AccessLane {
+        app,
+        state,
+        engine,
+        cloud_api,
+    }
+}
+
+/// `access_lane` with the setting on and nothing else.
+async fn model_access_lane(answers: Vec<ResponseTemplate>) -> AccessLane {
+    access_lane(
+        GatewayOptions {
+            model_access_refresh_secs: 60,
+            ..Default::default()
+        },
+        answers,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn model_access_serves_a_granted_organization_and_refuses_the_others() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let lane = model_access_lane(vec![model_access_document("test-model", &["org-granted"])]).await;
+    lane.refresh().await;
+    assert!(lane.state.model_access.has_snapshot());
+
+    lane.served("sk-live-granted").await;
+    assert_eq!(lane.dispatched().await, 1);
+    assert_eq!(lane.billed().await, 1);
+
+    // Another organization, and a key whose check named no organization.
+    lane.not_served("sk-live-other").await;
+    lane.not_served("sk-live-noorg").await;
+    // Neither reached the engine, and neither was billed.
+    assert_eq!(lane.dispatched().await, 1);
+    assert_eq!(lane.billed().await, 1);
+
+    let rendered = handle.render();
+    for line in [
+        "model_access_rejections_total 2",
+        "http_errors_total{error_type=\"model_not_found\"} 2",
+        "model_access_last_refresh_timestamp_seconds ",
+    ] {
+        assert!(rendered.contains(line), "{line}: {rendered}");
+    }
+    assert!(
+        !rendered.contains("model_access_refresh_failures_total"),
+        "{rendered}"
+    );
+}
+
+#[tokio::test]
+async fn model_access_leaves_an_unrestricted_model_alone() {
+    // Another model is restricted, to nobody. This lane's is not listed.
+    let lane = model_access_lane(vec![model_access_document("other-model", &[])]).await;
+    lane.refresh().await;
+    assert!(lane.state.model_access.has_snapshot());
+    for key in ["sk-live-granted", "sk-live-other", "sk-live-noorg"] {
+        lane.served(key).await;
+    }
+    assert_eq!(lane.dispatched().await, 3);
+}
+
+#[tokio::test]
+async fn a_model_access_refresh_picks_up_a_grant_and_a_revocation() {
+    let lane = model_access_lane(vec![
+        model_access_document("test-model", &["org-granted"]),
+        model_access_document("test-model", &["org-granted", "org-other"]),
+        model_access_document("test-model", &["org-other"]),
+        // The model is not restricted any more.
+        ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({"object": "model_access", "models": []})),
+    ])
+    .await;
+    lane.refresh().await;
+    lane.served("sk-live-granted").await;
+    lane.not_served("sk-live-other").await;
+
+    // A grant.
+    lane.refresh().await;
+    lane.served("sk-live-granted").await;
+    lane.served("sk-live-other").await;
+
+    // A revocation.
+    lane.refresh().await;
+    lane.not_served("sk-live-granted").await;
+    lane.served("sk-live-other").await;
+
+    lane.refresh().await;
+    lane.served("sk-live-granted").await;
+    lane.served("sk-live-noorg").await;
+    assert_eq!(lane.reads().await, 4);
+}
+
+#[tokio::test]
+async fn a_failed_model_access_refresh_keeps_the_previous_snapshot() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let lane = model_access_lane(vec![
+        model_access_document("test-model", &["org-granted"]),
+        ResponseTemplate::new(503),
+        // Not the document: a body without `models`, and an entry without
+        // its list, next to one that would have opened the model.
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({"object": "list", "data": []})),
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "model_access",
+            "models": [
+                {"id": "test-model", "organization_ids": ["org-granted", "org-other"]},
+                {"id": "other-model"}
+            ]
+        })),
+        // The route is gone again (a cloud-api rolled back).
+        ResponseTemplate::new(404),
+    ])
+    .await;
+    lane.refresh().await;
+    for _failed in 0..4 {
+        lane.refresh().await;
+        assert!(lane.state.model_access.has_snapshot());
+        lane.served("sk-live-granted").await;
+        lane.not_served("sk-live-other").await;
+    }
+    assert_eq!(lane.reads().await, 5);
+
+    let rendered = handle.render();
+    for line in [
+        "model_access_refresh_failures_total{reason=\"status\"} 1",
+        "model_access_refresh_failures_total{reason=\"malformed\"} 2",
+        "model_access_refresh_failures_total{reason=\"route_missing\"} 1",
+        "model_access_rejections_total 4",
+    ] {
+        assert!(rendered.contains(line), "{line}: {rendered}");
+    }
+}
+
+#[tokio::test]
+async fn until_a_model_access_document_is_read_nothing_is_restricted() {
+    // A cloud-api that does not have the route yet, one that fails, and one
+    // that answers something else: none of them blocks a request.
+    for first in [
+        ResponseTemplate::new(404),
+        ResponseTemplate::new(503),
+        ResponseTemplate::new(200).set_body_string("<html>not the document</html>"),
+    ] {
+        let lane = model_access_lane(vec![
+            first,
+            model_access_document("test-model", &["org-granted"]),
+        ])
+        .await;
+        // Before any read at all, too.
+        lane.served("sk-live-other").await;
+        lane.refresh().await;
+        assert!(!lane.state.model_access.has_snapshot());
+        lane.served("sk-live-other").await;
+        lane.served("sk-live-noorg").await;
+
+        // Polling goes on, and the first document that arrives applies.
+        lane.refresh().await;
+        lane.not_served("sk-live-other").await;
+        lane.served("sk-live-granted").await;
+    }
+}
+
+#[tokio::test]
+async fn the_static_org_allowlist_still_applies_next_to_model_access() {
+    let lane = access_lane(
+        GatewayOptions {
+            model_access_refresh_secs: 60,
+            allowed_org_ids: vec!["org-granted".to_string()],
+            ..Default::default()
+        },
+        vec![
+            ResponseTemplate::new(503),
+            model_access_document("test-model", &["org-other"]),
+        ],
+    )
+    .await;
+    // No document yet: the allow-list is what keeps the lane to its
+    // organization. Then a document that grants the model to another one:
+    // that organization is still not on the lane, and the lane's own is
+    // not on the model.
+    for read in ["failed", "granted to org-other"] {
+        lane.refresh().await;
+        let response = lane.chat("sk-live-other").await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{read}");
+        assert_eq!(json_body(response).await["error"]["type"], "forbidden");
+    }
+    lane.not_served("sk-live-granted").await;
+    assert_eq!(lane.dispatched().await, 0);
+}
+
+#[tokio::test]
+async fn without_the_setting_model_access_is_never_read_or_checked() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let lane = access_lane(GatewayOptions::default(), Vec::new()).await;
+    // A document that would refuse everyone, if anything read it.
+    Mock::given(method("GET"))
+        .and(path(MODEL_ACCESS_ROUTE))
+        .respond_with(model_access_document("test-model", &[]))
+        .expect(0)
+        .mount(&lane.cloud_api)
+        .await;
+    assert!(!lane.state.model_access.is_enabled());
+    // What `main` starts for this configuration: no task, and a read that
+    // is asked for anyway does nothing.
+    let started = model_access::start(&lane.state.config, &lane.state.http_client);
+    assert!(!started.is_enabled());
+    started.refresh(&lane.state.http_client).await;
+    lane.refresh().await;
+
+    for key in ["sk-live-granted", "sk-live-other", "sk-live-noorg"] {
+        lane.served(key).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    lane.cloud_api.verify().await;
+    assert_eq!(lane.reads().await, 0);
+    let rendered = handle.render();
+    assert!(!rendered.contains("model_access"), "{rendered}");
+}
+
+#[tokio::test]
+async fn trusted_token_requests_are_not_checked_for_model_access() {
+    // Restricted to nobody: every customer key is refused.
+    let lane = model_access_lane(vec![model_access_document("test-model", &[])]).await;
+    lane.refresh().await;
+    lane.not_served("sk-live-granted").await;
+    assert_eq!(lane.dispatched().await, 0);
+    // The config token is cloud-api's or the operator's, and is served.
+    lane.served("test-token").await;
+    assert_eq!(lane.dispatched().await, 1);
+    // Nothing to bill either way: a trusted caller bills its own requests.
+    assert_eq!(lane.billed().await, 0);
+}
+
+/// A request to `route` as `key`. The two upload routes take a multipart
+/// body, every other one JSON.
+fn inference_request(route: &str, key: &str) -> Request<Body> {
+    let builder = Request::builder()
+        .method("POST")
+        .uri(route)
+        .header("authorization", format!("Bearer {key}"));
+    if [
+        routes::ROUTE_IMAGES_EDITS,
+        routes::ROUTE_AUDIO_TRANSCRIPTIONS,
+    ]
+    .contains(&route)
+    {
+        let body = "--part\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ntest-model\r\n--part--\r\n";
+        return builder
+            .header("content-type", "multipart/form-data; boundary=part")
+            .body(Body::from(body))
+            .unwrap();
+    }
+    let body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "hello"}],
+        "prompt": "hello",
+        "input": ["hello"]
+    });
+    builder
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn model_access_covers_every_inference_route_of_the_model() {
+    // Every route of the router that authenticates a caller and reaches the
+    // model's backends.
+    let inference_routes = [
+        routes::ROUTE_CHAT_COMPLETIONS,
+        routes::ROUTE_COMPLETIONS,
+        routes::ROUTE_TOKENIZE,
+        routes::ROUTE_EMBEDDINGS,
+        routes::ROUTE_RERANK,
+        routes::ROUTE_SCORE,
+        routes::ROUTE_PRIVACY_CLASSIFY,
+        routes::ROUTE_IMAGES_GENERATIONS,
+        routes::ROUTE_IMAGES_EDITS,
+        routes::ROUTE_AUDIO_TRANSCRIPTIONS,
+    ];
+    let lane = model_access_lane(vec![model_access_document("test-model", &["org-granted"])]).await;
+    lane.refresh().await;
+
+    for route in inference_routes {
+        let request = inference_request(route, "sk-live-other");
+        let response = lane.app.clone().oneshot(request).await.unwrap();
+        assert_model_not_found(response, route).await;
+    }
+    assert_eq!(lane.dispatched().await, 0);
+    assert_eq!(lane.billed().await, 0);
+
+    // The same requests from the granted organization and from a trusted
+    // caller all reach the engine, whatever it then answers.
+    for key in ["sk-live-granted", "test-token"] {
+        let before = lane.dispatched().await;
+        for route in inference_routes {
+            let request = inference_request(route, key);
+            let response = lane.app.clone().oneshot(request).await.unwrap();
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(
+                !String::from_utf8_lossy(&body).contains("model_not_found"),
+                "{key} {route}: {status}"
+            );
+        }
+        assert_eq!(
+            lane.dispatched().await - before,
+            inference_routes.len(),
+            "{key}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_model_access_refresh_task_reads_at_startup_and_keeps_polling() {
+    let lane = model_access_lane(Vec::new()).await;
+    let first = Mock::given(method("GET"))
+        .and(path(MODEL_ACCESS_ROUTE))
+        .respond_with(model_access_document("test-model", &["org-granted"]))
+        .mount_as_scoped(&lane.cloud_api)
+        .await;
+    lane.served("sk-live-other").await;
+
+    model_access::spawn_refresh(
+        lane.state.model_access.clone(),
+        lane.state.http_client.clone(),
+        Duration::from_millis(50),
+    );
+    // The first read is made at once, not one interval in.
+    for _ in 0..250 {
+        if lane.state.model_access.has_snapshot() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    lane.not_served("sk-live-other").await;
+
+    // The document changes: a later poll picks the grant up.
+    Mock::given(method("GET"))
+        .and(path(MODEL_ACCESS_ROUTE))
+        .respond_with(model_access_document(
+            "test-model",
+            &["org-granted", "org-other"],
+        ))
+        .mount(&lane.cloud_api)
+        .await;
+    drop(first);
+    for _ in 0..250 {
+        if lane.chat("sk-live-other").await.status() == StatusCode::OK {
+            assert!(lane.reads().await >= 2);
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the grant was never picked up");
+}
+
+#[tokio::test]
+async fn the_usage_token_is_sent_to_cloud_api_only() {
+    let lane = model_access_lane(vec![model_access_document("test-model", &["org-granted"])]).await;
+    // The mock answers only a read that carries the token, so a snapshot
+    // means the read carried it.
+    lane.refresh().await;
+    assert!(lane.state.model_access.has_snapshot());
+    lane.served("sk-live-granted").await;
+    assert_eq!(lane.billed().await, 1);
+
+    let carries_the_token = |request: &wiremock::Request| {
+        request
+            .headers
+            .values()
+            .any(|value| value.as_bytes().windows(12).any(|w| w == b"usage-secret"))
+    };
+    // The engine is another origin: nothing it was sent carries the token.
+    let to_engine = lane.engine.received_requests().await.unwrap_or_default();
+    assert_eq!(to_engine.len(), 1);
+    assert!(!to_engine.iter().any(carries_the_token));
+    // On cloud-api it is on the document read and the usage report; the key
+    // check carries the customer's key.
+    let to_cloud_api = lane.cloud_api.received_requests().await.unwrap_or_default();
+    assert_eq!(to_cloud_api.len(), 3);
+    for request in &to_cloud_api {
+        let expected = request.url.path() != "/v1/check_api_key";
+        assert_eq!(carries_the_token(request), expected, "{}", request.url);
+    }
+
+    // A redirect to another origin is followed without the token.
+    let elsewhere = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(MODEL_ACCESS_ROUTE))
+        .respond_with(model_access_document("test-model", &[]))
+        .mount(&elsewhere)
+        .await;
+    let redirected = model_access_lane(vec![ResponseTemplate::new(307).insert_header(
+        "location",
+        format!("{}{MODEL_ACCESS_ROUTE}", elsewhere.uri()).as_str(),
+    )])
+    .await;
+    redirected.refresh().await;
+    let followed = elsewhere.received_requests().await.unwrap_or_default();
+    assert_eq!(followed.len(), 1);
+    assert!(!followed[0].headers.contains_key("authorization"));
+    assert!(!followed.iter().any(carries_the_token));
 }
 
 // ---------------------------------------------------------------------------

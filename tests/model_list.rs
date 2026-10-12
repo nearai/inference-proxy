@@ -191,6 +191,7 @@ fn single_model_state(process: model_list::Process<'_>) -> AppState {
         } else {
             backend_client(backend_headers).unwrap()
         },
+        model_access: model_access::start(&config, &http_client),
         http_client,
         metrics_handle,
         tls_cert_fingerprint: Arc::new(attestation::TlsCertTracker::new(None).unwrap()),
@@ -551,6 +552,137 @@ async fn an_unknown_or_missing_model_is_a_404_and_nothing_is_dispatched_or_bille
     drop(held);
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(requests_to(&cloud, "/v1/internal/usage").await.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Per-organization model access (`VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS`)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn model_access_restricts_one_model_of_a_list_and_not_the_others() {
+    let alpha = MockServer::start().await;
+    let beta = MockServer::start().await;
+    for route in ROUTES {
+        // Alpha serves the operator only, beta the customer.
+        mount_completions(&alpha, route, 1).await;
+        mount_completions(&beta, route, 1).await;
+    }
+    // The customer's key belongs to organization `org`. Alpha is restricted
+    // to another one; beta is not in the document.
+    let cloud = cloud_api("sk-live-customer").await;
+    Mock::given(method("GET"))
+        .and(path(model_access::MODEL_ACCESS_PATH))
+        .and(header("authorization", "Bearer usage-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "model_access",
+            "models": [{"id": ALPHA, "organization_ids": ["another-org"]}]
+        })))
+        .mount(&cloud)
+        .await;
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let logs = Logs::default();
+    let _logs = logs.capture();
+    let gateway = start_list(
+        &json!({"models": [
+            {"id": ALPHA, "backend_urls": [alpha.uri()]},
+            {"id": BETA, "backend_urls": [beta.uri()]}
+        ]}),
+        &[
+            ("CLOUD_API_URL", &cloud.uri()),
+            ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+            ("VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS", "30"),
+        ],
+        Some(handle.clone()),
+    );
+    // The task `app_state` started reads the document at startup.
+    eventually(5, "the model access document", || {
+        gateway.state.model_access.has_snapshot()
+    })
+    .await;
+    let logged = logs.contents();
+    assert!(
+        logged.contains("Per-organization model access enforced"),
+        "{logged}"
+    );
+    assert!(logged.contains("Model access document read"), "{logged}");
+
+    for route in ROUTES {
+        let ask = |bearer: &str, model: &str| {
+            let request = post(route, Some(bearer), &body_for(Some(json!(model))));
+            gateway.app.clone().oneshot(request)
+        };
+        // The restricted model, to the customer: the answer of a model the
+        // gateway does not serve, apart from the name the caller sent.
+        let refused = ask("sk-live-customer", ALPHA).await.unwrap();
+        let unknown = ask("sk-live-customer", GAMMA).await.unwrap();
+        assert_eq!(
+            refused.headers().get("content-type"),
+            unknown.headers().get("content-type")
+        );
+        let refused = assert_model_not_found(refused).await;
+        let unknown = assert_model_not_found(unknown).await;
+        assert_eq!(
+            refused.to_string().replace(ALPHA, GAMMA),
+            unknown.to_string(),
+            "{route}"
+        );
+
+        // The model the document does not list is served to the customer,
+        // and the restricted one to the operator's token.
+        for (bearer, model) in [("sk-live-customer", BETA), ("test-token", ALPHA)] {
+            let response = ask(bearer, model).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{route} {model}");
+            json_body(response).await;
+        }
+    }
+    // Alpha saw the operator's two requests and none of the customer's.
+    alpha.verify().await;
+    beta.verify().await;
+
+    // Billed: the customer's two requests for beta, and nothing for alpha.
+    usage_reports(&cloud, 2).await;
+    let drained = gateway
+        .state
+        .usage_report_delivery
+        .drain(Duration::from_secs(30))
+        .await;
+    assert_eq!(drained.left(), 0);
+    let reports = usage_reports(&cloud, 2).await;
+    assert_eq!(reports.len(), 2, "{reports:?}");
+    assert!(reports.iter().all(|report| report["model"] == BETA));
+
+    let rendered = handle.render();
+    let line = format!("model_access_rejections_total{{model=\"{ALPHA}\"}} 2");
+    assert!(rendered.contains(&line), "{line}: {rendered}");
+    assert!(
+        !rendered.contains(&format!(
+            "model_access_rejections_total{{model=\"{BETA}\"}}"
+        )),
+        "{rendered}"
+    );
+    // Like a request for an unknown model, a refused one is not among the
+    // responses of the model it named.
+    assert!(
+        !rendered.contains(
+            "inference_proxy_model_requests_total{endpoint=\"/v1/chat/completions\",status=\"404\""
+        ),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("http_errors_total{error_type=\"model_not_found\"} 4"),
+        "{rendered}"
+    );
+    // Nothing was logged for the refused requests: the lines about model
+    // access are the two of startup.
+    assert_eq!(
+        logs.contents()
+            .to_lowercase()
+            .matches("model access")
+            .count(),
+        2
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -11,7 +11,8 @@
 //! back-pressure marks), the engine-load poller, the long-context tier and the
 //! HTTP client that carries the model's backend bearer. What is one per
 //! process is what was never about the model: the API key check, the
-//! organization allowlist, usage reporting to cloud-api, the content policy,
+//! organization allowlist, cloud-api's model access document
+//! (`model_access.rs`), usage reporting to cloud-api, the content policy,
 //! the models document source, the stream timings and the health-check
 //! timings.
 //!
@@ -968,6 +969,7 @@ pub fn app_state(process: Process<'_>) -> anyhow::Result<AppState> {
         usage_report_delivery: crate::usage_report::UsageReportDelivery::new(
             config.usage_report.clone(),
         ),
+        model_access: crate::model_access::start(&config, &http_client),
         signing: Arc::new(signing),
         cache: Arc::new(crate::cache::ChatCache::new(
             &config.model_name,

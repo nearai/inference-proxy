@@ -18,6 +18,7 @@ pub mod fusion;
 pub mod gpu_evidence_delegate;
 pub mod image_validation;
 pub mod metrics_middleware;
+pub mod model_access;
 pub mod model_list;
 pub mod model_metrics;
 pub mod ohttp_gateway;
@@ -85,4 +86,9 @@ pub struct AppState {
     /// (`usage_report.rs`, `VLLM_PROXY_USAGE_REPORT_*`). One per process,
     /// shared by every model of a list.
     pub usage_report_delivery: Arc<usage_report::UsageReportDelivery>,
+    /// cloud-api's per-organization model access, as last read from its
+    /// document (`model_access.rs`, `VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS`).
+    /// One per process, shared by every model of a list. Inert unless
+    /// configured.
+    pub model_access: Arc<model_access::ModelAccess>,
 }

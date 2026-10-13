@@ -313,7 +313,10 @@ async fn serve(
     // config token, not an `sk-` API key). An untrusted caller's header is
     // discarded entirely (treated as absent, no metric), same as priority.
     let hint = if auth.cloud_api_key.is_none() {
-        parse_replica_hint(&headers)
+        parse_replica_hint(
+            &headers,
+            state.config.replica_state().map(|c| c.host_id.as_str()),
+        )
     } else {
         crate::backend_affinity::ReplicaHint::Absent
     };

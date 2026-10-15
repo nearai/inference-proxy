@@ -1837,11 +1837,13 @@ mod tests {
         let cache = AttestationCache::new(300);
         let report = make_test_report("ecdsa", "aabb");
 
-        // Use NON-alphabetical (struct-declaration-order) keys to verify the
-        // RawValue byte-exactness invariant: a verifier hashing the raw bytes
-        // gets the same result as compose-manager. This is the case that
-        // `serde_json::Value` would break (it alphabetizes keys).
-        let actions_json = r#"[{"timestamp":"2026-05-21T10:01:40Z","action":"compose_up","tag":"v0.0.169","commit":"8e71b71b","file":"small-models.yaml","file_sha256":"7f60fb50"}]"#;
+        // Use NON-alphabetical (struct-declaration-order) keys and spaced
+        // separators to verify the RawValue byte-exactness invariant: a
+        // verifier hashing the raw bytes gets the same result as
+        // compose-manager. `serde_json::Value` keeps the key order (the
+        // `preserve_order` feature) but not the bytes: it re-serializes
+        // compactly, so the spacing alone changes the hash.
+        let actions_json = r#"[{"timestamp": "2026-05-21T10:01:40Z", "action": "compose_up", "tag": "v0.0.169", "commit": "8e71b71b", "file": "small-models.yaml", "file_sha256": "7f60fb50"}]"#;
         let actions_hash = hex::encode(Sha256::digest(actions_json.as_bytes()));
         let cm_raw =
             format!(r#"{{"actions":{actions_json},"actions_hash":"{actions_hash}","quote":"q"}}"#);
@@ -1886,22 +1888,21 @@ mod tests {
         );
 
         // Confirm that serde_json::Value re-serialization DOES NOT match
-        // when keys are non-alphabetical — this is the regression the test
-        // exists to catch.
+        // the raw bytes — this is the regression the test exists to catch.
         let re_serialized = serde_json::to_string(&cm["actions"]).unwrap();
         let re_hash = hex::encode(Sha256::digest(re_serialized.as_bytes()));
         assert_ne!(
             re_hash,
             cm["actions_hash"].as_str().unwrap(),
-            "serde_json::Value must NOT produce the same hash for non-alphabetical keys \
+            "serde_json::Value must NOT produce the same hash as the raw bytes \
              — if this assertion fails, the RawValue byte-exactness invariant is untested"
         );
     }
 
-    /// Once compose-manager adopts alphabetical-key canonicalization
-    /// (PR nearai/compose-manager#36), `serde_json::Value` will sort keys
-    /// the same way, so re-serialization round-trips correctly. This test
-    /// verifies that property with an alphabetical-key fixture.
+    /// With an alphabetical-key, compact fixture (compose-manager's
+    /// canonical form, PR nearai/compose-manager#36), re-serialization
+    /// through `serde_json::Value` round-trips byte for byte. This test
+    /// verifies that property.
     #[tokio::test]
     async fn test_actions_hash_round_trips_with_alphabetical_keys() {
         use sha2::{Digest, Sha256};

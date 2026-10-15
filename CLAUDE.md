@@ -53,6 +53,7 @@ This is a Rust rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-pro
 - `system_messages::merge_system_messages` (list mode, per model, `merge_system_messages: true`) rewrites a chat request with a `system` message after the first position into one leading `system` message holding all their text, for a chat template that 400s anything else. It never drops anything: a non-text part, an unknown content shape or two values for one extra field leave the request untouched. Runs after decryption, the repairs and the content policy, before the estimate and the affinity keys
 - Signed text format: `"{model_name}:{sha256_request}:{sha256_response}"` signed by both algos
 - `serde_json::to_string` matches Python's `json.dumps(separators=(",",":"))`
+- `serde_json` is built with `preserve_order`: a body the proxy parses and re-serializes keeps the caller's key order. Grammar-constrained engines write fields in the order of a schema's `properties`, so sorting them (the default `BTreeMap`) changed what the model generates
 
 ### Dependencies to know about
 

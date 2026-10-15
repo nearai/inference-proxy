@@ -4377,6 +4377,68 @@ async fn test_json_schema_response_format_is_repaired_before_dispatch() {
     // The mock expectation (body_json) verifies the backend received the named schema
 }
 
+#[tokio::test]
+async fn test_forwarded_body_keeps_the_callers_key_order() {
+    // A grammar-constrained engine writes an object's fields in the order of
+    // the schema's `properties`, so the proxy must not reorder them: sorted,
+    // a free-text field that the caller listed last ("conditions") is written
+    // first. Same for a tool's parameters. Compared on the raw bytes the
+    // backend receives, since an object comparison ignores order.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-order",
+            "choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}]
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    let request_body = r#"{"messages":[{"role":"user","content":"What is the weather like in London?"}],
+        "response_format":{"type":"json_schema","json_schema":{"name":"weather","strict":true,
+          "schema":{"type":"object","properties":{
+            "location":{"type":"string","enum":["London","New York"]},
+            "temperature":{"type":"number"},
+            "conditions":{"type":"string"}},
+          "required":["location","temperature","conditions"]}}},
+        "tools":[{"type":"function","function":{"name":"get_current_weather","parameters":{"type":"object",
+          "properties":{"zone":{"type":"string"},"unit":{"type":"string"},"area":{"type":"string"}}}}}]}"#;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(request_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let received = mock_server.received_requests().await.unwrap();
+    let forwarded = String::from_utf8(received[0].body.clone()).unwrap();
+    let at = |needle: &str| {
+        forwarded
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} not forwarded"))
+    };
+    assert!(
+        at(r#""location":{"#) < at(r#""temperature":{"#)
+            && at(r#""temperature":{"#) < at(r#""conditions":{"#),
+        "schema properties reordered: {forwarded}"
+    );
+    assert!(
+        at(r#""zone":{"#) < at(r#""unit":{"#) && at(r#""unit":{"#) < at(r#""area":{"#),
+        "tool parameters reordered: {forwarded}"
+    );
+}
+
 /// Matches a chat body whose first assistant tool call carries exactly these
 /// plaintext `function.arguments`.
 struct FirstToolCallArguments(&'static str);

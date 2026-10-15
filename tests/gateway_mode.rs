@@ -125,6 +125,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         cloud_api_auth_timeout_secs: 5,
         cloud_api_usage_token: options.cloud_api_usage_token.clone(),
         usage_report: options.usage_report.clone(),
+        usage_report_outbox: None,
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,

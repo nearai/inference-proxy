@@ -34,6 +34,7 @@ pub mod startup_checks;
 pub mod system_messages;
 pub mod tool_calls;
 pub mod types;
+pub mod usage_outbox;
 pub mod usage_report;
 pub mod vllm_dp_affinity;
 

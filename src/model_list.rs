@@ -965,8 +965,9 @@ pub fn app_state(process: Process<'_>) -> anyhow::Result<AppState> {
         "Model list enabled"
     );
     Ok(AppState {
-        usage_report_delivery: crate::usage_report::UsageReportDelivery::new(
-            config.usage_report.clone(),
+        usage_report_delivery: crate::usage_report::UsageReportDelivery::from_config(
+            &config,
+            &http_client,
         ),
         signing: Arc::new(signing),
         cache: Arc::new(crate::cache::ChatCache::new(

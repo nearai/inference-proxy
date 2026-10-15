@@ -39,10 +39,10 @@
 # Hermetic inputs
 # ───────────────
 # The release binary contains natively compiled code (aws-lc-sys, ring,
-# secp256k1-sys, bindgen output via libclang, OpenSSL linkage), so a newer
-# gcc, binutils, glibc or libclang in the builder changes its bytes, and any
-# package that moves in the runtime stage changes the image. Neither stage
-# installs anything from a moving source:
+# secp256k1-sys, libsqlite3-sys, bindgen output via libclang, OpenSSL
+# linkage), so a newer gcc, binutils, glibc or libclang in the builder changes
+# its bytes, and any package that moves in the runtime stage changes the
+# image. Neither stage installs anything from a moving source:
 #   * Base image: ubuntu:22.04, pinned by digest, for both stages.
 #   * Ubuntu packages come from the Ubuntu snapshot archive frozen at
 #     UBUNTU_SNAPSHOT (https://snapshot.ubuntu.com/ubuntu/<timestamp>), and

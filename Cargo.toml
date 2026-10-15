@@ -59,6 +59,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
 
+# Durable usage-report outbox (opt-in, `usage_outbox.rs`). `bundled` compiles the
+# SQLite amalgamation shipped in libsqlite3-sys, so the SQLite version is the
+# one Cargo.lock pins and the image needs no libsqlite3 package.
+rusqlite = { version = "0.40", default-features = false, features = ["bundled", "cache"] }
+# `statvfs`, for the size of the outbox's volume (`usage_outbox.rs`). Already
+# in the tree many times over; here to be called directly.
+libc = "0.2"
+
 # Replica state publishing (opt-in)
 redis = { version = "0.32", default-features = false, features = ["tokio-comp", "tokio-rustls-comp", "connection-manager"] }
 # Direct dep only to install the ring provider as the process default: the lock enables

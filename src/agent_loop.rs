@@ -1029,18 +1029,20 @@ async fn send_upstream(
     body: Vec<u8>,
     tracing_ids: &TracingIds,
 ) -> Result<reqwest::Response, AppError> {
-    let mut req = client
-        .post(upstream_url)
-        .header("content-type", "application/json")
-        .header("accept", "text/event-stream");
-    for (k, v) in tracing_ids.upstream_headers() {
-        req = req.header(k, v);
-    }
-    let response = req
-        .body(body)
-        .send()
+    let body = Bytes::from(body);
+    let build = || {
+        let mut req = client
+            .post(upstream_url)
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream");
+        for (k, v) in tracing_ids.upstream_headers() {
+            req = req.header(k, v);
+        }
+        req.body(body.clone())
+    };
+    let response = crate::proxy::send_resending_undelivered(build, "agent_loop", || true)
         .await
-        .map_err(|e| AppError::Internal(e.into()))?;
+        .map_err(crate::proxy::send_error)?;
 
     let status = response.status();
     if !status.is_success() {

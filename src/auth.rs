@@ -5,7 +5,7 @@ use subtle::ConstantTimeEq;
 use tracing::warn;
 
 use crate::config::Config;
-use crate::error::AppError;
+use crate::error::{error_chain, AppError};
 use crate::request_tracing::TracingIds;
 use crate::AppState;
 
@@ -176,19 +176,6 @@ fn classify_reqwest_error(e: &reqwest::Error) -> &'static str {
     } else {
         "other"
     }
-}
-
-/// Render the full error chain (`source()` → `source()` → ...) so we don't
-/// lose the underlying hyper / rustls / io::Error message that reqwest hides.
-fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
-    let mut out = e.to_string();
-    let mut src = e.source();
-    while let Some(inner) = src {
-        out.push_str(" | ");
-        out.push_str(&inner.to_string());
-        src = inner.source();
-    }
-    out
 }
 
 /// Validate an `sk-` prefixed API key against the cloud API.

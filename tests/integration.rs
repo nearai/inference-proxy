@@ -639,6 +639,117 @@ async fn test_chat_completions_non_streaming() {
     assert_eq!(body["choices"][0]["message"]["content"], "Hello!");
 }
 
+/// A backend whose first connection is closed with the request still unread,
+/// so the kernel resets it: what a client sees when the engine's keep-alive
+/// timer closes a pooled connection just as a request goes out on it. Every
+/// later connection gets a chat completion. Returns the base URL and the
+/// number of connections accepted.
+async fn backend_resetting_first_connection() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let accepted = connections.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            if accepted.fetch_add(1, Ordering::SeqCst) == 0 {
+                tokio::spawn(async move {
+                    let _ = stream.readable().await;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    drop(stream);
+                });
+                continue;
+            }
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 8192];
+                loop {
+                    let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                    let length: usize = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .map_or(0, |value| value.trim().parse().unwrap());
+                    while buf.len() < end + 4 + length {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    buf.drain(..end + 4 + length);
+                    let body = serde_json::to_vec(&serde_json::json!({
+                        "id": "chatcmpl-resent",
+                        "object": "chat.completion",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "Hello!"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+                    }))
+                    .unwrap();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    if stream.write_all(head.as_bytes()).await.is_err()
+                        || stream.write_all(&body).await.is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (format!("http://{addr}"), connections)
+}
+
+/// The engine never read the request, so the proxy sends it again instead of
+/// answering 500 (`error sending request for url ...`).
+#[tokio::test]
+async fn test_chat_completions_resent_after_backend_reset_the_connection() {
+    let (backend_url, connections) = backend_resetting_first_connection().await;
+    let app = build_test_app(&backend_url);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "model": "test-model",
+                        "messages": [{"role": "user", "content": "Hi"}],
+                        "stream": false
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response).await;
+    assert_eq!(body["id"], "chatcmpl-resent");
+    assert_eq!(
+        connections.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "one reset connection, one resend"
+    );
+}
+
 #[tokio::test]
 async fn test_chat_completions_forwards_derived_vllm_data_parallel_rank() {
     let mock_server = MockServer::start().await;

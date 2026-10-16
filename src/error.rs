@@ -242,6 +242,22 @@ impl IntoResponse for AppError {
     }
 }
 
+/// Render the full error chain (`source()` → `source()` → ...) so we don't
+/// lose the underlying hyper / rustls / io::Error message that reqwest hides:
+/// its own `Display` is `error sending request for url (...)` whatever the
+/// cause. Only for transport errors: a decode error's chain can quote the
+/// body it failed on.
+pub(crate) fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = e.to_string();
+    let mut src = e.source();
+    while let Some(inner) = src {
+        out.push_str(" | ");
+        out.push_str(&inner.to_string());
+        src = inner.source();
+    }
+    out
+}
+
 impl From<crate::admission::Rejected> for AppError {
     fn from(rejected: crate::admission::Rejected) -> Self {
         AppError::Overloaded {

@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 
 use crate::cache::ChatCache;
-use crate::error::AppError;
+use crate::error::{error_chain, AppError};
 use crate::signing::SigningPair;
 use crate::{AppState, TracingIds};
 
@@ -17,6 +17,9 @@ use crate::{AppState, TracingIds};
 /// `:` are ignored by consumers.
 pub const SSE_KEEPALIVE_COMMENT: &[u8] = b": keep-alive\n\n";
 
+#[cfg(test)]
+#[path = "proxy_resend_tests.rs"]
+mod proxy_resend_tests;
 #[cfg(test)]
 #[path = "proxy_upstream_error_tests.rs"]
 mod proxy_upstream_error_tests;
@@ -159,10 +162,7 @@ pub fn sanitize_validation_errors(message: &str) -> String {
 pub(crate) fn sanitized_upstream_url_for_logs(url: &str) -> String {
     match url::Url::parse(url) {
         Ok(mut parsed) => {
-            let _ = parsed.set_username("");
-            let _ = parsed.set_password(None);
-            parsed.set_query(None);
-            parsed.set_fragment(None);
+            sanitize_url(&mut parsed);
             parsed.to_string()
         }
         Err(_) => url
@@ -171,6 +171,14 @@ pub(crate) fn sanitized_upstream_url_for_logs(url: &str) -> String {
             .unwrap_or("<invalid upstream url>")
             .to_string(),
     }
+}
+
+/// Drop what a log line must not carry: credentials, query and fragment.
+fn sanitize_url(url: &mut url::Url) {
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
 }
 
 /// Parse an upstream error body, log it, and return the parsed info.
@@ -1141,16 +1149,17 @@ fn build_upstream_request(
     client: &reqwest::Client,
     url: &str,
     body: Bytes,
-    opts: &ProxyOpts,
+    tracing_ids: Option<&TracingIds>,
+    data_parallel_rank: Option<usize>,
 ) -> reqwest::RequestBuilder {
     let req = apply_tracing_headers(
         client
             .post(url)
             .header("content-type", "application/json")
             .header("accept", "text/event-stream"),
-        opts.tracing_ids.as_ref(),
+        tracing_ids,
     );
-    apply_data_parallel_rank_header(req, opts.upstream_data_parallel_rank).body(body)
+    apply_data_parallel_rank_header(req, data_parallel_rank).body(body)
 }
 
 fn upstream_unreachable() -> AppError {
@@ -1173,8 +1182,91 @@ fn transport_error(error: reqwest::Error) -> AppError {
             error_type: "upstream_request_timeout".to_string(),
         }
     } else {
-        AppError::Internal(error.into())
+        send_error(error)
     }
+}
+
+/// The generic 500 for a request the backend never answered, logged with the
+/// whole error chain (`error_chain`): reqwest's own message is `error sending
+/// request for url (...)` whatever the cause. Only for errors from `send()`,
+/// which end before the response body, so the chain cannot quote it.
+pub(crate) fn send_error(mut error: reqwest::Error) -> AppError {
+    if let Some(url) = error.url_mut() {
+        sanitize_url(url);
+    }
+    AppError::Internal(anyhow::anyhow!(error_chain(&error)))
+}
+
+/// Why a failed `send()` proves the backend never read the whole request, or
+/// `None` when it may have.
+///
+/// A TCP reset (`ECONNRESET`, or `EPIPE` on a write after it) means the peer
+/// closed its socket while bytes of the request were still unread, or before
+/// they arrived: it never had the complete request, so it cannot have started
+/// on it. That is what a pooled keep-alive connection looks like when the
+/// engine's HTTP server closes it just as a request goes out on it (uvicorn
+/// closes idle connections after 5 s). A connection closed after the request
+/// was read (`connection closed before message completed`) proves nothing:
+/// the engine may have taken it. Timeouts and connect failures have their own
+/// handling and are not counted here.
+pub(crate) fn undelivered_request(error: &reqwest::Error) -> Option<&'static str> {
+    if !error.is_request() || error.is_connect() || error.is_timeout() {
+        return None;
+    }
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            match io.kind() {
+                std::io::ErrorKind::ConnectionReset => return Some("connection_reset"),
+                std::io::ErrorKind::BrokenPipe => return Some("broken_pipe"),
+                _ => {}
+            }
+        }
+        source = cause.source();
+    }
+    None
+}
+
+/// Send the request `build` makes, and send it once more when the first
+/// attempt fails in a way that proves the backend never read it
+/// (`undelivered_request`) and `may_resend` still agrees. The broken
+/// connection has left the client's pool by then, so the second attempt goes
+/// out on another one, to the same backend: it is healthy, and keeps the
+/// conversation's prefix cache. Exactly one resend; whatever the second
+/// attempt returns is the result.
+pub(crate) async fn send_resending_undelivered(
+    build: impl Fn() -> reqwest::RequestBuilder,
+    endpoint: &'static str,
+    may_resend: impl FnOnce() -> bool,
+) -> reqwest::Result<reqwest::Response> {
+    let error = match build().send().await {
+        Err(error) => error,
+        response => return response,
+    };
+    let Some(reason) = undelivered_request(&error) else {
+        return Err(error);
+    };
+    if !may_resend() {
+        return Err(error);
+    }
+    let backend = error.url().map_or_else(String::new, |url| {
+        sanitized_upstream_url_for_logs(url.as_str())
+    });
+    warn!(
+        backend = %backend,
+        endpoint,
+        reason,
+        error = %error_chain(&error.without_url()),
+        "Backend closed the connection before reading the request, sending it again"
+    );
+    let result = build().send().await;
+    metrics::counter!(
+        "upstream_resends_total",
+        "endpoint" => endpoint,
+        "outcome" => if result.is_ok() { "answered" } else { "failed" },
+    )
+    .increment(1);
+    result
 }
 
 fn mark_backend_unreachable(pool: &crate::backend_pool::BackendPool, index: usize) {
@@ -1193,11 +1285,12 @@ fn mark_backend_unreachable(pool: &crate::backend_pool::BackendPool, index: usiz
     }
 }
 
-/// Send the request to `url`. When the connection fails before anything was
-/// sent and `opts.connect_failover` is set, retry once on another healthy
-/// backend: `url` and `opts.backend_guard` then point at the replacement.
-/// Nothing else is retried here — an HTTP error, queue-full included, means
-/// the engine saw the request and the caller decides.
+/// Send the request to `url`. A request the backend provably never read is
+/// sent once more (`send_resending_undelivered`). When the connection fails
+/// before anything was sent and `opts.connect_failover` is set, retry once on
+/// another healthy backend: `url` and `opts.backend_guard` then point at the
+/// replacement. Nothing else is retried here — an HTTP error, queue-full
+/// included, means the engine saw the request and the caller decides.
 async fn send_upstream(
     client: &reqwest::Client,
     url: &mut String,
@@ -1213,9 +1306,18 @@ async fn send_upstream(
     if let Some(permit) = opts.admission.as_ref() {
         permit.mark_dispatched();
     }
-    let first = build_upstream_request(client, url, body.clone(), opts)
-        .send()
-        .await;
+    // A deadline that has passed by the time the first attempt fails rules
+    // out the resend, as it rules out a fail-over below.
+    let deadline = opts.first_token_deadline;
+    let first = {
+        let (tracing_ids, rank) = (opts.tracing_ids.as_ref(), opts.upstream_data_parallel_rank);
+        send_resending_undelivered(
+            || build_upstream_request(client, url, body.clone(), tracing_ids, rank),
+            endpoint,
+            || !deadline.is_some_and(|deadline| deadline.expired()),
+        )
+        .await
+    };
     let response = match first {
         Ok(response) => response,
         Err(error) if error.is_connect() && opts.connect_failover.is_some() => {
@@ -1346,7 +1448,16 @@ async fn send_upstream(
                 permit.attach_backend(next.index);
             }
             opts.backend_guard = Some(next.guard);
-            match build_upstream_request(client, url, body, opts).send().await {
+            match build_upstream_request(
+                client,
+                url,
+                body,
+                opts.tracing_ids.as_ref(),
+                opts.upstream_data_parallel_rank,
+            )
+            .send()
+            .await
+            {
                 Ok(response) => {
                     if let Some((affinity, key)) = affinity {
                         // Later turns follow the request, not the dead host.
@@ -3385,24 +3496,23 @@ pub async fn proxy_simple(
     timeout: Option<std::time::Duration>,
     tracing_ids: Option<&TracingIds>,
 ) -> Result<Response, AppError> {
-    let mut builder = client.request(method, url);
-
-    if let Some(body) = body {
-        builder = builder
-            .header("content-type", "application/json")
-            .body(body.to_vec());
-    }
-
-    if let Some(timeout) = timeout {
-        builder = builder.timeout(timeout);
-    }
-    builder = apply_tracing_headers(builder, tracing_ids);
+    let build = || {
+        let mut builder = client.request(method.clone(), url);
+        if let Some(body) = body {
+            builder = builder
+                .header("content-type", "application/json")
+                .body(body.to_vec());
+        }
+        if let Some(timeout) = timeout {
+            builder = builder.timeout(timeout);
+        }
+        apply_tracing_headers(builder, tracing_ids)
+    };
 
     let upstream_start = std::time::Instant::now();
-    let response = builder
-        .send()
+    let response = send_resending_undelivered(build, "simple", || true)
         .await
-        .map_err(|e| AppError::Internal(e.into()))?;
+        .map_err(send_error)?;
     metrics::histogram!("upstream_request_duration_seconds", "endpoint" => "simple")
         .record(upstream_start.elapsed().as_secs_f64());
 
@@ -4203,7 +4313,7 @@ mod tests {
     }
 
     /// Build a ProxyOpts with fixed signing keys for deterministic tests.
-    fn test_proxy_opts() -> ProxyOpts {
+    pub(super) fn test_proxy_opts() -> ProxyOpts {
         let ecdsa_key: [u8; 32] = [
             0xac, 0x09, 0x74, 0xbe, 0xc3, 0x9a, 0x17, 0xe3, 0x6b, 0xa4, 0xa6, 0xb4, 0xd2, 0x38,
             0xff, 0x94, 0x4b, 0xac, 0xb3, 0x5e, 0x5d, 0xc4, 0xaf, 0x0f, 0x33, 0x47, 0xe5, 0x87,

@@ -57,6 +57,16 @@ All error responses use the OpenAI-compatible JSON format:
 | 429 | `rate_limited` | Per-IP rate limit exceeded |
 | 500 | `server_error` | Internal proxy error (details hidden from client) |
 
+A request the backend never read is sent once more before any error: when the
+send fails with a connection reset (the backend closed its socket with the
+request still unread, e.g. its keep-alive timer closing a pooled connection as
+the request went out), the proxy repeats it on another connection to the same
+backend and counts it in `upstream_resends_total{endpoint,outcome}`. A
+connection closed after the request was read is never resent: the backend may
+have started on it. The log line of a 500 from a failed send carries the whole
+error chain (`error sending request for url (...) | ... | Connection reset by
+peer (os error 104)`), not just reqwest's first line.
+
 ### Upstream errors (vLLM/sglang)
 
 Named routes (`/v1/chat/completions`, `/v1/completions`, etc.) pass through the backend error body verbatim, preserving the original status code.

@@ -6,7 +6,7 @@ use tracing::info;
 use vllm_proxy_rs::ohttp_gateway::OhttpGateway;
 use vllm_proxy_rs::{
     admission, attestation, backend_affinity, backend_pool, cache, config, engine_load, fusion,
-    metrics_middleware, model_list, routes, signing, startup_checks, usage_report,
+    metrics_middleware, model_access, model_list, routes, signing, startup_checks, usage_report,
     vllm_dp_affinity, AppState,
 };
 
@@ -47,6 +47,15 @@ fn build_http_client(
     config: &config::Config,
     default_headers: Option<reqwest::header::HeaderMap>,
 ) -> reqwest::Result<reqwest::Client> {
+    let mut http_builder = http_client_builder(config);
+    if let Some(headers) = default_headers {
+        http_builder = http_builder.default_headers(headers);
+    }
+    http_builder.build()
+}
+
+/// The settings every client of the process shares (see `build_http_client`).
+fn http_client_builder(config: &config::Config) -> reqwest::ClientBuilder {
     let mut http_builder = reqwest::Client::builder()
         .dns_resolver(Arc::new(Ipv4OnlyResolver))
         .pool_max_idle_per_host(config.max_keepalive)
@@ -56,10 +65,16 @@ fn build_http_client(
             config.pool_idle_timeout_secs,
         ));
     }
-    if let Some(headers) = default_headers {
-        http_builder = http_builder.default_headers(headers);
-    }
-    http_builder.build()
+    http_builder
+}
+
+/// The client that reads cloud-api's model access document
+/// (`model_access.rs`): the same settings, and no redirect followed, so the
+/// service token on that read goes to the URL it was sent to and nowhere else.
+fn build_no_redirect_client(config: &config::Config) -> anyhow::Result<reqwest::Client> {
+    Ok(http_client_builder(config)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
 }
 
 #[tokio::main]
@@ -154,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
             http_client: build_http_client(&config, None)?,
             metrics_handle: metrics_middleware::setup_metrics_recorder(),
             backend_client: &|headers| Ok(build_http_client(&config, Some(headers))?),
+            no_redirect_client: &|| build_no_redirect_client(&config),
         })?;
         return serve(state, &listen_addr, listen_port).await;
     }
@@ -320,10 +336,17 @@ async fn main() -> anyhow::Result<()> {
         info!("Connection fail-over to another backend enabled for chat/completions");
     }
 
+    // Per-organization model access (gateway mode): inert unless configured,
+    // and read for the first time in `serve`.
+    let model_access = Arc::new(model_access::ModelAccess::new(&config, &|| {
+        build_no_redirect_client(&config)
+    })?);
+
     // Build app state
     let model_name = config.model_name.clone();
     let state = AppState {
         usage_report_delivery: usage_report::UsageReportDelivery::new(config.usage_report.clone()),
+        model_access,
         config: Arc::new(config),
         signing: Arc::new(signing),
         cache: Arc::new(chat_cache),
@@ -420,6 +443,15 @@ async fn serve(state: AppState, listen_addr: &str, listen_port: u16) -> anyhow::
         trust_proxy_headers = state.config.rate_limit_trust_proxy_headers,
         "Rate limiter configured"
     );
+
+    // Per-organization model access (`VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS`,
+    // nothing happens without it): the first read of cloud-api's document is
+    // waited for here, for at most its 5 second timeout, so the listener
+    // below never accepts a request the check cannot see yet. A read that
+    // fails does not stop the process: it starts with nothing restricted
+    // and tries again every few seconds. Only a token cloud-api refuses
+    // (401, 403) does: no later read would enforce anything.
+    model_access::start(&state).await?;
 
     // The routes for this state behind the rate limiter, the request id and
     // the HTTP metrics.

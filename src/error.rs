@@ -64,7 +64,9 @@ pub enum AppError {
     /// Gateway list mode (`model_list.rs`): the request's `model` is not one
     /// of the configured ids (`Some`), or is missing or not a string (`None`).
     /// The message leaves the name out: it is the caller's string and must
-    /// not reach a log line.
+    /// not reach a log line. Also the answer for a served model the caller's
+    /// organization may not use (`model_access.rs`), so that the two cannot
+    /// be told apart.
     #[error("model not found")]
     ModelNotFound { model: Option<String> },
 

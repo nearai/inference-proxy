@@ -43,7 +43,9 @@ It runs after the two repairs above. A process without a list never does it.
 1. `Authorization: Bearer sk-…` → `POST {CLOUD_API_URL}/v1/check_api_key`
    (retries on transport/5xx; 401/402/429 pass through). With
    `VLLM_PROXY_ALLOWED_ORG_IDS` set, a valid key from any other organization
-   gets a 403 here.
+   gets a 403 here. With `VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS` set, a key
+   whose organization may not use the model gets a 404 next (see
+   [Per-organization model access](#per-organization-model-access)).
 2. Policy: any content part whose `type` is in
    `VLLM_PROXY_REJECTED_CONTENT_PART_TYPES` (e.g. `video_url`) → `400` before
    anything is fetched or dispatched; image inputs are validated as today.
@@ -107,6 +109,7 @@ to the current in-CVM behavior.
 | `VLLM_BACKEND_CONVERSATION_AFFINITY` | `1` | Fleet-level conversation affinity (the CVM proxy still does its own across its replicas). |
 | `HEALTH_CHECK_INTERVAL_SECS` / `_TIMEOUT_SECS` / `_MAX_FAILURES` | `5` / `4` / `3` | The timeout must exceed the CVM proxy's own 3 s backend probe. |
 | `VLLM_PROXY_ALLOWED_ORG_IDS` | the partner's organization id | Only that organization's keys are served; any other valid key gets 403. Without it any cloud-api key works here, same as the direct `*.completions.near.ai` endpoints. |
+| `VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS` | unset (off) | Enforce cloud-api's per-organization model access: the restricted models and who may use each are read from `{CLOUD_API_URL}/v1/internal/model-access` before the gateway accepts requests and then every this many seconds, and a key of any other organization gets the 404 of a model that is not served (see [Per-organization model access](#per-organization-model-access)). A revocation takes up to this long, plus one read, to apply. Cannot be combined with `FUSION_ENABLED`. Unset or `0` = off. |
 | `VLLM_PROXY_REJECTED_CONTENT_PART_TYPES` | `video_url,input_audio,file` | Modalities this deployment does not serve → deterministic `400`. |
 | `VLLM_PROXY_MODELS_DOCUMENT_URL` / `VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE` | `https://cloud-api.near.ai/v1/models` / `150` | `GET /v1/models` serves cloud-api's entry for `MODEL_NAME` (pricing, modalities, `is_ready`, `openrouter.slug`) with `capacity` added: concurrency = `VLLM_PROXY_ADMISSION_MAX_INFLIGHT`, requests per minute = this value. One URL for inference and the listing; `is_ready` stays under cloud-api's catalog control (the kill switch). Source unreadable → the engine's list, as without the variable. To serve a model that cloud-api keeps out of its public catalog, point this at `{CLOUD_API_URL}/v1/internal/models`: a URL under `{CLOUD_API_URL}/v1/internal/` is read with `CLOUD_API_USAGE_TOKEN` (startup fails without it), and the token is sent to no other URL. |
 | `VLLM_PROXY_DISCOUNT_TO_USER` | unset (list price) | The lane's discount off the list price, a fraction in `[0, 1)` with at most four decimal places (`0.2` = 20 % off): published as `discount_to_user` on the models document entry (in place of any the source carries) and sent with every usage report, so cloud-api bills the price the aggregator shows; empty or `0` = none, an invalid value fails startup, and it requires `VLLM_PROXY_MODELS_DOCUMENT_URL`. While that source is unreadable, the engine list served instead carries the discount on every entry, and an engine answer that is not a model list becomes a 502 rather than going out without it. cloud-api refuses a report whose discount exceeds its `INTERNAL_USAGE_MAX_DISCOUNT` (default `0.5`), leaving that usage unbilled, so keep the value within it. |
@@ -658,6 +661,188 @@ lines are unchanged. Log
 lines carry ids only (request, organization, workspace, key, model), never a
 report's content.
 
+## Per-organization model access
+
+cloud-api can restrict a model to a list of organizations, and it applies
+that on its own inference path. A lane is not on that path: it checks the key
+and bills the usage itself. So without this setting, a valid key of any
+organization the lane lets in reaches a restricted model through the lane.
+`VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS` makes the gateway apply cloud-api's
+rule (`src/model_access.rs`).
+
+cloud-api publishes the rule as one document:
+
+```text
+GET {CLOUD_API_URL}/v1/internal/model-access
+Authorization: Bearer <CLOUD_API_USAGE_TOKEN>
+
+{"object": "model_access",
+ "models": [{"id": "<model name>", "organization_ids": ["<uuid>", "..."]}]}
+```
+
+It lists the restricted models, each with the organizations that may use it,
+possibly none. An `id` is the model's canonical catalog name, the same string
+as the gateway's `MODEL_NAME` or a list entry's `id`. A model that is not in
+the document is not restricted. Fields the gateway does not know are ignored.
+
+The gateway reads the document once before it accepts requests, and then
+every `VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS` seconds in a background task.
+A read has a 5 second timeout, follows no redirect and takes at most 1 MiB.
+The last document is kept in memory. A request never waits for cloud-api: it
+is checked against the document in memory.
+
+### What is checked
+
+The check comes after the key check and once the model is known: `MODEL_NAME`,
+or in [list mode](#several-models-in-one-gateway) the configured id the body's
+`model` matched. A request made with a cloud-api key is refused when the model
+is in the document and the key's organization is not on its list. Model names
+and organization ids are compared exactly. A key whose check returned no
+organization id (an older cloud-api) is refused for a restricted model.
+
+The refusal is the answer for a model the gateway does not serve:
+
+```json
+{"error": {"message": "The model `example/alpha` does not exist or you do not have access to it.",
+           "type": "invalid_request_error", "param": null, "code": "model_not_found"}}
+```
+
+The status is `404`. The name in the message is the `model` string the caller
+sent, never a configured id the caller did not name; without a `model` the
+message says that one is required, as for an unknown model. Nothing is
+dispatched, no admission slot is taken and nothing is billed. A streaming
+request gets the same status and JSON body, not a stream.
+
+Every route that takes a customer key applies the check:
+
+- `/v1/chat/completions` and `/v1/completions`;
+- on a process that serves one model, also tokenize, embeddings, rerank,
+  score, images, audio transcriptions and privacy classify;
+- `/v1/signature/{chat_id}`, whose signed text names the model. A request
+  to it names no model, so its refusal is its own answer for a chat it does
+  not have (`404`, "Chat id not found or expired"). That also holds for the
+  chats an organization made before it lost access.
+
+The inner request of `/ohttp` is a request to one of these routes and is
+checked there. A test walks the list the router is built from, so a route
+that takes a customer key cannot be added without the check.
+
+A caller that presents the gateway's own `TOKEN` is not checked. It is a
+trusted caller that applies the rule itself.
+
+`VLLM_PROXY_ALLOWED_ORG_IDS` is independent and still applies, first: an
+organization that is not on the lane gets its `403` at the key check, whatever
+the document says. An organization has to pass both.
+
+### What a caller can and cannot tell
+
+- In list mode, the response to a refused caller is the response for a model
+  the gateway does not serve: the same status, headers and body, with the
+  caller's own `model` string in it. From that response a caller cannot tell
+  a restricted model from one the gateway does not have.
+- Operators can tell them apart, on purpose. A refusal is counted in
+  `model_access_rejections_total`, and an unknown model is not.
+- The lane's own `/v1/models` lists a restricted model, on purpose. That
+  document is the lane's listing of what it serves and it is unauthenticated,
+  so there is no organization to check. A caller who reads it can see that
+  the lane serves a model it is refused.
+- A process that serves one model never answers "unknown model" for another
+  reason: it serves its model whatever the body names. There this answer
+  always means that the caller's organization may not use the lane's model.
+
+### When the document cannot be read
+
+| Situation | Effect |
+| --- | --- |
+| A read fails while a document is in force | That document stays in force, however old it is. |
+| No document has been read yet, because the read at startup failed | Nothing is restricted and `model_access_enforcing` is `0`. The read is tried again every 5 seconds (every interval, if that is shorter) until one succeeds. From then on the interval applies. |
+| The read at startup is answered `401` or `403` | The process does not start. The token is not the one cloud-api expects, so no later read would enforce anything. |
+
+A read fails when cloud-api does not answer within the timeout, when the
+connection fails, and on any answer that is not a success: a `404` (a
+cloud-api that does not have the route yet), a `5xx`, a `401` or `403` after
+startup, and any redirect, which is never followed. It also fails when the
+body is not the document: more than 1 MiB, not valid JSON, an entry without
+its `id` or its `organization_ids`, or a model listed twice. A document
+counts only when all of it is valid: one bad entry fails the whole read.
+
+Startup waits for the first read. The listener is bound only when that read
+has ended, so the first request the gateway accepts is already checked. The
+wait is one read, at most its 5 second timeout. If that read fails or times
+out, the gateway starts all the same with nothing restricted (the second row
+above), unless the answer was a `401` or `403` (the third).
+
+A grant or a revocation in cloud-api applies when the next read has been
+applied here, so after up to `VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS` seconds
+plus the time of that read. While reads fail it does not apply at all: the
+last document stays in force, with no bound. A request that was accepted
+before the new document was applied runs to its end, and a stream that is
+already running is not cut. The setting has no upper bound: set it to the
+longest delay a revocation may take, and alert on failing reads.
+
+### Settings and rollout
+
+`VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS` is the only setting. Unset or `0`, the
+gateway behaves as before: it never calls the route, checks nothing and has
+none of the series below. Set, startup fails:
+
+- without `CLOUD_API_URL` and `CLOUD_API_USAGE_TOKEN`;
+- when the token cannot be sent as a header value. White space around it is
+  dropped for this read;
+- when cloud-api answers `401` or `403` to the first read;
+- with `FUSION_ENABLED`. A fusion request names the panel and judge models it
+  calls, and the proxy calls them with a trusted token that no access check
+  sees, so the two cannot run together.
+
+The token is sent to `{CLOUD_API_URL}/v1/internal/model-access` and nowhere
+else by this feature: a redirect is not followed, to another host or to the
+same one.
+
+Roll out cloud-api first, then set the variable on the lane. A lane that is
+switched on in front of a cloud-api without the route keeps serving as
+before, retries every 5 seconds and starts enforcing when the route appears.
+
+The setting is not specific to a gateway: a per-model proxy that
+authenticates callers against cloud-api can run it too, and unless it does,
+the direct endpoint of a restricted model stays open to any valid key.
+
+### Metrics and logs
+
+- `model_access_enforcing`: `1` once a document is in force, `0` while none
+  is. A process with the setting on that shows `0` is not enforcing: alert on
+  it.
+- `model_access_rejections_total`: requests refused by this check. In list
+  mode it carries the `model` label, always a configured id.
+- `model_access_refresh_failures_total{reason}`: reads that did not produce a
+  document. `reason` is `route_missing` (a `404`), `unauthorized` (a `401` or
+  `403`), `redirect` (any `3xx`), `status` (any other answer that is not a
+  success), `transport` (timeout, connection or body error) or `malformed`.
+- `model_access_last_refresh_timestamp_seconds`: when the document in force
+  was last read, as Unix time. `time()` minus this is its age. The series does
+  not exist until a first document has been read.
+
+A refused request is also one `http_errors_total{error_type="model_not_found"}`,
+like a request for an unknown model (`not_found` on the signature route). In
+list mode it is not in `inference_proxy_model_requests_total`, for the same
+reason.
+
+The log says what is true at the time. Before the first read: "Model access:
+reading cloud-api's document before serving". Each time a document that
+differs from the last one is applied, one line names the models this process
+serves that the document restricts, with the number of organizations on each
+list and no organization id:
+
+```text
+Model access document applied: it restricts these models served here restricted=example/alpha (organizations: 2)
+```
+
+When the document restricts none of the served models, the line says that
+instead, with the ids the process serves. A model that should be restricted
+and is not in that line has another name in cloud-api's catalog than in this
+gateway's configuration. A failing read is logged once when it starts to fail
+or fails in another way, and says whether a document stays in force or model
+access is not enforced. Nothing is logged per request or per poll.
+
 ## Several models in one gateway
 
 A gateway is model-scoped: `MODEL_NAME` is its billing key, it has one backend
@@ -688,7 +873,10 @@ only ever sent to that model's backends: not to another model's, and not to
 cloud-api.
 
 One per process, as before: the key check against cloud-api, the organization
-allowlist, the usage-report endpoint and token and the delivery of the reports
+allowlist, cloud-api's model access document
+([Per-organization model access](#per-organization-model-access): one document
+covers every model of the list), the usage-report endpoint and
+token and the delivery of the reports
 (`VLLM_PROXY_USAGE_REPORT_*`: one cap and one queue for all models, since they
 report to the same cloud-api), the content policy, the models document source,
 the stream timings (keep-alive, commit window, error peek, first-token
@@ -1002,6 +1190,11 @@ billed. The check comes after authentication, so a caller without a valid key
 gets the same `401` whatever it names and cannot use the answer to enumerate
 models.
 
+With `VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS` set, a configured model that
+cloud-api restricts to other organizations gets this same answer
+([Per-organization model access](#per-organization-model-access)). One model
+of a list can be restricted while the others stay open to every key.
+
 Usage reports carry the selected model's `id` and its discount.
 
 Only what is defined for several models is served: `/v1/chat/completions`,
@@ -1086,6 +1279,7 @@ id, as their last label:
 - `backend_tier_requests_total`, `backend_tier_output_reserve_capped_total`,
   `request_estimated_prompt_tokens`;
 - `first_token_deadline_refusals_total`;
+- `model_access_rejections_total`;
 - `inference_proxy_usage_reports_total`,
   `inference_proxy_usage_report_duration_seconds` and the series of
   [Usage report delivery](#usage-report-delivery)
@@ -1137,7 +1331,9 @@ disconnects from an open stream is not a stream error either
 (`stream_client_disconnects_total`, process-wide, has those).
 
 A request without a resolved model is in neither series: an unknown or missing
-`model` (the `404` above, counted by `request_model_match_total`) and
+`model` (the `404` above, counted by `request_model_match_total`), a model the
+caller's organization may not use (the same `404`, counted by
+`model_access_rejections_total`) and
 everything refused before the body's `model` is read (the key check's `401`,
 `402`, `403` and `429`, the per-IP rate limit, a `413`, a body that is not a
 JSON object).

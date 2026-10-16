@@ -11,7 +11,8 @@
 //! back-pressure marks), the engine-load poller, the long-context tier and the
 //! HTTP client that carries the model's backend bearer. What is one per
 //! process is what was never about the model: the API key check, the
-//! organization allowlist, usage reporting to cloud-api, the content policy,
+//! organization allowlist, cloud-api's model access document
+//! (`model_access.rs`), usage reporting to cloud-api, the content policy,
 //! the models document source, the stream timings and the health-check
 //! timings.
 //!
@@ -925,6 +926,10 @@ pub struct Process<'a> {
     /// Builds a client with these default headers and the process's pool and
     /// timeout settings: one for each model that has a bearer or a priority.
     pub backend_client: &'a dyn Fn(reqwest::header::HeaderMap) -> anyhow::Result<reqwest::Client>,
+    /// Builds a client with the process's pool and timeout settings that
+    /// follows no redirect: the one that reads cloud-api's model access
+    /// document (`model_access.rs`). Only called when that is configured.
+    pub no_redirect_client: &'a dyn Fn() -> anyhow::Result<reqwest::Client>,
 }
 
 /// The whole state of a process in list mode, with every model's background
@@ -942,6 +947,7 @@ pub fn app_state(process: Process<'_>) -> anyhow::Result<AppState> {
         http_client,
         metrics_handle,
         backend_client,
+        no_redirect_client,
     } = process;
     let models = ModelList::start(&config, &http_client, backend_client)?;
     // What every model's lane shares; each model's own numbers are on its
@@ -968,6 +974,10 @@ pub fn app_state(process: Process<'_>) -> anyhow::Result<AppState> {
         usage_report_delivery: crate::usage_report::UsageReportDelivery::new(
             config.usage_report.clone(),
         ),
+        model_access: Arc::new(crate::model_access::ModelAccess::new(
+            &config,
+            no_redirect_client,
+        )?),
         signing: Arc::new(signing),
         cache: Arc::new(crate::cache::ChatCache::new(
             &config.model_name,
@@ -1052,7 +1062,8 @@ impl ModelMatch {
     }
 }
 
-fn requested_model(request: &Value) -> Option<&str> {
+/// The `model` string of a request body, when it has one.
+pub(crate) fn requested_model(request: &Value) -> Option<&str> {
     request.get("model").and_then(Value::as_str)
 }
 

@@ -55,6 +55,10 @@ async fn serve(
     // See the chat route: the process's one model, or the list entry the
     // body's `model` names.
     let model = crate::model_list::model_for(&state, &request_json)?;
+    // See the chat route: per-organization model access.
+    state.model_access.check(&auth, model.id, model.label, || {
+        crate::model_list::requested_model(&request_json).map(str::to_string)
+    })?;
     *counted_as = ModelRequest::of(model.label, ROUTE_COMPLETIONS);
 
     // Engine `priority`: the proxy decides it (trusted callers may set it via

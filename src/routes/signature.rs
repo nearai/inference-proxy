@@ -16,7 +16,7 @@ pub struct SignatureQuery {
 /// GET /v1/signature/{chat_id}?signing_algo=ecdsa
 pub async fn signature(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    auth: RequireAuth,
     Path(chat_id): Path<String>,
     Query(query): Query<SignatureQuery>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -26,10 +26,17 @@ pub async fn signature(
                 .to_string(),
         ));
     }
-    let cache_value = state
-        .cache
-        .get_chat(&chat_id)
-        .ok_or_else(|| AppError::NotFound("Chat id not found or expired".to_string()))?;
+    let unknown_chat = || AppError::NotFound("Chat id not found or expired".to_string());
+    // Per-organization model access (`model_access.rs`): the signed text
+    // names the model, so a key whose organization may not use it gets the
+    // answer of a chat this proxy does not have.
+    if !state
+        .model_access
+        .allows(&auth, &state.config.model_name, None)
+    {
+        return Err(unknown_chat());
+    }
+    let cache_value = state.cache.get_chat(&chat_id).ok_or_else(unknown_chat)?;
 
     let signed: SignedChat = serde_json::from_str(&cache_value)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Failed to parse cache value: {e}")))?;

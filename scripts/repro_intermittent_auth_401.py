@@ -27,18 +27,15 @@ Use it to:
   * Confirm the bug reproduces against current prod (expect non-zero 401 rate)
   * Confirm the retry fix mitigates it once deployed (expect 0% 401)
 
-Usage:
-    # Default: GLM-5, the synthetic test's API key, 200 reqs, 10-way concurrent
-    uv run scripts/repro_intermittent_auth_401.py
+Usage (an API key is required: set API_KEY or pass --api-key):
+    # Default: GLM-5, 200 reqs, 10-way concurrent
+    API_KEY=sk-... uv run scripts/repro_intermittent_auth_401.py
 
     # Sustained run against another model
-    uv run scripts/repro_intermittent_auth_401.py \\
+    API_KEY=sk-... uv run scripts/repro_intermittent_auth_401.py \\
         --url https://qwen35-122b.completions.near.ai/v1/chat/completions \\
         --model Qwen/Qwen3.5-122B-A10B \\
         --total 1000 --concurrency 20
-
-    # Use your own key
-    API_KEY=sk-... uv run scripts/repro_intermittent_auth_401.py
 
 Exits non-zero if any 401 with the inference-proxy auth error body is seen,
 so it can be used as a one-shot probe in cron/CI.
@@ -55,8 +52,6 @@ from dataclasses import dataclass
 
 import httpx
 
-# Synthetic test's API key (from Datadog synthetic mjg-788-p48).
-DEFAULT_API_KEY = "sk-67acfa4d689b4e94a0edb0087e043a9c"
 DEFAULT_URL = "https://glm-5.completions.near.ai/v1/chat/completions"
 DEFAULT_MODEL = "zai-org/GLM-5-FP8"
 
@@ -262,8 +257,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--url", default=DEFAULT_URL, help=f"chat-completions URL (default: {DEFAULT_URL})")
     p.add_argument(
         "--api-key",
-        default=os.environ.get("API_KEY", DEFAULT_API_KEY),
-        help="Bearer token (or env API_KEY). Defaults to the Datadog synthetic's key.",
+        default=os.environ.get("API_KEY"),
+        help="Bearer token. Required: pass it here or set env API_KEY.",
     )
     p.add_argument("--model", default=DEFAULT_MODEL, help=f"model id (default: {DEFAULT_MODEL})")
     p.add_argument("--prompt", default="Hi there", help="user prompt")
@@ -272,7 +267,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--concurrency", type=int, default=10, help="max concurrent in-flight")
     p.add_argument("--start-delay-ms", type=float, default=10.0, help="stagger start (ms)")
     p.add_argument("--request-timeout", type=float, default=60.0, help="per-request timeout (s)")
-    return p.parse_args()
+    args = p.parse_args()
+    if not args.api_key:
+        p.error("an API key is required: set API_KEY or pass --api-key")
+    return args
 
 
 def main() -> None:

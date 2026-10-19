@@ -252,12 +252,17 @@ pub(crate) fn effective_error_status(
     }
 }
 
-/// SGLang scheduler admission rejection (`_abort_on_queued_limit`): the
-/// waiting queue is full, or — with priority scheduling — a queued request was
-/// displaced by a higher-priority arrival before it started.
+/// Engine admission rejection. SGLang (`_abort_on_queued_limit`): the waiting
+/// queue is full, or — with priority scheduling — a queued request was
+/// displaced by a higher-priority arrival before it started. vLLM
+/// (`QueueOverflowError` for `--max-num-queued-reqs`, `MaxQueuedTokensError`
+/// for `--max-num-queued-tokens`, both 503).
 fn message_is_queue_full(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
-    message.contains("queue is full") || message.contains("aborted by a higher priority request")
+    message.contains("queue is full")
+        || message.contains("aborted by a higher priority request")
+        || message.contains("engine is currently busy and cannot accept new requests")
+        || message.contains("engine has reached its prefill token backlog limit")
 }
 
 /// If `chunk` begins with an SSE `data:` event whose payload carries an
@@ -1130,6 +1135,9 @@ pub struct ConnectFailover {
     /// `AppError::tier_unavailable` refusal below, when admission is off and
     /// there is no `Permit` to carry it instead.
     pub retry_after_secs: u64,
+    /// `Config::backend_max_inflight`: the replacement is bound like the
+    /// first placement.
+    pub max_conns: Option<u32>,
     /// Conversation to re-pin onto the replacement backend once it answers.
     pub affinity: Option<(
         Arc<crate::backend_affinity::BackendConversationAffinity>,
@@ -1219,7 +1227,7 @@ async fn send_upstream(
     let response = match first {
         Ok(response) => response,
         Err(error) if error.is_connect() && opts.connect_failover.is_some() => {
-            let (pool, path, failed, tier, strict, retry_after_secs, affinity) = {
+            let (pool, path, failed, tier, strict, retry_after_secs, max_conns, affinity) = {
                 let failover = opts.connect_failover.as_ref().expect("checked above");
                 (
                     failover.pool.clone(),
@@ -1228,6 +1236,7 @@ async fn send_upstream(
                     failover.tier,
                     failover.strict,
                     failover.retry_after_secs,
+                    failover.max_conns,
                     failover.affinity.clone(),
                 )
             };
@@ -1263,7 +1272,7 @@ async fn send_upstream(
                 };
                 let engine = |index: usize| opts.admission.as_ref().and_then(|p| p.engine(index));
                 let policy = crate::backend_pool::Policy {
-                    max_conns: None,
+                    max_conns,
                     max_conns_by_backend: limits.as_deref(),
                     requested_tier: opts.admission.as_ref().map(|p| p.requested_tier()),
                     avoid: &avoid,
@@ -1312,6 +1321,20 @@ async fn send_upstream(
                         // Nothing waited on an engine here either.
                         permit.abandon();
                         return Err(AppError::from(permit.reject_host_share()));
+                    }
+                    if max_conns.is_some() {
+                        // Pool proxy bounded per backend (`VLLM_BACKEND_MAX_INFLIGHT`)
+                        // and every other healthy backend is at the bound: the
+                        // same 429 the first placement gives when all are full,
+                        // not a 502 that counts against upstream uptime.
+                        crate::model_metrics::model_counter!(pool.model(), "backend_failover_total", "outcome" => "refused")
+                            .increment(1);
+                        crate::model_metrics::model_counter!(pool.model(), "admission_rejections_total", "reason" => "host_share")
+                            .increment(1);
+                        return Err(AppError::Overloaded {
+                            reason: "host_share",
+                            retry_after_secs,
+                        });
                     }
                 }
                 crate::model_metrics::model_counter!(pool.model(), "backend_failover_total", "outcome" => "exhausted").increment(1);
@@ -5798,6 +5821,33 @@ data: [DONE]
         let resp = asm.into_response("cmpl");
         let id = resp["id"].as_str().unwrap();
         assert!(id.starts_with("cmpl-"), "should generate id: {id}");
+    }
+
+    #[test]
+    fn test_vllm_admission_rejections_are_queue_full() {
+        // vllm/exceptions.py: QueueOverflowError, MaxQueuedTokensError (503).
+        assert!(message_is_queue_full(
+            "The engine is currently busy and cannot accept new requests. \
+             Please try again later or on a different instance."
+        ));
+        assert!(message_is_queue_full(
+            "The engine has reached its prefill token backlog limit. \
+             Please try again later or on a different instance."
+        ));
+        assert!(!message_is_queue_full("Internal server error"));
+        let info = |message: &str| UpstreamErrorInfo {
+            message: message.to_string(),
+            error_type: "ServiceUnavailableError".to_string(),
+        };
+        let busy = info("The engine is currently busy and cannot accept new requests.");
+        assert_eq!(
+            effective_error_status(503, Some(&busy), true),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            effective_error_status(503, Some(&busy), false),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[test]

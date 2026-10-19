@@ -31,6 +31,8 @@ struct TestAppOptions {
     backend_affinity_max_imbalance: u32,
     /// `sk-` key validation endpoint; `None` disables cloud_api_key auth.
     cloud_api_url: Option<String>,
+    /// `VLLM_BACKEND_MAX_INFLIGHT`.
+    backend_max_inflight: Option<u32>,
 }
 
 impl Default for TestAppOptions {
@@ -52,6 +54,7 @@ impl Default for TestAppOptions {
             backend_conversation_affinity: false,
             backend_affinity_max_imbalance: 8,
             cloud_api_url: None,
+            backend_max_inflight: None,
         }
     }
 }
@@ -288,6 +291,7 @@ fn build_test_app_inner_with_pool(
         admission_queue_saturated_at: 1,
         admission_retry_after_secs: 2,
         backend_connect_failover: false,
+        backend_max_inflight: options.backend_max_inflight,
         backend_probe_urls: Vec::new(),
         backend_long_context_urls: Vec::new(),
         backend_long_context_probe_urls: Vec::new(),
@@ -894,6 +898,68 @@ async fn test_multiple_backends_without_affinity_stay_least_connections() {
         StatusCode::OK
     );
     assert_eq!(requests_seen(&backend_a).await, 1);
+    assert_eq!(requests_seen(&backend_b).await, 1);
+}
+
+#[tokio::test]
+async fn test_backend_max_inflight_refuses_when_every_backend_is_full() {
+    let backend_a = MockServer::start().await;
+    let backend_b = MockServer::start().await;
+    mount_chat_ok(&backend_a, "/v1/chat/completions", 0).await;
+    mount_chat_ok(&backend_b, "/v1/chat/completions", 1).await;
+    let mock_url = backend_a.uri();
+    let (app, pool) = build_test_app_inner_with_pool(
+        &mock_url,
+        TestAppOptions {
+            backend_urls: vec![backend_a.uri(), backend_b.uri()],
+            backend_max_inflight: Some(2),
+            ..Default::default()
+        },
+    );
+    // The bound counts completions placed under it (`lane_conns`).
+    let full = |index: usize, conns| {
+        pool.backends()[index]
+            .lane_conns
+            .store(conns, std::sync::atomic::Ordering::Relaxed)
+    };
+
+    // Both at the bound: refused here with 429 `overloaded`, nothing sent.
+    full(0, 2);
+    full(1, 2);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(
+                    serde_json::to_vec(&affinity_chat_body(0)).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(response.headers().contains_key("retry-after"));
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["error"]["type"], "overloaded");
+    assert_eq!(requests_seen(&backend_a).await, 0);
+    assert_eq!(requests_seen(&backend_b).await, 0);
+
+    // One slot frees on B: the request goes there, A stays untouched.
+    full(1, 1);
+    assert_eq!(
+        post_chat(app, "/v1/chat/completions", &affinity_chat_body(1)).await,
+        StatusCode::OK
+    );
+    assert_eq!(requests_seen(&backend_a).await, 0);
     assert_eq!(requests_seen(&backend_b).await, 1);
 }
 
@@ -6211,6 +6277,7 @@ fn build_test_app_with_cloud_api_retries(
         admission_queue_saturated_at: 1,
         admission_retry_after_secs: 2,
         backend_connect_failover: false,
+        backend_max_inflight: None,
         backend_probe_urls: Vec::new(),
         backend_long_context_urls: Vec::new(),
         backend_long_context_probe_urls: Vec::new(),
@@ -8853,6 +8920,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         admission_queue_saturated_at: 1,
         admission_retry_after_secs: 2,
         backend_connect_failover: false,
+        backend_max_inflight: None,
         backend_probe_urls: Vec::new(),
         backend_long_context_urls: Vec::new(),
         backend_long_context_probe_urls: Vec::new(),
@@ -9321,6 +9389,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         admission_queue_saturated_at: 1,
         admission_retry_after_secs: 2,
         backend_connect_failover: false,
+        backend_max_inflight: None,
         backend_probe_urls: Vec::new(),
         backend_long_context_urls: Vec::new(),
         backend_long_context_probe_urls: Vec::new(),

@@ -37,7 +37,7 @@ pub(super) fn place_completion(
     let requested_tier = tier.map(|decision| decision.estimated);
     let place = |tier| {
         let policy = Policy {
-            max_conns: None,
+            max_conns: state.config.backend_max_inflight,
             max_conns_by_backend: limits.as_deref(),
             requested_tier,
             avoid: &|index| model.admission.backend_saturated(index),
@@ -112,6 +112,7 @@ pub(super) fn place_completion(
             tier: restrict,
             strict,
             retry_after_secs: state.config.admission_retry_after_secs,
+            max_conns: state.config.backend_max_inflight,
             affinity: affinity_key.map(|key| (model.backend_affinity.clone(), key)),
         });
 

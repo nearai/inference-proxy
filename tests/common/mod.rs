@@ -129,6 +129,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         admission_queue_saturated_at: 1,
         admission_retry_after_secs: 2,
         backend_connect_failover: false,
+        backend_max_inflight: None,
         backend_probe_urls: Vec::new(),
         backend_long_context_urls: Vec::new(),
         backend_long_context_probe_urls: Vec::new(),

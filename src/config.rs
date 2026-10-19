@@ -703,6 +703,16 @@ pub struct Config {
     /// (`VLLM_BACKEND_CONNECT_FAILOVER`). HTTP errors, queue-full included,
     /// are never retried.
     pub backend_connect_failover: bool,
+    /// Pool proxy: at most this many requests in flight per backend
+    /// (`VLLM_BACKEND_MAX_INFLIGHT`, 0 = unbounded). A request that finds every
+    /// healthy backend at the bound is refused with 429 `overloaded` instead of
+    /// being sent: the engine's running batch, not the caller, absorbs the
+    /// limit, so a busier lane cannot slow every stream. Size it at the
+    /// concurrency where the engine's per-token latency is still acceptable,
+    /// and keep the engine's own `--max-num-seqs` at or above it. Refused with
+    /// lane admission (single-model budget or list mode), whose per-host
+    /// shares bound the same thing and would take precedence.
+    pub backend_max_inflight: Option<u32>,
     /// Gateway mode: one plain-HTTP probe base URL per backend (same order as
     /// `VLLM_BACKEND_URLS`) whose `/v1/metrics` is polled for the engine's
     /// running and queued request counts (`VLLM_BACKEND_PROBE_URLS`). Empty =
@@ -1100,6 +1110,20 @@ impl Config {
             })?;
         }
         let backend_connect_failover = env_bool("VLLM_BACKEND_CONNECT_FAILOVER");
+        let backend_max_inflight = match env_parse::<u32>("VLLM_BACKEND_MAX_INFLIGHT", 0)? {
+            0 => None,
+            bound => Some(bound),
+        };
+        // Lane admission bounds each backend through its host share, which
+        // would take precedence (`Policy::limit`); a gateway in list mode sets
+        // that per model. Refuse the pair rather than let one silently win.
+        if backend_max_inflight.is_some() && (admission_max_inflight > 0 || list_mode) {
+            anyhow::bail!(
+                "VLLM_BACKEND_MAX_INFLIGHT is for a pool proxy and cannot be combined with lane \
+                 admission (VLLM_PROXY_ADMISSION_MAX_INFLIGHT or {})",
+                crate::model_list::MODEL_LIST_FILE_ENV
+            );
+        }
         let backend_probe_urls = url_list("VLLM_BACKEND_PROBE_URLS");
         check_probe_urls(&backend_urls, &backend_probe_urls)?;
         let backend_probe_interval_secs: u64 = env_parse("VLLM_BACKEND_PROBE_INTERVAL_SECS", 2)?;
@@ -1298,6 +1322,7 @@ impl Config {
             admission_queue_saturated_at,
             admission_retry_after_secs,
             backend_connect_failover,
+            backend_max_inflight,
             replica_state,
             backend_probe_urls,
             backend_probe_interval_secs,
@@ -1728,6 +1753,7 @@ mod tests {
             "VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT",
             "VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS",
             "VLLM_BACKEND_CONNECT_FAILOVER",
+            "VLLM_BACKEND_MAX_INFLIGHT",
             "VLLM_BACKEND_PROBE_URLS",
             "VLLM_BACKEND_PROBE_INTERVAL_SECS",
             "VLLM_BACKEND_LONG_CONTEXT_URLS",
@@ -3102,6 +3128,56 @@ mod tests {
                     .unwrap_err()
                     .to_string()
                     .contains("TIER_BORROWING"));
+            },
+        );
+    }
+
+    #[test]
+    fn test_backend_max_inflight_parses_and_refuses_admission() {
+        with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
+            assert_eq!(Config::from_env().unwrap().backend_max_inflight, None);
+        });
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                ("VLLM_BACKEND_MAX_INFLIGHT", "0"),
+            ],
+            || assert_eq!(Config::from_env().unwrap().backend_max_inflight, None),
+        );
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                ("VLLM_BACKEND_MAX_INFLIGHT", "96"),
+            ],
+            || assert_eq!(Config::from_env().unwrap().backend_max_inflight, Some(96)),
+        );
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                ("VLLM_BACKEND_MAX_INFLIGHT", "96"),
+                ("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", "48"),
+            ],
+            || {
+                let error = Config::from_env().unwrap_err().to_string();
+                assert!(error.contains("VLLM_BACKEND_MAX_INFLIGHT"), "{error}");
+            },
+        );
+        // A gateway in list mode bounds backends per model: refused too.
+        with_env_vars(
+            &[
+                ("TOKEN", "t"),
+                ("VLLM_BACKEND_MAX_INFLIGHT", "96"),
+                (
+                    crate::model_list::MODEL_LIST_FILE_ENV,
+                    "/nonexistent/models.json",
+                ),
+            ],
+            || {
+                let error = Config::from_env().unwrap_err().to_string();
+                assert!(error.contains("VLLM_BACKEND_MAX_INFLIGHT"), "{error}");
             },
         );
     }

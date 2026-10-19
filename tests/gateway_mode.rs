@@ -46,6 +46,8 @@ struct GatewayOptions {
     admission_backpressure_secs: Option<u64>,
     admission_queue_saturated_at: Option<u32>,
     backend_connect_failover: bool,
+    /// `VLLM_BACKEND_MAX_INFLIGHT` (pool proxy, admission off).
+    backend_max_inflight: Option<u32>,
     /// Engine metrics probe base URLs, one per backend (polled every 100 ms here).
     backend_probe_urls: Vec<String>,
     /// Long-context tier: backends appended after `backend_urls`, their probe
@@ -185,6 +187,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         admission_queue_saturated_at: options.admission_queue_saturated_at.unwrap_or(1),
         admission_retry_after_secs: 2,
         backend_connect_failover: options.backend_connect_failover,
+        backend_max_inflight: options.backend_max_inflight,
         backend_probe_urls: options.backend_probe_urls.clone(),
         backend_probe_interval_secs: 2,
         backend_long_context_urls: options.backend_long_context_urls.clone(),
@@ -1746,6 +1749,35 @@ async fn failover_never_retries_an_engine_rejection() {
         rejected.verify().await;
         idle.verify().await;
     }
+}
+
+#[tokio::test]
+async fn failover_onto_backends_at_their_bound_is_a_429_not_a_502() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    let dead = unreachable_backend_url();
+    let (app, state) = build_gateway_with_state(
+        &mock.uri(),
+        GatewayOptions {
+            backend_urls: vec![dead, mock.uri()],
+            backend_connect_failover: true,
+            backend_max_inflight: Some(1),
+            ..Default::default()
+        },
+    );
+    // The live backend is at its bound, so placement takes the dead one; its
+    // connection fails and fail-over has nowhere with room left.
+    state.backend_pool.backends()[1]
+        .lane_conns
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+    let response = app.oneshot(chat_request(hello_body())).await.unwrap();
+    assert_overloaded(response).await;
+    mock.verify().await;
 }
 
 #[tokio::test]

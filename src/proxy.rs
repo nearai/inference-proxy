@@ -1322,6 +1322,20 @@ async fn send_upstream(
                         permit.abandon();
                         return Err(AppError::from(permit.reject_host_share()));
                     }
+                    if max_conns.is_some() {
+                        // Pool proxy bounded per backend (`VLLM_BACKEND_MAX_INFLIGHT`)
+                        // and every other healthy backend is at the bound: the
+                        // same 429 the first placement gives when all are full,
+                        // not a 502 that counts against upstream uptime.
+                        crate::model_metrics::model_counter!(pool.model(), "backend_failover_total", "outcome" => "refused")
+                            .increment(1);
+                        crate::model_metrics::model_counter!(pool.model(), "admission_rejections_total", "reason" => "host_share")
+                            .increment(1);
+                        return Err(AppError::Overloaded {
+                            reason: "host_share",
+                            retry_after_secs,
+                        });
+                    }
                 }
                 crate::model_metrics::model_counter!(pool.model(), "backend_failover_total", "outcome" => "exhausted").increment(1);
                 warn!(

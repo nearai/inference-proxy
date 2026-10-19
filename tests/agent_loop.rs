@@ -135,6 +135,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
         admission_queue_saturated_at: 1,
         admission_retry_after_secs: 2,
         backend_connect_failover: false,
+        backend_max_inflight: None,
         backend_probe_urls: Vec::new(),
         backend_long_context_urls: Vec::new(),
         backend_long_context_probe_urls: Vec::new(),

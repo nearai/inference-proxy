@@ -185,6 +185,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         admission_queue_saturated_at: options.admission_queue_saturated_at.unwrap_or(1),
         admission_retry_after_secs: 2,
         backend_connect_failover: options.backend_connect_failover,
+        backend_max_inflight: None,
         backend_probe_urls: options.backend_probe_urls.clone(),
         backend_probe_interval_secs: 2,
         backend_long_context_urls: options.backend_long_context_urls.clone(),

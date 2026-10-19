@@ -319,6 +319,12 @@ async fn main() -> anyhow::Result<()> {
     if config.backend_connect_failover {
         info!("Connection fail-over to another backend enabled for chat/completions");
     }
+    if let Some(bound) = config.backend_max_inflight {
+        info!(
+            bound,
+            "Requests in flight bounded per backend; refusing with 429 when every backend is full"
+        );
+    }
 
     // Build app state
     let model_name = config.model_name.clone();

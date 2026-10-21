@@ -221,6 +221,8 @@ async fn serve(
                 "web_context_search requires stream:true".to_string(),
             ));
         }
+        let count =
+            agent_loop::web_context_search_count(&request_json).map_err(AppError::BadRequest)?;
         if state.config.web_context_search_url.is_none()
             || state.config.web_context_search_api_key.is_none()
         {
@@ -250,6 +252,7 @@ async fn serve(
             request_hash,
             request_json,
             chunk_transform,
+            count,
         )
         .await;
     }

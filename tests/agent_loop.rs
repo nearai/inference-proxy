@@ -12,7 +12,7 @@ use axum::http::{Request, StatusCode};
 use axum::middleware;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
-use wiremock::matchers::{body_string_contains, header, method, path};
+use wiremock::matchers::{body_string_contains, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use vllm_proxy_rs::*;
@@ -525,9 +525,12 @@ async fn happy_path_executes_search_and_continues() {
         )
         .mount(&upstream)
         .await;
+    // No `count` on the tool keeps the search at 20 results and 20 URLs.
     Mock::given(method("GET"))
         .and(path("/res/v1/llm/context"))
         .and(header("X-Subscription-Token", "brave-test-key"))
+        .and(query_param("count", "20"))
+        .and(query_param("maximum_number_of_urls", "20"))
         .respond_with(ResponseTemplate::new(200).set_body_json(brave_context_json()))
         .mount(&brave)
         .await;
@@ -580,6 +583,166 @@ async fn happy_path_executes_search_and_continues() {
     // [DONE] should only appear once in the final stream — intermediate
     // [DONE]s from upstream are swallowed by the loop.
     assert_eq!(body.matches("data: [DONE]").count(), 1);
+}
+
+/// Upstream answers with one `web_context_search` call, then a final answer.
+async fn mount_search_then_answer(upstream: &MockServer, chat_id: &str) {
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(upstream_tool_call_sse(chat_id, "rust"), "text/event-stream"),
+        )
+        .up_to_n_times(1)
+        .mount(upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(upstream_final_answer_sse(chat_id), "text/event-stream"),
+        )
+        .mount(upstream)
+        .await;
+}
+
+fn request_with_count(count: serde_json::Value) -> Request<Body> {
+    let mut body = agent_loop_request_body(true);
+    body["tools"][0]["count"] = count;
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("authorization", "Bearer test-token")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn count_sets_search_results_and_urls() {
+    let upstream = MockServer::start().await;
+    let brave = MockServer::start().await;
+    mount_search_then_answer(&upstream, "chatcmpl-COUNT").await;
+    Mock::given(method("GET"))
+        .and(path("/res/v1/llm/context"))
+        .and(query_param("count", "5"))
+        .and(query_param("maximum_number_of_urls", "5"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(brave_context_json()))
+        .expect(1)
+        .mount(&brave)
+        .await;
+
+    let brave_url = format!("{}/res/v1/llm/context", brave.uri());
+    let app = build_agent_loop_app(&upstream.uri(), Some(&brave_url));
+    let response = app
+        .oneshot(request_with_count(serde_json::json!(5)))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_string(response).await;
+    assert!(body.contains("\"status\":\"ok\""), "body: {body}");
+    assert!(body.contains("[1] Example A"));
+    assert!(body.contains("Hello."));
+    assert!(body.ends_with("data: [DONE]\n\n"));
+}
+
+#[tokio::test]
+async fn count_caps_sources_when_search_returns_more() {
+    let upstream = MockServer::start().await;
+    let brave = MockServer::start().await;
+    mount_search_then_answer(&upstream, "chatcmpl-CAP").await;
+    // The search API can return more URLs than `maximum_number_of_urls`.
+    let generic: Vec<_> = ["a", "b", "c"]
+        .iter()
+        .map(|id| {
+            serde_json::json!({
+                "url": format!("https://example.com/{id}"),
+                "title": format!("Example {id}"),
+                "snippets": [format!("Snippet {id}.")]
+            })
+        })
+        .collect();
+    Mock::given(method("GET"))
+        .and(path("/res/v1/llm/context"))
+        .and(query_param("count", "2"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"grounding": {"generic": generic}})),
+        )
+        .mount(&brave)
+        .await;
+
+    let brave_url = format!("{}/res/v1/llm/context", brave.uri());
+    let app = build_agent_loop_app(&upstream.uri(), Some(&brave_url));
+    let response = app
+        .oneshot(request_with_count(serde_json::json!(2)))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_string(response).await;
+    assert!(body.contains("[1] Example a"), "body: {body}");
+    assert!(body.contains("[2] Example b"));
+    assert!(!body.contains("Example c"));
+    assert!(body.ends_with("data: [DONE]\n\n"));
+}
+
+#[tokio::test]
+async fn count_zero_answers_without_searching() {
+    let upstream = MockServer::start().await;
+    let brave = MockServer::start().await;
+    mount_search_then_answer(&upstream, "chatcmpl-ZERO").await;
+    Mock::given(method("GET"))
+        .and(path("/res/v1/llm/context"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(brave_context_json()))
+        .expect(0)
+        .mount(&brave)
+        .await;
+
+    let brave_url = format!("{}/res/v1/llm/context", brave.uri());
+    let app = build_agent_loop_app(&upstream.uri(), Some(&brave_url));
+    let response = app
+        .oneshot(request_with_count(serde_json::json!(0)))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_string(response).await;
+    assert!(body.contains("nearai_tool_result"), "body: {body}");
+    assert!(body.contains("\"status\":\"ok\""));
+    assert!(body.contains("No results."));
+    assert!(body.contains("Hello."));
+    assert!(body.ends_with("data: [DONE]\n\n"));
+}
+
+#[tokio::test]
+async fn rejects_invalid_count() {
+    for count in [
+        serde_json::json!(21),
+        serde_json::json!(-1),
+        serde_json::json!("5"),
+        serde_json::json!(5.5),
+    ] {
+        let upstream = MockServer::start().await;
+        let brave = MockServer::start().await;
+        let app = build_agent_loop_app(&upstream.uri(), Some(&brave.uri()));
+
+        let response = app
+            .oneshot(request_with_count(count.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "count {count}");
+        let body = body_to_string(response).await;
+        assert!(
+            body.contains("count must be between 0 and 20"),
+            "count {count}: {body}"
+        );
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
 }
 
 #[tokio::test]
@@ -1219,8 +1382,10 @@ async fn e2ee_without_encrypt_all_fields_encrypts_tool_result() {
         )
         .mount(&upstream)
         .await;
+    // The tool's `count` reaches the search call on the E2EE path too.
     Mock::given(method("GET"))
         .and(path("/res/v1/llm/context"))
+        .and(query_param("count", "3"))
         .respond_with(ResponseTemplate::new(200).set_body_json(brave_context_json()))
         .mount(&brave)
         .await;
@@ -1278,7 +1443,7 @@ async fn e2ee_without_encrypt_all_fields_encrypts_tool_result() {
         "model": "test-model",
         "stream": true,
         "messages": [{"role": "user", "content": encrypted_content}],
-        "tools": [{"type": "web_context_search"}],
+        "tools": [{"type": "web_context_search", "count": 3}],
     });
 
     let response = app

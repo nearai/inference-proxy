@@ -5,7 +5,9 @@
 //! configured), this module drives a tool-call loop entirely inside the CVM:
 //! the model emits a tool call, we call the Brave LLM Context API, splice the
 //! result back into the conversation as a synthetic SSE chunk, and re-issue
-//! the upstream request until the model stops asking for tools.
+//! the upstream request until the model stops asking for tools. An optional
+//! `count` on the tool entry (0 to 20) caps the sources each search returns;
+//! 0 runs no search.
 //!
 //! Anything that doesn't match the trigger falls through to the existing
 //! pass-through path in `routes::chat`. Nothing about non-agent-loop requests
@@ -53,6 +55,10 @@ const BRAVE_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 /// the output is truncated with a marker.
 const MAX_FORMATTED_OUTPUT_BYTES: usize = 32 * 1024;
 
+/// Tool output when a search has nothing to return (no usable results, or
+/// `count` 0).
+const NO_RESULTS: &str = "No results.";
+
 /// Upper bound on how many `web_context_search` calls we execute in a single
 /// iteration. We force `parallel_tool_calls: false`, but some engines (e.g.
 /// SGLang serving GLM-5.1) ignore the flag and emit several calls anyway. We
@@ -60,6 +66,11 @@ const MAX_FORMATTED_OUTPUT_BYTES: usize = 32 * 1024;
 /// fulfil a server-side namespaced tool), but cap the count so a misbehaving
 /// model can't fan out an unbounded number of Brave requests per iteration.
 const MAX_TOOL_CALLS_PER_ITERATION: usize = 8;
+
+/// Highest `count` a caller may set on the tool, and the count sent to the
+/// search API when it sets none. Same range as cloud-api's `web_search`
+/// `count` on `/v1/responses`.
+pub const WEB_CONTEXT_SEARCH_MAX_COUNT: u32 = 20;
 
 /// True iff the request's `tools` field is exactly one entry of type
 /// `web_context_search`. Mixed tool types or multiple entries return false
@@ -72,6 +83,26 @@ pub fn is_web_context_search_request(request_json: &Value) -> bool {
         && tools[0].get("type").and_then(|v| v.as_str()) == Some(WEB_CONTEXT_SEARCH_TOOL_NAME)
 }
 
+/// The tool entry's optional `count` (`{"type":"web_context_search","count":5}`),
+/// 0 to 20; `None` when absent or null. Read it before
+/// `rewrite_tool_for_upstream`, which replaces the entry.
+pub fn web_context_search_count(request_json: &Value) -> Result<Option<u32>, String> {
+    let count = request_json
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .and_then(|tools| tools.first())
+        .and_then(|tool| tool.get("count"));
+    match count {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n <= WEB_CONTEXT_SEARCH_MAX_COUNT)
+            .map(Some)
+            .ok_or_else(|| "web_context_search count must be between 0 and 20".to_string()),
+    }
+}
+
 /// Drive an agent loop for a `/v1/chat/completions` request.
 ///
 /// Preconditions (checked by the caller in `routes::chat`):
@@ -79,6 +110,7 @@ pub fn is_web_context_search_request(request_json: &Value) -> bool {
 /// - `request_json.tools == [{"type":"web_context_search"}]`
 /// - `request_json.stream == true`
 /// - `state.config.web_context_search_url` and `..._api_key` are set
+/// - `count` comes from `web_context_search_count`
 ///
 /// `request_hash` is the SHA-256 of the original wire body, used unchanged in
 /// the signed text — signature semantics match the non-loop path.
@@ -89,6 +121,7 @@ pub async fn run_chat_completion(
     request_hash: String,
     mut request_json: Value,
     chunk_transform: Option<ChunkTransform>,
+    count: Option<u32>,
 ) -> Result<Response, AppError> {
     let request_started_at = Instant::now();
     // Rewrite our namespaced tool into a standard OpenAI `function` so the
@@ -170,6 +203,7 @@ pub async fn run_chat_completion(
                 max_iterations,
                 brave_url: &brave_url,
                 brave_key: &brave_key,
+                count,
                 tool_timeout,
                 stream_idle_timeout_secs,
                 tracing_ids: &tracing_ids,
@@ -276,9 +310,10 @@ pub async fn run_chat_completion(
 /// Replace `{"type":"web_context_search"}` with a standard function tool so
 /// the upstream engine knows how to advertise it to the model. The function
 /// surface is intentionally narrow: only `query`. Brave-specific tuning
-/// (count, max_urls, threshold, …) is fixed on our side; clients don't get
-/// to influence it via the tool schema, which keeps the prompt surface small
-/// and the result shape predictable.
+/// (max_urls, threshold, …) is fixed on our side and the model can't change
+/// it via the tool schema, which keeps the prompt surface small and the
+/// result shape predictable. The caller's `count` is read beforehand
+/// (`web_context_search_count`).
 ///
 /// Also forces `parallel_tool_calls: false`. Phase 1 caps execution at one
 /// tool call per iteration; instructing the model not to emit more than one
@@ -317,6 +352,8 @@ struct LoopCtx<'a> {
     max_iterations: u32,
     brave_url: &'a str,
     brave_key: &'a str,
+    /// Caller's `count`, if set; `Some(0)` skips the search call.
+    count: Option<u32>,
     tool_timeout: Duration,
     stream_idle_timeout_secs: u64,
     tracing_ids: &'a TracingIds,
@@ -544,6 +581,14 @@ async fn drive_loop(
             let query = parse_query(args_str);
 
             let (status, output) = match query {
+                Some(q) if !q.is_empty() && ctx.count == Some(0) => {
+                    debug!(
+                        tool = WEB_CONTEXT_SEARCH_TOOL_NAME,
+                        tool_call_id = %tool_call_id,
+                        "count is 0; skipping search"
+                    );
+                    ("ok", NO_RESULTS.to_string())
+                }
                 Some(q) if !q.is_empty() => {
                     let started = Instant::now();
                     // Race the Brave call against client disconnect: if the
@@ -556,6 +601,7 @@ async fn drive_loop(
                             ctx.brave_url,
                             ctx.brave_key,
                             &q,
+                            ctx.count,
                             ctx.tool_timeout,
                             ctx.tracing_ids,
                         ) => Some(r),
@@ -1211,19 +1257,25 @@ enum BraveError {
 ///
 /// Defaults match cloud-api's `WebContextSearchToolExecutor` so behavior is
 /// consistent between `/v1/responses` (in cloud-api) and the in-CVM loop.
+/// A caller's `count` goes to the search API as both the results to consider
+/// and the URLs to return, and also caps the formatted sources, because the
+/// API can return more URLs than asked for. Without one, the defaults below
+/// apply and the output is not capped, as before.
 async fn brave_llm_context_search(
     client: &reqwest::Client,
     url: &str,
     api_key: &str,
     query: &str,
+    count: Option<u32>,
     timeout: Duration,
     tracing_ids: &TracingIds,
 ) -> Result<String, BraveError> {
+    let api_count = count.unwrap_or(WEB_CONTEXT_SEARCH_MAX_COUNT).to_string();
     // Cloud-api defaults (see crates/services/src/responses/tools/web_context_search.rs).
     let query_params: [(&str, &str); 9] = [
         ("q", query),
-        ("count", "20"),
-        ("maximum_number_of_urls", "20"),
+        ("count", &api_count),
+        ("maximum_number_of_urls", &api_count),
         ("maximum_number_of_tokens", "8192"),
         ("maximum_number_of_snippets", "50"),
         ("maximum_number_of_tokens_per_url", "4096"),
@@ -1278,7 +1330,7 @@ async fn brave_llm_context_search(
     let parsed: BraveContextResponse = serde_json::from_slice(&body_bytes)
         .map_err(|e| BraveError::Other(format!("brave JSON parse failed: {e}")))?;
 
-    Ok(format_context_response(&parsed))
+    Ok(format_context_response(&parsed, count))
 }
 
 pub(crate) async fn brave_llm_context_search_text(
@@ -1289,7 +1341,7 @@ pub(crate) async fn brave_llm_context_search_text(
     timeout: Duration,
     tracing_ids: &TracingIds,
 ) -> Result<String, String> {
-    brave_llm_context_search(client, url, api_key, query, timeout, tracing_ids)
+    brave_llm_context_search(client, url, api_key, query, None, timeout, tracing_ids)
         .await
         .map_err(|err| match err {
             BraveError::Timeout => "timeout".to_string(),
@@ -1353,7 +1405,7 @@ struct BraveContextSource {
 /// want to depend on Brave honoring its input caps. The truncated output
 /// is what we both emit to the client AND feed back to the model on the
 /// next iteration, so this also bounds prompt growth across iterations.
-fn format_context_response(resp: &BraveContextResponse) -> String {
+fn format_context_response(resp: &BraveContextResponse, max_sources: Option<u32>) -> String {
     let mut out = String::new();
     let mut n: u32 = 0;
     let mut truncated = false;
@@ -1370,6 +1422,9 @@ fn format_context_response(resp: &BraveContextResponse) -> String {
             .collect();
         if snippets.is_empty() {
             continue;
+        }
+        if max_sources.is_some_and(|max| n >= max) {
+            break;
         }
         let title = entry
             .title
@@ -1409,7 +1464,7 @@ fn format_context_response(resp: &BraveContextResponse) -> String {
         out.push_str("\n[truncated]");
     }
     if out.is_empty() {
-        "No results.".to_string()
+        NO_RESULTS.to_string()
     } else {
         out
     }
@@ -1467,6 +1522,33 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&Value::String("query".to_string())));
+    }
+
+    #[test]
+    fn count_is_optional_and_accepts_0_through_20() {
+        let request =
+            |count: Value| json!({"tools": [{"type": "web_context_search", "count": count}]});
+        assert_eq!(
+            web_context_search_count(&json!({"tools": [{"type": "web_context_search"}]})),
+            Ok(None)
+        );
+        assert_eq!(web_context_search_count(&request(Value::Null)), Ok(None));
+        for n in [0, 1, 5, 20] {
+            assert_eq!(web_context_search_count(&request(json!(n))), Ok(Some(n)));
+        }
+        for bad in [
+            json!(21),
+            json!(-1),
+            json!(5.5),
+            json!(5.0),
+            json!("5"),
+            json!(4_294_967_296u64),
+        ] {
+            assert!(
+                web_context_search_count(&request(bad.clone())).is_err(),
+                "count {bad} should be refused"
+            );
+        }
     }
 
     #[test]
@@ -1558,13 +1640,20 @@ mod tests {
                 },
             )]),
         };
-        let out = format_context_response(&resp);
+        let out = format_context_response(&resp, None);
         assert!(out.contains("[1] Title A"));
         assert!(out.contains("https://example.com/a"));
         assert!(out.contains("snippet 1\n\nsnippet 2"));
         assert!(out.contains("[2] Source B Title"));
         assert!(out.contains("https://example.com/b"));
         assert!(!out.contains("skipped"));
+
+        // A caller's count caps the sources; skipped entries don't count.
+        let capped = format_context_response(&resp, Some(1));
+        assert!(capped.contains("[1] Title A"));
+        assert!(!capped.contains("[2]"));
+        assert!(!capped.contains("https://example.com/b"));
+        assert_eq!(format_context_response(&resp, Some(2)), out);
     }
 
     #[test]
@@ -1573,6 +1662,6 @@ mod tests {
             grounding: BraveContextGrounding::default(),
             sources: std::collections::HashMap::new(),
         };
-        assert_eq!(format_context_response(&resp), "No results.");
+        assert_eq!(format_context_response(&resp, None), "No results.");
     }
 }

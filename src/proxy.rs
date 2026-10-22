@@ -323,7 +323,9 @@ fn message_is_allowed_media_domain_error(message: &str) -> bool {
 #[derive(Clone)]
 pub struct UsageReporter {
     pub http_client: reqwest::Client,
-    pub cloud_api_url: String,
+    /// cloud-api's base URL. Required over HTTP; the SQS transport does not
+    /// post to cloud-api and carries none.
+    pub cloud_api_url: Option<String>,
     pub model_name: String,
     /// Shared infrastructure token for the service-token reporting path.
     /// Required: usage is reported only via `/v1/internal/usage`. cloud-api
@@ -360,8 +362,11 @@ impl UsageReporter {
         self.service_path_unavailable_reason().is_none()
     }
 
+    /// The usage token is what cloud-api's HTTP endpoint needs. The SQS
+    /// transport does not post to cloud-api and does not need it, so only the
+    /// HTTP transport checks it.
     fn service_path_unavailable_reason(&self) -> Option<UsageReportOutcome> {
-        if self.cloud_api_usage_token.is_none() {
+        if self.delivery.is_http() && self.cloud_api_usage_token.is_none() {
             Some(UsageReportOutcome::MissingUsageToken)
         } else if self.org_id.is_none() || self.workspace_id.is_none() || self.api_key_id.is_none()
         {
@@ -396,9 +401,46 @@ pub(crate) enum UsageReportOutcome {
     MissingResponseId,
     QueueFull,
     DeadlineExceeded,
+    /// SQS transport only (`usage_report/sqs_sender.rs`): throttled, retried.
+    SqsThrottled,
+    /// SQS transport only: access denied or credentials refused. Final.
+    SqsDenied,
+    /// SQS transport only: invalid parameter, missing queue or an unusable
+    /// body. Final.
+    SqsInvalid,
+    /// SQS transport only: a 5xx answer, retried.
+    Sqs5xx,
+    /// SQS transport only: credentials could not be had or were refused
+    /// (endpoint failure, expired, skewed or unknown to the service), retried
+    /// with fresh credentials.
+    SqsCredentials,
+    /// SQS transport only: an answer that names no known error, retried.
+    SqsUnknown,
 }
 
 impl UsageReportOutcome {
+    /// Whether an attempt that ended like this is worth another. The SQS
+    /// sender's answers are decided here; HTTP keeps its own rule
+    /// (`http_sender::retry_reason`), because a 429 and an unbuildable request
+    /// are told apart by the status and error, which these labels do not carry.
+    /// An outcome not listed is final: a new one is not retried until it is.
+    pub(crate) fn is_retryable(self) -> bool {
+        matches!(
+            self,
+            Self::Timeout
+                | Self::ConnectError
+                | Self::TransportError
+                | Self::Http5xx
+                | Self::SqsThrottled
+                | Self::SqsCredentials
+                // A freshly issued session can be briefly denied: retried
+                // with fresh credentials, and final once the attempts run out.
+                | Self::SqsDenied
+                | Self::SqsUnknown
+                | Self::Sqs5xx
+        )
+    }
+
     pub(crate) fn as_label(self) -> &'static str {
         match self {
             Self::Accepted => "accepted",
@@ -415,6 +457,12 @@ impl UsageReportOutcome {
             Self::MissingResponseId => "missing_response_id",
             Self::QueueFull => "queue_full",
             Self::DeadlineExceeded => "deadline_exceeded",
+            Self::SqsThrottled => "sqs_throttled",
+            Self::SqsDenied => "sqs_denied",
+            Self::SqsInvalid => "sqs_invalid",
+            Self::Sqs5xx => "sqs_5xx",
+            Self::SqsCredentials => "sqs_credentials",
+            Self::SqsUnknown => "sqs_unknown",
         }
     }
 }
@@ -543,6 +591,12 @@ pub fn make_usage_reporter_for(
     usage_reporter(auth, state, model.id, model.discount_to_user, model.label)
 }
 
+/// Whether a reporter may exist: over HTTP the report is posted to cloud-api,
+/// so there must be its URL. The SQS transport sends to the queue and needs none.
+fn may_report(cloud_api_url: Option<&str>, is_http: bool) -> bool {
+    cloud_api_url.is_some() || !is_http
+}
+
 fn usage_reporter(
     auth: &crate::auth::RequireAuth,
     state: &AppState,
@@ -554,10 +608,16 @@ fn usage_reporter(
     // itself is no longer stored — usage is attributed via the identity fields
     // below, not the sk-.
     auth.cloud_api_key.as_ref()?;
-    let url = state.config.cloud_api_url.as_ref()?;
+    let cloud_api_url = state.config.cloud_api_url.clone();
+    if !may_report(
+        cloud_api_url.as_deref(),
+        state.usage_report_delivery.is_http(),
+    ) {
+        return None;
+    }
     Some(UsageReporter {
         http_client: state.http_client.clone(),
-        cloud_api_url: url.clone(),
+        cloud_api_url,
         model_name: model_name.to_string(),
         cloud_api_usage_token: state.config.cloud_api_usage_token.clone(),
         org_id: auth.org_id.clone(),
@@ -584,7 +644,7 @@ fn cached_tokens(usage: &serde_json::Value, prompt_tokens: i64) -> Option<i64> {
 /// `None` when there is nothing billable to report. Pure (no I/O) so it can
 /// be unit-tested directly; `try_report_usage` wraps it with the
 /// fire-and-forget send.
-fn build_usage_body(
+pub(crate) fn build_usage_body(
     usage_type: &UsageType,
     response_data: &serde_json::Value,
     model_name: &str,
@@ -814,7 +874,7 @@ fn report_stream_usage_on_finalize(
 /// after `service_path_unavailable_reason` confirmed all three identity fields
 /// are present. A body that is not a JSON object is left untouched and its
 /// JSON kind returned, so the caller can drop it.
-fn complete_usage_body(
+pub(crate) fn complete_usage_body(
     reporter: &UsageReporter,
     body: &mut serde_json::Value,
 ) -> Result<(), &'static str> {
@@ -924,6 +984,7 @@ pub(crate) fn spawn_usage_report(reporter: &UsageReporter, mut body: serde_json:
     reporter.delivery.submit(crate::usage_report::Job {
         body: payload,
         completed_at: std::time::Instant::now(),
+        emitted_at: chrono::Utc::now(),
         reporter: reporter.clone(),
     });
 }
@@ -3922,7 +3983,7 @@ mod tests {
     ) -> UsageReporter {
         UsageReporter {
             http_client: reqwest::Client::new(),
-            cloud_api_url: "http://cloud-api.invalid".to_string(),
+            cloud_api_url: Some("http://cloud-api.invalid".to_string()),
             model_name: "test-model".to_string(),
             cloud_api_usage_token: usage_token.map(String::from),
             org_id: org_id.map(String::from),
@@ -3970,6 +4031,46 @@ mod tests {
 
         // Nothing configured: reporting is skipped.
         assert!(!reporter_with(None, None, None, None).can_use_service_token_path());
+    }
+
+    /// The reporter's cloud-api URL is required over HTTP and not over SQS.
+    #[test]
+    fn the_reporter_gate_needs_cloud_api_only_over_http() {
+        assert!(may_report(Some("https://cloud"), true));
+        assert!(!may_report(None, true));
+        assert!(may_report(None, false));
+        assert!(may_report(Some("https://cloud"), false));
+    }
+
+    /// The SQS transport sends to the queue: it needs neither cloud-api's URL
+    /// nor its usage token, but the identity of the report is still required.
+    /// The HTTP transport keeps requiring the token.
+    #[test]
+    fn the_sqs_transport_reports_without_cloud_api_url_or_usage_token() {
+        use crate::usage_report::{
+            SqsSettings, UsageReportDelivery, UsageReportPolicy, UsageReportTransport,
+        };
+        let sqs = UsageReportDelivery::for_transport(
+            UsageReportPolicy::default(),
+            &UsageReportTransport::Sqs(SqsSettings {
+                queue_url: "https://sqs.example/123/usage".to_string(),
+                region: "us-east-1".to_string(),
+                endpoint: None,
+                credentials_url: "http://127.0.0.1:9".to_string(),
+            }),
+        );
+        let mut queued = reporter_with(None, Some("org"), Some("ws"), Some("key"));
+        queued.cloud_api_url = None;
+        queued.delivery = sqs;
+        assert!(queued.can_use_service_token_path());
+
+        let mut without_identity = queued.clone();
+        without_identity.org_id = None;
+        assert!(!without_identity.can_use_service_token_path());
+
+        let http = reporter_with(None, Some("org"), Some("ws"), Some("key"));
+        assert!(http.delivery.is_http());
+        assert!(!http.can_use_service_token_path());
     }
 
     #[test]
@@ -4065,9 +4166,15 @@ mod tests {
             UsageReportOutcome::MissingResponseId,
             UsageReportOutcome::QueueFull,
             UsageReportOutcome::DeadlineExceeded,
+            UsageReportOutcome::SqsThrottled,
+            UsageReportOutcome::SqsDenied,
+            UsageReportOutcome::SqsInvalid,
+            UsageReportOutcome::Sqs5xx,
+            UsageReportOutcome::SqsCredentials,
+            UsageReportOutcome::SqsUnknown,
         ]
         .map(UsageReportOutcome::as_label);
-        assert_eq!(labels.len(), 14);
+        assert_eq!(labels.len(), 20);
         assert!(labels.iter().all(|label| !label.is_empty()));
     }
 

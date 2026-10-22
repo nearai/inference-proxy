@@ -329,7 +329,10 @@ async fn main() -> anyhow::Result<()> {
     // Build app state
     let model_name = config.model_name.clone();
     let state = AppState {
-        usage_report_delivery: usage_report::UsageReportDelivery::new(config.usage_report.clone()),
+        usage_report_delivery: usage_report::UsageReportDelivery::for_transport(
+            config.usage_report.clone(),
+            &config.usage_report_transport,
+        ),
         config: Arc::new(config),
         signing: Arc::new(signing),
         cache: Arc::new(chat_cache),

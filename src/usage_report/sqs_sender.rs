@@ -33,6 +33,7 @@ use crate::proxy::{classify_usage_request_error, UsageReportOutcome};
 
 const SERVICE: &str = "sqs";
 const TARGET: &str = "AmazonSQS.SendMessage";
+const CHECK_TARGET: &str = "AmazonSQS.GetQueueAttributes";
 const CONTENT_TYPE: &str = "application/x-amz-json-1.0";
 /// The most of an SQS error body that is read for its `__type`.
 const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
@@ -104,10 +105,27 @@ impl SqsSender {
         job: &Job,
         timeout: Duration,
     ) -> (UsageReportOutcome, Result<StatusCode, String>) {
+        let (outcome, answer, _) = self.call(TARGET, &job.body, timeout).await;
+        (outcome, answer)
+    }
+
+    /// One signed call of the SQS action `target` with `body`, within `timeout`.
+    /// Besides the outcome and the answer, the error type the answer names, if
+    /// it does (`QueueDoesNotExist`, `AccessDenied`, ...).
+    async fn call(
+        &self,
+        target: &str,
+        body: &Bytes,
+        timeout: Duration,
+    ) -> (
+        UsageReportOutcome,
+        Result<StatusCode, String>,
+        Option<String>,
+    ) {
         let started_at = Instant::now();
         let credentials = match self.credentials_within(timeout).await {
             Ok(credentials) => credentials,
-            Err((outcome, error)) => return (outcome, Err(error)),
+            Err((outcome, error)) => return (outcome, Err(error), None),
         };
         let Some(remaining) = timeout
             .checked_sub(started_at.elapsed())
@@ -116,17 +134,19 @@ impl SqsSender {
             return (
                 UsageReportOutcome::Timeout,
                 Err("the attempt's time was used up fetching credentials".to_string()),
+                None,
             );
         };
         let headers = match sign_request(
             &self.endpoint,
             &self.region,
             &credentials,
-            &job.body,
+            target,
+            body,
             SystemTime::now(),
         ) {
             Ok(headers) => headers,
-            Err(error) => return (UsageReportOutcome::SqsInvalid, Err(error)),
+            Err(error) => return (UsageReportOutcome::SqsInvalid, Err(error), None),
         };
 
         let mut request = self
@@ -134,8 +154,8 @@ impl SqsSender {
             .post(&self.endpoint)
             .timeout(remaining)
             .header(reqwest::header::CONTENT_TYPE, CONTENT_TYPE)
-            .header("x-amz-target", TARGET)
-            .body(job.body.clone());
+            .header("x-amz-target", target)
+            .body(body.clone());
         // The headers SigV4 added: the date and the authorization.
         for (name, value) in headers {
             request = request.header(name, value);
@@ -149,7 +169,7 @@ impl SqsSender {
                     }
                     other => other,
                 };
-                return (outcome, Err(error.to_string()));
+                return (outcome, Err(error.to_string()), None);
             }
         };
         let status = response.status();
@@ -168,7 +188,7 @@ impl SqsSender {
             // attempt fetches new ones.
             self.credentials.forget(&credentials);
         }
-        (outcome, Ok(status))
+        (outcome, Ok(status), error_type)
     }
 }
 
@@ -192,6 +212,43 @@ impl UsageSender for SqsSender {
         })?;
         job.body = Bytes::from(payload);
         Ok(())
+    }
+
+    /// `GetQueueAttributes` (`QueueArn`) on the usage queue: one attempt that
+    /// proves the queue exists and these credentials may reach it, signed like
+    /// a `SendMessage`. Needs `sqs:GetQueueAttributes` besides `sqs:SendMessage`.
+    fn startup_check<'a>(
+        &'a self,
+        timeout: Duration,
+    ) -> BoxFuture<'a, Result<(), (UsageReportOutcome, String)>> {
+        Box::pin(async move {
+            let body = Bytes::from(
+                serde_json::json!({"QueueUrl": self.queue_url, "AttributeNames": ["QueueArn"]})
+                    .to_string(),
+            );
+            match self.call(CHECK_TARGET, &body, timeout).await {
+                (UsageReportOutcome::Accepted, ..) => Ok(()),
+                (outcome, Ok(status), error_type) => Err((
+                    outcome,
+                    // The error type is AWS's name for what is wrong with the
+                    // queue or the permission: no secret, but not trusted
+                    // text, so it is cut to a name's characters.
+                    match error_type.as_deref().map(short_error_name) {
+                        Some(name) => format!(
+                            "status {status}, {}",
+                            name.chars()
+                                .filter(
+                                    |c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
+                                )
+                                .take(64)
+                                .collect::<String>()
+                        ),
+                        None => format!("status {status}"),
+                    },
+                )),
+                (outcome, Err(error), _) => Err((outcome, error)),
+            }
+        })
     }
 
     fn send<'a>(
@@ -260,13 +317,14 @@ fn message_body(job: &Job) -> Result<String, Refused> {
     })
 }
 
-/// The headers SigV4 adds to a `SendMessage` of `payload` to `endpoint` at
+/// The headers SigV4 adds to an SQS call of `target` with `payload` to `endpoint` at
 /// `time`, with the two the request carries itself (content type and target)
 /// signed.
 fn sign_request(
     endpoint: &str,
     region: &str,
     credentials: &aws_credential_types::Credentials,
+    target: &str,
     payload: &[u8],
     time: SystemTime,
 ) -> Result<Vec<(String, String)>, String> {
@@ -279,7 +337,7 @@ fn sign_request(
         .settings(SigningSettings::default())
         .build()
         .map_err(|error| error.to_string())?;
-    let headers = [("content-type", CONTENT_TYPE), ("x-amz-target", TARGET)];
+    let headers = [("content-type", CONTENT_TYPE), ("x-amz-target", target)];
     let request = SignableRequest::new(
         "POST",
         endpoint,
@@ -376,3 +434,7 @@ mod tests;
 #[cfg(test)]
 #[path = "sqs_sender_redirect_tests.rs"]
 mod redirect_tests;
+
+#[cfg(test)]
+#[path = "sqs_sender_startup_tests.rs"]
+mod startup_tests;

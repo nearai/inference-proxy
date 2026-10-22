@@ -22,12 +22,13 @@ use crate::usage_report::{UsageReportDelivery, UsageReportPolicy};
 use aws_sigv4::http_request::{sign, SignableBody, SignableRequest, SigningSettings};
 use aws_sigv4::sign::v4;
 
-const QUEUE: &str = "https://sqs.us-east-1.amazonaws.com/123456789012/cloud-platform-usage";
+pub(super) const QUEUE: &str =
+    "https://sqs.us-east-1.amazonaws.com/123456789012/cloud-platform-usage";
 const ACCESS_KEY: &str = "AKIDEXAMPLE";
 const SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
 
 /// The sum of the series of `family` whose line carries `label`.
-fn counter(recorder: &PrometheusRecorder, family: &str, label: &str) -> f64 {
+pub(super) fn counter(recorder: &PrometheusRecorder, family: &str, label: &str) -> f64 {
     recorder
         .handle()
         .render()
@@ -350,6 +351,7 @@ fn sigv4_signature_matches_the_independent_computation() {
         "https://sqs.us-east-1.amazonaws.com/",
         "us-east-1",
         &credentials,
+        TARGET,
         payload,
         fixed_time(),
     )

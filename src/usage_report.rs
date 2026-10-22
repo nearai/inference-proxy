@@ -212,6 +212,15 @@ pub(crate) trait UsageSender: Send + Sync {
         Ok(())
     }
 
+    /// One bounded check, before serving, that reports can be sent. The
+    /// default has none (HTTP); the error is the attempt's outcome and its text.
+    fn startup_check<'a>(
+        &'a self,
+        _timeout: Duration,
+    ) -> BoxFuture<'a, Result<(), (UsageReportOutcome, String)>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// One attempt, which gives up after `timeout`.
     ///
     /// `SendOutcome::Accepted` means the answer is `Ok` with a success status:
@@ -223,6 +232,14 @@ pub(crate) trait UsageSender: Send + Sync {
         job: &'a Job,
         timeout: Duration,
     ) -> BoxFuture<'a, (SendOutcome, AttemptLog)>;
+}
+
+/// Exposes a fallback to HTTP as the active transport: `transport="http"` is 1
+/// and `transport="sqs"` is 0, so it can be alerted on. Called once the
+/// Prometheus recorder is installed (a gauge set earlier is dropped).
+pub fn record_fallback_to_http() {
+    metrics::gauge!("inference_proxy_usage_report_transport_info", "transport" => "sqs").set(0.0);
+    metrics::gauge!("inference_proxy_usage_report_transport_info", "transport" => "http").set(1.0);
 }
 
 /// What was pending when `drain` started and what it left behind.
@@ -239,6 +256,9 @@ impl Drained {
         self.left_waiting + self.left_in_flight
     }
 }
+
+/// Tries of the startup check of the usage queue.
+const STARTUP_CHECK_ATTEMPTS: u32 = 4;
 
 /// The process's usage-report delivery: one per process, shared by every
 /// model of a list (the billing API and its capacity are shared too).
@@ -287,6 +307,90 @@ impl UsageReportDelivery {
             );
         }
         delivery
+    }
+
+    /// Startup check of the transport (SQS only; HTTP makes no call and logs
+    /// nothing): `STARTUP_CHECK_ATTEMPTS` tries, each within the policy's
+    /// attempt timeout, backing off from its initial backoff. An answer no retry
+    /// can change (a missing queue) stops at once. A failure is a startup error
+    /// naming the outcome category, never a secret.
+    pub async fn check_startup(&self) -> anyhow::Result<()> {
+        if self.sender.kind() == TransportKind::Http {
+            return Ok(());
+        }
+        let mut backoff = self.policy.initial_backoff;
+        let mut attempt = 1;
+        loop {
+            match self.sender.startup_check(self.policy.attempt_timeout).await {
+                Ok(()) => {
+                    info!(
+                        transport = self.sender.kind().label(),
+                        "Usage queue reachable"
+                    );
+                    return Ok(());
+                }
+                Err((outcome, _)) if attempt < STARTUP_CHECK_ATTEMPTS && outcome.is_retryable() => {
+                    tracing::warn!(
+                        attempt,
+                        outcome = outcome.as_label(),
+                        "Usage queue check failed; retrying"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                    attempt += 1;
+                }
+                Err((outcome, error)) => {
+                    anyhow::bail!("usage queue check failed ({}): {error}", outcome.as_label());
+                }
+            }
+        }
+    }
+
+    /// The transport this process runs on, decided once at startup. With
+    /// `sqs`, the startup check of the usage queue decides: if it fails and
+    /// the HTTP transport is fully configured (`http_configured`: cloud-api's
+    /// URL and usage token), the process uses HTTP for its whole life and says
+    /// so loudly; if HTTP is not configured the failure is a startup error, so
+    /// that no process runs without a billing path. A process that starts on
+    /// SQS stays on SQS: there is no switching afterwards. The check proves the
+    /// queue at startup only; a queue that goes away later is met by the
+    /// send-time retries, and by the counted drop when they run out.
+    pub async fn resolve_transport(
+        policy: UsageReportPolicy,
+        transport: UsageReportTransport,
+        http_configured: bool,
+    ) -> anyhow::Result<UsageReportTransport> {
+        if transport == UsageReportTransport::Http {
+            return Ok(transport);
+        }
+        let delivery = Self::for_transport(policy, &transport);
+        delivery
+            .resolve_after_check(transport, http_configured)
+            .await
+    }
+
+    async fn resolve_after_check(
+        &self,
+        transport: UsageReportTransport,
+        http_configured: bool,
+    ) -> anyhow::Result<UsageReportTransport> {
+        let error = match self.check_startup().await {
+            Ok(()) => return Ok(transport),
+            Err(error) => error,
+        };
+        if !http_configured {
+            return Err(error.context(
+                "the sqs usage transport cannot be used and the http transport is not \
+                 configured (CLOUD_API_URL and CLOUD_API_USAGE_TOKEN): refusing to start \
+                 without a billing path",
+            ));
+        }
+        tracing::error!(
+            error = %error,
+            "Usage queue check failed: falling back to the HTTP usage transport (cloud-api) \
+             for the life of this process"
+        );
+        Ok(UsageReportTransport::Http)
     }
 
     /// The delivery with `sender` making its attempts. `new` is this with the

@@ -28,13 +28,13 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use futures_util::future::BoxFuture;
 use tracing::{info, warn};
 
 use crate::model_metrics::{model_gauge, ModelLabel};
-use crate::proxy::{
-    classify_usage_http_status, classify_usage_request_error, record_usage_report_outcome,
-    UsageReportOutcome, UsageReporter,
-};
+use crate::proxy::{record_usage_report_outcome, UsageReportOutcome, UsageReporter};
+
+mod http_sender;
 
 /// Ceiling of the backoff between two attempts, whatever the attempt number.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -95,17 +95,52 @@ impl Default for UsageReportPolicy {
 }
 
 /// A report on its way to the billing API: what `proxy::spawn_usage_report`
-/// hands over.
+/// hands over. The body is transport-neutral. The reporter still carries the
+/// HTTP client and the cloud-api URL and usage token: the HTTP sender reads
+/// those, and other senders may read other fields of it.
 pub(crate) struct Job {
     /// Who the report is for and where it came from: ids and labels for the
     /// log lines and the metrics, and the HTTP client.
     pub reporter: UsageReporter,
-    pub url: String,
-    pub authorization: String,
     /// The serialized report. Every attempt sends these bytes.
     pub body: bytes::Bytes,
     /// When the request completed and its report was handed over.
     pub completed_at: Instant,
+}
+
+/// What a sender made of one attempt, in the terms of the shared delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SendOutcome {
+    /// Accepted: the report is done.
+    Accepted,
+    /// Not accepted, and another attempt may pass. The label is the retry's
+    /// reason in `inference_proxy_usage_report_retries_total`.
+    Retryable(&'static str),
+    /// Not accepted, and sending the same report again would not change that.
+    /// The label is the drop's reason in `inference_proxy_usage_reports_dropped_total`.
+    Final(&'static str),
+}
+
+/// What one attempt looked like, for its log line and the metrics.
+pub(crate) struct AttemptLog {
+    /// The status the billing API answered, or the error that stood in the way.
+    pub answer: Result<reqwest::StatusCode, String>,
+    /// The attempt's outcome label, as the report's final outcome would carry it.
+    pub outcome: UsageReportOutcome,
+    /// How long the attempt took.
+    pub duration: Duration,
+}
+
+/// One way of getting a report to the billing API. The shared delivery decides
+/// about attempts, retries, deadlines, the queue and the drain; a sender makes
+/// one attempt and says what it means in those terms.
+pub(crate) trait UsageSender: Send + Sync {
+    /// One attempt, which gives up after `timeout`.
+    fn send<'a>(
+        &'a self,
+        job: &'a Job,
+        timeout: Duration,
+    ) -> BoxFuture<'a, (SendOutcome, AttemptLog)>;
 }
 
 #[derive(Default)]
@@ -162,6 +197,8 @@ pub struct UsageReportDelivery {
     /// process whose policy differs from the default, so one that changed
     /// nothing keeps its `/metrics` and its logs.
     extended: bool,
+    /// How an attempt is made: over HTTP to cloud-api.
+    sender: Arc<dyn UsageSender>,
     state: Mutex<State>,
     /// Notified whenever nothing is pending any more.
     idle: tokio::sync::Notify,
@@ -175,7 +212,16 @@ impl Default for UsageReportDelivery {
 
 impl UsageReportDelivery {
     pub fn new(policy: UsageReportPolicy) -> Arc<Self> {
-        let delivery = Self::with(policy);
+        Self::with_sender(policy, Arc::new(http_sender::HttpSender))
+    }
+
+    /// The delivery with `sender` making its attempts. `new` is this with the
+    /// HTTP sender; the startup line is the same whichever sender is given.
+    pub(crate) fn with_sender(
+        policy: UsageReportPolicy,
+        sender: Arc<dyn UsageSender>,
+    ) -> Arc<Self> {
+        let delivery = Self::build(policy, sender);
         if delivery.extended {
             let policy = &delivery.policy;
             info!(
@@ -193,9 +239,14 @@ impl UsageReportDelivery {
     }
 
     fn with(policy: UsageReportPolicy) -> Self {
+        Self::build(policy, Arc::new(http_sender::HttpSender))
+    }
+
+    fn build(policy: UsageReportPolicy, sender: Arc<dyn UsageSender>) -> Self {
         Self {
             extended: policy != UsageReportPolicy::default(),
             policy,
+            sender,
             state: Mutex::default(),
             idle: tokio::sync::Notify::new(),
         }
@@ -338,33 +389,17 @@ impl UsageReportDelivery {
                 );
             }
             attempts += 1;
-            let started_at = Instant::now();
-            let mut request = reporter
-                .http_client
-                .post(&job.url)
-                .header("authorization", &job.authorization)
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(job.body.clone())
-                .timeout(timeout);
-            if let Some(request_id) = reporter.request_id.as_deref() {
-                request = request.header("x-request-id", request_id);
-            }
-            // The body is not read, as before: only the status decides.
-            let answer = request.send().await.map(|response| response.status());
-            let elapsed = started_at.elapsed();
-            let outcome = match &answer {
-                Ok(status) => classify_usage_http_status(*status),
-                Err(error) => classify_usage_request_error(error),
-            };
-            last_attempt = Some((outcome, elapsed));
+            let (decision, attempt) = self.sender.send(job, timeout).await;
+            last_attempt = Some((attempt.outcome, attempt.duration));
             self.count(
                 "inference_proxy_usage_report_attempts_total",
                 reporter,
-                ("outcome", outcome.as_label()),
+                ("outcome", attempt.outcome.as_label()),
             );
 
-            let retry_reason = retry_reason(outcome, &answer);
-            if let (Some(reason), true) = (retry_reason, attempts < self.policy.max_attempts) {
+            if let (SendOutcome::Retryable(reason), true) =
+                (decision, attempts < self.policy.max_attempts)
+            {
                 let delay = self.backoff(attempts);
                 // No use backing off for an attempt that could not start.
                 if self
@@ -385,12 +420,12 @@ impl UsageReportDelivery {
                     workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
                     api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
                     model = %reporter.model_name,
-                    status = answer.as_ref().ok().map(tracing::field::display),
-                    error = answer.as_ref().err().map(tracing::field::display),
-                    duration_ms = elapsed.as_millis() as u64,
+                    status = attempt.answer.as_ref().ok().map(tracing::field::display),
+                    error = attempt.answer.as_ref().err().map(tracing::field::display),
+                    duration_ms = attempt.duration.as_millis() as u64,
                     auth_path = reporter.request_source.auth_path.as_label(),
                     ingress_route = reporter.request_source.ingress_route.as_label(),
-                    outcome = outcome.as_label(),
+                    outcome = attempt.outcome.as_label(),
                     attempt = attempts,
                     max_attempts = self.policy.max_attempts,
                     retry_in_ms = delay.as_millis() as u64,
@@ -404,13 +439,16 @@ impl UsageReportDelivery {
             // The report's final outcome: the series and the log lines a
             // report has always ended with. `attempts` and
             // `since_completion_ms` are absent under the default policy.
+            let outcome = attempt.outcome;
+            let elapsed = attempt.duration;
+            let answer = &attempt.answer;
             record_usage_report_outcome(reporter, outcome, Some(elapsed));
             let attempts = self.extended.then_some(attempts);
             let since_completion_ms = self
                 .extended
                 .then(|| job.completed_at.elapsed().as_millis() as u64);
-            match &answer {
-                Ok(status) if outcome == UsageReportOutcome::Accepted => {
+            match answer {
+                Ok(status) if decision == SendOutcome::Accepted => {
                     if self.extended {
                         metrics::histogram!(
                             "inference_proxy_usage_report_time_to_accepted_seconds",
@@ -474,10 +512,10 @@ impl UsageReportDelivery {
             }
             // Not accepted, and no attempt follows: either the answer is
             // final, or it could have passed but the attempts are used up.
-            let reason = if retry_reason.is_some() {
-                "attempts_exhausted"
-            } else {
-                "rejected"
+            let reason = match decision {
+                SendOutcome::Final(reason) => reason,
+                SendOutcome::Retryable(_) => "attempts_exhausted",
+                SendOutcome::Accepted => unreachable!("an accepted report returned above"),
             };
             self.count(
                 "inference_proxy_usage_reports_dropped_total",
@@ -721,27 +759,6 @@ impl Drop for Place {
                 self.delivery.idle.notify_waiters();
             }
         }
-    }
-}
-
-/// Why an attempt with this result may be made again, `None` when the result
-/// is final: a 4xx other than 429 means the billing API refused the report
-/// itself, and sending the same bytes again would get the same answer.
-fn retry_reason(
-    outcome: UsageReportOutcome,
-    answer: &Result<reqwest::StatusCode, reqwest::Error>,
-) -> Option<&'static str> {
-    match (outcome, answer) {
-        (UsageReportOutcome::Timeout, _) => Some("timeout"),
-        (UsageReportOutcome::ConnectError, _) => Some("connect_error"),
-        // A request that could not even be built fails the same way each time.
-        (UsageReportOutcome::TransportError, Err(error)) if error.is_builder() => None,
-        (UsageReportOutcome::TransportError, _) => Some("transport_error"),
-        (UsageReportOutcome::Http5xx, _) => Some("http_5xx"),
-        (UsageReportOutcome::Http4xx, Ok(reqwest::StatusCode::TOO_MANY_REQUESTS)) => {
-            Some("http_429")
-        }
-        _ => None,
     }
 }
 

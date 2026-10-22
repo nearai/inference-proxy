@@ -922,8 +922,6 @@ pub(crate) fn spawn_usage_report(reporter: &UsageReporter, mut body: serde_json:
         }
     };
     reporter.delivery.submit(crate::usage_report::Job {
-        url: format!("{}/v1/internal/usage", reporter.cloud_api_url),
-        authorization: format!("Bearer {}", reporter.cloud_api_usage_token.clone().unwrap()),
         body: payload,
         completed_at: std::time::Instant::now(),
         reporter: reporter.clone(),

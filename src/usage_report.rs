@@ -1,12 +1,14 @@
-//! Delivery of usage reports to the billing API (cloud-api's
-//! `POST /v1/internal/usage`).
+//! Delivery of usage reports, over one of two transports: HTTP to cloud-api's
+//! `POST /v1/internal/usage` (the default), or `SendMessage` to the usage queue
+//! (`VLLM_PROXY_USAGE_REPORT_TRANSPORT=sqs`). The transport is a `UsageSender`.
 //!
-//! `proxy::spawn_usage_report` checks and completes a report, serializes it
-//! once and hands it over here. From then on the report is off the request
-//! path: `submit` takes a lock for a queue operation and returns, and nothing
-//! in this module is ever awaited by a handler. Sending, and the line of a
-//! report dropped from a full queue, happen in tasks of this module's own,
-//! outside the span of the request that happened to be completing.
+//! `proxy::spawn_usage_report` checks and completes a report and hands it over
+//! here. `submit` first has the transport prepare the report once (HTTP: nothing;
+//! SQS: validation and serialization of the envelope), then takes a lock for a
+//! queue operation and returns. Nothing in this module is ever awaited by a
+//! handler. Sending, and the line of a report dropped from a full queue, happen
+//! in tasks of this module's own, outside the span of the request that happened
+//! to be completing.
 //!
 //! With the default [`UsageReportPolicy`] delivery is what it has always been:
 //! one task per report, one attempt, a 5 second timeout, and the same log lines
@@ -24,17 +26,20 @@
 //! again is safe. A report is still only ever sent by one task, one attempt
 //! at a time, and every attempt carries the bytes of the first.
 
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::future::BoxFuture;
 use tracing::{info, warn};
 
-use crate::model_metrics::{model_gauge, ModelLabel};
 use crate::proxy::{record_usage_report_outcome, UsageReportOutcome, UsageReporter};
 
+use self::log::{source_labels, GiveUp};
+use self::queue::State;
 mod http_sender;
+mod log;
+mod queue;
+mod sqs_sender;
 
 /// Ceiling of the backoff between two attempts, whatever the attempt number.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -94,18 +99,70 @@ impl Default for UsageReportPolicy {
     }
 }
 
+/// Where a report is sent (`VLLM_PROXY_USAGE_REPORT_TRANSPORT`). `Default` is
+/// HTTP to cloud-api, the transport every deployment had before this.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum UsageReportTransport {
+    /// `POST /v1/internal/usage` on cloud-api.
+    #[default]
+    Http,
+    /// `SendMessage` to the usage queue (`VLLM_PROXY_USAGE_REPORT_SQS_*`).
+    Sqs(SqsSettings),
+}
+
+/// The transport a delivery sends over, by name. The labels are the
+/// `transport` label of `inference_proxy_usage_report_transport_info`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TransportKind {
+    Http,
+    Sqs,
+}
+
+impl TransportKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Sqs => "sqs",
+        }
+    }
+}
+
+/// Settings of the SQS transport. The credentials themselves are read from
+/// the environment when the sender is built (`aws_credentials.rs`); they are
+/// not part of the configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqsSettings {
+    /// The usage queue (`VLLM_PROXY_USAGE_REPORT_SQS_URL`, required).
+    pub queue_url: String,
+    /// The queue's region (`VLLM_PROXY_USAGE_REPORT_SQS_REGION`, default `us-east-1`).
+    pub region: String,
+    /// An endpoint in place of the regional one (`VLLM_PROXY_USAGE_REPORT_SQS_ENDPOINT`,
+    /// a local emulator).
+    pub endpoint: Option<String>,
+    /// Base URL of the IMDSv2 endpoint that serves session credentials (`VLLM_PROXY_AWS_CREDENTIALS_URL`,
+    /// required: there are no static keys).
+    pub credentials_url: String,
+}
+
 /// A report on its way to the billing API: what `proxy::spawn_usage_report`
-/// hands over. The body is transport-neutral. The reporter still carries the
-/// HTTP client and the cloud-api URL and usage token: the HTTP sender reads
-/// those, and other senders may read other fields of it.
+/// hands over. The body is the report as cloud-api's usage body; the HTTP
+/// sender posts it as it is. The SQS sender's `prepare` replaces it, once at
+/// submit, with the `SendMessage` request, so every attempt sends the same bytes.
+/// The reporter still carries the HTTP client and the cloud-api URL and usage
+/// token, which the HTTP sender reads.
+#[derive(Clone)]
 pub(crate) struct Job {
     /// Who the report is for and where it came from: ids and labels for the
     /// log lines and the metrics, and the HTTP client.
     pub reporter: UsageReporter,
-    /// The serialized report. Every attempt sends these bytes.
+    /// The bytes every attempt sends: the report as serialized by the proxy,
+    /// or, after the transport's `prepare`, what that transport sends.
     pub body: bytes::Bytes,
     /// When the request completed and its report was handed over.
     pub completed_at: Instant,
+    /// The same instant on the wall clock: the envelope's `emitted_at`, set
+    /// once so that every attempt carries the same message.
+    pub emitted_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// What a sender made of one attempt, in the terms of the shared delivery.
@@ -119,6 +176,16 @@ pub(crate) enum SendOutcome {
     /// Not accepted, and sending the same report again would not change that.
     /// The label is the drop's reason in `inference_proxy_usage_reports_dropped_total`.
     Final(&'static str),
+}
+
+/// A report a transport cannot send at all, refused before it is queued. It
+/// is final, counted under `reason` and logged with `error`, which names
+/// nothing of the report but its size and its missing field names.
+#[derive(Debug)]
+pub(crate) struct Refused {
+    pub reason: &'static str,
+    pub outcome: UsageReportOutcome,
+    pub error: String,
 }
 
 /// What one attempt looked like, for its log line and the metrics.
@@ -135,42 +202,27 @@ pub(crate) struct AttemptLog {
 /// about attempts, retries, deadlines, the queue and the drain; a sender makes
 /// one attempt and says what it means in those terms.
 pub(crate) trait UsageSender: Send + Sync {
+    /// The transport this sender sends over.
+    fn kind(&self) -> TransportKind;
+
+    /// Turns a submitted report into the bytes its attempts send. Called once,
+    /// when the report is submitted, so validation and serialization are not
+    /// repeated per attempt. Refusing a report here means it is never queued.
+    fn prepare(&self, _job: &mut Job) -> Result<(), Refused> {
+        Ok(())
+    }
+
     /// One attempt, which gives up after `timeout`.
+    ///
+    /// `SendOutcome::Accepted` means the answer is `Ok` with a success status:
+    /// the delivery logs and counts a report as accepted on that alone. A
+    /// sender that says accepted with any other answer breaks this contract;
+    /// the delivery then counts the report as rejected instead of accepting it.
     fn send<'a>(
         &'a self,
         job: &'a Job,
         timeout: Duration,
     ) -> BoxFuture<'a, (SendOutcome, AttemptLog)>;
-}
-
-#[derive(Default)]
-struct State {
-    /// Reports waiting for a place, oldest first. (A waiting report refers
-    /// back to its delivery through its reporter, until it leaves the queue.)
-    waiting: VecDeque<Job>,
-    /// Places taken: reports being sent or backing off before a retry.
-    in_flight: usize,
-    /// Reports dropped from a full queue whose line is still to be written.
-    drops_being_logged: usize,
-}
-
-impl State {
-    fn is_idle(&self) -> bool {
-        self.waiting.is_empty() && self.in_flight == 0 && self.drops_being_logged == 0
-    }
-}
-
-/// Why a report was given up on without a final answer from the billing API.
-#[derive(Clone, Copy)]
-enum GiveUp {
-    /// Pushed out of a full queue; it was never sent.
-    QueueFull,
-    /// No attempt fits before its deadline any more, after this many
-    /// attempts, the last of which ended like this and took this long.
-    Deadline {
-        attempts: u32,
-        last_attempt: Option<(UsageReportOutcome, Duration)>,
-    },
 }
 
 /// What was pending when `drain` started and what it left behind.
@@ -192,12 +244,12 @@ impl Drained {
 /// model of a list (the billing API and its capacity are shared too).
 pub struct UsageReportDelivery {
     policy: UsageReportPolicy,
-    /// False for the default policy, however it was arrived at. The delivery
+    /// False for the default policy over HTTP, however it was arrived at. The delivery
     /// series, the extra log fields and the shutdown line exist only for a
     /// process whose policy differs from the default, so one that changed
     /// nothing keeps its `/metrics` and its logs.
     extended: bool,
-    /// How an attempt is made: over HTTP to cloud-api.
+    /// How an attempt is made: over HTTP to cloud-api, or onto the usage queue.
     sender: Arc<dyn UsageSender>,
     state: Mutex<State>,
     /// Notified whenever nothing is pending any more.
@@ -213,6 +265,30 @@ impl Default for UsageReportDelivery {
 impl UsageReportDelivery {
     pub fn new(policy: UsageReportPolicy) -> Arc<Self> {
         Self::with_sender(policy, Arc::new(http_sender::HttpSender))
+    }
+
+    /// The delivery for the configured transport. Fails when the transport
+    /// cannot send (no credentials for SQS): that is a startup error.
+    pub fn for_transport(
+        policy: UsageReportPolicy,
+        transport: &UsageReportTransport,
+    ) -> anyhow::Result<Arc<Self>> {
+        let delivery = match transport {
+            UsageReportTransport::Http => Self::new(policy),
+            UsageReportTransport::Sqs(settings) => {
+                let sender = sqs_sender::SqsSender::new(settings);
+                Self::with_sender(policy, Arc::new(sender))
+            }
+        };
+        // Names the transport when it is not HTTP: the HTTP startup output is
+        // what it was. No endpoint, queue URL or credential is logged.
+        if delivery.sender.kind() != TransportKind::Http {
+            info!(
+                transport = delivery.sender.kind().label(),
+                "Usage report transport configured"
+            );
+        }
+        Ok(delivery)
     }
 
     /// The delivery with `sender` making its attempts. `new` is this with the
@@ -243,8 +319,20 @@ impl UsageReportDelivery {
     }
 
     fn build(policy: UsageReportPolicy, sender: Arc<dyn UsageSender>) -> Self {
+        // A transport other than the default is named by a gauge of 1. The
+        // default (HTTP) adds no series: its `/metrics` stay as they were.
+        if sender.kind() != TransportKind::Http {
+            metrics::gauge!(
+                "inference_proxy_usage_report_transport_info",
+                "transport" => sender.kind().label()
+            )
+            .set(1.0);
+        }
         Self {
-            extended: policy != UsageReportPolicy::default(),
+            // A non-default transport is new, so its drops are always counted:
+            // the HTTP delivery keeps its series unless the policy changes.
+            extended: policy != UsageReportPolicy::default()
+                || sender.kind() != TransportKind::Http,
             policy,
             sender,
             state: Mutex::default(),
@@ -256,84 +344,9 @@ impl UsageReportDelivery {
         &self.policy
     }
 
-    /// Reports waiting for a place, and reports holding one.
-    pub fn pending(&self) -> (usize, usize) {
-        let state = self.state();
-        (state.waiting.len(), state.in_flight)
-    }
-
-    /// Nothing waits, nothing is in flight, and every drop has been logged.
-    fn is_idle(&self) -> bool {
-        self.state().is_idle()
-    }
-
-    fn state(&self) -> MutexGuard<'_, State> {
-        // Nothing panics while holding the lock; if something ever does, the
-        // counts are still the best there is.
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Take a report for delivery. Never blocks and never waits: the report
-    /// starts at once while there is a place, waits in the queue otherwise.
-    /// Must be called inside a Tokio runtime.
-    pub(crate) fn submit(self: &Arc<Self>, job: Job) {
-        let model = job.reporter.model_label;
-        let evicted = {
-            let mut state = self.state();
-            if self.policy.max_in_flight == 0 || state.in_flight < self.policy.max_in_flight {
-                state.in_flight += 1;
-                drop(state);
-                // Held from here on, whatever becomes of the task.
-                let place = Place {
-                    delivery: Arc::clone(self),
-                    model,
-                    held: true,
-                };
-                self.in_flight_gauge(model, Step::Up);
-                // Nothing waits; said once so the series is there to read
-                // before the first report ever has to.
-                self.waiting_gauge(model, Step::None);
-                tokio::spawn(place.work(job));
-                return;
-            }
-            // The queue is full: the report that has waited longest goes. It
-            // has the least time left before its deadline.
-            let evicted = if state.waiting.len() >= self.policy.max_queued {
-                state.waiting.pop_front().map(|evicted| {
-                    let in_own_task = state.drops_being_logged < MAX_DROPS_BEING_LOGGED;
-                    if in_own_task {
-                        state.drops_being_logged += 1;
-                    }
-                    (evicted, in_own_task)
-                })
-            } else {
-                None
-            };
-            state.waiting.push_back(job);
-            evicted
-        };
-        self.waiting_gauge(model, Step::Up);
-        if let Some((evicted, in_own_task)) = evicted {
-            self.waiting_gauge(evicted.reporter.model_label, Step::Down);
-            if in_own_task {
-                // The line is about another request's report: it belongs
-                // neither on this caller's path nor in its request span.
-                let delivery = Arc::clone(self);
-                tokio::spawn(async move {
-                    delivery.give_up(&evicted, GiveUp::QueueFull);
-                    let idle = {
-                        let mut state = delivery.state();
-                        state.drops_being_logged -= 1;
-                        state.is_idle()
-                    };
-                    if idle {
-                        delivery.idle.notify_waiters();
-                    }
-                });
-            } else {
-                self.give_up(&evicted, GiveUp::QueueFull);
-            }
-        }
+    /// Whether reports go to cloud-api over HTTP, the transport with no queue.
+    pub(crate) fn is_http(&self) -> bool {
+        self.sender.kind() == TransportKind::Http
     }
 
     /// Time left before `job`'s deadline, `None` without one.
@@ -449,6 +462,13 @@ impl UsageReportDelivery {
                 .then(|| job.completed_at.elapsed().as_millis() as u64);
             match answer {
                 Ok(status) if decision == SendOutcome::Accepted => {
+                    // Named by transport: "by Cloud API" is only true over HTTP.
+                    // The HTTP text is the one it has always had.
+                    let accepted = if self.is_http() {
+                        "Direct-key usage report accepted by Cloud API"
+                    } else {
+                        "Usage report accepted by the usage queue"
+                    };
                     if self.extended {
                         metrics::histogram!(
                             "inference_proxy_usage_report_time_to_accepted_seconds",
@@ -469,7 +489,8 @@ impl UsageReportDelivery {
                         ingress_route = reporter.request_source.ingress_route.as_label(),
                         attempts,
                         since_completion_ms,
-                        "Direct-key usage report accepted by Cloud API"
+                        "{}",
+                        accepted
                     );
                     return;
                 }
@@ -515,7 +536,10 @@ impl UsageReportDelivery {
             let reason = match decision {
                 SendOutcome::Final(reason) => reason,
                 SendOutcome::Retryable(_) => "attempts_exhausted",
-                SendOutcome::Accepted => unreachable!("an accepted report returned above"),
+                // Accepted with an answer that is not a success breaks the
+                // sender's contract (see `UsageSender::send`). Not billed by
+                // this delivery, so it is a rejection, not a panic.
+                SendOutcome::Accepted => "rejected",
             };
             self.count(
                 "inference_proxy_usage_reports_dropped_total",
@@ -525,266 +549,6 @@ impl UsageReportDelivery {
             return;
         }
     }
-
-    /// Drop `job` without a (further) attempt: counted as the report's final
-    /// outcome and as a drop, and logged with its ids.
-    fn give_up(&self, job: &Job, why: GiveUp) {
-        let reporter = &job.reporter;
-        let since_completion_ms = job.completed_at.elapsed().as_millis() as u64;
-        match why {
-            GiveUp::QueueFull => {
-                let outcome = UsageReportOutcome::QueueFull;
-                record_usage_report_outcome(reporter, outcome, None);
-                self.count(
-                    "inference_proxy_usage_reports_dropped_total",
-                    reporter,
-                    ("reason", "queue_full"),
-                );
-                warn!(
-                    request_id = %reporter.request_id.as_deref().unwrap_or(""),
-                    org_id = %reporter.org_id.as_deref().unwrap_or(""),
-                    workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
-                    api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
-                    model = %reporter.model_name,
-                    auth_path = reporter.request_source.auth_path.as_label(),
-                    ingress_route = reporter.request_source.ingress_route.as_label(),
-                    outcome = outcome.as_label(),
-                    since_completion_ms,
-                    max_queued = self.policy.max_queued,
-                    "Usage report dropped: the waiting queue is full and this report waited \
-                     longest — usage NOT billed"
-                );
-            }
-            GiveUp::Deadline {
-                attempts,
-                last_attempt,
-            } => {
-                let outcome = UsageReportOutcome::DeadlineExceeded;
-                // With the duration of its last attempt, when it had one.
-                record_usage_report_outcome(
-                    reporter,
-                    outcome,
-                    last_attempt.map(|(_, elapsed)| elapsed),
-                );
-                self.count(
-                    "inference_proxy_usage_reports_dropped_total",
-                    reporter,
-                    ("reason", "deadline"),
-                );
-                warn!(
-                    request_id = %reporter.request_id.as_deref().unwrap_or(""),
-                    org_id = %reporter.org_id.as_deref().unwrap_or(""),
-                    workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
-                    api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
-                    model = %reporter.model_name,
-                    auth_path = reporter.request_source.auth_path.as_label(),
-                    ingress_route = reporter.request_source.ingress_route.as_label(),
-                    outcome = outcome.as_label(),
-                    attempts,
-                    last_attempt = last_attempt.map(|(outcome, _)| outcome.as_label()),
-                    since_completion_ms,
-                    "Usage report dropped: not accepted before its deadline — usage NOT billed"
-                );
-            }
-        }
-    }
-
-    /// Wait until nothing is pending, for at most `limit`.
-    pub async fn drain(&self, limit: Duration) -> Drained {
-        let started_at = Instant::now();
-        let give_up_at = tokio::time::Instant::now() + limit.min(Duration::from_secs(86_400));
-        let (waiting, in_flight) = self.pending();
-        let pending = waiting + in_flight;
-        loop {
-            // Registered before the state is read, so the notification of a
-            // report that ends in between is not missed.
-            let idle = self.idle.notified();
-            tokio::pin!(idle);
-            idle.as_mut().enable();
-            if self.is_idle() || tokio::time::timeout_at(give_up_at, idle).await.is_err() {
-                let (left_waiting, left_in_flight) = self.pending();
-                return Drained {
-                    pending,
-                    left_waiting,
-                    left_in_flight,
-                    waited: started_at.elapsed(),
-                };
-            }
-        }
-    }
-
-    /// Shutdown, once the server has stopped serving: give pending reports
-    /// `shutdown_drain` to finish and say how many were left. A process with
-    /// the default policy exits as it always has, without waiting or logging
-    /// (`None`).
-    pub async fn drain_at_shutdown(&self) -> Option<Drained> {
-        if !self.extended {
-            return None;
-        }
-        let drained = self.drain(self.policy.shutdown_drain).await;
-        if drained.left() == 0 {
-            info!(
-                pending = drained.pending,
-                waited_ms = drained.waited.as_millis() as u64,
-                "Usage reports drained before shutdown"
-            );
-        } else {
-            warn!(
-                pending = drained.pending,
-                left_waiting = drained.left_waiting,
-                left_in_flight = drained.left_in_flight,
-                waited_ms = drained.waited.as_millis() as u64,
-                "Usage reports left undelivered at shutdown — usage NOT billed"
-            );
-        }
-        Some(drained)
-    }
-
-    /// One more on a per-report delivery counter.
-    fn count(
-        &self,
-        name: &'static str,
-        reporter: &UsageReporter,
-        label: (&'static str, &'static str),
-    ) {
-        if self.extended {
-            metrics::counter!(name, source_labels(reporter, Some(label))).increment(1);
-        }
-    }
-
-    /// One more (`Step::Up`) or one fewer report of `model` waiting for a
-    /// place; `Step::None` only makes the series exist.
-    fn waiting_gauge(&self, model: ModelLabel, step: Step) {
-        if self.extended {
-            step.apply(model_gauge!(
-                model,
-                "inference_proxy_usage_report_queue_depth"
-            ));
-        }
-    }
-
-    /// One more or one fewer report of `model` holding a place.
-    fn in_flight_gauge(&self, model: ModelLabel, step: Step) {
-        if self.extended {
-            step.apply(model_gauge!(
-                model,
-                "inference_proxy_usage_reports_in_flight"
-            ));
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Step {
-    Up,
-    Down,
-    None,
-}
-
-impl Step {
-    fn apply(self, gauge: metrics::Gauge) {
-        match self {
-            Step::Up => gauge.increment(1.0),
-            Step::Down => gauge.decrement(1.0),
-            Step::None => gauge.increment(0.0),
-        }
-    }
-}
-
-/// A place among the `max_in_flight`, held by one worker task.
-struct Place {
-    delivery: Arc<UsageReportDelivery>,
-    /// The model of the report in the place, for the gauge.
-    model: ModelLabel,
-    held: bool,
-}
-
-impl Place {
-    /// Deliver `first`, then whatever waits, and give the place back when
-    /// nothing does.
-    async fn work(mut self, first: Job) {
-        let mut job = first;
-        loop {
-            self.delivery.deliver(&job).await;
-            match self.next() {
-                Some(next) => job = next,
-                None => return,
-            }
-            // A backlog of reports past their deadline is dropped without a
-            // single await; other tasks get their turn between two of them.
-            tokio::task::yield_now().await;
-        }
-    }
-
-    /// The next report to deliver in this place, or `None` after giving the
-    /// place back because nothing waits. One lock for both, so a report
-    /// queued in between cannot be left waiting with a place free.
-    fn next(&mut self) -> Option<Job> {
-        let (next, idle) = {
-            let mut state = self.delivery.state();
-            let next = state.waiting.pop_front();
-            if next.is_none() {
-                state.in_flight -= 1;
-                self.held = false;
-            }
-            (next, state.is_idle())
-        };
-        self.delivery.in_flight_gauge(self.model, Step::Down);
-        if let Some(next) = &next {
-            self.model = next.reporter.model_label;
-            self.delivery.waiting_gauge(self.model, Step::Down);
-            self.delivery.in_flight_gauge(self.model, Step::Up);
-        }
-        if idle {
-            self.delivery.idle.notify_waiters();
-        }
-        next
-    }
-}
-
-impl Drop for Place {
-    /// A worker that ends without giving its place back (it panicked, or the
-    /// runtime is going away) must not take the place with it: under a cap
-    /// that would stop delivery for good once every place was lost. Reports
-    /// still waiting are picked up by the worker of the next report.
-    fn drop(&mut self) {
-        if self.held {
-            let idle = {
-                let mut state = self.delivery.state();
-                state.in_flight -= 1;
-                state.is_idle()
-            };
-            self.delivery.in_flight_gauge(self.model, Step::Down);
-            if idle {
-                self.delivery.idle.notify_waiters();
-            }
-        }
-    }
-}
-
-/// `label`, the request source and, in list mode, the model: the label set of
-/// the per-report delivery series, in the order of the existing ones.
-fn source_labels(
-    reporter: &UsageReporter,
-    label: Option<(&'static str, &'static str)>,
-) -> Vec<metrics::Label> {
-    let source = [
-        ("auth_path", reporter.request_source.auth_path.as_label()),
-        (
-            "ingress_route",
-            reporter.request_source.ingress_route.as_label(),
-        ),
-    ];
-    label
-        .into_iter()
-        .chain(source)
-        .map(|(key, value)| metrics::Label::new(key, value))
-        .chain(
-            reporter
-                .model_label
-                .map(|model| metrics::Label::new("model", model)),
-        )
-        .collect()
 }
 
 #[cfg(test)]

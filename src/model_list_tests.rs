@@ -951,12 +951,23 @@ fn a_backend_token_requires_a_process_that_can_bill() {
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("VLLM_BACKEND_TOKEN requires CLOUD_API_URL and CLOUD_API_USAGE_TOKEN"),
+            error.contains("VLLM_BACKEND_TOKEN requires billing"),
             "{error}"
         );
     }
     // No token, nothing to bill for.
     parse_with(one(serde_json::json!({})), &defaults(), &cannot_bill).unwrap();
+    // The SQS transport bills without cloud-api: the same token is accepted.
+    let sqs_bills = ProcessSettings {
+        bills_usage: true,
+        ..process()
+    };
+    parse_with(
+        one(serde_json::json!({"backend_token_env": "VLLM_BACKEND_TOKEN_ALPHA"})),
+        &defaults(),
+        &sqs_bills,
+    )
+    .unwrap();
 }
 
 #[test]

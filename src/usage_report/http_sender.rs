@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::future::BoxFuture;
 
-use super::{AttemptLog, Job, SendOutcome, UsageSender};
+use super::{AttemptLog, Job, SendOutcome, TransportKind, UsageSender};
 use crate::proxy::{classify_usage_http_status, classify_usage_request_error, UsageReportOutcome};
 
 /// Sends reports to cloud-api over HTTP. It holds nothing: the URL, the usage
@@ -15,6 +15,10 @@ use crate::proxy::{classify_usage_http_status, classify_usage_request_error, Usa
 pub(crate) struct HttpSender;
 
 impl UsageSender for HttpSender {
+    fn kind(&self) -> TransportKind {
+        TransportKind::Http
+    }
+
     fn send<'a>(
         &'a self,
         job: &'a Job,
@@ -22,16 +26,24 @@ impl UsageSender for HttpSender {
     ) -> BoxFuture<'a, (SendOutcome, AttemptLog)> {
         Box::pin(async move {
             let reporter = &job.reporter;
-            // The token is checked when the report is made (`spawn_usage_report`)
-            // before it is ever handed over, so it is present here.
-            let url = format!("{}/v1/internal/usage", reporter.cloud_api_url);
-            let authorization = format!(
-                "Bearer {}",
-                reporter
-                    .cloud_api_usage_token
-                    .as_deref()
-                    .expect("checked in spawn_usage_report")
-            );
+            // `spawn_usage_report` checks the URL and the token before it hands
+            // a report over, so this is not reached in practice. Should it be,
+            // the report is refused as final: no panic on a production path.
+            let (Some(base), Some(token)) = (
+                reporter.cloud_api_url.as_deref(),
+                reporter.cloud_api_usage_token.as_deref(),
+            ) else {
+                return (
+                    SendOutcome::Final("missing_usage_token"),
+                    AttemptLog {
+                        answer: Err("no cloud-api URL or usage token configured".to_string()),
+                        outcome: UsageReportOutcome::MissingUsageToken,
+                        duration: Duration::ZERO,
+                    },
+                );
+            };
+            let url = format!("{base}/v1/internal/usage");
+            let authorization = format!("Bearer {token}");
             let started_at = Instant::now();
             let mut request = reporter
                 .http_client

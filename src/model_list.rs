@@ -579,7 +579,7 @@ fn validate(model: &ModelConfig, process: &ProcessSettings) -> anyhow::Result<()
     // that carries a trusted token, so this process must be able to.
     if model.backend_token.is_some() && !process.bills_usage {
         anyhow::bail!(
-            "VLLM_BACKEND_TOKEN requires CLOUD_API_URL and CLOUD_API_USAGE_TOKEN: backends do not bill trusted-token requests"
+            "VLLM_BACKEND_TOKEN requires billing: CLOUD_API_URL and CLOUD_API_USAGE_TOKEN, or VLLM_PROXY_USAGE_REPORT_TRANSPORT=sqs: backends do not bill trusted-token requests"
         );
     }
     // The reasoning handling runs for a model whose backends trust this
@@ -965,9 +965,10 @@ pub fn app_state(process: Process<'_>) -> anyhow::Result<AppState> {
         "Model list enabled"
     );
     Ok(AppState {
-        usage_report_delivery: crate::usage_report::UsageReportDelivery::new(
+        usage_report_delivery: crate::usage_report::UsageReportDelivery::for_transport(
             config.usage_report.clone(),
-        ),
+            &config.usage_report_transport,
+        )?,
         signing: Arc::new(signing),
         cache: Arc::new(crate::cache::ChatCache::new(
             &config.model_name,

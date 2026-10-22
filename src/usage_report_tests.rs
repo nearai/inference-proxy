@@ -10,8 +10,10 @@ use axum::extract::State as Shared;
 use axum::http::{HeaderMap, StatusCode};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusRecorder};
 
+use super::queue::Place;
 use super::*;
 use crate::auth::{AuthPath, IngressRouteKind, RequestSource};
+use crate::model_metrics::ModelLabel;
 
 /// How the stand-in answers.
 enum Answers {
@@ -187,7 +189,7 @@ impl Billing {
     fn report(&self, delivery: &Arc<UsageReportDelivery>, id: &str, model: ModelLabel) {
         let reporter = UsageReporter {
             http_client: self.client.clone(),
-            cloud_api_url: self.url.clone(),
+            cloud_api_url: Some(self.url.clone()),
             model_name: model.unwrap_or("test-model").to_string(),
             cloud_api_usage_token: Some("usage-secret".to_string()),
             org_id: Some("org-1".to_string()),
@@ -1431,7 +1433,7 @@ async fn shutdown_says_how_many_reports_it_waited_for_and_how_many_it_left() {
 async fn http_attempt(billing: &Billing, timeout: Duration) -> (SendOutcome, AttemptLog) {
     let reporter = UsageReporter {
         http_client: billing.client.clone(),
-        cloud_api_url: billing.url.clone(),
+        cloud_api_url: Some(billing.url.clone()),
         model_name: "test-model".to_string(),
         cloud_api_usage_token: Some("usage-secret".to_string()),
         org_id: Some("org-1".to_string()),
@@ -1450,6 +1452,7 @@ async fn http_attempt(billing: &Billing, timeout: Duration) -> (SendOutcome, Att
         reporter,
         body: bytes::Bytes::from_static(br#"{"id":"report-1"}"#),
         completed_at: Instant::now(),
+        emitted_at: chrono::Utc::now(),
     };
     super::http_sender::HttpSender.send(&job, timeout).await
 }
@@ -1530,6 +1533,10 @@ struct Scripted {
 }
 
 impl UsageSender for Scripted {
+    fn kind(&self) -> TransportKind {
+        TransportKind::Sqs
+    }
+
     fn send<'a>(
         &'a self,
         _job: &'a Job,
@@ -1600,4 +1607,51 @@ async fn an_injected_sender_drives_the_queue_and_retry_path() {
         attempts_made(vec![SendOutcome::Retryable("timeout")]).await,
         3
     );
+}
+
+/// A sender that says "accepted" with no successful answer. That breaks the
+/// contract `UsageSender::send` documents; the delivery must not panic on it.
+struct AcceptedWithoutAnAnswer;
+
+impl UsageSender for AcceptedWithoutAnAnswer {
+    fn kind(&self) -> TransportKind {
+        TransportKind::Sqs
+    }
+
+    fn send<'a>(
+        &'a self,
+        _job: &'a Job,
+        _timeout: Duration,
+    ) -> BoxFuture<'a, (SendOutcome, AttemptLog)> {
+        Box::pin(async move {
+            (
+                SendOutcome::Accepted,
+                AttemptLog {
+                    answer: Err("no answer".to_string()),
+                    outcome: UsageReportOutcome::ConnectError,
+                    duration: Duration::ZERO,
+                },
+            )
+        })
+    }
+}
+
+/// Accepted without a success answer is counted as a rejection: not billed,
+/// dropped with the reason `rejected`, and never as accepted.
+#[tokio::test]
+async fn an_accepted_attempt_without_a_success_answer_is_counted_as_rejected() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    // A cap on reports in flight makes the delivery's series exist.
+    let delivery = UsageReportDelivery::with_sender(
+        UsageReportPolicy {
+            max_in_flight: 4,
+            ..Default::default()
+        },
+        Arc::new(AcceptedWithoutAnAnswer),
+    );
+    Billing::unreachable().report(&delivery, "one", None);
+    delivered(&delivery).await;
+    assert_eq!(value(&recorder, DROPPED, &["reason=\"rejected\""]), 1.0);
+    assert_eq!(value(&recorder, REPORTS, &["outcome=\"accepted\""]), 0.0);
 }

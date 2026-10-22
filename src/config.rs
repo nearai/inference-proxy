@@ -121,12 +121,79 @@ pub(crate) fn validate_discount_to_user(discount: f64, raw: &str) -> anyhow::Res
     Ok((basis_points > 0.0).then_some(discount))
 }
 
+/// `VLLM_PROXY_USAGE_REPORT_TRANSPORT` (`http`, the default, or `sqs`) and its
+/// `VLLM_PROXY_USAGE_REPORT_SQS_*` and `VLLM_PROXY_AWS_CREDENTIALS_URL`
+/// settings. `sqs` needs a queue URL; a value that cannot work fails startup.
+fn usage_report_transport() -> anyhow::Result<crate::usage_report::UsageReportTransport> {
+    use crate::usage_report::{SqsSettings, UsageReportTransport};
+
+    const TRANSPORT: &str = "VLLM_PROXY_USAGE_REPORT_TRANSPORT";
+    const SQS_URL: &str = "VLLM_PROXY_USAGE_REPORT_SQS_URL";
+    const SQS_REGION: &str = "VLLM_PROXY_USAGE_REPORT_SQS_REGION";
+    const SQS_ENDPOINT: &str = "VLLM_PROXY_USAGE_REPORT_SQS_ENDPOINT";
+    const CREDENTIALS_URL: &str = "VLLM_PROXY_AWS_CREDENTIALS_URL";
+    const DEFAULT_REGION: &str = "us-east-1";
+
+    let optional = |name: &str| env::var(name).ok().filter(|v| !v.trim().is_empty());
+    let transport = optional(TRANSPORT).unwrap_or_else(|| "http".to_string());
+    match transport.trim() {
+        "http" => Ok(UsageReportTransport::Http),
+        "sqs" => {
+            let Some(queue_url) = optional(SQS_URL) else {
+                anyhow::bail!("{TRANSPORT}=sqs requires {SQS_URL}");
+            };
+            // The credentials come only from this endpoint: no endpoint, no sqs.
+            let Some(credentials_url) = optional(CREDENTIALS_URL) else {
+                anyhow::bail!("{TRANSPORT}=sqs requires {CREDENTIALS_URL}");
+            };
+            let region = optional(SQS_REGION)
+                .map_or_else(|| DEFAULT_REGION.to_string(), |r| r.trim().to_string());
+            // A region names an endpoint host, so it is letters, digits and hyphens only.
+            let region_ok = !region.is_empty()
+                && region.len() <= 32
+                && region
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+            if !region_ok {
+                anyhow::bail!(
+                    "{SQS_REGION} must be an AWS region name such as eu-west-1, not `{region}`"
+                );
+            }
+            Ok(UsageReportTransport::Sqs(SqsSettings {
+                queue_url: queue_url.trim().to_string(),
+                region,
+                endpoint: optional(SQS_ENDPOINT).map(|e| e.trim().to_string()),
+                credentials_url: credentials_url.trim().to_string(),
+            }))
+        }
+        other => anyhow::bail!("{TRANSPORT} must be `http` or `sqs`, not `{other}`"),
+    }
+}
+
+/// Whether this process bills usage: over HTTP it needs cloud-api's URL and
+/// usage token; over SQS the queue carries the usage, and `usage_report_transport`
+/// has already required its settings (queue, credentials endpoint).
+fn bills_usage(
+    cloud_api_configured: bool,
+    usage_token_configured: bool,
+    transport: &crate::usage_report::UsageReportTransport,
+) -> bool {
+    matches!(transport, crate::usage_report::UsageReportTransport::Sqs(_))
+        || (cloud_api_configured && usage_token_configured)
+}
+
 /// `VLLM_PROXY_USAGE_REPORT_*`: how usage reports are delivered to the
 /// billing API (`usage_report.rs`). With none of them set delivery is what it
 /// has always been: one attempt, 5 seconds, no cap on reports in flight,
 /// nothing awaited at shutdown. A value that cannot work fails startup: these
 /// settings decide whether usage is billed, so a typo must not be guessed at.
-fn usage_report_policy() -> anyhow::Result<crate::usage_report::UsageReportPolicy> {
+///
+/// The SQS transport has its own defaults: 5 attempts (the retries that
+/// credential and clock-skew errors need) and 8 reports in flight, the cap the
+/// gateway's delivery policy sets. Each stays overridable by its variable.
+fn usage_report_policy(
+    transport: &crate::usage_report::UsageReportTransport,
+) -> anyhow::Result<crate::usage_report::UsageReportPolicy> {
     use std::time::Duration;
 
     const TIMEOUT: &str = "VLLM_PROXY_USAGE_REPORT_TIMEOUT_SECS";
@@ -145,17 +212,34 @@ fn usage_report_policy() -> anyhow::Result<crate::usage_report::UsageReportPolic
     /// kilobyte or two, so this bounds the queue to a few hundred megabytes.
     const MAX_QUEUED_LIMIT: usize = 100_000;
     const SHUTDOWN_DRAIN_LIMIT_SECS: u64 = 600;
+    const SQS_DEFAULT_MAX_ATTEMPTS: u32 = 5;
+    const SQS_DEFAULT_MAX_IN_FLIGHT: usize = 8;
+    /// The queue's reports are durable once accepted, so a short wait at
+    /// shutdown lets the ones in flight land instead of being abandoned.
+    const SQS_DEFAULT_SHUTDOWN_DRAIN_SECS: u64 = 10;
 
     let default = crate::usage_report::UsageReportPolicy::default();
     let default_timeout_secs = default.attempt_timeout.as_secs();
     let timeout_secs: u64 = env_parse(TIMEOUT, default_timeout_secs)?;
-    let max_attempts: u32 = env_parse(MAX_ATTEMPTS, default.max_attempts)?;
+    let (default_attempts, default_in_flight, default_shutdown_drain) = match transport {
+        crate::usage_report::UsageReportTransport::Http => (
+            default.max_attempts,
+            default.max_in_flight,
+            default.shutdown_drain,
+        ),
+        crate::usage_report::UsageReportTransport::Sqs(_) => (
+            SQS_DEFAULT_MAX_ATTEMPTS,
+            SQS_DEFAULT_MAX_IN_FLIGHT,
+            Duration::from_secs(SQS_DEFAULT_SHUTDOWN_DRAIN_SECS),
+        ),
+    };
+    let max_attempts: u32 = env_parse(MAX_ATTEMPTS, default_attempts)?;
     let initial_backoff_ms: u64 =
         env_parse(INITIAL_BACKOFF, default.initial_backoff.as_millis() as u64)?;
     let deadline_secs: u64 = env_parse(DEADLINE, 0)?;
-    let max_in_flight: usize = env_parse(MAX_IN_FLIGHT, default.max_in_flight)?;
+    let max_in_flight: usize = env_parse(MAX_IN_FLIGHT, default_in_flight)?;
     let max_queued: usize = env_parse(MAX_QUEUED, default.max_queued)?;
-    let shutdown_drain_secs: u64 = env_parse(SHUTDOWN_DRAIN, 0)?;
+    let shutdown_drain_secs: u64 = env_parse(SHUTDOWN_DRAIN, default_shutdown_drain.as_secs())?;
 
     if !(1..=TIMEOUT_LIMIT_SECS).contains(&timeout_secs) {
         anyhow::bail!("{TIMEOUT} must be between 1 and {TIMEOUT_LIMIT_SECS}");
@@ -501,6 +585,9 @@ pub struct Config {
     /// a bounded queue behind it, and a drain at shutdown. The default is one
     /// attempt with a 5 second timeout and none of the rest.
     pub usage_report: crate::usage_report::UsageReportPolicy,
+    /// Where usage reports are sent (`VLLM_PROXY_USAGE_REPORT_TRANSPORT`):
+    /// cloud-api over HTTP (the default) or the usage queue over SQS.
+    pub usage_report_transport: crate::usage_report::UsageReportTransport,
 
     // Compose-manager attestation (deployment actions attestation)
     pub compose_manager_url: Option<String>,
@@ -939,6 +1026,7 @@ impl Config {
                 "OHTTP_ENABLED requires LISTEN_ADDR to be unspecified (0.0.0.0/::) or loopback"
             );
         }
+        let transport = usage_report_transport()?;
         let backend_token = env::var("VLLM_BACKEND_TOKEN")
             .ok()
             .map(|s| s.trim().to_string())
@@ -948,9 +1036,13 @@ impl Config {
         // at startup instead of serving unbilled inference.
         if backend_token.is_some() {
             let set = |name: &str| env::var(name).is_ok_and(|v| !v.trim().is_empty());
-            if !set("CLOUD_API_URL") || !set("CLOUD_API_USAGE_TOKEN") {
+            if !bills_usage(
+                set("CLOUD_API_URL"),
+                set("CLOUD_API_USAGE_TOKEN"),
+                &transport,
+            ) {
                 anyhow::bail!(
-                    "VLLM_BACKEND_TOKEN requires CLOUD_API_URL and CLOUD_API_USAGE_TOKEN: backends do not bill trusted-token requests"
+                    "VLLM_BACKEND_TOKEN requires billing: CLOUD_API_URL and CLOUD_API_USAGE_TOKEN, or VLLM_PROXY_USAGE_REPORT_TRANSPORT=sqs: backends do not bill trusted-token requests"
                 );
             }
         }
@@ -1240,7 +1332,8 @@ impl Config {
             cloud_api_usage_token: env::var("CLOUD_API_USAGE_TOKEN")
                 .ok()
                 .filter(|s| !s.is_empty()),
-            usage_report: usage_report_policy()?,
+            usage_report: usage_report_policy(&transport)?,
+            usage_report_transport: transport,
             compose_manager_url,
             gpu_evidence_delegate_url: env::var("GPU_EVIDENCE_DELEGATE_URL")
                 .ok()
@@ -1486,8 +1579,11 @@ impl Config {
                 admission_ramp_interval_secs: config.admission_ramp_interval_secs,
                 admission_backpressure_secs: config.admission_backpressure_secs,
                 admission_retry_after_secs: config.admission_retry_after_secs,
-                bills_usage: config.cloud_api_url.is_some()
-                    && config.cloud_api_usage_token.is_some(),
+                bills_usage: bills_usage(
+                    config.cloud_api_url.is_some(),
+                    config.cloud_api_usage_token.is_some(),
+                    &config.usage_report_transport,
+                ),
             };
             let models =
                 crate::model_list::load(&path, &defaults, &process, &|name| env::var(name).ok())?;
@@ -1769,7 +1865,7 @@ mod tests {
         }
     }
 
-    const USAGE_REPORT_ENV: [&str; 7] = [
+    const USAGE_REPORT_ENV: [&str; 12] = [
         "VLLM_PROXY_USAGE_REPORT_TIMEOUT_SECS",
         "VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS",
         "VLLM_PROXY_USAGE_REPORT_INITIAL_BACKOFF_MS",
@@ -1777,7 +1873,86 @@ mod tests {
         "VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT",
         "VLLM_PROXY_USAGE_REPORT_MAX_QUEUED",
         "VLLM_PROXY_USAGE_REPORT_SHUTDOWN_DRAIN_SECS",
+        "VLLM_PROXY_USAGE_REPORT_TRANSPORT",
+        "VLLM_PROXY_USAGE_REPORT_SQS_URL",
+        "VLLM_PROXY_USAGE_REPORT_SQS_REGION",
+        "VLLM_PROXY_USAGE_REPORT_SQS_ENDPOINT",
+        "VLLM_PROXY_AWS_CREDENTIALS_URL",
     ];
+
+    /// The SQS transport's defaults (5 attempts, 8 in flight) apply only to
+    /// it, and each stays overridable. HTTP keeps the one-attempt default.
+    #[test]
+    fn test_usage_report_defaults_depend_on_the_transport() {
+        use std::time::Duration;
+        const TRANSPORT: &str = "VLLM_PROXY_USAGE_REPORT_TRANSPORT";
+        const MAX_ATTEMPTS: &str = "VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS";
+        const MAX_IN_FLIGHT: &str = "VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT";
+        const SHUTDOWN_DRAIN: &str = "VLLM_PROXY_USAGE_REPORT_SHUTDOWN_DRAIN_SECS";
+        let base = [("MODEL_NAME", "m"), ("TOKEN", "t")];
+        let sqs = [
+            (TRANSPORT, "sqs"),
+            ("VLLM_PROXY_USAGE_REPORT_SQS_URL", "https://sqs.example/q"),
+            ("VLLM_PROXY_AWS_CREDENTIALS_URL", "http://127.0.0.1:9911"),
+        ];
+        with_clean_env(&base, &[], || {
+            let policy = Config::from_env().unwrap().usage_report;
+            assert_eq!(policy.max_attempts, 1);
+            assert_eq!(policy.max_in_flight, 0);
+            assert_eq!(policy.shutdown_drain, Duration::ZERO);
+        });
+        with_clean_env(&base, &sqs, || {
+            let policy = Config::from_env().unwrap().usage_report;
+            assert_eq!(policy.max_attempts, 5);
+            assert_eq!(policy.max_in_flight, 8);
+            assert_eq!(policy.shutdown_drain, Duration::from_secs(10));
+        });
+        let overridden: Vec<_> = sqs
+            .iter()
+            .copied()
+            .chain([
+                (MAX_ATTEMPTS, "2"),
+                (MAX_IN_FLIGHT, "4"),
+                (SHUTDOWN_DRAIN, "3"),
+            ])
+            .collect();
+        with_clean_env(&base, &overridden, || {
+            let policy = Config::from_env().unwrap().usage_report;
+            assert_eq!(policy.max_attempts, 2);
+            assert_eq!(policy.max_in_flight, 4);
+            assert_eq!(policy.shutdown_drain, Duration::from_secs(3));
+        });
+    }
+
+    /// The fail-closed rule for `VLLM_BACKEND_TOKEN` counts the SQS transport
+    /// as a billing path, and HTTP still needs cloud-api.
+    #[test]
+    fn test_backend_token_is_accepted_over_sqs_and_refused_over_http_without_cloud_api() {
+        const TRANSPORT: &str = "VLLM_PROXY_USAGE_REPORT_TRANSPORT";
+        let base = [("MODEL_NAME", "m"), ("TOKEN", "t")];
+        let token = ("VLLM_BACKEND_TOKEN", "backend-secret");
+        with_clean_env(
+            &base,
+            &[
+                token,
+                (TRANSPORT, "sqs"),
+                ("VLLM_PROXY_USAGE_REPORT_SQS_URL", "https://sqs.example/q"),
+                ("VLLM_PROXY_AWS_CREDENTIALS_URL", "http://127.0.0.1:9911"),
+            ],
+            || {
+                Config::from_env().expect("sqs bills without cloud-api");
+            },
+        );
+        with_clean_env(&base, &[token], || {
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(err.contains("requires billing"), "{err}");
+        });
+        // sqs selected without its endpoint still fails, from the transport's own check.
+        with_clean_env(&base, &[token, (TRANSPORT, "sqs")], || {
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(err.contains("VLLM_PROXY_USAGE_REPORT_SQS_URL"), "{err}");
+        });
+    }
 
     #[test]
     fn test_usage_report_delivery_is_unchanged_without_its_settings() {
@@ -1801,6 +1976,111 @@ mod tests {
                 crate::usage_report::UsageReportPolicy::default()
             );
             gateway_env_cleanup();
+        });
+    }
+
+    #[test]
+    fn test_bills_usage_counts_the_sqs_transport_without_cloud_api() {
+        use crate::usage_report::{SqsSettings, UsageReportTransport};
+        let sqs = UsageReportTransport::Sqs(SqsSettings {
+            queue_url: "https://q".into(),
+            region: "us-east-1".into(),
+            endpoint: None,
+            credentials_url: "http://127.0.0.1:9911".into(),
+        });
+        // SQS needs neither cloud-api's URL nor its usage token.
+        assert!(bills_usage(false, false, &sqs));
+        // HTTP needs both, as before.
+        let http = UsageReportTransport::Http;
+        assert!(!bills_usage(false, false, &http));
+        assert!(!bills_usage(true, false, &http));
+        assert!(!bills_usage(false, true, &http));
+        assert!(bills_usage(true, true, &http));
+    }
+
+    #[test]
+    fn test_usage_report_transport_defaults_to_http_and_sqs_needs_a_queue() {
+        use crate::usage_report::{SqsSettings, UsageReportTransport};
+        const TRANSPORT: &str = "VLLM_PROXY_USAGE_REPORT_TRANSPORT";
+        const SQS_URL: &str = "VLLM_PROXY_USAGE_REPORT_SQS_URL";
+        const SQS_REGION: &str = "VLLM_PROXY_USAGE_REPORT_SQS_REGION";
+        const CREDENTIALS_URL: &str = "VLLM_PROXY_AWS_CREDENTIALS_URL";
+        let base = [("MODEL_NAME", "m"), ("TOKEN", "t")];
+
+        with_clean_env(&base, &[], || {
+            assert_eq!(
+                Config::from_env().unwrap().usage_report_transport,
+                UsageReportTransport::Http
+            );
+        });
+        // An empty value is an unset one, and the transport is named exactly.
+        with_clean_env(&base, &[(TRANSPORT, " ")], || {
+            assert_eq!(
+                Config::from_env().unwrap().usage_report_transport,
+                UsageReportTransport::Http
+            );
+        });
+        with_clean_env(
+            &base,
+            &[
+                (TRANSPORT, "sqs"),
+                (SQS_URL, "https://sqs.example/123/usage"),
+                (SQS_REGION, "eu-west-1"),
+                (CREDENTIALS_URL, "http://127.0.0.1:9911"),
+            ],
+            || {
+                assert_eq!(
+                    Config::from_env().unwrap().usage_report_transport,
+                    UsageReportTransport::Sqs(SqsSettings {
+                        queue_url: "https://sqs.example/123/usage".into(),
+                        region: "eu-west-1".into(),
+                        endpoint: None,
+                        credentials_url: "http://127.0.0.1:9911".into(),
+                    })
+                );
+            },
+        );
+        // The region defaults; the queue does not.
+        with_clean_env(
+            &base,
+            &[
+                (TRANSPORT, "sqs"),
+                (SQS_URL, "https://q"),
+                (CREDENTIALS_URL, "http://127.0.0.1:9911"),
+            ],
+            || match Config::from_env().unwrap().usage_report_transport {
+                UsageReportTransport::Sqs(settings) => {
+                    assert_eq!(settings.region, "us-east-1");
+                }
+                other => panic!("expected sqs, got {other:?}"),
+            },
+        );
+        // Selected without its credentials endpoint: startup fails.
+        with_clean_env(&base, &[(TRANSPORT, "sqs"), (SQS_URL, "https://q")], || {
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(err.contains(CREDENTIALS_URL), "{err}");
+        });
+        // A region that is not a region name fails startup.
+        with_clean_env(
+            &base,
+            &[
+                (TRANSPORT, "sqs"),
+                (SQS_URL, "https://q"),
+                (SQS_REGION, "us-east-1.evil"),
+                (CREDENTIALS_URL, "http://127.0.0.1:9911"),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains(SQS_REGION), "{err}");
+            },
+        );
+        with_clean_env(&base, &[(TRANSPORT, "sqs")], || {
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(err.contains(SQS_URL), "{err}");
+        });
+        with_clean_env(&base, &[(TRANSPORT, "kafka")], || {
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(err.contains(TRANSPORT) && err.contains("kafka"), "{err}");
         });
     }
 
@@ -3695,10 +3975,7 @@ mod tests {
             "{error}"
         );
         let error = error_of(&with_token, &[("VLLM_BACKEND_TOKEN_ALPHA", "alpha-secret")]);
-        assert!(
-            error.contains("requires CLOUD_API_URL and CLOUD_API_USAGE_TOKEN"),
-            "{error}"
-        );
+        assert!(error.contains("requires billing"), "{error}");
         assert!(!error.contains("alpha-secret"), "{error}");
         let token_env: Vec<_> = billing
             .iter()

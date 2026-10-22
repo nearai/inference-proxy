@@ -22,12 +22,13 @@ use crate::usage_report::{UsageReportDelivery, UsageReportPolicy};
 use aws_sigv4::http_request::{sign, SignableBody, SignableRequest, SigningSettings};
 use aws_sigv4::sign::v4;
 
-const QUEUE: &str = "https://sqs.us-east-1.amazonaws.com/123456789012/cloud-platform-usage";
+pub(super) const QUEUE: &str =
+    "https://sqs.us-east-1.amazonaws.com/123456789012/cloud-platform-usage";
 const ACCESS_KEY: &str = "AKIDEXAMPLE";
 const SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
 
 /// The sum of the series of `family` whose line carries `label`.
-fn counter(recorder: &PrometheusRecorder, family: &str, label: &str) -> f64 {
+pub(super) fn counter(recorder: &PrometheusRecorder, family: &str, label: &str) -> f64 {
     recorder
         .handle()
         .render()
@@ -48,7 +49,7 @@ fn fixed_time() -> SystemTime {
 
 /// A sender against `endpoint` (a stand-in for SQS), holding credentials
 /// already cached, so no credentials endpoint is involved.
-fn sender(endpoint: &str) -> SqsSender {
+pub(super) fn sender(endpoint: &str) -> SqsSender {
     SqsSender {
         queue_url: QUEUE.to_string(),
         region: "us-east-1".to_string(),
@@ -72,7 +73,7 @@ async fn credential_fetches(server: &MockServer) -> usize {
 }
 
 /// A sender whose credentials come from the endpoint `credentials_url`.
-fn sender_with_endpoint_credentials(endpoint: &str, credentials_url: &str) -> SqsSender {
+pub(super) fn sender_with_endpoint_credentials(endpoint: &str, credentials_url: &str) -> SqsSender {
     SqsSender {
         queue_url: QUEUE.to_string(),
         region: "us-east-1".to_string(),
@@ -84,7 +85,7 @@ fn sender_with_endpoint_credentials(endpoint: &str, credentials_url: &str) -> Sq
 
 /// The usage body of a chat completion, as `spawn_usage_report` completes it
 /// for a deployment that bills at a discount.
-fn chat_body(id: &str) -> Value {
+pub(super) fn chat_body(id: &str) -> Value {
     json!({
         "type": "chat_completion",
         "model": "test-model",
@@ -99,7 +100,7 @@ fn chat_body(id: &str) -> Value {
     })
 }
 
-fn job_with(body: &Value, delivery: &Arc<UsageReportDelivery>) -> Job {
+pub(super) fn job_with(body: &Value, delivery: &Arc<UsageReportDelivery>) -> Job {
     Job {
         reporter: UsageReporter {
             http_client: reqwest::Client::new(),
@@ -128,7 +129,7 @@ fn job_with(body: &Value, delivery: &Arc<UsageReportDelivery>) -> Job {
 
 /// One attempt as the delivery makes it: the report is prepared at submit,
 /// and a refused report is not sent at all.
-async fn attempt(sender: &SqsSender, job: &Job) -> (SendOutcome, AttemptLog) {
+pub(super) async fn attempt(sender: &SqsSender, job: &Job) -> (SendOutcome, AttemptLog) {
     let mut job = job.clone();
     match sender.prepare(&mut job) {
         Ok(()) => sender.send(&job, Duration::from_secs(5)).await,
@@ -143,7 +144,7 @@ async fn attempt(sender: &SqsSender, job: &Job) -> (SendOutcome, AttemptLog) {
     }
 }
 
-async fn sqs_answering(status: u16, body: Value) -> MockServer {
+pub(super) async fn sqs_answering(status: u16, body: Value) -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/"))
@@ -976,262 +977,4 @@ async fn a_denial_that_persists_is_dropped_once_the_attempts_run_out() {
         ),
         1.0
     );
-}
-
-/// A delivery whose startup check tries quickly: the policy's attempt timeout
-/// and backoff are what bound it.
-fn checking(sender: SqsSender) -> Arc<UsageReportDelivery> {
-    UsageReportDelivery::with_sender(
-        UsageReportPolicy {
-            attempt_timeout: Duration::from_secs(1),
-            initial_backoff: Duration::from_millis(1),
-            ..Default::default()
-        },
-        Arc::new(sender),
-    )
-}
-
-/// The startup check is a signed `GetQueueAttributes` for `QueueArn` on the
-/// usage queue, made once when it succeeds.
-#[tokio::test]
-async fn startup_check_gets_the_queue_arn_once() {
-    let sqs = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/"))
-        .and(header("x-amz-target", "AmazonSQS.GetQueueAttributes"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"Attributes": {}})))
-        .expect(1)
-        .mount(&sqs)
-        .await;
-    let delivery = checking(sender(&sqs.uri()));
-    delivery
-        .check_startup(&reqwest::Client::new())
-        .await
-        .unwrap();
-    let requests = sqs.received_requests().await.unwrap();
-    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
-    assert_eq!(
-        body,
-        json!({"QueueUrl": QUEUE, "AttributeNames": ["QueueArn"]})
-    );
-    assert!(requests[0].headers.contains_key("authorization"));
-}
-
-/// A queue that does not exist refuses startup at once, naming the category.
-#[tokio::test]
-async fn startup_check_refuses_a_missing_queue() {
-    let sqs = sqs_answering(
-        400,
-        json!({"__type": "com.amazonaws.sqs#QueueDoesNotExist"}),
-    )
-    .await;
-    let delivery = checking(sender(&sqs.uri()));
-    let error = delivery
-        .check_startup(&reqwest::Client::new())
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("sqs_invalid"), "{error}");
-    assert_eq!(sqs.received_requests().await.unwrap().len(), 1);
-}
-
-/// Credentials that cannot be had are tried a few times, then startup is refused.
-#[tokio::test]
-async fn startup_check_refuses_when_credentials_fail() {
-    let creds = MockServer::start().await;
-    mount_imds_session(&creds).await;
-    Mock::given(method("GET"))
-        .and(path(ROLE_CREDENTIALS_PATH))
-        .respond_with(ResponseTemplate::new(500))
-        .expect(4)
-        .mount(&creds)
-        .await;
-    let sqs = sqs_answering(200, json!({})).await;
-    let delivery = checking(sender_with_endpoint_credentials(&sqs.uri(), &creds.uri()));
-    let error = delivery
-        .check_startup(&reqwest::Client::new())
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("sqs_credentials"), "{error}");
-    assert!(sqs.received_requests().await.unwrap().is_empty());
-}
-
-/// A failure that passes is retried: the second try succeeds.
-#[tokio::test]
-async fn startup_check_retries_a_transient_failure() {
-    let sqs = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(503))
-        .up_to_n_times(1)
-        .mount(&sqs)
-        .await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-        .mount(&sqs)
-        .await;
-    checking(sender(&sqs.uri()))
-        .check_startup(&reqwest::Client::new())
-        .await
-        .unwrap();
-    assert_eq!(sqs.received_requests().await.unwrap().len(), 2);
-}
-
-/// Over HTTP the check does nothing: no request is made.
-#[tokio::test]
-async fn startup_check_makes_no_call_over_http() {
-    let server = MockServer::start().await;
-    let client = reqwest::Client::new();
-    UsageReportDelivery::default()
-        .check_startup(&client)
-        .await
-        .unwrap();
-    assert!(server.received_requests().await.unwrap().is_empty());
-}
-
-/// A redirect from the queue endpoint is not followed: the signed request goes
-/// to the configured host only, and the answer is final (a redirecting
-/// endpoint is misconfigured; asking again changes nothing).
-#[tokio::test]
-async fn a_redirect_from_the_queue_endpoint_is_not_followed() {
-    let elsewhere = MockServer::start().await;
-    Mock::given(wiremock::matchers::any())
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"MessageId": "m"})))
-        .mount(&elsewhere)
-        .await;
-    let sqs = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(302).insert_header("location", elsewhere.uri()))
-        .mount(&sqs)
-        .await;
-    let sender = sender(&sqs.uri());
-    let job = job_with(
-        &chat_body("chatcmpl-redirect"),
-        &Arc::new(UsageReportDelivery::default()),
-    );
-    let (outcome, log) = attempt(&sender, &job).await;
-    assert_eq!(outcome, SendOutcome::Final("sqs_invalid"));
-    assert_eq!(log.outcome, UsageReportOutcome::SqsInvalid);
-    assert_eq!(sqs.received_requests().await.unwrap().len(), 1);
-    assert!(elsewhere.received_requests().await.unwrap().is_empty());
-}
-
-/// A redirect from the credentials endpoint is not followed either, at the
-/// token step and at the credentials step (which carries the session token):
-/// nothing reaches the other host, and the attempt fails as a credentials
-/// failure, which is retried like any other.
-#[tokio::test]
-async fn a_redirect_from_the_credentials_endpoint_is_not_followed() {
-    use wiremock::matchers::any;
-    let elsewhere = MockServer::start().await;
-    Mock::given(any())
-        .respond_with(ResponseTemplate::new(200).set_body_string("stolen"))
-        .mount(&elsewhere)
-        .await;
-    let sqs = sqs_answering(200, json!({"MessageId": "m"})).await;
-
-    // Redirected at the token step.
-    let creds = MockServer::start().await;
-    Mock::given(any())
-        .respond_with(ResponseTemplate::new(302).insert_header("location", elsewhere.uri()))
-        .mount(&creds)
-        .await;
-    let job = job_with(
-        &chat_body("chatcmpl-redirect-creds"),
-        &Arc::new(UsageReportDelivery::default()),
-    );
-    let sender_a = sender_with_endpoint_credentials(&sqs.uri(), &creds.uri());
-    let (outcome, log) = attempt(&sender_a, &job).await;
-    assert_eq!(outcome, SendOutcome::Retryable("sqs_credentials"));
-    assert_eq!(log.outcome, UsageReportOutcome::SqsCredentials);
-
-    // Redirected at the credentials step, which carries the token header.
-    let creds = MockServer::start().await;
-    mount_imds_session(&creds).await;
-    Mock::given(method("GET"))
-        .and(path(ROLE_CREDENTIALS_PATH))
-        .respond_with(ResponseTemplate::new(302).insert_header("location", elsewhere.uri()))
-        .mount(&creds)
-        .await;
-    let sender_b = sender_with_endpoint_credentials(&sqs.uri(), &creds.uri());
-    let (outcome, _) = attempt(&sender_b, &job).await;
-    assert_eq!(outcome, SendOutcome::Retryable("sqs_credentials"));
-
-    assert!(elsewhere.received_requests().await.unwrap().is_empty());
-    assert!(sqs.received_requests().await.unwrap().is_empty());
-}
-
-fn sqs_transport() -> crate::usage_report::UsageReportTransport {
-    crate::usage_report::UsageReportTransport::Sqs(crate::usage_report::SqsSettings {
-        queue_url: QUEUE.to_string(),
-        region: "us-east-1".to_string(),
-        endpoint: None,
-        credentials_url: "http://127.0.0.1:9911".to_string(),
-    })
-}
-
-const TRANSPORT_INFO: &str = "inference_proxy_usage_report_transport_info";
-
-/// A queue that passes its check keeps the process on SQS.
-#[tokio::test]
-async fn a_passing_queue_check_keeps_the_sqs_transport() {
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let _metrics = metrics::set_default_local_recorder(&recorder);
-    let sqs = sqs_answering(200, json!({})).await;
-    let resolved = checking(sender(&sqs.uri()))
-        .resolve_after_check(sqs_transport(), true)
-        .await
-        .unwrap();
-    assert_eq!(resolved, sqs_transport());
-    assert_eq!(
-        counter(&recorder, TRANSPORT_INFO, r#"transport="http""#),
-        0.0
-    );
-}
-
-/// A failing queue check with HTTP fully configured falls back to HTTP, and
-/// the active transport is exposed for alerting.
-#[tokio::test]
-async fn a_failing_queue_check_falls_back_to_http_when_it_is_configured() {
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let _metrics = metrics::set_default_local_recorder(&recorder);
-    let sqs = sqs_answering(
-        400,
-        json!({"__type": "com.amazonaws.sqs#QueueDoesNotExist"}),
-    )
-    .await;
-    let resolved = checking(sender(&sqs.uri()))
-        .resolve_after_check(sqs_transport(), true)
-        .await
-        .unwrap();
-    assert_eq!(resolved, crate::usage_report::UsageReportTransport::Http);
-    // The gauges are emitted once the process's recorder is installed.
-    crate::usage_report::record_fallback_to_http();
-    let exposition = recorder.handle().render();
-    assert!(
-        exposition.contains(r#"inference_proxy_usage_report_transport_info{transport="http"} 1"#),
-        "{exposition}"
-    );
-    assert!(
-        exposition.contains(r#"inference_proxy_usage_report_transport_info{transport="sqs"} 0"#),
-        "{exposition}"
-    );
-}
-
-/// A failing queue check without a configured HTTP transport refuses startup:
-/// there is never a process with no billing path.
-#[tokio::test]
-async fn a_failing_queue_check_without_http_configured_refuses_startup() {
-    let sqs = sqs_answering(
-        400,
-        json!({"__type": "com.amazonaws.sqs#QueueDoesNotExist"}),
-    )
-    .await;
-    let error = checking(sender(&sqs.uri()))
-        .resolve_after_check(sqs_transport(), false)
-        .await
-        .unwrap_err();
-    let message = format!("{error:#}");
-    assert!(message.contains("sqs_invalid"), "{message}");
-    assert!(message.contains("billing path"), "{message}");
 }

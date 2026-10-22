@@ -946,6 +946,21 @@ impl Config {
         Ok(())
     }
 
+    /// Takes the transport the startup check settled on (`resolve_transport`).
+    /// When it is not the configured one the process fell back to HTTP, and is
+    /// moved there as `fall_back_to_http_usage_transport` says. Returns whether
+    /// it fell back.
+    pub fn adopt_usage_transport(
+        &mut self,
+        resolved: crate::usage_report::UsageReportTransport,
+    ) -> anyhow::Result<bool> {
+        let fell_back = resolved != self.usage_report_transport;
+        if fell_back {
+            self.fall_back_to_http_usage_transport()?;
+        }
+        Ok(fell_back)
+    }
+
     pub fn from_env() -> anyhow::Result<Self> {
         // Gateway list mode: ids and backends come from the file, so the
         // variables that name the one model of a single-model process have
@@ -2084,6 +2099,49 @@ mod tests {
                 ..UsageReportPolicy::default()
             };
             assert_eq!(config.usage_report, expected);
+        });
+    }
+
+    /// The handoff of the startup check's answer to the config: an HTTP
+    /// resolution of an SQS config selects HTTP and rebuilds the policy with
+    /// HTTP's defaults (explicit settings kept); the configured transport as
+    /// the answer changes nothing.
+    #[test]
+    fn test_the_startup_resolution_is_adopted_by_the_config() {
+        use crate::usage_report::{UsageReportPolicy, UsageReportTransport};
+        let base = [("MODEL_NAME", "m"), ("TOKEN", "t")];
+        let sqs = [
+            ("VLLM_PROXY_USAGE_REPORT_TRANSPORT", "sqs"),
+            ("VLLM_PROXY_USAGE_REPORT_SQS_URL", "https://q"),
+            ("VLLM_PROXY_AWS_CREDENTIALS_URL", "http://127.0.0.1:9911"),
+            ("VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS", "3"),
+            ("VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT", "4"),
+        ];
+        with_clean_env(&base, &sqs, || {
+            let mut config = Config::from_env().unwrap();
+            let configured = config.usage_report_transport.clone();
+            assert!(matches!(configured, UsageReportTransport::Sqs(_)));
+            let sqs_policy = config.usage_report.clone();
+            assert_ne!(sqs_policy, UsageReportPolicy::default());
+
+            // The queue passed its check: nothing changes.
+            assert!(!config.adopt_usage_transport(configured.clone()).unwrap());
+            assert_eq!(config.usage_report_transport, configured);
+            assert_eq!(config.usage_report, sqs_policy);
+
+            // The queue failed its check and HTTP is the answer.
+            assert!(config
+                .adopt_usage_transport(UsageReportTransport::Http)
+                .unwrap());
+            assert_eq!(config.usage_report_transport, UsageReportTransport::Http);
+            assert_eq!(
+                config.usage_report,
+                UsageReportPolicy {
+                    max_attempts: 3,
+                    max_in_flight: 4,
+                    ..UsageReportPolicy::default()
+                }
+            );
         });
     }
 

@@ -26,7 +26,9 @@ use futures_util::future::BoxFuture;
 use reqwest::StatusCode;
 
 use super::{AttemptLog, Job, Refused, SendOutcome, SqsSettings, TransportKind, UsageSender};
-use crate::aws_credentials::{read_bounded, CredentialFailure, CredentialProvider};
+use crate::aws_credentials::{
+    no_redirect_client, read_bounded, CredentialFailure, CredentialProvider,
+};
 use crate::proxy::{classify_usage_request_error, UsageReportOutcome};
 
 const SERVICE: &str = "sqs";
@@ -47,16 +49,6 @@ pub(crate) struct SqsSender {
     /// proxy client: it never follows a redirect, so the metadata session
     /// token and the signed request go to the configured hosts only.
     client: reqwest::Client,
-}
-
-/// A client that treats a 3xx as the answer it is. Timeouts stay per call
-/// (the attempt's budget); bodies stay bounded by the callers.
-pub(crate) fn no_redirect_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .pool_idle_timeout(Duration::from_secs(30))
-        .build()
-        .expect("a client with default TLS settings builds")
 }
 
 impl SqsSender {
@@ -85,7 +77,7 @@ impl SqsSender {
             Ok(Err(CredentialFailure(error))) => Err((UsageReportOutcome::SqsCredentials, error)),
             Err(_) => Err((
                 UsageReportOutcome::Timeout,
-                "credentials were not had within the attempt's timeout".to_string(),
+                "credentials were not received within the attempt's timeout".to_string(),
             )),
         }
     }
@@ -113,20 +105,27 @@ impl SqsSender {
         job: &Job,
         timeout: Duration,
     ) -> (UsageReportOutcome, Result<StatusCode, String>) {
-        self.call(TARGET, &job.body, timeout).await
+        let (outcome, answer, _) = self.call(TARGET, &job.body, timeout).await;
+        (outcome, answer)
     }
 
     /// One signed call of the SQS action `target` with `body`, within `timeout`.
+    /// Besides the outcome and the answer, the error type the answer names, if
+    /// it does (`QueueDoesNotExist`, `AccessDenied`, ...).
     async fn call(
         &self,
         target: &str,
         body: &Bytes,
         timeout: Duration,
-    ) -> (UsageReportOutcome, Result<StatusCode, String>) {
+    ) -> (
+        UsageReportOutcome,
+        Result<StatusCode, String>,
+        Option<String>,
+    ) {
         let started_at = Instant::now();
         let credentials = match self.credentials_within(timeout).await {
             Ok(credentials) => credentials,
-            Err((outcome, error)) => return (outcome, Err(error)),
+            Err((outcome, error)) => return (outcome, Err(error), None),
         };
         let Some(remaining) = timeout
             .checked_sub(started_at.elapsed())
@@ -134,7 +133,8 @@ impl SqsSender {
         else {
             return (
                 UsageReportOutcome::Timeout,
-                Err("the attempt's time went on the credentials".to_string()),
+                Err("the attempt's time was used up fetching credentials".to_string()),
+                None,
             );
         };
         let headers = match sign_request(
@@ -146,7 +146,7 @@ impl SqsSender {
             SystemTime::now(),
         ) {
             Ok(headers) => headers,
-            Err(error) => return (UsageReportOutcome::SqsInvalid, Err(error)),
+            Err(error) => return (UsageReportOutcome::SqsInvalid, Err(error), None),
         };
 
         let mut request = self
@@ -169,11 +169,12 @@ impl SqsSender {
                     }
                     other => other,
                 };
-                return (outcome, Err(error.to_string()));
+                return (outcome, Err(error.to_string()), None);
             }
         };
         let status = response.status();
-        let error_type = if status.is_success() {
+        // A redirect is final whatever its body says: nothing in it is read.
+        let error_type = if status.is_success() || status.is_redirection() {
             None
         } else {
             Self::error_type(response).await
@@ -187,7 +188,7 @@ impl SqsSender {
             // attempt fetches new ones.
             self.credentials.forget(&credentials);
         }
-        (outcome, Ok(status))
+        (outcome, Ok(status), error_type)
     }
 }
 
@@ -218,7 +219,6 @@ impl UsageSender for SqsSender {
     /// a `SendMessage`. Needs `sqs:GetQueueAttributes` besides `sqs:SendMessage`.
     fn startup_check<'a>(
         &'a self,
-        _client: &'a reqwest::Client,
         timeout: Duration,
     ) -> BoxFuture<'a, Result<(), (UsageReportOutcome, String)>> {
         Box::pin(async move {
@@ -227,9 +227,26 @@ impl UsageSender for SqsSender {
                     .to_string(),
             );
             match self.call(CHECK_TARGET, &body, timeout).await {
-                (UsageReportOutcome::Accepted, _) => Ok(()),
-                (outcome, Ok(status)) => Err((outcome, format!("status {status}"))),
-                (outcome, Err(error)) => Err((outcome, error)),
+                (UsageReportOutcome::Accepted, ..) => Ok(()),
+                (outcome, Ok(status), error_type) => Err((
+                    outcome,
+                    // The error type is AWS's name for what is wrong with the
+                    // queue or the permission: no secret, but not trusted
+                    // text, so it is cut to a name's characters.
+                    match error_type.as_deref().map(short_error_name) {
+                        Some(name) => format!(
+                            "status {status}, {}",
+                            name.chars()
+                                .filter(
+                                    |c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
+                                )
+                                .take(64)
+                                .collect::<String>()
+                        ),
+                        None => format!("status {status}"),
+                    },
+                )),
+                (outcome, Err(error), _) => Err((outcome, error)),
             }
         })
     }
@@ -362,6 +379,12 @@ pub(crate) fn classify_sqs_answer(
     if status.is_success() {
         return UsageReportOutcome::Accepted;
     }
+    // Redirects are never followed: a queue endpoint that redirects is
+    // misconfigured, and asking again does not change that. This comes before
+    // the error type, so a redirect whose body names a throttle is not retried.
+    if status.is_redirection() {
+        return UsageReportOutcome::SqsInvalid;
+    }
     match error_type.map(short_error_name) {
         Some(
             "ThrottlingException"
@@ -398,9 +421,6 @@ pub(crate) fn classify_sqs_answer(
         _ => match status {
             StatusCode::TOO_MANY_REQUESTS => UsageReportOutcome::SqsThrottled,
             _ if status.is_server_error() => UsageReportOutcome::Sqs5xx,
-            // Redirects are never followed: a queue endpoint that redirects is
-            // misconfigured, and asking again does not change that.
-            _ if status.is_redirection() => UsageReportOutcome::SqsInvalid,
             StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED => UsageReportOutcome::SqsCredentials,
             _ => UsageReportOutcome::SqsUnknown,
         },
@@ -410,3 +430,11 @@ pub(crate) fn classify_sqs_answer(
 #[cfg(test)]
 #[path = "sqs_sender_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "sqs_sender_redirect_tests.rs"]
+mod redirect_tests;
+
+#[cfg(test)]
+#[path = "sqs_sender_startup_tests.rs"]
+mod startup_tests;

@@ -216,7 +216,6 @@ pub(crate) trait UsageSender: Send + Sync {
     /// default has none (HTTP); the error is the attempt's outcome and its text.
     fn startup_check<'a>(
         &'a self,
-        _client: &'a reqwest::Client,
         _timeout: Duration,
     ) -> BoxFuture<'a, Result<(), (UsageReportOutcome, String)>> {
         Box::pin(async { Ok(()) })
@@ -288,12 +287,10 @@ impl UsageReportDelivery {
         Self::with_sender(policy, Arc::new(http_sender::HttpSender))
     }
 
-    /// The delivery for the configured transport. Fails when the transport
-    /// cannot send (no credentials for SQS): that is a startup error.
-    pub fn for_transport(
-        policy: UsageReportPolicy,
-        transport: &UsageReportTransport,
-    ) -> anyhow::Result<Arc<Self>> {
+    /// The delivery for the configured transport. It cannot fail: the settings
+    /// are validated when the config is read, and the SQS credentials are
+    /// fetched at the first attempt (every failure there is retried).
+    pub fn for_transport(policy: UsageReportPolicy, transport: &UsageReportTransport) -> Arc<Self> {
         let delivery = match transport {
             UsageReportTransport::Http => Self::new(policy),
             UsageReportTransport::Sqs(settings) => {
@@ -309,7 +306,7 @@ impl UsageReportDelivery {
                 "Usage report transport configured"
             );
         }
-        Ok(delivery)
+        delivery
     }
 
     /// Startup check of the transport (SQS only; HTTP makes no call and logs
@@ -317,35 +314,36 @@ impl UsageReportDelivery {
     /// attempt timeout, backing off from its initial backoff. An answer no retry
     /// can change (a missing queue) stops at once. A failure is a startup error
     /// naming the outcome category, never a secret.
-    pub async fn check_startup(&self, client: &reqwest::Client) -> anyhow::Result<()> {
+    pub async fn check_startup(&self) -> anyhow::Result<()> {
         if self.sender.kind() == TransportKind::Http {
             return Ok(());
         }
         let mut backoff = self.policy.initial_backoff;
-        for attempt in 1..=STARTUP_CHECK_ATTEMPTS {
-            let Err((outcome, error)) = self
-                .sender
-                .startup_check(client, self.policy.attempt_timeout)
-                .await
-            else {
-                info!(
-                    transport = self.sender.kind().label(),
-                    "Usage queue reachable"
-                );
-                return Ok(());
-            };
-            if attempt == STARTUP_CHECK_ATTEMPTS || !outcome.is_retryable() {
-                anyhow::bail!("usage queue check failed ({}): {error}", outcome.as_label());
+        let mut attempt = 1;
+        loop {
+            match self.sender.startup_check(self.policy.attempt_timeout).await {
+                Ok(()) => {
+                    info!(
+                        transport = self.sender.kind().label(),
+                        "Usage queue reachable"
+                    );
+                    return Ok(());
+                }
+                Err((outcome, _)) if attempt < STARTUP_CHECK_ATTEMPTS && outcome.is_retryable() => {
+                    tracing::warn!(
+                        attempt,
+                        outcome = outcome.as_label(),
+                        "Usage queue check failed; retrying"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                    attempt += 1;
+                }
+                Err((outcome, error)) => {
+                    anyhow::bail!("usage queue check failed ({}): {error}", outcome.as_label());
+                }
             }
-            tracing::warn!(
-                attempt,
-                outcome = outcome.as_label(),
-                "Usage queue check failed; retrying"
-            );
-            tokio::time::sleep(backoff).await;
-            backoff *= 2;
         }
-        unreachable!("the last attempt returns")
     }
 
     /// The transport this process runs on, decided once at startup. With
@@ -354,7 +352,9 @@ impl UsageReportDelivery {
     /// URL and usage token), the process uses HTTP for its whole life and says
     /// so loudly; if HTTP is not configured the failure is a startup error, so
     /// that no process runs without a billing path. A process that starts on
-    /// SQS stays on SQS: there is no switching afterwards.
+    /// SQS stays on SQS: there is no switching afterwards. The check proves the
+    /// queue at startup only; a queue that goes away later is met by the
+    /// send-time retries, and by the counted drop when they run out.
     pub async fn resolve_transport(
         policy: UsageReportPolicy,
         transport: UsageReportTransport,
@@ -363,7 +363,7 @@ impl UsageReportDelivery {
         if transport == UsageReportTransport::Http {
             return Ok(transport);
         }
-        let delivery = Self::for_transport(policy, &transport)?;
+        let delivery = Self::for_transport(policy, &transport);
         delivery
             .resolve_after_check(transport, http_configured)
             .await
@@ -374,7 +374,7 @@ impl UsageReportDelivery {
         transport: UsageReportTransport,
         http_configured: bool,
     ) -> anyhow::Result<UsageReportTransport> {
-        let error = match self.check_startup(&reqwest::Client::new()).await {
+        let error = match self.check_startup().await {
             Ok(()) => return Ok(transport),
             Err(error) => error,
         };

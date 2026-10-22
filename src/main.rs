@@ -90,10 +90,7 @@ async fn main() -> anyhow::Result<()> {
         config.cloud_api_url.is_some() && config.cloud_api_usage_token.is_some(),
     )
     .await?;
-    let fell_back = resolved != config.usage_report_transport;
-    if fell_back {
-        config.fall_back_to_http_usage_transport()?;
-    }
+    let fell_back = config.adopt_usage_transport(resolved)?;
 
     let listen_port = config.listen_port;
     let listen_addr = config.listen_addr.clone();
@@ -348,7 +345,7 @@ async fn main() -> anyhow::Result<()> {
         usage_report_delivery: usage_report::UsageReportDelivery::for_transport(
             config.usage_report.clone(),
             &config.usage_report_transport,
-        )?,
+        ),
         config: Arc::new(config),
         signing: Arc::new(signing),
         cache: Arc::new(chat_cache),

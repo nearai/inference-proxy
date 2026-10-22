@@ -33,6 +33,19 @@ use aws_credential_types::Credentials;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
+/// A client that treats a 3xx as the answer it is. The metadata requests carry
+/// a session token in a custom header, which reqwest's redirect handling does
+/// not strip when it follows a redirect to another host; every client passed
+/// to [`CredentialProvider::get`] must be this one or one that is as strict.
+/// Timeouts stay per call (the caller's budget); bodies stay bounded.
+pub(crate) fn no_redirect_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_idle_timeout(Duration::from_secs(30))
+        .build()
+        .expect("a client with default TLS settings builds")
+}
+
 /// Credentials from an endpoint are fetched again this long before they expire.
 const REFRESH_BEFORE_EXPIRY: Duration = Duration::from_secs(300);
 /// Endpoint credentials that carry no `Expiration` are fetched again after this long.
@@ -103,7 +116,10 @@ impl CredentialProvider {
     }
 
     /// Credentials to sign with, fetched from the endpoint when none is cached
-    /// or the cached one is due. Callers bound this with their own timeout.
+    /// or the cached one is due. The lock is held across the fetch on purpose:
+    /// concurrent callers wait for the one fetch and share its result, so the
+    /// endpoint sees one flow, not one per caller. Callers bound this with
+    /// their own timeout.
     pub(crate) async fn get(
         &self,
         client: &reqwest::Client,
@@ -150,6 +166,8 @@ impl CredentialProvider {
 
 fn is_fresh(cached: &Cached) -> bool {
     match cached.credentials.expiry() {
+        // The endpoint gives an absolute time, so the wall clock is the only
+        // clock that can be compared with it; the margin absorbs small jumps.
         Some(expiry) => SystemTime::now() + REFRESH_BEFORE_EXPIRY < expiry,
         // No expiration given: a short fixed life, not forever.
         None => cached.fetched_at.elapsed() < WITHOUT_EXPIRATION_TTL,
@@ -215,17 +233,20 @@ async fn fetch_with_token(
     };
     let roles = get_text(client, &format!("{base}{ROLES_PATH}"), &value).await?;
     let role = roles.lines().next().map(str::trim).unwrap_or_default();
-    if role.is_empty() || role.contains(['/', '?', '#']) {
+    if role.is_empty() || role.contains(['/', '?', '#', '%']) {
         return Err(other("credentials endpoint listed no usable role name"));
     }
     let bytes = get_bytes(client, &format!("{base}{ROLES_PATH}{role}"), &value).await?;
     // The body holds secrets: it is parsed, never echoed into an error.
     let body: EndpointCredentials = serde_json::from_slice(&bytes)
         .map_err(|_| other("credentials endpoint answered something other than credentials"))?;
-    if body.code.as_deref().is_some_and(|code| code != "Success") {
-        return Err(other(
-            "credentials endpoint answered a Code other than Success",
-        ));
+    // `Code` is a status word, not a secret: it says why there are no
+    // credentials (`AssumeRoleUnauthorizedAccess`, `ExpiredToken`, ...).
+    if let Some(code) = body.code.as_deref().filter(|code| *code != "Success") {
+        return Err(other(format!(
+            "credentials endpoint answered Code {:?}",
+            code.chars().take(64).collect::<String>()
+        )));
     }
     let expiration = body
         .expiration
@@ -251,7 +272,7 @@ async fn fetch_token(client: &reqwest::Client, base: &str) -> Result<SessionToke
     check_status(&response)?;
     let bytes = read_bounded(response, MAX_ANSWER_BYTES)
         .await
-        .ok_or_else(too_large)?;
+        .map_err(read_failure)?;
     let value = String::from_utf8(bytes)
         .map(|text| text.trim().to_string())
         .ok()
@@ -274,7 +295,7 @@ async fn get_bytes(client: &reqwest::Client, url: &str, token: &str) -> Result<V
     check_status(&response)?;
     read_bounded(response, MAX_ANSWER_BYTES)
         .await
-        .ok_or_else(too_large)
+        .map_err(read_failure)
 }
 
 async fn get_text(client: &reqwest::Client, url: &str, token: &str) -> Result<String, Failure> {
@@ -294,21 +315,28 @@ fn check_status(response: &reqwest::Response) -> Result<(), Failure> {
     }
 }
 
-fn too_large() -> Failure {
-    other("credentials endpoint answer is larger than it may be or unreadable")
+fn read_failure(reason: String) -> Failure {
+    other(format!("credentials endpoint answer {reason}"))
 }
 
-/// The body of `response`, read for at most `limit` bytes. `None` when it is
-/// longer than that or cannot be read.
-pub(crate) async fn read_bounded(mut response: reqwest::Response, limit: usize) -> Option<Vec<u8>> {
+/// The body of `response`, read for at most `limit` bytes. The error says
+/// whether the body is longer than that or could not be read.
+pub(crate) async fn read_bounded(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.ok()? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("could not be read: {error}"))?
+    {
         if body.len() + chunk.len() > limit {
-            return None;
+            return Err("is larger than it may be".to_string());
         }
         body.extend_from_slice(&chunk);
     }
-    Some(body)
+    Ok(body)
 }
 
 fn parse_expiration(text: &str) -> Result<SystemTime, String> {
@@ -456,7 +484,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_or_unusable_role_listing_fails() {
-        for listing in ["", "\n", "a/b"] {
+        for listing in ["", "\n", "a/b", "a%2Fb"] {
             let server = MockServer::start().await;
             Mock::given(method("PUT"))
                 .and(path("/latest/api/token"))
@@ -699,6 +727,70 @@ mod tests {
                 .unwrap_err();
             assert!(!failure.0.contains("AKIDLEAK"), "{body}: {}", failure.0);
         }
+    }
+
+    /// The reason the endpoint gives (`Code`) is in the failure; the secrets
+    /// in the same body are not.
+    #[tokio::test]
+    async fn an_unsuccessful_code_is_named_in_the_failure() {
+        let server = MockServer::start().await;
+        mount_imds_session(&server).await;
+        credentials_mock()
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"Code":"AssumeRoleUnauthorizedAccess","AccessKeyId":"AKIDLEAK","SecretAccessKey":"s"}"#,
+            ))
+            .mount(&server)
+            .await;
+        let failure = CredentialProvider::new(server.uri())
+            .get(&reqwest::Client::new())
+            .await
+            .unwrap_err();
+        assert!(
+            failure.0.contains("AssumeRoleUnauthorizedAccess"),
+            "{}",
+            failure.0
+        );
+        assert!(!failure.0.contains("AKIDLEAK"), "{}", failure.0);
+    }
+
+    /// A redirect from the endpoint to another host must not carry the session
+    /// token there: with `no_redirect_client` it is not followed at all. The
+    /// plain client is the control: it does follow, and the token goes along.
+    #[tokio::test]
+    async fn a_redirect_from_the_endpoint_does_not_carry_the_token_to_another_host() {
+        let elsewhere = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("test-role"))
+            .mount(&elsewhere)
+            .await;
+        let endpoint = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/latest/api/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(TOKEN))
+            .mount(&endpoint)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/latest/meta-data/iam/security-credentials/"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/roles", elsewhere.uri())),
+            )
+            .mount(&endpoint)
+            .await;
+
+        let failure = CredentialProvider::new(endpoint.uri())
+            .get(&no_redirect_client())
+            .await
+            .unwrap_err();
+        assert!(failure.0.contains("307"), "{}", failure.0);
+        assert!(elsewhere.received_requests().await.unwrap().is_empty());
+
+        let _ = CredentialProvider::new(endpoint.uri())
+            .get(&reqwest::Client::new())
+            .await;
+        let followed = elsewhere.received_requests().await.unwrap();
+        assert_eq!(followed.len(), 1, "the control client follows the redirect");
+        assert!(followed[0].headers.contains_key("x-aws-ec2-metadata-token"));
     }
 
     #[tokio::test]

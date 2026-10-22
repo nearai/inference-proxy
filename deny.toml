@@ -47,4 +47,6 @@ allow-git = [
     # crates.io; pinned to release tag 2026.04.29 in Cargo.toml. Optional
     # `nv-attestation-sdk` feature only — default builds don't pull this.
     "https://github.com/NVIDIA/attestation-sdk.git",
+    # Usage envelope and payload shared with the SQS consumer (`usage_report`).
+    "https://github.com/nearai/cloud-platform-events",
 ]

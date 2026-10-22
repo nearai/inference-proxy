@@ -235,6 +235,14 @@ pub(crate) trait UsageSender: Send + Sync {
     ) -> BoxFuture<'a, (SendOutcome, AttemptLog)>;
 }
 
+/// Exposes a fallback to HTTP as the active transport: `transport="http"` is 1
+/// and `transport="sqs"` is 0, so it can be alerted on. Called once the
+/// Prometheus recorder is installed (a gauge set earlier is dropped).
+pub fn record_fallback_to_http() {
+    metrics::gauge!("inference_proxy_usage_report_transport_info", "transport" => "sqs").set(0.0);
+    metrics::gauge!("inference_proxy_usage_report_transport_info", "transport" => "http").set(1.0);
+}
+
 /// What was pending when `drain` started and what it left behind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Drained {
@@ -382,11 +390,6 @@ impl UsageReportDelivery {
             "Usage queue check failed: falling back to the HTTP usage transport (cloud-api) \
              for the life of this process"
         );
-        // The active transport as a pair of gauges: alert on `transport="http"` being 1.
-        metrics::gauge!("inference_proxy_usage_report_transport_info", "transport" => "sqs")
-            .set(0.0);
-        metrics::gauge!("inference_proxy_usage_report_transport_info", "transport" => "http")
-            .set(1.0);
         Ok(UsageReportTransport::Http)
     }
 

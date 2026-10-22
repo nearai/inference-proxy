@@ -90,7 +90,8 @@ async fn main() -> anyhow::Result<()> {
         config.cloud_api_url.is_some() && config.cloud_api_usage_token.is_some(),
     )
     .await?;
-    if resolved != config.usage_report_transport {
+    let fell_back = resolved != config.usage_report_transport;
+    if fell_back {
         config.fall_back_to_http_usage_transport()?;
     }
 
@@ -167,6 +168,9 @@ async fn main() -> anyhow::Result<()> {
             metrics_handle: metrics_middleware::setup_metrics_recorder(),
             backend_client: &|headers| Ok(build_http_client(&config, Some(headers))?),
         })?;
+        if fell_back {
+            usage_report::record_fallback_to_http();
+        }
         return serve(state, &listen_addr, listen_port).await;
     }
 
@@ -430,6 +434,9 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    if fell_back {
+        usage_report::record_fallback_to_http();
+    }
     serve(state, &listen_addr, listen_port).await
 }
 

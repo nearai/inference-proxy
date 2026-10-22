@@ -1205,13 +1205,16 @@ async fn a_failing_queue_check_falls_back_to_http_when_it_is_configured() {
         .await
         .unwrap();
     assert_eq!(resolved, crate::usage_report::UsageReportTransport::Http);
-    assert_eq!(
-        counter(&recorder, TRANSPORT_INFO, r#"transport="http""#),
-        1.0
+    // The gauges are emitted once the process's recorder is installed.
+    crate::usage_report::record_fallback_to_http();
+    let exposition = recorder.handle().render();
+    assert!(
+        exposition.contains(r#"inference_proxy_usage_report_transport_info{transport="http"} 1"#),
+        "{exposition}"
     );
-    assert_eq!(
-        counter(&recorder, TRANSPORT_INFO, r#"transport="sqs""#),
-        0.0
+    assert!(
+        exposition.contains(r#"inference_proxy_usage_report_transport_info{transport="sqs"} 0"#),
+        "{exposition}"
     );
 }
 

@@ -287,14 +287,19 @@ impl UsageReportDelivery {
         Self::with_sender(policy, Arc::new(http_sender::HttpSender))
     }
 
-    /// The delivery for the configured transport. It cannot fail: the settings
-    /// are validated when the config is read, and the SQS credentials are
-    /// fetched at the first attempt (every failure there is retried).
-    pub fn for_transport(policy: UsageReportPolicy, transport: &UsageReportTransport) -> Arc<Self> {
+    /// The delivery for the configured transport. The settings are validated
+    /// when the config is read, and the SQS credentials are fetched at the
+    /// first attempt (every failure there is retried); the one error is the
+    /// SQS HTTP client failing to build, which fails startup.
+    pub fn for_transport(
+        policy: UsageReportPolicy,
+        transport: &UsageReportTransport,
+    ) -> anyhow::Result<Arc<Self>> {
         let delivery = match transport {
             UsageReportTransport::Http => Self::new(policy),
             UsageReportTransport::Sqs(settings) => {
-                let sender = sqs_sender::SqsSender::new(settings);
+                let sender = sqs_sender::SqsSender::new(settings)
+                    .map_err(|e| anyhow::anyhow!("building the SQS usage client failed: {e}"))?;
                 Self::with_sender(policy, Arc::new(sender))
             }
         };
@@ -306,7 +311,7 @@ impl UsageReportDelivery {
                 "Usage report transport configured"
             );
         }
-        delivery
+        Ok(delivery)
     }
 
     /// Startup check of the transport (SQS only; HTTP makes no call and logs
@@ -363,7 +368,7 @@ impl UsageReportDelivery {
         if transport == UsageReportTransport::Http {
             return Ok(transport);
         }
-        let delivery = Self::for_transport(policy, &transport);
+        let delivery = Self::for_transport(policy, &transport)?;
         delivery
             .resolve_after_check(transport, http_configured)
             .await

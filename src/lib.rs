@@ -5,6 +5,9 @@ pub mod agent_loop;
 pub mod attestation;
 pub mod attestation_sdk;
 pub mod auth;
+// Used by the SQS sender, which comes in the next PR of the stack.
+#[allow(dead_code)]
+mod aws_credentials;
 pub mod backend_affinity;
 pub mod backend_pool;
 pub mod cache;

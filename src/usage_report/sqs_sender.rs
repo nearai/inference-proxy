@@ -42,6 +42,20 @@ pub(crate) struct SqsSender {
     /// `VLLM_PROXY_USAGE_REPORT_SQS_ENDPOINT` (a local emulator).
     endpoint: String,
     credentials: CredentialProvider,
+    /// The client of the credentials fetch and of the send. Not the shared
+    /// proxy client: it never follows a redirect, so the metadata session
+    /// token and the signed request go to the configured hosts only.
+    client: reqwest::Client,
+}
+
+/// A client that treats a 3xx as the answer it is. Timeouts stay per call
+/// (the attempt's budget); bodies stay bounded by the callers.
+pub(crate) fn no_redirect_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_idle_timeout(Duration::from_secs(30))
+        .build()
+        .expect("a client with default TLS settings builds")
 }
 
 impl SqsSender {
@@ -55,6 +69,7 @@ impl SqsSender {
             region: settings.region.clone(),
             endpoint,
             credentials: CredentialProvider::new(settings.credentials_url.clone()),
+            client: no_redirect_client(),
         }
     }
 
@@ -62,10 +77,9 @@ impl SqsSender {
     /// attempt's outcome and its log text.
     async fn credentials_within(
         &self,
-        job: &Job,
         timeout: Duration,
     ) -> Result<Credentials, (UsageReportOutcome, String)> {
-        match tokio::time::timeout(timeout, self.credentials.get(&job.reporter.http_client)).await {
+        match tokio::time::timeout(timeout, self.credentials.get(&self.client)).await {
             Ok(Ok(credentials)) => Ok(credentials),
             Ok(Err(CredentialFailure(error))) => Err((UsageReportOutcome::SqsCredentials, error)),
             Err(_) => Err((
@@ -99,7 +113,7 @@ impl SqsSender {
         timeout: Duration,
     ) -> (UsageReportOutcome, Result<StatusCode, String>) {
         let started_at = Instant::now();
-        let credentials = match self.credentials_within(job, timeout).await {
+        let credentials = match self.credentials_within(timeout).await {
             Ok(credentials) => credentials,
             Err((outcome, error)) => return (outcome, Err(error)),
         };
@@ -123,9 +137,8 @@ impl SqsSender {
             Err(error) => return (UsageReportOutcome::SqsInvalid, Err(error)),
         };
 
-        let mut request = job
-            .reporter
-            .http_client
+        let mut request = self
+            .client
             .post(&self.endpoint)
             .timeout(remaining)
             .header(reqwest::header::CONTENT_TYPE, CONTENT_TYPE)
@@ -351,6 +364,9 @@ pub(crate) fn classify_sqs_answer(
         _ => match status {
             StatusCode::TOO_MANY_REQUESTS => UsageReportOutcome::SqsThrottled,
             _ if status.is_server_error() => UsageReportOutcome::Sqs5xx,
+            // Redirects are never followed: a queue endpoint that redirects is
+            // misconfigured, and asking again does not change that.
+            _ if status.is_redirection() => UsageReportOutcome::SqsInvalid,
             StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED => UsageReportOutcome::SqsCredentials,
             _ => UsageReportOutcome::SqsUnknown,
         },

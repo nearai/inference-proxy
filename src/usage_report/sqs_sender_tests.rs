@@ -53,6 +53,7 @@ fn sender(endpoint: &str) -> SqsSender {
         queue_url: QUEUE.to_string(),
         region: "us-east-1".to_string(),
         endpoint: endpoint.to_string(),
+        client: no_redirect_client(),
         credentials: CredentialProvider::seeded(Credentials::new(
             ACCESS_KEY, SECRET_KEY, None, None, "test",
         )),
@@ -76,6 +77,7 @@ fn sender_with_endpoint_credentials(endpoint: &str, credentials_url: &str) -> Sq
         queue_url: QUEUE.to_string(),
         region: "us-east-1".to_string(),
         endpoint: endpoint.to_string(),
+        client: no_redirect_client(),
         credentials: CredentialProvider::new(credentials_url.to_string()),
     }
 }
@@ -613,6 +615,7 @@ async fn endpoint_credentials_are_cached_until_near_expiry_and_sent_as_a_session
         queue_url: QUEUE.to_string(),
         region: "us-east-1".to_string(),
         endpoint: sqs.uri(),
+        client: no_redirect_client(),
         credentials: CredentialProvider::new(server.uri()),
     };
     let job = job_with(
@@ -655,6 +658,7 @@ async fn endpoint_credentials_due_for_refresh_are_fetched_again() {
         queue_url: QUEUE.to_string(),
         region: "us-east-1".to_string(),
         endpoint: sqs.uri(),
+        client: no_redirect_client(),
         credentials: CredentialProvider::new(server.uri()),
     };
     let job = job_with(
@@ -971,4 +975,76 @@ async fn a_denial_that_persists_is_dropped_once_the_attempts_run_out() {
         ),
         1.0
     );
+}
+
+/// A redirect from the queue endpoint is not followed: the signed request goes
+/// to the configured host only, and the answer is final (a redirecting
+/// endpoint is misconfigured; asking again changes nothing).
+#[tokio::test]
+async fn a_redirect_from_the_queue_endpoint_is_not_followed() {
+    let elsewhere = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"MessageId": "m"})))
+        .mount(&elsewhere)
+        .await;
+    let sqs = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(302).insert_header("location", elsewhere.uri()))
+        .mount(&sqs)
+        .await;
+    let sender = sender(&sqs.uri());
+    let job = job_with(
+        &chat_body("chatcmpl-redirect"),
+        &Arc::new(UsageReportDelivery::default()),
+    );
+    let (outcome, log) = attempt(&sender, &job).await;
+    assert_eq!(outcome, SendOutcome::Final("sqs_invalid"));
+    assert_eq!(log.outcome, UsageReportOutcome::SqsInvalid);
+    assert_eq!(sqs.received_requests().await.unwrap().len(), 1);
+    assert!(elsewhere.received_requests().await.unwrap().is_empty());
+}
+
+/// A redirect from the credentials endpoint is not followed either, at the
+/// token step and at the credentials step (which carries the session token):
+/// nothing reaches the other host, and the attempt fails as a credentials
+/// failure, which is retried like any other.
+#[tokio::test]
+async fn a_redirect_from_the_credentials_endpoint_is_not_followed() {
+    use wiremock::matchers::any;
+    let elsewhere = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_string("stolen"))
+        .mount(&elsewhere)
+        .await;
+    let sqs = sqs_answering(200, json!({"MessageId": "m"})).await;
+
+    // Redirected at the token step.
+    let creds = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(302).insert_header("location", elsewhere.uri()))
+        .mount(&creds)
+        .await;
+    let job = job_with(
+        &chat_body("chatcmpl-redirect-creds"),
+        &Arc::new(UsageReportDelivery::default()),
+    );
+    let sender_a = sender_with_endpoint_credentials(&sqs.uri(), &creds.uri());
+    let (outcome, log) = attempt(&sender_a, &job).await;
+    assert_eq!(outcome, SendOutcome::Retryable("sqs_credentials"));
+    assert_eq!(log.outcome, UsageReportOutcome::SqsCredentials);
+
+    // Redirected at the credentials step, which carries the token header.
+    let creds = MockServer::start().await;
+    mount_imds_session(&creds).await;
+    Mock::given(method("GET"))
+        .and(path(ROLE_CREDENTIALS_PATH))
+        .respond_with(ResponseTemplate::new(302).insert_header("location", elsewhere.uri()))
+        .mount(&creds)
+        .await;
+    let sender_b = sender_with_endpoint_credentials(&sqs.uri(), &creds.uri());
+    let (outcome, _) = attempt(&sender_b, &job).await;
+    assert_eq!(outcome, SendOutcome::Retryable("sqs_credentials"));
+
+    assert!(elsewhere.received_requests().await.unwrap().is_empty());
+    assert!(sqs.received_requests().await.unwrap().is_empty());
 }

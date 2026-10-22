@@ -121,6 +121,36 @@ pub(crate) fn validate_discount_to_user(discount: f64, raw: &str) -> anyhow::Res
     Ok((basis_points > 0.0).then_some(discount))
 }
 
+/// Fails startup when the URL in `name` is not http(s), or is plain `http` to
+/// a host that is not loopback (127.0.0.0/8, ::1, `localhost`): credentials,
+/// the metadata session token and signed usage must not cross a network in
+/// the clear. The value itself is not echoed (it may carry userinfo).
+///
+/// `allow_insecure` (the test-only `VLLM_PROXY_USAGE_REPORT_ALLOW_INSECURE_ENDPOINTS`)
+/// accepts plain `http` to any host, for a compose network whose emulators
+/// have no TLS; the scheme must still be http(s).
+fn require_secure_url(name: &str, value: &str, allow_insecure: bool) -> anyhow::Result<()> {
+    let url = url::Url::parse(value.trim())
+        .map_err(|_| anyhow::anyhow!("{name} must be an http(s) URL"))?;
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            let loopback = match url.host() {
+                Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+                Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                None => false,
+            };
+            if loopback || allow_insecure {
+                Ok(())
+            } else {
+                anyhow::bail!("{name} must be https unless its host is loopback")
+            }
+        }
+        _ => anyhow::bail!("{name} must be an http(s) URL"),
+    }
+}
+
 /// `VLLM_PROXY_USAGE_REPORT_TRANSPORT` (`http`, the default, or `sqs`) and its
 /// `VLLM_PROXY_USAGE_REPORT_SQS_*` and `VLLM_PROXY_AWS_CREDENTIALS_URL`
 /// settings. `sqs` needs a queue URL; a value that cannot work fails startup.
@@ -132,6 +162,7 @@ fn usage_report_transport() -> anyhow::Result<crate::usage_report::UsageReportTr
     const SQS_REGION: &str = "VLLM_PROXY_USAGE_REPORT_SQS_REGION";
     const SQS_ENDPOINT: &str = "VLLM_PROXY_USAGE_REPORT_SQS_ENDPOINT";
     const CREDENTIALS_URL: &str = "VLLM_PROXY_AWS_CREDENTIALS_URL";
+    const ALLOW_INSECURE: &str = "VLLM_PROXY_USAGE_REPORT_ALLOW_INSECURE_ENDPOINTS";
     const DEFAULT_REGION: &str = "us-east-1";
 
     let optional = |name: &str| env::var(name).ok().filter(|v| !v.trim().is_empty());
@@ -139,15 +170,28 @@ fn usage_report_transport() -> anyhow::Result<crate::usage_report::UsageReportTr
     match transport.trim() {
         "http" => Ok(UsageReportTransport::Http),
         "sqs" => {
+            let allow_insecure = env_bool(ALLOW_INSECURE);
+            if allow_insecure {
+                tracing::warn!(
+                    "{ALLOW_INSECURE} is set: plain-http SQS and credentials endpoints on \
+                     non-loopback hosts are accepted. Test environments only; never set this \
+                     where real credentials are served"
+                );
+            }
             let Some(queue_url) = optional(SQS_URL) else {
                 anyhow::bail!("{TRANSPORT}=sqs requires {SQS_URL}");
             };
+            require_secure_url(SQS_URL, &queue_url, allow_insecure)?;
             // The credentials come only from this endpoint: no endpoint, no sqs.
             let Some(credentials_url) = optional(CREDENTIALS_URL) else {
                 anyhow::bail!("{TRANSPORT}=sqs requires {CREDENTIALS_URL}");
             };
             let region = optional(SQS_REGION)
                 .map_or_else(|| DEFAULT_REGION.to_string(), |r| r.trim().to_string());
+            require_secure_url(CREDENTIALS_URL, &credentials_url, allow_insecure)?;
+            if let Some(endpoint) = optional(SQS_ENDPOINT) {
+                require_secure_url(SQS_ENDPOINT, &endpoint, allow_insecure)?;
+            }
             // A region names an endpoint host, so it is letters, digits and hyphens only.
             let region_ok = !region.is_empty()
                 && region.len() <= 32
@@ -1865,7 +1909,7 @@ mod tests {
         }
     }
 
-    const USAGE_REPORT_ENV: [&str; 12] = [
+    const USAGE_REPORT_ENV: [&str; 13] = [
         "VLLM_PROXY_USAGE_REPORT_TIMEOUT_SECS",
         "VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS",
         "VLLM_PROXY_USAGE_REPORT_INITIAL_BACKOFF_MS",
@@ -1877,6 +1921,7 @@ mod tests {
         "VLLM_PROXY_USAGE_REPORT_SQS_URL",
         "VLLM_PROXY_USAGE_REPORT_SQS_REGION",
         "VLLM_PROXY_USAGE_REPORT_SQS_ENDPOINT",
+        "VLLM_PROXY_USAGE_REPORT_ALLOW_INSECURE_ENDPOINTS",
         "VLLM_PROXY_AWS_CREDENTIALS_URL",
     ];
 
@@ -2057,6 +2102,114 @@ mod tests {
         );
         // Selected without its credentials endpoint: startup fails.
         with_clean_env(&base, &[(TRANSPORT, "sqs"), (SQS_URL, "https://q")], || {
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(err.contains(CREDENTIALS_URL), "{err}");
+        });
+        // URLs that would carry credentials or signed usage in the clear fail
+        // startup; loopback http and any https are accepted.
+        let sqs_env = |queue: &'static str, creds: &'static str, endpoint: Option<&'static str>| {
+            let mut vars = vec![
+                (TRANSPORT, "sqs"),
+                (SQS_URL, queue),
+                (CREDENTIALS_URL, creds),
+            ];
+            if let Some(endpoint) = endpoint {
+                vars.push(("VLLM_PROXY_USAGE_REPORT_SQS_ENDPOINT", endpoint));
+            }
+            vars
+        };
+        for (queue, creds, endpoint) in [
+            ("https://q", "http://127.0.0.1:9911", None),
+            ("https://q", "http://127.9.9.9:9911/", None),
+            ("https://q", "http://localhost:9911", None),
+            ("https://q", "http://[::1]:9911", None),
+            ("https://q", "https://imds.internal", None),
+            (
+                "http://127.0.0.1:4566/q",
+                "http://127.0.0.1:9911",
+                Some("http://localhost:4566"),
+            ),
+            (
+                "https://q",
+                "http://127.0.0.1:9911",
+                Some("https://sqs.eu-west-1.amazonaws.com"),
+            ),
+        ] {
+            with_clean_env(&base, &sqs_env(queue, creds, endpoint), || {
+                Config::from_env().unwrap();
+            });
+        }
+        for (queue, creds, endpoint, named) in [
+            ("https://q", "http://169.254.169.254", None, CREDENTIALS_URL),
+            (
+                "https://q",
+                "http://imds.example:9911",
+                None,
+                CREDENTIALS_URL,
+            ),
+            (
+                "https://q",
+                "http://localhost.evil.com",
+                None,
+                CREDENTIALS_URL,
+            ),
+            ("https://q", "ftp://127.0.0.1", None, CREDENTIALS_URL),
+            ("https://q", "127.0.0.1:9911", None, CREDENTIALS_URL),
+            (
+                "http://sqs.example/q",
+                "http://127.0.0.1:9911",
+                None,
+                SQS_URL,
+            ),
+            (
+                "https://q",
+                "http://127.0.0.1:9911",
+                Some("http://sqs.example"),
+                "VLLM_PROXY_USAGE_REPORT_SQS_ENDPOINT",
+            ),
+            (
+                "https://q",
+                "http://127.0.0.1:9911",
+                Some("file:///etc/passwd"),
+                "VLLM_PROXY_USAGE_REPORT_SQS_ENDPOINT",
+            ),
+        ] {
+            with_clean_env(&base, &sqs_env(queue, creds, endpoint), || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains(named), "{err}");
+            });
+        }
+        // The test-only opt-in accepts plain http to non-loopback hosts (a
+        // compose network's emulators), and nothing else: off by default,
+        // the same URLs fail startup, and a non-http(s) scheme still does.
+        const ALLOW_INSECURE: &str = "VLLM_PROXY_USAGE_REPORT_ALLOW_INSECURE_ENDPOINTS";
+        let insecure = |insecure_flag: &'static str| {
+            let mut vars = sqs_env(
+                "http://elasticmq:9324/queue/usage",
+                "http://imds.internal:9911",
+                Some("http://elasticmq:9324"),
+            );
+            vars.push((ALLOW_INSECURE, insecure_flag));
+            vars
+        };
+        for flag in ["", "0", "false"] {
+            with_clean_env(&base, &insecure(flag), || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains(SQS_URL), "{err}");
+            });
+        }
+        with_clean_env(&base, &insecure("1"), || {
+            let UsageReportTransport::Sqs(settings) =
+                Config::from_env().unwrap().usage_report_transport
+            else {
+                panic!("expected the sqs transport");
+            };
+            assert_eq!(settings.queue_url, "http://elasticmq:9324/queue/usage");
+            assert_eq!(settings.credentials_url, "http://imds.internal:9911");
+        });
+        let mut vars = sqs_env("https://q", "ftp://imds.internal", None);
+        vars.push((ALLOW_INSECURE, "1"));
+        with_clean_env(&base, &vars, || {
             let err = Config::from_env().unwrap_err().to_string();
             assert!(err.contains(CREDENTIALS_URL), "{err}");
         });

@@ -26,7 +26,9 @@ use futures_util::future::BoxFuture;
 use reqwest::StatusCode;
 
 use super::{AttemptLog, Job, Refused, SendOutcome, SqsSettings, TransportKind, UsageSender};
-use crate::aws_credentials::{read_bounded, CredentialFailure, CredentialProvider};
+use crate::aws_credentials::{
+    no_redirect_client, read_bounded, CredentialFailure, CredentialProvider,
+};
 use crate::proxy::{classify_usage_request_error, UsageReportOutcome};
 
 const SERVICE: &str = "sqs";
@@ -46,16 +48,6 @@ pub(crate) struct SqsSender {
     /// proxy client: it never follows a redirect, so the metadata session
     /// token and the signed request go to the configured hosts only.
     client: reqwest::Client,
-}
-
-/// A client that treats a 3xx as the answer it is. Timeouts stay per call
-/// (the attempt's budget); bodies stay bounded by the callers.
-pub(crate) fn no_redirect_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .pool_idle_timeout(Duration::from_secs(30))
-        .build()
-        .expect("a client with default TLS settings builds")
 }
 
 impl SqsSender {
@@ -84,7 +76,7 @@ impl SqsSender {
             Ok(Err(CredentialFailure(error))) => Err((UsageReportOutcome::SqsCredentials, error)),
             Err(_) => Err((
                 UsageReportOutcome::Timeout,
-                "credentials were not had within the attempt's timeout".to_string(),
+                "credentials were not received within the attempt's timeout".to_string(),
             )),
         }
     }
@@ -123,7 +115,7 @@ impl SqsSender {
         else {
             return (
                 UsageReportOutcome::Timeout,
-                Err("the attempt's time went on the credentials".to_string()),
+                Err("the attempt's time was used up fetching credentials".to_string()),
             );
         };
         let headers = match sign_request(

@@ -267,12 +267,10 @@ impl UsageReportDelivery {
         Self::with_sender(policy, Arc::new(http_sender::HttpSender))
     }
 
-    /// The delivery for the configured transport. Fails when the transport
-    /// cannot send (no credentials for SQS): that is a startup error.
-    pub fn for_transport(
-        policy: UsageReportPolicy,
-        transport: &UsageReportTransport,
-    ) -> anyhow::Result<Arc<Self>> {
+    /// The delivery for the configured transport. It cannot fail: the settings
+    /// are validated when the config is read, and the SQS credentials are
+    /// fetched at the first attempt (every failure there is retried).
+    pub fn for_transport(policy: UsageReportPolicy, transport: &UsageReportTransport) -> Arc<Self> {
         let delivery = match transport {
             UsageReportTransport::Http => Self::new(policy),
             UsageReportTransport::Sqs(settings) => {
@@ -288,7 +286,7 @@ impl UsageReportDelivery {
                 "Usage report transport configured"
             );
         }
-        Ok(delivery)
+        delivery
     }
 
     /// The delivery with `sender` making its attempts. `new` is this with the

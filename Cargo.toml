@@ -2,6 +2,8 @@
 name = "vllm-proxy-rs"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.93"
+resolver = "3"
 publish = false
 
 [dependencies]
@@ -17,8 +19,8 @@ tokio-util = { version = "0.7", features = ["compat", "io"] }
 futures-util = "0.3"
 http-body-util = "0.1"
 # Usage reports to SQS (`usage_report/sqs_sender.rs`): SigV4 only, no AWS SDK
-aws-sigv4 = { version = "1.6.2", default-features = false, features = ["sign-http", "http1"] }
-aws-credential-types = "1.3"
+aws-sigv4 = { version = "1", default-features = false, features = ["sign-http", "http1"] }
+aws-credential-types = "1.2"
 chrono = { version = "0.4", features = ["serde"] }
 # Usage envelope and payload, shared with the consumer
 cloud-platform-events = { git = "https://github.com/nearai/cloud-platform-events", tag = "v1.1.0" }

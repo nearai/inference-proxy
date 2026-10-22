@@ -1426,3 +1426,204 @@ async fn shutdown_says_how_many_reports_it_waited_for_and_how_many_it_left() {
         logs.contents()
     );
 }
+
+/// One attempt through `HttpSender` at `billing`, which gives up after `timeout`.
+async fn http_attempt(billing: &Billing, timeout: Duration) -> (SendOutcome, AttemptLog) {
+    super::http_sender::HttpSender
+        .send(&http_job(billing), timeout)
+        .await
+}
+
+/// A report for `billing`, with every field the HTTP sender needs.
+fn http_job(billing: &Billing) -> Job {
+    let reporter = UsageReporter {
+        http_client: billing.client.clone(),
+        cloud_api_url: billing.url.clone(),
+        model_name: "test-model".to_string(),
+        cloud_api_usage_token: Some("usage-secret".to_string()),
+        org_id: Some("org-1".to_string()),
+        workspace_id: Some("ws-1".to_string()),
+        api_key_id: Some("key-1".to_string()),
+        discount_to_user: None,
+        model_label: None,
+        request_id: Some("request-1".to_string()),
+        request_source: RequestSource {
+            auth_path: AuthPath::CloudApiKey,
+            ingress_route: IngressRouteKind::Canonical,
+        },
+        delivery: Arc::new(UsageReportDelivery::default()),
+    };
+    Job {
+        reporter,
+        body: bytes::Bytes::from_static(br#"{"id":"report-1"}"#),
+        completed_at: Instant::now(),
+    }
+}
+
+/// The HTTP sender makes the same decision on each kind of answer as the
+/// delivery always made: 2xx accepted; 429, 5xx, timeout and connection
+/// failure retryable; any other 4xx final.
+#[tokio::test]
+async fn http_sender_outcomes_unchanged() {
+    let timeout = Duration::from_secs(5);
+    let answers = [
+        (204, SendOutcome::Accepted, UsageReportOutcome::Accepted),
+        (
+            429,
+            SendOutcome::Retryable("http_429"),
+            UsageReportOutcome::Http4xx,
+        ),
+        (
+            500,
+            SendOutcome::Retryable("http_5xx"),
+            UsageReportOutcome::Http5xx,
+        ),
+        (
+            503,
+            SendOutcome::Retryable("http_5xx"),
+            UsageReportOutcome::Http5xx,
+        ),
+        (
+            400,
+            SendOutcome::Final("rejected"),
+            UsageReportOutcome::Http4xx,
+        ),
+        (
+            404,
+            SendOutcome::Final("rejected"),
+            UsageReportOutcome::Http4xx,
+        ),
+        (
+            409,
+            SendOutcome::Final("rejected"),
+            UsageReportOutcome::Http4xx,
+        ),
+    ];
+    for (status, decision, outcome) in answers {
+        let billing = Billing::answering(status).await;
+        let (sent, attempt) = http_attempt(&billing, timeout).await;
+        assert_eq!(
+            (sent, attempt.outcome),
+            (decision, outcome),
+            "status {status}"
+        );
+        assert_eq!(
+            attempt.answer.as_ref().ok().map(|status| status.as_u16()),
+            Some(status)
+        );
+        assert_eq!(billing.received(), 1);
+    }
+
+    // A timeout: the stand-in answers after the attempt has given up.
+    let slow = Billing::start(Answers::Script(vec![(Duration::from_secs(30), 200)])).await;
+    let (sent, attempt) = http_attempt(&slow, Duration::from_millis(200)).await;
+    assert_eq!(sent, SendOutcome::Retryable("timeout"));
+    assert_eq!(attempt.outcome, UsageReportOutcome::Timeout);
+    assert!(attempt.answer.is_err());
+
+    // A connection that is refused.
+    let (sent, attempt) = http_attempt(&Billing::unreachable(), timeout).await;
+    assert_eq!(sent, SendOutcome::Retryable("connect_error"));
+    assert_eq!(attempt.outcome, UsageReportOutcome::ConnectError);
+    assert!(attempt.answer.is_err());
+}
+
+/// A report that reaches the HTTP sender without a usage token is refused as
+/// final, not panicked on, and nothing is sent.
+#[tokio::test]
+async fn http_sender_refuses_a_missing_token() {
+    let billing = Billing::answering(204).await;
+    let mut job = http_job(&billing);
+    job.reporter.cloud_api_usage_token = None;
+    let (sent, attempt) = super::http_sender::HttpSender
+        .send(&job, Duration::from_secs(5))
+        .await;
+    assert_eq!(sent, SendOutcome::Final("missing_usage_token"));
+    assert_eq!(attempt.outcome, UsageReportOutcome::MissingUsageToken);
+    assert!(attempt.answer.is_err());
+    assert_eq!(billing.received(), 0);
+}
+
+/// A sender that answers from a script: the n-th attempt gets the n-th
+/// decision, and the last one repeats.
+struct Scripted {
+    decisions: Vec<SendOutcome>,
+    attempts: AtomicUsize,
+}
+
+impl UsageSender for Scripted {
+    fn send<'a>(
+        &'a self,
+        _job: &'a Job,
+        _timeout: Duration,
+    ) -> BoxFuture<'a, (SendOutcome, AttemptLog)> {
+        Box::pin(async move {
+            let n = self.attempts.fetch_add(1, Ordering::SeqCst);
+            let decision = *self
+                .decisions
+                .get(n)
+                .or(self.decisions.last())
+                .expect("a Scripted sender needs at least one decision");
+            let (answer, outcome) = match decision {
+                SendOutcome::Accepted => {
+                    (Ok(reqwest::StatusCode::OK), UsageReportOutcome::Accepted)
+                }
+                SendOutcome::Retryable(_) => {
+                    (Err("scripted".to_string()), UsageReportOutcome::Timeout)
+                }
+                SendOutcome::Final(_) => (
+                    Ok(reqwest::StatusCode::BAD_REQUEST),
+                    UsageReportOutcome::Http4xx,
+                ),
+            };
+            (
+                decision,
+                AttemptLog {
+                    answer,
+                    outcome,
+                    duration: Duration::ZERO,
+                },
+            )
+        })
+    }
+}
+
+/// A report handed to a delivery whose sender is injected: the queue and the
+/// retry path around it are the delivery's own, and they drive the sender's
+/// decisions — one attempt when accepted or final, another attempt after a
+/// retryable answer, and all `max_attempts` before the report is dropped.
+#[tokio::test]
+async fn an_injected_sender_drives_the_queue_and_retry_path() {
+    async fn attempts_made(decisions: Vec<SendOutcome>) -> usize {
+        let sender = Arc::new(Scripted {
+            decisions,
+            attempts: AtomicUsize::new(0),
+        });
+        let delivery = UsageReportDelivery::with_sender(
+            UsageReportPolicy {
+                max_attempts: 3,
+                initial_backoff: Duration::from_millis(1),
+                ..Default::default()
+            },
+            sender.clone(),
+        );
+        Billing::unreachable().report(&delivery, "one", None);
+        delivered(&delivery).await;
+        sender.attempts.load(Ordering::SeqCst)
+    }
+
+    assert_eq!(attempts_made(vec![SendOutcome::Accepted]).await, 1);
+    assert_eq!(
+        attempts_made(vec![
+            SendOutcome::Retryable("http_5xx"),
+            SendOutcome::Accepted
+        ])
+        .await,
+        2
+    );
+    assert_eq!(attempts_made(vec![SendOutcome::Final("rejected")]).await, 1);
+    assert_eq!(
+        attempts_made(vec![SendOutcome::Retryable("timeout")]).await,
+        3
+    );
+}

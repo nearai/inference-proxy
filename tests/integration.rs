@@ -278,6 +278,7 @@ fn build_test_app_inner_with_pool(
         discount_to_user: None,
         reasoning_off_effort: "none".to_string(),
         allowed_org_ids: Vec::new(),
+        model_access_refresh_secs: 0,
         sse_keepalive_secs: 0,
         admission_max_inflight: 0,
         admission_tier_borrowing: false,
@@ -360,6 +361,7 @@ fn build_test_app_inner_with_pool(
     let state = AppState {
         models: None,
         usage_report_delivery: Default::default(),
+        model_access: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),
@@ -6264,6 +6266,7 @@ fn build_test_app_with_cloud_api_retries(
         discount_to_user: None,
         reasoning_off_effort: "none".to_string(),
         allowed_org_ids: Vec::new(),
+        model_access_refresh_secs: 0,
         sse_keepalive_secs: 0,
         admission_max_inflight: 0,
         admission_tier_borrowing: false,
@@ -6332,6 +6335,7 @@ fn build_test_app_with_cloud_api_retries(
     let state = AppState {
         models: None,
         usage_report_delivery: Default::default(),
+        model_access: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),
@@ -8907,6 +8911,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         discount_to_user: None,
         reasoning_off_effort: "none".to_string(),
         allowed_org_ids: Vec::new(),
+        model_access_refresh_secs: 0,
         sse_keepalive_secs: 0,
         admission_max_inflight: 0,
         admission_tier_borrowing: false,
@@ -8972,6 +8977,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
     let state = AppState {
         models: None,
         usage_report_delivery: Default::default(),
+        model_access: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),
@@ -9273,6 +9279,18 @@ async fn test_ohttp_attestation_present_for_default_route() {
 /// Returns (base_url, server_handle, key_config_bytes).
 /// The server runs in the background; drop the handle to stop it.
 async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<()>, Vec<u8>) {
+    let (base_url, handle, config_bytes, _state) = start_ohttp_server_with(mock_url, None).await;
+    (base_url, handle, config_bytes)
+}
+
+/// `start_ohttp_server`, and its state. With `cloud_api_url` the server
+/// checks `sk-` keys there and enforces cloud-api's model access document
+/// (`VLLM_PROXY_MODEL_ACCESS_REFRESH_SECS`), which the test reads with
+/// `ModelAccess::refresh`.
+async fn start_ohttp_server_with(
+    mock_url: &str,
+    cloud_api_url: Option<&str>,
+) -> (String, tokio::task::JoinHandle<()>, Vec<u8>, AppState) {
     let base = mock_url.trim_end_matches('/');
 
     let ed25519_key: [u8; 32] = [
@@ -9330,11 +9348,11 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         rate_limit_per_second: 100,
         rate_limit_burst_size: 200,
         rate_limit_trust_proxy_headers: true,
-        cloud_api_url: None,
+        cloud_api_url: cloud_api_url.map(str::to_string),
         cloud_api_auth_max_attempts: 1,
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
-        cloud_api_usage_token: None,
+        cloud_api_usage_token: cloud_api_url.map(|_| "usage-secret".to_string()),
         usage_report: Default::default(),
         compose_manager_url: None,
         tls_cert_path: None,
@@ -9376,6 +9394,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         discount_to_user: None,
         reasoning_off_effort: "none".to_string(),
         allowed_org_ids: Vec::new(),
+        model_access_refresh_secs: if cloud_api_url.is_some() { 60 } else { 0 },
         sse_keepalive_secs: 0,
         admission_max_inflight: 0,
         admission_tier_borrowing: false,
@@ -9432,6 +9451,14 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
     let state = AppState {
         models: None,
         usage_report_delivery: Default::default(),
+        model_access: Arc::new(
+            model_access::ModelAccess::new(&config, &|| {
+                Ok(reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()?)
+            })
+            .unwrap(),
+        ),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(cache::ChatCache::new("test-model", 1200)),
@@ -9463,14 +9490,14 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         .layer(middleware::from_fn(rate_limit::rate_limit_middleware))
         .layer(axum::Extension(rate_limit_state))
         .layer(middleware::from_fn(request_id_middleware))
-        .with_state(state);
+        .with_state(state.clone());
 
     let handle = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
 
     let base_url = format!("http://127.0.0.1:{port}");
-    (base_url, handle, config_bytes)
+    (base_url, handle, config_bytes, state)
 }
 
 /// Helper: create an OHTTP-encrypted request from an inner bhttp::Message.
@@ -10001,6 +10028,127 @@ async fn test_ohttp_non_bearer_outer_auth_falls_back_to_inner_authorization() {
     );
     assert_eq!(resp_body["id"], "chatcmpl-ohttp-inner-auth");
 
+    server_handle.abort();
+}
+
+// Per-organization model access (`model_access.rs`) through OHTTP: the inner
+// request is re-sent to the route it names, so it is refused like a direct one.
+#[tokio::test]
+async fn test_ohttp_inner_request_is_checked_for_model_access() {
+    // One mock plays the engine and cloud-api.
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Hello from OHTTP!"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 4, "total_tokens": 9}
+        })))
+        .expect(1) // the granted organization's request, and no other
+        .mount(&mock)
+        .await;
+    for (key, organization) in [
+        ("sk-live-granted", "org-granted"),
+        ("sk-live-other", "org-other"),
+    ] {
+        Mock::given(method("POST"))
+            .and(path("/v1/check_api_key"))
+            .and(header("authorization", format!("Bearer {key}").as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "valid": true,
+                "organization_id": organization,
+                "workspace_id": "ws",
+                "api_key_id": "k"
+            })))
+            .mount(&mock)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path("/v1/internal/usage"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(model_access::MODEL_ACCESS_PATH))
+        .and(header("authorization", "Bearer usage-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "model_access",
+            "models": [{"id": "test-model", "organization_ids": ["org-granted"]}]
+        })))
+        .mount(&mock)
+        .await;
+
+    let (base_url, server_handle, config_bytes, state) =
+        start_ohttp_server_with(&mock.uri(), Some(&mock.uri())).await;
+    state.model_access.refresh().await;
+    assert!(state.model_access.has_snapshot());
+
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": false
+    });
+    // The request with its key inside the envelope: the inner answer.
+    let through_ohttp = |key: &str| {
+        let mut inner_req = bhttp::Message::request(
+            b"POST".to_vec(),
+            b"https".to_vec(),
+            b"localhost".to_vec(),
+            b"/v1/chat/completions".to_vec(),
+        );
+        inner_req.put_header("content-type", "application/json");
+        inner_req.put_header("authorization", format!("Bearer {key}"));
+        inner_req.write_content(serde_json::to_vec(&body).unwrap());
+        let (enc_request, client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+        let request = client
+            .post(format!("{base_url}/ohttp"))
+            .header("content-type", "message/ohttp-req")
+            .body(enc_request);
+        async move {
+            let response = request.send().await.unwrap();
+            // The OHTTP layer itself succeeds; the answer is in the envelope.
+            assert_eq!(response.status(), 200);
+            let enc_response = response.bytes().await.unwrap();
+            ohttp_decrypt_response(client_response, &enc_response)
+        }
+    };
+
+    // Another organization, directly: the answer of a model that is not
+    // served.
+    let direct = client
+        .post(format!("{base_url}/v1/chat/completions"))
+        .bearer_auth("sk-live-other")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(direct.status(), 404);
+    let direct: serde_json::Value = direct.json().await.unwrap();
+    assert_eq!(direct["error"]["code"], "model_not_found");
+
+    // The same organization through OHTTP: the same answer.
+    let inner_resp = through_ohttp("sk-live-other").await;
+    assert_eq!(inner_resp.control().status().unwrap().code(), 404);
+    let refused: serde_json::Value = serde_json::from_slice(inner_resp.content()).unwrap();
+    assert_eq!(refused, direct);
+
+    // The granted organization through OHTTP is served.
+    let inner_resp = through_ohttp("sk-live-granted").await;
+    assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+    let served: serde_json::Value = serde_json::from_slice(inner_resp.content()).unwrap();
+    assert_eq!(
+        served["choices"][0]["message"]["content"],
+        "Hello from OHTTP!"
+    );
+
+    // Only that last request reached the engine.
+    mock.verify().await;
     server_handle.abort();
 }
 

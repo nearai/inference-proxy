@@ -113,6 +113,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         discount_to_user: None,
         reasoning_off_effort: "none".to_string(),
         allowed_org_ids: Vec::new(),
+        model_access_refresh_secs: 0,
         sse_keepalive_secs: 0,
         admission_max_inflight: 0,
         admission_tier_borrowing: false,
@@ -172,6 +173,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
     let state = AppState {
         models: None,
         usage_report_delivery: Default::default(),
+        model_access: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),

@@ -10,6 +10,7 @@ use crate::auth::RequireAuth;
 use crate::backend_pool::BackendGuard;
 use crate::encryption::{self, Endpoint};
 use crate::error::AppError;
+use crate::model_access::{check_single_model, model_in_json};
 use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageReporter, UsageType};
 use crate::routes::chat::read_body_with_limit;
 use crate::{AppState, TracingIds};
@@ -53,6 +54,10 @@ pub async fn tokenize(
     body: Body,
 ) -> Result<Response, AppError> {
     let request_body = read_body_with_limit(body, state.config.max_request_size).await?;
+    // Per-organization model access (`model_access.rs`), as on the chat
+    // route. Every route of this file is the configured model's; the body is
+    // read first because a refusal names the `model` the caller sent.
+    check_single_model(&state, &auth, || model_in_json(&request_body))?;
     let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
 
     let (url, _guard) = state.backend_pool.select_url("/tokenize");
@@ -84,6 +89,7 @@ pub async fn embeddings(
 
     json_passthrough_encrypted(
         state,
+        &auth,
         body,
         "/v1/embeddings",
         None,
@@ -113,6 +119,7 @@ pub async fn rerank(
 
     json_passthrough_encrypted(
         state,
+        &auth,
         body,
         "/v1/rerank",
         url_override.as_deref(),
@@ -142,6 +149,7 @@ pub async fn score(
 
     json_passthrough_encrypted(
         state,
+        &auth,
         body,
         "/v1/score",
         url_override.as_deref(),
@@ -171,6 +179,7 @@ pub async fn images_generations(
 
     json_passthrough_encrypted(
         state,
+        &auth,
         body,
         "/v1/images/generations",
         url_override.as_deref(),
@@ -197,6 +206,7 @@ pub async fn images_edits(
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
     let max_size = state.config.max_image_request_size;
     let mut form = reqwest::multipart::Form::new();
+    let mut requested_model = None;
     let mut total_size: usize = 0;
     let mut hasher = sha2::Sha256::new();
 
@@ -225,10 +235,16 @@ pub async fn images_edits(
         } else {
             let data =
                 read_field_chunks(&mut field, &mut total_size, max_size, &mut hasher).await?;
+            if name == "model" && state.model_access.is_enabled() {
+                requested_model = std::str::from_utf8(&data).ok().map(str::to_string);
+            }
             let part = build_multipart_part(data, file_name, content_type)?;
             form = form.part(name, part);
         }
     }
+    // Per-organization model access (`model_access.rs`), as on the chat
+    // route, once the form is read: a refusal names the `model` field.
+    check_single_model(&state, &auth, || requested_model)?;
 
     let request_sha256 = hex::encode(hasher.finalize());
 
@@ -286,6 +302,7 @@ pub async fn audio_transcriptions(
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
     let max_size = state.config.max_audio_request_size;
     let mut form = reqwest::multipart::Form::new();
+    let mut requested_model = None;
     let mut total_size: usize = 0;
     // Always hash the raw (original) bytes for signatures, matching the Python proxy.
     // When encryption is active, the prompt field is hashed in its encrypted form,
@@ -317,10 +334,16 @@ pub async fn audio_transcriptions(
         } else {
             let data =
                 read_field_chunks(&mut field, &mut total_size, max_size, &mut hasher).await?;
+            if name == "model" && state.model_access.is_enabled() {
+                requested_model = std::str::from_utf8(&data).ok().map(str::to_string);
+            }
             let part = build_multipart_part(data, file_name, content_type)?;
             form = form.part(name, part);
         }
     }
+    // Per-organization model access (`model_access.rs`), as on the chat
+    // route, once the form is read: a refusal names the `model` field.
+    check_single_model(&state, &auth, || requested_model)?;
 
     let request_sha256 = hex::encode(hasher.finalize());
 
@@ -370,6 +393,7 @@ pub async fn audio_transcriptions(
 #[allow(clippy::too_many_arguments)]
 async fn json_passthrough_encrypted(
     state: AppState,
+    auth: &RequireAuth,
     body: Body,
     pool_path: &str,
     url_override: Option<&str>,
@@ -383,22 +407,26 @@ async fn json_passthrough_encrypted(
 ) -> Result<Response, AppError> {
     let max_size = size_fn(&state.config);
     let request_body = read_body_with_limit(body, max_size).await?;
+    // The body has to be a JSON object whether or not it is encrypted.
+    let mut request_json = proxy::parse_json_object(&request_body)?;
+    // Per-organization model access (`model_access.rs`), as on the chat
+    // route, once the `model` the caller sent can be named in a refusal.
+    check_single_model(&state, auth, || {
+        crate::model_list::requested_model(&request_json).map(str::to_string)
+    })?;
 
     // When encryption is active, decrypt fields and re-serialize.
-    // When inactive, validate JSON but forward the original bytes to
-    // preserve the exact request body for hashing.
+    // When inactive, the JSON was validated above and the original bytes
+    // are forwarded, to preserve the exact request body for hashing.
     let (forward_body, original_request_hash, response_transform) = if let Some(ctx) = enc_ctx {
         // Hash original client-sent body before decryption for signatures
         let original_hash = hex::encode(sha2::Sha256::digest(&request_body));
-        let mut request_json = proxy::parse_json_object(&request_body)?;
         encryption::decrypt_request_fields(&mut request_json, endpoint, &ctx, &state.signing)?;
         let modified =
             serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?;
         let transform = encryption::make_response_transform(endpoint, ctx, state.signing.clone());
         (modified, Some(original_hash), Some(transform))
     } else {
-        // Validate JSON without re-serializing
-        proxy::parse_json_object(&request_body)?;
         (request_body, None, None)
     };
 

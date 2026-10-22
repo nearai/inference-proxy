@@ -11,7 +11,7 @@ pub mod privacy;
 pub mod signature;
 
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{get, post};
+use axum::routing::{get, post, MethodRouter};
 use axum::Router;
 
 use crate::error::AppError;
@@ -82,6 +82,27 @@ pub fn build_router_for(state: &AppState) -> Router<AppState> {
     }
 }
 
+/// One route: its path and its handlers.
+pub type Route = (&'static str, MethodRouter<AppState>);
+
+/// A router with exactly `routes`, failing closed on everything else.
+fn router_of(routes: Vec<Route>) -> Router<AppState> {
+    routes
+        .into_iter()
+        .fold(Router::new(), |router, (path, handlers)| {
+            router.route(path, handlers)
+        })
+        .fallback(unknown_route)
+}
+
+pub fn build_model_list_router() -> Router<AppState> {
+    router_of(model_list_routes())
+}
+
+pub fn build_router() -> Router<AppState> {
+    router_of(single_model_routes())
+}
+
 /// Gateway list mode (`model_list.rs`): only what is defined for several
 /// models — chat completions, completions, the models document, health,
 /// metrics and the version. The other inference routes (tokenize, embeddings,
@@ -89,51 +110,59 @@ pub fn build_router_for(state: &AppState) -> Router<AppState> {
 /// attestation, signatures and OHTTP all assume the one model, backend pool
 /// and signing identity of a single-model process, so here they are the same
 /// 404 as any undeclared route.
-pub fn build_model_list_router() -> Router<AppState> {
-    Router::new()
-        .route(ROUTE_VERSION, get(health::version))
-        .route(ROUTE_HEALTHZ, get(health::healthz))
-        .route(
+///
+/// The router is built from this list and from nothing else, so a test that
+/// walks it sees every route (see `single_model_routes`).
+pub fn model_list_routes() -> Vec<Route> {
+    vec![
+        (ROUTE_VERSION, get(health::version)),
+        (ROUTE_HEALTHZ, get(health::healthz)),
+        (
             ROUTE_METRICS,
             get(crate::metrics_middleware::prometheus_metrics_handler),
-        )
-        .route(ROUTE_V1_MODELS, get(metrics::models))
-        .route(ROUTE_CHAT_COMPLETIONS, post(chat::chat_completions))
-        .route(ROUTE_COMPLETIONS, post(completions::completions))
-        .fallback(unknown_route)
+        ),
+        (ROUTE_V1_MODELS, get(metrics::models)),
+        (ROUTE_CHAT_COMPLETIONS, post(chat::chat_completions)),
+        (ROUTE_COMPLETIONS, post(completions::completions)),
+    ]
 }
 
-pub fn build_router() -> Router<AppState> {
-    Router::new()
+/// Every route of a process that serves one model. `build_router` registers
+/// exactly these, so the list is the router: the test that every route which
+/// takes a customer key applies per-organization model access
+/// (`model_access.rs`) walks it, and a route added here is covered by that
+/// test without anyone remembering to add it there.
+pub fn single_model_routes() -> Vec<Route> {
+    vec![
         // Unauthenticated health endpoints
-        .route(ROUTE_ROOT, get(health::root))
-        .route(ROUTE_VERSION, get(health::version))
-        .route(ROUTE_HEALTHZ, get(health::healthz))
+        (ROUTE_ROOT, get(health::root)),
+        (ROUTE_VERSION, get(health::version)),
+        (ROUTE_HEALTHZ, get(health::healthz)),
         // Unauthenticated Prometheus metrics
-        .route(
+        (
             ROUTE_METRICS,
             get(crate::metrics_middleware::prometheus_metrics_handler),
-        )
+        ),
         // Unauthenticated backend metrics/models
-        .route(ROUTE_V1_METRICS, get(metrics::metrics))
-        .route(ROUTE_V1_MODELS, get(metrics::models))
+        (ROUTE_V1_METRICS, get(metrics::metrics)),
+        (ROUTE_V1_MODELS, get(metrics::models)),
         // Unauthenticated attestation report
-        .route(
+        (
             ROUTE_ATTESTATION_REPORT,
             get(attestation::attestation_report),
-        )
+        ),
         // Authenticated endpoints
-        .route(ROUTE_CHAT_COMPLETIONS, post(chat::chat_completions))
-        .route(ROUTE_COMPLETIONS, post(completions::completions))
-        .route(ROUTE_TOKENIZE, post(passthrough::tokenize))
-        .route(ROUTE_EMBEDDINGS, post(passthrough::embeddings))
-        .route(ROUTE_RERANK, post(passthrough::rerank))
-        .route(ROUTE_SCORE, post(passthrough::score))
-        .route(ROUTE_PRIVACY_CLASSIFY, post(privacy::classify))
-        .route(
+        (ROUTE_CHAT_COMPLETIONS, post(chat::chat_completions)),
+        (ROUTE_COMPLETIONS, post(completions::completions)),
+        (ROUTE_TOKENIZE, post(passthrough::tokenize)),
+        (ROUTE_EMBEDDINGS, post(passthrough::embeddings)),
+        (ROUTE_RERANK, post(passthrough::rerank)),
+        (ROUTE_SCORE, post(passthrough::score)),
+        (ROUTE_PRIVACY_CLASSIFY, post(privacy::classify)),
+        (
             ROUTE_IMAGES_GENERATIONS,
             post(passthrough::images_generations),
-        )
+        ),
         // Multipart upload routes: axum's `Multipart` extractor enforces the
         // global 2 MiB `DefaultBodyLimit`, which rejects the body before the
         // handler's own size guard (`max_audio_request_size` / `max_image_request_size`)
@@ -141,23 +170,23 @@ pub fn build_router() -> Router<AppState> {
         // enforced incrementally in `read_field_chunks` — the single source of
         // truth. Without this, audio/images > ~2 MiB fail upstream
         // with a 502 (connection reset before the body is consumed).
-        .route(
+        (
             ROUTE_IMAGES_EDITS,
             post(passthrough::images_edits).layer(DefaultBodyLimit::disable()),
-        )
-        .route(
+        ),
+        (
             ROUTE_AUDIO_TRANSCRIPTIONS,
             post(passthrough::audio_transcriptions).layer(DefaultBodyLimit::disable()),
-        )
-        .route(ROUTE_SIGNATURE, get(signature::signature))
+        ),
+        (ROUTE_SIGNATURE, get(signature::signature)),
         // Internal — sibling proxies on the same host call this when
         // configured with GPU_EVIDENCE_DELEGATE_URL pointed at us.
-        .route(ROUTE_INTERNAL_GPU_EVIDENCE, post(internal::gpu_evidence))
+        (ROUTE_INTERNAL_GPU_EVIDENCE, post(internal::gpu_evidence)),
         // OHTTP Gateway (RFC 9458) — POST /ohttp is unauthenticated; auth may be
         // inside the encrypted Binary HTTP message or on the outer HTTP request
         // (relay-injected Authorization). See `ohttp_relay` docs.
-        .route(ROUTE_OHTTP_WELL_KNOWN, get(ohttp::ohttp_config))
-        .route(ROUTE_OHTTP_CONFIG, get(ohttp::ohttp_config))
-        .route(ROUTE_OHTTP_RELAY, post(ohttp::ohttp_relay))
-        .fallback(unknown_route)
+        (ROUTE_OHTTP_WELL_KNOWN, get(ohttp::ohttp_config)),
+        (ROUTE_OHTTP_CONFIG, get(ohttp::ohttp_config)),
+        (ROUTE_OHTTP_RELAY, post(ohttp::ohttp_relay)),
+    ]
 }

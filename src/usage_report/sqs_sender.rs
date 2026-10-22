@@ -26,7 +26,9 @@ use futures_util::future::BoxFuture;
 use reqwest::StatusCode;
 
 use super::{AttemptLog, Job, Refused, SendOutcome, SqsSettings, TransportKind, UsageSender};
-use crate::aws_credentials::{read_bounded, CredentialFailure, CredentialProvider};
+use crate::aws_credentials::{
+    no_redirect_client, read_bounded, CredentialFailure, CredentialProvider,
+};
 use crate::proxy::{classify_usage_request_error, UsageReportOutcome};
 
 const SERVICE: &str = "sqs";
@@ -42,6 +44,10 @@ pub(crate) struct SqsSender {
     /// `VLLM_PROXY_USAGE_REPORT_SQS_ENDPOINT` (a local emulator).
     endpoint: String,
     credentials: CredentialProvider,
+    /// The client of the credentials fetch and of the send. Not the shared
+    /// proxy client: it never follows a redirect, so the metadata session
+    /// token and the signed request go to the configured hosts only.
+    client: reqwest::Client,
 }
 
 impl SqsSender {
@@ -55,6 +61,7 @@ impl SqsSender {
             region: settings.region.clone(),
             endpoint,
             credentials: CredentialProvider::new(settings.credentials_url.clone()),
+            client: no_redirect_client(),
         }
     }
 
@@ -62,15 +69,14 @@ impl SqsSender {
     /// attempt's outcome and its log text.
     async fn credentials_within(
         &self,
-        job: &Job,
         timeout: Duration,
     ) -> Result<Credentials, (UsageReportOutcome, String)> {
-        match tokio::time::timeout(timeout, self.credentials.get(&job.reporter.http_client)).await {
+        match tokio::time::timeout(timeout, self.credentials.get(&self.client)).await {
             Ok(Ok(credentials)) => Ok(credentials),
             Ok(Err(CredentialFailure(error))) => Err((UsageReportOutcome::SqsCredentials, error)),
             Err(_) => Err((
                 UsageReportOutcome::Timeout,
-                "credentials were not had within the attempt's timeout".to_string(),
+                "credentials were not received within the attempt's timeout".to_string(),
             )),
         }
     }
@@ -99,7 +105,7 @@ impl SqsSender {
         timeout: Duration,
     ) -> (UsageReportOutcome, Result<StatusCode, String>) {
         let started_at = Instant::now();
-        let credentials = match self.credentials_within(job, timeout).await {
+        let credentials = match self.credentials_within(timeout).await {
             Ok(credentials) => credentials,
             Err((outcome, error)) => return (outcome, Err(error)),
         };
@@ -109,7 +115,7 @@ impl SqsSender {
         else {
             return (
                 UsageReportOutcome::Timeout,
-                Err("the attempt's time went on the credentials".to_string()),
+                Err("the attempt's time was used up fetching credentials".to_string()),
             );
         };
         let headers = match sign_request(
@@ -123,9 +129,8 @@ impl SqsSender {
             Err(error) => return (UsageReportOutcome::SqsInvalid, Err(error)),
         };
 
-        let mut request = job
-            .reporter
-            .http_client
+        let mut request = self
+            .client
             .post(&self.endpoint)
             .timeout(remaining)
             .header(reqwest::header::CONTENT_TYPE, CONTENT_TYPE)

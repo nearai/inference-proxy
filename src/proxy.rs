@@ -423,6 +423,7 @@ impl UsageReportOutcome {
     /// sender's answers are decided here; HTTP keeps its own rule
     /// (`http_sender::retry_reason`), because a 429 and an unbuildable request
     /// are told apart by the status and error, which these labels do not carry.
+    /// An outcome not listed is final: a new one is not retried until it is.
     pub(crate) fn is_retryable(self) -> bool {
         matches!(
             self,
@@ -4057,8 +4058,7 @@ mod tests {
                 endpoint: None,
                 credentials_url: "http://127.0.0.1:9".to_string(),
             }),
-        )
-        .unwrap();
+        );
         let mut queued = reporter_with(None, Some("org"), Some("ws"), Some("key"));
         queued.cloud_api_url = None;
         queued.delivery = sqs;

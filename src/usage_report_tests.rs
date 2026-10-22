@@ -1547,6 +1547,22 @@ async fn http_sender_refuses_a_missing_token() {
     assert_eq!(billing.received(), 0);
 }
 
+/// The HTTP sender without a cloud-api URL (which only the SQS transport may
+/// lack) is refused as final too, and nothing is sent.
+#[tokio::test]
+async fn http_sender_refuses_a_missing_url() {
+    let billing = Billing::answering(204).await;
+    let mut job = http_job(&billing);
+    job.reporter.cloud_api_url = None;
+    let (sent, attempt) = super::http_sender::HttpSender
+        .send(&job, Duration::from_secs(5))
+        .await;
+    assert_eq!(sent, SendOutcome::Final("missing_usage_token"));
+    assert_eq!(attempt.outcome, UsageReportOutcome::MissingUsageToken);
+    assert!(attempt.answer.is_err());
+    assert_eq!(billing.received(), 0);
+}
+
 /// A sender that answers from a script: the n-th attempt gets the n-th
 /// decision, and the last one repeats.
 struct Scripted {

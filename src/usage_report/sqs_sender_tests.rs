@@ -53,6 +53,7 @@ fn sender(endpoint: &str) -> SqsSender {
         queue_url: QUEUE.to_string(),
         region: "us-east-1".to_string(),
         endpoint: endpoint.to_string(),
+        client: no_redirect_client(),
         credentials: CredentialProvider::seeded(Credentials::new(
             ACCESS_KEY, SECRET_KEY, None, None, "test",
         )),
@@ -76,6 +77,7 @@ fn sender_with_endpoint_credentials(endpoint: &str, credentials_url: &str) -> Sq
         queue_url: QUEUE.to_string(),
         region: "us-east-1".to_string(),
         endpoint: endpoint.to_string(),
+        client: no_redirect_client(),
         credentials: CredentialProvider::new(credentials_url.to_string()),
     }
 }
@@ -613,6 +615,7 @@ async fn endpoint_credentials_are_cached_until_near_expiry_and_sent_as_a_session
         queue_url: QUEUE.to_string(),
         region: "us-east-1".to_string(),
         endpoint: sqs.uri(),
+        client: no_redirect_client(),
         credentials: CredentialProvider::new(server.uri()),
     };
     let job = job_with(
@@ -655,6 +658,7 @@ async fn endpoint_credentials_due_for_refresh_are_fetched_again() {
         queue_url: QUEUE.to_string(),
         region: "us-east-1".to_string(),
         endpoint: sqs.uri(),
+        client: no_redirect_client(),
         credentials: CredentialProvider::new(server.uri()),
     };
     let job = job_with(

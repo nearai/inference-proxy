@@ -80,7 +80,19 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Load config
-    let config = config::Config::from_env()?;
+    let mut config = config::Config::from_env()?;
+    // Decided once, before anything is built on it: a usage queue that fails
+    // its startup check leaves the process on the HTTP transport when that is
+    // configured, and refuses startup when it is not.
+    let resolved = usage_report::UsageReportDelivery::resolve_transport(
+        config.usage_report.clone(),
+        config.usage_report_transport.clone(),
+        config.cloud_api_url.is_some() && config.cloud_api_usage_token.is_some(),
+    )
+    .await?;
+    if resolved != config.usage_report_transport {
+        config.fall_back_to_http_usage_transport()?;
+    }
 
     let listen_port = config.listen_port;
     let listen_addr = config.listen_addr.clone();

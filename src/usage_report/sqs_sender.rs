@@ -31,6 +31,7 @@ use crate::proxy::{classify_usage_request_error, UsageReportOutcome};
 
 const SERVICE: &str = "sqs";
 const TARGET: &str = "AmazonSQS.SendMessage";
+const CHECK_TARGET: &str = "AmazonSQS.GetQueueAttributes";
 const CONTENT_TYPE: &str = "application/x-amz-json-1.0";
 /// The most of an SQS error body that is read for its `__type`.
 const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
@@ -112,6 +113,16 @@ impl SqsSender {
         job: &Job,
         timeout: Duration,
     ) -> (UsageReportOutcome, Result<StatusCode, String>) {
+        self.call(TARGET, &job.body, timeout).await
+    }
+
+    /// One signed call of the SQS action `target` with `body`, within `timeout`.
+    async fn call(
+        &self,
+        target: &str,
+        body: &Bytes,
+        timeout: Duration,
+    ) -> (UsageReportOutcome, Result<StatusCode, String>) {
         let started_at = Instant::now();
         let credentials = match self.credentials_within(timeout).await {
             Ok(credentials) => credentials,
@@ -130,7 +141,8 @@ impl SqsSender {
             &self.endpoint,
             &self.region,
             &credentials,
-            &job.body,
+            target,
+            body,
             SystemTime::now(),
         ) {
             Ok(headers) => headers,
@@ -142,8 +154,8 @@ impl SqsSender {
             .post(&self.endpoint)
             .timeout(remaining)
             .header(reqwest::header::CONTENT_TYPE, CONTENT_TYPE)
-            .header("x-amz-target", TARGET)
-            .body(job.body.clone());
+            .header("x-amz-target", target)
+            .body(body.clone());
         // The headers SigV4 added: the date and the authorization.
         for (name, value) in headers {
             request = request.header(name, value);
@@ -199,6 +211,27 @@ impl UsageSender for SqsSender {
         })?;
         job.body = Bytes::from(payload);
         Ok(())
+    }
+
+    /// `GetQueueAttributes` (`QueueArn`) on the usage queue: one attempt that
+    /// proves the queue exists and these credentials may reach it, signed like
+    /// a `SendMessage`. Needs `sqs:GetQueueAttributes` besides `sqs:SendMessage`.
+    fn startup_check<'a>(
+        &'a self,
+        _client: &'a reqwest::Client,
+        timeout: Duration,
+    ) -> BoxFuture<'a, Result<(), (UsageReportOutcome, String)>> {
+        Box::pin(async move {
+            let body = Bytes::from(
+                serde_json::json!({"QueueUrl": self.queue_url, "AttributeNames": ["QueueArn"]})
+                    .to_string(),
+            );
+            match self.call(CHECK_TARGET, &body, timeout).await {
+                (UsageReportOutcome::Accepted, _) => Ok(()),
+                (outcome, Ok(status)) => Err((outcome, format!("status {status}"))),
+                (outcome, Err(error)) => Err((outcome, error)),
+            }
+        })
     }
 
     fn send<'a>(
@@ -267,13 +300,14 @@ fn message_body(job: &Job) -> Result<String, Refused> {
     })
 }
 
-/// The headers SigV4 adds to a `SendMessage` of `payload` to `endpoint` at
+/// The headers SigV4 adds to an SQS call of `target` with `payload` to `endpoint` at
 /// `time`, with the two the request carries itself (content type and target)
 /// signed.
 fn sign_request(
     endpoint: &str,
     region: &str,
     credentials: &aws_credential_types::Credentials,
+    target: &str,
     payload: &[u8],
     time: SystemTime,
 ) -> Result<Vec<(String, String)>, String> {
@@ -286,7 +320,7 @@ fn sign_request(
         .settings(SigningSettings::default())
         .build()
         .map_err(|error| error.to_string())?;
-    let headers = [("content-type", CONTENT_TYPE), ("x-amz-target", TARGET)];
+    let headers = [("content-type", CONTENT_TYPE), ("x-amz-target", target)];
     let request = SignableRequest::new(
         "POST",
         endpoint,

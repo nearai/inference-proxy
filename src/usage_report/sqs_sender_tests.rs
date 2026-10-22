@@ -48,7 +48,7 @@ fn fixed_time() -> SystemTime {
 
 /// A sender against `endpoint` (a stand-in for SQS), holding credentials
 /// already cached, so no credentials endpoint is involved.
-fn sender(endpoint: &str) -> SqsSender {
+pub(super) fn sender(endpoint: &str) -> SqsSender {
     SqsSender {
         queue_url: QUEUE.to_string(),
         region: "us-east-1".to_string(),
@@ -72,7 +72,7 @@ async fn credential_fetches(server: &MockServer) -> usize {
 }
 
 /// A sender whose credentials come from the endpoint `credentials_url`.
-fn sender_with_endpoint_credentials(endpoint: &str, credentials_url: &str) -> SqsSender {
+pub(super) fn sender_with_endpoint_credentials(endpoint: &str, credentials_url: &str) -> SqsSender {
     SqsSender {
         queue_url: QUEUE.to_string(),
         region: "us-east-1".to_string(),
@@ -84,7 +84,7 @@ fn sender_with_endpoint_credentials(endpoint: &str, credentials_url: &str) -> Sq
 
 /// The usage body of a chat completion, as `spawn_usage_report` completes it
 /// for a deployment that bills at a discount.
-fn chat_body(id: &str) -> Value {
+pub(super) fn chat_body(id: &str) -> Value {
     json!({
         "type": "chat_completion",
         "model": "test-model",
@@ -99,7 +99,7 @@ fn chat_body(id: &str) -> Value {
     })
 }
 
-fn job_with(body: &Value, delivery: &Arc<UsageReportDelivery>) -> Job {
+pub(super) fn job_with(body: &Value, delivery: &Arc<UsageReportDelivery>) -> Job {
     Job {
         reporter: UsageReporter {
             http_client: reqwest::Client::new(),
@@ -128,7 +128,7 @@ fn job_with(body: &Value, delivery: &Arc<UsageReportDelivery>) -> Job {
 
 /// One attempt as the delivery makes it: the report is prepared at submit,
 /// and a refused report is not sent at all.
-async fn attempt(sender: &SqsSender, job: &Job) -> (SendOutcome, AttemptLog) {
+pub(super) async fn attempt(sender: &SqsSender, job: &Job) -> (SendOutcome, AttemptLog) {
     let mut job = job.clone();
     match sender.prepare(&mut job) {
         Ok(()) => sender.send(&job, Duration::from_secs(5)).await,
@@ -143,7 +143,7 @@ async fn attempt(sender: &SqsSender, job: &Job) -> (SendOutcome, AttemptLog) {
     }
 }
 
-async fn sqs_answering(status: u16, body: Value) -> MockServer {
+pub(super) async fn sqs_answering(status: u16, body: Value) -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/"))
@@ -975,76 +975,4 @@ async fn a_denial_that_persists_is_dropped_once_the_attempts_run_out() {
         ),
         1.0
     );
-}
-
-/// A redirect from the queue endpoint is not followed: the signed request goes
-/// to the configured host only, and the answer is final (a redirecting
-/// endpoint is misconfigured; asking again changes nothing).
-#[tokio::test]
-async fn a_redirect_from_the_queue_endpoint_is_not_followed() {
-    let elsewhere = MockServer::start().await;
-    Mock::given(wiremock::matchers::any())
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"MessageId": "m"})))
-        .mount(&elsewhere)
-        .await;
-    let sqs = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(302).insert_header("location", elsewhere.uri()))
-        .mount(&sqs)
-        .await;
-    let sender = sender(&sqs.uri());
-    let job = job_with(
-        &chat_body("chatcmpl-redirect"),
-        &Arc::new(UsageReportDelivery::default()),
-    );
-    let (outcome, log) = attempt(&sender, &job).await;
-    assert_eq!(outcome, SendOutcome::Final("sqs_invalid"));
-    assert_eq!(log.outcome, UsageReportOutcome::SqsInvalid);
-    assert_eq!(sqs.received_requests().await.unwrap().len(), 1);
-    assert!(elsewhere.received_requests().await.unwrap().is_empty());
-}
-
-/// A redirect from the credentials endpoint is not followed either, at the
-/// token step and at the credentials step (which carries the session token):
-/// nothing reaches the other host, and the attempt fails as a credentials
-/// failure, which is retried like any other.
-#[tokio::test]
-async fn a_redirect_from_the_credentials_endpoint_is_not_followed() {
-    use wiremock::matchers::any;
-    let elsewhere = MockServer::start().await;
-    Mock::given(any())
-        .respond_with(ResponseTemplate::new(200).set_body_string("stolen"))
-        .mount(&elsewhere)
-        .await;
-    let sqs = sqs_answering(200, json!({"MessageId": "m"})).await;
-
-    // Redirected at the token step.
-    let creds = MockServer::start().await;
-    Mock::given(any())
-        .respond_with(ResponseTemplate::new(302).insert_header("location", elsewhere.uri()))
-        .mount(&creds)
-        .await;
-    let job = job_with(
-        &chat_body("chatcmpl-redirect-creds"),
-        &Arc::new(UsageReportDelivery::default()),
-    );
-    let sender_a = sender_with_endpoint_credentials(&sqs.uri(), &creds.uri());
-    let (outcome, log) = attempt(&sender_a, &job).await;
-    assert_eq!(outcome, SendOutcome::Retryable("sqs_credentials"));
-    assert_eq!(log.outcome, UsageReportOutcome::SqsCredentials);
-
-    // Redirected at the credentials step, which carries the token header.
-    let creds = MockServer::start().await;
-    mount_imds_session(&creds).await;
-    Mock::given(method("GET"))
-        .and(path(ROLE_CREDENTIALS_PATH))
-        .respond_with(ResponseTemplate::new(302).insert_header("location", elsewhere.uri()))
-        .mount(&creds)
-        .await;
-    let sender_b = sender_with_endpoint_credentials(&sqs.uri(), &creds.uri());
-    let (outcome, _) = attempt(&sender_b, &job).await;
-    assert_eq!(outcome, SendOutcome::Retryable("sqs_credentials"));
-
-    assert!(elsewhere.received_requests().await.unwrap().is_empty());
-    assert!(sqs.received_requests().await.unwrap().is_empty());
 }

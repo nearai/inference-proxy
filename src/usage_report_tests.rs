@@ -1429,6 +1429,13 @@ async fn shutdown_says_how_many_reports_it_waited_for_and_how_many_it_left() {
 
 /// One attempt through `HttpSender` at `billing`, which gives up after `timeout`.
 async fn http_attempt(billing: &Billing, timeout: Duration) -> (SendOutcome, AttemptLog) {
+    super::http_sender::HttpSender
+        .send(&http_job(billing), timeout)
+        .await
+}
+
+/// A report for `billing`, with every field the HTTP sender needs.
+fn http_job(billing: &Billing) -> Job {
     let reporter = UsageReporter {
         http_client: billing.client.clone(),
         cloud_api_url: billing.url.clone(),
@@ -1446,12 +1453,11 @@ async fn http_attempt(billing: &Billing, timeout: Duration) -> (SendOutcome, Att
         },
         delivery: Arc::new(UsageReportDelivery::default()),
     };
-    let job = Job {
+    Job {
         reporter,
         body: bytes::Bytes::from_static(br#"{"id":"report-1"}"#),
         completed_at: Instant::now(),
-    };
-    super::http_sender::HttpSender.send(&job, timeout).await
+    }
 }
 
 /// The HTTP sender makes the same decision on each kind of answer as the
@@ -1522,6 +1528,22 @@ async fn http_sender_outcomes_unchanged() {
     assert!(attempt.answer.is_err());
 }
 
+/// A report that reaches the HTTP sender without a usage token is refused as
+/// final, not panicked on, and nothing is sent.
+#[tokio::test]
+async fn http_sender_refuses_a_missing_token() {
+    let billing = Billing::answering(204).await;
+    let mut job = http_job(&billing);
+    job.reporter.cloud_api_usage_token = None;
+    let (sent, attempt) = super::http_sender::HttpSender
+        .send(&job, Duration::from_secs(5))
+        .await;
+    assert_eq!(sent, SendOutcome::Final("missing_usage_token"));
+    assert_eq!(attempt.outcome, UsageReportOutcome::MissingUsageToken);
+    assert!(attempt.answer.is_err());
+    assert_eq!(billing.received(), 0);
+}
+
 /// A sender that answers from a script: the n-th attempt gets the n-th
 /// decision, and the last one repeats.
 struct Scripted {
@@ -1537,7 +1559,11 @@ impl UsageSender for Scripted {
     ) -> BoxFuture<'a, (SendOutcome, AttemptLog)> {
         Box::pin(async move {
             let n = self.attempts.fetch_add(1, Ordering::SeqCst);
-            let decision = self.decisions[n.min(self.decisions.len() - 1)];
+            let decision = *self
+                .decisions
+                .get(n)
+                .or(self.decisions.last())
+                .expect("a Scripted sender needs at least one decision");
             let (answer, outcome) = match decision {
                 SendOutcome::Accepted => {
                     (Ok(reqwest::StatusCode::OK), UsageReportOutcome::Accepted)

@@ -54,7 +54,7 @@ pub(super) fn sender(endpoint: &str) -> SqsSender {
         queue_url: QUEUE.to_string(),
         region: "us-east-1".to_string(),
         endpoint: endpoint.to_string(),
-        client: no_redirect_client(),
+        client: no_redirect_client().unwrap(),
         credentials: CredentialProvider::seeded(Credentials::new(
             ACCESS_KEY, SECRET_KEY, None, None, "test",
         )),
@@ -78,7 +78,7 @@ pub(super) fn sender_with_endpoint_credentials(endpoint: &str, credentials_url: 
         queue_url: QUEUE.to_string(),
         region: "us-east-1".to_string(),
         endpoint: endpoint.to_string(),
-        client: no_redirect_client(),
+        client: no_redirect_client().unwrap(),
         credentials: CredentialProvider::new(credentials_url.to_string()),
     }
 }
@@ -393,6 +393,42 @@ async fn sqs_throttling_is_retried_and_named_so() {
     assert_eq!(log.answer.unwrap(), StatusCode::BAD_REQUEST);
 }
 
+/// The error type is read from the `x-amzn-errortype` header when the body
+/// names none (an empty body here), so a throttle is told from an unknown 400.
+#[tokio::test]
+async fn the_error_type_header_classifies_an_answer_without_a_body_type() {
+    for (header_value, decision, outcome) in [
+        (
+            "ThrottlingException",
+            SendOutcome::Retryable("sqs_throttled"),
+            UsageReportOutcome::SqsThrottled,
+        ),
+        // The header may carry a namespace suffix, as the body's `__type` does.
+        (
+            "InvalidParameterValue:http://internal.amazon.com/coral/",
+            SendOutcome::Final("sqs_invalid"),
+            UsageReportOutcome::SqsInvalid,
+        ),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(400).insert_header("x-amzn-errortype", header_value),
+            )
+            .mount(&server)
+            .await;
+        let job = job_with(
+            &chat_body("chatcmpl-hdr"),
+            &Arc::new(UsageReportDelivery::default()),
+        );
+        let (got, log) = attempt(&sender(&server.uri()), &job).await;
+        assert_eq!(got, decision, "{header_value}");
+        assert_eq!(log.outcome, outcome, "{header_value}");
+        assert_eq!(log.answer.unwrap(), StatusCode::BAD_REQUEST);
+    }
+}
+
 #[tokio::test]
 async fn sqs_access_denied_is_retried_and_invalid_parameters_are_final() {
     for (status, error_type, decision, outcome) in [
@@ -617,7 +653,7 @@ async fn endpoint_credentials_are_cached_until_near_expiry_and_sent_as_a_session
         queue_url: QUEUE.to_string(),
         region: "us-east-1".to_string(),
         endpoint: sqs.uri(),
-        client: no_redirect_client(),
+        client: no_redirect_client().unwrap(),
         credentials: CredentialProvider::new(server.uri()),
     };
     let job = job_with(
@@ -660,7 +696,7 @@ async fn endpoint_credentials_due_for_refresh_are_fetched_again() {
         queue_url: QUEUE.to_string(),
         region: "us-east-1".to_string(),
         endpoint: sqs.uri(),
-        client: no_redirect_client(),
+        client: no_redirect_client().unwrap(),
         credentials: CredentialProvider::new(server.uri()),
     };
     let job = job_with(

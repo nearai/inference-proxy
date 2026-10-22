@@ -68,6 +68,8 @@ struct GatewayOptions {
     /// How usage reports are delivered (`VLLM_PROXY_USAGE_REPORT_*`); the
     /// default is one attempt with a 5 second timeout.
     usage_report: usage_report::UsageReportPolicy,
+    /// `VLLM_PROXY_USAGE_REPORT_TRANSPORT` (default: HTTP to cloud-api).
+    usage_report_transport: usage_report::UsageReportTransport,
     /// `VLLM_PROXY_REASONING_OFF_EFFORT` (default `none`).
     reasoning_off_effort: Option<String>,
 }
@@ -127,7 +129,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         cloud_api_auth_timeout_secs: 5,
         cloud_api_usage_token: options.cloud_api_usage_token.clone(),
         usage_report: options.usage_report.clone(),
-        usage_report_transport: Default::default(),
+        usage_report_transport: options.usage_report_transport.clone(),
         compose_manager_url: None,
         tls_cert_path: None,
         timeout_secs: 30,
@@ -287,7 +289,11 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
     ));
     let state = AppState {
         models: None,
-        usage_report_delivery: usage_report::UsageReportDelivery::new(config.usage_report.clone()),
+        usage_report_delivery: usage_report::UsageReportDelivery::for_transport(
+            config.usage_report.clone(),
+            &config.usage_report_transport,
+        )
+        .unwrap(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(cache::ChatCache::new("test-model", 1200)),
@@ -3075,6 +3081,123 @@ async fn a_usage_report_the_intake_fails_is_sent_again_unchanged_when_retries_ar
     let report: serde_json::Value = serde_json::from_slice(&reports[0].body).unwrap();
     assert_eq!(report["id"], chat_completion_json()["id"]);
     assert_eq!(report["organization_id"], "org-partner");
+}
+
+/// With `VLLM_PROXY_USAGE_REPORT_TRANSPORT=sqs` a completed request's usage is
+/// one `SendMessage` to the queue, carrying the `cloud-platform-events` usage
+/// envelope, and nothing is posted to cloud-api's `/v1/internal/usage`. The
+/// queue and the instance-metadata (IMDSv2) credentials endpoint are mocks on
+/// loopback; cloud-api's mock serves the key check only.
+#[tokio::test]
+async fn the_sqs_transport_sends_the_usage_to_the_queue_and_not_to_cloud_api() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
+        .mount(&mock)
+        .await;
+    mount_key_check(&mock, "sk-live-partner", Some("org-partner")).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/internal/usage"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&mock)
+        .await;
+
+    let imds = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/latest/api/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("session-token"))
+        .mount(&imds)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/latest/meta-data/iam/security-credentials/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("test-role\n"))
+        .mount(&imds)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/latest/meta-data/iam/security-credentials/test-role"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "AccessKeyId": "ASIAEXAMPLE",
+            "SecretAccessKey": "secret",
+            "Token": "creds-token",
+            "Expiration": "2999-01-01T00:00:00Z",
+        })))
+        .mount(&imds)
+        .await;
+
+    let sqs = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(header("x-amz-target", "AmazonSQS.SendMessage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "MessageId": "m-1",
+            "MD5OfMessageBody": "00000000000000000000000000000000",
+        })))
+        .expect(1)
+        .mount(&sqs)
+        .await;
+
+    let queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/usage";
+    let (app, state) = build_gateway_with_state(
+        &mock.uri(),
+        GatewayOptions {
+            // Keys are still checked against cloud-api; no usage token.
+            cloud_api_url: Some(mock.uri()),
+            usage_report: usage_report::UsageReportPolicy {
+                max_attempts: 1,
+                ..Default::default()
+            },
+            usage_report_transport: usage_report::UsageReportTransport::Sqs(
+                usage_report::SqsSettings {
+                    queue_url: queue_url.to_string(),
+                    region: "us-east-1".to_string(),
+                    endpoint: Some(sqs.uri()),
+                    credentials_url: imds.uri(),
+                },
+            ),
+            ..Default::default()
+        },
+    );
+
+    let response = app
+        .oneshot(chat_request_with("sk-live-partner", None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    json_body(response).await;
+    let drained = state
+        .usage_report_delivery
+        .drain(Duration::from_secs(30))
+        .await;
+    assert_eq!(drained.left(), 0);
+
+    let sent = sqs.received_requests().await.unwrap();
+    assert_eq!(sent.len(), 1, "one SendMessage per completed request");
+    let outer: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+    assert_eq!(outer["QueueUrl"], queue_url);
+    let cloud_platform_events::ParsedMessage::Usage(envelope) =
+        cloud_platform_events::parse_message(outer["MessageBody"].as_str().unwrap().as_bytes())
+            .unwrap()
+    else {
+        panic!("the message is a usage envelope");
+    };
+    assert_eq!(
+        envelope.producer,
+        cloud_platform_events::Producer::OpenrouterGateway
+    );
+    let usage = serde_json::to_value(&envelope.usage).unwrap();
+    assert_eq!(usage["id"], chat_completion_json()["id"]);
+    assert_eq!(usage["organization_id"], "org-partner");
+    assert_eq!(usage["input_tokens"], 3);
+    assert_eq!(usage["output_tokens"], 1);
+
+    assert!(
+        usage_reports(&mock).await.is_empty(),
+        "no POST to cloud-api"
+    );
+    mock.verify().await;
+    sqs.verify().await;
 }
 
 // ---- Reasoning switch ----

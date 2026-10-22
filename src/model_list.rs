@@ -968,7 +968,7 @@ pub fn app_state(process: Process<'_>) -> anyhow::Result<AppState> {
         usage_report_delivery: crate::usage_report::UsageReportDelivery::for_transport(
             config.usage_report.clone(),
             &config.usage_report_transport,
-        ),
+        )?,
         signing: Arc::new(signing),
         cache: Arc::new(crate::cache::ChatCache::new(
             &config.model_name,

@@ -403,7 +403,8 @@ pub(crate) enum UsageReportOutcome {
     DeadlineExceeded,
     /// SQS transport only (`usage_report/sqs_sender.rs`): throttled, retried.
     SqsThrottled,
-    /// SQS transport only: access denied or credentials refused. Final.
+    /// SQS transport only: access denied. Retried with fresh credentials (a
+    /// new session can be denied briefly); final once the attempts run out.
     SqsDenied,
     /// SQS transport only: invalid parameter, missing queue or an unusable
     /// body. Final.
@@ -4058,7 +4059,8 @@ mod tests {
                 endpoint: None,
                 credentials_url: "http://127.0.0.1:9".to_string(),
             }),
-        );
+        )
+        .unwrap();
         let mut queued = reporter_with(None, Some("org"), Some("ws"), Some("key"));
         queued.cloud_api_url = None;
         queued.delivery = sqs;

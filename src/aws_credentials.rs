@@ -38,12 +38,11 @@ use serde::Deserialize;
 /// not strip when it follows a redirect to another host; every client passed
 /// to [`CredentialProvider::get`] must be this one or one that is as strict.
 /// Timeouts stay per call (the caller's budget); bodies stay bounded.
-pub(crate) fn no_redirect_client() -> reqwest::Client {
+pub(crate) fn no_redirect_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .pool_idle_timeout(Duration::from_secs(30))
         .build()
-        .expect("a client with default TLS settings builds")
 }
 
 /// Credentials from an endpoint are fetched again this long before they expire.
@@ -779,7 +778,7 @@ mod tests {
             .await;
 
         let failure = CredentialProvider::new(endpoint.uri())
-            .get(&no_redirect_client())
+            .get(&no_redirect_client().unwrap())
             .await
             .unwrap_err();
         assert!(failure.0.contains("307"), "{}", failure.0);

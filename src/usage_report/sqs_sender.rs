@@ -5,10 +5,12 @@
 //! report's bytes as they are.
 //!
 //! The sender makes one attempt and classifies its answer for the shared
-//! delivery. Only explicit, non-retryable answers end a report: a denied
-//! access, an invalid parameter, a missing queue, and a report too large for
-//! the queue. Everything else is retried, credentials included: a refused or
-//! unreadable credential is fetched again before the next attempt.
+//! delivery. Only explicit, non-retryable answers end a report: an invalid
+//! parameter, a missing queue, and a report too large for the queue.
+//! Everything else is retried, credentials included: a refused or unreadable
+//! credential is fetched again before the next attempt. That includes a denied
+//! access (`AccessDenied`), which a freshly issued session can get briefly;
+//! it ends the report only once the attempts run out.
 //!
 //! The report is validated and serialized once, when it is submitted
 //! (`UsageSender::prepare`); each attempt only signs and sends those bytes.
@@ -52,18 +54,18 @@ pub(crate) struct SqsSender {
 }
 
 impl SqsSender {
-    pub(crate) fn new(settings: &SqsSettings) -> Self {
+    pub(crate) fn new(settings: &SqsSettings) -> reqwest::Result<Self> {
         let endpoint = settings
             .endpoint
             .clone()
             .unwrap_or_else(|| format!("https://sqs.{}.amazonaws.com/", settings.region));
-        Self {
+        Ok(Self {
             queue_url: settings.queue_url.clone(),
             region: settings.region.clone(),
             endpoint,
             credentials: CredentialProvider::new(settings.credentials_url.clone()),
-            client: no_redirect_client(),
-        }
+            client: no_redirect_client()?,
+        })
     }
 
     /// The credentials for one attempt, within `timeout`. A failure is the

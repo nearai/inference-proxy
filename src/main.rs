@@ -345,7 +345,7 @@ async fn main() -> anyhow::Result<()> {
         usage_report_delivery: usage_report::UsageReportDelivery::for_transport(
             config.usage_report.clone(),
             &config.usage_report_transport,
-        ),
+        )?,
         config: Arc::new(config),
         signing: Arc::new(signing),
         cache: Arc::new(chat_cache),

@@ -48,7 +48,7 @@ fn fixed_time() -> SystemTime {
 
 /// A sender against `endpoint` (a stand-in for SQS), holding credentials
 /// already cached, so no credentials endpoint is involved.
-fn sender(endpoint: &str) -> SqsSender {
+pub(super) fn sender(endpoint: &str) -> SqsSender {
     SqsSender {
         queue_url: QUEUE.to_string(),
         region: "us-east-1".to_string(),
@@ -72,7 +72,7 @@ async fn credential_fetches(server: &MockServer) -> usize {
 }
 
 /// A sender whose credentials come from the endpoint `credentials_url`.
-fn sender_with_endpoint_credentials(endpoint: &str, credentials_url: &str) -> SqsSender {
+pub(super) fn sender_with_endpoint_credentials(endpoint: &str, credentials_url: &str) -> SqsSender {
     SqsSender {
         queue_url: QUEUE.to_string(),
         region: "us-east-1".to_string(),
@@ -84,7 +84,7 @@ fn sender_with_endpoint_credentials(endpoint: &str, credentials_url: &str) -> Sq
 
 /// The usage body of a chat completion, as `spawn_usage_report` completes it
 /// for a deployment that bills at a discount.
-fn chat_body(id: &str) -> Value {
+pub(super) fn chat_body(id: &str) -> Value {
     json!({
         "type": "chat_completion",
         "model": "test-model",
@@ -99,7 +99,7 @@ fn chat_body(id: &str) -> Value {
     })
 }
 
-fn job_with(body: &Value, delivery: &Arc<UsageReportDelivery>) -> Job {
+pub(super) fn job_with(body: &Value, delivery: &Arc<UsageReportDelivery>) -> Job {
     Job {
         reporter: UsageReporter {
             http_client: reqwest::Client::new(),
@@ -128,7 +128,7 @@ fn job_with(body: &Value, delivery: &Arc<UsageReportDelivery>) -> Job {
 
 /// One attempt as the delivery makes it: the report is prepared at submit,
 /// and a refused report is not sent at all.
-async fn attempt(sender: &SqsSender, job: &Job) -> (SendOutcome, AttemptLog) {
+pub(super) async fn attempt(sender: &SqsSender, job: &Job) -> (SendOutcome, AttemptLog) {
     let mut job = job.clone();
     match sender.prepare(&mut job) {
         Ok(()) => sender.send(&job, Duration::from_secs(5)).await,
@@ -143,7 +143,7 @@ async fn attempt(sender: &SqsSender, job: &Job) -> (SendOutcome, AttemptLog) {
     }
 }
 
-async fn sqs_answering(status: u16, body: Value) -> MockServer {
+pub(super) async fn sqs_answering(status: u16, body: Value) -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/"))

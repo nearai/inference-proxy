@@ -153,7 +153,8 @@ impl SqsSender {
             }
         };
         let status = response.status();
-        let error_type = if status.is_success() {
+        // A redirect is final whatever its body says: nothing in it is read.
+        let error_type = if status.is_success() || status.is_redirection() {
             None
         } else {
             Self::error_type(response).await
@@ -320,6 +321,12 @@ pub(crate) fn classify_sqs_answer(
     if status.is_success() {
         return UsageReportOutcome::Accepted;
     }
+    // Redirects are never followed: a queue endpoint that redirects is
+    // misconfigured, and asking again does not change that. This comes before
+    // the error type, so a redirect whose body names a throttle is not retried.
+    if status.is_redirection() {
+        return UsageReportOutcome::SqsInvalid;
+    }
     match error_type.map(short_error_name) {
         Some(
             "ThrottlingException"
@@ -365,3 +372,7 @@ pub(crate) fn classify_sqs_answer(
 #[cfg(test)]
 #[path = "sqs_sender_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "sqs_sender_redirect_tests.rs"]
+mod redirect_tests;

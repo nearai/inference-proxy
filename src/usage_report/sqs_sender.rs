@@ -1,11 +1,14 @@
-//! The SQS sender: one `SendMessage` of a report to the usage queue, carrying
-//! the report as a `cloud-platform-events` envelope and signed with SigV4
+//! The SQS sender: the reports to the usage queue, each carried as a
+//! `cloud-platform-events` envelope, in a `SendMessageBatch` of the reports
+//! already waiting (a retry is a single `SendMessage`), signed with SigV4
 //! (service `sqs`). It is selected by `VLLM_PROXY_USAGE_REPORT_TRANSPORT=sqs`
 //! and is the only code that builds the envelope: the HTTP sender posts the
 //! report's bytes as they are.
 //!
 //! The sender makes one attempt and classifies its answer for the shared
-//! delivery. Only explicit, non-retryable answers end a report: a denied
+//! delivery. A batch answers per report: a call that fails as a whole gives
+//! every report the outcome a single send would get, and an answer that
+//! names failed entries classifies each by its error code. Only explicit, non-retryable answers end a report: a denied
 //! access, an invalid parameter, a missing queue, and a report too large for
 //! the queue. Everything else is retried, credentials included: a refused or
 //! unreadable credential is fetched again before the next attempt.
@@ -33,10 +36,22 @@ use crate::proxy::{classify_usage_request_error, UsageReportOutcome};
 
 const SERVICE: &str = "sqs";
 const TARGET: &str = "AmazonSQS.SendMessage";
+const BATCH_TARGET: &str = "AmazonSQS.SendMessageBatch";
 const CHECK_TARGET: &str = "AmazonSQS.GetQueueAttributes";
 const CONTENT_TYPE: &str = "application/x-amz-json-1.0";
 /// The most of an SQS error body that is read for its `__type`.
 const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
+/// SQS takes at most 10 entries in a `SendMessageBatch`.
+const MAX_BATCH_ENTRIES: usize = 10;
+/// The most message bytes in one batch. SQS allows 1 MiB for a batch of a queue
+/// whose messages may be that large, and 256 KiB for older queues; the smaller
+/// one is kept, which is also the most one envelope may be
+/// (`cloud_platform_events::MAX_ENVELOPE_BYTES`). Reports are about 1 KB, so
+/// this only splits a batch of unusually large ones.
+const MAX_BATCH_BYTES: usize = 262_144;
+/// The most of a `SendMessageBatch` answer that is read: ten entries and their
+/// error messages are far less.
+const MAX_BATCH_RESPONSE_BYTES: usize = 64 * 1024;
 
 pub(crate) struct SqsSender {
     queue_url: String,
@@ -105,36 +120,33 @@ impl SqsSender {
         job: &Job,
         timeout: Duration,
     ) -> (UsageReportOutcome, Result<StatusCode, String>) {
-        let (outcome, answer, _) = self.call(TARGET, &job.body, timeout).await;
-        (outcome, answer)
+        let called = self.call(TARGET, &job.body, timeout, false).await;
+        (called.outcome, called.answer)
     }
 
     /// One signed call of the SQS action `target` with `body`, within `timeout`.
     /// Besides the outcome and the answer, the error type the answer names, if
-    /// it does (`QueueDoesNotExist`, `AccessDenied`, ...).
+    /// it does (`QueueDoesNotExist`, `AccessDenied`, ...), and, with
+    /// `read_answer`, the body of a successful answer.
     async fn call(
         &self,
         target: &str,
         body: &Bytes,
         timeout: Duration,
-    ) -> (
-        UsageReportOutcome,
-        Result<StatusCode, String>,
-        Option<String>,
-    ) {
+        read_answer: bool,
+    ) -> Called {
         let started_at = Instant::now();
         let credentials = match self.credentials_within(timeout).await {
             Ok(credentials) => credentials,
-            Err((outcome, error)) => return (outcome, Err(error), None),
+            Err((outcome, error)) => return Called::failed(outcome, error),
         };
         let Some(remaining) = timeout
             .checked_sub(started_at.elapsed())
             .filter(|left| !left.is_zero())
         else {
-            return (
+            return Called::failed(
                 UsageReportOutcome::Timeout,
-                Err("the attempt's time was used up fetching credentials".to_string()),
-                None,
+                "the attempt's time was used up fetching credentials".to_string(),
             );
         };
         let headers = match sign_request(
@@ -146,7 +158,7 @@ impl SqsSender {
             SystemTime::now(),
         ) {
             Ok(headers) => headers,
-            Err(error) => return (UsageReportOutcome::SqsInvalid, Err(error), None),
+            Err(error) => return Called::failed(UsageReportOutcome::SqsInvalid, error),
         };
 
         let mut request = self
@@ -169,12 +181,18 @@ impl SqsSender {
                     }
                     other => other,
                 };
-                return (outcome, Err(error.to_string()), None);
+                return Called::failed(outcome, error.to_string());
             }
         };
         let status = response.status();
         // A redirect is final whatever its body says: nothing in it is read.
-        let error_type = if status.is_success() || status.is_redirection() {
+        let mut answer = None;
+        let error_type = if status.is_success() {
+            if read_answer {
+                answer = read_bounded(response, MAX_BATCH_RESPONSE_BYTES).await.ok();
+            }
+            None
+        } else if status.is_redirection() {
             None
         } else {
             Self::error_type(response).await
@@ -188,8 +206,200 @@ impl SqsSender {
             // attempt fetches new ones.
             self.credentials.forget(&credentials);
         }
-        (outcome, Ok(status), error_type)
+        Called {
+            outcome,
+            answer: Ok(status),
+            error_type,
+            body: answer,
+        }
     }
+
+    /// The `SendMessageBatch` of `messages` (at most 10, within the byte limit):
+    /// one result per message, in order. Entry `Id`s are the positions.
+    async fn send_chunk(
+        &self,
+        messages: &[&str],
+        timeout: Duration,
+    ) -> Vec<(SendOutcome, AttemptLog)> {
+        let started_at = Instant::now();
+        let entries: Vec<_> = messages
+            .iter()
+            .enumerate()
+            .map(|(id, message)| serde_json::json!({"Id": id.to_string(), "MessageBody": message}))
+            .collect();
+        let body = Bytes::from(
+            serde_json::json!({"QueueUrl": self.queue_url, "Entries": entries}).to_string(),
+        );
+        let called = self.call(BATCH_TARGET, &body, timeout, true).await;
+        let duration = started_at.elapsed();
+        let result = |outcome: UsageReportOutcome, answer: Result<StatusCode, String>| {
+            (
+                decide(outcome),
+                AttemptLog {
+                    answer,
+                    outcome,
+                    duration,
+                },
+            )
+        };
+        // The call failed as a whole: each report has what a single send
+        // would have got.
+        if called.outcome != UsageReportOutcome::Accepted {
+            return messages
+                .iter()
+                .map(|_| result(called.outcome, called.answer.clone()))
+                .collect();
+        }
+        let status = called.answer.clone().unwrap_or(StatusCode::OK);
+        let Some(answered) = called
+            .body
+            .as_deref()
+            .and_then(|body| serde_json::from_slice::<BatchAnswer>(body).ok())
+        else {
+            // Accepted, but which messages were taken is not known. They are
+            // sent again; the billing side deduplicates.
+            return messages
+                .iter()
+                .map(|_| {
+                    result(
+                        UsageReportOutcome::SqsUnknown,
+                        Err("the batch answer could not be read".to_string()),
+                    )
+                })
+                .collect();
+        };
+        // A message the answer does not name is sent again too.
+        let mut results: Vec<_> = messages
+            .iter()
+            .map(|_| {
+                result(
+                    UsageReportOutcome::SqsUnknown,
+                    Err("the batch answer does not name the message".to_string()),
+                )
+            })
+            .collect();
+        for entry in answered.successful {
+            if let Some(slot) = entry_slot(&entry.id, &mut results) {
+                *slot = result(UsageReportOutcome::Accepted, Ok(status));
+            }
+        }
+        for entry in answered.failed {
+            let Some(slot) = entry_slot(&entry.id, &mut results) else {
+                continue;
+            };
+            let code = entry.code.as_deref();
+            // The status a single send of this entry would have been answered
+            // with: 400 for the sender's fault, else 500.
+            let mut outcome = classify_sqs_answer(
+                if entry.sender_fault {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                },
+                code,
+            );
+            // Not the sender's fault: another attempt may pass, whatever the
+            // code says.
+            if !entry.sender_fault && !outcome.is_retryable() {
+                outcome = UsageReportOutcome::Sqs5xx;
+            }
+            let error = match code.map(sanitized_name) {
+                Some(name) if !name.is_empty() => format!("batch entry failed, {name}"),
+                _ => "batch entry failed".to_string(),
+            };
+            *slot = result(outcome, Err(error));
+        }
+        results
+    }
+}
+
+/// The answer of one `call`.
+struct Called {
+    outcome: UsageReportOutcome,
+    answer: Result<StatusCode, String>,
+    /// The error type the answer names, if it does.
+    error_type: Option<String>,
+    /// The body of a successful answer, when it was asked for and could be read.
+    body: Option<Vec<u8>>,
+}
+
+impl Called {
+    fn failed(outcome: UsageReportOutcome, error: String) -> Self {
+        Self {
+            outcome,
+            answer: Err(error),
+            error_type: None,
+            body: None,
+        }
+    }
+}
+
+/// What the delivery does with an attempt that ended in `outcome`.
+fn decide(outcome: UsageReportOutcome) -> SendOutcome {
+    match outcome {
+        UsageReportOutcome::Accepted => SendOutcome::Accepted,
+        _ if outcome.is_retryable() => SendOutcome::Retryable(outcome.as_label()),
+        _ => SendOutcome::Final(outcome.as_label()),
+    }
+}
+
+/// The result of the entry with this `Id` (its position in the call).
+fn entry_slot<'a>(
+    id: &str,
+    results: &'a mut [(SendOutcome, AttemptLog)],
+) -> Option<&'a mut (SendOutcome, AttemptLog)> {
+    results.get_mut(id.parse::<usize>().ok()?)
+}
+
+/// A `SendMessageBatch` answer: the entries taken and the entries refused.
+#[derive(serde::Deserialize)]
+struct BatchAnswer {
+    #[serde(default, rename = "Successful")]
+    successful: Vec<BatchEntryAnswer>,
+    #[serde(default, rename = "Failed")]
+    failed: Vec<BatchEntryAnswer>,
+}
+
+#[derive(serde::Deserialize)]
+struct BatchEntryAnswer {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(default, rename = "SenderFault")]
+    sender_fault: bool,
+    #[serde(default, rename = "Code")]
+    code: Option<String>,
+}
+
+/// The `MessageBody` of a prepared report: the `SendMessage` request it carries.
+fn message_of(job: &Job) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Prepared {
+        #[serde(rename = "MessageBody")]
+        message: String,
+    }
+    serde_json::from_slice::<Prepared>(&job.body)
+        .ok()
+        .map(|prepared| prepared.message)
+}
+
+/// Splits `messages` (with their positions) into calls of at most 10 messages
+/// and `MAX_BATCH_BYTES` of message text, in order.
+fn chunks(messages: &[(usize, String)]) -> Vec<&[(usize, String)]> {
+    let mut chunks = Vec::new();
+    let (mut start, mut bytes) = (0, 0);
+    for (index, (_, message)) in messages.iter().enumerate() {
+        if index > start
+            && (index - start == MAX_BATCH_ENTRIES || bytes + message.len() > MAX_BATCH_BYTES)
+        {
+            chunks.push(&messages[start..index]);
+            (start, bytes) = (index, 0);
+        }
+        bytes += message.len();
+    }
+    if start < messages.len() {
+        chunks.push(&messages[start..]);
+    }
+    chunks
 }
 
 impl UsageSender for SqsSender {
@@ -226,7 +436,8 @@ impl UsageSender for SqsSender {
                 serde_json::json!({"QueueUrl": self.queue_url, "AttributeNames": ["QueueArn"]})
                     .to_string(),
             );
-            match self.call(CHECK_TARGET, &body, timeout).await {
+            let called = self.call(CHECK_TARGET, &body, timeout, false).await;
+            match (called.outcome, called.answer, called.error_type) {
                 (UsageReportOutcome::Accepted, ..) => Ok(()),
                 (outcome, Ok(status), error_type) => Err((
                     outcome,
@@ -234,20 +445,57 @@ impl UsageSender for SqsSender {
                     // queue or the permission: no secret, but not trusted
                     // text, so it is cut to a name's characters.
                     match error_type.as_deref().map(short_error_name) {
-                        Some(name) => format!(
-                            "status {status}, {}",
-                            name.chars()
-                                .filter(
-                                    |c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
-                                )
-                                .take(64)
-                                .collect::<String>()
-                        ),
+                        Some(name) => format!("status {status}, {}", sanitized(name)),
                         None => format!("status {status}"),
                     },
                 )),
                 (outcome, Err(error), _) => Err((outcome, error)),
             }
+        })
+    }
+
+    fn max_batch(&self) -> usize {
+        MAX_BATCH_ENTRIES
+    }
+
+    /// `SendMessageBatch` of the reports, split into several calls (sent
+    /// together) only when they are more than a call may carry in bytes.
+    fn send_batch<'a>(
+        &'a self,
+        jobs: &'a [&'a Job],
+        timeout: Duration,
+    ) -> BoxFuture<'a, Vec<(SendOutcome, AttemptLog)>> {
+        Box::pin(async move {
+            let mut results: Vec<Option<(SendOutcome, AttemptLog)>> =
+                jobs.iter().map(|_| None).collect();
+            let mut messages = Vec::with_capacity(jobs.len());
+            for (index, job) in jobs.iter().enumerate() {
+                match message_of(job) {
+                    Some(message) => messages.push((index, message)),
+                    // Prepared at submit, so not reached in practice. Final,
+                    // as a report that cannot be built.
+                    None => {
+                        results[index] = Some((
+                            SendOutcome::Final("sqs_invalid"),
+                            AttemptLog {
+                                answer: Err("prepared report has no message".to_string()),
+                                outcome: UsageReportOutcome::SqsInvalid,
+                                duration: Duration::ZERO,
+                            },
+                        ))
+                    }
+                }
+            }
+            let calls = chunks(&messages).into_iter().map(|chunk| async move {
+                let texts: Vec<&str> = chunk.iter().map(|(_, text)| text.as_str()).collect();
+                (chunk, self.send_chunk(&texts, timeout).await)
+            });
+            for (chunk, answers) in futures_util::future::join_all(calls).await {
+                for ((index, _), answer) in chunk.iter().zip(answers) {
+                    results[*index] = Some(answer);
+                }
+            }
+            results.into_iter().flatten().collect()
         })
     }
 
@@ -259,13 +507,8 @@ impl UsageSender for SqsSender {
         Box::pin(async move {
             let started_at = Instant::now();
             let (outcome, answer) = self.attempt(job, timeout).await;
-            let decision = match outcome {
-                UsageReportOutcome::Accepted => SendOutcome::Accepted,
-                _ if outcome.is_retryable() => SendOutcome::Retryable(outcome.as_label()),
-                _ => SendOutcome::Final(outcome.as_label()),
-            };
             (
-                decision,
+                decide(outcome),
                 AttemptLog {
                     answer,
                     outcome,
@@ -359,6 +602,18 @@ fn error_type_in_body(body: &str) -> Option<String> {
     value.get("__type")?.as_str().map(str::to_owned)
 }
 
+/// An error name cut to a name's characters: AWS's text, not trusted.
+fn sanitized_name(name: &str) -> String {
+    sanitized(short_error_name(name))
+}
+
+fn sanitized(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        .take(64)
+        .collect()
+}
+
 /// The short name of an error type: the part after the namespace (`#`), and
 /// before any `:` a header value appends.
 fn short_error_name(error_type: &str) -> &str {
@@ -430,6 +685,10 @@ pub(crate) fn classify_sqs_answer(
 #[cfg(test)]
 #[path = "sqs_sender_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "sqs_sender_batch_tests.rs"]
+mod batch_tests;
 
 #[cfg(test)]
 #[path = "sqs_sender_redirect_tests.rs"]

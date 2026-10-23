@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 pub mod admission;
 pub mod agent_loop;
+pub mod api_key_cache;
 pub mod attestation;
 pub mod attestation_sdk;
 pub mod auth;
@@ -86,4 +87,7 @@ pub struct AppState {
     /// (`usage_report.rs`, `VLLM_PROXY_USAGE_REPORT_*`). One per process,
     /// shared by every model of a list.
     pub usage_report_delivery: Arc<usage_report::UsageReportDelivery>,
+    /// `sk-` keys cloud-api accepted, for 10 minutes (`api_key_cache.rs`).
+    /// One per process, shared by every model of a list.
+    pub api_key_cache: Arc<api_key_cache::ApiKeyCache>,
 }

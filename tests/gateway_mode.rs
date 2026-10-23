@@ -287,6 +287,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
     ));
     let state = AppState {
         models: None,
+        api_key_cache: Default::default(),
         usage_report_delivery: usage_report::UsageReportDelivery::new(config.usage_report.clone()),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),

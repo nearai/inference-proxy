@@ -360,6 +360,7 @@ fn build_test_app_inner_with_pool(
 
     let state = AppState {
         models: None,
+        api_key_cache: Default::default(),
         usage_report_delivery: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
@@ -1044,6 +1045,136 @@ async fn test_completions_replica_hint_routes_to_hinted_backend() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(requests_seen(&backend_b).await, 1);
     assert_eq!(requests_seen(&backend_a).await, 0);
+}
+
+/// cloud-api's 200 for an `sk-` key is reused for 10 minutes: a second request
+/// with the same key does not check it again.
+#[tokio::test]
+async fn test_cloud_api_key_check_is_reused_across_requests() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    mount_completions_ok(&backend, 2).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})))
+        .expect(1)
+        .mount(&cloud_api)
+        .await;
+    let (app, _pool) =
+        build_test_app_with_backends_and_cloud_api(vec![backend.uri()], &cloud_api.uri());
+
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                    .body(Body::from(r#"{"prompt":"hello ","stream":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    cloud_api.verify().await;
+}
+
+/// A key cloud-api did not accept is checked on every request until a 200;
+/// only then is it reused.
+#[tokio::test]
+async fn test_cloud_api_key_is_checked_on_every_request_until_accepted() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    mount_completions_ok(&backend, 2).await;
+    // wiremock matches in priority order: lower number wins.
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(402))
+        .up_to_n_times(2)
+        .with_priority(1)
+        .expect(2)
+        .mount(&cloud_api)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})))
+        .with_priority(2)
+        .expect(1)
+        .mount(&cloud_api)
+        .await;
+    let (app, _pool) =
+        build_test_app_with_backends_and_cloud_api(vec![backend.uri()], &cloud_api.uri());
+
+    let expected = [
+        StatusCode::PAYMENT_REQUIRED,
+        StatusCode::PAYMENT_REQUIRED,
+        StatusCode::OK,
+        StatusCode::OK,
+    ];
+    for status in expected {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                    .body(Body::from(r#"{"prompt":"hello ","stream":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+    }
+    cloud_api.verify().await;
+}
+
+/// A cloud-api 5xx (this app makes one attempt) is not kept either: the next
+/// request is checked again and gets in on cloud-api's 200.
+#[tokio::test]
+async fn test_cloud_api_key_5xx_is_not_kept() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    mount_completions_ok(&backend, 2).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .expect(1)
+        .mount(&cloud_api)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})))
+        .with_priority(2)
+        .expect(1)
+        .mount(&cloud_api)
+        .await;
+    let (app, _pool) =
+        build_test_app_with_backends_and_cloud_api(vec![backend.uri()], &cloud_api.uri());
+
+    for status in [StatusCode::UNAUTHORIZED, StatusCode::OK, StatusCode::OK] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                    .body(Body::from(r#"{"prompt":"hello ","stream":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+    }
+    cloud_api.verify().await;
 }
 
 #[tokio::test]
@@ -6333,6 +6464,7 @@ fn build_test_app_with_cloud_api_retries(
 
     let state = AppState {
         models: None,
+        api_key_cache: Default::default(),
         usage_report_delivery: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
@@ -8974,6 +9106,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
 
     let state = AppState {
         models: None,
+        api_key_cache: Default::default(),
         usage_report_delivery: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
@@ -9435,6 +9568,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
 
     let state = AppState {
         models: None,
+        api_key_cache: Default::default(),
         usage_report_delivery: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),

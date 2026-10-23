@@ -172,6 +172,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
 
     let state = AppState {
         models: None,
+        api_key_cache: Default::default(),
         usage_report_delivery: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),

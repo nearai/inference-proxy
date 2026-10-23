@@ -187,6 +187,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
 
     let state = AppState {
         models: None,
+        api_key_cache: Default::default(),
         usage_report_delivery: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),

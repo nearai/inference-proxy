@@ -211,6 +211,7 @@ fn single_model_state(process: model_list::Process<'_>) -> AppState {
         fusion_caches: Arc::new(fusion::FusionCaches::default()),
         vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(None, 1_200)),
         models: None,
+        api_key_cache: Default::default(),
         usage_report_delivery: usage_report::UsageReportDelivery::new(config.usage_report.clone()),
         config,
     }
@@ -977,7 +978,13 @@ async fn a_models_backend_token_and_priority_reach_only_its_own_backends() {
     // cloud-api sees the customer key on the key check and the usage token on
     // the reports; no backend token on anything.
     let to_cloud = cloud.received_requests().await.unwrap();
-    assert!(to_cloud.len() >= 13, "{}", to_cloud.len());
+    // One key check: cloud-api's 200 is reused for the key's other requests.
+    let key_checks = to_cloud
+        .iter()
+        .filter(|request| request.url.path() == "/v1/check_api_key")
+        .count();
+    assert_eq!(key_checks, 1);
+    assert!(to_cloud.len() >= 6, "{}", to_cloud.len());
     for request in &to_cloud {
         let expected = match request.url.path() {
             "/v1/check_api_key" => Some("Bearer sk-live-customer"),

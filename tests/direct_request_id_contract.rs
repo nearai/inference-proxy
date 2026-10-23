@@ -75,7 +75,7 @@ async fn direct_privacy_classify_observable_request_id_contract() {
             Request::builder()
                 .method("POST")
                 .uri("/v1/privacy/classify?case=invalid")
-                .header("authorization", "Bearer sk-test-public-key-1234567890123")
+                .header("authorization", "Bearer sk-test-public-key-2234567890123")
                 .header("content-type", "application/json")
                 .header("x-request-id", "not-a-uuid")
                 .header("x-org-id", "org-spoofed")
@@ -139,7 +139,8 @@ async fn direct_privacy_classify_observable_request_id_contract() {
         .into_iter()
         .filter(|request| request.url.path() == "/v1/check_api_key")
         .collect();
-    assert_eq!(auth_checks.len(), 2, "expected one auth check per request");
+    // Two keys, because an accepted key is not checked again for 5 minutes.
+    assert_eq!(auth_checks.len(), 2, "expected one auth check per key");
     assert_eq!(
         auth_checks[0]
             .headers

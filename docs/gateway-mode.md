@@ -41,7 +41,13 @@ merged into that before dispatch (`merge_system_messages`,
 It runs after the two repairs above. A process without a list never does it.
 
 1. `Authorization: Bearer sk-…` → `POST {CLOUD_API_URL}/v1/check_api_key`
-   (retries on transport/5xx; 401/402/429 pass through). With
+   (retries on transport/5xx; 401/402/429 pass through). A 200 carrying the
+   key's full identity (organization, workspace, key id) is reused for 5
+   minutes per key, so a key revoked or out of credits keeps working here for
+   up to that long. Anything else is never kept: every request for the key is
+   checked until one gets such a 200 (the newest check decides). Concurrent
+   requests for a key wait for the check in flight; once a check is not a 200,
+   nobody waits and each request makes its own. With
    `VLLM_PROXY_ALLOWED_ORG_IDS` set, a valid key from any other organization
    gets a 403 here.
 2. Policy: any content part whose `type` is in

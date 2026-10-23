@@ -24,13 +24,47 @@ pub struct EncryptionContext {
     pub algo: EncryptionAlgo,
     /// Raw client public key bytes.
     pub client_pub_key: Vec<u8>,
-    /// Encryption protocol version (1 = legacy NaCl box, 2 = HKDF + XChaCha20-Poly1305).
+    /// 1 = legacy NaCl box, 2 = HKDF AEAD, 3 = reply-key-bound requests.
     pub version: u8,
     /// When true, encrypt/decrypt all sensitive fields (tool_calls, refusal, logprobs,
     /// function_call, tools definitions). When false, only the legacy set (content,
     /// reasoning_content, reasoning, audio.data) is covered.
-    /// Controlled by the `X-Encrypt-All-Fields: true` request header.
+    /// Mandatory in v3; controlled by `X-Encrypt-All-Fields` in v1/v2.
     pub encrypt_all_fields: bool,
+}
+
+impl EncryptionContext {
+    fn all_fields(&self) -> bool {
+        self.version == 3 || self.encrypt_all_fields
+    }
+
+    /// Request-only AAD. The suite byte also fixes the key's encoding/length.
+    fn request_aad(&self) -> Result<Vec<u8>, AppError> {
+        if self.version != 3 {
+            return Ok(Vec::new());
+        }
+        let mut aad = b"nearai-e2ee-request-v3".to_vec();
+        match self.algo {
+            EncryptionAlgo::Ecdsa => {
+                use k256::elliptic_curve::sec1::ToEncodedPoint;
+                let key = ecies::parse_client_pubkey(&self.client_pub_key)
+                    .map_err(AppError::BadRequest)?;
+                aad.push(1);
+                aad.extend_from_slice(key.to_encoded_point(false).as_bytes());
+            }
+            EncryptionAlgo::Ed25519 => {
+                let key: [u8; 32] = self
+                    .client_pub_key
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| AppError::BadRequest("Invalid Ed25519 reply key".into()))?;
+                nacl::ed25519_public_to_x25519(&key).map_err(AppError::BadRequest)?;
+                aad.push(2);
+                aad.extend_from_slice(&key);
+            }
+        }
+        Ok(aad)
+    }
 }
 
 /// Extract encryption context from request headers.
@@ -88,29 +122,39 @@ pub fn extract_encryption_context(
                 }
             }
 
-            let version = headers
-                .get("x-encryption-version")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u8>().ok())
-                .unwrap_or(1);
+            let version = match headers.get("x-encryption-version") {
+                None => 1,
+                Some(value) => value
+                    .to_str()
+                    .ok()
+                    .and_then(|s| s.parse::<u8>().ok())
+                    .ok_or_else(|| AppError::BadRequest("Invalid X-Encryption-Version".into()))?,
+            };
 
-            if version != 1 && version != 2 {
+            if !matches!(version, 1..=3) {
                 return Err(AppError::BadRequest(format!(
-                    "Invalid X-Encryption-Version: {version}. Must be 1 or 2"
+                    "Invalid X-Encryption-Version: {version}. Must be 1, 2 or 3"
                 )));
             }
 
-            let encrypt_all_fields = headers
-                .get("x-encrypt-all-fields")
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|s| s.eq_ignore_ascii_case("true"));
+            let encrypt_all_fields = version == 3
+                || headers
+                    .get("x-encrypt-all-fields")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|s| s.eq_ignore_ascii_case("true"));
 
-            Ok(Some(EncryptionContext {
+            let mut context = EncryptionContext {
                 algo,
                 client_pub_key: key_bytes,
                 version,
                 encrypt_all_fields,
-            }))
+            };
+            if version == 3 {
+                // Validate/canonicalize before inference, including empty requests.
+                let aad = context.request_aad()?;
+                context.client_pub_key = aad[b"nearai-e2ee-request-v3".len() + 1..].to_vec();
+            }
+            Ok(Some(context))
         }
     }
 }
@@ -202,7 +246,7 @@ mod nacl {
 
 mod nacl_v2 {
     use chacha20poly1305::{
-        aead::{Aead, AeadCore, KeyInit, OsRng},
+        aead::{Aead, AeadCore, KeyInit, OsRng, Payload},
         XChaCha20Poly1305,
     };
     use hkdf::Hkdf;
@@ -212,6 +256,14 @@ mod nacl_v2 {
     /// Encrypt bytes using X25519 ECDH + HKDF-SHA256 + XChaCha20-Poly1305.
     /// Wire format: [ephemeral_pubkey(32)][nonce(24)][ciphertext+tag]
     pub fn encrypt(plaintext: &[u8], recipient_pub: &[u8; 32]) -> Result<Vec<u8>, String> {
+        encrypt_with_aad(plaintext, recipient_pub, &[])
+    }
+
+    pub fn encrypt_with_aad(
+        plaintext: &[u8],
+        recipient_pub: &[u8; 32],
+        aad: &[u8],
+    ) -> Result<Vec<u8>, String> {
         let recipient = PublicKey::from(*recipient_pub);
         let ephemeral_secret = EphemeralSecret::random_from_rng(OsRng);
         let ephemeral_public = PublicKey::from(&ephemeral_secret);
@@ -227,7 +279,13 @@ mod nacl_v2 {
             .map_err(|e| format!("XChaCha20Poly1305 key init failed: {e}"))?;
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
         let ciphertext = cipher
-            .encrypt(&nonce, plaintext)
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
             .map_err(|e| format!("XChaCha20Poly1305 encrypt failed: {e}"))?;
 
         let mut out = Vec::with_capacity(32 + 24 + ciphertext.len());
@@ -239,7 +297,16 @@ mod nacl_v2 {
 
     /// Decrypt bytes using X25519 ECDH + HKDF-SHA256 + XChaCha20-Poly1305.
     /// Expects wire format: [ephemeral_pubkey(32)][nonce(24)][ciphertext+tag]
+    #[cfg(test)]
     pub fn decrypt(data: &[u8], secret_key_bytes: &[u8; 32]) -> Result<Vec<u8>, String> {
+        decrypt_with_aad(data, secret_key_bytes, &[])
+    }
+
+    pub fn decrypt_with_aad(
+        data: &[u8],
+        secret_key_bytes: &[u8; 32],
+        aad: &[u8],
+    ) -> Result<Vec<u8>, String> {
         if data.len() < 32 + 24 + 16 {
             return Err("Ciphertext too short".to_string());
         }
@@ -260,7 +327,13 @@ mod nacl_v2 {
         let cipher = XChaCha20Poly1305::new_from_slice(&symmetric_key)
             .map_err(|e| format!("XChaCha20Poly1305 key init failed: {e}"))?;
         cipher
-            .decrypt(nonce, ciphertext)
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad,
+                },
+            )
             .map_err(|e| format!("Decrypt failed: {e}"))
     }
 }
@@ -269,7 +342,7 @@ mod nacl_v2 {
 
 mod ecies {
     use aes_gcm::{
-        aead::{Aead, AeadCore, KeyInit, OsRng},
+        aead::{Aead, AeadCore, KeyInit, OsRng, Payload},
         Aes256Gcm,
     };
     use hkdf::Hkdf;
@@ -279,6 +352,14 @@ mod ecies {
     /// Encrypt bytes using ECIES (secp256k1 ECDH + HKDF-SHA256 + AES-256-GCM).
     /// Wire format: [ephemeral_pubkey_uncompressed(65)][nonce(12)][ciphertext+tag]
     pub fn encrypt(plaintext: &[u8], recipient_pub: &PublicKey) -> Result<Vec<u8>, String> {
+        encrypt_with_aad(plaintext, recipient_pub, &[])
+    }
+
+    pub fn encrypt_with_aad(
+        plaintext: &[u8],
+        recipient_pub: &PublicKey,
+        aad: &[u8],
+    ) -> Result<Vec<u8>, String> {
         let ephemeral_secret = EphemeralSecret::random(&mut OsRng);
         let ephemeral_public = ephemeral_secret.public_key().to_encoded_point(false);
 
@@ -293,7 +374,13 @@ mod ecies {
             Aes256Gcm::new_from_slice(&aes_key).map_err(|e| format!("AES key init failed: {e}"))?;
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
         let ciphertext = cipher
-            .encrypt(&nonce, plaintext)
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
             .map_err(|e| format!("AES-GCM encrypt failed: {e}"))?;
 
         let pub_bytes = ephemeral_public.as_bytes();
@@ -306,7 +393,16 @@ mod ecies {
 
     /// Decrypt bytes using ECIES.
     /// Expects wire format: [ephemeral_pubkey_uncompressed(65)][nonce(12)][ciphertext+tag]
+    #[cfg(test)]
     pub fn decrypt(data: &[u8], secret_key: &k256::ecdsa::SigningKey) -> Result<Vec<u8>, String> {
+        decrypt_with_aad(data, secret_key, &[])
+    }
+
+    pub fn decrypt_with_aad(
+        data: &[u8],
+        secret_key: &k256::ecdsa::SigningKey,
+        aad: &[u8],
+    ) -> Result<Vec<u8>, String> {
         if data.len() < 65 + 12 + 16 {
             return Err("ECIES ciphertext too short".to_string());
         }
@@ -329,7 +425,13 @@ mod ecies {
         let cipher =
             Aes256Gcm::new_from_slice(&aes_key).map_err(|e| format!("AES key init failed: {e}"))?;
         cipher
-            .decrypt(nonce, ciphertext)
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad,
+                },
+            )
             .map_err(|e| format!("AES-GCM decrypt failed: {e}"))
     }
 
@@ -409,19 +511,21 @@ pub fn decrypt_string(
     // Use a generic error message for all decryption failures to avoid
     // leaking oracle information (e.g. distinguishing "too short" from
     // "authentication tag mismatch").
+    let aad = ctx.request_aad()?;
     let plaintext_bytes = match ctx.algo {
         EncryptionAlgo::Ed25519 => {
             let x25519_secret = nacl::ed25519_secret_to_x25519(signing.ed25519.secret_bytes());
-            let decrypt_fn = if ctx.version >= 2 {
-                nacl_v2::decrypt
+            let result = if ctx.version >= 2 {
+                nacl_v2::decrypt_with_aad(&data, &x25519_secret, &aad)
             } else {
-                nacl::decrypt
+                nacl::decrypt(&data, &x25519_secret)
             };
-            decrypt_fn(&data, &x25519_secret)
+            result.map_err(|_| AppError::BadRequest("Decryption failed".to_string()))?
+        }
+        EncryptionAlgo::Ecdsa => {
+            ecies::decrypt_with_aad(&data, signing.ecdsa.secret_key(), &aad)
                 .map_err(|_| AppError::BadRequest("Decryption failed".to_string()))?
         }
-        EncryptionAlgo::Ecdsa => ecies::decrypt(&data, signing.ecdsa.secret_key())
-            .map_err(|_| AppError::BadRequest("Decryption failed".to_string()))?,
     };
 
     String::from_utf8(plaintext_bytes)
@@ -457,22 +561,22 @@ pub fn decrypt_request_fields(
                     decrypt_chat_message_fields(msg, ctx, signing)?;
                 }
             }
-            if ctx.encrypt_all_fields {
+            if ctx.all_fields() {
                 // tools[].function.name, .description, .parameters (JSON schema)
-                decrypt_tools_definitions(value, ctx, signing);
+                decrypt_tools_definitions(value, ctx, signing)?;
                 // tool_choice can be a string ("auto"/"none"/"required") or
                 // {"type":"function","function":{"name":"..."}}.
                 // Only the object form contains a sensitive function name.
                 if let Some(tc) = value.get_mut("tool_choice") {
                     if let Some(func) = tc.get_mut("function") {
-                        try_decrypt_field(func, "name", ctx, signing);
+                        try_decrypt_field(func, "name", ctx, signing)?;
                     }
                 }
                 // Deprecated function_call request param: string ("auto"/"none")
                 // or {"name":"..."}.
                 if let Some(fc) = value.get_mut("function_call") {
                     if fc.is_object() {
-                        try_decrypt_field(fc, "name", ctx, signing);
+                        try_decrypt_field(fc, "name", ctx, signing)?;
                     }
                 }
             }
@@ -519,6 +623,16 @@ pub fn encrypt_response_fields(
             if let Some(choices) = value.get_mut("choices").and_then(|c| c.as_array_mut()) {
                 for choice in choices.iter_mut() {
                     encrypt_field(choice, "text", ctx, signing)?;
+                    if ctx.version == 3 {
+                        if let Some(logprobs) = choice.get_mut("logprobs").filter(|v| !v.is_null())
+                        {
+                            *logprobs = serde_json::Value::String(encrypt_string(
+                                &logprobs.to_string(),
+                                ctx,
+                                signing,
+                            )?);
+                        }
+                    }
                 }
             }
         }
@@ -584,6 +698,16 @@ pub fn encrypt_streaming_chunk(
             if let Some(choices) = value.get_mut("choices").and_then(|c| c.as_array_mut()) {
                 for choice in choices.iter_mut() {
                     encrypt_field(choice, "text", ctx, signing)?;
+                    if ctx.version == 3 {
+                        if let Some(logprobs) = choice.get_mut("logprobs").filter(|v| !v.is_null())
+                        {
+                            *logprobs = serde_json::Value::String(encrypt_string(
+                                &logprobs.to_string(),
+                                ctx,
+                                signing,
+                            )?);
+                        }
+                    }
                 }
             }
             Ok(())
@@ -603,19 +727,35 @@ pub fn encrypt_streaming_chunk(
 /// Decrypt tool/function definitions in the request.
 /// `tools[].function.name`, `.description`, and `.parameters` (serialized JSON schema)
 /// are user-defined and reveal what capabilities are exposed to the model.
-/// Uses lenient decryption — plaintext values pass through for backward compatibility.
+/// v3 requires authentication; v1/v2 retain plaintext compatibility.
 fn decrypt_tools_definitions(
     value: &mut serde_json::Value,
     ctx: &EncryptionContext,
     signing: &SigningPair,
-) {
+) -> Result<(), AppError> {
     if let Some(tools) = value.get_mut("tools").and_then(|t| t.as_array_mut()) {
         for tool in tools.iter_mut() {
             if let Some(func) = tool.get_mut("function") {
-                try_decrypt_field(func, "name", ctx, signing);
-                try_decrypt_field(func, "description", ctx, signing);
+                try_decrypt_field(func, "name", ctx, signing)?;
+                try_decrypt_field(func, "description", ctx, signing)?;
                 // parameters is a JSON schema object — client encrypts as serialized JSON string
                 if let Some(params) = func.get_mut("parameters") {
+                    if ctx.version == 3 {
+                        if !params.is_null() {
+                            let ciphertext = params.as_str().ok_or_else(|| {
+                                AppError::BadRequest(
+                                    "Encrypted tool parameters must be a string".into(),
+                                )
+                            })?;
+                            let plaintext = decrypt_string(ciphertext, ctx, signing)?;
+                            *params = serde_json::from_str(&plaintext).map_err(|_| {
+                                AppError::BadRequest(
+                                    "Decrypted tool parameters must be valid JSON".into(),
+                                )
+                            })?;
+                        }
+                        continue;
+                    }
                     if let Some(s) = params.as_str() {
                         if !s.is_empty() {
                             if let Ok(decrypted) = decrypt_string(s, ctx, signing) {
@@ -636,6 +776,7 @@ fn decrypt_tools_definitions(
             }
         }
     }
+    Ok(())
 }
 
 fn decrypt_chat_message_fields(
@@ -647,6 +788,13 @@ fn decrypt_chat_message_fields(
     // When encrypted, the client sends a single encrypted string; after decryption
     // we try json.loads to restore multimodal content arrays (matching Python proxy).
     if let Some(content) = msg.get_mut("content") {
+        if ctx.version == 3 && !content.is_string() && !content.is_null() {
+            // The SDK serializes the entire parts array before encryption.
+            return Err(AppError::BadRequest(
+                "Encrypted content must be a string".into(),
+            ));
+        }
+
         if let Some(s) = content.as_str() {
             if !s.is_empty() {
                 let decrypted = decrypt_string(s, ctx, signing)?;
@@ -662,7 +810,6 @@ fn decrypt_chat_message_fields(
                 }
             }
         }
-        // If content is already an array, it was not encrypted — pass through
     }
 
     decrypt_field(msg, "reasoning_content", ctx, signing)?;
@@ -673,28 +820,27 @@ fn decrypt_chat_message_fields(
         decrypt_field(audio, "data", ctx, signing)?;
     }
 
-    // Extended fields — only when client opts in via X-Encrypt-All-Fields: true.
-    // Uses try_decrypt_field for additional safety: even with the flag, a client
-    // may not encrypt every field in the first deployment.
-    if ctx.encrypt_all_fields {
-        try_decrypt_field(msg, "refusal", ctx, signing);
+    // v3 authenticates every protected field; legacy clients retain opt-in,
+    // lenient handling of the extended fields.
+    if ctx.all_fields() {
+        try_decrypt_field(msg, "refusal", ctx, signing)?;
         // Top-level name field used in tool/function role messages
-        try_decrypt_field(msg, "name", ctx, signing);
+        try_decrypt_field(msg, "name", ctx, signing)?;
 
         // tool_calls[].function.arguments and .name
         if let Some(tool_calls) = msg.get_mut("tool_calls").and_then(|tc| tc.as_array_mut()) {
             for tc in tool_calls.iter_mut() {
                 if let Some(func) = tc.get_mut("function") {
-                    try_decrypt_field(func, "arguments", ctx, signing);
-                    try_decrypt_field(func, "name", ctx, signing);
+                    try_decrypt_field(func, "arguments", ctx, signing)?;
+                    try_decrypt_field(func, "name", ctx, signing)?;
                 }
             }
         }
 
         // deprecated function_call.arguments and .name
         if let Some(fc) = msg.get_mut("function_call") {
-            try_decrypt_field(fc, "arguments", ctx, signing);
-            try_decrypt_field(fc, "name", ctx, signing);
+            try_decrypt_field(fc, "arguments", ctx, signing)?;
+            try_decrypt_field(fc, "name", ctx, signing)?;
         }
     }
 
@@ -732,7 +878,7 @@ fn encrypt_chat_response_choices(
                 }
 
                 // Extended fields — only when client opts in
-                if ctx.encrypt_all_fields {
+                if ctx.all_fields() {
                     encrypt_field(msg, "refusal", ctx, signing)?;
 
                     // tool_calls[].function.arguments and .name
@@ -752,11 +898,11 @@ fn encrypt_chat_response_choices(
                         encrypt_field(fc, "arguments", ctx, signing)?;
                         encrypt_field(fc, "name", ctx, signing)?;
                     }
-
-                    // logprobs — encrypt each token string and bytes array
-                    if let Some(logprobs) = choice.get_mut("logprobs") {
-                        encrypt_logprobs_tokens(logprobs, ctx, signing)?;
-                    }
+                }
+            }
+            if ctx.all_fields() {
+                if let Some(logprobs) = choice.get_mut("logprobs") {
+                    encrypt_logprobs_tokens(logprobs, ctx, signing)?;
                 }
             }
         }
@@ -836,6 +982,11 @@ fn decrypt_field(
     signing: &SigningPair,
 ) -> Result<(), AppError> {
     if let Some(val) = obj.get_mut(field) {
+        if ctx.version == 3 && !val.is_string() && !val.is_null() {
+            return Err(AppError::BadRequest(format!(
+                "Encrypted {field} must be a string"
+            )));
+        }
         if let Some(s) = val.as_str() {
             if !s.is_empty() {
                 let s_owned = s.to_string();
@@ -856,7 +1007,10 @@ fn try_decrypt_field(
     field: &str,
     ctx: &EncryptionContext,
     signing: &SigningPair,
-) {
+) -> Result<(), AppError> {
+    if ctx.version == 3 {
+        return decrypt_field(obj, field, ctx, signing);
+    }
     if let Some(val) = obj.get_mut(field) {
         if let Some(s) = val.as_str() {
             if !s.is_empty() {
@@ -867,6 +1021,7 @@ fn try_decrypt_field(
             }
         }
     }
+    Ok(())
 }
 
 /// Decrypt a field that may be a string or an array of encrypted strings.
@@ -891,7 +1046,12 @@ fn decrypt_field_or_array(
                         *item = serde_json::Value::String(decrypted);
                     }
                 }
-                // Non-string array elements (e.g. token ID arrays) are not encrypted
+                if ctx.version == 3 && !item.is_string() {
+                    return Err(AppError::BadRequest(format!(
+                        "Encrypted {field} entries must be strings"
+                    )));
+                }
+                // Legacy token ID arrays pass through.
             }
         }
         _ => {}
@@ -2457,3 +2617,7 @@ mod tests {
         assert_eq!(request["function_call"].as_str().unwrap(), "auto");
     }
 }
+
+#[cfg(test)]
+#[path = "encryption_v3_tests.rs"]
+mod v3_tests;

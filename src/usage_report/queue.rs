@@ -76,6 +76,10 @@ impl Place {
         };
         self.delivery.in_flight_gauge(self.model, Step::Down);
         if let Some(first) = next.first() {
+            // The in-flight gauge counts places, not reports (it is stepped
+            // down above for the place's old model): one step up for the
+            // batch, under the model of its first report. The queue depth
+            // counts reports, so it steps down for each one claimed.
             self.model = first.reporter.model_label;
             for job in &next {
                 self.delivery

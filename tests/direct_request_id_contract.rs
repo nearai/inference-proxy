@@ -139,7 +139,7 @@ async fn direct_privacy_classify_observable_request_id_contract() {
         .into_iter()
         .filter(|request| request.url.path() == "/v1/check_api_key")
         .collect();
-    // Two keys, because an accepted key is not checked again for 10 minutes.
+    // Two keys, because an accepted key is not checked again for 5 minutes.
     assert_eq!(auth_checks.len(), 2, "expected one auth check per key");
     assert_eq!(
         auth_checks[0]

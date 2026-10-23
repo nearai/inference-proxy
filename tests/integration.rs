@@ -1047,8 +1047,9 @@ async fn test_completions_replica_hint_routes_to_hinted_backend() {
     assert_eq!(requests_seen(&backend_a).await, 0);
 }
 
-/// cloud-api's 200 for an `sk-` key is reused for 10 minutes: a second request
-/// with the same key does not check it again.
+/// cloud-api's 200 for an `sk-` key (with the identity usage reports need) is
+/// reused for 5 minutes: a second request with the same key does not check it
+/// again.
 #[tokio::test]
 async fn test_cloud_api_key_check_is_reused_across_requests() {
     let backend = MockServer::start().await;
@@ -1056,7 +1057,7 @@ async fn test_cloud_api_key_check_is_reused_across_requests() {
     mount_completions_ok(&backend, 2).await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true, "organization_id": "org-1", "workspace_id": "ws-1", "api_key_id": "key-1"})))
         .expect(1)
         .mount(&cloud_api)
         .await;
@@ -1100,7 +1101,7 @@ async fn test_cloud_api_key_is_checked_on_every_request_until_accepted() {
         .await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true, "organization_id": "org-1", "workspace_id": "ws-1", "api_key_id": "key-1"})))
         .with_priority(2)
         .expect(1)
         .mount(&cloud_api)
@@ -1150,7 +1151,7 @@ async fn test_cloud_api_key_5xx_is_not_kept() {
         .await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true, "organization_id": "org-1", "workspace_id": "ws-1", "api_key_id": "key-1"})))
         .with_priority(2)
         .expect(1)
         .mount(&cloud_api)

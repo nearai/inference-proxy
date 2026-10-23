@@ -1,4 +1,4 @@
-//! The `sk-` keys cloud-api accepted, kept for 10 minutes so `RequireAuth`
+//! The `sk-` keys cloud-api accepted, kept for 5 minutes so `RequireAuth`
 //! (`auth.rs`) does not ask `/v1/check_api_key` about the same key on every
 //! request. A gateway sees one or two keys for all of its traffic.
 
@@ -15,8 +15,9 @@ use crate::error::AppError;
 
 /// How long a key cloud-api accepted stays accepted without asking again.
 /// The cost: a key revoked or out of credits keeps working here for up to
-/// this long (usage is still reported per request).
-const ACCEPTED_FOR: Duration = Duration::from_secs(600);
+/// this long (usage is still reported per request), so it is kept short; one
+/// check per key every 5 minutes is still nothing next to one per request.
+const ACCEPTED_FOR: Duration = Duration::from_secs(300);
 
 /// Keys tracked at once; a flood of random keys can only evict accepted
 /// ones, which then cost one more check.
@@ -25,7 +26,10 @@ const CAPACITY: u64 = 10_000;
 /// Remembers the keys cloud-api accepted (200), for [`ACCEPTED_FOR`]. Nothing
 /// else is kept: a refusal, a 402, a 429 or an unreachable cloud-api drops the
 /// key's entry, and every request for the key goes to cloud-api until one gets
-/// a 200. Keyed by the SHA-256 of the key, never the key itself.
+/// a 200. Nor is a 200 whose identity is incomplete (a body that could not be
+/// read or parsed, an older cloud-api): that request gets in, but its usage
+/// cannot be reported, so the next one asks again. Keyed by the SHA-256 of
+/// the key, never the key itself.
 ///
 /// Requests for a key that needs checking wait for the check in flight
 /// rather than each calling cloud-api: a 200 then serves them all. Once a
@@ -41,8 +45,8 @@ struct KeySlot {
     /// Numbers the checks in the order they start, so the outcome of the
     /// newest one is what counts, whichever finishes last.
     started: AtomicU64,
-    /// The newest check was not a 200, or one was dropped before it finished:
-    /// requests stop waiting for each other until a 200.
+    /// The newest check was not a 200 that could be kept, or one was dropped
+    /// before it finished: requests stop waiting for each other until it is.
     failing: AtomicBool,
     /// Held by the check the other requests wait for.
     in_flight: tokio::sync::Mutex<()>,
@@ -102,11 +106,19 @@ impl KeySlot {
             state.accepted = outcome
                 .as_ref()
                 .ok()
+                .filter(|subject| has_identity(subject))
                 .map(|subject| (subject.clone(), Instant::now()));
-            self.failing.store(outcome.is_err(), Ordering::Release);
+            self.failing
+                .store(state.accepted.is_none(), Ordering::Release);
         }
         outcome
     }
+}
+
+/// Whether a 200's subject carries everything a usage report needs
+/// (`proxy::spawn_usage_report` skips the report otherwise).
+fn has_identity(subject: &AuthSubject) -> bool {
+    subject.org_id.is_some() && subject.workspace_id.is_some() && subject.api_key_id.is_some()
 }
 
 impl Default for ApiKeyCache {
@@ -174,7 +186,8 @@ mod tests {
     fn subject(org: &str) -> AuthSubject {
         AuthSubject {
             org_id: Some(org.to_string()),
-            ..Default::default()
+            workspace_id: Some(format!("{org}-workspace")),
+            api_key_id: Some(format!("{org}-key")),
         }
     }
 
@@ -182,6 +195,8 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum Answer {
         Accepted(&'static str),
+        /// A 200 whose body could not be read: no identity.
+        AcceptedWithoutIdentity,
         Unauthorized,
         InsufficientCredits,
         RateLimited,
@@ -197,6 +212,7 @@ mod tests {
         tokio::time::sleep(delay).await;
         match answer {
             Answer::Accepted(org) => Ok(subject(org)),
+            Answer::AcceptedWithoutIdentity => Ok(AuthSubject::default()),
             Answer::Unauthorized => Err(AppError::Unauthorized),
             Answer::InsufficientCredits => Err(AppError::InsufficientCredits),
             Answer::RateLimited => Err(AppError::RateLimited),
@@ -204,7 +220,9 @@ mod tests {
     }
 
     fn org(outcome: Result<AuthSubject, AppError>) -> Option<String> {
-        outcome.expect("accepted").org_id
+        outcome
+            .unwrap_or_else(|error| panic!("expected an accepted key, got {error:?}"))
+            .org_id
     }
 
     async fn ask(
@@ -241,8 +259,9 @@ mod tests {
     }
 
     #[test]
-    fn accepts_for_ten_minutes() {
-        assert_eq!(ApiKeyCache::new().accepted_for, Duration::from_secs(600));
+    fn the_cache_accepts_for_five_minutes() {
+        assert_eq!(ACCEPTED_FOR, Duration::from_secs(300));
+        assert_eq!(ApiKeyCache::new().accepted_for, ACCEPTED_FOR);
     }
 
     #[tokio::test]
@@ -383,7 +402,9 @@ mod tests {
         );
     }
 
-    /// A 200 that one of those side-by-side calls gets is kept for everyone.
+    /// After a refusal the key is failing, so the next request does not wait
+    /// for anyone: it calls cloud-api directly. A 200 it gets that way is
+    /// kept for everyone, like one from a request that waited.
     #[tokio::test]
     async fn keeps_a_200_from_a_request_that_did_not_wait() {
         let cache = ApiKeyCache::new();
@@ -396,6 +417,85 @@ mod tests {
         let got = ask(&cache, &calls, Duration::ZERO, Answer::Unauthorized).await;
         assert_eq!(org(got).as_deref(), Some("org-a"));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A 200 without the identity a usage report needs (its body could not
+    /// be read) lets that request in but is not kept: the next request asks
+    /// again, and a complete 200 is then kept.
+    #[tokio::test]
+    async fn does_not_keep_a_200_without_identity() {
+        let cache = ApiKeyCache::new();
+        let calls = AtomicUsize::new(0);
+        for _ in 0..2 {
+            let got = ask(
+                &cache,
+                &calls,
+                Duration::ZERO,
+                Answer::AcceptedWithoutIdentity,
+            )
+            .await;
+            assert_eq!(org(got), None);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        ask(&cache, &calls, Duration::ZERO, Answer::Accepted("org-a"))
+            .await
+            .unwrap();
+        let got = ask(&cache, &calls, Duration::ZERO, Answer::Unauthorized).await;
+        assert_eq!(org(got).as_deref(), Some("org-a"));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// A key in constant use (the gateway's case) still expires on time: its
+    /// slot never goes idle, so this is the acceptance's own deadline.
+    #[tokio::test]
+    async fn an_active_key_is_rechecked_at_its_deadline() {
+        let cache = ApiKeyCache::accepting_for(Duration::from_millis(200));
+        let calls = AtomicUsize::new(0);
+        ask(&cache, &calls, Duration::ZERO, Answer::Accepted("org-a"))
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_millis(150) {
+            ask(&cache, &calls, Duration::ZERO, Answer::Unauthorized)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let got = ask(&cache, &calls, Duration::ZERO, Answer::InsufficientCredits).await;
+        assert!(matches!(got, Err(AppError::InsufficientCredits)));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A refusal from a newer check clears a 200 an older check stored a
+    /// moment earlier, while that 200 is still fresh.
+    #[tokio::test]
+    async fn a_newer_refusal_clears_a_fresh_200() {
+        let cache = Arc::new(ApiKeyCache::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert!(ask(&cache, &calls, Duration::ZERO, Answer::Unauthorized)
+            .await
+            .is_err());
+
+        let spawn = |delay, answer| {
+            let (cache, calls) = (cache.clone(), calls.clone());
+            tokio::spawn(async move { ask(&cache, &calls, delay, answer).await })
+        };
+        // The older check finishes first, with a 200; the newer one after it,
+        // with a 402.
+        let older = spawn(Duration::from_millis(50), Answer::Accepted("org-a"));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let newer = spawn(Duration::from_millis(100), Answer::InsufficientCredits);
+        assert!(older.await.unwrap().is_ok());
+        assert!(matches!(
+            newer.await.unwrap(),
+            Err(AppError::InsufficientCredits)
+        ));
+
+        let got = ask(&cache, &calls, Duration::ZERO, Answer::RateLimited).await;
+        assert!(matches!(got, Err(AppError::RateLimited)));
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
     }
 
     /// The newest check decides, whichever finishes last: a slow 200 that

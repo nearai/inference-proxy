@@ -394,7 +394,7 @@ impl FromRequestParts<AppState> for RequireAuth {
                 if token.starts_with("sk-") {
                     if let Some(cloud_api_url) = &state.config.cloud_api_url {
                         // A key cloud-api accepted is not checked again for
-                        // 10 minutes; any other answer is never kept.
+                        // 5 minutes; any other answer is never kept.
                         let subject = state
                             .api_key_cache
                             .subject(token, || {

@@ -47,6 +47,13 @@ V3 always enables the extended field policy, including when
   completions, v3 additionally encrypts the entire non-null `choices[].logprobs`
   object as a JSON string, in both ordinary and streaming responses.
 
+V3 chat and text completions reject enabled `return_token_ids` and
+`return_prompt_text` options and any non-null `prompt_logprobs` (including `0`).
+Their response metadata (`prompt_token_ids`, `token_ids`, `prompt_text`,
+`prompt_logprobs`) is removed from JSON and SSE responses, including metadata
+emitted by the backend without an explicit request. Standard output `logprobs`
+remain available in encrypted form.
+
 Responses use the validated reply key and existing encryption envelopes with
 empty AAD. Clients must reject failed decryption and plaintext protected fields.
 Protocol metadata and fields outside these transforms remain visible.

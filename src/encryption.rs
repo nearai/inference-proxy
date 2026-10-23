@@ -554,6 +554,9 @@ pub fn decrypt_request_fields(
     ctx: &EncryptionContext,
     signing: &SigningPair,
 ) -> Result<(), AppError> {
+    if ctx.version == 3 && matches!(endpoint, Endpoint::ChatCompletions | Endpoint::Completions) {
+        validate_completion_metadata_options(value)?;
+    }
     match endpoint {
         Endpoint::ChatCompletions => {
             if let Some(messages) = value.get_mut("messages").and_then(|m| m.as_array_mut()) {
@@ -615,6 +618,9 @@ pub fn encrypt_response_fields(
     ctx: &EncryptionContext,
     signing: &SigningPair,
 ) -> Result<(), AppError> {
+    if ctx.version == 3 && matches!(endpoint, Endpoint::ChatCompletions | Endpoint::Completions) {
+        strip_completion_metadata(value);
+    }
     match endpoint {
         Endpoint::ChatCompletions => {
             encrypt_chat_response_choices(value, ctx, signing, false)?;
@@ -691,6 +697,9 @@ pub fn encrypt_streaming_chunk(
     ctx: &EncryptionContext,
     signing: &SigningPair,
 ) -> Result<(), AppError> {
+    if ctx.version == 3 && matches!(endpoint, Endpoint::ChatCompletions | Endpoint::Completions) {
+        strip_completion_metadata(value);
+    }
     match endpoint {
         Endpoint::ChatCompletions => encrypt_chat_response_choices(value, ctx, signing, true),
         Endpoint::Completions => {
@@ -723,6 +732,49 @@ pub fn encrypt_streaming_chunk(
 }
 
 // ── Internal helpers ────────────────────────────────────────────────
+
+/// These engine options return text or token IDs outside the encrypted fields.
+fn validate_completion_metadata_options(value: &serde_json::Value) -> Result<(), AppError> {
+    for field in ["return_token_ids", "return_prompt_text", "prompt_logprobs"] {
+        if let Some(option) = value.get(field).filter(|v| !v.is_null()) {
+            // Zero prompt logprobs still includes the prompt's sampled tokens.
+            if field == "prompt_logprobs" || option.as_bool() != Some(false) {
+                return Err(AppError::BadRequest(format!(
+                    "{field} is not supported with X-Encryption-Version: 3"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Filter engine metadata even when it is emitted without an explicit request.
+fn strip_completion_metadata(value: &mut serde_json::Value) {
+    fn strip(object: &mut serde_json::Value) {
+        if let Some(object) = object.as_object_mut() {
+            for field in [
+                "prompt_token_ids",
+                "token_ids",
+                "prompt_text",
+                "prompt_logprobs",
+            ] {
+                object.remove(field);
+            }
+        }
+    }
+
+    strip(value);
+    if let Some(choices) = value.get_mut("choices").and_then(|v| v.as_array_mut()) {
+        for choice in choices {
+            strip(choice);
+            for key in ["message", "delta"] {
+                if let Some(message) = choice.get_mut(key) {
+                    strip(message);
+                }
+            }
+        }
+    }
+}
 
 /// Decrypt tool/function definitions in the request.
 /// `tools[].function.name`, `.description`, and `.parameters` (serialized JSON schema)

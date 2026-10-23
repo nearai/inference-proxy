@@ -283,3 +283,93 @@ fn v3_protects_other_endpoint_fields_and_completion_logprobs() {
         }
     }
 }
+
+#[test]
+fn v3_completion_metadata_options_keep_legacy_compatibility() {
+    let vector = vectors().remove(0);
+    let server = pair(&hex::decode(vector["model_secret"].as_str().unwrap()).unwrap());
+    for version in [1, 2, 3] {
+        let ctx = EncryptionContext {
+            version,
+            ..context(&vector, None)
+        };
+        for endpoint in [Endpoint::ChatCompletions, Endpoint::Completions] {
+            for (field, value) in [
+                ("return_token_ids", json!(true)),
+                ("return_token_ids", json!("true")),
+                ("return_prompt_text", json!(true)),
+                ("prompt_logprobs", json!(0)),
+                ("prompt_logprobs", json!(1)),
+            ] {
+                let mut request = json!({field: value});
+                let result = decrypt_request_fields(&mut request, endpoint, &ctx, &server);
+                if version == 3 {
+                    assert!(
+                        matches!(result, Err(AppError::BadRequest(message)) if message.contains(field))
+                    );
+                } else {
+                    result.unwrap();
+                    assert_eq!(request[field], value);
+                }
+            }
+            let mut request = json!({
+                "return_token_ids": false,
+                "return_prompt_text": null,
+                "prompt_logprobs": null,
+                "logprobs": true,
+            });
+            decrypt_request_fields(&mut request, endpoint, &ctx, &server).unwrap();
+        }
+    }
+}
+
+#[test]
+fn v3_removes_completion_metadata_from_json_and_sse() {
+    let vector = vectors().remove(0);
+    let server = pair(&hex::decode(vector["model_secret"].as_str().unwrap()).unwrap());
+    let metadata = json!({
+        "prompt_token_ids": [101, 202],
+        "token_ids": [303, 404],
+        "prompt_text": "private prompt",
+        "prompt_logprobs": [{"101": {"decoded_token": "private", "logprob": -1.0}}],
+    });
+    for version in [1, 2, 3] {
+        let ctx = EncryptionContext {
+            version,
+            ..context(&vector, None)
+        };
+        for endpoint in [Endpoint::ChatCompletions, Endpoint::Completions] {
+            for stream in [false, true] {
+                let key = if stream { "delta" } else { "message" };
+                let mut choice = metadata.clone();
+                choice[key] = metadata.clone();
+                choice["index"] = json!(0);
+                let mut response = metadata.clone();
+                response["choices"] = json!([choice]);
+                response["id"] = json!("chat-test");
+                response["usage"] = json!({"prompt_tokens": 2});
+                if stream {
+                    encrypt_streaming_chunk(&mut response, endpoint, &ctx, &server).unwrap();
+                } else {
+                    encrypt_response_fields(&mut response, endpoint, &ctx, &server).unwrap();
+                }
+                for object in [
+                    &response,
+                    &response["choices"][0],
+                    &response["choices"][0][key],
+                ] {
+                    for (field, expected) in metadata.as_object().unwrap() {
+                        if version == 3 {
+                            assert!(object.get(field).is_none(), "{endpoint:?}: {field}");
+                        } else {
+                            assert_eq!(&object[field], expected);
+                        }
+                    }
+                }
+                assert_eq!(response["id"], "chat-test");
+                assert_eq!(response["usage"]["prompt_tokens"], 2);
+                assert_eq!(response["choices"][0]["index"], 0);
+            }
+        }
+    }
+}

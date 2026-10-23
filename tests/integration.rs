@@ -11098,7 +11098,30 @@ async fn test_e2ee_v3_authenticates_before_upstream_and_forces_response_encrypti
         for streaming in [false, true] {
             let upstream = MockServer::start().await;
             let key = if streaming { "delta" } else { "message" };
-            let response_body = serde_json::json!({"id":"chat-v3","object":if streaming {"chat.completion.chunk"} else {"chat.completion"},"model":"test-model","choices":[{"index":0,key:{"role":"assistant","content":"private answer","tool_calls":[{"type":"function","id":"call-v3","function":{"name":"private_tool","arguments":"{\"secret\":42}"}}]},"logprobs":{"content":[{"token":"private token","bytes":[112,114]}]},"finish_reason":"stop"}]});
+            let response_body = serde_json::json!({
+                "id": "chat-v3",
+                "object": if streaming { "chat.completion.chunk" } else { "chat.completion" },
+                "model": "test-model",
+                "prompt_token_ids": [101, 202],
+                "prompt_text": "private prompt",
+                "prompt_logprobs": [{"101": {"decoded_token": "private", "logprob": -1.0}}],
+                "choices": [{
+                    "index": 0,
+                    "token_ids": [303, 404],
+                    key: {
+                        "role": "assistant",
+                        "content": "private answer",
+                        "token_ids": [303, 404],
+                        "tool_calls": [{
+                            "type": "function",
+                            "id": "call-v3",
+                            "function": {"name": "private_tool", "arguments": "{\"secret\":42}"},
+                        }],
+                    },
+                    "logprobs": {"content": [{"token": "private token", "bytes": [112, 114]}]},
+                    "finish_reason": "stop",
+                }],
+            });
             let response = if streaming {
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "text/event-stream")
@@ -11176,6 +11199,19 @@ async fn test_e2ee_v3_authenticates_before_upstream_and_forces_response_encrypti
                     serde_json::from_str(&text).unwrap()
                 };
                 let choice = &value["choices"][0];
+                for object in [&value, choice, &choice[key]] {
+                    for field in [
+                        "prompt_token_ids",
+                        "token_ids",
+                        "prompt_text",
+                        "prompt_logprobs",
+                    ] {
+                        assert!(
+                            object.get(field).is_none(),
+                            "{algo}, stream={streaming}: {field}"
+                        );
+                    }
+                }
                 for (cipher, expected) in [
                     (&choice[key]["content"], "private answer"),
                     (
@@ -11197,4 +11233,57 @@ async fn test_e2ee_v3_authenticates_before_upstream_and_forces_response_encrypti
             }
         }
     }
+}
+
+#[tokio::test]
+async fn test_e2ee_v3_rejects_completion_metadata_options_before_upstream() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/e2ee-v3.json")).unwrap();
+    let upstream = MockServer::start().await;
+    let app = build_test_app(&upstream.uri());
+    for vector in fixture["vectors"].as_array().unwrap() {
+        for endpoint in ["/v1/chat/completions", "/v1/completions"] {
+            for streaming in [false, true] {
+                for (field, value) in [
+                    ("return_token_ids", serde_json::json!(true)),
+                    ("return_prompt_text", serde_json::json!(true)),
+                    ("prompt_logprobs", serde_json::json!(0)),
+                ] {
+                    let mut body =
+                        serde_json::json!({"model":"test-model","stream":streaming,field:value});
+                    if endpoint == "/v1/chat/completions" {
+                        body["messages"] =
+                            serde_json::json!([{"role":"user","content":vector["ciphertext"]}]);
+                    } else {
+                        body["prompt"] = vector["ciphertext"].clone();
+                    }
+                    let response = app
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .method("POST")
+                                .uri(endpoint)
+                                .header(auth_header().0, auth_header().1)
+                                .header("content-type", "application/json")
+                                .header("x-signing-algo", vector["signing_algo"].as_str().unwrap())
+                                .header(
+                                    "x-client-pub-key",
+                                    vector["reply_public"].as_str().unwrap(),
+                                )
+                                .header("x-encryption-version", "3")
+                                .body(Body::from(body.to_string()))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::BAD_REQUEST,
+                        "{endpoint}: {field}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(upstream.received_requests().await.unwrap().is_empty());
 }

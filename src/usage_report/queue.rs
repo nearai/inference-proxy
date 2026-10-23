@@ -1,6 +1,7 @@
 //! The queue behind a delivery: the reports waiting for a place, the places
-//! taken, and the drain. A place is held by a task that sends one report
-//! through the sender until it is accepted, dropped or out of attempts.
+//! taken, and the drain. A place is held by a task that sends reports through
+//! the sender, each until it is accepted, dropped or out of attempts: one at a
+//! time, or, for a sender that takes a batch, the ones already waiting.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, MutexGuard};
@@ -37,14 +38,20 @@ pub(super) struct Place {
 
 impl Place {
     /// Deliver `first`, then whatever waits, and give the place back when
-    /// nothing does.
+    /// nothing does. A sender with a `max_batch` above 1 takes the waiting
+    /// reports up to that many at once, never waiting for more to come.
     async fn work(mut self, first: Job) {
-        let mut job = first;
+        let max_batch = self.delivery.sender.max_batch().max(1);
+        let mut jobs = vec![first];
         loop {
-            self.delivery.deliver(&job).await;
-            match self.next() {
-                Some(next) => job = next,
-                None => return,
+            if max_batch == 1 {
+                self.delivery.deliver(&jobs[0]).await;
+            } else {
+                self.delivery.deliver_batch(jobs).await;
+            }
+            jobs = self.next(max_batch);
+            if jobs.is_empty() {
+                return;
             }
             // A backlog of reports past their deadline is dropped without a
             // single await; other tasks get their turn between two of them.
@@ -52,23 +59,32 @@ impl Place {
         }
     }
 
-    /// The next report to deliver in this place, or `None` after giving the
-    /// place back because nothing waits. One lock for both, so a report
-    /// queued in between cannot be left waiting with a place free.
-    pub(super) fn next(&mut self) -> Option<Job> {
+    /// The next reports to deliver in this place, the oldest first and at most
+    /// `max`, or none after giving the place back because nothing waits. One
+    /// lock for both, so a report queued in between cannot be left waiting
+    /// with a place free. The place counts as the model of the first report.
+    pub(super) fn next(&mut self, max: usize) -> Vec<Job> {
         let (next, idle) = {
             let mut state = self.delivery.state();
-            let next = state.waiting.pop_front();
-            if next.is_none() {
+            let count = state.waiting.len().min(max);
+            let next: Vec<Job> = state.waiting.drain(..count).collect();
+            if next.is_empty() {
                 state.in_flight -= 1;
                 self.held = false;
             }
             (next, state.is_idle())
         };
         self.delivery.in_flight_gauge(self.model, Step::Down);
-        if let Some(next) = &next {
-            self.model = next.reporter.model_label;
-            self.delivery.waiting_gauge(self.model, Step::Down);
+        if let Some(first) = next.first() {
+            // The in-flight gauge counts places, not reports (it is stepped
+            // down above for the place's old model): one step up for the
+            // batch, under the model of its first report. The queue depth
+            // counts reports, so it steps down for each one claimed.
+            self.model = first.reporter.model_label;
+            for job in &next {
+                self.delivery
+                    .waiting_gauge(job.reporter.model_label, Step::Down);
+            }
             self.delivery.in_flight_gauge(self.model, Step::Up);
         }
         if idle {

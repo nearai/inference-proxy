@@ -1,6 +1,6 @@
 //! Delivery of usage reports, over one of two transports: HTTP to cloud-api's
-//! `POST /v1/internal/usage` (the default), or `SendMessage` to the usage queue
-//! (`VLLM_PROXY_USAGE_REPORT_TRANSPORT=sqs`). The transport is a `UsageSender`.
+//! `POST /v1/internal/usage` (the default), or `SendMessageBatch` to the usage
+//! queue (`VLLM_PROXY_USAGE_REPORT_TRANSPORT=sqs`). The transport is a `UsageSender`.
 //!
 //! `proxy::spawn_usage_report` checks and completes a report and hands it over
 //! here. `submit` first has the transport prepare the report once (HTTP: nothing;
@@ -106,7 +106,7 @@ pub enum UsageReportTransport {
     /// `POST /v1/internal/usage` on cloud-api.
     #[default]
     Http,
-    /// `SendMessage` to the usage queue (`VLLM_PROXY_USAGE_REPORT_SQS_*`).
+    /// `SendMessageBatch` to the usage queue (`VLLM_PROXY_USAGE_REPORT_SQS_*`).
     Sqs(SqsSettings),
 }
 
@@ -232,6 +232,26 @@ pub(crate) trait UsageSender: Send + Sync {
         job: &'a Job,
         timeout: Duration,
     ) -> BoxFuture<'a, (SendOutcome, AttemptLog)>;
+
+    /// The most reports one place sends in one call. 1 (the default) means
+    /// `send_batch` is never used and a place sends one report at a time.
+    fn max_batch(&self) -> usize {
+        1
+    }
+
+    /// The first attempt of up to `max_batch` reports that are already waiting,
+    /// in one call that gives up after `timeout`. Returns one result per job,
+    /// in order, each as `send` would have said it. Retries are made with
+    /// `send`, one report at a time. The default sends each report on its own.
+    fn send_batch<'a>(
+        &'a self,
+        jobs: &'a [&'a Job],
+        timeout: Duration,
+    ) -> BoxFuture<'a, Vec<(SendOutcome, AttemptLog)>> {
+        Box::pin(futures_util::future::join_all(
+            jobs.iter().map(|job| self.send(job, timeout)),
+        ))
+    }
 }
 
 /// Exposes a fallback to HTTP as the active transport: `transport="http"` is 1
@@ -476,6 +496,41 @@ impl UsageReportDelivery {
     /// Send `job` until the billing API accepts it, answers something final,
     /// the attempts run out or no attempt fits before its deadline any more.
     async fn deliver(&self, job: &Job) {
+        self.deliver_from(job, None).await
+    }
+
+    /// The reports of one place's batch (see [`UsageSender::send_batch`]): the
+    /// first attempt of all of them is one call, then each report goes on by
+    /// itself as `deliver` would, with its own retries and its own final line.
+    /// A report that has no time left for an attempt is not part of the call.
+    async fn deliver_batch(&self, jobs: Vec<Job>) {
+        let timeout = self.policy.attempt_timeout;
+        let (due, late): (Vec<&Job>, Vec<&Job>) = jobs
+            .iter()
+            .partition(|job| self.time_left(job).is_none_or(|left| left >= timeout));
+        let mut results = Vec::new();
+        if !due.is_empty() {
+            if self.extended {
+                metrics::histogram!("inference_proxy_usage_report_batch_size")
+                    .record(due.len() as f64);
+            }
+            results = self.sender.send_batch(&due, timeout).await;
+        }
+        let mut results = results.into_iter();
+        let mut deliveries = Vec::with_capacity(jobs.len());
+        for job in due {
+            // A sender that answers for fewer reports than it was given
+            // does not lose the rest: they are sent again, one by one.
+            deliveries.push(self.deliver_from(job, results.next()));
+        }
+        for job in late {
+            deliveries.push(self.deliver_from(job, None));
+        }
+        futures_util::future::join_all(deliveries).await;
+    }
+
+    /// `deliver`, whose first attempt may already have been made (`first`).
+    async fn deliver_from(&self, job: &Job, mut first: Option<(SendOutcome, AttemptLog)>) {
         let reporter = &job.reporter;
         let timeout = self.policy.attempt_timeout;
         let mut attempts: u32 = 0;
@@ -487,7 +542,7 @@ impl UsageReportDelivery {
             // the deadline. Cutting the timeout short instead would, under a
             // backlog as old as the deadline, send every report with almost
             // no time left and get none of them accepted.
-            if self.time_left(job).is_some_and(|left| left < timeout) {
+            if first.is_none() && self.time_left(job).is_some_and(|left| left < timeout) {
                 return self.give_up(
                     job,
                     GiveUp::Deadline {
@@ -504,7 +559,10 @@ impl UsageReportDelivery {
                 );
             }
             attempts += 1;
-            let (decision, attempt) = self.sender.send(job, timeout).await;
+            let (decision, attempt) = match first.take() {
+                Some(made) => made,
+                None => self.sender.send(job, timeout).await,
+            };
             last_attempt = Some((attempt.outcome, attempt.duration));
             self.count(
                 "inference_proxy_usage_report_attempts_total",

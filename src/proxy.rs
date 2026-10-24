@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -2056,6 +2057,61 @@ fn inject_streaming(body: &[u8]) -> Result<Vec<u8>, AppError> {
     serde_json::to_vec(&json).map_err(|e| AppError::Internal(e.into()))
 }
 
+/// Carries an incomplete UTF-8 character across network chunks.
+#[derive(Default)]
+struct Utf8ChunkDecoder {
+    pending: Vec<u8>,
+}
+
+impl Utf8ChunkDecoder {
+    fn decode<'a>(&mut self, chunk: &'a [u8]) -> Result<Cow<'a, str>, std::str::Utf8Error> {
+        if !self.pending.is_empty() {
+            let mut combined = std::mem::take(&mut self.pending);
+            combined.extend_from_slice(chunk);
+            return self.decode(&combined).map(|s| Cow::Owned(s.into_owned()));
+        }
+
+        match std::str::from_utf8(chunk) {
+            Ok(s) => Ok(Cow::Borrowed(s)),
+            Err(e) if e.error_len().is_none() => {
+                self.pending.extend_from_slice(&chunk[e.valid_up_to()..]);
+                std::str::from_utf8(&chunk[..e.valid_up_to()]).map(Cow::Borrowed)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn decode_lossy<'a>(&mut self, chunk: &'a [u8]) -> Cow<'a, str> {
+        if !self.pending.is_empty() {
+            let mut combined = std::mem::take(&mut self.pending);
+            combined.extend_from_slice(chunk);
+            return Cow::Owned(self.decode_lossy(&combined).into_owned());
+        }
+
+        let mut offset = 0;
+        loop {
+            match std::str::from_utf8(&chunk[offset..]) {
+                Ok(s) if offset == 0 => return Cow::Borrowed(s),
+                Ok(_) => return String::from_utf8_lossy(chunk),
+                Err(e) => {
+                    offset += e.valid_up_to();
+                    match e.error_len() {
+                        Some(len) => offset += len,
+                        None => {
+                            self.pending.extend_from_slice(&chunk[offset..]);
+                            return String::from_utf8_lossy(&chunk[..offset]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn take_pending(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending)
+    }
+}
+
 /// Reassembles streaming SSE chunks into a single non-streaming response.
 ///
 /// Processes `data:` lines from the SSE stream. The capture rules and final
@@ -2067,6 +2123,7 @@ fn inject_streaming(body: &[u8]) -> Result<Vec<u8>, AppError> {
 ///   `text_completion` object with `choices[].text`.
 struct StreamingResponseAssembler {
     line_buffer: String,
+    utf8_decoder: Utf8ChunkDecoder,
     id: Option<String>,
     model: Option<String>,
     created: Option<i64>,
@@ -2121,6 +2178,7 @@ impl StreamingResponseAssembler {
     fn new(shape: ResponseShape) -> Self {
         Self {
             line_buffer: String::new(),
+            utf8_decoder: Utf8ChunkDecoder::default(),
             id: None,
             model: None,
             created: None,
@@ -2139,10 +2197,8 @@ impl StreamingResponseAssembler {
     }
 
     fn process_chunk(&mut self, chunk: &[u8]) {
-        match std::str::from_utf8(chunk) {
-            Ok(s) => self.line_buffer.push_str(s),
-            Err(_) => self.line_buffer.push_str(&String::from_utf8_lossy(chunk)),
-        }
+        self.line_buffer
+            .push_str(&self.utf8_decoder.decode_lossy(chunk));
 
         while let Some(newline_pos) = self.line_buffer.find('\n') {
             let line_end =
@@ -3257,6 +3313,7 @@ pub(crate) fn normalize_chat_chunk(val: &mut serde_json::Value) {
 /// Fail-closed: if a data line contains JSON that cannot be transformed, the stream errors.
 struct SseTransformer {
     line_buffer: String,
+    utf8_decoder: Utf8ChunkDecoder,
     extra_transform: Option<crate::encryption::ChunkTransform>,
 }
 
@@ -3264,6 +3321,7 @@ impl SseTransformer {
     fn new(extra_transform: Option<crate::encryption::ChunkTransform>) -> Self {
         Self {
             line_buffer: String::new(),
+            utf8_decoder: Utf8ChunkDecoder::default(),
             extra_transform,
         }
     }
@@ -3271,10 +3329,10 @@ impl SseTransformer {
     /// Feed raw bytes into the buffer and return all complete transformed lines.
     /// Incomplete lines are buffered for the next call.
     fn process_chunk(&mut self, chunk: &[u8]) -> Result<Bytes, AppError> {
-        let s = std::str::from_utf8(chunk).map_err(|e| {
+        let s = self.utf8_decoder.decode(chunk).map_err(|e| {
             AppError::Internal(anyhow::anyhow!("Received invalid UTF-8 in SSE stream: {e}"))
         })?;
-        self.line_buffer.push_str(s);
+        self.line_buffer.push_str(&s);
 
         let mut output = String::new();
 
@@ -3325,6 +3383,11 @@ impl SseTransformer {
     /// forwarded so the signature hash (which covers all raw bytes) matches
     /// what the client receives.
     fn flush(&mut self) -> Result<Bytes, AppError> {
+        if !self.utf8_decoder.pending.is_empty() {
+            return Err(AppError::Internal(anyhow::anyhow!(
+                "Received incomplete UTF-8 character at end of SSE stream"
+            )));
+        }
         if self.line_buffer.is_empty() {
             return Ok(Bytes::new());
         }
@@ -3624,6 +3687,7 @@ impl Drop for StreamingGuard {
 /// Extracts `chat_id` from the first JSON chunk and detects the `[DONE]` marker.
 pub struct SseParser {
     line_buffer: String,
+    utf8_decoder: Utf8ChunkDecoder,
     pub chat_id: Option<String>,
     pub seen_done: bool,
     /// Whether the stream has emitted client-visible generation progress.
@@ -3652,6 +3716,7 @@ impl SseParser {
     pub fn new() -> Self {
         Self {
             line_buffer: String::new(),
+            utf8_decoder: Utf8ChunkDecoder::default(),
             chat_id: None,
             seen_done: false,
             seen_generation_progress: false,
@@ -3669,10 +3734,8 @@ impl SseParser {
     }
 
     pub fn process_chunk(&mut self, chunk: &[u8]) -> bool {
-        match std::str::from_utf8(chunk) {
-            Ok(s) => self.line_buffer.push_str(s),
-            Err(_) => self.line_buffer.push_str(&String::from_utf8_lossy(chunk)),
-        }
+        self.line_buffer
+            .push_str(&self.utf8_decoder.decode_lossy(chunk));
 
         let mut chunk_has_generation_progress = false;
 
@@ -3795,6 +3858,9 @@ impl SseParser {
     /// Dispatch a final unterminated SSE line at end-of-stream. SSE permits
     /// the last event line to omit its newline, including `data: [DONE]`.
     pub fn finish(&mut self) {
+        let pending = self.utf8_decoder.take_pending();
+        self.line_buffer
+            .push_str(&String::from_utf8_lossy(&pending));
         if !self.line_buffer.is_empty() {
             let _ = self.process_chunk(b"\n");
         }
@@ -5207,6 +5273,161 @@ data: [DONE]
     }
 
     // ── Fix 1: SseTransformer line buffering and fail-closed tests ──
+
+    #[test]
+    fn test_sse_transformer_utf8_every_chunk_boundary() {
+        let line = "data: {\"text\":\"a中😀é\"}\n\n".as_bytes();
+        let mut whole = SseTransformer::new(None);
+        let expected = whole.process_chunk(line).unwrap();
+        assert!(std::str::from_utf8(&expected).unwrap().contains("a中😀é"));
+
+        for split in 1..line.len() {
+            let mut transformer = SseTransformer::new(None);
+            let mut output = transformer.process_chunk(&line[..split]).unwrap().to_vec();
+            output.extend_from_slice(&transformer.process_chunk(&line[split..]).unwrap());
+            output.extend_from_slice(&transformer.flush().unwrap());
+            assert_eq!(output, expected.as_ref(), "split at {split}");
+        }
+    }
+
+    #[test]
+    fn test_sse_transformer_utf8_one_byte_at_a_time() {
+        let line = "data: {\"text\":\"a中😀é\"}\n\n".as_bytes();
+        let mut transformer = SseTransformer::new(None);
+        let mut output = Vec::new();
+        for byte in line.chunks(1) {
+            output.extend_from_slice(&transformer.process_chunk(byte).unwrap());
+        }
+        output.extend_from_slice(&transformer.flush().unwrap());
+        assert_eq!(output, line);
+    }
+
+    #[test]
+    fn test_sse_transformer_utf8_extra_transform() {
+        let extra: ChunkTransform = Arc::new(|value| {
+            assert_eq!(value["text"], "a中😀é");
+            value["text"] = "transformed:a中😀é".into();
+            Ok(())
+        });
+        let line = "data: {\"text\":\"a中😀é\"}\n\n".as_bytes();
+        let split = line.iter().position(|byte| *byte == 0xf0).unwrap() + 2;
+        let mut transformer = SseTransformer::new(Some(extra));
+        assert!(transformer
+            .process_chunk(&line[..split])
+            .unwrap()
+            .is_empty());
+        let output = transformer.process_chunk(&line[split..]).unwrap();
+        assert!(std::str::from_utf8(&output)
+            .unwrap()
+            .contains("transformed:a中😀é"));
+    }
+
+    #[test]
+    fn test_sse_transformer_utf8_invalid_bytes_still_error() {
+        let mut transformer = SseTransformer::new(None);
+        let error = transformer.process_chunk(b"data: \xff\n").unwrap_err();
+        assert!(format!("{error:?}").contains("Received invalid UTF-8 in SSE stream:"));
+    }
+
+    #[test]
+    fn test_sse_transformer_utf8_invalid_continuation_still_errors() {
+        let mut transformer = SseTransformer::new(None);
+        transformer.process_chunk(b"\xf0\x9f").unwrap();
+        let error = transformer.process_chunk(b"x").unwrap_err();
+        assert!(format!("{error:?}").contains("invalid UTF-8"));
+    }
+
+    #[test]
+    fn test_sse_transformer_utf8_flush_rejects_incomplete_character() {
+        for prefix in [b"".as_slice(), b": comment ", b"data: {\"text\":\""] {
+            let mut transformer = SseTransformer::new(None);
+            transformer.process_chunk(prefix).unwrap();
+            transformer.process_chunk(b"\xf0\x9f\x98").unwrap();
+            let error = transformer.flush().unwrap_err();
+            assert!(format!("{error:?}").contains("incomplete UTF-8"));
+        }
+    }
+
+    #[test]
+    fn test_sse_parser_utf8_every_chunk_boundary() {
+        let line = "data: {\"id\":\"a中😀é\",\"choices\":[{\"delta\":{\"content\":\"a中😀é\"}}]}\n\ndata: [DONE]".as_bytes();
+        for split in 1..line.len() {
+            let mut parser = SseParser::new();
+            parser.process_chunk(&line[..split]);
+            parser.process_chunk(&line[split..]);
+            parser.finish();
+            assert_eq!(parser.chat_id.as_deref(), Some("a中😀é"), "split {split}");
+            assert!(parser.seen_generation_output);
+            assert!(parser.seen_done);
+        }
+    }
+
+    #[test]
+    fn test_sse_parser_utf8_one_byte_at_a_time() {
+        let mut parser = SseParser::new();
+        for byte in "data: {\"id\":\"a中😀é\"}".as_bytes().chunks(1) {
+            parser.process_chunk(byte);
+        }
+        parser.finish();
+        assert_eq!(parser.chat_id.as_deref(), Some("a中😀é"));
+    }
+
+    #[test]
+    fn test_sse_parser_utf8_invalid_bytes_and_incomplete_tail() {
+        let mut parser = SseParser::new();
+        parser.process_chunk(b"data: {\"id\":\"\xff\xf0\x9f");
+        parser.process_chunk(b"\x98\x80\"}\n");
+        assert_eq!(parser.chat_id.as_deref(), Some("�😀"));
+    }
+
+    #[test]
+    fn test_sse_parser_utf8_finish_replaces_incomplete_tail() {
+        let mut parser = SseParser::new();
+        parser.process_chunk(b"data: {\"id\":\"truncated\"}\xf0\x9f");
+        parser.finish();
+        assert!(parser.chat_id.is_none());
+
+        let mut parser = SseParser::new();
+        parser.process_chunk(b"\xf0\x9f");
+        parser.finish();
+        assert!(parser.line_buffer.is_empty());
+        parser.process_chunk(b"data: {\"id\":\"ok\"}\n");
+        assert_eq!(parser.chat_id.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn test_assembler_utf8_every_chunk_boundary() {
+        let line = "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a中😀é\"}}]}\n\n".as_bytes();
+        for split in 1..line.len() {
+            let mut assembler = StreamingResponseAssembler::new(ResponseShape::ChatCompletion);
+            assembler.process_chunk(&line[..split]);
+            assembler.process_chunk(&line[split..]);
+            let response = assembler.into_response("chatcmpl");
+            assert_eq!(response["choices"][0]["message"]["content"], "a中😀é");
+        }
+    }
+
+    #[test]
+    fn test_assembler_utf8_one_byte_at_a_time() {
+        let mut assembler = StreamingResponseAssembler::new(ResponseShape::ChatCompletion);
+        let line = "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a中😀é\"}}]}\n\n";
+        for byte in line.as_bytes().chunks(1) {
+            assembler.process_chunk(byte);
+        }
+        let response = assembler.into_response("chatcmpl");
+        assert_eq!(response["choices"][0]["message"]["content"], "a中😀é");
+    }
+
+    #[test]
+    fn test_assembler_utf8_invalid_bytes_remain_lossy() {
+        let mut assembler = StreamingResponseAssembler::new(ResponseShape::ChatCompletion);
+        assembler.process_chunk(
+            b"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\xff\xf0\x9f",
+        );
+        assembler.process_chunk(b"\x98\x80\"}}]}\n\n");
+        let response = assembler.into_response("chatcmpl");
+        assert_eq!(response["choices"][0]["message"]["content"], "�😀");
+    }
 
     #[test]
     fn test_sse_transformer_data_split_across_chunks() {

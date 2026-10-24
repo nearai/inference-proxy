@@ -38,19 +38,14 @@ impl EncryptionContext {
         self.version == 3 || self.encrypt_all_fields
     }
 
-    /// Request-only AAD. The suite byte also fixes the key's encoding/length.
-    fn request_aad(&self) -> Result<Vec<u8>, AppError> {
-        if self.version != 3 {
-            return Ok(Vec::new());
-        }
-        let mut aad = b"nearai-e2ee-request-v3".to_vec();
+    /// Validate the reply key and normalize its protocol encoding.
+    fn canonical_reply_key(&self) -> Result<Vec<u8>, AppError> {
         match self.algo {
             EncryptionAlgo::Ecdsa => {
                 use k256::elliptic_curve::sec1::ToEncodedPoint;
                 let key = ecies::parse_client_pubkey(&self.client_pub_key)
                     .map_err(AppError::BadRequest)?;
-                aad.push(1);
-                aad.extend_from_slice(key.to_encoded_point(false).as_bytes());
+                Ok(key.to_encoded_point(false).as_bytes().to_vec())
             }
             EncryptionAlgo::Ed25519 => {
                 let key: [u8; 32] = self
@@ -58,11 +53,24 @@ impl EncryptionContext {
                     .as_slice()
                     .try_into()
                     .map_err(|_| AppError::BadRequest("Invalid Ed25519 reply key".into()))?;
+                // Validate conversion, but bind the original Ed25519 bytes in AAD.
                 nacl::ed25519_public_to_x25519(&key).map_err(AppError::BadRequest)?;
-                aad.push(2);
-                aad.extend_from_slice(&key);
+                Ok(key.to_vec())
             }
         }
+    }
+
+    /// Request-only AAD. The suite byte also fixes the key's encoding/length.
+    fn request_aad(&self) -> Result<Vec<u8>, AppError> {
+        if self.version != 3 {
+            return Ok(Vec::new());
+        }
+        let mut aad = b"nearai-e2ee-request-v3".to_vec();
+        aad.push(match self.algo {
+            EncryptionAlgo::Ecdsa => 1,
+            EncryptionAlgo::Ed25519 => 2,
+        });
+        aad.extend_from_slice(&self.canonical_reply_key()?);
         Ok(aad)
     }
 }
@@ -151,8 +159,7 @@ pub fn extract_encryption_context(
             };
             if version == 3 {
                 // Validate/canonicalize before inference, including empty requests.
-                let aad = context.request_aad()?;
-                context.client_pub_key = aad[b"nearai-e2ee-request-v3".len() + 1..].to_vec();
+                context.client_pub_key = context.canonical_reply_key()?;
             }
             Ok(Some(context))
         }
@@ -629,16 +636,7 @@ pub fn encrypt_response_fields(
             if let Some(choices) = value.get_mut("choices").and_then(|c| c.as_array_mut()) {
                 for choice in choices.iter_mut() {
                     encrypt_field(choice, "text", ctx, signing)?;
-                    if ctx.version == 3 {
-                        if let Some(logprobs) = choice.get_mut("logprobs").filter(|v| !v.is_null())
-                        {
-                            *logprobs = serde_json::Value::String(encrypt_string(
-                                &logprobs.to_string(),
-                                ctx,
-                                signing,
-                            )?);
-                        }
-                    }
+                    encrypt_completion_logprobs(choice, ctx, signing)?;
                 }
             }
         }
@@ -707,16 +705,7 @@ pub fn encrypt_streaming_chunk(
             if let Some(choices) = value.get_mut("choices").and_then(|c| c.as_array_mut()) {
                 for choice in choices.iter_mut() {
                     encrypt_field(choice, "text", ctx, signing)?;
-                    if ctx.version == 3 {
-                        if let Some(logprobs) = choice.get_mut("logprobs").filter(|v| !v.is_null())
-                        {
-                            *logprobs = serde_json::Value::String(encrypt_string(
-                                &logprobs.to_string(),
-                                ctx,
-                                signing,
-                            )?);
-                        }
-                    }
+                    encrypt_completion_logprobs(choice, ctx, signing)?;
                 }
             }
             Ok(())
@@ -732,6 +721,21 @@ pub fn encrypt_streaming_chunk(
 }
 
 // ── Internal helpers ────────────────────────────────────────────────
+
+/// V3 encrypts text-completion logprobs as a whole, including token strings used as JSON keys.
+fn encrypt_completion_logprobs(
+    choice: &mut serde_json::Value,
+    ctx: &EncryptionContext,
+    signing: &SigningPair,
+) -> Result<(), AppError> {
+    if ctx.version == 3 {
+        if let Some(logprobs) = choice.get_mut("logprobs").filter(|v| !v.is_null()) {
+            *logprobs =
+                serde_json::Value::String(encrypt_string(&logprobs.to_string(), ctx, signing)?);
+        }
+    }
+    Ok(())
+}
 
 /// These engine options return text or token IDs outside the encrypted fields.
 fn validate_completion_metadata_options(value: &serde_json::Value) -> Result<(), AppError> {

@@ -1676,7 +1676,7 @@ async fn stream_final_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn detects_and_removes_fusion_tool() {
@@ -1792,6 +1792,18 @@ mod tests {
         let decode_addr = decode_listener.local_addr().unwrap();
         let decode_server = tokio::spawn(async move {
             let (mut stream, _) = decode_listener.accept().await.unwrap();
+            // Read the request before answering: closing a socket with unread
+            // bytes sends a reset, which can reach the client before the
+            // response does and turn the decode error into a request error.
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+            }
             stream
                 .write_all(
                     b"HTTP/1.1 200 OK\r\ncontent-length: 8\r\ncontent-type: application/json\r\n\r\nnot-json",

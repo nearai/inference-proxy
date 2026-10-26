@@ -1,6 +1,7 @@
 //! Delivery of usage reports, over one of two transports: HTTP to cloud-api's
-//! `POST /v1/internal/usage` (the default), or `SendMessage` to the usage queue
-//! (`VLLM_PROXY_USAGE_REPORT_TRANSPORT=sqs`). The transport is a `UsageSender`.
+//! `POST /v1/internal/usage` (the default), or `SendMessageBatch` to the usage
+//! queue (`VLLM_PROXY_USAGE_REPORT_TRANSPORT=sqs`), which gathers the reports
+//! being sent at once into one call. The transport is a `UsageSender`.
 //!
 //! `proxy::spawn_usage_report` checks and completes a report and hands it over
 //! here. `submit` first has the transport prepare the report once (HTTP: nothing;
@@ -106,7 +107,7 @@ pub enum UsageReportTransport {
     /// `POST /v1/internal/usage` on cloud-api.
     #[default]
     Http,
-    /// `SendMessage` to the usage queue (`VLLM_PROXY_USAGE_REPORT_SQS_*`).
+    /// `SendMessageBatch` to the usage queue (`VLLM_PROXY_USAGE_REPORT_SQS_*`).
     Sqs(SqsSettings),
 }
 
@@ -142,12 +143,16 @@ pub struct SqsSettings {
     /// Base URL of the IMDSv2 endpoint that serves session credentials (`VLLM_PROXY_AWS_CREDENTIALS_URL`,
     /// required: there are no static keys).
     pub credentials_url: String,
+    /// How long a batch stays open for more reports after its first
+    /// (`VLLM_PROXY_USAGE_REPORT_SQS_BATCH_WINDOW_MS`, default 50; 0 = only
+    /// the reports already waiting).
+    pub batch_window: std::time::Duration,
 }
 
 /// A report on its way to the billing API: what `proxy::spawn_usage_report`
 /// hands over. The body is the report as cloud-api's usage body; the HTTP
 /// sender posts it as it is. The SQS sender's `prepare` replaces it, once at
-/// submit, with the `SendMessage` request, so every attempt sends the same bytes.
+/// submit, with the report's envelope, so every attempt sends the same message.
 /// The reporter still carries the HTTP client and the cloud-api URL and usage
 /// token, which the HTTP sender reads.
 #[derive(Clone)]

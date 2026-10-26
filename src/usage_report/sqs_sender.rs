@@ -427,7 +427,18 @@ fn entry_answers(call: CallAnswer, entries: usize) -> Vec<Answer> {
         (UsageReportOutcome::Accepted, Ok(status)) => *status,
         _ => return vec![(call.outcome, call.status); entries],
     };
-    let answer: BatchAnswer = serde_json::from_slice(&call.body).unwrap_or_default();
+    let answer: BatchAnswer = match serde_json::from_slice(&call.body) {
+        Ok(answer) => answer,
+        Err(_) => {
+            // Its length only: an answer is not logged.
+            tracing::warn!(
+                answer_bytes = call.body.len(),
+                entries,
+                "SendMessageBatch answer could not be read; its entries are sent again"
+            );
+            BatchAnswer::default()
+        }
+    };
     (0..entries)
         .map(|entry| {
             let id = entry.to_string();
@@ -533,12 +544,18 @@ impl UsageSender for SqsSender {
 
 /// An error type as it may be logged: AWS's name for what is wrong, which is
 /// no secret but not trusted text either, so it is cut to a name's characters.
+/// A name with none of them left (an entry refused without a code) is `unknown`.
 fn error_name(error_type: &str) -> String {
-    short_error_name(error_type)
+    let name: String = short_error_name(error_type)
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
         .take(64)
-        .collect()
+        .collect();
+    if name.is_empty() {
+        "unknown".to_string()
+    } else {
+        name
+    }
 }
 
 /// The `MessageBody`: the report as a usage envelope, emitted when the
@@ -703,3 +720,7 @@ mod redirect_tests;
 #[cfg(test)]
 #[path = "sqs_sender_startup_tests.rs"]
 mod startup_tests;
+
+#[cfg(test)]
+#[path = "sqs_sender_batch_tests.rs"]
+mod batch_tests;

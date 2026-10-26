@@ -8,9 +8,8 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use super::tests::{
-    attempt, chat_body, job_with, sender, sender_with_endpoint_credentials, sqs_taking, TakesEvery,
-};
+use super::batch_tests::{sqs_taking, TakesEvery};
+use super::tests::{attempt, chat_body, job_with, sender, sender_with_endpoint_credentials};
 use super::*;
 use crate::aws_credentials::test_support::{mount_imds_session, ROLE_CREDENTIALS_PATH};
 use crate::usage_report::UsageReportDelivery;

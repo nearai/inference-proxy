@@ -331,6 +331,15 @@ fn usage_report_policy(
     if shutdown_drain_secs > SHUTDOWN_DRAIN_LIMIT_SECS {
         anyhow::bail!("{SHUTDOWN_DRAIN} must be at most {SHUTDOWN_DRAIN_LIMIT_SECS}");
     }
+    // A report's batch window is spent inside its attempt's timeout: a window
+    // that takes most of it leaves no time to send a batch that does not fill.
+    if let crate::usage_report::UsageReportTransport::Sqs(settings) = transport {
+        if settings.batch_window * 2 > Duration::from_secs(timeout_secs) {
+            anyhow::bail!(
+                "VLLM_PROXY_USAGE_REPORT_SQS_BATCH_WINDOW_MS must be at most half of {TIMEOUT}"
+            );
+        }
+    }
     Ok(crate::usage_report::UsageReportPolicy {
         attempt_timeout: Duration::from_secs(timeout_secs),
         max_attempts,
@@ -2004,6 +2013,36 @@ mod tests {
             assert_eq!(policy.max_in_flight, 4);
             assert_eq!(policy.shutdown_drain, Duration::from_secs(3));
         });
+    }
+
+    /// A batch window is spent inside the attempt's timeout, so it may take at
+    /// most half of it: a window as long as the timeout would leave a report
+    /// whose batch does not fill no time to be sent at all.
+    #[test]
+    fn test_sqs_batch_window_fits_in_half_the_attempt_timeout() {
+        const WINDOW: &str = "VLLM_PROXY_USAGE_REPORT_SQS_BATCH_WINDOW_MS";
+        const TIMEOUT: &str = "VLLM_PROXY_USAGE_REPORT_TIMEOUT_SECS";
+        let base = [("MODEL_NAME", "m"), ("TOKEN", "t")];
+        let sqs = |window: &'static str, timeout: &'static str| {
+            vec![
+                ("VLLM_PROXY_USAGE_REPORT_TRANSPORT", "sqs"),
+                ("VLLM_PROXY_USAGE_REPORT_SQS_URL", "https://sqs.example/q"),
+                ("VLLM_PROXY_AWS_CREDENTIALS_URL", "http://127.0.0.1:9911"),
+                (WINDOW, window),
+                (TIMEOUT, timeout),
+            ]
+        };
+        for (window, timeout) in [("1000", "1"), ("600", "1")] {
+            with_clean_env(&base, &sqs(window, timeout), || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains(WINDOW) && err.contains(TIMEOUT), "{err}");
+            });
+        }
+        for (window, timeout) in [("500", "1"), ("1000", "2"), ("0", "1")] {
+            with_clean_env(&base, &sqs(window, timeout), || {
+                Config::from_env().unwrap();
+            });
+        }
     }
 
     /// The fail-closed rule for `VLLM_BACKEND_TOKEN` counts the SQS transport

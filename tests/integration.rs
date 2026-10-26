@@ -4996,7 +4996,7 @@ async fn test_ecdsa_signature_cryptographic_verification() {
         VerifyingKey::recover_from_prehash(&msg_hash[..], &signature, recovery_id).unwrap();
 
     // Derive Ethereum address from recovered key
-    let pk_encoded = recovered_key.to_encoded_point(false);
+    let pk_encoded = recovered_key.to_sec1_point(false);
     let pk_uncompressed = &pk_encoded.as_bytes()[1..];
     let addr_hash = Keccak256::digest(pk_uncompressed);
     let recovered_address = format!("0x{}", hex::encode(&addr_hash[12..32]));
@@ -5275,7 +5275,7 @@ async fn assert_ecdsa_signature_covers(
     let recovery_id = RecoveryId::from_byte(sig_bytes[64] - 27).unwrap();
     let recovered_key =
         VerifyingKey::recover_from_prehash(&msg_hash[..], &signature, recovery_id).unwrap();
-    let pk_encoded = recovered_key.to_encoded_point(false);
+    let pk_encoded = recovered_key.to_sec1_point(false);
     let addr_hash = Keccak256::digest(&pk_encoded.as_bytes()[1..]);
     assert_eq!(
         format!("0x{}", hex::encode(&addr_hash[12..32])),

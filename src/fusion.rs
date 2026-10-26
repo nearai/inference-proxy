@@ -695,6 +695,14 @@ async fn run_judge(
 
 fn build_panel_request(request_json: &Value, config: &FusionConfig, model: &str) -> Value {
     let mut request = request_json.clone();
+    // The adapter `VLLM_PROXY_BACKEND_LORA` set is this engine's; a panel is
+    // another model behind another proxy, which refuses LoRA selector keys.
+    // Local synthesis keeps it (`build_synthesis_request`).
+    if let Some(object) = request.as_object_mut() {
+        for key in crate::model_list::LORA_SELECTOR_KEYS {
+            object.remove(key);
+        }
+    }
     request["model"] = Value::String(model.to_string());
     request["messages"] = augmented_messages(
         request_json,
@@ -1677,6 +1685,28 @@ async fn stream_final_response(
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn panel_requests_drop_the_local_adapter_and_synthesis_keeps_it() {
+        let request = json!({
+            "model": "outer",
+            "messages": [{"role": "user", "content": "hi"}],
+            "lora_path": "local-adapter"
+        });
+        let config = FusionConfig {
+            analysis_models: vec!["panel".to_string()],
+            judge_model: None,
+            max_tool_calls: 0,
+            max_completion_tokens: None,
+            temperature: None,
+            reasoning: None,
+        };
+        let panel = build_panel_request(&request, &config, "panel");
+        assert_eq!(panel["model"], "panel");
+        assert!(panel.get("lora_path").is_none());
+        let synthesis = build_synthesis_request(&request, &[], None);
+        assert_eq!(synthesis["lora_path"], "local-adapter");
+    }
 
     #[test]
     fn detects_and_removes_fusion_tool() {

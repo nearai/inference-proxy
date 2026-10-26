@@ -1111,7 +1111,7 @@ pub fn model_for<'a>(state: &'a AppState, request: &Value) -> Result<ModelView<'
 /// Body keys that make an SGLang engine started with `--enable-lora` serve a
 /// request with an adapter. The caller never picks one: the model a process
 /// serves is its `MODEL_NAME`, and an adapter is another model.
-const LORA_SELECTOR_KEYS: [&str; 3] = ["lora_path", "lora_id", "lora_name"];
+pub(crate) const LORA_SELECTOR_KEYS: [&str; 3] = ["lora_path", "lora_id", "lora_name"];
 
 /// The model a JSON body is compared with: the one it is served as in list
 /// mode, or `id` in a single-model process that runs with

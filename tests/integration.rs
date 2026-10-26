@@ -11410,3 +11410,101 @@ async fn without_strict_request_model_any_model_is_served_but_lora_keys_are_refu
     }
     assert_eq!(requests_seen(&backend).await, GUARDED_ROUTES.len() * 3);
 }
+
+#[tokio::test]
+async fn backend_lora_embeddings_signature_covers_original_request() {
+    use sha2::{Digest, Sha256};
+    use vllm_proxy_rs::encryption;
+
+    let backend = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "emb-lora-sig",
+            "data": [{"embedding": [0.1, 0.2], "index": 0}],
+            "usage": {"prompt_tokens": 2, "total_tokens": 2}
+        })))
+        .mount(&backend)
+        .await;
+    let app = build_test_app_inner(
+        &backend.uri(),
+        TestAppOptions {
+            backend_lora: Some("abliterated".to_string()),
+            strict_request_model: true,
+            ..Default::default()
+        },
+    );
+
+    // Plaintext, with spacing a re-serialization would not reproduce.
+    let plain_bytes = br#"{ "model" : "test-model",   "input" : "hello" }"#.to_vec();
+    // Encrypted: same idea around two individually encrypted elements.
+    let client_pair = test_client_signing_pair();
+    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
+    let enc_for_request = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: hex::decode(test_ed25519_pub_key_hex()).unwrap(),
+        version: 1,
+        encrypt_all_fields: false,
+    };
+    let enc_a = encryption::encrypt_string("hello", &enc_for_request, &client_pair).unwrap();
+    let enc_b = encryption::encrypt_string("world", &enc_for_request, &client_pair).unwrap();
+    let enc_bytes = format!(
+        r#"{{ "model" : "test-model",  "input" : [ {} ,  {} ] }}"#,
+        serde_json::to_string(&enc_a).unwrap(),
+        serde_json::to_string(&enc_b).unwrap()
+    )
+    .into_bytes();
+
+    for (encrypted, sent) in [(false, plain_bytes), (true, enc_bytes)] {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json")
+            .header(auth_header().0, auth_header().1);
+        if encrypted {
+            builder = builder
+                .header("x-signing-algo", "ed25519")
+                .header("x-client-pub-key", &client_pub_hex);
+        }
+        let response = app
+            .clone()
+            .oneshot(builder.body(Body::from(sent.clone())).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "encrypted={encrypted}");
+        let _ = body_to_bytes(response).await;
+
+        // The upstream got the adapter, and a body that differs from what was sent.
+        let received = backend.received_requests().await.unwrap();
+        let forwarded = &received.last().unwrap().body;
+        let forwarded_json: serde_json::Value = serde_json::from_slice(forwarded).unwrap();
+        assert_eq!(forwarded_json["lora_path"], "abliterated");
+        assert_ne!(forwarded.as_slice(), sent.as_slice());
+
+        let sig_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/signature/emb-lora-sig?signing_algo=ecdsa")
+                    .header(auth_header().0, auth_header().1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sig_response.status(), StatusCode::OK);
+        let sig_body = body_to_json(sig_response).await;
+        let text = sig_body["text"].as_str().unwrap();
+        let signed_request_hash = text.split(':').nth(1).unwrap();
+        assert_eq!(
+            signed_request_hash,
+            hex::encode(Sha256::digest(&sent)),
+            "encrypted={encrypted}"
+        );
+        assert_ne!(
+            signed_request_hash,
+            hex::encode(Sha256::digest(forwarded)),
+            "encrypted={encrypted}"
+        );
+    }
+}

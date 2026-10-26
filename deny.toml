@@ -12,6 +12,16 @@ ignore = [
     # transitive build-dep, no action available until upstreams migrate off it.
     # Same advisory cloud-api ignored in nearai/cloud-api#733.
     "RUSTSEC-2026-0173",
+    # crypto-bigint 0.5.5 timing variability (patched only in >=0.7.6). It is
+    # pulled in solely by elliptic-curve 0.13 -> k256/ecdsa 0.13/0.16, used by
+    # alloy (via dstack-sdk) and by our own k256 ECDH in src/encryption.rs. The
+    # fix needs the RustCrypto elliptic-curve 0.14 generation, which k256 and
+    # alloy have not released stable (latest alloy still uses k256 0.13). The
+    # path IS reachable (ECDH with the server key), so this is a tracked
+    # accepted risk, not a non-reachability claim: the leak needs a local
+    # timing/microarchitectural observer on the TEE host. Remove once k256 0.14
+    # lands and alloy/dstack-sdk move to it.
+    "RUSTSEC-2026-0387",
 ]
 
 [licenses]

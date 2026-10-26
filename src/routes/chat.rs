@@ -102,6 +102,13 @@ async fn serve(
             &state.signing,
         )?;
     }
+    // The model and adapter checks, on the body as it will be forwarded: the
+    // decrypted fields are in it now.
+    crate::model_list::guard_request_body(
+        &request_json,
+        crate::model_list::checked_model(&state, model.id),
+    )?;
+    crate::model_list::apply_backend_lora(&state, &mut request_json);
 
     // Repair tool-call `arguments` the engine would refuse (empty, missing,
     // double-encoded, non-object): one odd historical turn must not 400 the

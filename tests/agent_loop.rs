@@ -111,6 +111,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
         backend_priority: None,
         backend_health_path: "/health".to_string(),
         non_tee_deployment: false,
+        strict_model: false,
         map_queue_full_to_429: false,
         stream_error_peek_ms: 0,
         stream_commit_ms: 0,

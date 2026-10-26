@@ -720,6 +720,16 @@ pub struct Config {
     /// `/internal/gpu_evidence` answer 404 so nothing unverifiable is
     /// advertised. Inference routes are unaffected.
     pub non_tee_deployment: bool,
+    /// Refuse a chat/completions body whose `model` names a model other than
+    /// `MODEL_NAME` (`VLLM_PROXY_STRICT_MODEL`): OpenAI's 404
+    /// `model_not_found`, after authentication, with nothing dispatched or
+    /// billed. For engines that serve more ids than this proxy's model (LoRA
+    /// adapters selected by `model`): one proxy per id, each refusing the
+    /// others, so each id is attested, billed and access-controlled as itself.
+    /// A body without a string `model` is still served as `MODEL_NAME`. Off by
+    /// default: a single-model proxy serves its model whatever the body says.
+    /// No effect with `VLLM_PROXY_MODEL_LIST_FILE`, which always matches exactly.
+    pub strict_model: bool,
     /// Rewrite the engine's queue-full rejection (HTTP 503 / SSE error event
     /// `"The request queue is full."`) to 429 (`VLLM_PROXY_MAP_QUEUE_FULL_TO_429`).
     /// Aggregators treat 429 as back-pressure and 5xx as an outage; off by
@@ -1459,6 +1469,7 @@ impl Config {
             backend_priority,
             backend_health_path,
             non_tee_deployment: env_bool("NON_TEE_DEPLOYMENT"),
+            strict_model: env_bool("VLLM_PROXY_STRICT_MODEL"),
             map_queue_full_to_429: env_bool("VLLM_PROXY_MAP_QUEUE_FULL_TO_429"),
             stream_error_peek_ms: env_int("VLLM_PROXY_STREAM_ERROR_PEEK_MS", 0) as u64,
             stream_commit_ms: env_int("VLLM_PROXY_STREAM_COMMIT_MS", 0) as u64,

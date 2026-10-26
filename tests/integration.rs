@@ -33,6 +33,8 @@ struct TestAppOptions {
     cloud_api_url: Option<String>,
     /// `VLLM_BACKEND_MAX_INFLIGHT`.
     backend_max_inflight: Option<u32>,
+    /// `VLLM_PROXY_STRICT_MODEL`.
+    strict_model: bool,
 }
 
 impl Default for TestAppOptions {
@@ -55,6 +57,7 @@ impl Default for TestAppOptions {
             backend_affinity_max_imbalance: 8,
             cloud_api_url: None,
             backend_max_inflight: None,
+            strict_model: false,
         }
     }
 }
@@ -267,6 +270,7 @@ fn build_test_app_inner_with_pool(
         backend_priority: None,
         backend_health_path: "/health".to_string(),
         non_tee_deployment: false,
+        strict_model: options.strict_model,
         map_queue_full_to_429: false,
         stream_error_peek_ms: 0,
         stream_commit_ms: 0,
@@ -643,6 +647,98 @@ async fn test_chat_completions_non_streaming() {
     let body = body_to_json(response).await;
     assert_eq!(body["id"], "chatcmpl-test123");
     assert_eq!(body["choices"][0]["message"]["content"], "Hello!");
+}
+
+#[tokio::test]
+async fn test_strict_model_refuses_another_model_before_dispatch() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+    let app = build_test_app_inner(
+        &mock_server.uri(),
+        TestAppOptions {
+            strict_model: true,
+            ..Default::default()
+        },
+    );
+    for (uri, body) in [
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"model": "test-model-abliterated", "messages": [{"role": "user", "content": "Hi"}]}),
+        ),
+        (
+            "/v1/completions",
+            serde_json::json!({"model": "test-model-abliterated", "prompt": "Hi"}),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .header(auth_header().0, auth_header().1)
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        let body = body_to_json(response).await;
+        assert_eq!(body["error"]["code"], "model_not_found", "{uri}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn test_strict_model_serves_its_own_model_and_a_body_without_model() {
+    let mock_server = MockServer::start().await;
+    mount_chat_ok(&mock_server, "/v1/chat/completions", 2).await;
+    let app = build_test_app_inner(
+        &mock_server.uri(),
+        TestAppOptions {
+            strict_model: true,
+            ..Default::default()
+        },
+    );
+    let own =
+        serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": "Hi"}]});
+    let missing = serde_json::json!({"messages": [{"role": "user", "content": "Hi"}]});
+    assert_eq!(
+        post_chat(app.clone(), "/v1/chat/completions", &own).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_chat(app, "/v1/chat/completions", &missing).await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn test_without_strict_model_another_model_is_forwarded_unchanged() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"model": "test-model-abliterated"}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-x", "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    let app = build_test_app(&mock_server.uri());
+    let body = serde_json::json!({"model": "test-model-abliterated", "messages": [{"role": "user", "content": "Hi"}]});
+    assert_eq!(
+        post_chat(app, "/v1/chat/completions", &body).await,
+        StatusCode::OK
+    );
 }
 
 #[tokio::test]
@@ -6386,6 +6482,7 @@ fn build_test_app_with_cloud_api_retries(
         backend_priority: None,
         backend_health_path: "/health".to_string(),
         non_tee_deployment: false,
+        strict_model: false,
         map_queue_full_to_429: false,
         stream_error_peek_ms: 0,
         stream_commit_ms: 0,
@@ -9031,6 +9128,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         backend_priority: None,
         backend_health_path: "/health".to_string(),
         non_tee_deployment: false,
+        strict_model: false,
         map_queue_full_to_429: false,
         stream_error_peek_ms: 0,
         stream_commit_ms: 0,
@@ -9502,6 +9600,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         backend_priority: None,
         backend_health_path: "/health".to_string(),
         non_tee_deployment: false,
+        strict_model: false,
         map_queue_full_to_429: false,
         stream_error_peek_ms: 0,
         stream_commit_ms: 0,

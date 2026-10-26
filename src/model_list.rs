@@ -1087,7 +1087,8 @@ fn count_model_match(result: ModelMatch) {
 /// enumerate models.
 ///
 /// A single-model process serves its one model whatever the body says, as it
-/// always has. When it runs as a gateway lane — outside a TEE
+/// always has, unless `VLLM_PROXY_STRICT_MODEL` is set: then a body naming
+/// another model is a 404 `model_not_found`. When it runs as a gateway lane — outside a TEE
 /// (`NON_TEE_DEPLOYMENT`) and with a backend token, which together no proxy
 /// inside a CVM has — it also counts how the body's `model` compares with
 /// `MODEL_NAME`, so the effect of exact matching can be read from production
@@ -1096,6 +1097,15 @@ pub fn model_for<'a>(state: &'a AppState, request: &Value) -> Result<ModelView<'
     match &state.models {
         Some(models) => models.select(request).map(ServedModel::view),
         None => {
+            if state.config.strict_model {
+                if let Some(requested) = requested_model(request) {
+                    if requested != state.config.model_name {
+                        return Err(AppError::ModelNotFound {
+                            model: Some(requested.to_string()),
+                        });
+                    }
+                }
+            }
             if state.config.non_tee_deployment && state.config.backend_token.is_some() {
                 count_model_match(classify(
                     requested_model(request),

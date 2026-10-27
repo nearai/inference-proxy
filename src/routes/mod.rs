@@ -9,6 +9,7 @@ pub mod ohttp;
 pub mod passthrough;
 pub mod privacy;
 pub mod signature;
+pub mod systemone;
 
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
@@ -31,6 +32,7 @@ pub const ROUTE_EMBEDDINGS: &str = "/v1/embeddings";
 pub const ROUTE_RERANK: &str = "/v1/rerank";
 pub const ROUTE_SCORE: &str = "/v1/score";
 pub const ROUTE_PRIVACY_CLASSIFY: &str = "/v1/privacy/classify";
+pub const ROUTE_SYSTEMONE: &str = "/v1/systemone";
 pub const ROUTE_IMAGES_GENERATIONS: &str = "/v1/images/generations";
 pub const ROUTE_IMAGES_EDITS: &str = "/v1/images/edits";
 pub const ROUTE_AUDIO_TRANSCRIPTIONS: &str = "/v1/audio/transcriptions";
@@ -73,10 +75,14 @@ pub fn build_app(state: AppState) -> Router {
 }
 
 /// The router for `state`: every route for a process that serves one model,
-/// the model-list subset in gateway list mode.
+/// the model-list subset in gateway list mode. `/v1/systemone` is added only
+/// for a proxy in front of a decision model (`SYSTEMONE_UPSTREAM_MODEL`), so
+/// every other deployment keeps answering it like any undeclared path.
 pub fn build_router_for(state: &AppState) -> Router<AppState> {
     if state.models.is_some() {
         build_model_list_router()
+    } else if state.config.systemone_upstream_model.is_some() {
+        build_router().route(ROUTE_SYSTEMONE, post(systemone::systemone))
     } else {
         build_router()
     }

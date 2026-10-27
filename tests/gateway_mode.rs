@@ -157,6 +157,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         backend_health_path: options
             .backend_health_path
             .unwrap_or_else(|| "/health".to_string()),
+        systemone_upstream_model: None,
         non_tee_deployment: options.non_tee_deployment,
         map_queue_full_to_429: options.map_queue_full_to_429,
         stream_error_peek_ms: options.stream_error_peek_ms,

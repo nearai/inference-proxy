@@ -12,6 +12,7 @@ pub(crate) struct TestAppOptions {
     pub(crate) images_edits_url_override: Option<String>,
     pub(crate) transcriptions_url_override: Option<String>,
     pub(crate) rerank_url_override: Option<String>,
+    pub(crate) systemone_upstream_model: Option<String>,
 }
 
 pub(crate) fn test_signing_pair() -> signing::SigningPair {
@@ -104,6 +105,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         backend_token: options.backend_token,
         backend_priority: None,
         backend_health_path: "/health".to_string(),
+        systemone_upstream_model: options.systemone_upstream_model.clone(),
         non_tee_deployment: false,
         map_queue_full_to_429: false,
         stream_error_peek_ms: 0,
@@ -214,7 +216,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         trust_proxy_headers: true,
     };
 
-    routes::build_router()
+    routes::build_router_for(&state)
         .layer(middleware::from_fn(rate_limit::rate_limit_middleware))
         .layer(axum::Extension(rate_limit_state))
         .layer(middleware::from_fn(request_id_middleware))

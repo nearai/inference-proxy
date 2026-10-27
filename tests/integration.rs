@@ -33,6 +33,10 @@ struct TestAppOptions {
     cloud_api_url: Option<String>,
     /// `VLLM_BACKEND_MAX_INFLIGHT`.
     backend_max_inflight: Option<u32>,
+    /// `VLLM_PROXY_BACKEND_LORA`.
+    backend_lora: Option<String>,
+    /// `VLLM_PROXY_STRICT_REQUEST_MODEL`.
+    strict_request_model: bool,
 }
 
 impl Default for TestAppOptions {
@@ -55,6 +59,8 @@ impl Default for TestAppOptions {
             backend_affinity_max_imbalance: 8,
             cloud_api_url: None,
             backend_max_inflight: None,
+            backend_lora: None,
+            strict_request_model: false,
         }
     }
 }
@@ -277,6 +283,8 @@ fn build_test_app_inner_with_pool(
         models_document_url: None,
         capacity_requests_per_minute: 0,
         discount_to_user: None,
+        backend_lora: options.backend_lora.clone(),
+        strict_request_model: options.strict_request_model,
         reasoning_off_effort: "none".to_string(),
         allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,
@@ -6396,6 +6404,8 @@ fn build_test_app_with_cloud_api_retries(
         models_document_url: None,
         capacity_requests_per_minute: 0,
         discount_to_user: None,
+        backend_lora: None,
+        strict_request_model: false,
         reasoning_off_effort: "none".to_string(),
         allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,
@@ -9041,6 +9051,8 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         models_document_url: None,
         capacity_requests_per_minute: 0,
         discount_to_user: None,
+        backend_lora: None,
+        strict_request_model: false,
         reasoning_off_effort: "none".to_string(),
         allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,
@@ -9512,6 +9524,8 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         models_document_url: None,
         capacity_requests_per_minute: 0,
         discount_to_user: None,
+        backend_lora: None,
+        strict_request_model: false,
         reasoning_off_effort: "none".to_string(),
         allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,
@@ -11068,4 +11082,429 @@ async fn test_tracing_headers_propagated_non_streaming() {
         StatusCode::OK,
         "upstream did not receive tracing headers on non-streaming path"
     );
+}
+
+// ---- Single-model request guard (model id and LoRA selectors) ----
+
+const GUARDED_ROUTES: [&str; 7] = [
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/tokenize",
+    "/v1/embeddings",
+    "/v1/rerank",
+    "/v1/score",
+    "/v1/images/generations",
+];
+
+fn build_strict_app(mock_url: &str) -> axum::Router {
+    build_test_app_inner(
+        mock_url,
+        TestAppOptions {
+            strict_request_model: true,
+            ..Default::default()
+        },
+    )
+}
+
+/// A backend that answers every POST with a 200 JSON body, so a request the
+/// guard let through is a 200 and one it stopped never reaches `requests_seen`.
+async fn start_any_post_backend() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "guard-ok",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "text": "ok"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+async fn post_guarded(
+    app: &axum::Router,
+    uri: &str,
+    body: &serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(serde_json::to_vec(body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = body_to_bytes(response).await;
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn single_model_process_refuses_another_model_id_on_every_json_route() {
+    let backend = start_any_post_backend().await;
+    let app = build_strict_app(&backend.uri());
+    // The adapter's own id, the engine's `base:adapter` form, a prefix and a
+    // different case: none is MODEL_NAME ("test-model") byte for byte.
+    for model in [
+        "test-model-abliterated",
+        "test-model:abliterated",
+        "test-model:",
+        "Test-Model",
+    ] {
+        for route in GUARDED_ROUTES {
+            let (status, body) =
+                post_guarded(&app, route, &serde_json::json!({"model": model})).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{route} {model}");
+            assert_eq!(body["error"]["code"], "model_not_found", "{route} {model}");
+        }
+    }
+    let (status, _) = post_guarded(
+        &app,
+        "/v1/chat/completions",
+        &serde_json::json!({"model": 7}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(requests_seen(&backend).await, 0);
+}
+
+#[tokio::test]
+async fn single_model_process_refuses_lora_selectors_on_every_json_route() {
+    let backend = start_any_post_backend().await;
+    let app = build_strict_app(&backend.uri());
+    for key in ["lora_path", "lora_id", "lora_name"] {
+        for route in GUARDED_ROUTES {
+            // With the right model, and without one.
+            for mut body in [
+                serde_json::json!({"model": "test-model"}),
+                serde_json::json!({}),
+            ] {
+                body[key] = serde_json::json!("abliterated");
+                let (status, response) = post_guarded(&app, route, &body).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{route} {key}");
+                assert!(
+                    response["error"]["message"].as_str().unwrap().contains(key),
+                    "{route} {key}: {response}"
+                );
+            }
+        }
+    }
+    assert_eq!(requests_seen(&backend).await, 0);
+}
+
+#[tokio::test]
+async fn single_model_process_serves_its_own_model_or_none() {
+    let backend = start_any_post_backend().await;
+    let app = build_strict_app(&backend.uri());
+    for route in GUARDED_ROUTES {
+        for body in [
+            serde_json::json!({"model": "test-model"}),
+            serde_json::json!({}),
+        ] {
+            let (status, _) = post_guarded(&app, route, &body).await;
+            assert_eq!(status, StatusCode::OK, "{route} {body}");
+        }
+    }
+    assert_eq!(requests_seen(&backend).await, GUARDED_ROUTES.len() * 2);
+}
+
+#[tokio::test]
+async fn guard_runs_on_the_decrypted_body_of_an_encrypted_request() {
+    use vllm_proxy_rs::encryption;
+
+    let backend = start_any_post_backend().await;
+    let app = build_strict_app(&backend.uri());
+    let client_pair = test_client_signing_pair();
+    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
+    let enc_for_request = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: hex::decode(test_ed25519_pub_key_hex()).unwrap(),
+        version: 1,
+        encrypt_all_fields: false,
+    };
+    let encrypted =
+        encryption::encrypt_string("secret prompt", &enc_for_request, &client_pair).unwrap();
+
+    let mut statuses = Vec::new();
+    for extra in [
+        serde_json::json!({"model": "test-model"}),
+        serde_json::json!({"model": "test-model:abliterated"}),
+        serde_json::json!({"lora_path": "abliterated"}),
+    ] {
+        let mut body = serde_json::json!({
+            "messages": [{"role": "user", "content": encrypted}],
+            "stream": false
+        });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header(auth_header().0, auth_header().1)
+                    .header("x-signing-algo", "ed25519")
+                    .header("x-client-pub-key", &client_pub_hex)
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        statuses.push(response.status());
+    }
+    assert_eq!(
+        statuses,
+        [
+            StatusCode::OK,
+            StatusCode::NOT_FOUND,
+            StatusCode::BAD_REQUEST
+        ]
+    );
+    // Only the first request, whose decrypted prompt reached the engine.
+    let received = backend.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1);
+    assert!(!String::from_utf8_lossy(&received[0].body).contains(&encrypted));
+}
+
+#[tokio::test]
+async fn single_model_process_guards_multipart_model_and_lora_fields() {
+    let backend = start_any_post_backend().await;
+    let app = build_strict_app(&backend.uri());
+    let multipart = |fields: &[(&str, &str)]| {
+        let mut body = String::new();
+        for (name, value) in fields {
+            body.push_str(&format!(
+                "--B\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            ));
+        }
+        body.push_str(
+            "--B\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\
+             Content-Type: audio/wav\r\n\r\nfake\r\n--B--\r\n",
+        );
+        body
+    };
+    let mut statuses = Vec::new();
+    for fields in [
+        vec![("model", "test-model")],
+        vec![("model", "test-model:abliterated")],
+        vec![("model", "test-model"), ("lora_path", "abliterated")],
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/audio/transcriptions")
+                    .header("content-type", "multipart/form-data; boundary=B")
+                    .header(auth_header().0, auth_header().1)
+                    .body(Body::from(multipart(&fields)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        statuses.push(response.status());
+    }
+    assert_eq!(
+        statuses,
+        [
+            StatusCode::OK,
+            StatusCode::NOT_FOUND,
+            StatusCode::BAD_REQUEST
+        ]
+    );
+    assert_eq!(requests_seen(&backend).await, 1);
+}
+
+#[tokio::test]
+async fn single_model_process_refuses_a_colon_in_the_model_id() {
+    let backend = start_any_post_backend().await;
+    let app = build_strict_app(&backend.uri());
+    for model in ["Qwen/Qwen3.8-27B:abliterated", "x:abliterated", ":a"] {
+        for route in ["/v1/chat/completions", "/v1/completions"] {
+            let (status, _) = post_guarded(&app, route, &serde_json::json!({"model": model})).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{route} {model}");
+        }
+    }
+    assert_eq!(requests_seen(&backend).await, 0);
+}
+
+async fn forwarded_lora_paths(backend: &MockServer) -> Vec<Option<String>> {
+    backend
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            body.get("lora_path")
+                .map(|v| v.as_str().unwrap().to_string())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn backend_lora_is_set_on_chat_completions_and_embeddings_only_when_configured() {
+    let routes = ["/v1/chat/completions", "/v1/completions", "/v1/embeddings"];
+    let body = serde_json::json!({"model": "test-model"});
+
+    let backend = start_any_post_backend().await;
+    let app = build_test_app_inner(
+        &backend.uri(),
+        TestAppOptions {
+            backend_lora: Some("abliterated".to_string()),
+            strict_request_model: true,
+            ..Default::default()
+        },
+    );
+    for route in routes {
+        assert_eq!(post_guarded(&app, route, &body).await.0, StatusCode::OK);
+    }
+    // A client cannot supply or override it; the guard refuses first.
+    let (status, _) = post_guarded(
+        &app,
+        "/v1/chat/completions",
+        &serde_json::json!({"model": "test-model", "lora_path": "other"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        forwarded_lora_paths(&backend).await,
+        vec![Some("abliterated".to_string()); 3]
+    );
+
+    let backend = start_any_post_backend().await;
+    let app = build_strict_app(&backend.uri());
+    for route in routes {
+        assert_eq!(post_guarded(&app, route, &body).await.0, StatusCode::OK);
+    }
+    assert_eq!(forwarded_lora_paths(&backend).await, vec![None; 3]);
+}
+
+#[tokio::test]
+async fn without_strict_request_model_any_model_is_served_but_lora_keys_are_refused() {
+    let backend = start_any_post_backend().await;
+    let app = build_test_app(&backend.uri());
+    for route in GUARDED_ROUTES {
+        for model in ["client-alias", "test-model:abliterated", "test-model"] {
+            let (status, _) = post_guarded(&app, route, &serde_json::json!({"model": model})).await;
+            assert_eq!(status, StatusCode::OK, "{route} {model}");
+        }
+        let (status, _) = post_guarded(
+            &app,
+            route,
+            &serde_json::json!({"model": "test-model", "lora_id": "x"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{route}");
+    }
+    assert_eq!(requests_seen(&backend).await, GUARDED_ROUTES.len() * 3);
+}
+
+#[tokio::test]
+async fn backend_lora_embeddings_signature_covers_original_request() {
+    use sha2::{Digest, Sha256};
+    use vllm_proxy_rs::encryption;
+
+    let backend = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "emb-lora-sig",
+            "data": [{"embedding": [0.1, 0.2], "index": 0}],
+            "usage": {"prompt_tokens": 2, "total_tokens": 2}
+        })))
+        .mount(&backend)
+        .await;
+    let app = build_test_app_inner(
+        &backend.uri(),
+        TestAppOptions {
+            backend_lora: Some("abliterated".to_string()),
+            strict_request_model: true,
+            ..Default::default()
+        },
+    );
+
+    // Plaintext, with spacing a re-serialization would not reproduce.
+    let plain_bytes = br#"{ "model" : "test-model",   "input" : "hello" }"#.to_vec();
+    // Encrypted: same idea around two individually encrypted elements.
+    let client_pair = test_client_signing_pair();
+    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
+    let enc_for_request = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: hex::decode(test_ed25519_pub_key_hex()).unwrap(),
+        version: 1,
+        encrypt_all_fields: false,
+    };
+    let enc_a = encryption::encrypt_string("hello", &enc_for_request, &client_pair).unwrap();
+    let enc_b = encryption::encrypt_string("world", &enc_for_request, &client_pair).unwrap();
+    let enc_bytes = format!(
+        r#"{{ "model" : "test-model",  "input" : [ {} ,  {} ] }}"#,
+        serde_json::to_string(&enc_a).unwrap(),
+        serde_json::to_string(&enc_b).unwrap()
+    )
+    .into_bytes();
+
+    for (encrypted, sent) in [(false, plain_bytes), (true, enc_bytes)] {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json")
+            .header(auth_header().0, auth_header().1);
+        if encrypted {
+            builder = builder
+                .header("x-signing-algo", "ed25519")
+                .header("x-client-pub-key", &client_pub_hex);
+        }
+        let response = app
+            .clone()
+            .oneshot(builder.body(Body::from(sent.clone())).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "encrypted={encrypted}");
+        let _ = body_to_bytes(response).await;
+
+        // The upstream got the adapter, and a body that differs from what was sent.
+        let received = backend.received_requests().await.unwrap();
+        let forwarded = &received.last().unwrap().body;
+        let forwarded_json: serde_json::Value = serde_json::from_slice(forwarded).unwrap();
+        assert_eq!(forwarded_json["lora_path"], "abliterated");
+        assert_ne!(forwarded.as_slice(), sent.as_slice());
+
+        let sig_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/signature/emb-lora-sig?signing_algo=ecdsa")
+                    .header(auth_header().0, auth_header().1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sig_response.status(), StatusCode::OK);
+        let sig_body = body_to_json(sig_response).await;
+        let text = sig_body["text"].as_str().unwrap();
+        let signed_request_hash = text.split(':').nth(1).unwrap();
+        assert_eq!(
+            signed_request_hash,
+            hex::encode(Sha256::digest(&sent)),
+            "encrypted={encrypted}"
+        );
+        assert_ne!(
+            signed_request_hash,
+            hex::encode(Sha256::digest(forwarded)),
+            "encrypted={encrypted}"
+        );
+    }
 }

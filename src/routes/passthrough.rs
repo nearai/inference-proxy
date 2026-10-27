@@ -54,6 +54,8 @@ pub async fn tokenize(
 ) -> Result<Response, AppError> {
     let request_body = read_body_with_limit(body, state.config.max_request_size).await?;
     let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
+    // Parsed only to be checked: the original bytes are what is forwarded.
+    crate::model_list::guard_passthrough_body(&state, &proxy::parse_json_object(&request_body)?)?;
 
     let (url, _guard) = state.backend_pool.select_url("/tokenize");
     proxy::proxy_simple(
@@ -225,6 +227,7 @@ pub async fn images_edits(
         } else {
             let data =
                 read_field_chunks(&mut field, &mut total_size, max_size, &mut hasher).await?;
+            crate::model_list::guard_form_field(&state, &name, &data)?;
             let part = build_multipart_part(data, file_name, content_type)?;
             form = form.part(name, part);
         }
@@ -317,6 +320,7 @@ pub async fn audio_transcriptions(
         } else {
             let data =
                 read_field_chunks(&mut field, &mut total_size, max_size, &mut hasher).await?;
+            crate::model_list::guard_form_field(&state, &name, &data)?;
             let part = build_multipart_part(data, file_name, content_type)?;
             form = form.part(name, part);
         }
@@ -384,22 +388,37 @@ async fn json_passthrough_encrypted(
     let max_size = size_fn(&state.config);
     let request_body = read_body_with_limit(body, max_size).await?;
 
+    // Only embeddings take the adapter from the proxy (`lora_path`).
+    let with_lora = matches!(endpoint, Endpoint::Embeddings) && state.config.backend_lora.is_some();
     // When encryption is active, decrypt fields and re-serialize.
     // When inactive, validate JSON but forward the original bytes to
-    // preserve the exact request body for hashing.
+    // preserve the exact request body for hashing, unless the adapter has to
+    // be set on it (the signature then still binds the body the client sent).
     let (forward_body, original_request_hash, response_transform) = if let Some(ctx) = enc_ctx {
         // Hash original client-sent body before decryption for signatures
         let original_hash = hex::encode(sha2::Sha256::digest(&request_body));
         let mut request_json = proxy::parse_json_object(&request_body)?;
         encryption::decrypt_request_fields(&mut request_json, endpoint, &ctx, &state.signing)?;
+        crate::model_list::guard_passthrough_body(&state, &request_json)?;
+        if with_lora {
+            crate::model_list::apply_backend_lora(&state, &mut request_json);
+        }
         let modified =
             serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?;
         let transform = encryption::make_response_transform(endpoint, ctx, state.signing.clone());
         (modified, Some(original_hash), Some(transform))
     } else {
-        // Validate JSON without re-serializing
-        proxy::parse_json_object(&request_body)?;
-        (request_body, None, None)
+        let mut request_json = proxy::parse_json_object(&request_body)?;
+        crate::model_list::guard_passthrough_body(&state, &request_json)?;
+        if with_lora {
+            let original_hash = hex::encode(sha2::Sha256::digest(&request_body));
+            crate::model_list::apply_backend_lora(&state, &mut request_json);
+            let modified =
+                serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?;
+            (modified, Some(original_hash), None)
+        } else {
+            (request_body, None, None)
+        }
     };
 
     let target = passthrough_target(&state, url_override, pool_path);

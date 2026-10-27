@@ -121,6 +121,8 @@ fn build_agent_loop_app_with_cloud_and_idle(
         models_document_url: None,
         capacity_requests_per_minute: 0,
         discount_to_user: None,
+        backend_lora: None,
+        strict_request_model: false,
         reasoning_off_effort: "none".to_string(),
         allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,

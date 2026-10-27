@@ -796,6 +796,19 @@ pub struct Config {
     /// report, where cloud-api applies it after catalog pricing. Requires
     /// `VLLM_PROXY_MODELS_DOCUMENT_URL`.
     pub discount_to_user: Option<f64>,
+    /// Single-model mode: the engine-side LoRA adapter this process's
+    /// `MODEL_NAME` is served by (`VLLM_PROXY_BACKEND_LORA`; unset or empty =
+    /// none). SGLang picks an adapter from a `lora_path` field, not from the
+    /// `model` id, so the proxy sets it on the chat, completions and
+    /// embeddings bodies it forwards (`model_list::apply_backend_lora`).
+    /// Clients may never send one themselves (`guard_request_body`).
+    pub backend_lora: Option<String>,
+    /// Single-model mode: a body `model` must be `MODEL_NAME` byte for byte
+    /// (404 `model_not_found`; 400 for a non-string), instead of being served
+    /// whatever it says (`VLLM_PROXY_STRICT_REQUEST_MODEL`, default off).
+    /// Required by `VLLM_PROXY_BACKEND_LORA`: SGLang resolves `base:adapter`
+    /// in `model` to an adapter. LoRA selector keys are refused either way.
+    pub strict_request_model: bool,
     /// Gateway mode: the `reasoning_effort` that stands for "as little
     /// reasoning as possible" on the served model
     /// (`VLLM_PROXY_REASONING_OFF_EFFORT`, default `none`). Applied to an
@@ -1168,6 +1181,16 @@ impl Config {
                 anyhow::bail!("VLLM_PROXY_DISCOUNT_TO_USER must be valid UTF-8")
             }
         };
+        let backend_lora = env::var("VLLM_PROXY_BACKEND_LORA")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let strict_request_model = env_bool("VLLM_PROXY_STRICT_REQUEST_MODEL");
+        if backend_lora.is_some() && !strict_request_model {
+            anyhow::bail!(
+                "VLLM_PROXY_BACKEND_LORA requires VLLM_PROXY_STRICT_REQUEST_MODEL=1: without it a request `model` of `base:adapter` would select any adapter on the engine"
+            );
+        }
         // Every usage report is billed at the discount, so the listing has to
         // publish it, and only the models document can: without it `/v1/models`
         // would pass the engine's list through at list price.
@@ -1489,6 +1512,8 @@ impl Config {
             models_document_url,
             capacity_requests_per_minute,
             discount_to_user,
+            backend_lora,
+            strict_request_model,
             reasoning_off_effort,
             allowed_org_ids,
             sse_keepalive_secs: env_int("VLLM_PROXY_SSE_KEEPALIVE_SECS", 0) as u64,
@@ -1851,6 +1876,27 @@ mod tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn test_backend_lora_requires_strict_request_model() {
+        let base = [("MODEL_NAME", "m"), ("TOKEN", "t")];
+        let with = |extra: &[(&'static str, &'static str)]| {
+            let mut vars = base.to_vec();
+            vars.extend_from_slice(extra);
+            with_env_vars(&vars, Config::from_env)
+        };
+        let lora = ("VLLM_PROXY_BACKEND_LORA", "abliterated");
+        let strict = ("VLLM_PROXY_STRICT_REQUEST_MODEL", "1");
+        let off = ("VLLM_PROXY_STRICT_REQUEST_MODEL", "");
+        let error = with(&[lora, off]).unwrap_err().to_string();
+        assert!(error.contains("VLLM_PROXY_STRICT_REQUEST_MODEL"), "{error}");
+        let config = with(&[lora, strict]).unwrap();
+        assert_eq!(config.backend_lora.as_deref(), Some("abliterated"));
+        assert!(config.strict_request_model);
+        // Neither is on by default.
+        let config = with(&[off]).unwrap();
+        assert!(config.backend_lora.is_none() && !config.strict_request_model);
     }
 
     #[test]

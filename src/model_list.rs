@@ -1086,8 +1086,9 @@ fn count_model_match(result: ModelMatch) {
 /// authentication, so an unauthenticated caller cannot use the 404 to
 /// enumerate models.
 ///
-/// A single-model process serves its one model whatever the body says, as it
-/// always has. When it runs as a gateway lane — outside a TEE
+/// A single-model process serves its one model whatever the body says, unless
+/// `VLLM_PROXY_STRICT_REQUEST_MODEL` makes `guard_request_body` refuse a body
+/// that names another. When it runs as a gateway lane — outside a TEE
 /// (`NON_TEE_DEPLOYMENT`) and with a backend token, which together no proxy
 /// inside a CVM has — it also counts how the body's `model` compares with
 /// `MODEL_NAME`, so the effect of exact matching can be read from production
@@ -1104,5 +1105,92 @@ pub fn model_for<'a>(state: &'a AppState, request: &Value) -> Result<ModelView<'
             }
             Ok(ModelView::single(state))
         }
+    }
+}
+
+/// Body keys that make an SGLang engine started with `--enable-lora` serve a
+/// request with an adapter. The caller never picks one: the model a process
+/// serves is its `MODEL_NAME`, and an adapter is another model.
+pub(crate) const LORA_SELECTOR_KEYS: [&str; 3] = ["lora_path", "lora_id", "lora_name"];
+
+/// The model a JSON body is compared with: the one it is served as in list
+/// mode, or `id` in a single-model process that runs with
+/// `VLLM_PROXY_STRICT_REQUEST_MODEL`. Otherwise `None`: the process serves its
+/// one model whatever the body says.
+pub fn checked_model<'a>(state: &AppState, id: &'a str) -> Option<&'a str> {
+    (state.models.is_some() || state.config.strict_request_model).then_some(id)
+}
+
+/// The last check before a JSON body goes to the engine, run on the body that
+/// is forwarded (after decryption, so a decrypted field cannot bring in what
+/// the plaintext could not). `served_model` is the model this request is
+/// served as, `None` when `model` is not checked.
+///
+/// - A `model` in the body must be `served_model`, byte for byte: no prefix,
+///   no case folding and no `base:adapter` form, all of which the engine
+///   would resolve to an adapter. A missing `model` is left to the engine's
+///   default, as it always was. A `model` that is not a string is a 400.
+/// - A LoRA selector key at the top level is a 400, whatever `served_model`
+///   is. It is refused, not stripped, so a caller who sends one learns it did
+///   nothing.
+pub fn guard_request_body(request: &Value, served_model: Option<&str>) -> Result<(), AppError> {
+    if let Some(key) = LORA_SELECTOR_KEYS
+        .iter()
+        .find(|key| request.get(**key).is_some())
+    {
+        return Err(lora_selector_refused(key));
+    }
+    match (request.get("model"), served_model) {
+        (None, _) | (Some(_), None) => Ok(()),
+        (Some(Value::String(requested)), Some(served)) if requested == served => Ok(()),
+        (Some(Value::String(requested)), Some(_)) => Err(AppError::ModelNotFound {
+            model: Some(requested.clone()),
+        }),
+        (Some(_), Some(_)) => Err(AppError::BadRequest("`model` must be a string".to_string())),
+    }
+}
+
+fn lora_selector_refused(key: &str) -> AppError {
+    AppError::BadRequest(format!(
+        "`{key}` is not supported: the model is chosen by `model` alone"
+    ))
+}
+
+/// `guard_request_body` for one field of a multipart form (images/edits,
+/// audio/transcriptions), where the same `model` and LoRA keys travel as
+/// fields. Run on the field as forwarded.
+pub fn guard_form_field(state: &AppState, name: &str, value: &[u8]) -> Result<(), AppError> {
+    if let Some(key) = LORA_SELECTOR_KEYS.iter().find(|key| **key == name) {
+        return Err(lora_selector_refused(key));
+    }
+    if name == "model"
+        && state.models.is_none()
+        && state.config.strict_request_model
+        && value != state.config.model_name.as_bytes()
+    {
+        return Err(AppError::ModelNotFound {
+            model: Some(String::from_utf8_lossy(value).into_owned()),
+        });
+    }
+    Ok(())
+}
+
+/// `guard_request_body` for a route outside `model_for` (tokenize, embeddings,
+/// rerank, score, images): in a strict single-model process the body's
+/// `model` is compared with `MODEL_NAME`; a gateway list has no one model for
+/// these routes, so there only the LoRA keys are refused.
+pub fn guard_passthrough_body(state: &AppState, request: &Value) -> Result<(), AppError> {
+    let served = (state.models.is_none() && state.config.strict_request_model)
+        .then_some(state.config.model_name.as_str());
+    guard_request_body(request, served)
+}
+
+/// Single-model mode: point the engine at the adapter `MODEL_NAME` stands for
+/// (`VLLM_PROXY_BACKEND_LORA`) by setting `lora_path` on a body that has passed
+/// `guard_request_body`, so no client value can be there to overwrite. A
+/// gateway list serves base models and never sets it.
+pub fn apply_backend_lora(state: &AppState, request: &mut Value) {
+    if let (None, Some(lora)) = (&state.models, &state.config.backend_lora) {
+        request["lora_path"] = Value::String(lora.clone());
     }
 }

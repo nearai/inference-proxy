@@ -59,7 +59,7 @@ impl EncryptionContext {
     }
 
     /// Request-only AAD. The suite byte also fixes the key's encoding/length.
-    fn request_aad(&self) -> Result<Vec<u8>, AppError> {
+    fn request_aad(&self, field: &str) -> Result<Vec<u8>, AppError> {
         if self.version != 3 {
             return Ok(Vec::new());
         }
@@ -69,6 +69,8 @@ impl EncryptionContext {
             EncryptionAlgo::Ed25519 => 2,
         });
         aad.extend_from_slice(&self.canonical_reply_key()?);
+        aad.push(0);
+        aad.extend_from_slice(field.as_bytes());
         Ok(aad)
     }
 }
@@ -507,6 +509,16 @@ pub fn decrypt_string(
     ctx: &EncryptionContext,
     signing: &SigningPair,
 ) -> Result<String, AppError> {
+    decrypt_string_for_field(hex_ciphertext, ctx, signing, "")
+}
+
+/// Decrypt a request value using its protocol field label.
+pub fn decrypt_string_for_field(
+    hex_ciphertext: &str,
+    ctx: &EncryptionContext,
+    signing: &SigningPair,
+    field: &str,
+) -> Result<String, AppError> {
     if hex_ciphertext.is_empty() {
         return Ok(String::new());
     }
@@ -516,7 +528,7 @@ pub fn decrypt_string(
     // Use a generic error message for all decryption failures to avoid
     // leaking oracle information (e.g. distinguishing "too short" from
     // "authentication tag mismatch").
-    let aad = ctx.request_aad()?;
+    let aad = ctx.request_aad(field)?;
     let plaintext_bytes = match ctx.algo {
         EncryptionAlgo::Ed25519 => {
             let x25519_secret = nacl::ed25519_secret_to_x25519(signing.ed25519.secret_bytes());
@@ -577,14 +589,14 @@ pub fn decrypt_request_fields(
                 // Only the object form contains a sensitive function name.
                 if let Some(tc) = value.get_mut("tool_choice") {
                     if let Some(func) = tc.get_mut("function") {
-                        try_decrypt_field(func, "name", ctx, signing)?;
+                        try_decrypt_field(func, "name", "tool_choice.function.name", ctx, signing)?;
                     }
                 }
                 // Deprecated function_call request param: string ("auto"/"none")
                 // or {"name":"..."}.
                 if let Some(fc) = value.get_mut("function_call") {
                     if fc.is_object() {
-                        try_decrypt_field(fc, "name", ctx, signing)?;
+                        try_decrypt_field(fc, "name", "function_call.name", ctx, signing)?;
                     }
                 }
             }
@@ -594,7 +606,7 @@ pub fn decrypt_request_fields(
             decrypt_field_or_array(value, "prompt", ctx, signing)?;
         }
         Endpoint::ImagesGenerations | Endpoint::ImagesEdits => {
-            decrypt_field(value, "prompt", ctx, signing)?;
+            decrypt_field(value, "prompt", "prompt", ctx, signing)?;
         }
         Endpoint::Embeddings => {
             // Input can be an encrypted string or an array of encrypted strings.
@@ -602,15 +614,15 @@ pub fn decrypt_request_fields(
             decrypt_field_or_array(value, "input", ctx, signing)?;
         }
         Endpoint::AudioTranscriptions => {
-            decrypt_field(value, "prompt", ctx, signing)?;
+            decrypt_field(value, "prompt", "prompt", ctx, signing)?;
         }
         Endpoint::Rerank => {
-            decrypt_field(value, "query", ctx, signing)?;
+            decrypt_field(value, "query", "query", ctx, signing)?;
             decrypt_rerank_documents(value, ctx, signing)?;
         }
         Endpoint::Score => {
-            decrypt_field(value, "text_1", ctx, signing)?;
-            decrypt_field(value, "text_2", ctx, signing)?;
+            decrypt_field(value, "text_1", "text_1", ctx, signing)?;
+            decrypt_field(value, "text_2", "text_2", ctx, signing)?;
         }
     }
     Ok(())
@@ -623,8 +635,11 @@ pub fn encrypt_response_fields(
     ctx: &EncryptionContext,
     signing: &SigningPair,
 ) -> Result<(), AppError> {
+    if sanitize_encrypted_error(value) {
+        return Ok(());
+    }
     if ctx.version == 3 && matches!(endpoint, Endpoint::ChatCompletions | Endpoint::Completions) {
-        strip_completion_metadata(value);
+        retain_completion_fields(value, endpoint, false);
     }
     match endpoint {
         Endpoint::ChatCompletions => {
@@ -666,7 +681,24 @@ pub fn encrypt_response_fields(
         }
         Endpoint::Rerank => {
             if let Some(results) = value.get_mut("results").and_then(|r| r.as_array_mut()) {
+                if ctx.version == 3 {
+                    results.sort_by(|a, b| {
+                        match (a["relevance_score"].as_f64(), b["relevance_score"].as_f64()) {
+                            (Some(a), Some(b)) => b.total_cmp(&a),
+                            _ => std::cmp::Ordering::Equal,
+                        }
+                    });
+                }
                 for result in results.iter_mut() {
+                    if ctx.version == 3 {
+                        if let Some(score) = result.get_mut("relevance_score") {
+                            *score = serde_json::Value::String(encrypt_string(
+                                &score.to_string(),
+                                ctx,
+                                signing,
+                            )?);
+                        }
+                    }
                     if let Some(doc) = result.get_mut("document") {
                         encrypt_field(doc, "text", ctx, signing)?;
                     }
@@ -693,8 +725,11 @@ pub fn encrypt_streaming_chunk(
     ctx: &EncryptionContext,
     signing: &SigningPair,
 ) -> Result<(), AppError> {
+    if sanitize_encrypted_error(value) {
+        return Ok(());
+    }
     if ctx.version == 3 && matches!(endpoint, Endpoint::ChatCompletions | Endpoint::Completions) {
-        strip_completion_metadata(value);
+        retain_completion_fields(value, endpoint, true);
     }
     match endpoint {
         Endpoint::ChatCompletions => encrypt_chat_response_choices(value, ctx, signing, true),
@@ -750,31 +785,177 @@ fn validate_completion_metadata_options(value: &serde_json::Value) -> Result<(),
     Ok(())
 }
 
-/// Filter engine metadata even when it is emitted without an explicit request.
-fn strip_completion_metadata(value: &mut serde_json::Value) {
-    fn strip(object: &mut serde_json::Value) {
-        if let Some(object) = object.as_object_mut() {
-            for field in [
-                "prompt_token_ids",
-                "token_ids",
-                "prompt_text",
-                "prompt_logprobs",
-            ] {
-                object.remove(field);
-            }
+/// Errors are outside the encrypted response field set, including SSE errors.
+fn sanitize_encrypted_error(value: &mut serde_json::Value) -> bool {
+    let error = if let Some(error) = value.get("error").filter(|e| !e.is_null()) {
+        error
+    } else if value.get("object").and_then(|v| v.as_str()) == Some("error") {
+        &*value
+    } else {
+        return false;
+    };
+    let error_type = crate::error::safe_upstream_error_type(
+        error
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("upstream_error"),
+    );
+    let code = error
+        .get("code")
+        .and_then(|v| v.as_u64())
+        .filter(|c| (400..600).contains(c));
+    *value = serde_json::json!({"error": {
+        "message": crate::error::E2EE_UPSTREAM_MESSAGE,
+        "type": error_type,
+        "param": null,
+        "code": code,
+    }});
+    true
+}
+
+/// Retain only response fields with an explicit v3 encryption or metadata policy.
+fn retain_completion_fields(value: &mut serde_json::Value, endpoint: Endpoint, streaming: bool) {
+    fn object(value: &mut serde_json::Value, allowed: &[&str]) {
+        if let Some(map) = value.as_object_mut() {
+            map.retain(|key, _| allowed.contains(&key.as_str()));
+        } else {
+            *value = serde_json::Value::Null;
         }
     }
-
-    strip(value);
-    if let Some(choices) = value.get_mut("choices").and_then(|v| v.as_array_mut()) {
-        for choice in choices {
-            strip(choice);
-            for key in ["message", "delta"] {
-                if let Some(message) = choice.get_mut(key) {
-                    strip(message);
+    fn array(value: &mut serde_json::Value, mut retain: impl FnMut(&mut serde_json::Value)) {
+        if let Some(items) = value.as_array_mut() {
+            for item in items {
+                retain(item);
+            }
+        } else {
+            *value = serde_json::Value::Null;
+        }
+    }
+    fn logprob(entry: &mut serde_json::Value) {
+        object(entry, &["token", "bytes", "logprob", "top_logprobs"]);
+        if let Some(top) = entry.get_mut("top_logprobs") {
+            array(top, |entry| object(entry, &["token", "bytes", "logprob"]));
+        }
+    }
+    object(
+        value,
+        &[
+            "id",
+            "object",
+            "created",
+            "model",
+            "choices",
+            "usage",
+            "system_fingerprint",
+            "service_tier",
+        ],
+    );
+    if let Some(usage) = value.get_mut("usage") {
+        object(
+            usage,
+            &[
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
+                "reasoning_tokens",
+                "prompt_tokens_details",
+                "completion_tokens_details",
+            ],
+        );
+        if let Some(details) = usage.get_mut("prompt_tokens_details") {
+            object(details, &["cached_tokens", "audio_tokens"]);
+        }
+        if let Some(details) = usage.get_mut("completion_tokens_details") {
+            object(
+                details,
+                &[
+                    "reasoning_tokens",
+                    "audio_tokens",
+                    "accepted_prediction_tokens",
+                    "rejected_prediction_tokens",
+                ],
+            );
+        }
+    }
+    if let Some(choices) = value.get_mut("choices") {
+        array(choices, |choice| {
+            let content_key = match endpoint {
+                Endpoint::ChatCompletions if streaming => "delta",
+                Endpoint::ChatCompletions => "message",
+                _ => "text",
+            };
+            object(
+                choice,
+                &[
+                    "index",
+                    content_key,
+                    "finish_reason",
+                    "logprobs",
+                    "nearai_loop_terminated",
+                ],
+            );
+            if matches!(endpoint, Endpoint::ChatCompletions) {
+                if let Some(logprobs) = choice.get_mut("logprobs") {
+                    object(logprobs, &["content", "refusal"]);
+                    for field in ["content", "refusal"] {
+                        if let Some(entries) = logprobs.get_mut(field) {
+                            array(entries, logprob);
+                        }
+                    }
                 }
             }
-        }
+            for field in ["message", "delta"] {
+                if let Some(message) = choice.get_mut(field) {
+                    object(
+                        message,
+                        &[
+                            "role",
+                            "content",
+                            "reasoning_content",
+                            "reasoning",
+                            "refusal",
+                            "audio",
+                            "tool_calls",
+                            "function_call",
+                            "nearai_tool_result",
+                        ],
+                    );
+                    if let Some(content) = message.get_mut("content").filter(|v| v.is_array()) {
+                        array(content, |part| object(part, &["type", "text"]));
+                    }
+                    if let Some(audio) = message.get_mut("audio") {
+                        object(audio, &["id", "expires_at", "data"]);
+                    }
+                    if let Some(calls) = message.get_mut("tool_calls") {
+                        array(calls, |call| {
+                            object(call, &["index", "id", "type", "function"]);
+                            if let Some(function) = call.get_mut("function") {
+                                object(function, &["name", "arguments"]);
+                            }
+                        });
+                    }
+                    if let Some(function) = message.get_mut("function_call") {
+                        object(function, &["name", "arguments"]);
+                    }
+                    if let Some(result) = message.get_mut("nearai_tool_result") {
+                        object(result, &["tool_call_id", "name", "status", "output"]);
+                        if let Some(result) = result.as_object_mut() {
+                            if result.get("name").and_then(|v| v.as_str())
+                                != Some(crate::agent_loop::WEB_CONTEXT_SEARCH_TOOL_NAME)
+                            {
+                                result.remove("name");
+                            }
+                            if !matches!(
+                                result.get("status").and_then(|v| v.as_str()),
+                                Some("ok" | "timeout" | "error")
+                            ) {
+                                result.remove("status");
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -790,8 +971,14 @@ fn decrypt_tools_definitions(
     if let Some(tools) = value.get_mut("tools").and_then(|t| t.as_array_mut()) {
         for tool in tools.iter_mut() {
             if let Some(func) = tool.get_mut("function") {
-                try_decrypt_field(func, "name", ctx, signing)?;
-                try_decrypt_field(func, "description", ctx, signing)?;
+                try_decrypt_field(func, "name", "tools[].function.name", ctx, signing)?;
+                try_decrypt_field(
+                    func,
+                    "description",
+                    "tools[].function.description",
+                    ctx,
+                    signing,
+                )?;
                 // parameters is a JSON schema object — client encrypts as serialized JSON string
                 if let Some(params) = func.get_mut("parameters") {
                     if ctx.version == 3 {
@@ -801,7 +988,12 @@ fn decrypt_tools_definitions(
                                     "Encrypted tool parameters must be a string".into(),
                                 )
                             })?;
-                            let plaintext = decrypt_string(ciphertext, ctx, signing)?;
+                            let plaintext = decrypt_string_for_field(
+                                ciphertext,
+                                ctx,
+                                signing,
+                                "tools[].function.parameters",
+                            )?;
                             *params = serde_json::from_str(&plaintext).map_err(|_| {
                                 AppError::BadRequest(
                                     "Decrypted tool parameters must be valid JSON".into(),
@@ -812,7 +1004,12 @@ fn decrypt_tools_definitions(
                     }
                     if let Some(s) = params.as_str() {
                         if !s.is_empty() {
-                            if let Ok(decrypted) = decrypt_string(s, ctx, signing) {
+                            if let Ok(decrypted) = decrypt_string_for_field(
+                                s,
+                                ctx,
+                                signing,
+                                "tools[].function.parameters",
+                            ) {
                                 // Restore the JSON schema object from the decrypted string
                                 if let Ok(parsed) =
                                     serde_json::from_str::<serde_json::Value>(&decrypted)
@@ -851,7 +1048,7 @@ fn decrypt_chat_message_fields(
 
         if let Some(s) = content.as_str() {
             if !s.is_empty() {
-                let decrypted = decrypt_string(s, ctx, signing)?;
+                let decrypted = decrypt_string_for_field(s, ctx, signing, "messages[].content")?;
                 // Try to parse as JSON array (multimodal content parts)
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&decrypted) {
                     if parsed.is_array() {
@@ -866,35 +1063,59 @@ fn decrypt_chat_message_fields(
         }
     }
 
-    decrypt_field(msg, "reasoning_content", ctx, signing)?;
-    decrypt_field(msg, "reasoning", ctx, signing)?;
+    decrypt_field(
+        msg,
+        "reasoning_content",
+        "messages[].reasoning_content",
+        ctx,
+        signing,
+    )?;
+    decrypt_field(msg, "reasoning", "messages[].reasoning", ctx, signing)?;
 
     // audio.data
     if let Some(audio) = msg.get_mut("audio") {
-        decrypt_field(audio, "data", ctx, signing)?;
+        decrypt_field(audio, "data", "messages[].audio.data", ctx, signing)?;
     }
 
     // v3 authenticates every protected field; legacy clients retain opt-in,
     // lenient handling of the extended fields.
     if ctx.all_fields() {
-        try_decrypt_field(msg, "refusal", ctx, signing)?;
+        try_decrypt_field(msg, "refusal", "messages[].refusal", ctx, signing)?;
         // Top-level name field used in tool/function role messages
-        try_decrypt_field(msg, "name", ctx, signing)?;
+        try_decrypt_field(msg, "name", "messages[].name", ctx, signing)?;
 
         // tool_calls[].function.arguments and .name
         if let Some(tool_calls) = msg.get_mut("tool_calls").and_then(|tc| tc.as_array_mut()) {
             for tc in tool_calls.iter_mut() {
                 if let Some(func) = tc.get_mut("function") {
-                    try_decrypt_field(func, "arguments", ctx, signing)?;
-                    try_decrypt_field(func, "name", ctx, signing)?;
+                    try_decrypt_field(
+                        func,
+                        "arguments",
+                        "messages[].tool_calls[].function.arguments",
+                        ctx,
+                        signing,
+                    )?;
+                    try_decrypt_field(
+                        func,
+                        "name",
+                        "messages[].tool_calls[].function.name",
+                        ctx,
+                        signing,
+                    )?;
                 }
             }
         }
 
         // deprecated function_call.arguments and .name
         if let Some(fc) = msg.get_mut("function_call") {
-            try_decrypt_field(fc, "arguments", ctx, signing)?;
-            try_decrypt_field(fc, "name", ctx, signing)?;
+            try_decrypt_field(
+                fc,
+                "arguments",
+                "messages[].function_call.arguments",
+                ctx,
+                signing,
+            )?;
+            try_decrypt_field(fc, "name", "messages[].function_call.name", ctx, signing)?;
         }
     }
 
@@ -998,6 +1219,11 @@ fn encrypt_bytes_field(
     signing: &SigningPair,
 ) -> Result<(), AppError> {
     if let Some(bytes_val) = obj.get_mut("bytes") {
+        if ctx.version == 3 && !bytes_val.is_array() && !bytes_val.is_null() {
+            return Err(AppError::Internal(anyhow::anyhow!(
+                "Invalid response logprob bytes"
+            )));
+        }
         if bytes_val.is_array() {
             let json_str =
                 serde_json::to_string(bytes_val).map_err(|e| AppError::Internal(e.into()))?;
@@ -1023,6 +1249,11 @@ fn encrypt_content_field(
                 encrypt_field(part, "text", ctx, signing)?;
             }
         }
+        Some(value) if ctx.version == 3 && !value.is_null() && !value.is_string() => {
+            return Err(AppError::Internal(anyhow::anyhow!(
+                "Invalid response content"
+            )));
+        }
         _ => {}
     }
     Ok(())
@@ -1032,6 +1263,7 @@ fn encrypt_content_field(
 fn decrypt_field(
     obj: &mut serde_json::Value,
     field: &str,
+    label: &str,
     ctx: &EncryptionContext,
     signing: &SigningPair,
 ) -> Result<(), AppError> {
@@ -1044,7 +1276,7 @@ fn decrypt_field(
         if let Some(s) = val.as_str() {
             if !s.is_empty() {
                 let s_owned = s.to_string();
-                let decrypted = decrypt_string(&s_owned, ctx, signing)?;
+                let decrypted = decrypt_string_for_field(&s_owned, ctx, signing, label)?;
                 *val = serde_json::Value::String(decrypted);
             }
         }
@@ -1058,16 +1290,17 @@ fn decrypt_field(
 fn try_decrypt_field(
     obj: &mut serde_json::Value,
     field: &str,
+    label: &str,
     ctx: &EncryptionContext,
     signing: &SigningPair,
 ) -> Result<(), AppError> {
     if ctx.version == 3 {
-        return decrypt_field(obj, field, ctx, signing);
+        return decrypt_field(obj, field, label, ctx, signing);
     }
     if let Some(val) = obj.get_mut(field) {
         if let Some(s) = val.as_str() {
             if !s.is_empty() {
-                if let Ok(decrypted) = decrypt_string(s, ctx, signing) {
+                if let Ok(decrypted) = decrypt_string_for_field(s, ctx, signing, label) {
                     *val = serde_json::Value::String(decrypted);
                 }
                 // On failure, leave original value — assume plaintext
@@ -1087,7 +1320,7 @@ fn decrypt_field_or_array(
 ) -> Result<(), AppError> {
     match obj.get_mut(field) {
         Some(serde_json::Value::String(s)) if !s.is_empty() => {
-            let decrypted = decrypt_string(s, ctx, signing)?;
+            let decrypted = decrypt_string_for_field(s, ctx, signing, field)?;
             *s = decrypted;
         }
         Some(serde_json::Value::Array(arr)) => {
@@ -1095,7 +1328,7 @@ fn decrypt_field_or_array(
                 if let Some(s) = item.as_str() {
                     if !s.is_empty() {
                         let s_owned = s.to_string();
-                        let decrypted = decrypt_string(&s_owned, ctx, signing)?;
+                        let decrypted = decrypt_string_for_field(&s_owned, ctx, signing, field)?;
                         *item = serde_json::Value::String(decrypted);
                     }
                 }
@@ -1123,11 +1356,11 @@ fn decrypt_rerank_documents(
         for doc in docs.iter_mut() {
             match doc {
                 serde_json::Value::String(s) if !s.is_empty() => {
-                    let decrypted = decrypt_string(s, ctx, signing)?;
+                    let decrypted = decrypt_string_for_field(s, ctx, signing, "documents[]")?;
                     *s = decrypted;
                 }
                 serde_json::Value::Object(_) => {
-                    decrypt_field(doc, "text", ctx, signing)?;
+                    decrypt_field(doc, "text", "documents[].text", ctx, signing)?;
                 }
                 _ => {}
             }
@@ -1144,6 +1377,11 @@ fn encrypt_field(
     signing: &SigningPair,
 ) -> Result<(), AppError> {
     if let Some(val) = obj.get_mut(field) {
+        if ctx.version == 3 && !val.is_null() && !val.is_string() {
+            return Err(AppError::Internal(anyhow::anyhow!(
+                "Invalid protected response field"
+            )));
+        }
         if let Some(s) = val.as_str() {
             if !s.is_empty() {
                 let s_owned = s.to_string();

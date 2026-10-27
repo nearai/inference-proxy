@@ -13,6 +13,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use vllm_proxy_rs::*;
 
 struct TestAppOptions {
+    stream_commit_ms: u64,
     rate_per_second: u64,
     rate_burst: u32,
     dstack_socket_path: String,
@@ -42,6 +43,7 @@ struct TestAppOptions {
 impl Default for TestAppOptions {
     fn default() -> Self {
         Self {
+            stream_commit_ms: 0,
             rate_per_second: 100,
             rate_burst: 200,
             dstack_socket_path: "/var/run/dstack.sock".to_string(),
@@ -275,7 +277,7 @@ fn build_test_app_inner_with_pool(
         non_tee_deployment: false,
         map_queue_full_to_429: false,
         stream_error_peek_ms: 0,
-        stream_commit_ms: 0,
+        stream_commit_ms: options.stream_commit_ms,
         first_token_deadline_ms: 0,
         first_token_deadline_per_1k_tokens_ms: 0,
         first_token_deadline_max_ms: 0,
@@ -11122,6 +11124,8 @@ async fn test_e2ee_v3_authenticates_before_upstream_and_forces_response_encrypti
                 "choices": [{
                     "index": 0,
                     "token_ids": [303, 404],
+                    "matched_stop": "private stop", "stop_reason": 101,
+                    "meta_info": {"private": "value"}, "hidden_states": [[0.5]], "sglext": "private extension",
                     key: {
                         "role": "assistant",
                         "content": "private answer",
@@ -11219,6 +11223,11 @@ async fn test_e2ee_v3_authenticates_before_upstream_and_forces_response_encrypti
                         "token_ids",
                         "prompt_text",
                         "prompt_logprobs",
+                        "matched_stop",
+                        "stop_reason",
+                        "meta_info",
+                        "hidden_states",
+                        "sglext",
                     ] {
                         assert!(
                             object.get(field).is_none(),
@@ -11724,5 +11733,86 @@ async fn backend_lora_embeddings_signature_covers_original_request() {
             hex::encode(Sha256::digest(forwarded)),
             "encrypted={encrypted}"
         );
+    }
+}
+
+#[tokio::test]
+async fn test_e2ee_upstream_errors_are_redacted_in_http_and_sse() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/e2ee-v3.json")).unwrap();
+    for vector in fixture["vectors"].as_array().unwrap() {
+        for (streaming, commit_ms, in_band) in [
+            (false, 0, false),
+            (true, 0, false),
+            (true, 1, false),
+            (false, 0, true),
+            (true, 0, true),
+        ] {
+            let upstream = MockServer::start().await;
+            let error = serde_json::json!({"error":{"message":"backend private value","type":"private type","code":400}});
+            let response = if in_band {
+                ResponseTemplate::new(200).set_body_raw(
+                    format!("data: {{\"id\":\"chat-error\",\"choices\":[]}}\n\ndata: {error}\n\ndata: [DONE]\n\n"),
+                    "text/event-stream",
+                )
+            } else {
+                let response = ResponseTemplate::new(400).set_body_json(error);
+                if commit_ms > 0 {
+                    response.set_delay(Duration::from_millis(50))
+                } else {
+                    response
+                }
+            };
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&upstream)
+                .await;
+            let app = build_test_app_inner(
+                &upstream.uri(),
+                TestAppOptions {
+                    stream_commit_ms: commit_ms,
+                    ..Default::default()
+                },
+            );
+            let body = serde_json::json!({"model":"test-model","messages":[{"role":"user","content":vector["ciphertext"]}],"stream":streaming});
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header(auth_header().0, auth_header().1)
+                        .header("content-type", "application/json")
+                        .header("x-signing-algo", vector["signing_algo"].as_str().unwrap())
+                        .header("x-client-pub-key", vector["reply_public"].as_str().unwrap())
+                        .header("x-encryption-version", "3")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(
+                !text.contains("private"),
+                "stream={streaming}, commit={commit_ms}, in_band={in_band}"
+            );
+            assert!(
+                text.contains("Upstream request failed"),
+                "stream={streaming}, commit={commit_ms}, in_band={in_band}: {status} {text}"
+            );
+            assert_eq!(
+                status,
+                if streaming && (in_band || commit_ms > 0) {
+                    StatusCode::OK
+                } else {
+                    StatusCode::BAD_REQUEST
+                }
+            );
+        }
     }
 }

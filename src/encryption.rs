@@ -26,10 +26,8 @@ pub struct EncryptionContext {
     pub client_pub_key: Vec<u8>,
     /// 1 = legacy NaCl box, 2 = HKDF AEAD, 3 = reply-key-bound requests.
     pub version: u8,
-    /// When true, encrypt/decrypt all sensitive fields (tool_calls, refusal, logprobs,
-    /// function_call, tools definitions). When false, only the legacy set (content,
-    /// reasoning_content, reasoning, audio.data) is covered.
-    /// Mandatory in v3; controlled by `X-Encrypt-All-Fields` in v1/v2.
+    /// Selects extended field encryption in v1/v2 via `X-Encrypt-All-Fields`.
+    /// V3 always uses the extended field set through `all_fields()`.
     pub encrypt_all_fields: bool,
 }
 
@@ -599,8 +597,8 @@ pub fn decrypt_request_fields(
             decrypt_field(value, "prompt", ctx, signing)?;
         }
         Endpoint::Embeddings => {
-            // input can be a string or array of strings; non-string elements
-            // (token ID arrays) pass through unchanged — matches Python proxy.
+            // Input can be an encrypted string or an array of encrypted strings.
+            // Legacy versions also pass through token ID arrays.
             decrypt_field_or_array(value, "input", ctx, signing)?;
         }
         Endpoint::AudioTranscriptions => {
@@ -933,7 +931,7 @@ fn encrypt_chat_response_choices(
                     encrypt_field(tool_result, "output", ctx, signing)?;
                 }
 
-                // Extended fields — only when client opts in
+                // Extended fields: always in v3, opt-in in v1/v2.
                 if ctx.all_fields() {
                     encrypt_field(msg, "refusal", ctx, signing)?;
 
@@ -1054,10 +1052,9 @@ fn decrypt_field(
     Ok(())
 }
 
-/// Try to decrypt a single string field on an object, in-place.
-/// If decryption fails (e.g. field contains plaintext), the original value is preserved.
-/// This provides backward compatibility: existing E2EE clients that don't encrypt
-/// newly-added fields (tool_calls, refusal, tools, name) won't get 400 errors.
+/// Decrypt an extended request field in-place.
+/// V3 requires successful decryption. V1/v2 preserve the original value on failure
+/// to support clients that send extended fields as plaintext.
 fn try_decrypt_field(
     obj: &mut serde_json::Value,
     field: &str,

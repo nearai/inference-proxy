@@ -168,6 +168,8 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         models_document_url: options.models_document_url.clone(),
         capacity_requests_per_minute: options.capacity_requests_per_minute,
         discount_to_user: options.discount_to_user,
+        backend_lora: None,
+        strict_request_model: false,
         reasoning_off_effort: options
             .reasoning_off_effort
             .clone()

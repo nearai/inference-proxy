@@ -80,6 +80,12 @@ async fn serve(
             &state.signing,
         )?;
     }
+    // See the chat route: the check runs on the body that is forwarded.
+    crate::model_list::guard_request_body(
+        &request_json,
+        crate::model_list::checked_model(&state, model.id),
+    )?;
+    crate::model_list::apply_backend_lora(&state, &mut request_json);
 
     let is_stream = request_json
         .get("stream")

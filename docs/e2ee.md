@@ -113,5 +113,6 @@ A replay with the original reply key can still be processed; its response is
 encrypted to that key. Replay prevention and authentication of other request
 metadata are separate protocol properties.
 
-The [shared test vectors](../tests/fixtures/e2ee-v3.json) contain public test keys
-and independent AES-GCM/libsodium ciphertexts, also consumed by all four SDKs.
+The [protocol test vectors](../tests/fixtures/e2ee-v3.json) contain public test keys
+and independent AES-GCM/libsodium ciphertexts. Their format is shared with the
+test fixtures in all four SDKs.

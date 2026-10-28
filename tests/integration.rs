@@ -3602,6 +3602,103 @@ async fn test_encrypted_forced_fusion_decrypts_request_and_encrypts_final_answer
     assert_eq!(decrypted, "Encrypted fusion final.");
 }
 
+#[tokio::test]
+async fn test_e2ee_fusion_errors_are_redacted_in_preflight_and_synthesis() {
+    use wiremock::matchers::body_string_contains;
+
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/e2ee-v3.json")).unwrap();
+    for vector in fixture["vectors"].as_array().unwrap() {
+        let plaintext = vector["plaintext"].as_str().unwrap();
+        for streaming in [false, true] {
+            for synthesis in [false, true] {
+                let upstream = MockServer::start().await;
+                if synthesis {
+                    Mock::given(method("GET"))
+                        .and(path("/endpoints"))
+                        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "endpoints": [{"domain": upstream.uri(), "models": ["panel-a"]}]
+                        })))
+                        .expect(1)
+                        .mount(&upstream)
+                        .await;
+                    Mock::given(method("GET"))
+                        .and(path("/v1/attestation/report"))
+                        .respond_with(
+                            ResponseTemplate::new(200)
+                                .set_body_json(serde_json::json!({"ok": true})),
+                        )
+                        .mount(&upstream)
+                        .await;
+                    Mock::given(method("POST"))
+                        .and(path("/v1/chat/completions"))
+                        .and(header("authorization", "Bearer fusion-token"))
+                        .and(body_string_contains("one member of a private multi-model panel"))
+                        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "id": "panel-e2ee-error-test",
+                            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Panel answer"}, "finish_reason": "stop"}]
+                        })))
+                        .expect(1)
+                        .mount(&upstream)
+                        .await;
+                }
+
+                let stage = if synthesis {
+                    "final synthesis model"
+                } else {
+                    "__nearai_fusion"
+                };
+                Mock::given(method("POST"))
+                    .and(path("/v1/chat/completions"))
+                    .and(body_string_contains(stage))
+                    .and(body_string_contains(plaintext))
+                    .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                        "error": {"message": format!("Invalid request value: {plaintext}"), "type": "invalid_request_error"}
+                    })))
+                    .expect(1)
+                    .mount(&upstream)
+                    .await;
+
+                let app = build_test_app_with_fusion(
+                    &upstream.uri(),
+                    format!("{}/endpoints", upstream.uri()),
+                );
+                let body = serde_json::json!({
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": vector["ciphertext"]}],
+                    "tools": [{"type": "nearai:fusion", "analysis_models": ["panel-a"]}],
+                    "tool_choice": if synthesis { "required" } else { "auto" },
+                    "stream": streaming
+                });
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/v1/chat/completions")
+                            .header(auth_header().0, auth_header().1)
+                            .header("content-type", "application/json")
+                            .header("x-signing-algo", vector["signing_algo"].as_str().unwrap())
+                            .header("x-client-pub-key", vector["reply_public"].as_str().unwrap())
+                            .header("x-encryption-version", "3")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let body = body_to_json(response).await;
+                assert_eq!(
+                    body["error"]["message"], "Upstream request failed",
+                    "algo={}, stream={streaming}, stage={stage}",
+                    vector["signing_algo"]
+                );
+                assert_eq!(body["error"]["type"], "invalid_request_error");
+                assert!(!body.to_string().contains(plaintext));
+            }
+        }
+    }
+}
+
 // ---- Streaming chat completions ----
 
 #[tokio::test]

@@ -260,6 +260,7 @@ RUN if [ "$ENABLE_NV_ATTESTATION_SDK" = "1" ]; then \
 
 # Cache dependencies: copy manifests first, then do a dummy build
 COPY Cargo.toml Cargo.lock ./
+COPY vendor/ vendor/
 RUN FEATURES=$(cat /tmp/cargo-features) && \
     mkdir src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs \
     && mkdir -p benches && echo "fn main() {}" > benches/hot_path.rs && echo "fn main() {}" > benches/e2e.rs \

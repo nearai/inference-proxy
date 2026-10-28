@@ -2117,6 +2117,34 @@ fn merge_extra(target: &mut serde_json::Value, extra: serde_json::Map<String, se
     }
 }
 
+/// Fold one chunk's `choices[].logprobs` into what the earlier chunks left.
+///
+/// A chunk carries the logprobs of its own tokens only, and with speculative
+/// decoding one chunk is several tokens, so every array is extended, in
+/// order: `content` and `refusal` (chat), `tokens`, `token_logprobs`,
+/// `top_logprobs` and `text_offset` (legacy completions). `text_offset` is
+/// appended as is: vLLM sends offsets from the start of the whole text, not
+/// of the chunk. A non-array field takes the latest non-null value.
+fn merge_logprobs(acc: &mut Option<serde_json::Value>, incoming: &serde_json::Value) {
+    let (Some(serde_json::Value::Object(acc)), serde_json::Value::Object(incoming)) =
+        (acc.as_mut(), incoming)
+    else {
+        *acc = Some(incoming.clone());
+        return;
+    };
+    for (key, value) in incoming {
+        match (acc.get_mut(key), value) {
+            (_, serde_json::Value::Null) => {}
+            (Some(serde_json::Value::Array(existing)), serde_json::Value::Array(more)) => {
+                existing.extend(more.iter().cloned());
+            }
+            _ => {
+                acc.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
 impl StreamingResponseAssembler {
     fn new(shape: ResponseShape) -> Self {
         Self {
@@ -2315,7 +2343,7 @@ impl StreamingResponseAssembler {
                     ca.finish_reason = Some(fr.to_string());
                 }
                 if let Some(lp) = choice.get("logprobs").filter(|v| !v.is_null()) {
-                    ca.logprobs = Some(lp.clone());
+                    merge_logprobs(&mut ca.logprobs, lp);
                 }
 
                 // Preserve unknown choice-level fields (e.g. `matched_stop`, or
@@ -5898,6 +5926,218 @@ data: [DONE]
         // No chat-shape fields.
         assert!(resp["choices"][0].get("message").is_none());
         assert_eq!(resp["usage"]["completion_tokens"], 3);
+    }
+
+    /// One chat SSE chunk carrying the logprobs of `tokens`, as speculative
+    /// decoding emits several tokens per chunk.
+    fn chat_logprobs_chunk(tokens: &[&str]) -> Vec<u8> {
+        let content: Vec<serde_json::Value> = tokens
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "token": t, "logprob": -0.5, "bytes": t.as_bytes(),
+                    "top_logprobs": [{"token": t, "logprob": -0.5, "bytes": t.as_bytes()}]
+                })
+            })
+            .collect();
+        let event = serde_json::json!({
+            "id": "c1",
+            "choices": [{
+                "index": 0,
+                "delta": {"content": tokens.concat()},
+                "logprobs": {"content": content},
+                "finish_reason": null
+            }]
+        });
+        format!("data: {event}\n\n").into_bytes()
+    }
+
+    fn assemble(shape: ResponseShape, chunks: &[Vec<u8>]) -> serde_json::Value {
+        let mut asm = StreamingResponseAssembler::new(shape);
+        for chunk in chunks {
+            asm.process_chunk(chunk);
+        }
+        asm.process_chunk(b"data: [DONE]\n\n");
+        asm.into_response("x")
+    }
+
+    #[test]
+    fn test_assembler_accumulates_chat_logprobs_across_chunks() {
+        // 3 chunks x 3 tokens (speculative decoding): all 9, in order, not
+        // just the last chunk's.
+        let words = ["a", "b", "c", "d", "e", "f", "g", "h", "i"];
+        let chunks: Vec<_> = words.chunks(3).map(chat_logprobs_chunk).collect();
+        let resp = assemble(ResponseShape::ChatCompletion, &chunks);
+        let content = resp["choices"][0]["logprobs"]["content"]
+            .as_array()
+            .unwrap();
+        let tokens: Vec<_> = content
+            .iter()
+            .map(|e| e["token"].as_str().unwrap())
+            .collect();
+        assert_eq!(tokens, words);
+        assert_eq!(content[4]["top_logprobs"][0]["token"], "e");
+        assert_eq!(resp["choices"][0]["message"]["content"], "abcdefghi");
+    }
+
+    #[test]
+    fn test_assembler_accumulates_chat_refusal_logprobs() {
+        let chunk = |field: &str, token: &str| {
+            let event = serde_json::json!({"choices": [{"index": 0, "delta": {},
+                "logprobs": {field: [{"token": token, "logprob": -1.0}]}}]});
+            format!("data: {event}\n\n").into_bytes()
+        };
+        let resp = assemble(
+            ResponseShape::ChatCompletion,
+            &[chunk("refusal", "No"), chunk("refusal", "pe")],
+        );
+        let refusal = &resp["choices"][0]["logprobs"]["refusal"];
+        assert_eq!(refusal[0]["token"], "No");
+        assert_eq!(refusal[1]["token"], "pe");
+        assert_eq!(refusal.as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_assembler_single_chunk_logprobs_unchanged() {
+        let chunk = chat_logprobs_chunk(&["x", "y"]);
+        let resp = assemble(ResponseShape::ChatCompletion, std::slice::from_ref(&chunk));
+        let line = std::str::from_utf8(&chunk).unwrap();
+        let event: serde_json::Value =
+            serde_json::from_str(line.trim().strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(
+            resp["choices"][0]["logprobs"],
+            event["choices"][0]["logprobs"]
+        );
+    }
+
+    #[test]
+    fn test_assembler_null_or_absent_logprobs_stay_absent() {
+        // Absent everywhere: the field is emitted as null, as before.
+        let absent = br#"data: {"choices":[{"index":0,"delta":{"content":"a"}}]}"#;
+        let null = br#"data: {"choices":[{"index":0,"delta":{"content":"b"},"logprobs":null}]}"#;
+        for shape in [ResponseShape::ChatCompletion, ResponseShape::TextCompletion] {
+            let resp = assemble(
+                shape,
+                &[
+                    [&absent[..], b"\n\n"].concat(),
+                    [&null[..], b"\n\n"].concat(),
+                ],
+            );
+            assert!(resp["choices"][0]["logprobs"].is_null(), "{resp}");
+        }
+        // A null chunk after real logprobs neither drops nor duplicates them.
+        let resp = assemble(
+            ResponseShape::ChatCompletion,
+            &[
+                chat_logprobs_chunk(&["a"]),
+                [&null[..], b"\n\n"].concat(),
+                chat_logprobs_chunk(&["c"]),
+            ],
+        );
+        let content = resp["choices"][0]["logprobs"]["content"]
+            .as_array()
+            .unwrap();
+        assert_eq!(content.len(), 2);
+        // A null array inside the logprobs object keeps what came before.
+        let empty_content =
+            br#"data: {"choices":[{"index":0,"delta":{},"logprobs":{"content":null}}]}"#;
+        let resp = assemble(
+            ResponseShape::ChatCompletion,
+            &[
+                chat_logprobs_chunk(&["a"]),
+                [&empty_content[..], b"\n\n"].concat(),
+            ],
+        );
+        assert_eq!(
+            resp["choices"][0]["logprobs"]["content"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_assembler_accumulates_text_completion_logprobs_across_chunks() {
+        // Legacy parallel arrays; vLLM's `text_offset` is already absolute,
+        // so it is appended, not rebased.
+        let words = ["a", "bb", "c", "dd", "e", "ff", "g", "hh", "i"];
+        let mut offset = 0;
+        let chunks: Vec<Vec<u8>> = words
+            .chunks(3)
+            .map(|group| {
+                let offsets: Vec<usize> = group
+                    .iter()
+                    .map(|w| {
+                        let at = offset;
+                        offset += w.len();
+                        at
+                    })
+                    .collect();
+                let event = serde_json::json!({"id": "cmpl-1", "choices": [{
+                    "index": 0,
+                    "text": group.concat(),
+                    "logprobs": {
+                        "tokens": group,
+                        "token_logprobs": group.iter().map(|_| -0.25).collect::<Vec<_>>(),
+                        "top_logprobs": group.iter().map(|w| serde_json::json!({*w: -0.25})).collect::<Vec<_>>(),
+                        "text_offset": offsets,
+                    },
+                    "finish_reason": null
+                }]});
+                format!("data: {event}\n\n").into_bytes()
+            })
+            .collect();
+        let resp = assemble(ResponseShape::TextCompletion, &chunks);
+        let choice = &resp["choices"][0];
+        assert_eq!(choice["text"], "abbcddeffghhi");
+        let lp = &choice["logprobs"];
+        assert_eq!(lp["tokens"], serde_json::json!(words));
+        assert_eq!(lp["token_logprobs"].as_array().unwrap().len(), 9);
+        assert_eq!(lp["top_logprobs"][5], serde_json::json!({"ff": -0.25}));
+        assert_eq!(
+            lp["text_offset"],
+            serde_json::json!([0, 1, 3, 4, 6, 7, 9, 10, 12])
+        );
+    }
+
+    #[test]
+    fn test_assembled_chat_logprobs_are_all_encrypted() {
+        // Non-stream encryption runs on the assembled body: every merged
+        // entry, not only the last chunk's, must be encrypted.
+        let signing = test_proxy_opts().signing;
+        let ctx = crate::encryption::EncryptionContext {
+            algo: crate::encryption::EncryptionAlgo::Ed25519,
+            client_pub_key: hex::decode(&signing.ed25519.signing_public_key).unwrap(),
+            version: 1,
+            encrypt_all_fields: true,
+        };
+        let words = ["a", "b", "c", "d", "e", "f"];
+        let chunks: Vec<_> = words.chunks(3).map(chat_logprobs_chunk).collect();
+        let mut resp = assemble(ResponseShape::ChatCompletion, &chunks);
+        let transform = crate::encryption::make_response_transform(
+            crate::encryption::Endpoint::ChatCompletions,
+            ctx.clone(),
+            signing.clone(),
+        );
+        transform(&mut resp).unwrap();
+        let content = resp["choices"][0]["logprobs"]["content"]
+            .as_array()
+            .unwrap();
+        assert_eq!(content.len(), 6);
+        for (entry, word) in content.iter().zip(words) {
+            let token = entry["token"].as_str().unwrap();
+            assert_ne!(token, word);
+            assert_eq!(
+                crate::encryption::decrypt_string(token, &ctx, &signing).unwrap(),
+                word
+            );
+            let top = entry["top_logprobs"][0]["token"].as_str().unwrap();
+            assert_eq!(
+                crate::encryption::decrypt_string(top, &ctx, &signing).unwrap(),
+                word
+            );
+        }
     }
 
     #[test]

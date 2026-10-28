@@ -108,6 +108,10 @@ async fn serve(
         &request_json,
         crate::model_list::checked_model(&state, model.id),
     )?;
+    // Sampling parameters that crash the engine (top_logprobs/logprobs,
+    // top_k, stop_token_ids): a 400 before any backend is chosen, on the
+    // decrypted body. See `sampling_params.rs`.
+    crate::sampling_params::validate_chat(&request_json)?;
     crate::model_list::apply_backend_lora(&state, &mut request_json);
 
     // Repair tool-call `arguments` the engine would refuse (empty, missing,

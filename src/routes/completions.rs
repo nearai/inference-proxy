@@ -85,6 +85,8 @@ async fn serve(
         &request_json,
         crate::model_list::checked_model(&state, model.id),
     )?;
+    // See the chat route: engine-crashing sampling parameters are a 400.
+    crate::sampling_params::validate_completion(&request_json)?;
     crate::model_list::apply_backend_lora(&state, &mut request_json);
 
     let is_stream = request_json

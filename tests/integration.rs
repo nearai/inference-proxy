@@ -1281,6 +1281,66 @@ async fn test_chat_completions_replica_hint_is_dropped_for_cloud_api_key_auth() 
 }
 
 #[tokio::test]
+async fn test_engine_crashing_sampling_params_rejected_before_dispatch() {
+    // tee-bench C08-C12: each of these killed SGLang schedulers. The proxy
+    // answers 400 naming the field and the backend is never called.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"x"})))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+    let app = build_test_app(&mock_server.uri());
+
+    let messages = serde_json::json!([{"role": "user", "content": "hi"}]);
+    let cases = [
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"messages": messages, "logprobs": true, "top_logprobs": 1_000_000}),
+            "`top_logprobs`",
+        ),
+        (
+            "/v1/completions",
+            serde_json::json!({"prompt": "hi", "logprobs": 2_000_000_000}),
+            "`logprobs`",
+        ),
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"messages": messages, "stop_token_ids": [null]}),
+            "`stop_token_ids`",
+        ),
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"messages": messages, "top_k": 2_147_483_648u64, "stream": true}),
+            "`top_k`",
+        ),
+    ];
+    for (uri, request_body, field) in cases {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .header(auth_header().0, auth_header().1)
+                    .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{uri} {request_body}"
+        );
+        let body = body_to_json(response).await;
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains(field), "{uri}: {message}");
+    }
+}
+
+#[tokio::test]
 async fn test_chat_completions_image_validation_rejects_bad_image() {
     // Handler-level wiring: with image validation enabled, a request carrying a
     // clearly-bad image (dangerous scheme) is rejected at the proxy with a 400

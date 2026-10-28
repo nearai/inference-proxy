@@ -1,6 +1,6 @@
 use anyhow::Result;
 use ed25519_dalek::{Signer, SigningKey as Ed25519SigningKey};
-use k256::ecdsa::{signature::hazmat::PrehashSigner, RecoveryId, SigningKey as K256SigningKey};
+use k256::ecdsa::{RecoveryId, SigningKey as K256SigningKey};
 use sha3::{Digest as Sha3Digest, Keccak256};
 use tracing::info;
 
@@ -35,11 +35,11 @@ pub struct SigningPair {
 impl EcdsaContext {
     /// Create from raw 32-byte key material.
     pub fn from_key_bytes(key_bytes: &[u8; 32]) -> Result<Self> {
-        let signing_key = K256SigningKey::from_bytes(key_bytes.into())?;
+        let signing_key = K256SigningKey::from_slice(key_bytes)?;
         let verifying_key = signing_key.verifying_key();
 
         // Get uncompressed public key (65 bytes with 0x04 prefix)
-        let pk_encoded = verifying_key.to_encoded_point(false);
+        let pk_encoded = verifying_key.to_sec1_point(false);
         let pk_bytes = pk_encoded.as_bytes();
         // Skip the 0x04 prefix to get 64-byte uncompressed key
         let pk_uncompressed = &pk_bytes[1..];
@@ -77,7 +77,7 @@ impl EcdsaContext {
 
         // Sign with recoverable signature
         let (signature, recovery_id): (k256::ecdsa::Signature, RecoveryId) =
-            self.signing_key.sign_prehash(&hash[..])?;
+            self.signing_key.sign_prehash_recoverable(&hash);
 
         // Build 0x{r}{s}{v} where v = recovery_id + 27
         let mut sig_bytes = [0u8; 65];
@@ -254,6 +254,26 @@ mod tests {
     }
 
     #[test]
+    fn test_ecdsa_sign_preserves_legacy_wire_format() {
+        let ctx = EcdsaContext::from_key_bytes(&[1; 32]).unwrap();
+
+        // Recorded with k256 0.13.4: EIP-191 framing, deterministic low-S
+        // signing, and Ethereum's recovery byte must survive dependency upgrades.
+        assert_eq!(
+            ctx.sign("request-hash:response-hash").unwrap(),
+            concat!(
+                "0x",
+                "c4949d98d11acafc9db9059591c185ecc1ba39048a8b6b95524d9317bee50f4538",
+                "37a274a9db76a3075e2ad3c8f37908c05fe35791e39cdc66d55bb6720ecb031c",
+            ),
+        );
+        assert_eq!(
+            ctx.signing_address,
+            "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+        );
+    }
+
+    #[test]
     fn test_ecdsa_sign_produces_valid_eip191_signature() {
         let ctx = EcdsaContext::from_key_bytes(&TEST_ECDSA_KEY).unwrap();
         let message = "hello world";
@@ -287,7 +307,7 @@ mod tests {
             VerifyingKey::recover_from_prehash(&hash[..], &signature, recovery_id).unwrap();
 
         // Recovered key should match original public key
-        let recovered_pk = recovered_key.to_encoded_point(false);
+        let recovered_pk = recovered_key.to_sec1_point(false);
         let recovered_pk_hex = hex::encode(&recovered_pk.as_bytes()[1..]);
         assert_eq!(recovered_pk_hex, ctx.signing_public_key);
     }
@@ -436,7 +456,7 @@ mod tests {
         let recovery_id = RecoveryId::from_byte(v - 27).unwrap();
         let recovered_key =
             VerifyingKey::recover_from_prehash(&hash[..], &signature, recovery_id).unwrap();
-        let pk_encoded = recovered_key.to_encoded_point(false);
+        let pk_encoded = recovered_key.to_sec1_point(false);
         let pk_hash = Keccak256::digest(&pk_encoded.as_bytes()[1..]);
         format!("0x{}", hex::encode(&pk_hash[12..32]))
     }

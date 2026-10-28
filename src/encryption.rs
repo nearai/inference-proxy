@@ -40,10 +40,10 @@ impl EncryptionContext {
     fn canonical_reply_key(&self) -> Result<Vec<u8>, AppError> {
         match self.algo {
             EncryptionAlgo::Ecdsa => {
-                use k256::elliptic_curve::sec1::ToEncodedPoint;
+                use k256::elliptic_curve::sec1::ToSec1Point;
                 let key = ecies::parse_client_pubkey(&self.client_pub_key)
                     .map_err(AppError::BadRequest)?;
-                Ok(key.to_encoded_point(false).as_bytes().to_vec())
+                Ok(key.to_sec1_point(false).as_bytes().to_vec())
             }
             EncryptionAlgo::Ed25519 => {
                 let key: [u8; 32] = self
@@ -353,7 +353,11 @@ mod ecies {
         Aes256Gcm,
     };
     use hkdf::Hkdf;
-    use k256::{ecdh::EphemeralSecret, elliptic_curve::sec1::ToEncodedPoint, PublicKey};
+    use k256::{
+        ecdh::EphemeralSecret,
+        elliptic_curve::{sec1::ToSec1Point, Generate},
+        PublicKey,
+    };
     use sha2::Sha256;
 
     /// Encrypt bytes using ECIES (secp256k1 ECDH + HKDF-SHA256 + AES-256-GCM).
@@ -367,8 +371,9 @@ mod ecies {
         recipient_pub: &PublicKey,
         aad: &[u8],
     ) -> Result<Vec<u8>, String> {
-        let ephemeral_secret = EphemeralSecret::random(&mut OsRng);
-        let ephemeral_public = ephemeral_secret.public_key().to_encoded_point(false);
+        let ephemeral_secret = EphemeralSecret::try_generate_from_rng(&mut rand::rngs::SysRng)
+            .map_err(|e| format!("Ephemeral key generation failed: {e}"))?;
+        let ephemeral_public = ephemeral_secret.public_key().to_sec1_point(false);
 
         let shared_secret = ephemeral_secret.diffie_hellman(recipient_pub);
 
@@ -1652,6 +1657,24 @@ mod tests {
     // ── ECIES round-trip tests ──────────────────────────────────────
 
     #[test]
+    fn test_ecies_decrypts_legacy_ciphertext() {
+        let ctx = EcdsaContext::from_key_bytes(&[1; 32]).unwrap();
+        // Captured with k256 0.13.4 before the upgrade: uncompressed SEC1 key,
+        // HKDF-SHA256 with "ecdsa_encryption", and the AES-256-GCM envelope.
+        let encrypted = hex::decode(concat!(
+            "04e244e5230103ed32d3385f391c51710dbe34d1e06adc13ab3d881267622c345b0",
+            "3619f109da5723ed716367294c8a4e261f9f4332bc421533d1aaf178237a39d60",
+            "0f2e1db2524f74e6a0ea4ce3faf46c4c2c957b78722f5897865552863f21d028",
+            "b30d7df2f9526329f5db0e99943addad5d18fd60",
+        ))
+        .unwrap();
+        assert_eq!(
+            ecies::decrypt(&encrypted, ctx.secret_key()).unwrap(),
+            b"legacy encrypted response",
+        );
+    }
+
+    #[test]
     fn test_ecies_round_trip() {
         let server_pair = test_signing_pair();
         let server_pk = server_pair.ecdsa.secret_key().verifying_key();
@@ -1708,7 +1731,7 @@ mod tests {
     fn test_ecies_parse_client_pubkey_65_bytes() {
         let server_pair = test_signing_pair();
         let vk = server_pair.ecdsa.secret_key().verifying_key();
-        let encoded = vk.to_encoded_point(false);
+        let encoded = vk.to_sec1_point(false);
         let bytes = encoded.as_bytes();
         assert_eq!(bytes.len(), 65);
         assert!(ecies::parse_client_pubkey(bytes).is_ok());
@@ -1718,7 +1741,7 @@ mod tests {
     fn test_ecies_parse_client_pubkey_64_bytes() {
         let server_pair = test_signing_pair();
         let vk = server_pair.ecdsa.secret_key().verifying_key();
-        let encoded = vk.to_encoded_point(false);
+        let encoded = vk.to_sec1_point(false);
         let bytes = &encoded.as_bytes()[1..]; // strip 0x04 prefix
         assert_eq!(bytes.len(), 64);
         assert!(ecies::parse_client_pubkey(bytes).is_ok());
@@ -1756,7 +1779,7 @@ mod tests {
 
         // Use server's ECDSA public key as "client" public key
         let vk = server_pair.ecdsa.secret_key().verifying_key();
-        let encoded = vk.to_encoded_point(false);
+        let encoded = vk.to_sec1_point(false);
         let client_pub = encoded.as_bytes()[1..].to_vec(); // 64 bytes raw
 
         let ctx = EncryptionContext {

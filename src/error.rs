@@ -72,6 +72,54 @@ pub enum AppError {
     Internal(#[from] anyhow::Error),
 }
 
+pub(crate) const E2EE_UPSTREAM_MESSAGE: &str = "Upstream request failed";
+
+/// Only protocol error categories may accompany an encrypted request's failure.
+pub(crate) fn safe_upstream_error_type(error_type: &str) -> &str {
+    match error_type {
+        "invalid_request_error"
+        | "BadRequestError"
+        | "NotFoundError"
+        | "server_error"
+        | "upstream_error"
+        | "upstream_unreachable"
+        | "overloaded" => error_type,
+        _ => "upstream_error",
+    }
+}
+
+impl AppError {
+    pub(crate) fn for_encrypted_request(self, encrypted: bool) -> Self {
+        if !encrypted {
+            return self;
+        }
+        match self {
+            Self::Upstream { status, body } => {
+                let error_type = parse_upstream_error(&body)
+                    .map(|info| safe_upstream_error_type(&info.error_type).to_owned())
+                    .unwrap_or_else(|| "upstream_error".into());
+                // Keep the Upstream variant's status and Retry-After handling.
+                Self::Upstream {
+                    status,
+                    body: serde_json::to_vec(&serde_json::json!({
+                        "error": {"message": E2EE_UPSTREAM_MESSAGE, "type": error_type}
+                    }))
+                    .expect("static error body is serializable")
+                    .into(),
+                }
+            }
+            Self::UpstreamParsed {
+                status, error_type, ..
+            } => Self::UpstreamParsed {
+                status,
+                message: E2EE_UPSTREAM_MESSAGE.into(),
+                error_type: safe_upstream_error_type(&error_type).into(),
+            },
+            other => other,
+        }
+    }
+}
+
 /// Longest requested model name echoed back in the `model_not_found` message.
 const MODEL_NOT_FOUND_ECHO_MAX_BYTES: usize = 256;
 

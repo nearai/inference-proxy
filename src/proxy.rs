@@ -1719,6 +1719,18 @@ pub async fn proxy_json_request(
     client: &reqwest::Client,
     url: &str,
     request_body: Vec<u8>,
+    opts: ProxyOpts,
+) -> Result<Response, AppError> {
+    let encrypted = opts.response_transform.is_some();
+    proxy_json_request_inner(client, url, request_body, opts)
+        .await
+        .map_err(|err| err.for_encrypted_request(encrypted))
+}
+
+async fn proxy_json_request_inner(
+    client: &reqwest::Client,
+    url: &str,
+    request_body: Vec<u8>,
     mut opts: ProxyOpts,
 ) -> Result<Response, AppError> {
     // Hash the ORIGINAL request body for signing (before we inject stream: true).
@@ -2672,6 +2684,18 @@ pub async fn proxy_streaming_request(
     client: &reqwest::Client,
     url: &str,
     request_body: Vec<u8>,
+    opts: ProxyOpts,
+) -> Result<Response, AppError> {
+    let encrypted = opts.chunk_transform.is_some();
+    proxy_streaming_request_inner(client, url, request_body, opts)
+        .await
+        .map_err(|err| err.for_encrypted_request(encrypted))
+}
+
+async fn proxy_streaming_request_inner(
+    client: &reqwest::Client,
+    url: &str,
+    request_body: Vec<u8>,
     mut opts: ProxyOpts,
 ) -> Result<Response, AppError> {
     // A request under a first-token deadline is never committed early: it is
@@ -2729,6 +2753,7 @@ pub async fn proxy_streaming_request(
         // only when it has something to say. Keep-alives run here too, from
         // the moment the response is committed, so the client is not left
         // staring at a silent socket for the whole prefill.
+        let encrypted = opts.chunk_transform.is_some();
         let opened = {
             let open = open_upstream_stream(&client, &mut url, request_body, &mut opts);
             tokio::pin!(open);
@@ -2832,7 +2857,11 @@ pub async fn proxy_streaming_request(
                     // Too late for a status line: the client already has a 200.
                     metrics::counter!("stream_late_upstream_errors_total").increment(1);
                     crate::model_metrics::count_stream_error(stream_errors);
-                    let _ = tx.send(Ok(late_error_event(err).await)).await;
+                    let _ = tx
+                        .send(Ok(
+                            late_error_event(err.for_encrypted_request(encrypted)).await
+                        ))
+                        .await;
                 }
                 return;
             }
@@ -3358,6 +3387,19 @@ impl SseTransformer {
 
 /// Proxy a multipart request. Caller provides pre-computed request hash covering all field bytes.
 pub async fn proxy_multipart_request(
+    client: &reqwest::Client,
+    url: &str,
+    form: reqwest::multipart::Form,
+    request_sha256: &str,
+    opts: ProxyOpts,
+) -> Result<Response, AppError> {
+    let encrypted = opts.response_transform.is_some();
+    proxy_multipart_request_inner(client, url, form, request_sha256, opts)
+        .await
+        .map_err(|err| err.for_encrypted_request(encrypted))
+}
+
+async fn proxy_multipart_request_inner(
     client: &reqwest::Client,
     url: &str,
     form: reqwest::multipart::Form,

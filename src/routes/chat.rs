@@ -214,7 +214,8 @@ async fn serve(
             },
             request_json,
         )
-        .await;
+        .await
+        .map_err(|err| err.for_encrypted_request(enc_ctx.is_some()));
     }
 
     // Server-side agent loop opt-in: the request advertises exactly

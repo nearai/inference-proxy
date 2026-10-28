@@ -13,6 +13,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use vllm_proxy_rs::*;
 
 struct TestAppOptions {
+    stream_commit_ms: u64,
     rate_per_second: u64,
     rate_burst: u32,
     dstack_socket_path: String,
@@ -42,6 +43,7 @@ struct TestAppOptions {
 impl Default for TestAppOptions {
     fn default() -> Self {
         Self {
+            stream_commit_ms: 0,
             rate_per_second: 100,
             rate_burst: 200,
             dstack_socket_path: "/var/run/dstack.sock".to_string(),
@@ -275,7 +277,7 @@ fn build_test_app_inner_with_pool(
         non_tee_deployment: false,
         map_queue_full_to_429: false,
         stream_error_peek_ms: 0,
-        stream_commit_ms: 0,
+        stream_commit_ms: options.stream_commit_ms,
         first_token_deadline_ms: 0,
         first_token_deadline_per_1k_tokens_ms: 0,
         first_token_deadline_max_ms: 0,
@@ -3598,6 +3600,103 @@ async fn test_encrypted_forced_fusion_decrypts_request_and_encrypts_final_answer
     let decrypted =
         encryption::decrypt_string(encrypted_response, &dec_for_response, &client_pair).unwrap();
     assert_eq!(decrypted, "Encrypted fusion final.");
+}
+
+#[tokio::test]
+async fn test_e2ee_fusion_errors_are_redacted_in_preflight_and_synthesis() {
+    use wiremock::matchers::body_string_contains;
+
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/e2ee-v3.json")).unwrap();
+    for vector in fixture["vectors"].as_array().unwrap() {
+        let plaintext = vector["plaintext"].as_str().unwrap();
+        for streaming in [false, true] {
+            for synthesis in [false, true] {
+                let upstream = MockServer::start().await;
+                if synthesis {
+                    Mock::given(method("GET"))
+                        .and(path("/endpoints"))
+                        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "endpoints": [{"domain": upstream.uri(), "models": ["panel-a"]}]
+                        })))
+                        .expect(1)
+                        .mount(&upstream)
+                        .await;
+                    Mock::given(method("GET"))
+                        .and(path("/v1/attestation/report"))
+                        .respond_with(
+                            ResponseTemplate::new(200)
+                                .set_body_json(serde_json::json!({"ok": true})),
+                        )
+                        .mount(&upstream)
+                        .await;
+                    Mock::given(method("POST"))
+                        .and(path("/v1/chat/completions"))
+                        .and(header("authorization", "Bearer fusion-token"))
+                        .and(body_string_contains("one member of a private multi-model panel"))
+                        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "id": "panel-e2ee-error-test",
+                            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Panel answer"}, "finish_reason": "stop"}]
+                        })))
+                        .expect(1)
+                        .mount(&upstream)
+                        .await;
+                }
+
+                let stage = if synthesis {
+                    "final synthesis model"
+                } else {
+                    "__nearai_fusion"
+                };
+                Mock::given(method("POST"))
+                    .and(path("/v1/chat/completions"))
+                    .and(body_string_contains(stage))
+                    .and(body_string_contains(plaintext))
+                    .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                        "error": {"message": format!("Invalid request value: {plaintext}"), "type": "invalid_request_error"}
+                    })))
+                    .expect(1)
+                    .mount(&upstream)
+                    .await;
+
+                let app = build_test_app_with_fusion(
+                    &upstream.uri(),
+                    format!("{}/endpoints", upstream.uri()),
+                );
+                let body = serde_json::json!({
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": vector["ciphertext"]}],
+                    "tools": [{"type": "nearai:fusion", "analysis_models": ["panel-a"]}],
+                    "tool_choice": if synthesis { "required" } else { "auto" },
+                    "stream": streaming
+                });
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/v1/chat/completions")
+                            .header(auth_header().0, auth_header().1)
+                            .header("content-type", "application/json")
+                            .header("x-signing-algo", vector["signing_algo"].as_str().unwrap())
+                            .header("x-client-pub-key", vector["reply_public"].as_str().unwrap())
+                            .header("x-encryption-version", "3")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let body = body_to_json(response).await;
+                assert_eq!(
+                    body["error"]["message"], "Upstream request failed",
+                    "algo={}, stream={streaming}, stage={stage}",
+                    vector["signing_algo"]
+                );
+                assert_eq!(body["error"]["type"], "invalid_request_error");
+                assert!(!body.to_string().contains(plaintext));
+            }
+        }
+    }
 }
 
 // ---- Streaming chat completions ----
@@ -11084,6 +11183,231 @@ async fn test_tracing_headers_propagated_non_streaming() {
     );
 }
 
+#[tokio::test]
+async fn test_e2ee_v3_authenticates_before_upstream_and_forces_response_encryption() {
+    use vllm_proxy_rs::encryption::{decrypt_string, EncryptionAlgo, EncryptionContext};
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/e2ee-v3.json")).unwrap();
+    for vector in fixture["vectors"].as_array().unwrap() {
+        let algo = vector["signing_algo"].as_str().unwrap();
+        let secret: [u8; 32] = hex::decode(vector["reply_secret"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let client = signing::SigningPair {
+            ecdsa: signing::EcdsaContext::from_key_bytes(&secret).unwrap(),
+            ed25519: signing::Ed25519Context::from_key_bytes(&secret).unwrap(),
+        };
+        let response_ctx = EncryptionContext {
+            algo: if algo == "ecdsa" {
+                EncryptionAlgo::Ecdsa
+            } else {
+                EncryptionAlgo::Ed25519
+            },
+            client_pub_key: hex::decode(vector["reply_public"].as_str().unwrap()).unwrap(),
+            version: 2,
+            encrypt_all_fields: true,
+        };
+        for streaming in [false, true] {
+            let upstream = MockServer::start().await;
+            let key = if streaming { "delta" } else { "message" };
+            let response_body = serde_json::json!({
+                "id": "chat-v3",
+                "object": if streaming { "chat.completion.chunk" } else { "chat.completion" },
+                "model": "test-model",
+                "prompt_token_ids": [101, 202],
+                "prompt_text": "private prompt",
+                "prompt_logprobs": [{"101": {"decoded_token": "private", "logprob": -1.0}}],
+                "choices": [{
+                    "index": 0,
+                    "token_ids": [303, 404],
+                    "matched_stop": "private stop", "stop_reason": 101,
+                    "meta_info": {"private": "value"}, "hidden_states": [[0.5]], "sglext": "private extension",
+                    key: {
+                        "role": "assistant",
+                        "content": "private answer",
+                        "token_ids": [303, 404],
+                        "tool_calls": [{
+                            "type": "function",
+                            "id": "call-v3",
+                            "function": {"name": "private_tool", "arguments": "{\"secret\":42}"},
+                        }],
+                    },
+                    "logprobs": {"content": [{"token": "private token", "bytes": [112, 114]}]},
+                    "finish_reason": "stop",
+                }],
+            });
+            let response = if streaming {
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!("data: {response_body}\n\ndata: [DONE]\n\n"))
+            } else {
+                ResponseTemplate::new(200).set_body_json(response_body)
+            };
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(response)
+                .mount(&upstream)
+                .await;
+            let app = build_test_app(&upstream.uri());
+            let body = serde_json::json!({"model":"test-model","messages":[{"role":"user","content":vector["ciphertext"]}],"stream":streaming,"logprobs":true});
+            // Wrong reply key and explicit legacy downgrade both stop before inference.
+            for (reply, version) in [
+                (vector["model_public"].as_str().unwrap(), "3"),
+                (vector["reply_public"].as_str().unwrap(), "2"),
+            ] {
+                let result = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/v1/chat/completions")
+                            .header(auth_header().0, auth_header().1)
+                            .header("content-type", "application/json")
+                            .header("x-signing-algo", algo)
+                            .header("x-client-pub-key", reply)
+                            .header("x-encryption-version", version)
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(result.status(), StatusCode::BAD_REQUEST);
+            }
+            assert!(upstream.received_requests().await.unwrap().is_empty());
+            // Both an absent optional header and an explicit false keep v3 protections.
+            for flag in [None, Some("false")] {
+                let mut request = Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(auth_header().0, auth_header().1)
+                    .header("content-type", "application/json")
+                    .header("x-signing-algo", algo)
+                    .header("x-client-pub-key", vector["reply_public"].as_str().unwrap())
+                    .header("x-encryption-version", "3");
+                if let Some(flag) = flag {
+                    request = request.header("x-encrypt-all-fields", flag);
+                }
+                let result = app
+                    .clone()
+                    .oneshot(request.body(Body::from(body.to_string())).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(result.status(), StatusCode::OK);
+                let wire = axum::body::to_bytes(result.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let text = String::from_utf8(wire.to_vec()).unwrap();
+                assert!(!text.contains("private answer"));
+                assert!(!text.contains("private token"));
+                assert!(!text.contains("private_tool"));
+                let value: serde_json::Value = if streaming {
+                    serde_json::from_str(
+                        text.lines()
+                            .find_map(|line| {
+                                line.strip_prefix("data: ").filter(|s| s.starts_with('{'))
+                            })
+                            .unwrap(),
+                    )
+                    .unwrap()
+                } else {
+                    serde_json::from_str(&text).unwrap()
+                };
+                let choice = &value["choices"][0];
+                for object in [&value, choice, &choice[key]] {
+                    for field in [
+                        "prompt_token_ids",
+                        "token_ids",
+                        "prompt_text",
+                        "prompt_logprobs",
+                        "matched_stop",
+                        "stop_reason",
+                        "meta_info",
+                        "hidden_states",
+                        "sglext",
+                    ] {
+                        assert!(
+                            object.get(field).is_none(),
+                            "{algo}, stream={streaming}: {field}"
+                        );
+                    }
+                }
+                for (cipher, expected) in [
+                    (&choice[key]["content"], "private answer"),
+                    (
+                        &choice[key]["tool_calls"][0]["function"]["arguments"],
+                        "{\"secret\":42}",
+                    ),
+                    (&choice["logprobs"]["content"][0]["token"], "private token"),
+                    (&choice["logprobs"]["content"][0]["bytes"], "[112,114]"),
+                ] {
+                    assert_eq!(
+                        decrypt_string(cipher.as_str().unwrap(), &response_ctx, &client).unwrap(),
+                        expected
+                    );
+                }
+            }
+            for request in upstream.received_requests().await.unwrap() {
+                let value: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(value["messages"][0]["content"], vector["plaintext"]);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_e2ee_v3_rejects_completion_metadata_options_before_upstream() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/e2ee-v3.json")).unwrap();
+    let upstream = MockServer::start().await;
+    let app = build_test_app(&upstream.uri());
+    for vector in fixture["vectors"].as_array().unwrap() {
+        for endpoint in ["/v1/chat/completions", "/v1/completions"] {
+            for streaming in [false, true] {
+                for (field, value) in [
+                    ("return_token_ids", serde_json::json!(true)),
+                    ("return_prompt_text", serde_json::json!(true)),
+                    ("prompt_logprobs", serde_json::json!(0)),
+                ] {
+                    let mut body =
+                        serde_json::json!({"model":"test-model","stream":streaming,field:value});
+                    if endpoint == "/v1/chat/completions" {
+                        body["messages"] =
+                            serde_json::json!([{"role":"user","content":vector["ciphertext"]}]);
+                    } else {
+                        body["prompt"] = vector["ciphertext"].clone();
+                    }
+                    let response = app
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .method("POST")
+                                .uri(endpoint)
+                                .header(auth_header().0, auth_header().1)
+                                .header("content-type", "application/json")
+                                .header("x-signing-algo", vector["signing_algo"].as_str().unwrap())
+                                .header(
+                                    "x-client-pub-key",
+                                    vector["reply_public"].as_str().unwrap(),
+                                )
+                                .header("x-encryption-version", "3")
+                                .body(Body::from(body.to_string()))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::BAD_REQUEST,
+                        "{endpoint}: {field}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+}
+
 // ---- Single-model request guard (model id and LoRA selectors) ----
 
 const GUARDED_ROUTES: [&str; 7] = [
@@ -11506,5 +11830,86 @@ async fn backend_lora_embeddings_signature_covers_original_request() {
             hex::encode(Sha256::digest(forwarded)),
             "encrypted={encrypted}"
         );
+    }
+}
+
+#[tokio::test]
+async fn test_e2ee_upstream_errors_are_redacted_in_http_and_sse() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/e2ee-v3.json")).unwrap();
+    for vector in fixture["vectors"].as_array().unwrap() {
+        for (streaming, commit_ms, in_band) in [
+            (false, 0, false),
+            (true, 0, false),
+            (true, 1, false),
+            (false, 0, true),
+            (true, 0, true),
+        ] {
+            let upstream = MockServer::start().await;
+            let error = serde_json::json!({"error":{"message":"backend private value","type":"private type","code":400}});
+            let response = if in_band {
+                ResponseTemplate::new(200).set_body_raw(
+                    format!("data: {{\"id\":\"chat-error\",\"choices\":[]}}\n\ndata: {error}\n\ndata: [DONE]\n\n"),
+                    "text/event-stream",
+                )
+            } else {
+                let response = ResponseTemplate::new(400).set_body_json(error);
+                if commit_ms > 0 {
+                    response.set_delay(Duration::from_millis(50))
+                } else {
+                    response
+                }
+            };
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&upstream)
+                .await;
+            let app = build_test_app_inner(
+                &upstream.uri(),
+                TestAppOptions {
+                    stream_commit_ms: commit_ms,
+                    ..Default::default()
+                },
+            );
+            let body = serde_json::json!({"model":"test-model","messages":[{"role":"user","content":vector["ciphertext"]}],"stream":streaming});
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header(auth_header().0, auth_header().1)
+                        .header("content-type", "application/json")
+                        .header("x-signing-algo", vector["signing_algo"].as_str().unwrap())
+                        .header("x-client-pub-key", vector["reply_public"].as_str().unwrap())
+                        .header("x-encryption-version", "3")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(
+                !text.contains("private"),
+                "stream={streaming}, commit={commit_ms}, in_band={in_band}"
+            );
+            assert!(
+                text.contains("Upstream request failed"),
+                "stream={streaming}, commit={commit_ms}, in_band={in_band}: {status} {text}"
+            );
+            assert_eq!(
+                status,
+                if streaming && (in_band || commit_ms > 0) {
+                    StatusCode::OK
+                } else {
+                    StatusCode::BAD_REQUEST
+                }
+            );
+        }
     }
 }

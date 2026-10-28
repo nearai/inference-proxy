@@ -163,7 +163,8 @@ pub async fn run_chat_completion(
         first_request_body,
         &tracing_ids,
     )
-    .await?;
+    .await
+    .map_err(|err| err.for_encrypted_request(chunk_transform.is_some()))?;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
@@ -1183,10 +1184,7 @@ async fn emit_synthetic_error_chunk(
     if let Some(c) = created {
         chunk["created"] = c.into();
     }
-    // Pass through the chunk transform for shape parity with normal
-    // chunks. The `error` object has no encryptable string fields under
-    // the current transform — but the message text we put here is
-    // controlled by us, so this is safe regardless.
+    // Apply the same error policy as other encrypted SSE events.
     if let Some(transform) = chunk_transform {
         transform(&mut chunk)?;
     }

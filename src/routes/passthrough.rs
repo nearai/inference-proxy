@@ -218,7 +218,8 @@ pub async fn images_edits(
             let text = String::from_utf8(raw_data)
                 .map_err(|_| AppError::BadRequest("prompt field is not UTF-8".to_string()))?;
             let data = if !text.is_empty() {
-                encryption::decrypt_string(&text, ctx, &state.signing)?.into_bytes()
+                encryption::decrypt_string_for_field(&text, ctx, &state.signing, "prompt")?
+                    .into_bytes()
             } else {
                 text.into_bytes()
             };
@@ -311,7 +312,8 @@ pub async fn audio_transcriptions(
             let text = String::from_utf8(raw_data)
                 .map_err(|_| AppError::BadRequest("prompt field is not UTF-8".to_string()))?;
             let data = if !text.is_empty() {
-                encryption::decrypt_string(&text, ctx, &state.signing)?.into_bytes()
+                encryption::decrypt_string_for_field(&text, ctx, &state.signing, "prompt")?
+                    .into_bytes()
             } else {
                 text.into_bytes()
             };

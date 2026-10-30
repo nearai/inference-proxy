@@ -19,6 +19,12 @@
 //!   customer cannot reach the header through it, and a direct customer's
 //!   header is ignored because they authenticate with an `sk-` key.
 //!
+//! vLLM's `--scheduling-policy priority` runs the *lowest* value first. A
+//! proxy in front of vLLM sets `VLLM_PROXY_PRIORITY_LOWER_FIRST`, and the
+//! engine then gets the negated value: the header keeps one meaning (higher =
+//! more important) on both engines, so the gateway's `-1` and a reseller
+//! org's `-2` still run after cloud-api's default 0.
+//!
 //! `0` is also vLLM's default value for the field, and SGLang ignores
 //! `priority` while its scheduling flag is off (`abort_on_priority_when_disabled`
 //! defaults to false), so the proxy can be rolled before the engines.
@@ -62,11 +68,19 @@ pub fn resolve_priority(headers: &HeaderMap, trusted_caller: bool) -> i64 {
 }
 
 /// Set `priority` on a chat/completions request body, overwriting any
-/// client-supplied value.
-pub fn apply_priority(request_json: &mut Value, headers: &HeaderMap, trusted_caller: bool) {
+/// client-supplied value. `lower_first`: the engine runs the lowest value
+/// first (vLLM), so the body gets the negated value. The metric keeps the
+/// caller's value either way.
+pub fn apply_priority(
+    request_json: &mut Value,
+    headers: &HeaderMap,
+    trusted_caller: bool,
+    lower_first: bool,
+) {
     let priority = resolve_priority(headers, trusted_caller);
+    let engine_priority = if lower_first { -priority } else { priority };
     if let Some(body) = request_json.as_object_mut() {
-        body.insert("priority".to_string(), Value::from(priority));
+        body.insert("priority".to_string(), Value::from(engine_priority));
     }
     metrics::counter!("request_priority_total", "priority" => priority.to_string()).increment(1);
 }
@@ -109,13 +123,28 @@ mod tests {
     #[test]
     fn client_supplied_priority_is_overwritten() {
         let mut body = json!({"model": "m", "priority": 999, "messages": []});
-        apply_priority(&mut body, &headers(None), false);
+        apply_priority(&mut body, &headers(None), false, false);
         assert_eq!(body["priority"], 0);
         let mut body = json!({"model": "m", "priority": 999});
-        apply_priority(&mut body, &headers(Some("-1")), true);
+        apply_priority(&mut body, &headers(Some("-1")), true, false);
         assert_eq!(body["priority"], -1);
         let mut body = json!({"model": "m"});
-        apply_priority(&mut body, &headers(None), true);
+        apply_priority(&mut body, &headers(None), true, false);
+        assert_eq!(body["priority"], 0);
+    }
+
+    #[test]
+    fn lower_first_engine_gets_the_negated_value() {
+        // vLLM runs the lowest value first: the gateway's -1 and a reseller's
+        // -2 must land behind cloud-api's 0, a +5 org ahead of it.
+        for (header, engine) in [(Some("-1"), 1), (Some("-2"), 2), (Some("5"), -5), (None, 0)] {
+            let mut body = json!({"model": "m", "priority": -999});
+            apply_priority(&mut body, &headers(header), true, true);
+            assert_eq!(body["priority"], engine, "{header:?}");
+        }
+        // Untrusted callers still get the default, whatever they send.
+        let mut body = json!({"model": "m", "priority": -999});
+        apply_priority(&mut body, &headers(Some("1000")), false, true);
         assert_eq!(body["priority"], 0);
     }
 }

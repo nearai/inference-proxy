@@ -28,6 +28,7 @@ Rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-proxy) (Python).
 | POST | `/v1/rerank` | Yes | Reranking |
 | POST | `/v1/score` | Yes | Scoring |
 | POST | `/v1/privacy/classify` | Yes | Privacy classification |
+| POST | `/v1/systemone` | Trusted token | Typed decisions (System One), only with `SYSTEMONE_UPSTREAM_MODEL` |
 | POST | `/v1/images/generations` | Yes | Image generation |
 | POST | `/v1/images/edits` | Yes | Image editing (multipart) |
 | POST | `/v1/audio/transcriptions` | Yes | Audio transcription (multipart) |
@@ -124,6 +125,7 @@ All configuration is via environment variables:
 | `VLLM_BACKEND_TOKEN` | No | unset | Bearer attached to backend requests only (gateway mode: the backends are CVM inference-proxies and accept it as a trusted config token). Never sent to cloud-api |
 | `VLLM_BACKEND_PRIORITY` | No | unset | Gateway mode: engine priority for this proxy's traffic, sent as `X-NearAI-Priority` on every backend request (e.g. `-1` for the OpenRouter lane). The CVM proxy honors the header only from callers using its `TOKEN`; it sets `priority` on every chat/completions body itself (header value or 0), discarding client values |
 | `VLLM_BACKEND_HEALTH_PATH` | No | `/health` | Path probed by the pool health checker and `/healthz` |
+| `SYSTEMONE_UPSTREAM_MODEL` | No | unset | The backend's name for a System One decision model (e.g. Levanto Sage). Adds `POST /v1/systemone` (config `TOKEN` only, `model` rewritten to this name, answer signed under a generated `id`) and makes `/v1/models` list `MODEL_NAME` while `VLLM_BACKEND_HEALTH_PATH` answers 2xx |
 | `NON_TEE_DEPLOYMENT` | No | `false` | This proxy runs outside a TEE: `/healthz` skips the dstack probe, the attestation cache refresh is not started, and `/v1/attestation/report`, `/v1/signature/{id}`, `/internal/gpu_evidence` return 404 |
 | `VLLM_PROXY_MAP_QUEUE_FULL_TO_429` | No | `false` | Rewrite the engine's admission rejection (503: SGLang "The request queue is full." / "aborted by a higher priority request"; vLLM `--max-num-queued-reqs` / `--max-num-queued-tokens` "The engine is currently busy…" / "…prefill token backlog limit") to 429 with `Retry-After: 2` and type `overloaded`. Off in CVMs: cloud-api's peer fallback keys on the 503 |
 | `VLLM_PROXY_STREAM_ERROR_PEEK_MS` | No | `0` (off) | Streaming: wait up to this long for the first upstream SSE chunk before committing a 200; an admission-time `data: {"error":…}` first event becomes a real error status instead of a 200 that fails mid-stream |

@@ -59,7 +59,12 @@ async fn serve(
 
     // Engine `priority`: the proxy decides it (trusted callers may set it via
     // header; any client value is discarded).
-    crate::priority::apply_priority(&mut request_json, &headers, auth.cloud_api_key.is_none());
+    crate::priority::apply_priority(
+        &mut request_json,
+        &headers,
+        auth.cloud_api_key.is_none(),
+        state.config.priority_lower_first,
+    );
 
     // Extract encryption context from headers
     let enc_ctx = encryption::extract_encryption_context(&headers)?;

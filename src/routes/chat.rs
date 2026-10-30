@@ -68,7 +68,12 @@ async fn serve(
     // Engine `priority`: the proxy decides it (trusted callers may set it via
     // header; any client value is discarded). Before any branch so the agent
     // loop and fusion inherit it.
-    crate::priority::apply_priority(&mut request_json, &headers, auth.cloud_api_key.is_none());
+    crate::priority::apply_priority(
+        &mut request_json,
+        &headers,
+        auth.cloud_api_key.is_none(),
+        state.config.priority_lower_first,
+    );
     // Gateway mode: an aggregator's `reasoning` object becomes the engine's
     // `reasoning_effort` switch (`enabled: false` → `none`), otherwise the
     // model keeps thinking and the caller pays for it.

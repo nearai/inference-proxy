@@ -725,6 +725,12 @@ pub struct Config {
     /// Aggregators treat 429 as back-pressure and 5xx as an outage; off by
     /// default because cloud-api's peer fallback keys on the 503.
     pub map_queue_full_to_429: bool,
+    /// The engine behind this proxy runs the *lowest* `priority` first
+    /// (`VLLM_PROXY_PRIORITY_LOWER_FIRST`): vLLM's `--scheduling-policy
+    /// priority`. The proxy then writes the negated value, so callers keep
+    /// one meaning (higher = more important) on SGLang and vLLM alike. Off by
+    /// default: SGLang runs the highest first.
+    pub priority_lower_first: bool,
     /// For streaming requests, wait up to this many milliseconds for the
     /// first upstream SSE chunk before committing a 200 to the client
     /// (`VLLM_PROXY_STREAM_ERROR_PEEK_MS`, 0 = off). An engine that rejects
@@ -1483,6 +1489,7 @@ impl Config {
             backend_health_path,
             non_tee_deployment: env_bool("NON_TEE_DEPLOYMENT"),
             map_queue_full_to_429: env_bool("VLLM_PROXY_MAP_QUEUE_FULL_TO_429"),
+            priority_lower_first: env_bool("VLLM_PROXY_PRIORITY_LOWER_FIRST"),
             stream_error_peek_ms: env_int("VLLM_PROXY_STREAM_ERROR_PEEK_MS", 0) as u64,
             stream_commit_ms: env_int("VLLM_PROXY_STREAM_COMMIT_MS", 0) as u64,
             first_token_deadline_ms,
@@ -1943,6 +1950,7 @@ mod tests {
             "VLLM_BACKEND_HEALTH_PATH",
             "NON_TEE_DEPLOYMENT",
             "VLLM_PROXY_MAP_QUEUE_FULL_TO_429",
+            "VLLM_PROXY_PRIORITY_LOWER_FIRST",
             "VLLM_PROXY_STREAM_ERROR_PEEK_MS",
             "VLLM_PROXY_REJECTED_CONTENT_PART_TYPES",
             "VLLM_PROXY_MODELS_DOCUMENT_URL",
@@ -2525,6 +2533,7 @@ mod tests {
             assert_eq!(config.backend_health_path, "/health");
             assert!(!config.non_tee_deployment);
             assert!(!config.map_queue_full_to_429);
+            assert!(!config.priority_lower_first);
             assert_eq!(config.stream_error_peek_ms, 0);
             assert_eq!(config.stream_commit_ms, 0);
             assert_eq!(config.first_token_deadline_ms, 0);
@@ -2629,6 +2638,7 @@ mod tests {
                 ("VLLM_BACKEND_HEALTH_PATH", "/healthz"),
                 ("NON_TEE_DEPLOYMENT", "1"),
                 ("VLLM_PROXY_MAP_QUEUE_FULL_TO_429", "1"),
+                ("VLLM_PROXY_PRIORITY_LOWER_FIRST", "1"),
                 ("VLLM_PROXY_STREAM_ERROR_PEEK_MS", "750"),
                 (
                     "VLLM_PROXY_REJECTED_CONTENT_PART_TYPES",
@@ -2647,6 +2657,7 @@ mod tests {
                 assert_eq!(config.backend_health_path, "/healthz");
                 assert!(config.non_tee_deployment);
                 assert!(config.map_queue_full_to_429);
+                assert!(config.priority_lower_first);
                 assert_eq!(config.stream_error_peek_ms, 750);
                 assert_eq!(
                     config.rejected_content_part_types,

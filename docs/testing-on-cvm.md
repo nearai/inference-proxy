@@ -122,7 +122,7 @@ ssh gpu07 'scp -P 10022 /tmp/test-delegate.yaml root@localhost:/tmp/'
 ssh gpu07 'ssh -p 10022 root@localhost' <<'CVM'
 mkdir -p /tmp/deltest && cd /tmp/deltest && mv /tmp/test-delegate.yaml .
 PROXY_IMAGE='nearaidev/vllm-proxy-rs@sha256:<digest from build run>' \
-PROXY_TOKEN=delegate-test-token-1234 \
+PROXY_TOKEN='<throwaway token, e.g. from openssl rand -hex 16>' \
 docker compose -f test-delegate.yaml -p deltest up -d
 CVM
 ```

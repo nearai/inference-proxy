@@ -118,6 +118,7 @@ fn sqs_transport() -> crate::usage_report::UsageReportTransport {
         region: "us-east-1".to_string(),
         endpoint: None,
         credentials_url: "http://127.0.0.1:9911".to_string(),
+        batch_window: std::time::Duration::ZERO,
     })
 }
 

@@ -161,9 +161,14 @@ fn usage_report_transport() -> anyhow::Result<crate::usage_report::UsageReportTr
     const SQS_URL: &str = "VLLM_PROXY_USAGE_REPORT_SQS_URL";
     const SQS_REGION: &str = "VLLM_PROXY_USAGE_REPORT_SQS_REGION";
     const SQS_ENDPOINT: &str = "VLLM_PROXY_USAGE_REPORT_SQS_ENDPOINT";
+    const SQS_BATCH_WINDOW: &str = "VLLM_PROXY_USAGE_REPORT_SQS_BATCH_WINDOW_MS";
     const CREDENTIALS_URL: &str = "VLLM_PROXY_AWS_CREDENTIALS_URL";
     const ALLOW_INSECURE: &str = "VLLM_PROXY_USAGE_REPORT_ALLOW_INSECURE_ENDPOINTS";
     const DEFAULT_REGION: &str = "us-east-1";
+    /// Long enough for the reports of a busy second to share calls, short
+    /// next to the time a report has to be accepted in.
+    const DEFAULT_BATCH_WINDOW_MS: u64 = 50;
+    const BATCH_WINDOW_LIMIT_MS: u64 = 1_000;
 
     let optional = |name: &str| env::var(name).ok().filter(|v| !v.trim().is_empty());
     let transport = optional(TRANSPORT).unwrap_or_else(|| "http".to_string());
@@ -203,11 +208,16 @@ fn usage_report_transport() -> anyhow::Result<crate::usage_report::UsageReportTr
                     "{SQS_REGION} must be an AWS region name such as eu-west-1, not `{region}`"
                 );
             }
+            let batch_window_ms: u64 = env_parse(SQS_BATCH_WINDOW, DEFAULT_BATCH_WINDOW_MS)?;
+            if batch_window_ms > BATCH_WINDOW_LIMIT_MS {
+                anyhow::bail!("{SQS_BATCH_WINDOW} must be at most {BATCH_WINDOW_LIMIT_MS}");
+            }
             Ok(UsageReportTransport::Sqs(SqsSettings {
                 queue_url: queue_url.trim().to_string(),
                 region,
                 endpoint: optional(SQS_ENDPOINT).map(|e| e.trim().to_string()),
                 credentials_url: credentials_url.trim().to_string(),
+                batch_window: std::time::Duration::from_millis(batch_window_ms),
             }))
         }
         other => anyhow::bail!("{TRANSPORT} must be `http` or `sqs`, not `{other}`"),
@@ -233,8 +243,9 @@ fn bills_usage(
 /// settings decide whether usage is billed, so a typo must not be guessed at.
 ///
 /// The SQS transport has its own defaults: 5 attempts (the retries that
-/// credential and clock-skew errors need) and 8 reports in flight, the cap the
-/// gateway's delivery policy sets. Each stays overridable by its variable.
+/// credential and clock-skew errors need) and 100 reports in flight: the
+/// reports in flight are the ones a batch can gather, ten batches of ten. Each
+/// stays overridable by its variable.
 fn usage_report_policy(
     transport: &crate::usage_report::UsageReportTransport,
 ) -> anyhow::Result<crate::usage_report::UsageReportPolicy> {
@@ -257,7 +268,7 @@ fn usage_report_policy(
     const MAX_QUEUED_LIMIT: usize = 100_000;
     const SHUTDOWN_DRAIN_LIMIT_SECS: u64 = 600;
     const SQS_DEFAULT_MAX_ATTEMPTS: u32 = 5;
-    const SQS_DEFAULT_MAX_IN_FLIGHT: usize = 8;
+    const SQS_DEFAULT_MAX_IN_FLIGHT: usize = 100;
     /// The queue's reports are durable once accepted, so a short wait at
     /// shutdown lets the ones in flight land instead of being abandoned.
     const SQS_DEFAULT_SHUTDOWN_DRAIN_SECS: u64 = 10;
@@ -319,6 +330,15 @@ fn usage_report_policy(
     }
     if shutdown_drain_secs > SHUTDOWN_DRAIN_LIMIT_SECS {
         anyhow::bail!("{SHUTDOWN_DRAIN} must be at most {SHUTDOWN_DRAIN_LIMIT_SECS}");
+    }
+    // A report's batch window is spent inside its attempt's timeout: a window
+    // that takes most of it leaves no time to send a batch that does not fill.
+    if let crate::usage_report::UsageReportTransport::Sqs(settings) = transport {
+        if settings.batch_window * 2 > Duration::from_secs(timeout_secs) {
+            anyhow::bail!(
+                "VLLM_PROXY_USAGE_REPORT_SQS_BATCH_WINDOW_MS must be at most half of {TIMEOUT}"
+            );
+        }
     }
     Ok(crate::usage_report::UsageReportPolicy {
         attempt_timeout: Duration::from_secs(timeout_secs),
@@ -1988,7 +2008,7 @@ mod tests {
         }
     }
 
-    const USAGE_REPORT_ENV: [&str; 13] = [
+    const USAGE_REPORT_ENV: [&str; 14] = [
         "VLLM_PROXY_USAGE_REPORT_TIMEOUT_SECS",
         "VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS",
         "VLLM_PROXY_USAGE_REPORT_INITIAL_BACKOFF_MS",
@@ -2000,6 +2020,7 @@ mod tests {
         "VLLM_PROXY_USAGE_REPORT_SQS_URL",
         "VLLM_PROXY_USAGE_REPORT_SQS_REGION",
         "VLLM_PROXY_USAGE_REPORT_SQS_ENDPOINT",
+        "VLLM_PROXY_USAGE_REPORT_SQS_BATCH_WINDOW_MS",
         "VLLM_PROXY_USAGE_REPORT_ALLOW_INSECURE_ENDPOINTS",
         "VLLM_PROXY_AWS_CREDENTIALS_URL",
     ];
@@ -2028,7 +2049,7 @@ mod tests {
         with_clean_env(&base, &sqs, || {
             let policy = Config::from_env().unwrap().usage_report;
             assert_eq!(policy.max_attempts, 5);
-            assert_eq!(policy.max_in_flight, 8);
+            assert_eq!(policy.max_in_flight, 100);
             assert_eq!(policy.shutdown_drain, Duration::from_secs(10));
         });
         let overridden: Vec<_> = sqs
@@ -2046,6 +2067,36 @@ mod tests {
             assert_eq!(policy.max_in_flight, 4);
             assert_eq!(policy.shutdown_drain, Duration::from_secs(3));
         });
+    }
+
+    /// A batch window is spent inside the attempt's timeout, so it may take at
+    /// most half of it: a window as long as the timeout would leave a report
+    /// whose batch does not fill no time to be sent at all.
+    #[test]
+    fn test_sqs_batch_window_fits_in_half_the_attempt_timeout() {
+        const WINDOW: &str = "VLLM_PROXY_USAGE_REPORT_SQS_BATCH_WINDOW_MS";
+        const TIMEOUT: &str = "VLLM_PROXY_USAGE_REPORT_TIMEOUT_SECS";
+        let base = [("MODEL_NAME", "m"), ("TOKEN", "t")];
+        let sqs = |window: &'static str, timeout: &'static str| {
+            vec![
+                ("VLLM_PROXY_USAGE_REPORT_TRANSPORT", "sqs"),
+                ("VLLM_PROXY_USAGE_REPORT_SQS_URL", "https://sqs.example/q"),
+                ("VLLM_PROXY_AWS_CREDENTIALS_URL", "http://127.0.0.1:9911"),
+                (WINDOW, window),
+                (TIMEOUT, timeout),
+            ]
+        };
+        for (window, timeout) in [("1000", "1"), ("600", "1")] {
+            with_clean_env(&base, &sqs(window, timeout), || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains(WINDOW) && err.contains(TIMEOUT), "{err}");
+            });
+        }
+        for (window, timeout) in [("500", "1"), ("1000", "2"), ("0", "1")] {
+            with_clean_env(&base, &sqs(window, timeout), || {
+                Config::from_env().unwrap();
+            });
+        }
     }
 
     /// The fail-closed rule for `VLLM_BACKEND_TOKEN` counts the SQS transport
@@ -2111,6 +2162,7 @@ mod tests {
             region: "us-east-1".into(),
             endpoint: None,
             credentials_url: "http://127.0.0.1:9911".into(),
+            batch_window: std::time::Duration::from_millis(50),
         });
         // SQS needs neither cloud-api's URL nor its usage token.
         assert!(bills_usage(false, false, &sqs));
@@ -2136,7 +2188,7 @@ mod tests {
         with_clean_env(&base, &sqs, || {
             let mut config = Config::from_env().unwrap();
             assert_eq!(config.usage_report.max_attempts, 5);
-            assert_eq!(config.usage_report.max_in_flight, 8);
+            assert_eq!(config.usage_report.max_in_flight, 100);
             config.fall_back_to_http_usage_transport().unwrap();
             assert_eq!(config.usage_report_transport, UsageReportTransport::Http);
             assert_eq!(config.usage_report, UsageReportPolicy::default());
@@ -2237,6 +2289,7 @@ mod tests {
                         region: "eu-west-1".into(),
                         endpoint: None,
                         credentials_url: "http://127.0.0.1:9911".into(),
+                        batch_window: std::time::Duration::from_millis(50),
                     })
                 );
             },

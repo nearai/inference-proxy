@@ -4099,6 +4099,7 @@ mod tests {
                 region: "us-east-1".to_string(),
                 endpoint: None,
                 credentials_url: "http://127.0.0.1:9".to_string(),
+                batch_window: std::time::Duration::ZERO,
             }),
         );
         let mut queued = reporter_with(None, Some("org"), Some("ws"), Some("key"));

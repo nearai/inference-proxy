@@ -70,8 +70,9 @@ It runs after the two repairs above. A process without a list never does it.
    report is handed over when the request completes and sent off the request
    path: once, with a 5 s timeout, unless `VLLM_PROXY_USAGE_REPORT_*` says
    otherwise (see [Usage report delivery](#usage-report-delivery)). With
-   `VLLM_PROXY_USAGE_REPORT_TRANSPORT=sqs` the report is a `SendMessage` to the
-   usage queue instead, and needs neither `CLOUD_API_URL` nor the usage token.
+   `VLLM_PROXY_USAGE_REPORT_TRANSPORT=sqs` the report goes to the usage queue
+   instead, in a `SendMessageBatch` with the other reports sent at once, and
+   needs neither `CLOUD_API_URL` nor the usage token.
 
 Nothing about request or response content is logged or stored at any hop.
 
@@ -563,17 +564,18 @@ then has to wait for.
 
 | Variable | Default | Lane value | Meaning |
 | --- | --- | --- | --- |
-| `VLLM_PROXY_USAGE_REPORT_TRANSPORT` | `http` | unchanged | `http` (cloud-api, the default) or `sqs` (the usage queue, `SendMessage` signed with SigV4). `sqs` needs `_SQS_URL` and `VLLM_PROXY_AWS_CREDENTIALS_URL`, and not `CLOUD_API_URL` or the usage token. Any other value fails startup. |
+| `VLLM_PROXY_USAGE_REPORT_TRANSPORT` | `http` | unchanged | `http` (cloud-api, the default) or `sqs` (the usage queue, `SendMessageBatch` signed with SigV4). `sqs` needs `_SQS_URL` and `VLLM_PROXY_AWS_CREDENTIALS_URL`, and not `CLOUD_API_URL` or the usage token. Any other value fails startup. |
 | `VLLM_PROXY_USAGE_REPORT_SQS_URL` | unset | unset | The usage queue's URL. Required with `sqs`. |
 | `VLLM_PROXY_USAGE_REPORT_SQS_REGION` | `us-east-1` | unchanged | The queue's region (letters, digits and hyphens). |
 | `VLLM_PROXY_USAGE_REPORT_SQS_ENDPOINT` | unset | unset | Replaces the regional SQS endpoint (a local emulator). |
+| `VLLM_PROXY_USAGE_REPORT_SQS_BATCH_WINDOW_MS` | `50` | default | How long a batch stays open for more reports after its first (at most 1000, and at most half of `_TIMEOUT_SECS`, since the window is spent inside the attempt; `0` = only the reports already waiting). A batch is sent once it holds ten reports or the bytes of one envelope (256 KiB), whichever comes first. |
 | `VLLM_PROXY_AWS_CREDENTIALS_URL` | unset | unset | Base URL of an instance-metadata (IMDSv2) credentials endpoint, e.g. `http://127.0.0.1:9911`; on a gateway host, `aws_signing_helper serve` on localhost. The gateway fetches a session token (`PUT /latest/api/token`), the role name (`GET /latest/meta-data/iam/security-credentials/`) and the credentials (`GET .../security-credentials/<role>`: `AccessKeyId`, `SecretAccessKey`, `Token`, `Expiration`). It is not the credentials path: a URL that already includes one is not served. Required with `sqs`. There are no static keys. |
 | `VLLM_PROXY_USAGE_REPORT_ALLOW_INSECURE_ENDPOINTS` | off | off | Test environments only. The SQS URLs and the credentials URL must be `https` unless the host is loopback; `1` also accepts plain `http` to any host (a compose network's emulators) and logs a warning at startup. |
 | `VLLM_PROXY_USAGE_REPORT_TIMEOUT_SECS` | `5` | `30` | Timeout of one attempt (1 to 300). Above 5 requires `_MAX_IN_FLIGHT`. |
 | `VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS` | `1` (`5` with `sqs`) | `5` | Attempts per report, the first one included; `1` = never retried, at most `10`. More than one requires `_MAX_IN_FLIGHT`. |
 | `VLLM_PROXY_USAGE_REPORT_INITIAL_BACKOFF_MS` | `500` | `5000` | Backoff before the first retry (at most 30000); doubled for each later one, at most 30 s. |
 | `VLLM_PROXY_USAGE_REPORT_DEADLINE_SECS` | `0` (none) | `300` | How long after its request completed a report may still be sent. Above the timeout: the difference is the time a report has to wait and to back off. |
-| `VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT` | `0` (no cap; `8` with `sqs`) | `8` | Reports in flight at once, for the whole process (at most 1000). |
+| `VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT` | `0` (no cap; `100` with `sqs`) | `8` | Reports in flight at once, for the whole process (at most 1000). |
 | `VLLM_PROXY_USAGE_REPORT_MAX_QUEUED` | `10000` | default | Reports that may wait for a place when the cap is reached (1 to 100000). Unused without a cap. |
 | `VLLM_PROXY_USAGE_REPORT_SHUTDOWN_DRAIN_SECS` | `0` (no wait; `10` with `sqs`) | below the service's stop timeout | How long shutdown waits for pending reports once every open request has ended (at most 600). |
 
@@ -586,6 +588,16 @@ is `1` for `transport="http"` and `0` for `transport="sqs"` (alert on it). If
 HTTP is not configured, startup is refused. After a fallback the delivery policy is the one the HTTP transport would have had (its defaults for every unset `VLLM_PROXY_USAGE_REPORT_*` variable, not the `sqs` defaults; explicit values are kept), so the process behaves like today's HTTP transport. The choice is made once: a process
 that starts on SQS stays on SQS. Reports are deduplicated on the completion id
 across transports, so a fleet mixing the two does not double-bill.
+
+With `sqs` the reports being sent at once share calls: each attempt hands its
+report to a batch, which stays open for `_SQS_BATCH_WINDOW_MS` after its first
+report, or until it holds ten, and goes in one `SendMessageBatch` (the same
+`sqs:SendMessage` permission). SQS bills a batch as one request, so a busy
+gateway makes up to ten times fewer calls, and pays for up to ten times fewer
+requests. Each report keeps its own attempts, retries, log lines and metrics:
+a report the batch's answer refused is retried alone, and one it took is done.
+A batch gathers only the reports in flight, which is why the `sqs` default cap
+is 100 (ten full batches) rather than the 8 sized for cloud-api's writes.
 
 A value that cannot work fails startup. A report only gets more than the one
 5 s attempt it has always had under a cap, so whatever is configured, what the

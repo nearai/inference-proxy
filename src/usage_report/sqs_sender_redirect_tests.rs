@@ -8,9 +8,8 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use super::tests::{
-    attempt, chat_body, job_with, sender, sender_with_endpoint_credentials, sqs_answering,
-};
+use super::batch_tests::{sqs_taking, TakesEvery};
+use super::tests::{attempt, chat_body, job_with, sender, sender_with_endpoint_credentials};
 use super::*;
 use crate::aws_credentials::test_support::{mount_imds_session, ROLE_CREDENTIALS_PATH};
 use crate::usage_report::UsageReportDelivery;
@@ -59,7 +58,7 @@ async fn a_redirect_is_final_whatever_error_type_it_names() {
 async fn a_redirect_from_the_queue_endpoint_is_not_followed() {
     let elsewhere = MockServer::start().await;
     Mock::given(wiremock::matchers::any())
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"MessageId": "m"})))
+        .respond_with(TakesEvery::now())
         .mount(&elsewhere)
         .await;
     let sqs = MockServer::start().await;
@@ -91,7 +90,7 @@ async fn a_redirect_from_the_credentials_endpoint_is_not_followed() {
         .respond_with(ResponseTemplate::new(200).set_body_string("stolen"))
         .mount(&elsewhere)
         .await;
-    let sqs = sqs_answering(200, json!({"MessageId": "m"})).await;
+    let sqs = sqs_taking().await;
 
     // Redirected at the token step.
     let creds = MockServer::start().await;

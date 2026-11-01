@@ -70,6 +70,7 @@ fn test_upstream_error_log_excludes_parsed_body_content() {
     let body = br#"{"message":"403, message='Forbidden', url='https://private.example/media.jpg?token=SECRET_TOKEN_SENTINEL&email=alice@example.com'","type":"InternalServerError"}"#;
     let tracing_ids = TracingIds {
         request_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+        upstream_request_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
         request_id_inbound: true,
         org_id: Some("org-test".to_string()),
         workspace_id: Some("workspace-test".to_string()),

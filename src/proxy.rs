@@ -2059,6 +2059,16 @@ pub fn parse_json_object(body: &[u8]) -> Result<serde_json::Value, AppError> {
     Ok(json)
 }
 
+/// Remove the `rid` (SGLang) and `request_id` body fields from a direct
+/// `sk-` request, so the backend assigns its own id. No-op on a non-object
+/// body.
+pub fn strip_client_request_ids(body: &mut serde_json::Value) {
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("rid");
+        obj.remove("request_id");
+    }
+}
+
 /// Inject `"stream": true` and `"stream_options": {"include_usage": true}`
 /// into a JSON request body for internal streaming.
 fn inject_streaming(body: &[u8]) -> Result<Vec<u8>, AppError> {
@@ -3931,9 +3941,32 @@ mod tests {
     use crate::signing::{EcdsaContext, Ed25519Context, SigningPair};
 
     #[test]
+    fn strip_client_request_ids_removes_backend_id_fields() {
+        let mut body = serde_json::json!({
+            "model": "m",
+            "messages": [],
+            "rid": "client-chosen-123",
+            "request_id": "client-chosen-456",
+            "temperature": 0.5,
+        });
+        strip_client_request_ids(&mut body);
+        assert!(body.get("rid").is_none());
+        assert!(body.get("request_id").is_none());
+        // Unrelated fields are untouched.
+        assert_eq!(body["model"], "m");
+        assert_eq!(body["temperature"], 0.5);
+
+        // No-op on a non-object body.
+        let mut array = serde_json::json!([1, 2, 3]);
+        strip_client_request_ids(&mut array);
+        assert_eq!(array, serde_json::json!([1, 2, 3]));
+    }
+
+    #[test]
     fn request_metric_labels_preserve_only_bounded_source_dimensions() {
         let tracing_ids = Some(TracingIds {
             request_id: uuid::Uuid::new_v4().to_string(),
+            upstream_request_id: uuid::Uuid::new_v4().to_string(),
             request_id_inbound: true,
             org_id: Some("not-emitted-as-a-label".to_string()),
             workspace_id: None,
@@ -3952,6 +3985,7 @@ mod tests {
 
         let direct_ids = Some(TracingIds {
             request_id: uuid::Uuid::new_v4().to_string(),
+            upstream_request_id: uuid::Uuid::new_v4().to_string(),
             request_id_inbound: false,
             org_id: Some("org-verified-but-not-a-metric-label".to_string()),
             workspace_id: Some("workspace-verified-but-not-a-metric-label".to_string()),
@@ -3969,6 +4003,7 @@ mod tests {
 
         let trusted_without_tenant = Some(TracingIds {
             request_id: uuid::Uuid::new_v4().to_string(),
+            upstream_request_id: uuid::Uuid::new_v4().to_string(),
             request_id_inbound: false,
             org_id: None,
             workspace_id: None,
@@ -3988,6 +4023,7 @@ mod tests {
     fn tenant_context_label_separates_customer_streams_from_probes() {
         let customer = Some(TracingIds {
             request_id: uuid::Uuid::new_v4().to_string(),
+            upstream_request_id: uuid::Uuid::new_v4().to_string(),
             request_id_inbound: true,
             org_id: Some("org".to_string()),
             workspace_id: Some("workspace".to_string()),
@@ -4000,6 +4036,7 @@ mod tests {
 
         let probe = Some(TracingIds {
             request_id: uuid::Uuid::new_v4().to_string(),
+            upstream_request_id: uuid::Uuid::new_v4().to_string(),
             request_id_inbound: false,
             org_id: None,
             workspace_id: None,

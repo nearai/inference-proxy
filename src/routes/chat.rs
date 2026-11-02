@@ -146,6 +146,17 @@ async fn serve(
     if model.merge_system_messages {
         crate::system_messages::merge_system_messages(&mut request_json, model.label);
     }
+    // Size bonus on the engine `priority`: needs the plaintext prompt, so it
+    // runs here (after decryption and the repairs) and before every branch
+    // that forwards the body: fusion, the agent loop and the plain proxy path.
+    if let Some(tiers) = &state.config.priority_size_tiers {
+        crate::priority::apply_size_bonus(
+            &mut request_json,
+            tiers,
+            crate::priority::BodyKind::Chat,
+            state.config.priority_lower_first,
+        );
+    }
     let is_stream = request_json
         .get("stream")
         .and_then(|v| v.as_bool())

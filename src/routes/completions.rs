@@ -91,6 +91,16 @@ async fn serve(
         crate::model_list::checked_model(&state, model.id),
     )?;
     crate::model_list::apply_backend_lora(&state, &mut request_json);
+    // Size bonus on the engine `priority`, from the decrypted prompt; see the
+    // chat route.
+    if let Some(tiers) = &state.config.priority_size_tiers {
+        crate::priority::apply_size_bonus(
+            &mut request_json,
+            tiers,
+            crate::priority::BodyKind::Completion,
+            state.config.priority_lower_first,
+        );
+    }
 
     let is_stream = request_json
         .get("stream")

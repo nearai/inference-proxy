@@ -107,6 +107,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         non_tee_deployment: false,
         map_queue_full_to_429: false,
         priority_lower_first: false,
+        priority_size_tiers: None,
         stream_error_peek_ms: 0,
         stream_commit_ms: 0,
         first_token_deadline_ms: 0,

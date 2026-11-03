@@ -50,6 +50,17 @@ fn env_bool(name: &str) -> bool {
     env::var(name).map(|v| parse_bool(&v)).unwrap_or(false)
 }
 
+/// `VLLM_PROXY_PRIORITY_SIZE_TIERS`: unset or blank = off, malformed = startup error.
+fn priority_size_tiers_from_env() -> anyhow::Result<Option<crate::priority::SizeTiers>> {
+    const NAME: &str = "VLLM_PROXY_PRIORITY_SIZE_TIERS";
+    match env::var(NAME) {
+        Ok(raw) if !raw.trim().is_empty() => crate::priority::SizeTiers::parse(&raw)
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("{NAME}: {e}")),
+        _ => Ok(None),
+    }
+}
+
 fn env_bool_optional(name: &str) -> Option<bool> {
     env::var(name).ok().map(|v| parse_bool(&v))
 }
@@ -731,6 +742,10 @@ pub struct Config {
     /// one meaning (higher = more important) on SGLang and vLLM alike. Off by
     /// default: SGLang runs the highest first.
     pub priority_lower_first: bool,
+    /// Size-based priority bonus (`VLLM_PROXY_PRIORITY_SIZE_TIERS`, e.g.
+    /// `16000:10,65536:5,*:0`), CVM proxy mode only. `None` (unset or empty)
+    /// leaves `priority` exactly as the caller class set it; see `priority.rs`.
+    pub priority_size_tiers: Option<crate::priority::SizeTiers>,
     /// For streaming requests, wait up to this many milliseconds for the
     /// first upstream SSE chunk before committing a 200 to the client
     /// (`VLLM_PROXY_STREAM_ERROR_PEEK_MS`, 0 = off). An engine that rejects
@@ -1490,6 +1505,7 @@ impl Config {
             non_tee_deployment: env_bool("NON_TEE_DEPLOYMENT"),
             map_queue_full_to_429: env_bool("VLLM_PROXY_MAP_QUEUE_FULL_TO_429"),
             priority_lower_first: env_bool("VLLM_PROXY_PRIORITY_LOWER_FIRST"),
+            priority_size_tiers: priority_size_tiers_from_env()?,
             stream_error_peek_ms: env_int("VLLM_PROXY_STREAM_ERROR_PEEK_MS", 0) as u64,
             stream_commit_ms: env_int("VLLM_PROXY_STREAM_COMMIT_MS", 0) as u64,
             first_token_deadline_ms,
@@ -1951,6 +1967,7 @@ mod tests {
             "NON_TEE_DEPLOYMENT",
             "VLLM_PROXY_MAP_QUEUE_FULL_TO_429",
             "VLLM_PROXY_PRIORITY_LOWER_FIRST",
+            "VLLM_PROXY_PRIORITY_SIZE_TIERS",
             "VLLM_PROXY_STREAM_ERROR_PEEK_MS",
             "VLLM_PROXY_REJECTED_CONTENT_PART_TYPES",
             "VLLM_PROXY_MODELS_DOCUMENT_URL",
@@ -2534,6 +2551,7 @@ mod tests {
             assert!(!config.non_tee_deployment);
             assert!(!config.map_queue_full_to_429);
             assert!(!config.priority_lower_first);
+            assert!(config.priority_size_tiers.is_none());
             assert_eq!(config.stream_error_peek_ms, 0);
             assert_eq!(config.stream_commit_ms, 0);
             assert_eq!(config.first_token_deadline_ms, 0);
@@ -2668,6 +2686,33 @@ mod tests {
                 gateway_env_cleanup();
             },
         );
+    }
+
+    #[test]
+    fn test_priority_size_tiers_env() {
+        let base = [("MODEL_NAME", "m"), ("TOKEN", "t")];
+        let with = |value: &'static str| {
+            let mut vars = base.to_vec();
+            vars.push(("VLLM_PROXY_PRIORITY_SIZE_TIERS", value));
+            vars
+        };
+        with_env_vars(&with("16000:10, 65536:5, *:0"), || {
+            let config = Config::from_env().unwrap();
+            let tiers = config.priority_size_tiers.unwrap();
+            assert_eq!(tiers.classify(16000), (0, 10));
+            assert_eq!(tiers.classify(65536), (1, 5));
+            assert_eq!(tiers.classify(65537), (2, 0));
+            gateway_env_cleanup();
+        });
+        with_env_vars(&with("  "), || {
+            assert!(Config::from_env().unwrap().priority_size_tiers.is_none());
+            gateway_env_cleanup();
+        });
+        with_env_vars(&with("16000:10"), || {
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(err.contains("VLLM_PROXY_PRIORITY_SIZE_TIERS"), "{err}");
+            gateway_env_cleanup();
+        });
     }
 
     #[test]

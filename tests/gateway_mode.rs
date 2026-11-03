@@ -160,6 +160,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         non_tee_deployment: options.non_tee_deployment,
         map_queue_full_to_429: options.map_queue_full_to_429,
         priority_lower_first: false,
+        priority_size_tiers: None,
         stream_error_peek_ms: options.stream_error_peek_ms,
         stream_commit_ms: options.stream_commit_ms,
         first_token_deadline_ms: options.first_token_deadline_ms,

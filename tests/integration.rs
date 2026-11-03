@@ -38,6 +38,10 @@ struct TestAppOptions {
     backend_lora: Option<String>,
     /// `VLLM_PROXY_STRICT_REQUEST_MODEL`.
     strict_request_model: bool,
+    /// `VLLM_PROXY_PRIORITY_SIZE_TIERS`.
+    priority_size_tiers: Option<String>,
+    /// `VLLM_PROXY_PRIORITY_LOWER_FIRST`.
+    priority_lower_first: bool,
 }
 
 impl Default for TestAppOptions {
@@ -63,6 +67,8 @@ impl Default for TestAppOptions {
             backend_max_inflight: None,
             backend_lora: None,
             strict_request_model: false,
+            priority_size_tiers: None,
+            priority_lower_first: false,
         }
     }
 }
@@ -276,7 +282,11 @@ fn build_test_app_inner_with_pool(
         backend_health_path: "/health".to_string(),
         non_tee_deployment: false,
         map_queue_full_to_429: false,
-        priority_lower_first: false,
+        priority_lower_first: options.priority_lower_first,
+        priority_size_tiers: options
+            .priority_size_tiers
+            .as_deref()
+            .map(|raw| priority::SizeTiers::parse(raw).unwrap()),
         stream_error_peek_ms: 0,
         stream_commit_ms: options.stream_commit_ms,
         first_token_deadline_ms: 0,
@@ -6496,6 +6506,7 @@ fn build_test_app_with_cloud_api_retries(
         non_tee_deployment: false,
         map_queue_full_to_429: false,
         priority_lower_first: false,
+        priority_size_tiers: None,
         stream_error_peek_ms: 0,
         stream_commit_ms: 0,
         first_token_deadline_ms: 0,
@@ -9144,6 +9155,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         non_tee_deployment: false,
         map_queue_full_to_429: false,
         priority_lower_first: false,
+        priority_size_tiers: None,
         stream_error_peek_ms: 0,
         stream_commit_ms: 0,
         first_token_deadline_ms: 0,
@@ -9618,6 +9630,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         non_tee_deployment: false,
         map_queue_full_to_429: false,
         priority_lower_first: false,
+        priority_size_tiers: None,
         stream_error_peek_ms: 0,
         stream_commit_ms: 0,
         first_token_deadline_ms: 0,
@@ -11916,4 +11929,204 @@ async fn test_e2ee_upstream_errors_are_redacted_in_http_and_sse() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Size-based priority tiers (VLLM_PROXY_PRIORITY_SIZE_TIERS)
+// ---------------------------------------------------------------------------
+
+fn priority_app(mock_url: &str, tiers: Option<&str>, lower_first: bool) -> axum::Router {
+    build_test_app_inner(
+        mock_url,
+        TestAppOptions {
+            priority_size_tiers: tiers.map(str::to_string),
+            priority_lower_first: lower_first,
+            ..Default::default()
+        },
+    )
+}
+
+/// POST to `uri` with a `priority` the client must not control; the mock only
+/// answers 200 when the forwarded `priority` is `expected`, else wiremock 404s.
+async fn forwarded_priority_status(
+    app: axum::Router,
+    mock: &MockServer,
+    uri: &str,
+    body: serde_json::Value,
+    header_priority: Option<&str>,
+    expected: i64,
+) -> StatusCode {
+    mock.reset().await;
+    Mock::given(method("POST"))
+        .and(path(uri))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"priority": expected}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "x", "choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        })))
+        .mount(mock)
+        .await;
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header(auth_header().0, auth_header().1);
+    if let Some(value) = header_priority {
+        builder = builder.header(priority::PRIORITY_HEADER, value);
+    }
+    app.oneshot(
+        builder
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+    .status()
+}
+
+fn chat_of_bytes(bytes: usize) -> serde_json::Value {
+    serde_json::json!({
+        "model": "test-model",
+        "priority": 777,
+        "messages": [{"role": "user", "content": "x".repeat(bytes)}],
+    })
+}
+
+#[tokio::test]
+async fn size_tiers_unset_leave_priority_exactly_as_the_caller_class_set_it() {
+    let mock = MockServer::start().await;
+    // Short and long prompts alike: 0, or the header value unscaled.
+    for (bytes, header, expected) in [(100, None, 0), (400_000, None, 0), (100, Some("-1"), -1)] {
+        let status = forwarded_priority_status(
+            priority_app(&mock.uri(), None, false),
+            &mock,
+            "/v1/chat/completions",
+            chat_of_bytes(bytes),
+            header,
+            expected,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{bytes} {header:?}");
+    }
+}
+
+#[tokio::test]
+async fn size_tiers_give_short_and_long_prompts_different_priority() {
+    let mock = MockServer::start().await;
+    // Estimated tokens: 100 bytes → 29, 4_000 → 1_004, 400_000 → 100_004.
+    let tiers = Some("1000:10,64000:5,*:0");
+    for (bytes, header, expected) in [
+        (100, None, 10),
+        (4_000, None, 5),
+        (400_000, None, 0),
+        // Caller classes stay ordered: -1 short (-90) below 0 long (0).
+        (100, Some("-1"), -90),
+        (400_000, Some("-1"), -100),
+    ] {
+        let status = forwarded_priority_status(
+            priority_app(&mock.uri(), tiers, false),
+            &mock,
+            "/v1/chat/completions",
+            chat_of_bytes(bytes),
+            header,
+            expected,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{bytes} {header:?} → {expected}");
+    }
+    // Completions take the same tiers: string prompt, array prompt, token ids.
+    for (prompt, expected) in [
+        (serde_json::json!("x".repeat(100)), 10),
+        (serde_json::json!(["x".repeat(400_000)]), 0),
+        (serde_json::json!([1, 2, 3]), 10),
+    ] {
+        let status = forwarded_priority_status(
+            priority_app(&mock.uri(), tiers, false),
+            &mock,
+            "/v1/completions",
+            serde_json::json!({"model": "test-model", "priority": 777, "prompt": prompt}),
+            None,
+            expected,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "completions → {expected}");
+    }
+}
+
+#[tokio::test]
+async fn size_tiers_with_lower_first_negate_the_combined_value() {
+    let mock = MockServer::start().await;
+    let tiers = Some("1000:10,*:0");
+    for (bytes, header, expected) in [
+        (100, None, -10),
+        (400_000, None, 0),
+        (100, Some("-1"), 90),
+        (400_000, Some("-1"), 100),
+    ] {
+        let status = forwarded_priority_status(
+            priority_app(&mock.uri(), tiers, true),
+            &mock,
+            "/v1/chat/completions",
+            chat_of_bytes(bytes),
+            header,
+            expected,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{bytes} {header:?} → {expected}");
+    }
+}
+
+#[tokio::test]
+async fn size_tier_is_computed_from_the_decrypted_prompt() {
+    use vllm_proxy_rs::encryption;
+
+    let mock = MockServer::start().await;
+    let client_pair = test_client_signing_pair();
+    let enc_for_request = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: hex::decode(test_ed25519_pub_key_hex()).unwrap(),
+        version: 1,
+        encrypt_all_fields: false,
+    };
+    // "Hi" is 4 estimated tokens (one message); its hex ciphertext is far
+    // above the 10-token bound, so tier 0 (bonus 5) proves the estimate read
+    // the plaintext, and not what the client put on the wire.
+    let ciphertext = encryption::encrypt_string("Hi", &enc_for_request, &client_pair).unwrap();
+    assert!(ciphertext.len() > 100);
+
+    let app = priority_app(&mock.uri(), Some("10:5,*:0"), false);
+    mock.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"priority": 5}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "x", "choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        })))
+        .mount(&mock)
+        .await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header("x-signing-algo", "ed25519")
+                .header("x-client-pub-key", &client_pair.ed25519.signing_public_key)
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "model": "test-model",
+                        "priority": 777,
+                        "messages": [{"role": "user", "content": ciphertext}],
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }

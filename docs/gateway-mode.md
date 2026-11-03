@@ -172,7 +172,8 @@ are operator-only.
 The CVM proxy sets `priority` on every chat/completions body it forwards and
 discards whatever the client sent: the `X-NearAI-Priority` value when the
 caller authenticated with the proxy's own `TOKEN` (cloud-api, or this gateway),
-0 otherwise. No CVM configuration is involved. cloud-api never forwards
+0 otherwise. No CVM configuration is needed for that (size tiers below are
+optional). cloud-api never forwards
 customer headers and sends none of its own, so its requests are 0; this gateway
 sends `-1`; a direct customer's header is ignored because they use an `sk-`
 key. With SGLang's `--enable-priority-scheduling --disable-priority-preemption`
@@ -182,6 +183,45 @@ request, which the engine aborts with "The request is aborted by a higher
 priority request." (a 429 here, see below). The engine ignores `priority` until
 its flag is on, and 0 is vLLM's default for the field, so the proxies roll
 first, everywhere.
+
+### Size tiers (optional, CVM proxy only)
+
+Short prompts otherwise queue FCFS behind 100k-token prefills. Setting
+`VLLM_PROXY_PRIORITY_SIZE_TIERS` on a CVM proxy (for example
+`16000:10,65536:5,*:0`) adds a size bonus to the caller-class value:
+`engine priority = caller * 100 + bonus`, with the bonus in `0..=99`, so a
+cloud-api request (0) always outranks an OpenRouter one (-1) whatever their
+sizes, and inside a class shorter prompts run first. Thresholds are estimated
+prompt tokens (the `context_tier` estimate: bytes/4, 1024 per media part, 4
+per message, tool definitions and calls counted, token-id prompts exact),
+positive, strictly ascending, inclusive (`estimate <= T` gets that bonus); the
+last entry must be `*`; anything malformed stops the proxy at startup naming
+the variable. Unset or empty = off, and `priority` is exactly as above.
+`VLLM_PROXY_PRIORITY_LOWER_FIRST` negates the combined value.
+
+- **Per proxy, so per model.** Each model has its own CVM proxy: set it only
+  where the engine runs priority scheduling. This gateway does not apply
+  tiers in this mode; it only forwards the caller header, and the CVM proxy
+  in front of each engine adds the bonus.
+- **E2EE.** The bonus is computed after request-field decryption, from the
+  plaintext the engine will see, for plain, E2EE, fusion and agent-loop
+  requests alike (the caller-class value is still set before decryption, as
+  it never depends on content). A field the proxy cannot decrypt is rejected
+  before this step, so no path falls back to bonus 0 for ciphertext.
+- **SGLang** needs `--enable-priority-scheduling`; **vLLM** needs
+  `--scheduling-policy priority` plus `VLLM_PROXY_PRIORITY_LOWER_FIRST`.
+- **Preemption.** With `--disable-priority-preemption` (the setup above) tiers
+  only reorder the waiting queue and pick who is displaced when it is full.
+  With preemption on, a waiting request preempts a running one when its value
+  exceeds the running one's by at least
+  `--priority-scheduling-preemption-threshold`; tests with tiers 10/5/0 used a
+  threshold of 5, so a short prompt preempts a running long prefill. A
+  cross-class gap is `100 - (bonus difference)`, at least 1 only if bonuses
+  span nearly 0..99: keep bonuses small (single digits to low tens) and it
+  stays well above any practical threshold, so a cloud-api request can preempt
+  a running OpenRouter one unless preemption is disabled.
+- Metric: `request_priority_size_tier_total{tier}` (tier index, `*` last);
+  `request_priority_total{priority}` still counts the caller value.
 
 ## Overload
 

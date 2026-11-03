@@ -26,12 +26,15 @@
 //! org's `-2` still run after cloud-api's default 0.
 //!
 //! Optionally (`VLLM_PROXY_PRIORITY_SIZE_TIERS`, CVM proxy mode only) a size
-//! bonus is added on top: `engine = caller * CLASS_SCALE + bonus`, bonus in
+//! bonus is added on top: `combined = caller * CLASS_SCALE + bonus`, bonus in
 //! `0..CLASS_SCALE`, picked from the request's estimated prompt tokens
 //! (`context_tier` estimators), so within one caller class shorter prompts
 //! run ahead of long prefills and no size can lift a request over a higher
 //! class. The `lower_first` negation applies to the combined value. Unset =
 //! off = the values above, untouched.
+//! The engine gets `combined`, or `-combined` with `lower_first` (vLLM runs
+//! the lowest value first), so the bonus orders requests the same way on both
+//! engines.
 //!
 //! `0` is also vLLM's default value for the field, and SGLang ignores
 //! `priority` while its scheduling flag is off (`abort_on_priority_when_disabled`
@@ -102,15 +105,6 @@ impl SizeTiers {
             bounded.push((limit, bonus));
         }
         Err("the last entry must be `*:BONUS`".to_string())
-    }
-
-    /// Number of tiers, `*` included.
-    pub fn len(&self) -> usize {
-        self.bounded.len() + 1
-    }
-
-    pub fn is_empty(&self) -> bool {
-        false
     }
 
     /// `(tier index, bonus)` for an estimated prompt size; the bound is inclusive.
@@ -264,7 +258,7 @@ mod tests {
     #[test]
     fn parses_size_tiers() {
         let tiers = SizeTiers::parse(" 16000:10, 65536 : 5 ,*:0 ").unwrap();
-        assert_eq!(tiers.len(), 3);
+        assert_eq!(tiers.bounded.len() + 1, 3);
         assert_eq!(tiers.classify(0), (0, 10));
         assert_eq!(tiers.classify(16_000), (0, 10), "inclusive bound");
         assert_eq!(tiers.classify(16_001), (1, 5));

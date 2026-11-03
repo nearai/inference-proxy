@@ -2698,7 +2698,10 @@ mod tests {
         };
         with_env_vars(&with("16000:10, 65536:5, *:0"), || {
             let config = Config::from_env().unwrap();
-            assert_eq!(config.priority_size_tiers.unwrap().len(), 3);
+            let tiers = config.priority_size_tiers.unwrap();
+            assert_eq!(tiers.classify(16000), (0, 10));
+            assert_eq!(tiers.classify(65536), (1, 5));
+            assert_eq!(tiers.classify(65537), (2, 0));
             gateway_env_cleanup();
         });
         with_env_vars(&with("  "), || {

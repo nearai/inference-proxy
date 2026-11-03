@@ -107,13 +107,14 @@ async fn direct_privacy_classify_observable_request_id_contract() {
         .find(|request| request.url.query() == Some("case=valid"))
         .expect("valid classify request reached backend");
     assert_eq!(valid_upstream.url.path(), "/v1/privacy/classify");
-    assert_eq!(
-        valid_upstream
-            .headers
-            .get("x-request-id")
-            .and_then(|value| value.to_str().ok()),
-        Some(VALID_REQUEST_ID)
-    );
+    // The direct path forwards a server id to the backend, not the inbound one.
+    let valid_forwarded = valid_upstream
+        .headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("valid classify request has an x-request-id");
+    assert_uuid(valid_forwarded);
+    assert_ne!(valid_forwarded, VALID_REQUEST_ID);
     assert!(!valid_upstream.headers.contains_key("x-org-id"));
     assert!(!valid_upstream.headers.contains_key("x-workspace-id"));
 
@@ -122,13 +123,13 @@ async fn direct_privacy_classify_observable_request_id_contract() {
         .find(|request| request.url.query() == Some("case=invalid"))
         .expect("invalid classify request reached backend");
     assert_eq!(invalid_upstream.url.path(), "/v1/privacy/classify");
-    assert_eq!(
-        invalid_upstream
-            .headers
-            .get("x-request-id")
-            .and_then(|value| value.to_str().ok()),
-        Some(replacement_id.as_str())
-    );
+    let invalid_forwarded = invalid_upstream
+        .headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("invalid classify request has an x-request-id");
+    assert_uuid(invalid_forwarded);
+    assert_ne!(invalid_forwarded, replacement_id);
     assert!(!invalid_upstream.headers.contains_key("x-org-id"));
     assert!(!invalid_upstream.headers.contains_key("x-workspace-id"));
 

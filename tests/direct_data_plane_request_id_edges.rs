@@ -167,10 +167,14 @@ async fn public_cloud_api_key_tenant_headers_are_not_forwarded() {
         .await
         .expect("backend records requests");
     assert_eq!(received.len(), 1, "expected one backend request");
-    assert_eq!(
-        received[0].headers.get("x-request-id").unwrap(),
-        VALID_REQUEST_ID
-    );
+    // The direct path forwards a server id to the backend, not the inbound one.
+    let forwarded_id = received[0]
+        .headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("backend gets an x-request-id");
+    assert_uuid(forwarded_id);
+    assert_ne!(forwarded_id, VALID_REQUEST_ID);
     assert!(!received[0].headers.contains_key("x-org-id"));
     assert!(!received[0].headers.contains_key("x-workspace-id"));
 

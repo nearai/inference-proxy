@@ -17,6 +17,10 @@ pub struct TracingIds {
     /// inbound `X-Request-Id` (when `request_id_inbound` is true) or a freshly
     /// generated UUID.
     pub request_id: String,
+    /// The request ID forwarded to the model backend. For the trusted
+    /// gateway/config-token path this mirrors `request_id` so engine logs
+    /// correlate. For a public direct `sk-` request it is a fresh server UUID.
+    pub(crate) upstream_request_id: String,
     /// Whether `request_id` came from a valid inbound UUID header.
     pub request_id_inbound: bool,
     /// Trusted `X-Org-Id`, if present and ASCII-valid.
@@ -46,6 +50,9 @@ impl TracingIds {
         let request_id = inbound_request_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
         Self {
+            // Until auth classifies the path, mirror the inbound id upstream.
+            // `with_request_source` replaces this with a fresh id for direct keys.
+            upstream_request_id: request_id.clone(),
             request_id,
             request_id_inbound,
             org_id: None,
@@ -75,6 +82,7 @@ impl TracingIds {
 
         Self {
             request_id: self.request_id.clone(),
+            upstream_request_id: self.upstream_request_id.clone(),
             request_id_inbound: self.request_id_inbound,
             org_id,
             workspace_id,
@@ -89,6 +97,7 @@ impl TracingIds {
     fn with_verified_tenant(&self, org_id: Option<&str>, workspace_id: Option<&str>) -> Self {
         Self {
             request_id: self.request_id.clone(),
+            upstream_request_id: self.upstream_request_id.clone(),
             request_id_inbound: self.request_id_inbound,
             org_id: org_id.map(str::to_string),
             workspace_id: workspace_id.map(str::to_string),
@@ -114,6 +123,12 @@ impl TracingIds {
     pub fn with_request_source(&self, request_source: RequestSource) -> Self {
         let mut ids = self.clone();
         ids.request_source = Some(request_source);
+        // The backend id on the direct `sk-` path is the server's. The trusted
+        // gateway path keeps the shared id so engine logs correlate.
+        ids.upstream_request_id = match request_source.auth_path {
+            AuthPath::CloudApiKey => uuid::Uuid::new_v4().to_string(),
+            AuthPath::TrustedConfigToken => ids.request_id.clone(),
+        };
         ids
     }
 
@@ -121,7 +136,7 @@ impl TracingIds {
     /// the middleware-selected UUID request ID; tenant IDs appear only when a
     /// handler explicitly attached trusted tenant metadata.
     pub fn upstream_headers(&self) -> impl Iterator<Item = (&'static str, &str)> + '_ {
-        let req = Some(("x-request-id", self.request_id.as_str()));
+        let req = Some(("x-request-id", self.upstream_request_id.as_str()));
         let org = self
             .forward_tenant_headers
             .then_some(self.org_id.as_deref())
@@ -322,10 +337,23 @@ mod tests {
             verified_ids.request_source,
             Some(direct_auth.request_source)
         );
+        // The inbound request id stays the log/response id; the direct path
+        // forwards a fresh server id to the backend. No tenant header leaks either.
         assert_eq!(
-            verified_ids.upstream_headers().collect::<Vec<_>>(),
-            vec![("x-request-id", "550e8400-e29b-41d4-a716-446655440000")],
-            "verified direct-key identity is log-only; spoofed public tenant headers stay off wire"
+            verified_ids.request_id,
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+        let direct_forwarded = verified_ids.upstream_headers().collect::<Vec<_>>();
+        assert_eq!(direct_forwarded.len(), 1);
+        let (name, forwarded_id) = direct_forwarded[0];
+        assert_eq!(name, "x-request-id");
+        assert!(
+            uuid::Uuid::parse_str(forwarded_id).is_ok(),
+            "upstream request id is a UUID"
+        );
+        assert_ne!(
+            forwarded_id, "550e8400-e29b-41d4-a716-446655440000",
+            "a direct-key request must not pin the backend's request id to its inbound value"
         );
 
         // The explicit auth-path classification is the authorization boundary;

@@ -55,6 +55,11 @@ async fn serve(
     let request_body = read_body_with_limit(body, state.config.max_request_size).await?;
 
     let mut request_json = proxy::parse_json_object(&request_body)?;
+    // On the direct `sk-` path the backend assigns its own id. Trusted
+    // gateway traffic is unaffected.
+    if auth.cloud_api_key.is_some() {
+        proxy::strip_client_request_ids(&mut request_json);
+    }
 
     // The model this request is served as: the process's one model, or, in
     // gateway list mode, the entry the body's `model` names (404 otherwise).

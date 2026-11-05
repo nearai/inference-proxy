@@ -2255,6 +2255,105 @@ async fn the_models_document_lists_every_configured_model_with_its_own_capacity_
 }
 
 #[tokio::test]
+async fn a_listed_model_is_published_with_its_own_capacity_and_never_served() {
+    const DECIDER: &str = "example/decider";
+    const ABSENT: &str = "example/absent";
+    let backend = MockServer::start().await;
+    expect_untouched(&backend).await;
+    let source = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [
+                {"id": DECIDER, "name": "Decider", "output_modalities": ["decisions"],
+                 "discount_to_user": 0.9},
+                {"id": "example/unrelated", "name": "Unrelated"},
+                {"id": ALPHA, "name": "Alpha"}
+            ]
+        })))
+        .expect(1)
+        .mount(&source)
+        .await;
+
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let gateway = start_list(
+        &json!({
+            "models": [
+                {"id": ALPHA, "backend_urls": [backend.uri()], "admission_max_inflight": 48}
+            ],
+            "listed_models": [
+                {
+                    "id": DECIDER,
+                    "capacity_concurrency": 64,
+                    "capacity_requests_per_minute": 600,
+                    "discount_to_user": 0.2
+                },
+                // Listed here, but not in the catalog.
+                {"id": ABSENT}
+            ]
+        }),
+        &[(
+            "VLLM_PROXY_MODELS_DOCUMENT_URL",
+            &format!("{}/v1/models", source.uri()),
+        )],
+        Some(handle.clone()),
+    );
+    let models = gateway.state.models.as_ref().expect("list mode");
+    assert_eq!(models.len(), 1, "a listed model is not a served one");
+    assert!(models.get(DECIDER).is_none());
+
+    let response = gateway
+        .app
+        .clone()
+        .oneshot(get(routes::ROUTE_V1_MODELS))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let document = json_body(response).await;
+    let data = document["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2, "{document}");
+    // The source's entry as it is, completed with the listed model's own
+    // capacity and discount (the source's discount is not this lane's).
+    assert_eq!(data[0]["id"], DECIDER);
+    assert_eq!(data[0]["output_modalities"], json!(["decisions"]));
+    assert_eq!(
+        data[0]["capacity"],
+        json!([
+            {"type": "concurrency", "unit": "request", "value": 64},
+            {"type": "request", "unit": "request", "per": "minute", "value": 600}
+        ])
+    );
+    assert_eq!(data[0]["discount_to_user"].as_f64(), Some(0.2));
+    assert_eq!(data[1]["id"], ALPHA);
+    assert_eq!(
+        data[1]["capacity"],
+        json!([{"type": "concurrency", "unit": "request", "value": 48}])
+    );
+
+    // The listed model the source does not list is left out and counted, as
+    // a served one is.
+    let rendered = handle.render();
+    assert!(
+        rendered.contains("models_document_missing_models_total{model=\"example/absent\"} 1"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("models_document_missing_models_total{model=\"example/decider\"}"));
+
+    // Nothing is served for it: a request naming it is the 404 of any id the
+    // process does not serve, and reaches no backend.
+    for route in ROUTES {
+        let request = post(route, Some("test-token"), &body_for(Some(json!(DECIDER))));
+        let response = gateway.app.clone().oneshot(request).await.unwrap();
+        assert_model_not_found(response).await;
+    }
+    source.verify().await;
+    backend.verify().await;
+}
+
+#[tokio::test]
 async fn an_unreadable_models_document_is_a_502_and_never_an_engine_list() {
     let backend = MockServer::start().await;
     expect_untouched(&backend).await;

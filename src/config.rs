@@ -1702,10 +1702,14 @@ impl Config {
                     &config.usage_report_transport,
                 ),
             };
-            let models =
+            let crate::model_list::ParsedList { models, listed } =
                 crate::model_list::load(&path, &defaults, &process, &|name| env::var(name).ok())?;
             config.unset_single_model();
-            config.model_list = Some(crate::model_list::ModelListConfig { path, models });
+            config.model_list = Some(crate::model_list::ModelListConfig {
+                path,
+                models,
+                listed,
+            });
         }
         Ok(config)
     }

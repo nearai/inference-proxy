@@ -1892,12 +1892,24 @@ async fn engine_rejection_after_the_peek_window_still_reaches_admission() {
     );
     let mut body = first.into_body();
     let mut seen = String::new();
+    let mut body_errors = Vec::new();
     while let Some(frame) = body.frame().await {
-        if let Ok(data) = frame.unwrap().into_data() {
-            seen.push_str(&String::from_utf8_lossy(&data));
+        match frame {
+            Ok(frame) => {
+                if let Ok(data) = frame.into_data() {
+                    seen.push_str(&String::from_utf8_lossy(&data));
+                }
+            }
+            Err(error) => body_errors.push(error.to_string()),
         }
     }
     assert!(seen.contains("queue is full"), "{seen}");
+    // The engine error is forwarded, and its unterminated SSE body still
+    // fails completion validation even with the idle watchdog disabled.
+    assert_eq!(
+        body_errors,
+        ["Upstream response stream ended before [DONE]"]
+    );
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // The only backend is now known to be saturated: refused before dispatch.

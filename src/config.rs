@@ -225,16 +225,9 @@ fn usage_report_transport() -> anyhow::Result<crate::usage_report::UsageReportTr
     }
 }
 
-/// Whether this process bills usage: over HTTP it needs cloud-api's URL and
-/// usage token; over SQS the queue carries the usage, and `usage_report_transport`
-/// has already required its settings (queue, credentials endpoint).
-fn bills_usage(
-    cloud_api_configured: bool,
-    usage_token_configured: bool,
-    transport: &crate::usage_report::UsageReportTransport,
-) -> bool {
-    matches!(transport, crate::usage_report::UsageReportTransport::Sqs(_))
-        || (cloud_api_configured && usage_token_configured)
+/// Both receipt transports need synchronous monetary admission through cloud-api.
+fn bills_usage(cloud_api_configured: bool, usage_token_configured: bool) -> bool {
+    cloud_api_configured && usage_token_configured
 }
 
 /// `VLLM_PROXY_USAGE_REPORT_*`: how usage reports are delivered to the
@@ -1137,15 +1130,13 @@ impl Config {
         // A backend bearer means the backends treat this proxy as trusted and
         // do not bill its requests, so this proxy must be able to: fail closed
         // at startup instead of serving unbilled inference.
-        if backend_token.is_some() {
+        if backend_token.is_some()
+            || matches!(transport, crate::usage_report::UsageReportTransport::Sqs(_))
+        {
             let set = |name: &str| env::var(name).is_ok_and(|v| !v.trim().is_empty());
-            if !bills_usage(
-                set("CLOUD_API_URL"),
-                set("CLOUD_API_USAGE_TOKEN"),
-                &transport,
-            ) {
+            if !bills_usage(set("CLOUD_API_URL"), set("CLOUD_API_USAGE_TOKEN")) {
                 anyhow::bail!(
-                    "VLLM_BACKEND_TOKEN requires billing: CLOUD_API_URL and CLOUD_API_USAGE_TOKEN, or VLLM_PROXY_USAGE_REPORT_TRANSPORT=sqs: backends do not bill trusted-token requests"
+                    "VLLM_BACKEND_TOKEN or SQS usage reporting requires billing: CLOUD_API_URL and CLOUD_API_USAGE_TOKEN for monetary admission"
                 );
             }
         }
@@ -1699,7 +1690,6 @@ impl Config {
                 bills_usage: bills_usage(
                     config.cloud_api_url.is_some(),
                     config.cloud_api_usage_token.is_some(),
-                    &config.usage_report_transport,
                 ),
             };
             let crate::model_list::ParsedList { models, listed } =
@@ -2034,7 +2024,12 @@ mod tests {
         const MAX_ATTEMPTS: &str = "VLLM_PROXY_USAGE_REPORT_MAX_ATTEMPTS";
         const MAX_IN_FLIGHT: &str = "VLLM_PROXY_USAGE_REPORT_MAX_IN_FLIGHT";
         const SHUTDOWN_DRAIN: &str = "VLLM_PROXY_USAGE_REPORT_SHUTDOWN_DRAIN_SECS";
-        let base = [("MODEL_NAME", "m"), ("TOKEN", "t")];
+        let base = [
+            ("MODEL_NAME", "m"),
+            ("TOKEN", "t"),
+            ("CLOUD_API_URL", "https://cloud.example"),
+            ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+        ];
         let sqs = [
             (TRANSPORT, "sqs"),
             ("VLLM_PROXY_USAGE_REPORT_SQS_URL", "https://sqs.example/q"),
@@ -2069,10 +2064,9 @@ mod tests {
         });
     }
 
-    /// The fail-closed rule for `VLLM_BACKEND_TOKEN` counts the SQS transport
-    /// as a billing path, and HTTP still needs cloud-api.
+    /// SQS delivers receipts; it never replaces monetary admission.
     #[test]
-    fn test_backend_token_is_accepted_over_sqs_and_refused_over_http_without_cloud_api() {
+    fn test_backend_token_requires_admission_over_sqs_and_http() {
         const TRANSPORT: &str = "VLLM_PROXY_USAGE_REPORT_TRANSPORT";
         let base = [("MODEL_NAME", "m"), ("TOKEN", "t")];
         let token = ("VLLM_BACKEND_TOKEN", "backend-secret");
@@ -2085,13 +2079,30 @@ mod tests {
                 ("VLLM_PROXY_AWS_CREDENTIALS_URL", "http://127.0.0.1:9911"),
             ],
             || {
-                Config::from_env().expect("sqs bills without cloud-api");
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("requires billing"), "{err}");
             },
         );
         with_clean_env(&base, &[token], || {
             let err = Config::from_env().unwrap_err().to_string();
             assert!(err.contains("requires billing"), "{err}");
         });
+        for transport in ["http", "sqs"] {
+            with_clean_env(
+                &base,
+                &[
+                    token,
+                    (TRANSPORT, transport),
+                    ("CLOUD_API_URL", "https://cloud.example"),
+                    ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+                    ("VLLM_PROXY_USAGE_REPORT_SQS_URL", "https://sqs.example/q"),
+                    ("VLLM_PROXY_AWS_CREDENTIALS_URL", "http://127.0.0.1:9911"),
+                ],
+                || {
+                    Config::from_env().expect("admission and receipt delivery configured");
+                },
+            );
+        }
         // sqs selected without its endpoint still fails, from the transport's own check.
         with_clean_env(&base, &[token, (TRANSPORT, "sqs")], || {
             let err = Config::from_env().unwrap_err().to_string();
@@ -2125,22 +2136,11 @@ mod tests {
     }
 
     #[test]
-    fn test_bills_usage_counts_the_sqs_transport_without_cloud_api() {
-        use crate::usage_report::{SqsSettings, UsageReportTransport};
-        let sqs = UsageReportTransport::Sqs(SqsSettings {
-            queue_url: "https://q".into(),
-            region: "us-east-1".into(),
-            endpoint: None,
-            credentials_url: "http://127.0.0.1:9911".into(),
-        });
-        // SQS needs neither cloud-api's URL nor its usage token.
-        assert!(bills_usage(false, false, &sqs));
-        // HTTP needs both, as before.
-        let http = UsageReportTransport::Http;
-        assert!(!bills_usage(false, false, &http));
-        assert!(!bills_usage(true, false, &http));
-        assert!(!bills_usage(false, true, &http));
-        assert!(bills_usage(true, true, &http));
+    fn test_bills_usage_requires_both_admission_settings() {
+        assert!(!bills_usage(false, false));
+        assert!(!bills_usage(true, false));
+        assert!(!bills_usage(false, true));
+        assert!(bills_usage(true, true));
     }
 
     /// A fallback to HTTP gets HTTP's own policy defaults, not the SQS ones;
@@ -2148,7 +2148,12 @@ mod tests {
     #[test]
     fn test_falling_back_to_http_uses_the_http_policy_defaults() {
         use crate::usage_report::{UsageReportPolicy, UsageReportTransport};
-        let base = [("MODEL_NAME", "m"), ("TOKEN", "t")];
+        let base = [
+            ("MODEL_NAME", "m"),
+            ("TOKEN", "t"),
+            ("CLOUD_API_URL", "https://cloud.example"),
+            ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+        ];
         let sqs = [
             ("VLLM_PROXY_USAGE_REPORT_TRANSPORT", "sqs"),
             ("VLLM_PROXY_USAGE_REPORT_SQS_URL", "https://q"),
@@ -2184,7 +2189,12 @@ mod tests {
     #[test]
     fn test_the_startup_resolution_is_adopted_by_the_config() {
         use crate::usage_report::{UsageReportPolicy, UsageReportTransport};
-        let base = [("MODEL_NAME", "m"), ("TOKEN", "t")];
+        let base = [
+            ("MODEL_NAME", "m"),
+            ("TOKEN", "t"),
+            ("CLOUD_API_URL", "https://cloud.example"),
+            ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+        ];
         let sqs = [
             ("VLLM_PROXY_USAGE_REPORT_TRANSPORT", "sqs"),
             ("VLLM_PROXY_USAGE_REPORT_SQS_URL", "https://q"),
@@ -2227,7 +2237,12 @@ mod tests {
         const SQS_URL: &str = "VLLM_PROXY_USAGE_REPORT_SQS_URL";
         const SQS_REGION: &str = "VLLM_PROXY_USAGE_REPORT_SQS_REGION";
         const CREDENTIALS_URL: &str = "VLLM_PROXY_AWS_CREDENTIALS_URL";
-        let base = [("MODEL_NAME", "m"), ("TOKEN", "t")];
+        let base = [
+            ("MODEL_NAME", "m"),
+            ("TOKEN", "t"),
+            ("CLOUD_API_URL", "https://cloud.example"),
+            ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
+        ];
 
         with_clean_env(&base, &[], || {
             assert_eq!(

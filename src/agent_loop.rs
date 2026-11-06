@@ -247,19 +247,7 @@ pub async fn run_chat_completion(
                         i64::try_from(result.input_tokens).unwrap_or(i64::MAX),
                         i64::try_from(result.output_tokens).unwrap_or(i64::MAX),
                     ));
-                    let reported =
-                        report_chat_usage_if_present(reporter, usage, result.chat_id.as_deref());
-                    if reported && !result.completed_cleanly {
-                        info!(
-                            request_id = %tracing_ids.request_id,
-                            org_id = %tracing_ids.org_id_or_empty(),
-                            workspace_id = %tracing_ids.workspace_id_or_empty(),
-                            chat_id = %result.chat_id.as_deref().unwrap_or(""),
-                            input_tokens = result.input_tokens,
-                            output_tokens = result.output_tokens,
-                            "Reported usage for interrupted agent loop"
-                        );
-                    }
+                    report_chat_usage_if_present(reporter, usage, result.chat_id.as_deref());
                 }
 
                 // Only sign / cache when the stream closed cleanly (final `[DONE]`

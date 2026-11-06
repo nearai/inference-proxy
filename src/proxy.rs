@@ -812,11 +812,9 @@ pub(crate) fn report_chat_usage_if_present(
     true
 }
 
-/// Report token usage to cloud-api when a streaming response finalizes — even if
-/// it did NOT complete cleanly (client disconnect, upstream error, or no `[DONE]`).
-/// Billing must not depend on a clean `[DONE]` (nearai/infra#98): the tokens were
-/// already produced. The caller keeps signing/caching gated on clean completion;
-/// a partial response cannot be verified, but it was still billed.
+/// Settle admitted streaming work only with final usage. An interrupted stream's
+/// counters may omit billable upstream work, so its full reservation stays held.
+/// Legacy reporters without an admission retain their partial-usage behavior.
 ///
 /// The reporter only exists for direct `sk-` requests
 /// (`RequireAuth.cloud_api_key`); cloud-api's own `InterceptStream` is not in
@@ -3121,12 +3119,8 @@ async fn proxy_streaming_request_inner(
             );
         }
 
-        // Bill for the tokens the backend already produced, even when the stream
-        // did NOT finish cleanly (nearai/infra#98). With continuous_usage_stats
-        // forced on cloud-key streaming (routes/chat.rs, routes/completions.rs),
-        // `parser.usage` holds the running cumulative counts from the last chunk
-        // we saw — the best figure at the point of interruption. Signing/caching
-        // stays gated on a clean [DONE] below.
+        // Partial cumulative counts cannot release the remainder of an admitted budget.
+        // Finalization retains interrupted holds; signing/caching also require completion.
         report_stream_usage_on_finalize(
             &usage_reporter,
             parser.usage.map(|usage| (usage, parser.cached_tokens)),

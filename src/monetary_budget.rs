@@ -97,6 +97,7 @@ pub(crate) async fn admit_for_model(
     } else {
         None
     };
+    // Charge bounds cover generated candidates, including best_of candidates not returned.
     let response = reporter.http_client.post(format!("{}/v1/internal/budget", base.trim_end_matches('/')))
         .bearer_auth(token).timeout(Duration::from_secs(12)).json(&json!({
             "id": id.to_string(), "organization_id": org, "workspace_id": workspace, "api_key_id": key,

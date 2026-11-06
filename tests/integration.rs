@@ -472,6 +472,7 @@ async fn test_healthz_returns_503_when_dstack_socket_missing() {
     // to drop this instance and stop routing requests that would 500 on
     // /v1/attestation/report.
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     Mock::given(method("GET"))
         .and(path("/health"))
         .respond_with(ResponseTemplate::new(200))
@@ -508,6 +509,7 @@ async fn test_healthz_returns_503_when_dstack_socket_missing() {
 async fn test_healthz_returns_503_when_backend_down() {
     // Backend that always 500s on /health — pretends sglang/vLLM is wedged.
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     Mock::given(method("GET"))
         .and(path("/health"))
         .respond_with(ResponseTemplate::new(500))
@@ -548,6 +550,7 @@ async fn test_healthz_returns_503_when_backend_down() {
 #[tokio::test]
 async fn test_healthz_returns_200_when_all_healthy() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     Mock::given(method("GET"))
         .and(path("/health"))
         .respond_with(ResponseTemplate::new(200))
@@ -624,6 +627,7 @@ async fn test_auth_rejection_bad_token() {
 #[tokio::test]
 async fn test_chat_completions_non_streaming() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     let backend_response = serde_json::json!({
         "id": "chatcmpl-test123",
@@ -672,6 +676,7 @@ async fn test_chat_completions_non_streaming() {
 #[tokio::test]
 async fn test_chat_completions_forwards_derived_vllm_data_parallel_rank() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     let request_body = serde_json::json!({
         "model": "client-alias",
         "messages": [
@@ -799,7 +804,9 @@ async fn requests_seen(server: &MockServer) -> usize {
 #[tokio::test]
 async fn test_backend_affinity_keeps_conversation_on_first_backend() {
     let backend_a = MockServer::start().await;
+    budget_fixture::mount_counter(&backend_a).await;
     let backend_b = MockServer::start().await;
+    budget_fixture::mount_counter(&backend_b).await;
     mount_chat_ok(&backend_a, "/v1/chat/completions", 2).await;
     mount_chat_ok(&backend_b, "/v1/chat/completions", 1).await;
     let (app, pool) = build_test_app_with_backends(vec![backend_a.uri(), backend_b.uri()], true, 8);
@@ -839,7 +846,9 @@ async fn test_backend_affinity_keeps_conversation_on_first_backend() {
 #[tokio::test]
 async fn test_backend_affinity_rebalances_when_pinned_backend_is_overloaded() {
     let backend_a = MockServer::start().await;
+    budget_fixture::mount_counter(&backend_a).await;
     let backend_b = MockServer::start().await;
+    budget_fixture::mount_counter(&backend_b).await;
     mount_chat_ok(&backend_a, "/v1/chat/completions", 1).await;
     mount_chat_ok(&backend_b, "/v1/chat/completions", 2).await;
     let (app, pool) = build_test_app_with_backends(vec![backend_a.uri(), backend_b.uri()], true, 2);
@@ -880,7 +889,9 @@ async fn test_backend_affinity_rebalances_when_pinned_backend_is_overloaded() {
 #[tokio::test]
 async fn test_backend_affinity_skips_unhealthy_pinned_backend() {
     let backend_a = MockServer::start().await;
+    budget_fixture::mount_counter(&backend_a).await;
     let backend_b = MockServer::start().await;
+    budget_fixture::mount_counter(&backend_b).await;
     mount_chat_ok(&backend_a, "/v1/chat/completions", 1).await;
     mount_chat_ok(&backend_b, "/v1/chat/completions", 1).await;
     let (app, pool) = build_test_app_with_backends(vec![backend_a.uri(), backend_b.uri()], true, 8);
@@ -905,7 +916,9 @@ async fn test_backend_affinity_skips_unhealthy_pinned_backend() {
 #[tokio::test]
 async fn test_multiple_backends_without_affinity_stay_least_connections() {
     let backend_a = MockServer::start().await;
+    budget_fixture::mount_counter(&backend_a).await;
     let backend_b = MockServer::start().await;
+    budget_fixture::mount_counter(&backend_b).await;
     mount_chat_ok(&backend_a, "/v1/chat/completions", 1).await;
     mount_chat_ok(&backend_b, "/v1/chat/completions", 1).await;
     let (app, pool) =
@@ -930,7 +943,9 @@ async fn test_multiple_backends_without_affinity_stay_least_connections() {
 #[tokio::test]
 async fn test_backend_max_inflight_refuses_when_every_backend_is_full() {
     let backend_a = MockServer::start().await;
+    budget_fixture::mount_counter(&backend_a).await;
     let backend_b = MockServer::start().await;
+    budget_fixture::mount_counter(&backend_b).await;
     mount_chat_ok(&backend_a, "/v1/chat/completions", 0).await;
     mount_chat_ok(&backend_b, "/v1/chat/completions", 1).await;
     let mock_url = backend_a.uri();
@@ -992,7 +1007,9 @@ async fn test_backend_max_inflight_refuses_when_every_backend_is_full() {
 #[tokio::test]
 async fn test_replica_hint_routes_to_hinted_backend() {
     let backend_a = MockServer::start().await;
+    budget_fixture::mount_counter(&backend_a).await;
     let backend_b = MockServer::start().await;
+    budget_fixture::mount_counter(&backend_b).await;
     mount_chat_ok(&backend_a, "/v1/chat/completions", 1).await;
     mount_chat_ok(&backend_b, "/v1/chat/completions", 1).await;
     let (app, _pool) =
@@ -1045,7 +1062,9 @@ async fn test_replica_hint_routes_to_hinted_backend() {
 #[tokio::test]
 async fn test_completions_replica_hint_routes_to_hinted_backend() {
     let backend_a = MockServer::start().await;
+    budget_fixture::mount_counter(&backend_a).await;
     let backend_b = MockServer::start().await;
+    budget_fixture::mount_counter(&backend_b).await;
     mount_completions_ok(&backend_a, 0).await;
     mount_completions_ok(&backend_b, 1).await;
     let (app, _pool) =
@@ -1077,7 +1096,9 @@ async fn test_completions_replica_hint_routes_to_hinted_backend() {
 #[tokio::test]
 async fn test_cloud_api_key_check_is_reused_across_requests() {
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
     mount_completions_ok(&backend, 2).await;
     Mock::given(method("POST"))
@@ -1113,7 +1134,9 @@ async fn test_cloud_api_key_check_is_reused_across_requests() {
 #[tokio::test]
 async fn test_cloud_api_key_is_checked_on_every_request_until_accepted() {
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
     mount_completions_ok(&backend, 2).await;
     // wiremock matches in priority order: lower number wins.
@@ -1165,7 +1188,9 @@ async fn test_cloud_api_key_is_checked_on_every_request_until_accepted() {
 #[tokio::test]
 async fn test_cloud_api_key_5xx_is_not_kept() {
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
     mount_completions_ok(&backend, 2).await;
     Mock::given(method("POST"))
@@ -1208,8 +1233,11 @@ async fn test_cloud_api_key_5xx_is_not_kept() {
 #[tokio::test]
 async fn test_completions_replica_hint_is_dropped_for_cloud_api_key_auth() {
     let backend_a = MockServer::start().await;
+    budget_fixture::mount_counter(&backend_a).await;
     let backend_b = MockServer::start().await;
+    budget_fixture::mount_counter(&backend_b).await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
     mount_completions_ok(&backend_a, 1).await;
     mount_completions_ok(&backend_b, 0).await;
@@ -1248,15 +1276,18 @@ async fn test_completions_replica_hint_is_dropped_for_cloud_api_key_auth() {
     // An `sk-` (untrusted) caller's hint must not be forwarded: the request
     // stays on least-connections, landing on the idle backend_a rather than
     // the hinted, already-loaded backend_b.
-    assert_eq!(requests_seen(&backend_a).await, 1);
+    assert_eq!(requests_seen(&backend_a).await, 2);
     assert_eq!(requests_seen(&backend_b).await, 0);
 }
 
 #[tokio::test]
 async fn test_chat_completions_replica_hint_is_dropped_for_cloud_api_key_auth() {
     let backend_a = MockServer::start().await;
+    budget_fixture::mount_counter(&backend_a).await;
     let backend_b = MockServer::start().await;
+    budget_fixture::mount_counter(&backend_b).await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
     mount_chat_ok(&backend_a, "/v1/chat/completions", 1).await;
     mount_chat_ok(&backend_b, "/v1/chat/completions", 0).await;
@@ -1297,7 +1328,7 @@ async fn test_chat_completions_replica_hint_is_dropped_for_cloud_api_key_auth() 
     // An `sk-` (untrusted) caller's hint must not be forwarded: the request
     // stays on least-connections, landing on the idle backend_a rather than
     // the hinted, already-loaded backend_b.
-    assert_eq!(requests_seen(&backend_a).await, 1);
+    assert_eq!(requests_seen(&backend_a).await, 2);
     assert_eq!(requests_seen(&backend_b).await, 0);
 }
 
@@ -1307,6 +1338,7 @@ async fn test_chat_completions_image_validation_rejects_bad_image() {
     // clearly-bad image (dangerous scheme) is rejected at the proxy with a 400
     // and OpenAI error shape — before reaching the backend.
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     // Backend mock present but must NOT be hit (validation rejects first).
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -1355,6 +1387,7 @@ async fn test_chat_completions_image_validation_rejects_bad_image() {
 #[tokio::test]
 async fn test_chat_completions_image_validation_rejects_remote_video_image_url() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"x"})))
@@ -1409,6 +1442,7 @@ async fn test_chat_completions_image_validation_allows_text_only() {
     // Control: validation enabled but a text-only request passes through to the
     // backend unchanged (validation is a no-op without image parts).
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1446,6 +1480,7 @@ async fn test_fusion_tool_passes_through_when_disabled() {
     use wiremock::matchers::body_string_contains;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     let backend_response = serde_json::json!({
         "id": "chatcmpl-fusion-disabled",
@@ -1501,6 +1536,7 @@ async fn test_non_forced_fusion_skips_when_outer_model_does_not_call_tool() {
     use wiremock::matchers::body_string_contains;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("GET"))
         .and(path("/endpoints"))
@@ -1601,6 +1637,7 @@ async fn test_non_forced_fusion_runs_when_outer_model_calls_internal_tool() {
     use wiremock::matchers::body_string_contains;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("GET"))
         .and(path("/endpoints"))
@@ -1751,6 +1788,7 @@ async fn test_forced_fusion_runs_panel_judge_and_synthesis() {
     use wiremock::matchers::body_string_contains;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("GET"))
         .and(path("/endpoints"))
@@ -1886,6 +1924,7 @@ async fn test_forced_openrouter_fusion_flat_tool_runs_panel_judge_and_synthesis(
     use wiremock::matchers::body_string_contains;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("GET"))
         .and(path("/endpoints"))
@@ -2027,6 +2066,7 @@ async fn test_forced_fusion_retries_transient_panel_5xx() {
     use wiremock::matchers::body_string_contains;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("GET"))
         .and(path("/endpoints"))
@@ -2172,6 +2212,7 @@ async fn test_forced_fusion_exhausts_transient_panel_5xx_retries() {
     use wiremock::matchers::body_string_contains;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("GET"))
         .and(path("/endpoints"))
@@ -2256,6 +2297,7 @@ async fn test_forced_fusion_does_not_retry_when_attempts_one() {
     use wiremock::matchers::body_string_contains;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("GET"))
         .and(path("/endpoints"))
@@ -2333,7 +2375,9 @@ async fn test_forced_fusion_runs_panel_web_context_search() {
     use wiremock::matchers::{body_string_contains, query_param};
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     let brave = MockServer::start().await;
+    budget_fixture::mount_counter(&brave).await;
 
     Mock::given(method("GET"))
         .and(path("/endpoints"))
@@ -2523,6 +2567,7 @@ async fn test_forced_fusion_streaming_emits_usage_metadata_and_signature() {
     use wiremock::matchers::body_string_contains;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("GET"))
         .and(path("/endpoints"))
@@ -2675,6 +2720,7 @@ async fn test_forced_fusion_partial_panel_failure_still_synthesizes() {
     use wiremock::matchers::body_string_contains;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("GET"))
         .and(path("/endpoints"))
@@ -2799,6 +2845,7 @@ async fn test_forced_fusion_invalid_judge_json_degrades_to_panel_summaries() {
     use wiremock::matchers::body_string_contains;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("GET"))
         .and(path("/endpoints"))
@@ -2921,6 +2968,7 @@ async fn test_forced_fusion_invalid_judge_json_degrades_to_panel_summaries() {
 #[tokio::test]
 async fn test_forced_fusion_all_panels_failed_returns_taxonomy_error() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("GET"))
         .and(path("/endpoints"))
@@ -2968,6 +3016,7 @@ async fn test_forced_fusion_all_panels_failed_returns_taxonomy_error() {
 #[tokio::test]
 async fn test_forced_fusion_accepts_openrouter_plugin_config() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("GET"))
         .and(path("/endpoints"))
@@ -3025,6 +3074,7 @@ async fn test_forced_fusion_accepts_openrouter_plugin_config() {
 #[tokio::test]
 async fn test_forced_fusion_parameters_fall_back_to_config_per_field() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("GET"))
         .and(path("/endpoints"))
@@ -3080,6 +3130,7 @@ async fn test_forced_fusion_plugin_defaults_judge_to_outer_model() {
     use wiremock::matchers::body_string_contains;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("GET"))
         .and(path("/endpoints"))
@@ -3197,6 +3248,7 @@ async fn test_forced_fusion_plugin_defaults_judge_to_outer_model() {
 #[tokio::test]
 async fn test_forced_fusion_rejects_oversized_endpoint_discovery_response() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     let mut oversized_models: Vec<String> = (0..64).map(|i| format!("panel-{i}")).collect();
     oversized_models.push("panel-a".to_string());
     Mock::given(method("GET"))
@@ -3260,6 +3312,7 @@ async fn test_forced_fusion_rejects_oversized_endpoint_discovery_response() {
 #[tokio::test]
 async fn test_forced_fusion_rejects_oversized_panel_response() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     Mock::given(method("GET"))
         .and(path("/endpoints"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3326,6 +3379,7 @@ async fn test_forced_fusion_rejects_oversized_panel_response() {
 #[tokio::test]
 async fn test_forced_fusion_panel_timeout_returns_failure() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     Mock::given(method("GET"))
         .and(path("/endpoints"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3390,6 +3444,7 @@ async fn test_forced_fusion_panel_timeout_returns_failure() {
 #[tokio::test]
 async fn test_client_supplied_fusion_depth_header_is_ignored() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     Mock::given(method("GET"))
         .and(path("/endpoints"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3478,6 +3533,7 @@ async fn test_encrypted_forced_fusion_decrypts_request_and_encrypts_final_answer
     use vllm_proxy_rs::encryption;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     let client_pair = test_client_signing_pair();
 
     Mock::given(method("GET"))
@@ -3632,6 +3688,7 @@ async fn test_e2ee_fusion_errors_are_redacted_in_preflight_and_synthesis() {
         for streaming in [false, true] {
             for synthesis in [false, true] {
                 let upstream = MockServer::start().await;
+                budget_fixture::mount_counter(&upstream).await;
                 if synthesis {
                     Mock::given(method("GET"))
                         .and(path("/endpoints"))
@@ -3723,6 +3780,7 @@ async fn test_e2ee_fusion_errors_are_redacted_in_preflight_and_synthesis() {
 #[tokio::test]
 async fn test_chat_completions_streaming() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     let sse_body = "data: {\"id\":\"chatcmpl-stream1\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\ndata: [DONE]\n\n";
 
@@ -3775,6 +3833,7 @@ async fn test_chat_completions_streaming() {
 #[tokio::test]
 async fn test_signature_retrieval_after_chat() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     let backend_response = serde_json::json!({
         "id": "chatcmpl-sig-test",
@@ -3835,6 +3894,7 @@ async fn test_signature_retrieval_after_chat() {
 #[tokio::test]
 async fn test_signature_retrieval_ed25519() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -3906,6 +3966,7 @@ async fn test_signature_not_found() {
 #[tokio::test]
 async fn test_upstream_error_passthrough() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     let error_body = serde_json::json!({
         "error": {"message": "model not found", "type": "invalid_request"}
@@ -3967,6 +4028,7 @@ async fn test_payload_too_large() {
 #[tokio::test]
 async fn test_metrics_no_auth_required() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("GET"))
         .and(path("/metrics"))
@@ -3996,6 +4058,7 @@ async fn test_metrics_no_auth_required() {
 #[tokio::test]
 async fn test_models_no_auth_required() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("GET"))
         .and(path("/v1/models"))
@@ -4027,6 +4090,7 @@ async fn test_models_no_auth_required() {
 #[tokio::test]
 async fn test_completions_endpoint() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/completions"))
@@ -4065,6 +4129,7 @@ async fn test_completions_endpoint() {
 #[tokio::test]
 async fn test_completions_endpoint_sse_reassembly() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     let sse_body = concat!(
         "data: {\"id\":\"cmpl-sse-1\",\"object\":\"text_completion\",\"model\":\"test-model\",\"created\":100,\"choices\":[{\"index\":0,\"text\":\"The \",\"finish_reason\":null,\"logprobs\":null}]}\n\n",
@@ -4122,6 +4187,7 @@ async fn test_completions_endpoint_sse_reassembly() {
 #[tokio::test]
 async fn test_chat_sse_queue_full_propagates_503() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     let sse_body = concat!(
         "data: {\"error\":{\"object\":\"error\",\"message\":\"The request queue is full.\",\"type\":\"SERVICE_UNAVAILABLE\",\"code\":503}}\n\n",
@@ -4168,6 +4234,7 @@ async fn test_chat_sse_queue_full_propagates_503() {
 #[tokio::test]
 async fn test_chat_sse_client_media_fetch_4xx_becomes_400() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     let sse_body = concat!(
         "data: {\"error\":{\"object\":\"error\",\"message\":\"403, message='Forbidden', url='https://upload.wikimedia.org/x.jpg'\",\"type\":\"InternalServerError\",\"code\":500}}\n\n",
@@ -4209,6 +4276,7 @@ async fn test_chat_sse_client_media_fetch_4xx_becomes_400() {
 #[tokio::test]
 async fn test_embeddings_endpoint() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/embeddings"))
@@ -4244,6 +4312,7 @@ async fn test_embeddings_endpoint() {
 #[tokio::test]
 async fn test_tokenize_endpoint() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("POST"))
         .and(path("/tokenize"))
@@ -4324,6 +4393,7 @@ async fn test_signature_binds_actual_request_body() {
     use sha2::{Digest, Sha256};
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -4383,6 +4453,7 @@ async fn test_x_request_hash_invalid_or_same_as_body_uses_body_hash() {
     use sha2::{Digest, Sha256};
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -4446,6 +4517,7 @@ async fn test_x_request_hash_honored_when_differs_from_wire_body() {
     use sha2::{Digest, Sha256};
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -4519,6 +4591,7 @@ async fn test_strip_empty_tool_calls() {
     use wiremock::matchers::body_json;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     // Expect the backend receives the request WITHOUT empty tool_calls.
     // The proxy injects stream: true and the engine priority internally, so
@@ -4576,6 +4649,7 @@ async fn test_tool_call_arguments_are_normalized_before_dispatch() {
     use wiremock::matchers::body_json;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     // The engine refuses `function.arguments` that is not a string holding a
     // JSON object; the proxy repairs each shape and leaves good ones alone.
@@ -4643,6 +4717,7 @@ async fn test_json_schema_response_format_is_repaired_before_dispatch() {
     use wiremock::matchers::body_json;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     // Not gateway-specific: a nameless `json_schema` is a pydantic 400 on
     // SGLang whichever lane sent it, so the CVM proxy repairs it too.
@@ -4710,6 +4785,7 @@ async fn test_forwarded_body_keeps_the_callers_key_order() {
     // first. Same for a tool's parameters. Compared on the raw bytes the
     // backend receives, since an object comparison ignores order.
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -4791,6 +4867,7 @@ async fn test_tool_call_arguments_are_normalized_after_decryption() {
     // string, repaired to `{}`), never the hex, or the backend would receive
     // a wrapped ciphertext it cannot use.
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .and(FirstToolCallArguments("{}"))
@@ -4852,6 +4929,7 @@ async fn test_tool_call_arguments_are_normalized_after_decryption() {
 #[tokio::test]
 async fn test_response_id_generation_when_missing() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     // Backend returns response without an ID
     Mock::given(method("POST"))
@@ -4918,7 +4996,13 @@ async fn test_invalid_json_body() {
 #[tokio::test]
 async fn test_non_object_json_body_is_rejected_before_dispatch() {
     let backend = MockServer::start().await;
+    Mock::given(path("/tokenize"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"count":128})))
+        .with_priority(1)
+        .mount(&backend)
+        .await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
 
     // An `sk-` caller with usage reporting on, and an engine that answers
@@ -5014,7 +5098,7 @@ async fn test_non_object_json_body_is_rejected_before_dispatch() {
     .await
     .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(requests_seen(&backend).await, 1);
+    assert_eq!(requests_seen(&backend).await, 2);
     wait_for_usage_request(&cloud_api, 1).await;
     // Reports are asynchronous: by the time the control's has landed, any
     // report from the rejected requests before it would have landed too.
@@ -5030,6 +5114,7 @@ async fn test_ecdsa_signature_cryptographic_verification() {
     use sha3::Keccak256;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     let backend_response = serde_json::json!({
         "id": "chatcmpl-ecverify",
@@ -5129,6 +5214,7 @@ async fn test_ed25519_signature_cryptographic_verification() {
     use sha2::{Digest, Sha256};
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     let backend_response = serde_json::json!({
         "id": "chatcmpl-edverify",
@@ -5216,6 +5302,7 @@ async fn test_streaming_signature_cached_and_verifiable() {
     use sha2::{Digest, Sha256};
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     let sse_body = "data: {\"id\":\"chatcmpl-streamver\",\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
 
@@ -5409,6 +5496,7 @@ async fn test_non_streaming_reasoning_usage_mirrored_and_signed() {
     // `set_body_raw` because `set_body_string` forces `text/plain`, which would
     // send the proxy down its plain-JSON branch instead of the reassembly.
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_raw(
@@ -5458,6 +5546,7 @@ async fn test_non_streaming_plain_json_reasoning_usage_mirrored_and_signed() {
     // An engine that ignores the injected `stream: true` and answers with one
     // JSON object takes the plain-JSON branch; same result.
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -5511,6 +5600,7 @@ async fn test_non_streaming_plain_json_reasoning_usage_mirrored_and_signed() {
 #[tokio::test]
 async fn test_streaming_reasoning_usage_mirrored_and_signed() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_raw(
@@ -5578,6 +5668,7 @@ async fn test_embeddings_usage_gets_no_completion_tokens_details() {
         "reasoning_tokens": 0
     });
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     Mock::given(method("POST"))
         .and(path("/v1/embeddings"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -5634,7 +5725,9 @@ async fn test_internal_gpu_evidence_requires_auth() {
 #[tokio::test]
 async fn test_internal_gpu_evidence_rejects_cloud_api_keys() {
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
@@ -5845,6 +5938,7 @@ async fn test_attestation_invalid_nonce() {
 #[tokio::test]
 async fn test_streaming_without_done_marker_no_signature_cached() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     // Simulate a stream that ends abruptly without [DONE]
     let sse_body = "data: {\"id\":\"chatcmpl-nodone\",\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
@@ -5906,6 +6000,7 @@ async fn test_streaming_without_done_marker_no_signature_cached() {
 #[tokio::test]
 async fn test_rerank_endpoint() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/rerank"))
@@ -5941,6 +6036,7 @@ async fn test_rerank_endpoint() {
 #[tokio::test]
 async fn test_score_endpoint() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/score"))
@@ -5976,6 +6072,7 @@ async fn test_score_endpoint() {
 #[tokio::test]
 async fn test_images_generations_endpoint() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/images/generations"))
@@ -6011,6 +6108,7 @@ async fn test_images_generations_endpoint() {
 #[tokio::test]
 async fn test_signature_invalid_algo_returns_400() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -6062,6 +6160,7 @@ async fn test_signature_invalid_algo_returns_400() {
 #[tokio::test]
 async fn test_streaming_completions() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     let sse_body =
         "data: {\"id\":\"cmpl-stream1\",\"choices\":[{\"text\":\"world\"}]}\n\ndata: [DONE]\n\n";
@@ -6131,6 +6230,7 @@ async fn test_streaming_completions() {
 #[tokio::test]
 async fn test_images_edits_multipart() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/images/edits"))
@@ -6194,6 +6294,7 @@ async fn test_images_edits_multipart() {
 #[tokio::test]
 async fn test_audio_transcriptions_multipart() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/audio/transcriptions"))
@@ -6261,6 +6362,7 @@ async fn test_audio_transcriptions_multipart() {
 #[tokio::test]
 async fn test_audio_transcriptions_large_body_not_rejected() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/audio/transcriptions"))
@@ -6636,7 +6738,9 @@ fn build_test_app_with_cloud_api_retries(
 #[tokio::test]
 async fn test_cloud_api_key_valid() {
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
 
     // Mock the cloud API check endpoint to return 200
@@ -6690,6 +6794,7 @@ async fn test_cloud_api_key_valid() {
 #[tokio::test]
 async fn test_cloud_api_key_unauthorized() {
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
@@ -6721,6 +6826,7 @@ async fn test_cloud_api_key_unauthorized() {
 #[tokio::test]
 async fn test_cloud_api_key_insufficient_credits() {
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
@@ -6752,6 +6858,7 @@ async fn test_cloud_api_key_insufficient_credits() {
 #[tokio::test]
 async fn test_cloud_api_key_rate_limited() {
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
@@ -6781,7 +6888,9 @@ async fn test_cloud_api_key_rate_limited() {
 #[tokio::test]
 async fn test_cloud_api_key_retries_after_5xx() {
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
 
     // First call to /v1/check_api_key returns 503; the next returns 200.
@@ -6840,6 +6949,7 @@ async fn test_cloud_api_key_retries_after_5xx() {
 #[tokio::test]
 async fn test_cloud_api_key_no_retry_on_4xx() {
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
 
     // Always return 401. With max_attempts=3, the proxy must NOT retry — a
@@ -6875,6 +6985,7 @@ async fn test_cloud_api_key_no_retry_on_4xx() {
 #[tokio::test]
 async fn test_cloud_api_key_exhausts_retries_on_persistent_5xx() {
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
 
     // 5xx every time. With max_attempts=3, expect exactly 3 calls and a 401
@@ -6908,7 +7019,9 @@ async fn test_cloud_api_key_exhausts_retries_on_persistent_5xx() {
 #[tokio::test]
 async fn test_proxy_token_still_works_with_cloud_api_configured() {
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
 
     let backend_response = serde_json::json!({
@@ -7001,7 +7114,9 @@ async fn get_usage_requests(cloud_api: &MockServer) -> Vec<serde_json::Value> {
 #[tokio::test]
 async fn test_usage_reported_for_cloud_api_key_non_streaming() {
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
     let request_id = "550e8400-e29b-41d4-a716-446655440000";
 
@@ -7098,7 +7213,9 @@ async fn test_responses_endpoint_refused_instead_of_billing_silently() {
     // and absent from accounting. The proxy must refuse the endpoint outright
     // until a dedicated Responses usage parser exists.
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
@@ -7183,6 +7300,7 @@ async fn test_responses_subpaths_refused() {
     // Sub-paths (`/v1/responses/{id}`, `.../cancel`) share the same accounting
     // gap and are not a supported direct-host surface either.
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     let app = build_test_app(&backend.uri());
 
     for uri in [
@@ -7222,6 +7340,7 @@ async fn test_responses_subpaths_refused() {
 async fn test_similar_unknown_paths_are_refused() {
     // Prefix lookalikes must not bypass the exact-route allowlist.
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     let app = build_test_app(&backend.uri());
 
     let response = app
@@ -7253,7 +7372,9 @@ async fn test_similar_unknown_paths_are_refused() {
 #[tokio::test]
 async fn test_usage_reported_for_streaming_chat_with_cloud_api_key() {
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
@@ -7338,7 +7459,9 @@ data: [DONE]\n\n";
 #[tokio::test]
 async fn test_interrupted_stream_retains_budget_without_final_receipt() {
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
@@ -7437,7 +7560,9 @@ data: {\"id\":\"chatcmpl-interrupted\",\"choices\":[{\"delta\":{\"content\":\"lo
 #[tokio::test]
 async fn test_no_usage_reported_for_proxy_token() {
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
@@ -7487,7 +7612,9 @@ async fn test_no_usage_reported_for_proxy_token() {
 #[tokio::test]
 async fn test_usage_report_failure_does_not_affect_response() {
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
@@ -7548,7 +7675,9 @@ async fn test_usage_report_failure_does_not_affect_response() {
 #[tokio::test]
 async fn test_usage_reported_for_image_generation() {
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
@@ -7612,7 +7741,9 @@ async fn test_usage_reported_for_image_generation() {
 #[tokio::test]
 async fn test_usage_reported_for_embeddings() {
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
@@ -7682,7 +7813,9 @@ async fn test_streaming_includes_usage_injected_for_cloud_key() {
     use wiremock::matchers::body_string_contains;
 
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
@@ -7787,6 +7920,7 @@ async fn test_encrypted_chat_non_streaming_ed25519() {
     use vllm_proxy_rs::encryption;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     let client_pair = test_client_signing_pair();
     let server_pair = test_signing_pair();
 
@@ -7885,6 +8019,7 @@ async fn test_encrypted_chat_image_validation_rejects_decrypted_bad_image() {
     use vllm_proxy_rs::encryption;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     let client_pair = test_client_signing_pair();
 
     Mock::given(method("POST"))
@@ -7953,6 +8088,7 @@ async fn test_encrypted_chat_streaming_ed25519() {
     use vllm_proxy_rs::encryption;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     let client_pair = test_client_signing_pair();
 
     let sse_body = "data: {\"id\":\"chatcmpl-encstream1\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\ndata: [DONE]\n\n";
@@ -8041,6 +8177,7 @@ async fn test_encrypted_chat_streaming_ed25519() {
 async fn test_non_encrypted_request_still_works() {
     // Verify backward compatibility: requests without encryption headers work normally
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     let backend_response = serde_json::json!({
         "id": "chatcmpl-plain",
@@ -8166,6 +8303,7 @@ async fn test_encrypted_completions_ed25519() {
     use vllm_proxy_rs::encryption;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     let client_pair = test_client_signing_pair();
 
     let backend_response = serde_json::json!({
@@ -8239,6 +8377,7 @@ async fn test_encrypted_signature_covers_plaintext() {
     use vllm_proxy_rs::encryption;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     let server_pair = test_signing_pair();
     let client_pair = test_client_signing_pair();
 
@@ -8365,6 +8504,7 @@ async fn test_encrypted_streaming_signature_covers_transformed_bytes() {
     use vllm_proxy_rs::encryption;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     let client_pair = test_client_signing_pair();
 
     let sse_body = "data: {\"id\":\"chatcmpl-encsig1\",\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: [DONE]\n\n";
@@ -8468,6 +8608,7 @@ async fn test_encrypted_chat_non_streaming_ecdsa() {
     use vllm_proxy_rs::encryption;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     let server_pair = test_signing_pair();
     let client_pair = test_client_signing_pair();
 
@@ -8544,6 +8685,7 @@ async fn test_encrypted_embeddings_ed25519() {
     use vllm_proxy_rs::encryption;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     let client_pair = test_client_signing_pair();
 
     let backend_response = serde_json::json!({
@@ -8621,6 +8763,7 @@ async fn test_encrypted_images_generations_ed25519() {
     use vllm_proxy_rs::encryption;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     let client_pair = test_client_signing_pair();
 
     let backend_response = serde_json::json!({
@@ -8696,6 +8839,7 @@ async fn test_encrypted_streaming_completions_ed25519() {
     use vllm_proxy_rs::encryption;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     let client_pair = test_client_signing_pair();
 
     let sse_body = "data: {\"id\":\"cmpl-encstream1\",\"choices\":[{\"text\":\"hello\",\"index\":0}]}\n\ndata: [DONE]\n\n";
@@ -8783,6 +8927,7 @@ async fn test_encrypted_audio_transcription_signature_hashes_raw_request_and_res
     use vllm_proxy_rs::encryption;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     let client_pair = test_client_signing_pair();
 
     let backend_response = serde_json::json!({
@@ -8906,6 +9051,7 @@ async fn test_encrypted_chat_salsa20_fallback_e2e() {
     use vllm_proxy_rs::encryption;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     let client_pair = test_client_signing_pair();
 
     let backend_response = serde_json::json!({
@@ -9007,6 +9153,7 @@ async fn test_encrypted_chat_non_streaming_ed25519_v2() {
     use vllm_proxy_rs::encryption;
 
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
     let client_pair = test_client_signing_pair();
 
     let backend_response = serde_json::json!({
@@ -9303,6 +9450,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
 #[tokio::test]
 async fn test_ohttp_config_returns_404_when_disabled() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     let app = build_test_app(&mock.uri());
 
     let response = app
@@ -9321,6 +9469,7 @@ async fn test_ohttp_config_returns_404_when_disabled() {
 #[tokio::test]
 async fn test_ohttp_config_returns_key_config_when_enabled() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     let app = build_test_app_with_ohttp(&mock.uri());
 
     let response = app
@@ -9353,6 +9502,7 @@ async fn test_ohttp_config_returns_key_config_when_enabled() {
 #[tokio::test]
 async fn test_ohttp_config_alias_matches_well_known() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
 
     // Get from well-known endpoint
     let app1 = build_test_app_with_ohttp(&mock.uri());
@@ -9391,6 +9541,7 @@ async fn test_ohttp_config_alias_matches_well_known() {
 #[tokio::test]
 async fn test_ohttp_relay_returns_404_when_disabled() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     let app = build_test_app(&mock.uri());
 
     let response = app
@@ -9410,6 +9561,7 @@ async fn test_ohttp_relay_returns_404_when_disabled() {
 #[tokio::test]
 async fn test_ohttp_relay_empty_body_returns_400() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     let app = build_test_app_with_ohttp(&mock.uri());
 
     let response = app
@@ -9429,6 +9581,7 @@ async fn test_ohttp_relay_empty_body_returns_400() {
 #[tokio::test]
 async fn test_ohttp_relay_garbage_body_returns_400() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     let app = build_test_app_with_ohttp(&mock.uri());
 
     let response = app
@@ -9478,6 +9631,7 @@ fn assert_ohttp_attestation_fields(json: &serde_json::Value) {
 #[tokio::test]
 async fn test_ohttp_attestation_includes_key_config() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     let app = build_test_app_with_ohttp(&mock.uri());
 
     let response = app
@@ -9506,6 +9660,7 @@ async fn test_ohttp_attestation_includes_key_config() {
 #[tokio::test]
 async fn test_ohttp_attestation_omits_key_config_when_disabled() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     let app = build_test_app(&mock.uri());
 
     let response = app
@@ -9539,6 +9694,7 @@ async fn test_ohttp_attestation_omits_key_config_when_disabled() {
 #[tokio::test]
 async fn test_ohttp_attestation_present_for_default_route() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     let app = build_test_app_with_ohttp(&mock.uri());
 
     let response = app
@@ -9802,6 +9958,7 @@ fn ohttp_decrypt_response(
 #[tokio::test]
 async fn test_ohttp_full_roundtrip_chat_completion() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
 
     // Mock the backend vLLM response
     Mock::given(method("POST"))
@@ -9878,6 +10035,7 @@ async fn test_ohttp_full_roundtrip_chat_completion() {
 #[tokio::test]
 async fn test_ohttp_auth_enforcement_inside_envelope() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock.uri()).await;
 
     // Build inner request WITHOUT authorization header
@@ -9925,6 +10083,7 @@ async fn test_ohttp_auth_enforcement_inside_envelope() {
 #[tokio::test]
 async fn test_ohttp_outer_authorization_relay_injected() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -9992,6 +10151,7 @@ async fn test_ohttp_outer_bearer_scrubs_inner_x_nearai_priority() {
     // bearer (trusted), while the inner headers come from the end customer:
     // an inner X-NearAI-Priority must be dropped so the body gets the default.
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .and(wiremock::matchers::body_partial_json(
@@ -10098,6 +10258,7 @@ async fn test_ohttp_outer_bearer_scrubs_inner_x_request_hash() {
     use sha2::{Digest, Sha256};
 
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -10186,6 +10347,7 @@ async fn test_ohttp_outer_bearer_scrubs_inner_x_request_hash() {
 #[tokio::test]
 async fn test_ohttp_chunked_outer_authorization_relay_injected() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -10242,6 +10404,7 @@ async fn test_ohttp_chunked_outer_authorization_relay_injected() {
 #[tokio::test]
 async fn test_ohttp_non_bearer_outer_auth_falls_back_to_inner_authorization() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -10307,6 +10470,7 @@ async fn test_ohttp_non_bearer_outer_auth_falls_back_to_inner_authorization() {
 #[tokio::test]
 async fn test_ohttp_get_request_inner() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
 
     Mock::given(method("GET"))
         .and(path("/v1/models"))
@@ -10418,6 +10582,7 @@ async fn ohttp_chunked_roundtrip(
 #[tokio::test]
 async fn test_ohttp_chunked_chat_completion() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -10472,6 +10637,7 @@ async fn test_ohttp_chunked_chat_completion() {
 #[tokio::test]
 async fn test_ohttp_standard_still_works_after_chunked_added() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
 
     Mock::given(method("GET"))
         .and(path("/v1/models"))
@@ -10519,6 +10685,7 @@ async fn test_ohttp_standard_still_works_after_chunked_added() {
 #[tokio::test]
 async fn test_ohttp_chunked_auth_enforcement() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock.uri()).await;
 
     let mut inner_req = bhttp::Message::request(
@@ -10555,6 +10722,7 @@ async fn test_ohttp_chunked_auth_enforcement() {
 #[tokio::test]
 async fn test_ohttp_chunked_get_request() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -10588,6 +10756,7 @@ async fn test_ohttp_chunked_get_request() {
 #[tokio::test]
 async fn test_ohttp_chunked_empty_body_returns_400() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     let app = build_test_app_with_ohttp(&mock.uri());
 
     let response = app
@@ -10607,6 +10776,7 @@ async fn test_ohttp_chunked_empty_body_returns_400() {
 #[tokio::test]
 async fn test_ohttp_chunked_garbage_body_returns_400() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     let app = build_test_app_with_ohttp(&mock.uri());
 
     let response = app
@@ -10627,6 +10797,7 @@ async fn test_ohttp_chunked_garbage_body_returns_400() {
 #[tokio::test]
 async fn test_ohttp_content_type_mismatch_returns_400() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
@@ -10667,6 +10838,7 @@ async fn test_ohttp_content_type_mismatch_returns_400() {
 #[tokio::test]
 async fn test_ohttp_chunked_large_response() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
 
     // Create a response >16KB to force multiple AEAD chunks
     let large_content = "x".repeat(32 * 1024);
@@ -10732,6 +10904,7 @@ async fn test_ohttp_chunked_uses_indeterminate_length_framing() {
     use tokio_util::compat::TokioAsyncWriteCompatExt;
 
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -11073,6 +11246,7 @@ async fn test_ohttp_chunked_streams_before_upstream_finishes() {
 #[tokio::test]
 async fn test_tracing_headers_propagated_to_upstream() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     // Upstream SSE response — minimal but valid
     let sse_body =
@@ -11129,6 +11303,7 @@ async fn test_tracing_headers_propagated_to_upstream() {
 #[tokio::test]
 async fn test_request_id_echoed_in_response() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     let sse_body =
         "data: {\"id\":\"chatcmpl-2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}\n\ndata: [DONE]\n\n";
@@ -11181,6 +11356,7 @@ async fn test_request_id_echoed_in_response() {
 #[tokio::test]
 async fn test_tracing_headers_propagated_non_streaming() {
     let mock_server = MockServer::start().await;
+    budget_fixture::mount_counter(&mock_server).await;
 
     // Non-streaming JSON response — proxy_json_request POSTs with stream:true internally
     // and reassembles the SSE into a single JSON body, so we return SSE here.
@@ -11257,6 +11433,7 @@ async fn test_e2ee_v3_authenticates_before_upstream_and_forces_response_encrypti
         };
         for streaming in [false, true] {
             let upstream = MockServer::start().await;
+            budget_fixture::mount_counter(&upstream).await;
             let key = if streaming { "delta" } else { "message" };
             let response_body = serde_json::json!({
                 "id": "chat-v3",
@@ -11407,6 +11584,7 @@ async fn test_e2ee_v3_rejects_completion_metadata_options_before_upstream() {
     let fixture: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/e2ee-v3.json")).unwrap();
     let upstream = MockServer::start().await;
+    budget_fixture::mount_counter(&upstream).await;
     let app = build_test_app(&upstream.uri());
     for vector in fixture["vectors"].as_array().unwrap() {
         for endpoint in ["/v1/chat/completions", "/v1/completions"] {
@@ -11481,6 +11659,7 @@ fn build_strict_app(mock_url: &str) -> axum::Router {
 /// guard let through is a 200 and one it stopped never reaches `requests_seen`.
 async fn start_any_post_backend() -> MockServer {
     let server = MockServer::start().await;
+    budget_fixture::mount_counter(&server).await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "guard-ok",
@@ -11788,6 +11967,7 @@ async fn backend_lora_embeddings_signature_covers_original_request() {
     use vllm_proxy_rs::encryption;
 
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     Mock::given(method("POST"))
         .and(path("/v1/embeddings"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -11893,6 +12073,7 @@ async fn test_e2ee_upstream_errors_are_redacted_in_http_and_sse() {
             (true, 0, true),
         ] {
             let upstream = MockServer::start().await;
+            budget_fixture::mount_counter(&upstream).await;
             let error = serde_json::json!({"error":{"message":"backend private value","type":"private type","code":400}});
             let response = if in_band {
                 ResponseTemplate::new(200).set_body_raw(
@@ -12026,6 +12207,7 @@ fn chat_of_bytes(bytes: usize) -> serde_json::Value {
 #[tokio::test]
 async fn size_tiers_unset_leave_priority_exactly_as_the_caller_class_set_it() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     // Short and long prompts alike: 0, or the header value unscaled.
     for (bytes, header, expected) in [(100, None, 0), (400_000, None, 0), (100, Some("-1"), -1)] {
         let status = forwarded_priority_status(
@@ -12044,6 +12226,7 @@ async fn size_tiers_unset_leave_priority_exactly_as_the_caller_class_set_it() {
 #[tokio::test]
 async fn size_tiers_give_short_and_long_prompts_different_priority() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     // Estimated tokens: 100 bytes → 29, 4_000 → 1_004, 400_000 → 100_004.
     let tiers = Some("1000:10,64000:5,*:0");
     for (bytes, header, expected) in [
@@ -12087,6 +12270,7 @@ async fn size_tiers_give_short_and_long_prompts_different_priority() {
 #[tokio::test]
 async fn size_tiers_with_lower_first_negate_the_combined_value() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     let tiers = Some("1000:10,*:0");
     for (bytes, header, expected) in [
         (100, None, -10),
@@ -12112,6 +12296,7 @@ async fn size_tier_is_computed_from_the_decrypted_prompt() {
     use vllm_proxy_rs::encryption;
 
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     let client_pair = test_client_signing_pair();
     let enc_for_request = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,

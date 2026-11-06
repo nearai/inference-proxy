@@ -438,7 +438,7 @@ pub fn resolve_request_hash_for_signing(
 }
 
 /// Strip empty tool_calls arrays from messages (vLLM bug workaround).
-fn strip_empty_tool_calls(payload: &mut serde_json::Value) {
+pub(crate) fn strip_empty_tool_calls(payload: &mut serde_json::Value) {
     if let Some(messages) = payload.get_mut("messages").and_then(|m| m.as_array_mut()) {
         for message in messages.iter_mut() {
             if let Some(obj) = message.as_object_mut() {

@@ -100,6 +100,10 @@ pub fn build_model_list_router() -> Router<AppState> {
         .route(ROUTE_V1_MODELS, get(metrics::models))
         .route(ROUTE_CHAT_COMPLETIONS, post(chat::chat_completions))
         .route(ROUTE_COMPLETIONS, post(completions::completions))
+        .route(
+            "/v1/internal/input-tokens",
+            post(crate::input_tokens::internal_count),
+        )
         .fallback(unknown_route)
 }
 
@@ -126,6 +130,10 @@ pub fn build_router() -> Router<AppState> {
         .route(ROUTE_CHAT_COMPLETIONS, post(chat::chat_completions))
         .route(ROUTE_COMPLETIONS, post(completions::completions))
         .route(ROUTE_TOKENIZE, post(passthrough::tokenize))
+        .route(
+            "/v1/internal/input-tokens",
+            post(crate::input_tokens::internal_count),
+        )
         .route(ROUTE_EMBEDDINGS, post(passthrough::embeddings))
         .route(ROUTE_RERANK, post(passthrough::rerank))
         .route(ROUTE_SCORE, post(passthrough::score))

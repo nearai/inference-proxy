@@ -233,6 +233,7 @@ fn completion_json() -> Value {
 
 /// Answer `expected` chat/completions requests on `route`.
 async fn mount_completions(backend: &MockServer, route: &str, expected: u64) {
+    budget_fixture::mount_counter(backend).await;
     Mock::given(method("POST"))
         .and(path(route))
         .respond_with(ResponseTemplate::new(200).set_body_json(completion_json()))
@@ -335,6 +336,7 @@ async fn assert_model_not_found(response: axum::response::Response) -> Value {
 /// and usage reports are accepted under the shared usage token.
 async fn cloud_api(key: &str) -> MockServer {
     let cloud = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud).await;
     budget_fixture::mount(&cloud).await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -423,7 +425,9 @@ fn bearer_of(request: &wiremock::Request) -> Option<String> {
 #[tokio::test]
 async fn a_request_is_served_by_the_model_its_body_names() {
     let alpha = MockServer::start().await;
+    budget_fixture::mount_counter(&alpha).await;
     let beta = MockServer::start().await;
+    budget_fixture::mount_counter(&beta).await;
     for (backend, id) in [(&alpha, ALPHA), (&beta, BETA)] {
         for route in ROUTES {
             // The body is forwarded with the id it arrived with.
@@ -459,7 +463,9 @@ async fn a_request_is_served_by_the_model_its_body_names() {
 #[tokio::test]
 async fn an_unknown_or_missing_model_is_a_404_and_nothing_is_dispatched_or_billed() {
     let alpha = MockServer::start().await;
+    budget_fixture::mount_counter(&alpha).await;
     let beta = MockServer::start().await;
+    budget_fixture::mount_counter(&beta).await;
     expect_untouched(&alpha).await;
     expect_untouched(&beta).await;
     let cloud = cloud_api("sk-live-customer").await;
@@ -626,8 +632,11 @@ async fn usage_is_billed_under_the_selected_model_at_its_own_discount() {
 #[tokio::test]
 async fn text_completions_are_placed_billed_and_counted_as_their_model() {
     let alpha = MockServer::start().await;
+    budget_fixture::mount_counter(&alpha).await;
     let alpha_long = MockServer::start().await;
+    budget_fixture::mount_counter(&alpha_long).await;
     let beta = MockServer::start().await;
+    budget_fixture::mount_counter(&beta).await;
     for backend in [&alpha, &alpha_long, &beta] {
         mount_completions(backend, routes::ROUTE_COMPLETIONS, 1).await;
     }
@@ -713,12 +722,14 @@ async fn a_stream_is_served_billed_and_refused_as_its_own_model() {
     };
     // alpha's engine is slow to its first token; beta's answers at once.
     let alpha = MockServer::start().await;
+    budget_fixture::mount_counter(&alpha).await;
     Mock::given(method("POST"))
         .and(path(routes::ROUTE_CHAT_COMPLETIONS))
         .respond_with(stream().set_delay(Duration::from_secs(30)))
         .mount(&alpha)
         .await;
     let beta = MockServer::start().await;
+    budget_fixture::mount_counter(&beta).await;
     Mock::given(method("POST"))
         .and(path(routes::ROUTE_CHAT_COMPLETIONS))
         .respond_with(stream())
@@ -821,7 +832,9 @@ async fn a_stream_is_served_billed_and_refused_as_its_own_model() {
 #[tokio::test]
 async fn a_model_at_its_budget_or_without_backends_refuses_nothing_for_another() {
     let alpha = MockServer::start().await;
+    budget_fixture::mount_counter(&alpha).await;
     let beta = MockServer::start().await;
+    budget_fixture::mount_counter(&beta).await;
     mount_completions(&alpha, routes::ROUTE_CHAT_COMPLETIONS, 0).await;
     mount_completions(&beta, routes::ROUTE_CHAT_COMPLETIONS, 3).await;
     let gateway = start_list(
@@ -879,8 +892,11 @@ async fn a_model_at_its_budget_or_without_backends_refuses_nothing_for_another()
 #[tokio::test]
 async fn a_models_backend_token_and_priority_reach_only_its_own_backends() {
     let alpha = MockServer::start().await;
+    budget_fixture::mount_counter(&alpha).await;
     let beta = MockServer::start().await;
+    budget_fixture::mount_counter(&beta).await;
     let gamma = MockServer::start().await;
+    budget_fixture::mount_counter(&gamma).await;
     for backend in [&alpha, &beta, &gamma] {
         for route in ROUTES {
             mount_completions(backend, route, 2).await;
@@ -959,7 +975,9 @@ async fn a_models_backend_token_and_priority_reach_only_its_own_backends() {
             .await
             .unwrap()
             .into_iter()
-            .filter(|request| request.method.as_str() == "POST")
+            .filter(|request| {
+                request.method.as_str() == "POST" && request.url.path() != "/tokenize"
+            })
             .collect();
         assert_eq!(inference.len(), 4);
         for request in &inference {
@@ -1010,8 +1028,11 @@ async fn a_models_backend_token_and_priority_reach_only_its_own_backends() {
 #[tokio::test]
 async fn each_model_keeps_its_own_tier_and_reasoning_switch() {
     let alpha = MockServer::start().await;
+    budget_fixture::mount_counter(&alpha).await;
     let alpha_long = MockServer::start().await;
+    budget_fixture::mount_counter(&alpha_long).await;
     let beta = MockServer::start().await;
+    budget_fixture::mount_counter(&beta).await;
     // alpha: a long-context tier above 1,000 estimated tokens, and `low` as
     // its "no reasoning". beta: one flat pool, and the default `none`.
     Mock::given(method("POST"))
@@ -1152,6 +1173,7 @@ const STREAMED: &str = "as a stream";
 /// the two apart by the message.
 async fn reasoning_backend() -> MockServer {
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     for route in ROUTES {
         Mock::given(method("POST"))
             .and(path(route))
@@ -1457,6 +1479,7 @@ const MERGED: &str = "inference_proxy_model_system_messages_merged_total";
 /// the two apart by a message that says `STREAMED`, wherever it is.
 async fn messages_backend() -> MockServer {
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     for route in ROUTES {
         Mock::given(method("POST"))
             .and(path(route))
@@ -2072,6 +2095,7 @@ fn engine_metrics(running: u32, queued: u32) -> String {
 async fn every_model_gets_a_health_checker_and_an_engine_poller_that_carry_no_bearer() {
     // alpha's one backend fails its first health probe and passes the next.
     let alpha = MockServer::start().await;
+    budget_fixture::mount_counter(&alpha).await;
     Mock::given(method("GET"))
         .and(path("/health"))
         .respond_with(ResponseTemplate::new(500))
@@ -2084,12 +2108,14 @@ async fn every_model_gets_a_health_checker_and_an_engine_poller_that_carry_no_be
         .mount(&alpha)
         .await;
     let alpha_engine = MockServer::start().await;
+    budget_fixture::mount_counter(&alpha_engine).await;
     Mock::given(method("GET"))
         .and(path("/v1/metrics"))
         .respond_with(ResponseTemplate::new(200).set_body_string(engine_metrics(3, 2)))
         .mount(&alpha_engine)
         .await;
     let beta = MockServer::start().await;
+    budget_fixture::mount_counter(&beta).await;
     Mock::given(method("GET"))
         .and(path("/health"))
         .respond_with(ResponseTemplate::new(200))
@@ -2176,8 +2202,10 @@ async fn every_model_gets_a_health_checker_and_an_engine_poller_that_carry_no_be
 #[tokio::test]
 async fn the_models_document_lists_every_configured_model_with_its_own_capacity_and_discount() {
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     expect_untouched(&backend).await;
     let source = MockServer::start().await;
+    budget_fixture::mount_counter(&source).await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -2264,8 +2292,10 @@ async fn a_listed_model_is_published_with_its_own_capacity_and_never_served() {
     const DECIDER: &str = "example/decider";
     const ABSENT: &str = "example/absent";
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     expect_untouched(&backend).await;
     let source = MockServer::start().await;
+    budget_fixture::mount_counter(&source).await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -2361,14 +2391,17 @@ async fn a_listed_model_is_published_with_its_own_capacity_and_never_served() {
 #[tokio::test]
 async fn an_unreadable_models_document_is_a_502_and_never_an_engine_list() {
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     expect_untouched(&backend).await;
     let failing = MockServer::start().await;
+    budget_fixture::mount_counter(&failing).await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
         .respond_with(ResponseTemplate::new(503))
         .mount(&failing)
         .await;
     let not_a_list = MockServer::start().await;
+    budget_fixture::mount_counter(&not_a_list).await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
@@ -2415,7 +2448,9 @@ async fn an_unreadable_models_document_is_a_502_and_never_an_engine_list() {
 #[tokio::test]
 async fn a_model_missing_from_the_document_is_logged_when_that_changes_and_counted_every_time() {
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     let source = MockServer::start().await;
+    budget_fixture::mount_counter(&source).await;
     let document = |ids: &[&str]| {
         let data: Vec<Value> = ids.iter().map(|id| json!({"id": id})).collect();
         Mock::given(method("GET"))
@@ -2505,12 +2540,14 @@ async fn a_model_missing_from_the_document_is_logged_when_that_changes_and_count
 #[tokio::test]
 async fn healthz_is_ok_while_one_model_is_and_names_the_models_to_the_operator_only() {
     let alpha = MockServer::start().await;
+    budget_fixture::mount_counter(&alpha).await;
     Mock::given(method("GET"))
         .and(path("/healthz"))
         .respond_with(ResponseTemplate::new(200))
         .mount(&alpha)
         .await;
     let gamma = MockServer::start().await;
+    budget_fixture::mount_counter(&gamma).await;
     Mock::given(method("GET"))
         .and(path("/healthz"))
         .respond_with(ResponseTemplate::new(503))
@@ -2626,6 +2663,7 @@ async fn healthz_is_ok_while_one_model_is_and_names_the_models_to_the_operator_o
 #[tokio::test]
 async fn list_mode_serves_only_the_routes_defined_for_several_models() {
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     expect_untouched(&backend).await;
     let gateway = start_list(
         &json!({"models": [{"id": ALPHA, "backend_urls": [backend.uri()]}]}),
@@ -3072,9 +3110,11 @@ async fn every_response_is_counted_once_under_its_model_route_and_status() {
     // alpha answers; beta's engine fails; gamma's backend is down; delta's
     // never answers in time.
     let alpha = MockServer::start().await;
+    budget_fixture::mount_counter(&alpha).await;
     mount_completions(&alpha, CHAT, 2).await;
     mount_completions(&alpha, TEXT, 1).await;
     let beta = MockServer::start().await;
+    budget_fixture::mount_counter(&beta).await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(500).set_body_json(json!({
             "error": {"message": "engine failure", "type": "internal_error"}
@@ -3083,6 +3123,7 @@ async fn every_response_is_counted_once_under_its_model_route_and_status() {
         .mount(&beta)
         .await;
     let delta = MockServer::start().await;
+    budget_fixture::mount_counter(&delta).await;
     Mock::given(method("POST"))
         .respond_with(
             ResponseTemplate::new(200)
@@ -3198,11 +3239,13 @@ async fn the_gateways_own_refusals_are_counted_under_the_model_they_refused() {
     // alpha's engine is slow to its first token. beta's long-context tier is
     // down and strict, so an oversized prompt has nowhere to go.
     let alpha = MockServer::start().await;
+    budget_fixture::mount_counter(&alpha).await;
     Mock::given(method("POST"))
         .respond_with(sse(ONE_TOKEN_STREAM).set_delay(Duration::from_secs(30)))
         .mount(&alpha)
         .await;
     let beta = MockServer::start().await;
+    budget_fixture::mount_counter(&beta).await;
     expect_untouched(&beta).await;
     let recorder = PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
@@ -3260,6 +3303,7 @@ async fn the_gateways_own_refusals_are_counted_under_the_model_they_refused() {
 #[tokio::test]
 async fn a_connection_fail_over_is_still_one_response() {
     let live = MockServer::start().await;
+    budget_fixture::mount_counter(&live).await;
     for route in ROUTES {
         mount_completions(&live, route, 1).await;
     }
@@ -3309,6 +3353,7 @@ async fn a_stream_that_fails_after_its_200_is_a_stream_error_of_its_model_and_st
     // alpha's engine reports an error after its first event; beta's
     // connection is cut in the middle of the body; gamma's stream is whole.
     let alpha = MockServer::start().await;
+    budget_fixture::mount_counter(&alpha).await;
     Mock::given(method("POST"))
         .respond_with(sse(STREAM_WITH_AN_ERROR_EVENT))
         .expect(2)
@@ -3316,6 +3361,7 @@ async fn a_stream_that_fails_after_its_200_is_a_stream_error_of_its_model_and_st
         .await;
     let beta = interrupted_stream_backend(Then::Cut).await;
     let gamma = MockServer::start().await;
+    budget_fixture::mount_counter(&gamma).await;
     Mock::given(method("POST"))
         .respond_with(sse(ONE_TOKEN_STREAM))
         .expect(2)
@@ -3374,6 +3420,7 @@ async fn a_stalled_stream_and_a_failure_after_the_early_commit_are_stream_errors
     // gateway has committed the 200 on its own; gamma's ends without `[DONE]`.
     let alpha = interrupted_stream_backend(Then::Stall).await;
     let beta = MockServer::start().await;
+    budget_fixture::mount_counter(&beta).await;
     Mock::given(method("POST"))
         .respond_with(
             ResponseTemplate::new(500)
@@ -3386,6 +3433,7 @@ async fn a_stalled_stream_and_a_failure_after_the_early_commit_are_stream_errors
         .mount(&beta)
         .await;
     let gamma = MockServer::start().await;
+    budget_fixture::mount_counter(&gamma).await;
     Mock::given(method("POST"))
         .respond_with(sse(FIRST_EVENT))
         .expect(2)
@@ -3458,6 +3506,7 @@ async fn a_client_that_leaves_is_no_stream_error_and_is_counted_only_once_it_was
     // alpha's stream stalls after its first event; beta never answers.
     let alpha = interrupted_stream_backend(Then::Stall).await;
     let beta = MockServer::start().await;
+    budget_fixture::mount_counter(&beta).await;
     Mock::given(method("POST"))
         .respond_with(sse(ONE_TOKEN_STREAM).set_delay(Duration::from_secs(30)))
         .mount(&beta)
@@ -3525,6 +3574,7 @@ async fn a_client_that_leaves_is_no_stream_error_and_is_counted_only_once_it_was
 #[tokio::test]
 async fn a_single_model_process_has_neither_per_model_response_series() {
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     mount_completions(&backend, CHAT, 1).await;
     Mock::given(method("POST"))
         .and(path(TEXT))
@@ -3643,6 +3693,7 @@ const REQUESTED: [&str; 2] = ["Example/ALPHA", "someone-elses/model-sentinel"];
 #[tokio::test]
 async fn a_single_model_lane_counts_how_the_requested_model_compares_and_serves_as_before() {
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     for route in ROUTES {
         mount_completions(&backend, route, 6).await;
     }
@@ -3721,6 +3772,7 @@ async fn a_process_that_is_not_a_lane_does_not_look_at_the_requested_model() {
     ];
     for extra in inside_a_cvm {
         let backend = MockServer::start().await;
+        budget_fixture::mount_counter(&backend).await;
         mount_completions(&backend, routes::ROUTE_CHAT_COMPLETIONS, 2).await;
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
@@ -3751,6 +3803,7 @@ async fn a_process_that_is_not_a_lane_does_not_look_at_the_requested_model() {
 #[tokio::test]
 async fn list_mode_counts_refused_models_without_naming_them() {
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     mount_completions(&backend, routes::ROUTE_CHAT_COMPLETIONS, 1).await;
     let recorder = PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
@@ -3800,11 +3853,13 @@ async fn list_mode_counts_refused_models_without_naming_them() {
 #[tokio::test]
 async fn in_list_mode_the_single_model_state_serves_nothing() {
     let seen = MockServer::start().await;
+    budget_fixture::mount_counter(&seen).await;
     Mock::given(any())
         .respond_with(ResponseTemplate::new(200))
         .mount(&seen)
         .await;
     let backend = MockServer::start().await;
+    budget_fixture::mount_counter(&backend).await;
     let cloud = cloud_api("sk-live-customer").await;
     let recorder = PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
@@ -3976,7 +4031,9 @@ impl Binary {
 #[tokio::test]
 async fn the_binary_serves_a_model_list() {
     let alpha = MockServer::start().await;
+    budget_fixture::mount_counter(&alpha).await;
     let beta = MockServer::start().await;
+    budget_fixture::mount_counter(&beta).await;
     for backend in [&alpha, &beta] {
         mount_completions(backend, routes::ROUTE_CHAT_COMPLETIONS, 1).await;
         Mock::given(method("GET"))
@@ -3986,6 +4043,7 @@ async fn the_binary_serves_a_model_list() {
             .await;
     }
     let alpha_engine = MockServer::start().await;
+    budget_fixture::mount_counter(&alpha_engine).await;
     Mock::given(method("GET"))
         .and(path("/v1/metrics"))
         .respond_with(ResponseTemplate::new(200).set_body_string(engine_metrics(3, 0)))
@@ -4262,6 +4320,7 @@ async fn refused_at_startup(list: &Value, env: &[(&str, &str)]) -> String {
 #[tokio::test]
 async fn the_binary_applies_a_reasoning_effort_map_and_refuses_one_it_cannot_serve() {
     let alpha = MockServer::start().await;
+    budget_fixture::mount_counter(&alpha).await;
     mount_completions(&alpha, CHAT, 2).await;
     let cloud = cloud_api("sk-live-customer").await;
     let (alpha_url, cloud_url) = (alpha.uri(), cloud.uri());
@@ -4402,6 +4461,7 @@ async fn the_binary_applies_a_reasoning_effort_map_and_refuses_one_it_cannot_ser
 #[tokio::test]
 async fn the_binary_merges_system_messages_and_refuses_a_value_that_is_not_a_boolean() {
     let alpha = MockServer::start().await;
+    budget_fixture::mount_counter(&alpha).await;
     mount_completions(&alpha, CHAT, 2).await;
     let alpha_url = alpha.uri();
     let list = |value: Value| {
@@ -4507,6 +4567,7 @@ async fn usage_report_delivery_series_carry_the_model_label_in_list_mode_only() 
     ];
     for listed in [false, true] {
         let backend = MockServer::start().await;
+        budget_fixture::mount_counter(&backend).await;
         mount_completions(&backend, routes::ROUTE_CHAT_COMPLETIONS, 1).await;
         let cloud = cloud_api("sk-live-customer").await;
         let recorder = PrometheusBuilder::new().build_recorder();
@@ -4595,10 +4656,12 @@ async fn the_binary_waits_for_pending_usage_reports_at_shutdown_only_when_told_t
     const DRAINED: &str = "Usage reports drained before shutdown";
     for configured in [true, false] {
         let backend = MockServer::start().await;
+        budget_fixture::mount_counter(&backend).await;
         mount_completions(&backend, routes::ROUTE_CHAT_COMPLETIONS, 1).await;
         // A cloud-api whose usage intake takes its time, after one failure
         // for the process that retries.
         let cloud = MockServer::start().await;
+        budget_fixture::mount_counter(&cloud).await;
         budget_fixture::mount(&cloud).await;
         Mock::given(method("POST"))
             .and(path("/v1/check_api_key"))

@@ -90,6 +90,7 @@ async fn response_json(response: axum::response::Response) -> serde_json::Value 
 #[tokio::test]
 async fn pool_passthrough_uses_backend_client_and_bearer() {
     let pool = MockServer::start().await;
+    common::budget::mount_counter(&pool).await;
     Mock::given(method("POST"))
         .and(path("/v1/rerank"))
         .and(header("authorization", "Bearer backend-secret"))
@@ -117,7 +118,9 @@ async fn pool_passthrough_uses_backend_client_and_bearer() {
 #[tokio::test]
 async fn override_passthrough_uses_plain_client_without_backend_bearer() {
     let pool = MockServer::start().await;
+    common::budget::mount_counter(&pool).await;
     let override_server = MockServer::start().await;
+    common::budget::mount_counter(&override_server).await;
     Mock::given(method("POST"))
         .and(path("/custom/rerank"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -148,6 +151,7 @@ async fn override_passthrough_uses_plain_client_without_backend_bearer() {
 #[tokio::test]
 async fn pool_multipart_passthrough_uses_backend_client_and_bearer() {
     let pool = MockServer::start().await;
+    common::budget::mount_counter(&pool).await;
     for case in MULTIPART_CASES {
         Mock::given(method("POST"))
             .and(path(case.pool_path))
@@ -186,7 +190,9 @@ async fn pool_multipart_passthrough_uses_backend_client_and_bearer() {
 #[tokio::test]
 async fn override_multipart_passthrough_uses_plain_client_without_backend_bearer() {
     let pool = MockServer::start().await;
+    common::budget::mount_counter(&pool).await;
     let overrides = MockServer::start().await;
+    common::budget::mount_counter(&overrides).await;
     for case in MULTIPART_CASES {
         Mock::given(method("POST"))
             .and(path(case.override_path))
@@ -244,6 +250,7 @@ async fn override_multipart_passthrough_uses_plain_client_without_backend_bearer
 #[tokio::test]
 async fn encrypted_image_edit_signature_hashes_raw_request_and_response() {
     let backend = MockServer::start().await;
+    common::budget::mount_counter(&backend).await;
     Mock::given(method("POST"))
         .and(path("/v1/images/edits"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({

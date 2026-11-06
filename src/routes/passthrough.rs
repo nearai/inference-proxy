@@ -250,6 +250,7 @@ pub async fn images_edits(
             &UsageType::ImageGeneration,
             &mut serde_json::json!({"n": image_count}),
             1,
+            0,
         )
         .await?;
     }
@@ -379,6 +380,7 @@ pub async fn audio_transcriptions(
             &UsageType::AudioTranscription,
             &mut serde_json::json!({"duration_seconds": audio_seconds}),
             1,
+            audio_seconds,
         )
         .await?;
         // The v1 queue schema has no audio variant. Use the existing HTTP delivery,

@@ -368,6 +368,7 @@ async fn json_body(response: axum::response::Response) -> serde_json::Value {
 #[tokio::test]
 async fn backend_token_is_attached_to_backend_requests() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     // Only a request carrying the backend bearer is answered; a request that
     // still carried the client's token (or none) would fall through to 404.
     Mock::given(method("POST"))
@@ -407,6 +408,7 @@ async fn backend_token_is_attached_to_backend_requests() {
 #[tokio::test]
 async fn gateway_defaults_missing_json_schema_name_before_backend_validation() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .and(wiremock::matchers::body_partial_json(serde_json::json!({
@@ -482,6 +484,7 @@ async fn gateway_defaults_missing_json_schema_name_before_backend_validation() {
 #[tokio::test]
 async fn gateway_defaults_json_schema_name_on_streaming_requests() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .and(wiremock::matchers::body_partial_json(serde_json::json!({
@@ -529,6 +532,7 @@ async fn gateway_defaults_json_schema_name_on_streaming_requests() {
 #[tokio::test]
 async fn without_backend_token_no_authorization_reaches_backend() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .and(header("authorization", "Bearer test-token"))
@@ -593,6 +597,7 @@ fn expect_priority(value: i64) -> Mock {
 #[tokio::test]
 async fn gateway_sends_priority_header_next_to_backend_token() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .and(header("authorization", "Bearer backend-secret"))
@@ -622,6 +627,7 @@ async fn gateway_sends_priority_header_next_to_backend_token() {
 #[tokio::test]
 async fn trusted_caller_sets_priority_by_header_everything_else_is_zero() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     // Requests below use the proxy's config token, i.e. a trusted caller
     // (cloud-api, or the gateway on the CVM hop).
     for (header_value, expected) in [
@@ -645,6 +651,7 @@ async fn trusted_caller_sets_priority_by_header_everything_else_is_zero() {
 #[tokio::test]
 async fn customer_key_cannot_set_priority() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     budget_fixture::mount(&mock).await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -669,6 +676,7 @@ async fn customer_key_cannot_set_priority() {
         assert_eq!(response.status(), StatusCode::OK, "header={header_value:?}");
         mock.verify().await;
         mock.reset().await;
+        budget_fixture::mount_counter(&mock).await;
         budget_fixture::mount(&mock).await;
         Mock::given(method("POST"))
             .and(path("/v1/check_api_key"))
@@ -683,6 +691,7 @@ async fn customer_key_cannot_set_priority() {
 #[tokio::test]
 async fn completions_route_gets_priority_too() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     Mock::given(method("POST"))
         .and(path("/v1/completions"))
         .and(wiremock::matchers::body_partial_json(
@@ -738,6 +747,7 @@ async fn mount_key_check(mock: &MockServer, key: &str, org: Option<&str>) {
 #[tokio::test]
 async fn org_allowlist_admits_partner_keys_and_refuses_others() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
@@ -779,6 +789,7 @@ async fn org_allowlist_admits_partner_keys_and_refuses_others() {
 #[tokio::test]
 async fn empty_org_allowlist_admits_every_valid_key() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
@@ -808,6 +819,7 @@ async fn empty_org_allowlist_admits_every_valid_key() {
 #[tokio::test]
 async fn rejected_content_part_types_get_400_without_dispatch() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
@@ -874,6 +886,7 @@ async fn rejected_content_part_types_get_400_without_dispatch() {
 #[tokio::test]
 async fn healthz_can_skip_dstack_and_probe_a_custom_backend_path() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     Mock::given(method("GET"))
         .and(path("/healthz"))
         .respond_with(ResponseTemplate::new(200).set_body_string("{\"status\":\"ok\"}"))
@@ -914,6 +927,7 @@ async fn healthz_can_skip_dstack_and_probe_a_custom_backend_path() {
 #[tokio::test]
 async fn healthz_reports_unhealthy_without_dstack_by_default() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     Mock::given(method("GET"))
         .and(path("/health"))
         .respond_with(ResponseTemplate::new(200))
@@ -1184,6 +1198,7 @@ async fn sse_keepalive_is_off_by_default() {
 #[tokio::test]
 async fn non_tee_deployment_hides_attestation_signature_and_gpu_evidence() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
@@ -1254,6 +1269,7 @@ async fn non_tee_deployment_hides_attestation_signature_and_gpu_evidence() {
 #[tokio::test]
 async fn tee_deployment_keeps_signature_route() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
@@ -1298,6 +1314,7 @@ async fn queue_full_503_becomes_429_only_when_enabled() {
         (false, StatusCode::SERVICE_UNAVAILABLE),
     ] {
         let mock = MockServer::start().await;
+        budget_fixture::mount_counter(&mock).await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(
@@ -1340,6 +1357,7 @@ async fn queue_full_503_becomes_429_only_when_enabled() {
 #[tokio::test]
 async fn other_503s_are_not_rewritten() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(503).set_body_raw(
@@ -1374,6 +1392,7 @@ fn queue_full_sse_stream() -> String {
 #[tokio::test]
 async fn streaming_queue_full_first_event_becomes_429_with_peek() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(
@@ -1415,6 +1434,7 @@ async fn streaming_queue_full_first_event_becomes_429_with_peek() {
 #[tokio::test]
 async fn streaming_first_event_error_keeps_engine_status_without_mapping() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(
@@ -1446,6 +1466,7 @@ async fn streaming_first_event_error_keeps_engine_status_without_mapping() {
 async fn streaming_without_peek_forwards_the_error_event_on_200() {
     // Existing behavior, preserved for CVM deployments (peek off).
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(
@@ -1585,6 +1606,7 @@ async fn assert_overloaded(response: axum::response::Response) {
 async fn admission_budget_refuses_with_429_before_dispatch() {
     for route in COMPLETION_ROUTES {
         let mock = MockServer::start().await;
+        budget_fixture::mount_counter(&mock).await;
         Mock::given(method("POST"))
             .and(path(route))
             .respond_with(
@@ -1619,6 +1641,7 @@ async fn admission_budget_refuses_with_429_before_dispatch() {
 #[tokio::test]
 async fn admission_is_inert_when_not_configured() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
@@ -1641,6 +1664,7 @@ async fn admission_is_inert_when_not_configured() {
 #[tokio::test]
 async fn engine_queue_full_on_every_backend_refuses_new_work_without_dispatch() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(503).set_body_string(QUEUE_FULL_BODY))
@@ -1685,6 +1709,7 @@ async fn engine_queue_full_on_every_backend_refuses_new_work_without_dispatch() 
 async fn connect_error_fails_over_to_another_backend_when_enabled() {
     for route in COMPLETION_ROUTES {
         let mock = MockServer::start().await;
+        budget_fixture::mount_counter(&mock).await;
         Mock::given(method("POST"))
             .and(path(route))
             .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
@@ -1710,6 +1735,7 @@ async fn connect_error_fails_over_to_another_backend_when_enabled() {
 #[tokio::test]
 async fn connect_error_is_not_retried_without_failover() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
@@ -1735,6 +1761,7 @@ async fn connect_error_is_not_retried_without_failover() {
 async fn failover_never_retries_an_engine_rejection() {
     for route in COMPLETION_ROUTES {
         let rejected = MockServer::start().await;
+        budget_fixture::mount_counter(&rejected).await;
         Mock::given(method("POST"))
             .and(path(route))
             .respond_with(ResponseTemplate::new(503).set_body_string(QUEUE_FULL_BODY))
@@ -1742,6 +1769,7 @@ async fn failover_never_retries_an_engine_rejection() {
             .mount(&rejected)
             .await;
         let idle = MockServer::start().await;
+        budget_fixture::mount_counter(&idle).await;
         Mock::given(method("POST"))
             .and(path(route))
             .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
@@ -1769,6 +1797,7 @@ async fn failover_never_retries_an_engine_rejection() {
 #[tokio::test]
 async fn failover_onto_backends_at_their_bound_is_a_429_not_a_502() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
@@ -1942,7 +1971,9 @@ async fn mount_engine(mock: &MockServer, running: u32, queued: u32, expected_cha
 #[tokio::test]
 async fn a_queueing_engine_is_steered_around_and_a_fleet_wide_queue_refuses() {
     let busy = MockServer::start().await;
+    budget_fixture::mount_counter(&busy).await;
     let idle = MockServer::start().await;
+    budget_fixture::mount_counter(&idle).await;
     // busy is first in the pool, so least-connections alone would pick it.
     mount_engine(&busy, 20, 3, 0).await;
     mount_engine(&idle, 2, 0, 2).await;
@@ -1980,7 +2011,9 @@ async fn a_queueing_engine_is_steered_around_and_a_fleet_wide_queue_refuses() {
 #[tokio::test]
 async fn a_configured_queue_threshold_gates_admission() {
     let backend_a = MockServer::start().await;
+    budget_fixture::mount_counter(&backend_a).await;
     let backend_b = MockServer::start().await;
+    budget_fixture::mount_counter(&backend_b).await;
     // Symmetric loads: least-connections ties break on index, so backend_a
     // (first in the pool) is the one dispatched to below the threshold.
     mount_engine(&backend_a, 0, 2, 1).await;
@@ -2065,7 +2098,9 @@ fn conversation(turn: usize) -> serde_json::Value {
 #[tokio::test]
 async fn oversized_requests_go_to_the_long_tier_and_the_rest_to_the_base_fleet() {
     let base = MockServer::start().await;
+    budget_fixture::mount_counter(&base).await;
     let long = MockServer::start().await;
+    budget_fixture::mount_counter(&long).await;
     mount_chat(&base, 1).await;
     mount_chat(&long, 1).await;
     let app = build_gateway(
@@ -2092,8 +2127,11 @@ async fn oversized_requests_go_to_the_long_tier_and_the_rest_to_the_base_fleet()
 #[tokio::test]
 async fn a_conversation_that_grows_past_the_threshold_moves_and_stays_there() {
     let base = MockServer::start().await;
+    budget_fixture::mount_counter(&base).await;
     let long = MockServer::start().await;
+    budget_fixture::mount_counter(&long).await;
     let long_peer = MockServer::start().await;
+    budget_fixture::mount_counter(&long_peer).await;
     mount_chat(&base, 1).await;
     // One slow unrelated request parks on the long host the conversation
     // moves onto, so plain least-connections would send the turn after it to
@@ -2160,6 +2198,7 @@ async fn a_conversation_that_grows_past_the_threshold_moves_and_stays_there() {
 #[tokio::test]
 async fn a_tier_without_a_healthy_backend_falls_back_to_the_other_one() {
     let live = MockServer::start().await;
+    budget_fixture::mount_counter(&live).await;
     let dead = unreachable_backend_url();
     // The long tier is down...
     let app = build_gateway(
@@ -2235,6 +2274,7 @@ async fn oneshot_with_rejection_reason_metric(
 #[tokio::test]
 async fn strict_mode_refuses_instead_of_falling_back_across_the_tiers() {
     let live = MockServer::start().await;
+    budget_fixture::mount_counter(&live).await;
     let dead = unreachable_backend_url();
     // The long tier's only host is unreachable; strict mode pins the
     // restriction through the connect fail-over instead of widening the
@@ -2297,6 +2337,7 @@ async fn strict_mode_refuses_instead_of_falling_back_across_the_tiers() {
 #[tokio::test]
 async fn strict_mode_tier_already_empty_before_placement_refuses_with_tier_unavailable() {
     let live = MockServer::start().await;
+    budget_fixture::mount_counter(&live).await;
     let dead = unreachable_backend_url();
     // Unlike `strict_mode_refuses_instead_of_falling_back_across_the_tiers`,
     // the long tier's only backend is marked unhealthy up front rather than
@@ -2329,6 +2370,7 @@ async fn strict_mode_tier_already_empty_before_placement_refuses_with_tier_unava
 #[tokio::test]
 async fn strict_mode_returns_503_when_admission_is_disabled() {
     let live = MockServer::start().await;
+    budget_fixture::mount_counter(&live).await;
     let dead = unreachable_backend_url();
     // No `admission_max_inflight`: admission is off, so the refusal has no
     // `Permit` to build the 429 `Overloaded` shape from and falls back to a
@@ -2354,7 +2396,9 @@ async fn strict_mode_returns_503_when_admission_is_disabled() {
 #[tokio::test]
 async fn a_full_long_tier_refuses_while_the_base_fleet_keeps_serving() {
     let base = MockServer::start().await;
+    budget_fixture::mount_counter(&base).await;
     let long = MockServer::start().await;
+    budget_fixture::mount_counter(&long).await;
     mount_chat(&base, 1).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -2404,7 +2448,9 @@ async fn a_full_long_tier_refuses_while_the_base_fleet_keeps_serving() {
 #[tokio::test]
 async fn a_token_id_prompt_is_routed_by_its_exact_length() {
     let base = MockServer::start().await;
+    budget_fixture::mount_counter(&base).await;
     let long = MockServer::start().await;
+    budget_fixture::mount_counter(&long).await;
     for mock in [&base, &long] {
         Mock::given(method("POST"))
             .and(path("/v1/completions"))
@@ -2454,7 +2500,9 @@ async fn a_token_id_prompt_is_routed_by_its_exact_length() {
 #[tokio::test]
 async fn a_huge_output_window_on_a_short_request_stays_on_the_base_fleet() {
     let base = MockServer::start().await;
+    budget_fixture::mount_counter(&base).await;
     let long = MockServer::start().await;
+    budget_fixture::mount_counter(&long).await;
     let completion = serde_json::json!({
         "id": "cmpl-1", "object": "text_completion", "model": "test-model",
         "choices": [{"index": 0, "text": "hi", "finish_reason": "stop"}],
@@ -2532,7 +2580,9 @@ async fn get_models(app: axum::Router) -> (StatusCode, serde_json::Value) {
 #[tokio::test]
 async fn models_document_is_reduced_to_this_model_and_carries_capacity() {
     let engine = MockServer::start().await;
+    budget_fixture::mount_counter(&engine).await;
     let source = MockServer::start().await;
+    budget_fixture::mount_counter(&source).await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2578,7 +2628,9 @@ async fn models_document_is_reduced_to_this_model_and_carries_capacity() {
 #[tokio::test]
 async fn internal_models_document_is_read_with_the_usage_token() {
     let engine = MockServer::start().await;
+    budget_fixture::mount_counter(&engine).await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
     // cloud-api's internal catalog: only a read that carries the service token
     // is answered. It lists a model the public document leaves out.
@@ -2610,9 +2662,12 @@ async fn internal_models_document_is_read_with_the_usage_token() {
 #[tokio::test]
 async fn usage_token_is_sent_to_cloud_api_internal_routes_only() {
     let engine = MockServer::start().await;
+    budget_fixture::mount_counter(&engine).await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
     let elsewhere = MockServer::start().await;
+    budget_fixture::mount_counter(&elsewhere).await;
     let document = serde_json::json!({
         "object": "list",
         "data": [{"id": "test-model", "name": "Test Model"}]
@@ -2658,7 +2713,9 @@ async fn usage_token_is_sent_to_cloud_api_internal_routes_only() {
 #[tokio::test]
 async fn models_document_without_a_budget_or_rate_declares_no_capacity() {
     let engine = MockServer::start().await;
+    budget_fixture::mount_counter(&engine).await;
     let source = MockServer::start().await;
+    budget_fixture::mount_counter(&source).await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2682,6 +2739,7 @@ async fn models_document_without_a_budget_or_rate_declares_no_capacity() {
 #[tokio::test]
 async fn models_document_falls_back_to_the_engine_list_when_the_source_fails() {
     let engine = MockServer::start().await;
+    budget_fixture::mount_counter(&engine).await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2692,6 +2750,7 @@ async fn models_document_falls_back_to_the_engine_list_when_the_source_fails() {
         .mount(&engine)
         .await;
     let source = MockServer::start().await;
+    budget_fixture::mount_counter(&source).await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
         .respond_with(ResponseTemplate::new(503))
@@ -2714,6 +2773,7 @@ async fn models_document_falls_back_to_the_engine_list_when_the_source_fails() {
 
     // Source serving a document that lacks this model: same fallback.
     let empty = MockServer::start().await;
+    budget_fixture::mount_counter(&empty).await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2737,7 +2797,9 @@ async fn models_document_falls_back_to_the_engine_list_when_the_source_fails() {
 #[tokio::test]
 async fn models_document_publishes_the_configured_discount_as_a_number() {
     let engine = MockServer::start().await;
+    budget_fixture::mount_counter(&engine).await;
     let source = MockServer::start().await;
+    budget_fixture::mount_counter(&source).await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2777,7 +2839,9 @@ async fn models_document_publishes_the_configured_discount_as_a_number() {
 #[tokio::test]
 async fn models_document_carries_no_discount_when_unset() {
     let engine = MockServer::start().await;
+    budget_fixture::mount_counter(&engine).await;
     let source = MockServer::start().await;
+    budget_fixture::mount_counter(&source).await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2807,6 +2871,7 @@ async fn models_document_fallback_carries_the_discount() {
     // The source is down, but usage reports still carry the discount: the
     // engine list served in its place must publish it too.
     let engine = MockServer::start().await;
+    budget_fixture::mount_counter(&engine).await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2820,6 +2885,7 @@ async fn models_document_fallback_carries_the_discount() {
         .mount(&engine)
         .await;
     let source = MockServer::start().await;
+    budget_fixture::mount_counter(&source).await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
         .respond_with(ResponseTemplate::new(503))
@@ -2851,6 +2917,7 @@ async fn models_document_fallback_refuses_an_engine_answer_it_cannot_discount() 
     // An engine answer that is not a model list cannot carry the discount, so
     // it is not served without it.
     let source = MockServer::start().await;
+    budget_fixture::mount_counter(&source).await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
         .respond_with(ResponseTemplate::new(503))
@@ -2861,6 +2928,7 @@ async fn models_document_fallback_refuses_an_engine_answer_it_cannot_discount() 
         ResponseTemplate::new(200).set_body_json(serde_json::json!({"object": "list"})),
     ] {
         let engine = MockServer::start().await;
+        budget_fixture::mount_counter(&engine).await;
         Mock::given(method("GET"))
             .and(path("/v1/models"))
             .respond_with(engine_answer)
@@ -2903,6 +2971,7 @@ async fn usage_reports_carry_the_discount_the_models_document_publishes() {
         // One mock plays the engine and cloud-api: the key check, the usage
         // intake and the catalog the models document is read from.
         let mock = MockServer::start().await;
+        budget_fixture::mount_counter(&mock).await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(chat_completion_json()))
@@ -3022,6 +3091,7 @@ async fn gateway_with_usage_intake(
 #[tokio::test]
 async fn a_failed_usage_report_is_not_sent_again_unless_retries_are_configured() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     let (app, state) = gateway_with_usage_intake(&mock, &[503], Default::default()).await;
     assert_eq!(
         state.config.usage_report,
@@ -3048,6 +3118,7 @@ async fn a_failed_usage_report_is_not_sent_again_unless_retries_are_configured()
 #[tokio::test]
 async fn a_usage_report_the_intake_fails_is_sent_again_unchanged_when_retries_are_configured() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     let (app, state) = gateway_with_usage_intake(
         &mock,
         &[503, 429],
@@ -3116,6 +3187,7 @@ impl wiremock::Match for NoReasoningEffort {
 #[tokio::test]
 async fn reasoning_object_becomes_reasoning_effort_in_gateway_mode() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .and(wiremock::matchers::body_partial_json(serde_json::json!({
@@ -3158,6 +3230,7 @@ async fn reasoning_object_becomes_reasoning_effort_in_gateway_mode() {
 #[tokio::test]
 async fn reasoning_object_is_left_alone_outside_gateway_mode() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .and(NoReasoningEffort)
@@ -3611,7 +3684,9 @@ async fn first_token_deadlines_preserve_strict_tier_placement_on_both_routes() {
     for route in ["/v1/chat/completions", "/v1/completions"] {
         for long in [false, true] {
             let base = MockServer::start().await;
+            budget_fixture::mount_counter(&base).await;
             let large = MockServer::start().await;
+            budget_fixture::mount_counter(&large).await;
             for (backend, expected) in [(&base, u64::from(!long)), (&large, u64::from(long))] {
                 Mock::given(method("POST"))
                     .and(path(route))
@@ -3827,6 +3902,7 @@ async fn without_a_deadline_early_headers_commit_the_stream_at_once() {
 #[tokio::test]
 async fn a_deadline_spent_before_dispatch_refuses_without_asking_an_engine() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     // Authentication counts against the deadline: a slow cloud-api round trip
     // can use the whole budget before the request would be dispatched.
     budget_fixture::mount(&mock).await;
@@ -4323,6 +4399,7 @@ async fn mount_reasoning_stream(mock: &MockServer) {
 #[tokio::test]
 async fn streamed_usage_carries_reasoning_tokens_in_completion_tokens_details() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     mount_reasoning_stream(&mock).await;
     let response = reasoning_lane(&mock)
         .oneshot(stream_request())
@@ -4348,6 +4425,7 @@ async fn streamed_usage_carries_reasoning_tokens_in_completion_tokens_details() 
 #[tokio::test]
 async fn non_streamed_usage_carries_reasoning_tokens_in_completion_tokens_details() {
     let mock = MockServer::start().await;
+    budget_fixture::mount_counter(&mock).await;
     mount_reasoning_stream(&mock).await;
     let response = reasoning_lane(&mock)
         .oneshot(chat_request(serde_json::json!({

@@ -35,6 +35,7 @@ const BLOCKED_PATHS: &[&str] = &[
 #[tokio::test]
 async fn unknown_and_backend_control_plane_routes_never_reach_backend() {
     let backend = MockServer::start().await;
+    common::budget::mount_counter(&backend).await;
     let app = build_test_app(&backend.uri(), TestAppOptions::default());
 
     for path in BLOCKED_PATHS {

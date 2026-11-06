@@ -19,6 +19,7 @@ pub mod error;
 pub mod fusion;
 pub mod gpu_evidence_delegate;
 pub mod image_validation;
+pub(crate) mod input_tokens;
 pub mod metrics_middleware;
 pub mod model_list;
 pub mod model_metrics;

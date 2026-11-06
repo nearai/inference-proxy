@@ -26,6 +26,10 @@ const EXCLUDED_REQUEST_HEADERS: &[&str] = &[
     "x-request-id",
     "x-org-id",
     "x-workspace-id",
+    "x-nearai-billing",
+    "x-nearai-billing-org",
+    "x-nearai-billing-workspace",
+    "x-nearai-billing-key",
     crate::vllm_dp_affinity::DATA_PARALLEL_RANK_HEADER,
 ];
 
@@ -60,6 +64,28 @@ pub async fn classify(
     let (backend_url, backend_guard) = state.backend_pool.select_url(&path_with_query);
     let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
 
+    let mut usage_reporter = make_usage_reporter(&auth, &state);
+    if let Some(reporter) = usage_reporter.as_mut() {
+        let mut input: serde_json::Value = serde_json::from_slice(&request_body)
+            .map_err(|_| AppError::BadRequest("Invalid privacy input".into()))?;
+        if let Some(ctx) = crate::encryption::extract_encryption_context(&headers)? {
+            crate::encryption::decrypt_request_fields(
+                &mut input,
+                crate::encryption::Endpoint::Embeddings,
+                &ctx,
+                &state.signing,
+            )?;
+        }
+        let tokens = crate::input_tokens::count(
+            &state.backend_client,
+            &backend_url,
+            &UsageType::PrivacyClassify,
+            &input,
+        )
+        .await?;
+        crate::monetary_budget::admit(reporter, &UsageType::PrivacyClassify, &mut input, 1, tokens)
+            .await?;
+    }
     let mut request = state.backend_client.post(&backend_url);
     for (name, value) in &headers {
         if !EXCLUDED_REQUEST_HEADERS.contains(&name.as_str()) {
@@ -122,7 +148,7 @@ pub async fn classify(
             model_name: state.config.model_name.clone(),
             model_label: None,
             model_request: None,
-            usage_reporter: make_usage_reporter(&auth, &state),
+            usage_reporter,
             usage_type: UsageType::PrivacyClassify,
             request_hash: None,
             response_transform: None,

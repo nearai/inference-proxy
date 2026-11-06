@@ -1,5 +1,4 @@
-#[path = "common/budget.rs"]
-mod budget_fixture;
+use common::budget as budget_fixture;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -35,6 +34,7 @@ use valid_request_id::*;
 #[tokio::test]
 async fn generated_request_id_is_forwarded_to_tokenize_upstream() {
     let mock_server = MockServer::start().await;
+    common::budget::mount_counter(&mock_server).await;
     Mock::given(method("POST"))
         .and(path("/tokenize"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -71,6 +71,7 @@ async fn generated_request_id_is_forwarded_to_tokenize_upstream() {
 #[tokio::test]
 async fn invalid_request_id_is_replaced_and_forwarded_to_score_upstream() {
     let mock_server = MockServer::start().await;
+    common::budget::mount_counter(&mock_server).await;
     Mock::given(method("POST"))
         .and(path("/v1/score"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -106,7 +107,9 @@ async fn invalid_request_id_is_replaced_and_forwarded_to_score_upstream() {
 #[tokio::test]
 async fn public_cloud_api_key_tenant_headers_are_not_forwarded() {
     let backend = MockServer::start().await;
+    common::budget::mount_counter(&backend).await;
     let cloud_api = MockServer::start().await;
+    common::budget::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
@@ -170,6 +173,10 @@ async fn public_cloud_api_key_tenant_headers_are_not_forwarded() {
         .received_requests()
         .await
         .expect("backend records requests");
+    let received: Vec<_> = received
+        .into_iter()
+        .filter(|r| r.url.path() != "/tokenize")
+        .collect();
     assert_eq!(received.len(), 1, "expected one backend request");
     // The direct path forwards a server id to the backend, not the inbound one.
     let forwarded_id = received[0]
@@ -208,6 +215,7 @@ async fn public_cloud_api_key_tenant_headers_are_not_forwarded() {
 #[tokio::test]
 async fn streaming_response_has_request_id_header_before_body_is_read() {
     let mock_server = MockServer::start().await;
+    common::budget::mount_counter(&mock_server).await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(

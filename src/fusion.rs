@@ -1015,11 +1015,25 @@ async fn post_chat_json(
             // The existing Fusion tariff is the outer model's tariff. Every call
             // receives an independent ceiling and receipt under that same tariff.
             let execution_model = json.get("model").and_then(Value::as_str).map(str::to_owned);
+            let count_client = if bearer.is_some() {
+                &state.http_client
+            } else {
+                &state.backend_client
+            };
+            let input = crate::input_tokens::count_with_bearer(
+                count_client,
+                url,
+                &UsageType::ChatCompletion,
+                &json,
+                bearer,
+            )
+            .await?;
             crate::monetary_budget::admit_for_model(
                 reporter,
                 &UsageType::ChatCompletion,
                 &mut json,
                 1,
+                input,
                 execution_model.as_deref(),
             )
             .await?;

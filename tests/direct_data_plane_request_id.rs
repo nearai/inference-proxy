@@ -164,6 +164,7 @@ fn direct_data_plane_cases() -> [DataPlaneRouteCase; 9] {
 async fn direct_data_plane_routes_forward_selected_request_id_to_upstream() {
     for case in direct_data_plane_cases() {
         let mock_server = MockServer::start().await;
+        common::budget::mount_counter(&mock_server).await;
         Mock::given(method("POST"))
             .and(path(case.upstream_route))
             .respond_with(

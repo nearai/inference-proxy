@@ -358,6 +358,7 @@ fn agent_loop_request_body(stream: bool) -> serde_json::Value {
 async fn upstream_idle_watchdog_covers_agent_loop_iterations() {
     let upstream_url = stalled_sse_upstream_url().await;
     let brave = MockServer::start().await;
+    budget_fixture::mount_counter(&brave).await;
     let app = build_agent_loop_app_with_cloud_and_idle(&upstream_url, Some(&brave.uri()), None, 1);
 
     let response = app
@@ -387,6 +388,7 @@ async fn upstream_idle_watchdog_covers_agent_loop_iterations() {
 async fn agent_loop_idle_watchdog_allows_slow_first_chunk() {
     let upstream_url = delayed_valid_sse_upstream_url(std::time::Duration::from_secs(2)).await;
     let brave = MockServer::start().await;
+    budget_fixture::mount_counter(&brave).await;
     let app = build_agent_loop_app_with_cloud_and_idle(&upstream_url, Some(&brave.uri()), None, 1);
 
     let response = app
@@ -419,7 +421,9 @@ async fn agent_loop_idle_watchdog_allows_slow_first_chunk() {
 #[tokio::test]
 async fn agent_loop_accepts_done_without_trailing_newline() {
     let upstream = MockServer::start().await;
+    budget_fixture::mount_counter(&upstream).await;
     let brave = MockServer::start().await;
+    budget_fixture::mount_counter(&brave).await;
     let final_answer = upstream_final_answer_sse("chatcmpl-NO-NL")
         .trim_end_matches('\n')
         .to_string();
@@ -456,6 +460,7 @@ async fn agent_loop_accepts_done_without_trailing_newline() {
 #[tokio::test]
 async fn rejects_when_search_unconfigured() {
     let upstream = MockServer::start().await;
+    budget_fixture::mount_counter(&upstream).await;
     let app = build_agent_loop_app(&upstream.uri(), None);
 
     let response = app
@@ -482,7 +487,9 @@ async fn rejects_when_search_unconfigured() {
 #[tokio::test]
 async fn rejects_non_streaming() {
     let upstream = MockServer::start().await;
+    budget_fixture::mount_counter(&upstream).await;
     let brave = MockServer::start().await;
+    budget_fixture::mount_counter(&brave).await;
     let app = build_agent_loop_app(&upstream.uri(), Some(&brave.uri()));
 
     let response = app
@@ -509,7 +516,9 @@ async fn rejects_non_streaming() {
 #[tokio::test]
 async fn happy_path_executes_search_and_continues() {
     let upstream = MockServer::start().await;
+    budget_fixture::mount_counter(&upstream).await;
     let brave = MockServer::start().await;
+    budget_fixture::mount_counter(&brave).await;
 
     // First upstream call: tool_calls finish. Second: final answer.
     Mock::given(method("POST"))
@@ -632,7 +641,9 @@ fn request_with_count(count: serde_json::Value) -> Request<Body> {
 #[tokio::test]
 async fn count_sets_search_results_and_urls() {
     let upstream = MockServer::start().await;
+    budget_fixture::mount_counter(&upstream).await;
     let brave = MockServer::start().await;
+    budget_fixture::mount_counter(&brave).await;
     mount_search_then_answer(&upstream, "chatcmpl-COUNT").await;
     Mock::given(method("GET"))
         .and(path("/res/v1/llm/context"))
@@ -661,7 +672,9 @@ async fn count_sets_search_results_and_urls() {
 #[tokio::test]
 async fn count_caps_sources_when_search_returns_more() {
     let upstream = MockServer::start().await;
+    budget_fixture::mount_counter(&upstream).await;
     let brave = MockServer::start().await;
+    budget_fixture::mount_counter(&brave).await;
     mount_search_then_answer(&upstream, "chatcmpl-CAP").await;
     // The search API can return more URLs than `maximum_number_of_urls`.
     let generic: Vec<_> = ["a", "b", "c"]
@@ -702,7 +715,9 @@ async fn count_caps_sources_when_search_returns_more() {
 #[tokio::test]
 async fn count_zero_answers_without_searching() {
     let upstream = MockServer::start().await;
+    budget_fixture::mount_counter(&upstream).await;
     let brave = MockServer::start().await;
+    budget_fixture::mount_counter(&brave).await;
     mount_search_then_answer(&upstream, "chatcmpl-ZERO").await;
     Mock::given(method("GET"))
         .and(path("/res/v1/llm/context"))
@@ -736,7 +751,9 @@ async fn rejects_invalid_count() {
         serde_json::json!(5.5),
     ] {
         let upstream = MockServer::start().await;
+        budget_fixture::mount_counter(&upstream).await;
         let brave = MockServer::start().await;
+        budget_fixture::mount_counter(&brave).await;
         let app = build_agent_loop_app(&upstream.uri(), Some(&brave.uri()));
 
         let response = app
@@ -757,7 +774,9 @@ async fn rejects_invalid_count() {
 #[tokio::test]
 async fn brave_error_falls_back_with_error_status() {
     let upstream = MockServer::start().await;
+    budget_fixture::mount_counter(&upstream).await;
     let brave = MockServer::start().await;
+    budget_fixture::mount_counter(&brave).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -815,7 +834,9 @@ async fn brave_error_falls_back_with_error_status() {
 #[tokio::test]
 async fn max_iterations_emits_terminator() {
     let upstream = MockServer::start().await;
+    budget_fixture::mount_counter(&upstream).await;
     let brave = MockServer::start().await;
+    budget_fixture::mount_counter(&brave).await;
 
     // Upstream always returns tool_calls — the loop should cap out.
     Mock::given(method("POST"))
@@ -869,7 +890,9 @@ async fn function_only_tools_pass_through_without_loop() {
     // exactly the body we sent — including the `function` tool, untouched —
     // and the response is forwarded back without any nearai_tool_result.
     let upstream = MockServer::start().await;
+    budget_fixture::mount_counter(&upstream).await;
     let brave = MockServer::start().await;
+    budget_fixture::mount_counter(&brave).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -919,7 +942,9 @@ async fn malformed_tool_args_continues_loop() {
     // still emit a synthetic chunk with status:"error" and feed the error
     // string back to the model so it can recover or apologize.
     let upstream = MockServer::start().await;
+    budget_fixture::mount_counter(&upstream).await;
     let brave = MockServer::start().await;
+    budget_fixture::mount_counter(&brave).await;
 
     let bad_args_sse = "data: {\"id\":\"chatcmpl-E\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_x\",\"type\":\"function\",\"function\":{\"name\":\"web_context_search\",\"arguments\":\"{}\"}}]}}]}\n\n\
                        data: {\"id\":\"chatcmpl-E\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
@@ -978,7 +1003,9 @@ async fn malformed_tool_args_continues_loop() {
 #[tokio::test]
 async fn upstream_5xx_on_first_call_propagates_status() {
     let upstream = MockServer::start().await;
+    budget_fixture::mount_counter(&upstream).await;
     let brave = MockServer::start().await;
+    budget_fixture::mount_counter(&brave).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -1056,7 +1083,9 @@ fn upstream_parallel_tool_calls_sse(chat_id: &str, n: usize) -> String {
 #[tokio::test]
 async fn multiple_tool_calls_in_one_iteration_all_execute() {
     let upstream = MockServer::start().await;
+    budget_fixture::mount_counter(&upstream).await;
     let brave = MockServer::start().await;
+    budget_fixture::mount_counter(&brave).await;
 
     // First upstream call: two parallel tool calls. Second: final answer.
     Mock::given(method("POST"))
@@ -1134,7 +1163,9 @@ async fn multiple_tool_calls_in_one_iteration_all_execute() {
 #[tokio::test]
 async fn over_cap_parallel_tool_calls_skip_loop() {
     let upstream = MockServer::start().await;
+    budget_fixture::mount_counter(&upstream).await;
     let brave = MockServer::start().await;
+    budget_fixture::mount_counter(&brave).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -1192,7 +1223,9 @@ async fn client_disconnect_during_brave_aborts_without_signature() {
     use http_body_util::BodyExt as _;
 
     let upstream = MockServer::start().await;
+    budget_fixture::mount_counter(&upstream).await;
     let brave = MockServer::start().await;
+    budget_fixture::mount_counter(&brave).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -1289,7 +1322,9 @@ async fn client_disconnect_during_brave_aborts_without_signature() {
 #[tokio::test]
 async fn mid_stream_error_chunk_skips_done_and_signature() {
     let upstream = MockServer::start().await;
+    budget_fixture::mount_counter(&upstream).await;
     let brave = MockServer::start().await;
+    budget_fixture::mount_counter(&brave).await;
 
     // SGLang-shaped abort: a content chunk, then a top-level error chunk,
     // then `[DONE]`. The loop should swallow the upstream `[DONE]` and
@@ -1364,7 +1399,9 @@ async fn e2ee_without_encrypt_all_fields_encrypts_tool_result() {
     use vllm_proxy_rs::encryption;
 
     let upstream = MockServer::start().await;
+    budget_fixture::mount_counter(&upstream).await;
     let brave = MockServer::start().await;
+    budget_fixture::mount_counter(&brave).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -1566,7 +1603,9 @@ async fn e2ee_without_encrypt_all_fields_encrypts_tool_result() {
 #[tokio::test]
 async fn upstream_error_message_does_not_leak_prompt_or_query() {
     let upstream = MockServer::start().await;
+    budget_fixture::mount_counter(&upstream).await;
     let brave = MockServer::start().await;
+    budget_fixture::mount_counter(&brave).await;
 
     // Upstream emits an error chunk whose `message` echoes a sensitive
     // marker string from the user's prompt — simulating a backend that
@@ -1643,7 +1682,9 @@ async fn upstream_error_message_does_not_leak_prompt_or_query() {
 #[tokio::test]
 async fn brave_response_oversized_body_is_rejected() {
     let upstream = MockServer::start().await;
+    budget_fixture::mount_counter(&upstream).await;
     let brave = MockServer::start().await;
+    budget_fixture::mount_counter(&brave).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -1728,7 +1769,9 @@ async fn brave_response_oversized_body_is_rejected() {
 #[tokio::test]
 async fn brave_formatted_output_is_truncated() {
     let upstream = MockServer::start().await;
+    budget_fixture::mount_counter(&upstream).await;
     let brave = MockServer::start().await;
+    budget_fixture::mount_counter(&brave).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -1822,7 +1865,9 @@ async fn brave_formatted_output_is_truncated() {
 #[tokio::test]
 async fn interrupted_agent_loop_retains_budget_without_final_receipt() {
     let upstream = MockServer::start().await;
+    budget_fixture::mount_counter(&upstream).await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
 
     // sk- key validation succeeds → usage reporter is active for this request.
@@ -1897,7 +1942,8 @@ async fn interrupted_agent_loop_retains_budget_without_final_receipt() {
         .find(|r| r.url.path() == "/v1/internal/budget")
         .expect("loop must reserve before dispatch");
     let metadata: serde_json::Value = serde_json::from_slice(&admission.body).unwrap();
-    assert!(metadata["executions"].as_i64().unwrap() > 1);
+    assert_eq!(metadata["executions"], 1);
+    assert_eq!(metadata["input_units"], 128);
 
     // ...but no signature is cached over the incomplete response.
     let sig_response = app_for_sig
@@ -1912,4 +1958,131 @@ async fn interrupted_agent_loop_retains_budget_without_final_receipt() {
         .await
         .unwrap();
     assert_eq!(sig_response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn each_iteration_counts_tool_results_and_only_complete_rounds_settle() {
+    for interrupted in [false, true] {
+        let upstream = MockServer::start().await;
+        let brave = MockServer::start().await;
+        let cloud = MockServer::start().await;
+        budget_fixture::mount(&cloud).await;
+        Mock::given(path("/v1/check_api_key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "organization_id":"org", "workspace_id":"ws", "api_key_id":"key"
+            })))
+            .mount(&cloud)
+            .await;
+        Mock::given(path("/v1/internal/usage"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&cloud)
+            .await;
+        Mock::given(path("/tokenize"))
+            .respond_with(|r: &wiremock::Request| {
+                let b: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+                let tools = b["tools"].as_array().unwrap();
+                assert_eq!(
+                    tools[0]["type"], "function",
+                    "count must see the rewritten tool definition"
+                );
+                let has_result = b["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m["role"] == "tool");
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"count":if has_result {45} else {10}}))
+            })
+            .expect(2)
+            .mount(&upstream)
+            .await;
+        Mock::given(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                upstream_tool_call_sse("round-one", "rust"),
+                "text/event-stream",
+            ))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                if interrupted {
+                    upstream_final_answer_sse_no_done("round-two")
+                } else {
+                    upstream_final_answer_sse("round-two")
+                },
+                "text/event-stream",
+            ))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(brave_context_json()))
+            .mount(&brave)
+            .await;
+        let app = build_agent_loop_app_with_cloud(
+            &upstream.uri(),
+            Some(&brave.uri()),
+            Some(&cloud.uri()),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer sk-loop")
+                    .header("content-type", "application/json")
+                    .body(Body::from(agent_loop_request_body(true).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let stream = body_to_string(response).await;
+        assert_eq!(stream.ends_with("data: [DONE]\n\n"), !interrupted);
+        let expected = if interrupted { 1 } else { 2 };
+        let requests = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let requests = cloud.received_requests().await.unwrap();
+                if requests
+                    .iter()
+                    .filter(|r| r.url.path() == "/v1/internal/usage")
+                    .count()
+                    >= expected
+                {
+                    break requests;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let budgets: Vec<serde_json::Value> = requests
+            .iter()
+            .filter(|r| r.url.path() == "/v1/internal/budget")
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        assert_eq!(budgets.len(), 2);
+        assert_eq!(budgets[0]["input_units"], 10);
+        assert_eq!(budgets[1]["input_units"], 45);
+        assert_eq!(budgets[0]["executions"], 1);
+        assert_ne!(budgets[0]["id"], budgets[1]["id"]);
+        let receipts: Vec<serde_json::Value> = requests
+            .iter()
+            .filter(|r| r.url.path() == "/v1/internal/usage")
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        assert_eq!(receipts.len(), expected);
+        assert!(
+            receipts
+                .iter()
+                .all(|r| r["input_tokens"] == 10 || r["input_tokens"] == 15),
+            "no aggregate charge"
+        );
+        assert!(receipts.iter().any(|r| r["id"] == budgets[0]["id"]));
+        if interrupted {
+            assert!(!receipts.iter().any(|r| r["id"] == budgets[1]["id"]));
+        }
+    }
 }

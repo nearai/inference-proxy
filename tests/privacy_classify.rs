@@ -1,5 +1,4 @@
-#[path = "common/budget.rs"]
-mod budget_fixture;
+use common::budget as budget_fixture;
 
 use std::time::Duration;
 
@@ -16,7 +15,9 @@ use common::*;
 #[tokio::test]
 async fn direct_privacy_classify_reports_nested_input_usage() {
     let backend = MockServer::start().await;
+    common::budget::mount_counter(&backend).await;
     let cloud_api = MockServer::start().await;
+    common::budget::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))

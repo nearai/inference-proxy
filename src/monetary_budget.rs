@@ -11,8 +11,9 @@ pub(crate) async fn admit(
     kind: &UsageType,
     body: &mut Value,
     executions: i32,
+    input_units: i32,
 ) -> Result<(), AppError> {
-    admit_for_model(reporter, kind, body, executions, None).await
+    admit_for_model(reporter, kind, body, executions, input_units, None).await
 }
 
 pub(crate) async fn admit_for_model(
@@ -20,6 +21,7 @@ pub(crate) async fn admit_for_model(
     kind: &UsageType,
     body: &mut Value,
     executions: i32,
+    input_units: i32,
     execution_model: Option<&str>,
 ) -> Result<(), AppError> {
     let unavailable = || AppError::UpstreamParsed {
@@ -92,11 +94,9 @@ pub(crate) async fn admit_for_model(
             .map_or(1, Vec::len)
             .max(1)
     };
-    let input_units = if matches!(kind, UsageType::AudioTranscription) {
-        Some(number("duration_seconds", 0)?)
-    } else {
-        None
-    };
+    if input_units < 0 {
+        return Err(AppError::BadRequest("Invalid counted input".into()));
+    }
     let response = reporter.http_client.post(format!("{}/v1/internal/budget", base.trim_end_matches('/')))
         .bearer_auth(token).timeout(Duration::from_secs(12)).json(&json!({
             "id": id.to_string(), "organization_id": org, "workspace_id": workspace, "api_key_id": key,

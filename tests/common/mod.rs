@@ -1,3 +1,5 @@
+#[allow(dead_code)]
+pub(crate) mod budget;
 use std::sync::Arc;
 
 use axum::middleware;
@@ -12,6 +14,8 @@ pub(crate) struct TestAppOptions {
     pub(crate) images_edits_url_override: Option<String>,
     pub(crate) transcriptions_url_override: Option<String>,
     pub(crate) rerank_url_override: Option<String>,
+    pub(crate) validate_images: bool,
+    pub(crate) rejected_content_part_types: Vec<String>,
 }
 
 pub(crate) fn test_signing_pair() -> signing::SigningPair {
@@ -54,7 +58,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         max_request_size: 1024 * 1024,
         max_image_request_size: 5 * 1024 * 1024,
         max_audio_request_size: 10 * 1024 * 1024,
-        image_validation_enabled: false,
+        image_validation_enabled: options.validate_images,
         image_validation_timeout_secs: 5,
         image_validation_max_bytes: 8192,
         image_validation_max_concurrency: 8,
@@ -113,7 +117,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         first_token_deadline_ms: 0,
         first_token_deadline_per_1k_tokens_ms: 0,
         first_token_deadline_max_ms: 0,
-        rejected_content_part_types: Vec::new(),
+        rejected_content_part_types: options.rejected_content_part_types,
         models_document_url: None,
         capacity_requests_per_minute: 0,
         discount_to_user: None,

@@ -17,7 +17,9 @@ use valid_request_id::*;
 #[tokio::test]
 async fn direct_privacy_classify_observable_request_id_contract() {
     let backend = MockServer::start().await;
+    common::budget::mount_counter(&backend).await;
     let cloud_api = MockServer::start().await;
+    common::budget::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -95,7 +97,10 @@ async fn direct_privacy_classify_observable_request_id_contract() {
     let received = backend
         .received_requests()
         .await
-        .expect("backend records requests");
+        .expect("backend records requests")
+        .into_iter()
+        .filter(|r| r.url.path() != "/tokenize")
+        .collect::<Vec<_>>();
     assert_eq!(
         received.len(),
         2,

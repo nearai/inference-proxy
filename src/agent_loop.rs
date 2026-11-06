@@ -157,13 +157,19 @@ pub async fn run_chat_completion(
     // when this first call succeeds do we return 200 + spawn the loop.
     let mut usage_reporter = make_usage_reporter(&auth, &state);
     if let Some(reporter) = usage_reporter.as_mut() {
-        let executions = i32::try_from(state.config.agent_loop_max_iterations)
-            .map_err(|_| AppError::BadRequest("Too many agent iterations".into()))?;
+        let input = crate::input_tokens::count(
+            &state.backend_client,
+            &upstream_url,
+            &crate::proxy::UsageType::ChatCompletion,
+            &request_json,
+        )
+        .await?;
         crate::monetary_budget::admit(
             reporter,
             &crate::proxy::UsageType::ChatCompletion,
             &mut request_json,
-            executions,
+            1,
+            input,
         )
         .await?;
     }
@@ -210,6 +216,7 @@ pub async fn run_chat_completion(
                 backend_client: &backend_client,
                 upstream_url: &upstream_url,
                 request_json: &mut request_json,
+                usage_reporter: &mut usage_reporter,
                 tx: &tx,
                 chunk_transform: chunk_transform.as_ref(),
                 max_iterations,
@@ -239,29 +246,6 @@ pub async fn run_chat_completion(
                     completed_cleanly = result.completed_cleanly,
                     "agent loop completed"
                 );
-                // Only the final aggregate is authoritative. An interrupted loop retains
-                // its complete reservation until final usage can be reconciled.
-                if let Some(reporter) = usage_reporter.as_ref().filter(|_| result.completed_cleanly)
-                {
-                    let usage = (result.input_tokens > 0 || result.output_tokens > 0).then_some((
-                        i64::try_from(result.input_tokens).unwrap_or(i64::MAX),
-                        i64::try_from(result.output_tokens).unwrap_or(i64::MAX),
-                    ));
-                    let reported =
-                        report_chat_usage_if_present(reporter, usage, result.chat_id.as_deref());
-                    if reported && !result.completed_cleanly {
-                        info!(
-                            request_id = %tracing_ids.request_id,
-                            org_id = %tracing_ids.org_id_or_empty(),
-                            workspace_id = %tracing_ids.workspace_id_or_empty(),
-                            chat_id = %result.chat_id.as_deref().unwrap_or(""),
-                            input_tokens = result.input_tokens,
-                            output_tokens = result.output_tokens,
-                            "Reported usage for interrupted agent loop"
-                        );
-                    }
-                }
-
                 // Only sign / cache when the stream closed cleanly (final `[DONE]`
                 // was sent downstream): a partial response cannot be verified.
                 if !result.completed_cleanly {
@@ -353,6 +337,7 @@ struct LoopCtx<'a> {
     backend_client: &'a reqwest::Client,
     upstream_url: &'a str,
     request_json: &'a mut Value,
+    usage_reporter: &'a mut Option<crate::proxy::UsageReporter>,
     tx: &'a tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
     chunk_transform: Option<&'a ChunkTransform>,
     max_iterations: u32,
@@ -426,6 +411,23 @@ async fn drive_loop(
         let response = match next_response.take() {
             Some(r) => r,
             None => {
+                if let Some(reporter) = ctx.usage_reporter.as_mut() {
+                    let input = crate::input_tokens::count(
+                        ctx.backend_client,
+                        ctx.upstream_url,
+                        &crate::proxy::UsageType::ChatCompletion,
+                        ctx.request_json,
+                    )
+                    .await?;
+                    crate::monetary_budget::admit(
+                        reporter,
+                        &crate::proxy::UsageType::ChatCompletion,
+                        ctx.request_json,
+                        1,
+                        input,
+                    )
+                    .await?;
+                }
                 let body = serde_json::to_vec(ctx.request_json)
                     .map_err(|e| AppError::Internal(e.into()))?;
                 let send_outcome = tokio::select! {
@@ -492,6 +494,25 @@ async fn drive_loop(
         )
         .await?;
 
+        // Each completed iteration has its own final receipt. A later tool failure or
+        // disconnect must not discard this charge or settle another iteration's hold.
+        if iter_outcome.saw_done
+            && !iter_outcome.client_disconnected
+            && iter_outcome.upstream_error.is_none()
+        {
+            if let Some(reporter) = ctx.usage_reporter.as_ref() {
+                report_chat_usage_if_present(
+                    reporter,
+                    Some((
+                        i64::try_from(iter_outcome.input_tokens)
+                            .map_err(|_| crate::input_tokens::unavailable())?,
+                        i64::try_from(iter_outcome.output_tokens)
+                            .map_err(|_| crate::input_tokens::unavailable())?,
+                    )),
+                    iter_outcome.chat_id.as_deref(),
+                );
+            }
+        }
         if chat_id.is_none() {
             chat_id = iter_outcome.chat_id.clone();
         }

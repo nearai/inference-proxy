@@ -26,6 +26,7 @@ use valid_request_id::*;
 #[tokio::test]
 async fn operational_public_routes_echo_uuid_request_id_headers() {
     let mock_server = MockServer::start().await;
+    common::budget::mount_counter(&mock_server).await;
     Mock::given(method("GET"))
         .and(path("/health"))
         .respond_with(ResponseTemplate::new(200))
@@ -122,6 +123,7 @@ async fn operational_public_routes_echo_uuid_request_id_headers() {
 #[tokio::test]
 async fn route_matrix_responses_include_uuid_request_id_headers() {
     let mock_server = MockServer::start().await;
+    common::budget::mount_counter(&mock_server).await;
     Mock::given(method("POST"))
         .and(path("/v1/images/edits"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({

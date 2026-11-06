@@ -1,4 +1,5 @@
-use common::budget as budget_fixture;
+#[path = "common/budget.rs"]
+mod budget_fixture;
 
 use std::time::Duration;
 
@@ -15,9 +16,7 @@ use common::*;
 #[tokio::test]
 async fn direct_privacy_classify_reports_nested_input_usage() {
     let backend = MockServer::start().await;
-    common::budget::mount_counter(&backend).await;
     let cloud_api = MockServer::start().await;
-    common::budget::mount_counter(&cloud_api).await;
     budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
@@ -94,4 +93,58 @@ async fn direct_privacy_classify_reports_nested_input_usage() {
     assert_eq!(usage["organization_id"], "org-test");
     assert_eq!(usage["workspace_id"], "ws-test");
     assert_eq!(usage["api_key_id"], "key-test");
+    let requests = cloud_api.received_requests().await.unwrap();
+    let admission = requests
+        .iter()
+        .find(|r| r.url.path() == "/v1/internal/budget")
+        .unwrap();
+    let metadata: serde_json::Value = serde_json::from_slice(&admission.body).unwrap();
+    assert!(metadata["input_units"].is_null());
+    assert_eq!(metadata["batch_items"], 2);
+    assert!(metadata.get("input").is_none());
+    assert_eq!(usage["id"], metadata["id"]);
+    assert!(backend
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .all(|r| r.url.path() == "/v1/privacy/classify"));
+}
+
+#[tokio::test]
+async fn direct_privacy_budget_denial_never_calls_a_counter_or_inference() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    Mock::given(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id":"org-test", "workspace_id":"ws-test", "api_key_id":"key-test"
+        })))
+        .mount(&cloud_api)
+        .await;
+    Mock::given(path("/v1/internal/budget"))
+        .respond_with(ResponseTemplate::new(402))
+        .expect(1)
+        .mount(&cloud_api)
+        .await;
+    let app = build_test_app(
+        &backend.uri(),
+        TestAppOptions {
+            cloud_api_url: Some(cloud_api.uri()),
+            ..Default::default()
+        },
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/privacy/classify")
+                .header("authorization", "Bearer sk-test-customer")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"input":["one","two"]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    assert!(backend.received_requests().await.unwrap().is_empty());
 }

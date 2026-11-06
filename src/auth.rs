@@ -377,29 +377,11 @@ impl FromRequestParts<AppState> for RequireAuth {
                 // Constant-time comparison against each configured admin token
                 // so multiple tokens can be active simultaneously (rotation).
                 if state.config.tokens.iter().any(|t| token_eq(token, t)) {
-                    // Only the authenticated Cloud gateway may delegate a billing identity.
-                    // Public sk- callers always use the identity returned by check_api_key.
-                    let delegated = parts
-                        .headers
-                        .get("x-nearai-billing")
-                        .is_some_and(|v| v == "per_attempt_v1");
-                    let identity = |name: &str| -> Result<Option<String>, AppError> {
-                        if !delegated {
-                            return Ok(None);
-                        }
-                        let value = parts
-                            .headers
-                            .get(name)
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(|v| uuid::Uuid::parse_str(v).ok())
-                            .ok_or(AppError::Forbidden)?;
-                        Ok(Some(value.to_string()))
-                    };
                     return Ok(RequireAuth {
                         cloud_api_key: None,
-                        org_id: identity("x-nearai-billing-org")?,
-                        workspace_id: identity("x-nearai-billing-workspace")?,
-                        api_key_id: identity("x-nearai-billing-key")?,
+                        org_id: None,
+                        workspace_id: None,
+                        api_key_id: None,
                         request_id,
                         request_source: RequestSource {
                             auth_path: AuthPath::TrustedConfigToken,

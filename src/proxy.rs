@@ -602,9 +602,7 @@ fn usage_reporter(
     // Gate: a reporter exists only for direct sk- requests. The key value
     // itself is no longer stored — usage is attributed via the identity fields
     // below, not the sk-.
-    if auth.cloud_api_key.is_none() && auth.api_key_id.is_none() {
-        return None;
-    }
+    auth.cloud_api_key.as_ref()?;
     let cloud_api_url = state.config.cloud_api_url.clone();
     Some(UsageReporter {
         budget_report_id: None,
@@ -1283,8 +1281,7 @@ async fn send_upstream(
     let body = if let Some(reporter) = &mut opts.usage_reporter {
         let mut json: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|_| AppError::BadRequest("Invalid JSON body".into()))?;
-        let input = crate::input_tokens::count(client, url, &opts.usage_type, &json).await?;
-        crate::monetary_budget::admit(reporter, &opts.usage_type, &mut json, 1, input).await?;
+        crate::monetary_budget::admit(reporter, &opts.usage_type, &mut json, 1).await?;
         Bytes::from(serde_json::to_vec(&json).map_err(|e| AppError::Internal(e.into()))?)
     } else {
         body
@@ -4115,12 +4112,6 @@ mod tests {
         let ledger = MockServer::start().await;
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/tokenize"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"count":2})))
-            .expect(1)
-            .mount(&upstream)
-            .await;
-        Mock::given(method("POST"))
             .and(path("/v1/internal/budget"))
             .respond_with(ResponseTemplate::new(402))
             .expect(1)
@@ -4140,12 +4131,7 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(AppError::InsufficientCredits)));
-        assert!(upstream
-            .received_requests()
-            .await
-            .unwrap()
-            .iter()
-            .all(|r| r.url.path() == "/tokenize"));
+        assert!(upstream.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -4168,7 +4154,7 @@ mod tests {
         let mut reporter = reporter_with(Some("test-token"), Some("org"), Some("ws"), Some("key"));
         reporter.cloud_api_url = Some(ledger.uri());
         let mut body = serde_json::json!({"messages":[{"role":"user","content":"synthetic"}],"max_completion_tokens":16});
-        crate::monetary_budget::admit(&mut reporter, &UsageType::ChatCompletion, &mut body, 1, 2)
+        crate::monetary_budget::admit(&mut reporter, &UsageType::ChatCompletion, &mut body, 1)
             .await
             .unwrap();
         assert_eq!(body["max_tokens"], 16);
@@ -4187,7 +4173,7 @@ mod tests {
         complete_usage_body(&reporter, &mut retry).unwrap();
         assert_eq!(first, retry);
         assert_eq!(first["id"], original_id);
-        crate::monetary_budget::admit(&mut reporter, &UsageType::ChatCompletion, &mut body, 1, 2)
+        crate::monetary_budget::admit(&mut reporter, &UsageType::ChatCompletion, &mut body, 1)
             .await
             .unwrap();
         assert_ne!(
@@ -4223,15 +4209,9 @@ mod tests {
                 reporter_with(Some("test-token"), Some("org"), Some("ws"), Some("key"));
             reporter.cloud_api_url = Some(ledger.uri());
             let mut body = serde_json::json!({"prompt":prompt,"n":2,"best_of":5,"max_tokens":16});
-            crate::monetary_budget::admit(
-                &mut reporter,
-                &UsageType::ChatCompletion,
-                &mut body,
-                1,
-                2,
-            )
-            .await
-            .unwrap();
+            crate::monetary_budget::admit(&mut reporter, &UsageType::ChatCompletion, &mut body, 1)
+                .await
+                .unwrap();
             let requests = ledger.received_requests().await.unwrap();
             let metadata: serde_json::Value =
                 serde_json::from_slice(&requests.last().unwrap().body).unwrap();
@@ -4247,8 +4227,7 @@ mod tests {
             &mut reporter,
             &UsageType::ChatCompletion,
             &mut body,
-            1,
-            2
+            1
         )
         .await
         .is_err());
@@ -4266,8 +4245,7 @@ mod tests {
             &mut reporter,
             &UsageType::ChatCompletion,
             &mut body,
-            1,
-            2
+            1
         )
         .await
         .is_err());

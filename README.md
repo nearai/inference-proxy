@@ -45,31 +45,15 @@ Every direct `sk-` request reserves organization and API-key credit through
 `CLOUD_API_USAGE_TOKEN` even when final usage reports use SQS. Missing identity,
 unavailable accounting or malformed admission replies return 503 before backend
 execution; insufficient budget returns 402. Trusted proxy-token calls rely on their
-Cloud API caller to reserve credit, except capability-checked delegated calls
-whose trusted billing identity is billed by this proxy per actual execution.
+Cloud API caller to reserve credit.
 
 Only identity, catalog model and execution bounds reach admission; prompts and
-outputs stay on the inference path. The selected engine's tokenizer counts the
-normalized request input before admission. E2EE fields are decrypted inside the
-trusted inference process first; the private `/v1/internal/input-tokens` endpoint
-accepts only configured proxy tokens and returns a count, never token ids or
-plaintext. Engines must support `/tokenize` for the served input modalities.
-Unsupported, malformed or unavailable counters fail closed before inference.
-Cloud API reserves this input count plus the enforced maximum output, rather
-than the model's entire context. An omitted output ceiling uses the catalog
-maximum. Choices and batch outputs are included in the quote. Chat/Completions,
-embeddings, rerank, score, privacy classification, image generation/edits and
-decoded audio duration share monetary admission.
-
-Fusion reserves every panel, synthesis and retry separately. Remote Fusion calls
-use the sibling gateway's private counter so its normalization owns the count.
-The search agent counts and reserves each iteration after adding tool results;
-completed iterations settle independently, while an interrupted later iteration
-retains only its own hold. A trusted Cloud API caller can delegate this per-call
-accounting using `x-nearai-billing: per_attempt_v1` and the organization, workspace
-and key UUID headers. Public API keys ignore these headers and use their
-authenticated identity. Delegation requires `CLOUD_API_URL` and
-`CLOUD_API_USAGE_TOKEN`, and Cloud API checks this capability before delegating.
+outputs stay on the inference path. Cloud API quotes the catalog context window
+and enforces the approved output ceiling. A short prompt can therefore require
+more available credit than its final cost. Chat/Completions, embeddings, rerank,
+score, privacy classification, image generation/edits and audio share this path.
+Fusion reserves every panel, synthesis and retry separately. The agent loop
+reserves its maximum bounded iteration count before starting.
 
 Final receipts carry the admission id across HTTP/SQS retries while public
 response and signature ids remain unchanged. Partial streams, disconnects and

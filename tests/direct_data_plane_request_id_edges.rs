@@ -1,3 +1,6 @@
+#[path = "common/budget.rs"]
+mod budget_fixture;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
@@ -104,6 +107,7 @@ async fn invalid_request_id_is_replaced_and_forwarded_to_score_upstream() {
 async fn public_cloud_api_key_tenant_headers_are_not_forwarded() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))

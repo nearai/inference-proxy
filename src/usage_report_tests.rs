@@ -188,6 +188,7 @@ impl Billing {
     /// request does.
     fn report(&self, delivery: &Arc<UsageReportDelivery>, id: &str, model: ModelLabel) {
         let reporter = UsageReporter {
+            budget_report_id: None,
             http_client: self.client.clone(),
             cloud_api_url: Some(self.url.clone()),
             model_name: model.unwrap_or("test-model").to_string(),
@@ -1439,6 +1440,7 @@ async fn http_attempt(billing: &Billing, timeout: Duration) -> (SendOutcome, Att
 /// A report for `billing`, with every field the HTTP sender needs.
 fn http_job(billing: &Billing) -> Job {
     let reporter = UsageReporter {
+        budget_report_id: None,
         http_client: billing.client.clone(),
         cloud_api_url: Some(billing.url.clone()),
         model_name: "test-model".to_string(),

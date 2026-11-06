@@ -1,4 +1,7 @@
 use std::io::Cursor;
+#[path = "common/budget.rs"]
+mod budget_fixture;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -250,7 +253,7 @@ fn build_test_app_inner_with_pool(
         cloud_api_auth_max_attempts: 1,
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
-        cloud_api_usage_token: None,
+        cloud_api_usage_token: Some("test-usage-token".into()),
         usage_report: Default::default(),
         usage_report_transport: Default::default(),
         compose_manager_url: None,
@@ -1075,6 +1078,7 @@ async fn test_completions_replica_hint_routes_to_hinted_backend() {
 async fn test_cloud_api_key_check_is_reused_across_requests() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
     mount_completions_ok(&backend, 2).await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -1110,6 +1114,7 @@ async fn test_cloud_api_key_check_is_reused_across_requests() {
 async fn test_cloud_api_key_is_checked_on_every_request_until_accepted() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
     mount_completions_ok(&backend, 2).await;
     // wiremock matches in priority order: lower number wins.
     Mock::given(method("POST"))
@@ -1161,6 +1166,7 @@ async fn test_cloud_api_key_is_checked_on_every_request_until_accepted() {
 async fn test_cloud_api_key_5xx_is_not_kept() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
     mount_completions_ok(&backend, 2).await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -1204,11 +1210,12 @@ async fn test_completions_replica_hint_is_dropped_for_cloud_api_key_auth() {
     let backend_a = MockServer::start().await;
     let backend_b = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
     mount_completions_ok(&backend_a, 1).await;
     mount_completions_ok(&backend_b, 0).await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true, "organization_id": "org-test", "workspace_id": "ws-test", "api_key_id": "key-test"})))
         .mount(&cloud_api)
         .await;
     let (app, pool) = build_test_app_with_backends_and_cloud_api(
@@ -1250,11 +1257,12 @@ async fn test_chat_completions_replica_hint_is_dropped_for_cloud_api_key_auth() 
     let backend_a = MockServer::start().await;
     let backend_b = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
     mount_chat_ok(&backend_a, "/v1/chat/completions", 1).await;
     mount_chat_ok(&backend_b, "/v1/chat/completions", 0).await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true, "organization_id": "org-test", "workspace_id": "ws-test", "api_key_id": "key-test"})))
         .mount(&cloud_api)
         .await;
     let (app, pool) = build_test_app_with_backends_and_cloud_api(
@@ -4911,6 +4919,7 @@ async fn test_invalid_json_body() {
 async fn test_non_object_json_body_is_rejected_before_dispatch() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     // An `sk-` caller with usage reporting on, and an engine that answers
     // anything with billable usage: a dispatched request would be billed.
@@ -5626,6 +5635,7 @@ async fn test_internal_gpu_evidence_requires_auth() {
 async fn test_internal_gpu_evidence_rejects_cloud_api_keys() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -6627,6 +6637,7 @@ fn build_test_app_with_cloud_api_retries(
 async fn test_cloud_api_key_valid() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     // Mock the cloud API check endpoint to return 200
     Mock::given(method("POST"))
@@ -6635,7 +6646,7 @@ async fn test_cloud_api_key_valid() {
             "authorization",
             "Bearer sk-test-valid-key-12345678901",
         ))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true, "organization_id": "org-test", "workspace_id": "ws-test", "api_key_id": "key-test"})))
         .mount(&cloud_api)
         .await;
 
@@ -6679,6 +6690,7 @@ async fn test_cloud_api_key_valid() {
 #[tokio::test]
 async fn test_cloud_api_key_unauthorized() {
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -6709,6 +6721,7 @@ async fn test_cloud_api_key_unauthorized() {
 #[tokio::test]
 async fn test_cloud_api_key_insufficient_credits() {
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -6739,6 +6752,7 @@ async fn test_cloud_api_key_insufficient_credits() {
 #[tokio::test]
 async fn test_cloud_api_key_rate_limited() {
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -6768,6 +6782,7 @@ async fn test_cloud_api_key_rate_limited() {
 async fn test_cloud_api_key_retries_after_5xx() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     // First call to /v1/check_api_key returns 503; the next returns 200.
     // wiremock matches in priority order: lower number wins, expectation
@@ -6781,7 +6796,7 @@ async fn test_cloud_api_key_retries_after_5xx() {
         .await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true, "organization_id": "org-test", "workspace_id": "ws-test", "api_key_id": "key-test"})))
         .with_priority(2)
         .mount(&cloud_api)
         .await;
@@ -6825,6 +6840,7 @@ async fn test_cloud_api_key_retries_after_5xx() {
 #[tokio::test]
 async fn test_cloud_api_key_no_retry_on_4xx() {
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     // Always return 401. With max_attempts=3, the proxy must NOT retry — a
     // genuine 4xx is the upstream's verdict on the token, not a transient blip.
@@ -6859,6 +6875,7 @@ async fn test_cloud_api_key_no_retry_on_4xx() {
 #[tokio::test]
 async fn test_cloud_api_key_exhausts_retries_on_persistent_5xx() {
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     // 5xx every time. With max_attempts=3, expect exactly 3 calls and a 401
     // back to the client (we don't expose 5xx details to callers).
@@ -6892,6 +6909,7 @@ async fn test_cloud_api_key_exhausts_retries_on_persistent_5xx() {
 async fn test_proxy_token_still_works_with_cloud_api_configured() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     let backend_response = serde_json::json!({
         "id": "chatcmpl-1",
@@ -6984,6 +7002,7 @@ async fn get_usage_requests(cloud_api: &MockServer) -> Vec<serde_json::Value> {
 async fn test_usage_reported_for_cloud_api_key_non_streaming() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
     let request_id = "550e8400-e29b-41d4-a716-446655440000";
 
     Mock::given(method("POST"))
@@ -7080,6 +7099,7 @@ async fn test_responses_endpoint_refused_instead_of_billing_silently() {
     // until a dedicated Responses usage parser exists.
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -7234,6 +7254,7 @@ async fn test_similar_unknown_paths_are_refused() {
 async fn test_usage_reported_for_streaming_chat_with_cloud_api_key() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -7315,9 +7336,10 @@ data: [DONE]\n\n";
 /// figure we bill. The signature must still be withheld — a partial response
 /// cannot be verified.
 #[tokio::test]
-async fn test_usage_reported_for_interrupted_stream_without_done() {
+async fn test_interrupted_stream_retains_budget_without_final_receipt() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -7386,14 +7408,17 @@ data: {\"id\":\"chatcmpl-interrupted\",\"choices\":[{\"delta\":{\"content\":\"lo
     use http_body_util::BodyExt;
     let _ = response.into_body().collect().await;
 
-    // Usage IS reported with the last cumulative counts seen before interruption.
-    wait_for_usage_request(&cloud_api, 1).await;
-    let usage_reqs = get_usage_requests(&cloud_api).await;
-    assert_eq!(usage_reqs.len(), 1, "Expected exactly one usage report");
-    assert_eq!(usage_reqs[0]["type"], "chat_completion");
-    assert_eq!(usage_reqs[0]["input_tokens"], 8);
-    assert_eq!(usage_reqs[0]["output_tokens"], 2);
-    assert_eq!(usage_reqs[0]["cache_read_tokens"], 6);
+    // Partial counters are not a final receipt: the ledger must keep the full hold.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(get_usage_requests(&cloud_api).await.is_empty());
+    let admissions = cloud_api
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path() == "/v1/internal/budget")
+        .count();
+    assert_eq!(admissions, 1);
 
     // ...but the signature is still withheld: a partial stream cannot be verified.
     let sig_response = app
@@ -7413,6 +7438,7 @@ data: {\"id\":\"chatcmpl-interrupted\",\"choices\":[{\"delta\":{\"content\":\"lo
 async fn test_no_usage_reported_for_proxy_token() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -7462,6 +7488,7 @@ async fn test_no_usage_reported_for_proxy_token() {
 async fn test_usage_report_failure_does_not_affect_response() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -7654,6 +7681,7 @@ async fn test_streaming_includes_usage_injected_for_cloud_key() {
 
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -9122,7 +9150,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         cloud_api_auth_max_attempts: 1,
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
-        cloud_api_usage_token: None,
+        cloud_api_usage_token: Some("test-usage-token".into()),
         usage_report: Default::default(),
         usage_report_transport: Default::default(),
         compose_manager_url: None,
@@ -9597,7 +9625,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         cloud_api_auth_max_attempts: 1,
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
-        cloud_api_usage_token: None,
+        cloud_api_usage_token: Some("test-usage-token".into()),
         usage_report: Default::default(),
         usage_report_transport: Default::default(),
         compose_manager_url: None,

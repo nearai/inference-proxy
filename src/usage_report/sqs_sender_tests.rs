@@ -103,6 +103,7 @@ pub(super) fn chat_body(id: &str) -> Value {
 pub(super) fn job_with(body: &Value, delivery: &Arc<UsageReportDelivery>) -> Job {
     Job {
         reporter: UsageReporter {
+            budget_report_id: None,
             http_client: reqwest::Client::new(),
             cloud_api_url: None,
             model_name: "test-model".to_string(),

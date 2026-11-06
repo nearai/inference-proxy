@@ -14,6 +14,11 @@ use common::*;
 async fn direct_privacy_classify_reports_nested_input_usage() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    Mock::given(path("/v1/internal/budget"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(0)
+        .mount(&cloud_api)
+        .await;
 
     Mock::given(method("POST"))
         .and(path("/v1/privacy/classify"))
@@ -89,4 +94,14 @@ async fn direct_privacy_classify_reports_nested_input_usage() {
     assert_eq!(usage["organization_id"], "org-test");
     assert_eq!(usage["workspace_id"], "ws-test");
     assert_eq!(usage["api_key_id"], "key-test");
+    let requests = cloud_api.received_requests().await.unwrap();
+    assert!(requests
+        .iter()
+        .all(|r| r.url.path() != "/v1/internal/budget"));
+    assert!(backend
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .all(|r| r.url.path() == "/v1/privacy/classify"));
 }

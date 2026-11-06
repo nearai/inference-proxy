@@ -64,14 +64,15 @@ It runs after the two repairs above. A process without a list never does it.
    `stream_options.include_usage` and `continuous_usage_stats`.
 5. Response streamed back. On client disconnect the upstream connection is
    dropped (the CVM proxy drops its engine connection, the engine aborts) and
-   the usage observed so far is reported.
+   its monetary reservation remains held until authoritative final usage is recovered.
 6. `POST {CLOUD_API_URL}/v1/internal/usage` with the shared usage token,
-   idempotent on the provider completion id (over HTTP, the default). The
+   idempotent on the execution's reservation report id (over HTTP, the default). The
    report is handed over when the request completes and sent off the request
    path: once, with a 5 s timeout, unless `VLLM_PROXY_USAGE_REPORT_*` says
    otherwise (see [Usage report delivery](#usage-report-delivery)). With
    `VLLM_PROXY_USAGE_REPORT_TRANSPORT=sqs` the report is a `SendMessage` to the
-   usage queue instead, and needs neither `CLOUD_API_URL` nor the usage token.
+   usage queue instead. Text-generation requests require `CLOUD_API_URL` and
+   `CLOUD_API_USAGE_TOKEN` for synchronous budget admission with either transport.
 
 Nothing about request or response content is logged or stored at any hop.
 
@@ -603,7 +604,7 @@ then has to wait for.
 
 | Variable | Default | Lane value | Meaning |
 | --- | --- | --- | --- |
-| `VLLM_PROXY_USAGE_REPORT_TRANSPORT` | `http` | unchanged | `http` (cloud-api, the default) or `sqs` (the usage queue, `SendMessage` signed with SigV4). `sqs` needs `_SQS_URL` and `VLLM_PROXY_AWS_CREDENTIALS_URL`, and not `CLOUD_API_URL` or the usage token. Any other value fails startup. |
+| `VLLM_PROXY_USAGE_REPORT_TRANSPORT` | `http` | unchanged | `http` (cloud-api, the default) or `sqs` (the usage queue, `SendMessage` signed with SigV4). `sqs` needs `_SQS_URL` and `VLLM_PROXY_AWS_CREDENTIALS_URL`. Text generation requires `CLOUD_API_URL` and `CLOUD_API_USAGE_TOKEN` for monetary admission with either transport; missing admission settings refuse text requests before dispatch. Non-text receipts retain their existing transport requirements. |
 | `VLLM_PROXY_USAGE_REPORT_SQS_URL` | unset | unset | The usage queue's URL. Required with `sqs`. |
 | `VLLM_PROXY_USAGE_REPORT_SQS_REGION` | `us-east-1` | unchanged | The queue's region (letters, digits and hyphens). |
 | `VLLM_PROXY_USAGE_REPORT_SQS_ENDPOINT` | unset | unset | Replaces the regional SQS endpoint (a local emulator). |

@@ -1,5 +1,8 @@
 [advisories]
 version = 2
+ignore = [
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils is an unmaintained transitive dependency of the AWS signing SDK, not a vulnerability advisory. The latest AWS versions compatible with the pinned Rust 1.93 builder still depend on it; remove this exception when the SDK can be upgraded with the builder." },
+]
 
 [licenses]
 version = 2

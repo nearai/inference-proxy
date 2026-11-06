@@ -242,7 +242,7 @@ pub async fn internal_count(
     if !request.is_object() {
         return Err(AppError::BadRequest("Invalid counting request".into()));
     }
-    if request["_nearai_billing_probe"] == "per_attempt_v1" {
+    if envelope["billing_probe"] == "per_attempt_v1" {
         if state.config.cloud_api_url.is_none() || state.config.cloud_api_usage_token.is_none() {
             return Err(unavailable());
         }

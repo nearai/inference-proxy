@@ -101,6 +101,49 @@ async fn customer_key_cannot_call_the_private_counter_even_with_delegation_heade
 }
 
 #[tokio::test]
+async fn capability_probe_is_protocol_metadata_not_a_caller_body_field() {
+    let backend = MockServer::start().await;
+    Mock::given(path("/tokenize"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"count":7})))
+        .expect(1)
+        .mount(&backend)
+        .await;
+    let app = common::build_test_app(
+        &backend.uri(),
+        common::TestAppOptions {
+            cloud_api_url: Some(backend.uri()),
+            ..Default::default()
+        },
+    );
+    for (envelope, expected) in [
+        (
+            json!({"billing_probe":"per_attempt_v1","request":{}}),
+            json!({"billing":"per_attempt_v1"}),
+        ),
+        (
+            json!({"kind":"chat","request":{
+                "model":"test-model","messages":[{"role":"user","content":"hello"}],
+                "_nearai_billing_probe":"per_attempt_v1","billing_probe":"per_attempt_v1"
+            }}),
+            json!({"input_tokens":7}),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                request("/v1/internal/input-tokens")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::from(envelope.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await, expected);
+    }
+}
+
+#[tokio::test]
 async fn private_counter_enforces_content_and_image_policy_before_engine_access() {
     let backend = MockServer::start().await;
     let app = common::build_test_app(

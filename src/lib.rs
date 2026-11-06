@@ -92,5 +92,3 @@ pub struct AppState {
     /// One per process, shared by every model of a list.
     pub api_key_cache: Arc<api_key_cache::ApiKeyCache>,
 }
-
-pub(crate) mod audio_budget;

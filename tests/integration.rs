@@ -7549,7 +7549,6 @@ async fn test_usage_report_failure_does_not_affect_response() {
 async fn test_usage_reported_for_image_generation() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
-    budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -7613,7 +7612,6 @@ async fn test_usage_reported_for_image_generation() {
 async fn test_usage_reported_for_embeddings() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
-    budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))

@@ -528,7 +528,6 @@ pub(crate) fn record_usage_report_outcome(
 /// label to report it under.
 #[derive(Clone, Default)]
 pub enum UsageType {
-    AudioTranscription,
     /// Extract prompt_tokens / completion_tokens from the `usage` object.
     #[default]
     ChatCompletion,
@@ -662,16 +661,6 @@ pub(crate) fn build_usage_body(
                 "cache_read_tokens": cached_tokens(usage, input).unwrap_or(0),
                 "id": id,
             }))
-        }
-        UsageType::AudioTranscription => {
-            let seconds = response_data.get("duration")?.as_f64()?;
-            if !seconds.is_finite() || seconds <= 0.0 || seconds > i32::MAX as f64 {
-                return None;
-            }
-            Some(
-                serde_json::json!({"type": "audio_transcription", "model": model_name,
-                "duration_seconds": seconds.ceil() as i32, "id": id}),
-            )
         }
         UsageType::ImageGeneration => {
             let count = response_data
@@ -1276,7 +1265,8 @@ async fn send_upstream(
     opts: &mut ProxyOpts,
     endpoint: &'static str,
 ) -> Result<reqwest::Response, AppError> {
-    let body = if let Some(reporter) = &mut opts.usage_reporter {
+    let text_generation = matches!(opts.usage_type, UsageType::ChatCompletion);
+    let body = if let Some(reporter) = opts.usage_reporter.as_mut().filter(|_| text_generation) {
         let mut json: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|_| AppError::BadRequest("Invalid JSON body".into()))?;
         crate::monetary_budget::admit(reporter, &opts.usage_type, &mut json, 1).await?;
@@ -3424,17 +3414,6 @@ async fn proxy_multipart_request_inner(
     request_sha256: &str,
     mut opts: ProxyOpts,
 ) -> Result<Response, AppError> {
-    if opts
-        .usage_reporter
-        .as_ref()
-        .is_some_and(|r| r.budget_report_id.is_none())
-    {
-        return Err(AppError::UpstreamParsed {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: "Multipart request is missing monetary admission".into(),
-            error_type: "budget_admission_error".into(),
-        });
-    }
     let upstream_start = std::time::Instant::now();
     let req = apply_tracing_headers(client.post(url).multipart(form), opts.tracing_ids.as_ref());
     let response = req.send().await.map_err(|e| AppError::Internal(e.into()))?;

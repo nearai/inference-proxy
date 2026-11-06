@@ -4,8 +4,6 @@ use tower::ServiceExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-#[path = "common/budget.rs"]
-mod budget_fixture;
 mod common;
 #[path = "common/response_request_id.rs"]
 mod response_request_id;
@@ -20,7 +18,6 @@ use valid_request_id::*;
 async fn direct_privacy_classify_observable_request_id_contract() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
-    budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))

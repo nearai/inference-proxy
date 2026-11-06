@@ -50,8 +50,12 @@ pub(crate) async fn admit_for_model(
                 .ok_or_else(|| AppError::BadRequest(format!("{field} must be a positive integer"))),
         }
     };
-    let text = matches!(kind, UsageType::ChatCompletion);
-    let max_output = if text {
+    if !matches!(kind, UsageType::ChatCompletion) {
+        return Err(AppError::BadRequest(
+            "Admission is limited to text generation".into(),
+        ));
+    }
+    let max_output = {
         match body
             .get("max_completion_tokens")
             .or_else(|| body.get("max_tokens"))
@@ -64,46 +68,21 @@ pub(crate) async fn admit_for_model(
             ),
             _ => None,
         }
-    } else {
-        None
     };
-    let (inference_type, images) = match kind {
-        UsageType::ChatCompletion => ("chat_completion", 0),
-        UsageType::AudioTranscription => ("audio_transcription", 0),
-        UsageType::ImageGeneration => ("image_generation", number("n", 1)?),
-        UsageType::Embedding => ("embedding", 0),
-        UsageType::Rerank => ("rerank", 0),
-        UsageType::Score => ("score", 0),
-        UsageType::PrivacyClassify => ("privacy_classify", 0),
-    };
-    let batch_items = if text {
-        // A flat token-id list is one prompt; strings/nested token lists are a batch.
-        body.get("prompt")
-            .and_then(Value::as_array)
-            .filter(|items| !items.iter().all(Value::is_number))
-            .map_or(1, Vec::len)
-            .max(1)
-    } else if images > 0 {
-        1
-    } else {
-        body.get("input")
-            .or_else(|| body.get("documents"))
-            .and_then(Value::as_array)
-            .map_or(1, Vec::len)
-            .max(1)
-    };
-    let input_units = if matches!(kind, UsageType::AudioTranscription) {
-        Some(number("duration_seconds", 0)?)
-    } else {
-        None
-    };
+    // A flat token-id list is one prompt; strings/nested token lists are a batch.
+    let batch_items = body
+        .get("prompt")
+        .and_then(Value::as_array)
+        .filter(|items| !items.iter().all(Value::is_number))
+        .map_or(1, Vec::len)
+        .max(1);
     // Charge bounds cover generated candidates, including best_of candidates not returned.
     let response = reporter.http_client.post(format!("{}/v1/internal/budget", base.trim_end_matches('/')))
         .bearer_auth(token).timeout(Duration::from_secs(12)).json(&json!({
             "id": id.to_string(), "organization_id": org, "workspace_id": workspace, "api_key_id": key,
-            "model": reporter.model_name, "execution_model": execution_model, "inference_type": inference_type,
-            "input_units": input_units, "batch_items": batch_items, "max_output_tokens": max_output,
-            "choices": if text { number("n", 1)?.max(number("best_of", 1)?) } else { 1 }, "executions": executions, "images": images,
+            "model": reporter.model_name, "execution_model": execution_model, "inference_type": "chat_completion",
+            "batch_items": batch_items, "max_output_tokens": max_output,
+            "choices": number("n", 1)?.max(number("best_of", 1)?), "executions": executions,
         })).send().await.map_err(|_| unavailable())?;
     if response.status() == StatusCode::PAYMENT_REQUIRED {
         return Err(AppError::InsufficientCredits);
@@ -119,7 +98,7 @@ pub(crate) async fn admit_for_model(
         .as_str()
         .ok_or_else(unavailable)?
         .to_string();
-    if text {
+    {
         let limit = admitted["max_output_tokens"]
             .as_i64()
             .filter(|n| *n > 0)

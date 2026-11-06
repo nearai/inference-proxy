@@ -724,6 +724,14 @@ pub struct Config {
     /// lightweight route). Gateway mode points it at the inference-proxy's
     /// unauthenticated `/healthz`.
     pub backend_health_path: String,
+    /// The backend's name for its decision model (`SYSTEMONE_UPSTREAM_MODEL`),
+    /// for a proxy in front of a System One decision model such as Levanto
+    /// Sage. Only then does `POST /v1/systemone` exist (`build_router_for`):
+    /// its `model` (cloud-api sends the catalog id, `MODEL_NAME`) is replaced
+    /// by this name, and `/v1/models` lists `MODEL_NAME` while the backend is
+    /// healthy (`routes::systemone::models`).
+    /// Not available in list mode.
+    pub systemone_upstream_model: Option<String>,
     /// This proxy does not run inside a TEE (`NON_TEE_DEPLOYMENT=1`): no
     /// dstack guest agent, no hardware evidence, dev signing keys. Effects:
     /// `/healthz` skips the dstack probe, the attestation cache refresh is not
@@ -1163,6 +1171,15 @@ impl Config {
         if !backend_health_path.starts_with('/') {
             anyhow::bail!("VLLM_BACKEND_HEALTH_PATH must start with '/'");
         }
+        let systemone_upstream_model = env::var("SYSTEMONE_UPSTREAM_MODEL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if list_mode && systemone_upstream_model.is_some() {
+            anyhow::bail!(
+                "SYSTEMONE_UPSTREAM_MODEL is not supported with VLLM_PROXY_MODEL_LIST_FILE"
+            );
+        }
         let allowed_org_ids: Vec<String> = env::var("VLLM_PROXY_ALLOWED_ORG_IDS")
             .unwrap_or_default()
             .split(',')
@@ -1502,6 +1519,7 @@ impl Config {
             backend_token,
             backend_priority,
             backend_health_path,
+            systemone_upstream_model,
             non_tee_deployment: env_bool("NON_TEE_DEPLOYMENT"),
             map_queue_full_to_429: env_bool("VLLM_PROXY_MAP_QUEUE_FULL_TO_429"),
             priority_lower_first: env_bool("VLLM_PROXY_PRIORITY_LOWER_FIRST"),

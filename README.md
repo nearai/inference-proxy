@@ -38,6 +38,38 @@ Rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-proxy) (Python).
 All other paths return `404` locally. They are never forwarded to the backend
 inference engine.
 
+## Monetary admission for cloud keys
+
+Every direct `sk-` request reserves organization and API-key credit through
+`POST {CLOUD_API_URL}/v1/internal/budget` before inference. Configure
+`CLOUD_API_USAGE_TOKEN` even when final usage reports use SQS. Missing identity,
+unavailable accounting or malformed admission replies return 503 before backend
+execution; insufficient budget returns 402. Trusted proxy-token calls rely on their
+Cloud API caller to reserve credit.
+
+Only identity, catalog model and execution bounds reach admission; prompts and
+outputs stay on the inference path. Cloud API quotes the catalog context window
+and enforces the approved output ceiling. A short prompt can therefore require
+more available credit than its final cost. Chat/Completions, embeddings, rerank,
+score, privacy classification, image generation/edits and audio share this path.
+Fusion reserves every panel, synthesis and retry separately. The agent loop
+reserves its maximum bounded iteration count before starting.
+
+Final receipts carry the admission id across HTTP/SQS retries while public
+response and signature ids remain unchanged. Partial streams, disconnects and
+process crashes retain the full hold until an authoritative final receipt is
+recovered; replaying that receipt is idempotent. There is no timeout refund or
+automatic discovery of missing vendor receipts. Audio receipts use HTTP because
+the current SQS envelope does not represent audio duration. FFmpeg is required
+for audio normalization and tests; the runtime image includes it.
+
+Deploy cloud-platform V0099 and reservation-aware accounting writers, then Cloud
+API's admission endpoint and this proxy build. Drain the old fleet and receipt
+queues before reopening traffic. On rollback, stop inference intake first and
+preserve the new ledger and reservation-aware writers until outstanding work is
+reconciled. The guarantee covers usage metered by the catalog; additional vendor
+charges need their own metering and reservation.
+
 ## Error Handling
 
 All error responses use the OpenAI-compatible JSON format:
@@ -141,7 +173,7 @@ All configuration is via environment variables:
 | `VLLM_PROXY_DISCOUNT_TO_USER` | No | empty (list price) | Gateway mode: the lane's discount off the list price, a fraction in `[0, 1)` with at most four decimal places (`0.2` = 20 % off; empty or `0` = none; an invalid value fails startup). Requires `VLLM_PROXY_MODELS_DOCUMENT_URL`. Published as `discount_to_user` on the models document entry (and on every entry of the engine list served while that source is unreadable) and sent as `discount_to_user` on every usage report, so the advertised and the billed price come from one setting |
 | `VLLM_PROXY_STRICT_REQUEST_MODEL` | No | off | Single-model mode: a body `model` must be `MODEL_NAME` byte for byte (404 `model_not_found` otherwise, 400 for a non-string; a missing `model` is still served), on chat, completions, the JSON routes and the `model` field of the multipart routes. Off, the process serves its one model whatever the body says. List mode always matches exactly |
 | `VLLM_PROXY_BACKEND_LORA` | No | unset | Single-model mode, SGLang with `--enable-lora`: the adapter that `MODEL_NAME` stands for, set as `lora_path` on the chat, completions and embeddings bodies forwarded to the engine. Requires `VLLM_PROXY_STRICT_REQUEST_MODEL=1` (startup fails otherwise). Independent of both, a request carrying `lora_path`, `lora_id` or `lora_name` (a form field on the multipart routes) is always a 400 |
-| `VLLM_PROXY_USAGE_REPORT_TRANSPORT` | No | `http` | Where usage reports go. `http`: `POST {CLOUD_API_URL}/v1/internal/usage` with `CLOUD_API_USAGE_TOKEN`. `sqs`: a `SendMessage` to the usage queue, each report a usage envelope signed with SigV4; this needs `VLLM_PROXY_USAGE_REPORT_SQS_URL` and `VLLM_PROXY_AWS_CREDENTIALS_URL`, and not `CLOUD_API_URL` or the usage token. Any other value fails startup. If the usage queue fails its startup check and `CLOUD_API_URL` and `CLOUD_API_USAGE_TOKEN` are set, the process falls back to `http` for its life (ERROR log; `inference_proxy_usage_report_transport_info{transport="http"}` is 1); without them it refuses to start |
+| `VLLM_PROXY_USAGE_REPORT_TRANSPORT` | No | `http` | Where usage reports go. `http`: `POST {CLOUD_API_URL}/v1/internal/usage` with `CLOUD_API_USAGE_TOKEN`. `sqs`: a `SendMessage` to the usage queue, each report a usage envelope signed with SigV4; this needs `VLLM_PROXY_USAGE_REPORT_SQS_URL` and `VLLM_PROXY_AWS_CREDENTIALS_URL`, `CLOUD_API_URL` and the usage token are still required for synchronous monetary admission. Any other value fails startup. If the usage queue fails its startup check and `CLOUD_API_URL` and `CLOUD_API_USAGE_TOKEN` are set, the process falls back to `http` for its life (ERROR log; `inference_proxy_usage_report_transport_info{transport="http"}` is 1); without them it refuses to start |
 | `VLLM_PROXY_USAGE_REPORT_SQS_URL` | With `sqs` | unset | The usage queue's URL |
 | `VLLM_PROXY_USAGE_REPORT_SQS_REGION` | No | `us-east-1` | The usage queue's AWS region (letters, digits and hyphens) |
 | `VLLM_PROXY_USAGE_REPORT_SQS_ENDPOINT` | No | unset | Replaces the regional SQS endpoint, for a local emulator |

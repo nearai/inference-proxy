@@ -2,6 +2,9 @@
 //! (a backend-only bearer, modality policy, non-TEE route hiding, queue-full
 //! back-pressure, the first-event peek, keep-alives).
 
+#[path = "common/budget.rs"]
+mod budget_fixture;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -63,7 +66,7 @@ struct GatewayOptions {
     capacity_requests_per_minute: u64,
     /// `VLLM_PROXY_DISCOUNT_TO_USER`, already validated.
     discount_to_user: Option<f64>,
-    /// `CLOUD_API_USAGE_TOKEN`: without it usage reports are skipped.
+    /// `CLOUD_API_USAGE_TOKEN` for monetary admission and receipts.
     cloud_api_usage_token: Option<String>,
     /// How usage reports are delivered (`VLLM_PROXY_USAGE_REPORT_*`); the
     /// default is one attempt with a 5 second timeout.
@@ -125,7 +128,10 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         cloud_api_auth_max_attempts: 1,
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
-        cloud_api_usage_token: options.cloud_api_usage_token.clone(),
+        cloud_api_usage_token: options
+            .cloud_api_usage_token
+            .clone()
+            .or_else(|| Some("test-usage-token".into())),
         usage_report: options.usage_report.clone(),
         usage_report_transport: Default::default(),
         compose_manager_url: None,
@@ -639,6 +645,7 @@ async fn trusted_caller_sets_priority_by_header_everything_else_is_zero() {
 #[tokio::test]
 async fn customer_key_cannot_set_priority() {
     let mock = MockServer::start().await;
+    budget_fixture::mount(&mock).await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -662,6 +669,7 @@ async fn customer_key_cannot_set_priority() {
         assert_eq!(response.status(), StatusCode::OK, "header={header_value:?}");
         mock.verify().await;
         mock.reset().await;
+        budget_fixture::mount(&mock).await;
         Mock::given(method("POST"))
             .and(path("/v1/check_api_key"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -712,6 +720,7 @@ async fn completions_route_gets_priority_too() {
 // ---------------------------------------------------------------------------
 
 async fn mount_key_check(mock: &MockServer, key: &str, org: Option<&str>) {
+    budget_fixture::mount(mock).await;
     let mut body = serde_json::json!({"valid": true, "workspace_id": "ws", "api_key_id": "k"});
     if let Some(org) = org {
         body["organization_id"] = serde_json::json!(org);
@@ -2570,6 +2579,7 @@ async fn models_document_is_reduced_to_this_model_and_carries_capacity() {
 async fn internal_models_document_is_read_with_the_usage_token() {
     let engine = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
     // cloud-api's internal catalog: only a read that carries the service token
     // is answered. It lists a model the public document leaves out.
     Mock::given(method("GET"))
@@ -2601,6 +2611,7 @@ async fn internal_models_document_is_read_with_the_usage_token() {
 async fn usage_token_is_sent_to_cloud_api_internal_routes_only() {
     let engine = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
     let elsewhere = MockServer::start().await;
     let document = serde_json::json!({
         "object": "list",
@@ -3078,7 +3089,14 @@ async fn a_usage_report_the_intake_fails_is_sent_again_unchanged_when_retries_ar
         );
     }
     let report: serde_json::Value = serde_json::from_slice(&reports[0].body).unwrap();
-    assert_eq!(report["id"], chat_completion_json()["id"]);
+    let requests = mock.received_requests().await.unwrap();
+    let admission = requests
+        .iter()
+        .find(|r| r.url.path() == "/v1/internal/budget")
+        .expect("execution must have an admission");
+    let admitted: serde_json::Value = serde_json::from_slice(&admission.body).unwrap();
+    assert_eq!(report["id"], admitted["id"]);
+    assert_ne!(report["id"], chat_completion_json()["id"]);
     assert_eq!(report["organization_id"], "org-partner");
 }
 
@@ -3811,6 +3829,7 @@ async fn a_deadline_spent_before_dispatch_refuses_without_asking_an_engine() {
     let mock = MockServer::start().await;
     // Authentication counts against the deadline: a slow cloud-api round trip
     // can use the whole budget before the request would be dispatched.
+    budget_fixture::mount(&mock).await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
         .respond_with(

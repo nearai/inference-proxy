@@ -155,6 +155,18 @@ pub async fn run_chat_completion(
     // on iteration 0 would arrive as a 200 text/event-stream followed by a
     // broken / empty body, hiding the real failure from the client. Only
     // when this first call succeeds do we return 200 + spawn the loop.
+    let mut usage_reporter = make_usage_reporter(&auth, &state);
+    if let Some(reporter) = usage_reporter.as_mut() {
+        let executions = i32::try_from(state.config.agent_loop_max_iterations)
+            .map_err(|_| AppError::BadRequest("Too many agent iterations".into()))?;
+        crate::monetary_budget::admit(
+            reporter,
+            &crate::proxy::UsageType::ChatCompletion,
+            &mut request_json,
+            executions,
+        )
+        .await?;
+    }
     let first_request_body =
         serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?;
     let first_response = send_upstream(
@@ -186,7 +198,6 @@ pub async fn run_chat_completion(
         .expect("caller verified web_context_search_api_key is set");
     let tool_timeout = Duration::from_secs(state.config.web_context_search_timeout_secs);
     let stream_idle_timeout_secs = state.config.stream_idle_timeout_secs;
-    let usage_reporter = make_usage_reporter(&auth, &state);
 
     tokio::spawn(async move {
         // Keep the streaming_connections gauge accurate for the full loop
@@ -228,16 +239,10 @@ pub async fn run_chat_completion(
                     completed_cleanly = result.completed_cleanly,
                     "agent loop completed"
                 );
-                // Bill for the tokens already produced, even when the loop did
-                // NOT finish cleanly (client disconnect or mid-loop error). The
-                // loop accumulates usage across iterations, so result.{input,output}_tokens
-                // hold the partial total at the point of interruption. This must not
-                // be gated on a clean [DONE] (nearai/infra#98) — mirrors the same fix
-                // in `proxy_streaming_request`. The reporter only exists for direct
-                // sk- requests (RequireAuth.cloud_api_key); cloud-api's own
-                // InterceptStream is not in that path, so this is the sole biller —
-                // no double-billing. Reported at most once per loop (one chat id).
-                if let Some(reporter) = usage_reporter.as_ref() {
+                // Only the final aggregate is authoritative. An interrupted loop retains
+                // its complete reservation until final usage can be reconciled.
+                if let Some(reporter) = usage_reporter.as_ref().filter(|_| result.completed_cleanly)
+                {
                     let usage = (result.input_tokens > 0 || result.output_tokens > 0).then_some((
                         i64::try_from(result.input_tokens).unwrap_or(i64::MAX),
                         i64::try_from(result.output_tokens).unwrap_or(i64::MAX),

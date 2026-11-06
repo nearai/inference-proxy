@@ -1,3 +1,6 @@
+#[path = "common/budget.rs"]
+mod budget_fixture;
+
 use std::time::Duration;
 
 use axum::body::Body;
@@ -14,6 +17,7 @@ use common::*;
 async fn direct_privacy_classify_reports_nested_input_usage() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/privacy/classify"))

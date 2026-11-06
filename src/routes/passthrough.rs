@@ -199,6 +199,8 @@ pub async fn images_edits(
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
     let max_size = state.config.max_image_request_size;
     let mut form = reqwest::multipart::Form::new();
+    let mut usage_reporter = make_usage_reporter(&auth, &state);
+    let mut image_count = 1_i64;
     let mut total_size: usize = 0;
     let mut hasher = sha2::Sha256::new();
 
@@ -229,11 +231,28 @@ pub async fn images_edits(
             let data =
                 read_field_chunks(&mut field, &mut total_size, max_size, &mut hasher).await?;
             crate::model_list::guard_form_field(&state, &name, &data)?;
+            if name == "n" {
+                let n = std::str::from_utf8(&data)
+                    .ok()
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| AppError::BadRequest("n must be a positive integer".into()))?;
+                image_count = image_count.max(n);
+            }
             let part = build_multipart_part(data, file_name, content_type)?;
             form = form.part(name, part);
         }
     }
 
+    if let Some(reporter) = usage_reporter.as_mut() {
+        crate::monetary_budget::admit(
+            reporter,
+            &UsageType::ImageGeneration,
+            &mut serde_json::json!({"n": image_count}),
+            1,
+        )
+        .await?;
+    }
     let request_sha256 = hex::encode(hasher.finalize());
 
     let response_transform = enc_ctx.as_ref().map(|ctx| {
@@ -256,7 +275,7 @@ pub async fn images_edits(
         model_name: state.config.model_name.clone(),
         model_label: None,
         model_request: None,
-        usage_reporter: make_usage_reporter(&auth, &state),
+        usage_reporter,
         usage_type: UsageType::ImageGeneration,
         request_hash: None,
         response_transform,
@@ -290,6 +309,8 @@ pub async fn audio_transcriptions(
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
     let max_size = state.config.max_audio_request_size;
     let mut form = reqwest::multipart::Form::new();
+    let mut usage_reporter = make_usage_reporter(&auth, &state);
+    let mut audio_seconds = 0_i32;
     let mut total_size: usize = 0;
     // Always hash the raw (original) bytes for signatures, matching the Python proxy.
     // When encryption is active, the prompt field is hashed in its encrypted form,
@@ -323,11 +344,48 @@ pub async fn audio_transcriptions(
             let data =
                 read_field_chunks(&mut field, &mut total_size, max_size, &mut hasher).await?;
             crate::model_list::guard_form_field(&state, &name, &data)?;
+            if usage_reporter.is_some() && name == "response_format" {
+                continue;
+            }
+            if usage_reporter.is_some() && name == "file" {
+                let (encoded, seconds) = crate::audio_budget::normalize(data)
+                    .await
+                    .map_err(|error| AppError::BadRequest(error.into()))?;
+                audio_seconds = audio_seconds
+                    .checked_add(seconds)
+                    .ok_or_else(|| AppError::BadRequest("Audio duration overflow".into()))?;
+                form = form.part(
+                    name,
+                    build_multipart_part(
+                        encoded,
+                        Some("audio.flac".into()),
+                        Some("audio/flac".into()),
+                    )?,
+                );
+                continue;
+            }
             let part = build_multipart_part(data, file_name, content_type)?;
             form = form.part(name, part);
         }
     }
 
+    if let Some(reporter) = usage_reporter.as_mut() {
+        if audio_seconds <= 0 {
+            return Err(AppError::BadRequest("Missing audio file".into()));
+        }
+        form = form.text("response_format", "verbose_json");
+        crate::monetary_budget::admit(
+            reporter,
+            &UsageType::AudioTranscription,
+            &mut serde_json::json!({"duration_seconds": audio_seconds}),
+            1,
+        )
+        .await?;
+        // The v1 queue schema has no audio variant. Use the existing HTTP delivery,
+        // with the same retry policy and durable reservation identity.
+        reporter.delivery =
+            crate::usage_report::UsageReportDelivery::new(reporter.delivery.policy().clone());
+    }
     let request_sha256 = hex::encode(hasher.finalize());
 
     let response_transform = enc_ctx.as_ref().map(|ctx| {
@@ -350,8 +408,8 @@ pub async fn audio_transcriptions(
         model_name: state.config.model_name.clone(),
         model_label: None,
         model_request: None,
-        usage_reporter: make_usage_reporter(&auth, &state),
-        usage_type: UsageType::ChatCompletion,
+        usage_reporter,
+        usage_type: UsageType::AudioTranscription,
         request_hash: None,
         response_transform,
         chunk_transform: None,

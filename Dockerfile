@@ -335,7 +335,7 @@ RUN --mount=type=bind,source=pinned-packages-runtime.txt,target=/run/pinned-pack
     sh /run/apt-retry.sh -o Acquire::https::CAInfo=/run/bootstrap-ca.crt update; \
     DEBIAN_FRONTEND=noninteractive sh /run/apt-retry.sh -o Acquire::https::CAInfo=/run/bootstrap-ca.crt \
         install -y --no-install-recommends \
-        python3 python3-pip ca-certificates \
+        python3 python3-pip ca-certificates ffmpeg \
         libcurl4 libxml2 libxmlsec1-openssl $nvat; \
     ldconfig; \
     rm -rf /var/lib/apt/lists/* \

@@ -322,9 +322,9 @@ fn message_is_allowed_media_domain_error(message: &str) -> bool {
 /// posting to a deleted endpoint.
 #[derive(Clone)]
 pub struct UsageReporter {
+    pub budget_report_id: Option<String>,
     pub http_client: reqwest::Client,
-    /// cloud-api's base URL. Required over HTTP; the SQS transport does not
-    /// post to cloud-api and carries none.
+    /// cloud-api's base URL. Required for synchronous admission with either report transport.
     pub cloud_api_url: Option<String>,
     pub model_name: String,
     /// Shared infrastructure token for the service-token reporting path.
@@ -528,6 +528,7 @@ pub(crate) fn record_usage_report_outcome(
 /// label to report it under.
 #[derive(Clone, Default)]
 pub enum UsageType {
+    AudioTranscription,
     /// Extract prompt_tokens / completion_tokens from the `usage` object.
     #[default]
     ChatCompletion,
@@ -591,12 +592,6 @@ pub fn make_usage_reporter_for(
     usage_reporter(auth, state, model.id, model.discount_to_user, model.label)
 }
 
-/// Whether a reporter may exist: over HTTP the report is posted to cloud-api,
-/// so there must be its URL. The SQS transport sends to the queue and needs none.
-fn may_report(cloud_api_url: Option<&str>, is_http: bool) -> bool {
-    cloud_api_url.is_some() || !is_http
-}
-
 fn usage_reporter(
     auth: &crate::auth::RequireAuth,
     state: &AppState,
@@ -609,13 +604,8 @@ fn usage_reporter(
     // below, not the sk-.
     auth.cloud_api_key.as_ref()?;
     let cloud_api_url = state.config.cloud_api_url.clone();
-    if !may_report(
-        cloud_api_url.as_deref(),
-        state.usage_report_delivery.is_http(),
-    ) {
-        return None;
-    }
     Some(UsageReporter {
+        budget_report_id: None,
         http_client: state.http_client.clone(),
         cloud_api_url,
         model_name: model_name.to_string(),
@@ -672,6 +662,16 @@ pub(crate) fn build_usage_body(
                 "cache_read_tokens": cached_tokens(usage, input).unwrap_or(0),
                 "id": id,
             }))
+        }
+        UsageType::AudioTranscription => {
+            let seconds = response_data.get("duration")?.as_f64()?;
+            if !seconds.is_finite() || seconds <= 0.0 || seconds > i32::MAX as f64 {
+                return None;
+            }
+            Some(
+                serde_json::json!({"type": "audio_transcription", "model": model_name,
+                "duration_seconds": seconds.ceil() as i32, "id": id}),
+            )
         }
         UsageType::ImageGeneration => {
             let count = response_data
@@ -833,6 +833,9 @@ fn report_stream_usage_on_finalize(
     let Some(reporter) = usage_reporter else {
         return;
     };
+    if reporter.budget_report_id.is_some() && !completed_cleanly {
+        return;
+    }
     match (usage, chat_id) {
         (Some(((input, output), cache_read_tokens)), Some(id)) => {
             let body = serde_json::json!({
@@ -886,6 +889,9 @@ pub(crate) fn complete_usage_body(
         serde_json::Value::String(_) => return Err("string"),
         serde_json::Value::Array(_) => return Err("array"),
     };
+    if let Some(id) = &reporter.budget_report_id {
+        map.insert("id".into(), serde_json::Value::String(id.clone()));
+    }
     let identity = [
         ("organization_id", &reporter.org_id),
         ("workspace_id", &reporter.workspace_id),
@@ -1272,6 +1278,14 @@ async fn send_upstream(
     opts: &mut ProxyOpts,
     endpoint: &'static str,
 ) -> Result<reqwest::Response, AppError> {
+    let body = if let Some(reporter) = &mut opts.usage_reporter {
+        let mut json: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|_| AppError::BadRequest("Invalid JSON body".into()))?;
+        crate::monetary_budget::admit(reporter, &opts.usage_type, &mut json, 1).await?;
+        Bytes::from(serde_json::to_vec(&json).map_err(|e| AppError::Internal(e.into()))?)
+    } else {
+        body
+    };
     let upstream_start = std::time::Instant::now();
     // The lane's time-to-first-token clock starts here. The engine sends the
     // SSE response headers only once it has something to say, so measuring
@@ -3416,6 +3430,17 @@ async fn proxy_multipart_request_inner(
     request_sha256: &str,
     mut opts: ProxyOpts,
 ) -> Result<Response, AppError> {
+    if opts
+        .usage_reporter
+        .as_ref()
+        .is_some_and(|r| r.budget_report_id.is_none())
+    {
+        return Err(AppError::UpstreamParsed {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "Multipart request is missing monetary admission".into(),
+            error_type: "budget_admission_error".into(),
+        });
+    }
     let upstream_start = std::time::Instant::now();
     let req = apply_tracing_headers(client.post(url).multipart(form), opts.tracing_ids.as_ref());
     let response = req.send().await.map_err(|e| AppError::Internal(e.into()))?;
@@ -4061,6 +4086,7 @@ mod tests {
         api_key_id: Option<&str>,
     ) -> UsageReporter {
         UsageReporter {
+            budget_report_id: None,
             http_client: reqwest::Client::new(),
             cloud_api_url: Some("http://cloud-api.invalid".to_string()),
             model_name: "test-model".to_string(),
@@ -4079,6 +4105,152 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn monetary_admission_denial_never_dispatches_upstream() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let ledger = MockServer::start().await;
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/internal/budget"))
+            .respond_with(ResponseTemplate::new(402))
+            .expect(1)
+            .mount(&ledger)
+            .await;
+        let mut opts = test_proxy_opts();
+        let mut reporter = reporter_with(Some("test-token"), Some("org"), Some("ws"), Some("key"));
+        reporter.cloud_api_url = Some(ledger.uri());
+        opts.usage_reporter = Some(reporter);
+        let mut url = format!("{}/v1/chat/completions", upstream.uri());
+        let result = send_upstream(
+            &reqwest::Client::new(),
+            &mut url,
+            Bytes::from_static(br#"{"model":"test-model","messages":[]}"#),
+            &mut opts,
+            "test",
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::InsufficientCredits)));
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn monetary_admission_bounds_are_enforced_and_receipt_identity_is_stable() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+        let ledger = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/internal/budget"))
+            .respond_with(|request: &Request| {
+                let metadata: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert!(metadata.get("messages").is_none());
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id":metadata["id"], "model":"test-model", "max_output_tokens":16
+                }))
+            })
+            .expect(2)
+            .mount(&ledger)
+            .await;
+        let mut reporter = reporter_with(Some("test-token"), Some("org"), Some("ws"), Some("key"));
+        reporter.cloud_api_url = Some(ledger.uri());
+        let mut body = serde_json::json!({"messages":[{"role":"user","content":"synthetic"}],"max_completion_tokens":16});
+        crate::monetary_budget::admit(&mut reporter, &UsageType::ChatCompletion, &mut body, 1)
+            .await
+            .unwrap();
+        assert_eq!(body["max_tokens"], 16);
+        assert_eq!(body["max_completion_tokens"], 16);
+        let original_id = reporter.budget_report_id.clone().unwrap();
+        let response = serde_json::json!({"usage":{"prompt_tokens":2,"completion_tokens":3}});
+        let mut first = build_usage_body(
+            &UsageType::ChatCompletion,
+            &response,
+            "test-model",
+            "provider-id",
+        )
+        .unwrap();
+        complete_usage_body(&reporter, &mut first).unwrap();
+        let mut retry = first.clone();
+        complete_usage_body(&reporter, &mut retry).unwrap();
+        assert_eq!(first, retry);
+        assert_eq!(first["id"], original_id);
+        crate::monetary_budget::admit(&mut reporter, &UsageType::ChatCompletion, &mut body, 1)
+            .await
+            .unwrap();
+        assert_ne!(
+            reporter.budget_report_id.as_deref(),
+            Some(original_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn monetary_admission_covers_batched_prompts_and_best_of() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+        let ledger = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/internal/budget"))
+            .respond_with(|request: &Request| {
+                let metadata: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(metadata["choices"], 5);
+                assert!(metadata.get("prompt").is_none());
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id":metadata["id"], "model":"test-model", "max_output_tokens":16
+                }))
+            })
+            .expect(3)
+            .mount(&ledger)
+            .await;
+        for (prompt, batch) in [
+            (serde_json::json!(["a", "b", "c"]), 3),
+            (serde_json::json!([[1, 2], [3, 4]]), 2),
+            (serde_json::json!([1, 2, 3]), 1),
+        ] {
+            let mut reporter =
+                reporter_with(Some("test-token"), Some("org"), Some("ws"), Some("key"));
+            reporter.cloud_api_url = Some(ledger.uri());
+            let mut body = serde_json::json!({"prompt":prompt,"n":2,"best_of":5,"max_tokens":16});
+            crate::monetary_budget::admit(&mut reporter, &UsageType::ChatCompletion, &mut body, 1)
+                .await
+                .unwrap();
+            let requests = ledger.received_requests().await.unwrap();
+            let metadata: serde_json::Value =
+                serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+            assert_eq!(metadata["batch_items"], batch);
+        }
+    }
+
+    #[tokio::test]
+    async fn monetary_admission_missing_configuration_or_bad_reply_fails_closed() {
+        let mut reporter = reporter_with(None, Some("org"), Some("ws"), Some("key"));
+        let mut body = serde_json::json!({});
+        assert!(crate::monetary_budget::admit(
+            &mut reporter,
+            &UsageType::ChatCompletion,
+            &mut body,
+            1
+        )
+        .await
+        .is_err());
+        assert!(reporter.budget_report_id.is_none());
+        let ledger = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"id":"wrong","model":"test-model","max_output_tokens":16}),
+            ))
+            .mount(&ledger)
+            .await;
+        reporter.cloud_api_usage_token = Some("test-token".into());
+        reporter.cloud_api_url = Some(ledger.uri());
+        assert!(crate::monetary_budget::admit(
+            &mut reporter,
+            &UsageType::ChatCompletion,
+            &mut body,
+            1
+        )
+        .await
+        .is_err());
+        assert!(reporter.budget_report_id.is_none());
+    }
     #[test]
     fn test_can_use_service_token_path_requires_all_fields() {
         // Token + all three identity fields: green light.
@@ -4110,15 +4282,6 @@ mod tests {
 
         // Nothing configured: reporting is skipped.
         assert!(!reporter_with(None, None, None, None).can_use_service_token_path());
-    }
-
-    /// The reporter's cloud-api URL is required over HTTP and not over SQS.
-    #[test]
-    fn the_reporter_gate_needs_cloud_api_only_over_http() {
-        assert!(may_report(Some("https://cloud"), true));
-        assert!(!may_report(None, true));
-        assert!(may_report(None, false));
-        assert!(may_report(Some("https://cloud"), false));
     }
 
     /// The SQS transport sends to the queue: it needs neither cloud-api's URL

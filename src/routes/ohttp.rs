@@ -515,8 +515,8 @@ fn validated_loopback_url(
     path: &str,
 ) -> Result<reqwest::Url, AppError> {
     let invalid_target = || AppError::BadRequest("Unsupported OHTTP inner request".to_string());
-    let allowed = (method == &Method::GET && path == crate::routes::ROUTE_V1_MODELS)
-        || (method == &Method::POST
+    let allowed = (method == Method::GET && path == crate::routes::ROUTE_V1_MODELS)
+        || (method == Method::POST
             && [
                 crate::routes::ROUTE_CHAT_COMPLETIONS,
                 crate::routes::ROUTE_COMPLETIONS,

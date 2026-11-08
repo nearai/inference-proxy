@@ -10385,7 +10385,7 @@ async fn test_ohttp_text_completions_allowed() {
     );
     inner_req.put_header("content-type", "application/json");
     inner_req.put_header("authorization", "Bearer test-token");
-    inner_req.write_content(br#"{"prompt":"hello "}"#.to_vec());
+    inner_req.write_content(br#"{"prompt":"hello "}"#);
 
     let (enc_request, client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
     let response = reqwest::Client::new()

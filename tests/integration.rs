@@ -9769,17 +9769,31 @@ fn ohttp_decrypt_response(
 }
 
 #[tokio::test]
-async fn test_ohttp_rejects_non_origin_inner_paths_before_forwarding() {
+async fn test_ohttp_rejects_non_allowlisted_inner_requests_before_forwarding() {
     let target = MockServer::start().await;
     let (base_url, server_handle, config_bytes) = start_ohttp_server(&target.uri()).await;
     let client = reqwest::Client::new();
 
-    for inner_path in [
-        format!("@127.0.0.1:{}/secret", target.address().port()),
-        format!("//127.0.0.1:{}/secret", target.address().port()),
+    for (inner_method, inner_path) in [
+        (
+            "POST",
+            format!("@127.0.0.1:{}/secret", target.address().port()),
+        ),
+        (
+            "POST",
+            format!("//127.0.0.1:{}/secret", target.address().port()),
+        ),
+        ("GET", "/v1/chat/completions".to_string()),
+        ("POST", "/v1/models".to_string()),
+        ("GET", "/v1/completions".to_string()),
+        ("GET", "/v1/audio/transcriptions".to_string()),
+        ("POST", "/v1/embeddings".to_string()),
+        ("POST", "/update_weights_from_tensor".to_string()),
+        ("POST", "/v1/chat/completions?debug=1".to_string()),
+        ("POST", "/v1/chat/%63ompletions".to_string()),
     ] {
         let inner_req = bhttp::Message::request(
-            b"GET".to_vec(),
+            inner_method.as_bytes().to_vec(),
             b"https".to_vec(),
             b"localhost".to_vec(),
             inner_path.into_bytes(),
@@ -10305,7 +10319,7 @@ async fn test_ohttp_non_bearer_outer_auth_falls_back_to_inner_authorization() {
     server_handle.abort();
 }
 
-// Test 12: OHTTP with inner GET request (e.g. /v1/models)
+// OHTTP model discovery remains available to clients before completion.
 #[tokio::test]
 async fn test_ohttp_get_request_inner() {
     let mock = MockServer::start().await;
@@ -10320,7 +10334,6 @@ async fn test_ohttp_get_request_inner() {
 
     let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock.uri()).await;
 
-    // Build inner GET request — note: /v1/models is unauthenticated (passthrough)
     let inner_req = bhttp::Message::request(
         b"GET".to_vec(),
         b"https".to_vec(),
@@ -10347,6 +10360,102 @@ async fn test_ohttp_get_request_inner() {
     assert_eq!(inner_resp.control().status().unwrap().code(), 200);
     let resp_body: serde_json::Value = serde_json::from_slice(inner_resp.content()).unwrap();
     assert_eq!(resp_body["data"][0]["id"], "test-model");
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_ohttp_text_completions_allowed() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "cmpl-ohttp",
+            "choices": [{"text": "world", "finish_reason": "stop"}]
+        })))
+        .mount(&mock)
+        .await;
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock.uri()).await;
+
+    let mut inner_req = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/completions".to_vec(),
+    );
+    inner_req.put_header("content-type", "application/json");
+    inner_req.put_header("authorization", "Bearer test-token");
+    inner_req.write_content(br#"{"prompt":"hello "}"#.to_vec());
+
+    let (enc_request, client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/ohttp"))
+        .header("content-type", "message/ohttp-req")
+        .body(enc_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let inner_resp = ohttp_decrypt_response(client_response, &response.bytes().await.unwrap());
+    assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+    let body: serde_json::Value = serde_json::from_slice(inner_resp.content()).unwrap();
+    assert_eq!(body["id"], "cmpl-ohttp");
+    assert_eq!(mock.received_requests().await.unwrap().len(), 1);
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_ohttp_audio_transcriptions_allowed() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "trans-ohttp",
+            "text": "Hello world"
+        })))
+        .mount(&mock)
+        .await;
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock.uri()).await;
+
+    let boundary = "----OhttpAudioBoundary";
+    let multipart_body = format!(
+        "--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"model\"\r\n\r\n\
+         whisper-1\r\n\
+         --{boundary}\r\n\
+         Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n\
+         Content-Type: audio/wav\r\n\r\n\
+         fakeaudiodata\r\n\
+         --{boundary}--\r\n"
+    );
+    let mut inner_req = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/audio/transcriptions".to_vec(),
+    );
+    inner_req.put_header(
+        "content-type",
+        format!("multipart/form-data; boundary={boundary}").as_bytes(),
+    );
+    inner_req.put_header("authorization", "Bearer test-token");
+    inner_req.write_content(multipart_body.into_bytes());
+
+    let (enc_request, client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/ohttp"))
+        .header("content-type", "message/ohttp-req")
+        .body(enc_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let inner_resp = ohttp_decrypt_response(client_response, &response.bytes().await.unwrap());
+    assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+    let body: serde_json::Value = serde_json::from_slice(inner_resp.content()).unwrap();
+    assert_eq!(body["id"], "trans-ohttp");
+    assert_eq!(mock.received_requests().await.unwrap().len(), 1);
 
     server_handle.abort();
 }

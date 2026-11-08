@@ -1,5 +1,6 @@
 use std::io::Cursor;
-use std::time::Instant;
+use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::State;
@@ -12,6 +13,17 @@ use tracing::{info, warn};
 
 use crate::error::AppError;
 use crate::AppState;
+
+// OHTTP must never follow an inner request away from the local proxy, including
+// redirects returned by a local route. Keep this client separate from the
+// shared HTTP client used for external services.
+static OHTTP_LOOPBACK_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("build OHTTP loopback client")
+});
 
 /// GET /.well-known/ohttp-gateway  (and /v1/ohttp/config alias)
 ///
@@ -438,8 +450,10 @@ fn parse_bhttp_and_build_loopback(
         .parse()
         .map_err(|_| AppError::BadRequest(format!("Unsupported HTTP method: {method_str}")))?;
 
-    let loopback_url = format!("http://127.0.0.1:{}{}", state.config.listen_port, path_str);
-    let mut request_builder = state.http_client.request(method, &loopback_url);
+    let loopback_url = validated_loopback_url(state.config.listen_port, &method, path_str)?;
+    let mut request_builder = OHTTP_LOOPBACK_CLIENT
+        .request(method, loopback_url)
+        .timeout(Duration::from_secs(state.config.timeout_secs));
 
     let relay_outer_bearer = outer_authorization.filter(|value| {
         value
@@ -492,6 +506,42 @@ fn parse_bhttp_and_build_loopback(
     Ok((request_builder, path_str.to_string()))
 }
 
+/// Accept only GET /v1/models and POST to chat, text, or audio completions.
+/// Verify that URL parsing preserves the fixed loopback authority: a path
+/// starting with `@` would turn `127.0.0.1:PORT` into URL userinfo.
+fn validated_loopback_url(
+    port: u16,
+    method: &Method,
+    path: &str,
+) -> Result<reqwest::Url, AppError> {
+    let invalid_target = || AppError::BadRequest("Unsupported OHTTP inner request".to_string());
+    let allowed = (method == Method::GET && path == crate::routes::ROUTE_V1_MODELS)
+        || (method == Method::POST
+            && [
+                crate::routes::ROUTE_CHAT_COMPLETIONS,
+                crate::routes::ROUTE_COMPLETIONS,
+                crate::routes::ROUTE_AUDIO_TRANSCRIPTIONS,
+            ]
+            .contains(&path));
+    if !allowed {
+        return Err(invalid_target());
+    }
+
+    let url = reqwest::Url::parse(&format!("http://127.0.0.1:{port}{path}"))
+        .map_err(|_| invalid_target())?;
+    if url.scheme() != "http"
+        || url.host_str() != Some("127.0.0.1")
+        || url.port_or_known_default() != Some(port)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid_target());
+    }
+
+    Ok(url)
+}
+
 /// Send a loopback request, returning the response.
 async fn send_loopback(
     request_builder: reqwest::RequestBuilder,
@@ -522,6 +572,97 @@ mod tests {
     use std::io::Cursor;
 
     use futures_util::io::Cursor as FuturesCursor;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn ohttp_only_accepts_inference_routes_on_loopback() {
+        let url =
+            validated_loopback_url(8000, &Method::POST, crate::routes::ROUTE_CHAT_COMPLETIONS)
+                .unwrap();
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+        assert_eq!(url.port(), Some(8000));
+        assert_eq!(url.path(), crate::routes::ROUTE_CHAT_COMPLETIONS);
+        assert_eq!(url.query(), None);
+
+        let models =
+            validated_loopback_url(8000, &Method::GET, crate::routes::ROUTE_V1_MODELS).unwrap();
+        assert_eq!(models.path(), crate::routes::ROUTE_V1_MODELS);
+        assert_eq!(models.query(), None);
+
+        for path in [
+            crate::routes::ROUTE_COMPLETIONS,
+            crate::routes::ROUTE_AUDIO_TRANSCRIPTIONS,
+        ] {
+            assert_eq!(
+                validated_loopback_url(8000, &Method::POST, path)
+                    .unwrap()
+                    .path(),
+                path
+            );
+        }
+
+        // URL parsing removes the explicit default HTTP port.
+        assert_eq!(
+            validated_loopback_url(80, &Method::POST, crate::routes::ROUTE_CHAT_COMPLETIONS)
+                .unwrap()
+                .port_or_known_default(),
+            Some(80)
+        );
+
+        for (method, path) in [
+            (Method::GET, "/v1/chat/completions"),
+            (Method::PUT, "/v1/chat/completions"),
+            (Method::POST, "/v1/models"),
+            (Method::GET, "/v1/completions"),
+            (Method::GET, "/v1/audio/transcriptions"),
+            (Method::POST, "/update_weights_from_tensor"),
+            (Method::POST, "/v1/chat/completions?debug=1"),
+            (Method::GET, "/v1/models?debug=1"),
+            (Method::POST, "/v1/chat/completions/"),
+            (Method::POST, "/v1/chat/%63ompletions"),
+            (Method::POST, "@example.com/x"),
+            (Method::POST, "//example.com/x"),
+            (Method::POST, "http://example.com/x"),
+            (Method::POST, ""),
+        ] {
+            assert!(
+                matches!(
+                    validated_loopback_url(8000, &method, path),
+                    Err(AppError::BadRequest(_))
+                ),
+                "unexpectedly accepted {method} {path:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ohttp_loopback_client_does_not_follow_redirects() {
+        let destination = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/secret"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&destination)
+            .await;
+
+        let source = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redirect"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/secret", destination.uri())),
+            )
+            .mount(&source)
+            .await;
+
+        let response = OHTTP_LOOPBACK_CLIENT
+            .get(format!("{}/redirect", source.uri()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert!(destination.received_requests().await.unwrap().is_empty());
+    }
 
     async fn varint_bytes(v: u64) -> Vec<u8> {
         let mut buf = FuturesCursor::new(Vec::new());

@@ -9768,6 +9768,38 @@ fn ohttp_decrypt_response(
     bhttp::Message::read_bhttp(&mut Cursor::new(&bhttp_bytes[..])).unwrap()
 }
 
+#[tokio::test]
+async fn test_ohttp_rejects_non_origin_inner_paths_before_forwarding() {
+    let target = MockServer::start().await;
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&target.uri()).await;
+    let client = reqwest::Client::new();
+
+    for inner_path in [
+        format!("@127.0.0.1:{}/secret", target.address().port()),
+        format!("//127.0.0.1:{}/secret", target.address().port()),
+    ] {
+        let inner_req = bhttp::Message::request(
+            b"GET".to_vec(),
+            b"https".to_vec(),
+            b"localhost".to_vec(),
+            inner_path.into_bytes(),
+        );
+        let (enc_request, _) = ohttp_encrypt_request(&config_bytes, &inner_req);
+        let response = client
+            .post(format!("{base_url}/ohttp"))
+            .header("content-type", "message/ohttp-req")
+            .header("authorization", "Bearer test-token")
+            .body(enc_request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    assert!(target.received_requests().await.unwrap().is_empty());
+    server_handle.abort();
+}
+
 // Test 10: Full OHTTP roundtrip — encrypt chat completion, get real response
 #[tokio::test]
 async fn test_ohttp_full_roundtrip_chat_completion() {

@@ -441,16 +441,22 @@ fn parse_bhttp_and_build_loopback(
         .ok_or_else(|| AppError::BadRequest("OHTTP inner message is not a request".to_string()))?;
     let path_bytes = control.path().unwrap_or(b"/");
 
-    let method_str = std::str::from_utf8(method_bytes)
-        .map_err(|_| AppError::BadRequest("Invalid method".to_string()))?;
-    let path_str = std::str::from_utf8(path_bytes)
-        .map_err(|_| AppError::BadRequest("Invalid path".to_string()))?;
+    let method_str = std::str::from_utf8(method_bytes).map_err(|_| {
+        log_rejected_inner_request("invalid_method", "-", path_bytes);
+        AppError::BadRequest("Invalid method".to_string())
+    })?;
+    let path_str = std::str::from_utf8(path_bytes).map_err(|_| {
+        log_rejected_inner_request("invalid_path", method_str, path_bytes);
+        AppError::BadRequest("Invalid path".to_string())
+    })?;
 
-    let method: Method = method_str
-        .parse()
-        .map_err(|_| AppError::BadRequest(format!("Unsupported HTTP method: {method_str}")))?;
+    let method: Method = method_str.parse().map_err(|_| {
+        log_rejected_inner_request("invalid_method", "-", path_bytes);
+        AppError::BadRequest("Unsupported HTTP method".to_string())
+    })?;
 
-    let loopback_url = validated_loopback_url(state.config.listen_port, &method, path_str)?;
+    let loopback_url = validated_loopback_url(state.config.listen_port, &method, path_str)
+        .inspect_err(|_| log_rejected_inner_request("not_allowed", method.as_str(), path_bytes))?;
     let mut request_builder = OHTTP_LOOPBACK_CLIENT
         .request(method, loopback_url)
         .timeout(Duration::from_secs(state.config.timeout_secs));
@@ -504,6 +510,147 @@ fn parse_bhttp_and_build_loopback(
     }
 
     Ok((request_builder, path_str.to_string()))
+}
+
+/// Log and count an inner OHTTP request that was refused before any loopback call.
+///
+/// Inner paths are attacker-controlled and have carried scripts and tokens (incident
+/// 2026-11-07), so the raw path is never logged. The log carries only what is needed to
+/// spot and correlate an attack: the method (standard methods only), the path's shape, any
+/// `@host:port` / `//host` / `scheme://host` forward target (host and port only, no
+/// userinfo), the path with long segments and the query removed, the path length, and a
+/// SHA-256 prefix of the exact bytes so repeated attempts can be matched.
+fn log_rejected_inner_request(reason: &'static str, method: &str, path: &[u8]) {
+    metrics::counter!("ohttp_rejected_inner_requests_total", "reason" => reason).increment(1);
+    let summary = summarize_inner_path(path);
+    let method = match method {
+        "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS" | "CONNECT" | "TRACE" => {
+            method
+        }
+        "-" => "-",
+        _ => "other",
+    };
+    warn!(
+        reason,
+        inner_method = method,
+        inner_path_shape = summary.shape,
+        inner_target = summary.target.as_deref().unwrap_or("-"),
+        inner_path_redacted = %summary.redacted,
+        inner_path_len = path.len(),
+        inner_query_len = summary.query_len,
+        inner_path_sha256 = %summary.sha256_prefix,
+        "OHTTP inner request rejected"
+    );
+}
+
+struct InnerPathSummary {
+    /// `origin` (/...), `userinfo` (@...), `scheme_relative` (//...), `absolute` (x://...),
+    /// `empty`, or `other`.
+    shape: &'static str,
+    /// Forward target host[:port] for `userinfo`, `scheme_relative` and `absolute` shapes.
+    target: Option<String>,
+    /// Path without query or fragment. A segment is kept if it is at most 24 bytes of
+    /// `[A-Za-z0-9._-]`, or at most 48 bytes of `[a-z_-]` (route names); anything else
+    /// becomes `<N>` (its length). At most 8 segments are kept.
+    redacted: String,
+    query_len: usize,
+    sha256_prefix: String,
+}
+
+fn summarize_inner_path(path: &[u8]) -> InnerPathSummary {
+    use sha2::{Digest, Sha256};
+
+    const MAX_SEGMENT: usize = 24;
+    const MAX_ROUTE_SEGMENT: usize = 48;
+    const MAX_SEGMENTS: usize = 8;
+
+    let sha256_prefix = hex::encode(&Sha256::digest(path)[..8]);
+    let text = String::from_utf8_lossy(path);
+    let (before_fragment, _) = text.split_once('#').unwrap_or((&text, ""));
+    let (path_part, query) = match before_fragment.split_once('?') {
+        Some((p, q)) => (p, q.len()),
+        None => (before_fragment, 0),
+    };
+
+    let (shape, rest) = if path_part.is_empty() {
+        ("empty", "")
+    } else if let Some(r) = path_part.strip_prefix('@') {
+        ("userinfo", r)
+    } else if let Some(r) = path_part.strip_prefix("//") {
+        ("scheme_relative", r)
+    } else if let Some((scheme, r)) = path_part.split_once("://") {
+        if !scheme.is_empty()
+            && scheme
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b))
+        {
+            ("absolute", r)
+        } else {
+            ("other", path_part)
+        }
+    } else if path_part.starts_with('/') {
+        ("origin", path_part)
+    } else {
+        ("other", path_part)
+    };
+
+    let (target, path_rest) = match shape {
+        "userinfo" | "scheme_relative" | "absolute" => {
+            let (authority, tail) = match rest.find('/') {
+                Some(i) => (&rest[..i], &rest[i..]),
+                None => (rest, ""),
+            };
+            // Drop any userinfo (user:password@) in front of the host.
+            let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            let safe = !host_port.is_empty()
+                && host_port.len() <= 64
+                && host_port
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b".-:[]_".contains(&b));
+            let target = if safe {
+                host_port.to_ascii_lowercase()
+            } else {
+                format!("<{}>", host_port.len())
+            };
+            (Some(target), tail)
+        }
+        _ => (None, rest),
+    };
+
+    let segments: Vec<&str> = path_rest.split('/').skip(1).collect();
+    let mut redacted = String::new();
+    for segment in segments.iter().take(MAX_SEGMENTS) {
+        redacted.push('/');
+        // Short plain segments, or longer route-like names (lowercase letters and
+        // `_`/`-` only, e.g. update_weights_from_tensor). Tokens mix digits or case.
+        let plain = (segment.len() <= MAX_SEGMENT
+            && segment
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)))
+            || (segment.len() <= MAX_ROUTE_SEGMENT
+                && segment
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b == b'_' || b == b'-'));
+        if plain {
+            redacted.push_str(segment);
+        } else {
+            redacted.push_str(&format!("<{}>", segment.len()));
+        }
+    }
+    if segments.len() > MAX_SEGMENTS {
+        redacted.push_str(&format!("/...+{}", segments.len() - MAX_SEGMENTS));
+    }
+    if redacted.is_empty() && shape == "other" {
+        redacted = format!("<{}>", path_part.len());
+    }
+
+    InnerPathSummary {
+        shape,
+        target,
+        redacted,
+        query_len: query,
+        sha256_prefix,
+    }
 }
 
 /// Accept only GET /v1/models and POST to chat, text, or audio completions.
@@ -633,6 +780,64 @@ mod tests {
                 ),
                 "unexpectedly accepted {method} {path:?}"
             );
+        }
+    }
+
+    #[test]
+    fn rejected_inner_path_summary_keeps_the_target_and_drops_secrets() {
+        // The 2026-11 attack shape: userinfo forward to a webshell with a command in the query.
+        let s =
+            summarize_inner_path(b"@172.18.0.5:9998/run?cmd=curl%20-H%20Bearer%20sk-SECRETSECRET");
+        assert_eq!(s.shape, "userinfo");
+        assert_eq!(s.target.as_deref(), Some("172.18.0.5:9998"));
+        assert_eq!(s.redacted, "/run");
+        assert_eq!(
+            s.query_len,
+            "cmd=curl%20-H%20Bearer%20sk-SECRETSECRET".len()
+        );
+        assert_eq!(s.sha256_prefix.len(), 16);
+
+        // Userinfo inside the authority is dropped; long or odd segments become lengths.
+        let s = summarize_inner_path(
+            b"//admin:hunter2@10.0.2.2:8443/prpc/CreateVm/eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig",
+        );
+        assert_eq!(s.shape, "scheme_relative");
+        assert_eq!(s.target.as_deref(), Some("10.0.2.2:8443"));
+        assert_eq!(s.redacted, "/prpc/CreateVm/<40>");
+
+        let s = summarize_inner_path(b"http://Example.COM/x");
+        assert_eq!(
+            (s.shape, s.target.as_deref()),
+            ("absolute", Some("example.com"))
+        );
+
+        let s = summarize_inner_path(b"/update_weights_from_tensor");
+        assert_eq!((s.shape, s.target.as_deref()), ("origin", None));
+        assert_eq!(s.redacted, "/update_weights_from_tensor");
+
+        let s = summarize_inner_path(b"/v1/chat/%63ompletions#frag");
+        assert_eq!(s.redacted, "/v1/chat/<13>");
+
+        let s = summarize_inner_path(b"");
+        assert_eq!((s.shape, s.redacted.as_str()), ("empty", ""));
+
+        let s = summarize_inner_path(b"@bad host with spaces/x");
+        assert_eq!(s.target.as_deref(), Some("<20>"));
+
+        let deep = "/a".repeat(12);
+        let s = summarize_inner_path(deep.as_bytes());
+        assert_eq!(s.redacted, format!("{}/...+4", "/a".repeat(8)));
+
+        // No byte of a secret ever reaches the redacted fields.
+        for secret_path in [
+            "@h:1/x?token=SECRETSECRET".as_bytes(),
+            b"/SECRETSECRETSECRETSECRETSECRET",
+            b"/x/sk-SECRET0a1b2c3d4e5f6a7b8c9d0e",
+            b"//u:SECRETSECRET@h/x",
+        ] {
+            let s = summarize_inner_path(secret_path);
+            let all = format!("{} {:?} {}", s.redacted, s.target, s.shape);
+            assert!(!all.contains("SECRET"), "{all}");
         }
     }
 

@@ -65,9 +65,6 @@ impl UsageFeatures {
             "input",
             "instructions",
             "system",
-            "tools",
-            "functions",
-            "tool_choice",
             "state",
             "questions",
             "assets",
@@ -75,6 +72,23 @@ impl UsageFeatures {
             if let Some(value) = body.get(name) {
                 features.count(value)?;
             }
+        }
+        // Schemas are part of the model input. Count their serialized keys and values;
+        // the media walker intentionally skips fields such as `data`, `id`, and URLs.
+        for value in [
+            body.get("tools"),
+            body.get("functions"),
+            body.get("tool_choice"),
+            body.get("response_format"),
+            body.pointer("/text/format"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            features.text_bytes = features
+                .text_bytes
+                .checked_add(value.to_string().len() as u64)
+                .ok_or_else(overflow)?;
         }
         if let Some(items) = body.get("prompt").and_then(Value::as_array) {
             if !items.iter().all(Value::is_number) {
@@ -136,5 +150,33 @@ impl UsageFeatures {
             _ => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn schema_keys_and_media_named_properties_count_as_model_input() {
+        use serde_json::json;
+        // Large keys and "data"/"id" properties used to be omitted by the media walker.
+        let schema = json!({"type": "object", "properties": {
+            "data": {"const": "x".repeat(120_000)},
+            "id": {"enum": ["y".repeat(60_000)]},
+            "z".repeat(10_000): {"type": "number"}
+        }});
+        for body in [
+            json!({"response_format": {"type": "json_schema", "json_schema": {"schema": schema}}}),
+            json!({"text": {"format": {"type": "json_schema", "schema": schema}}}),
+            json!({"tools": [{"type": "function", "function": {"parameters": schema}}]}),
+            json!({"tools": [{"name": "test", "input_schema": schema}]}),
+            json!({"functions": [{"parameters": schema}]}),
+        ] {
+            let original = body.clone();
+            let features = UsageFeatures::from_json("chat_completion".into(), &body).unwrap();
+            assert!(features.text_bytes >= 190_000);
+            assert_eq!((features.images, features.unknown_media), (0, 0));
+            assert_eq!(body, original, "estimation must not alter inference");
+        }
     }
 }

@@ -5,6 +5,7 @@ pub mod agent_loop;
 pub mod api_key_cache;
 pub mod attestation;
 pub mod attestation_sdk;
+mod audio_duration;
 pub mod auth;
 mod aws_credentials;
 pub mod backend_affinity;

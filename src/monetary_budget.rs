@@ -47,7 +47,7 @@ pub(crate) async fn admit_for_model(
     let label = match kind {
         UsageType::ChatCompletion => "chat_completion",
         UsageType::ImageGeneration => "image_generation",
-        UsageType::AudioTranscription => "audio_transcription",
+        UsageType::AudioTranscription { .. } => "audio_transcription",
         _ => {
             return Err(AppError::BadRequest(
                 "Admission is unavailable for this inference type".into(),

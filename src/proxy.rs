@@ -544,7 +544,9 @@ pub enum UsageType {
     /// Privacy-filter responses report input usage per classified item under
     /// `data[].usage.input_tokens` rather than in a top-level usage object.
     PrivacyClassify,
-    AudioTranscription,
+    AudioTranscription {
+        duration_seconds: Option<i32>,
+    },
 }
 
 /// Shape of the reassembled non-streaming response when `proxy_json_request`
@@ -679,14 +681,16 @@ pub(crate) fn build_usage_body(
                 "id": id,
             }))
         }
-        UsageType::AudioTranscription => {
-            let seconds = response_data.get("duration")?.as_f64()?;
-            if !seconds.is_finite() || seconds <= 0.0 || seconds.ceil() > f64::from(i32::MAX) {
-                return None;
-            }
+        UsageType::AudioTranscription { duration_seconds } => {
+            let seconds = response_data
+                .get("duration")
+                .and_then(|value| value.as_f64().or_else(|| value.as_str()?.parse().ok()))
+                .filter(|n| n.is_finite() && *n > 0.0 && n.ceil() <= f64::from(i32::MAX))
+                .map(|n| n.ceil() as i32)
+                .or(*duration_seconds)?;
             Some(
                 serde_json::json!({"type":"audio_transcription", "model":model_name,
-                "duration_seconds":seconds.ceil() as i32, "id":id}),
+                "duration_seconds":seconds, "id":id}),
             )
         }
         UsageType::Embedding => input_only_usage_body("embedding", response_data, model_name, id),

@@ -309,6 +309,7 @@ pub async fn audio_transcriptions(
     let max_size = state.config.max_audio_request_size;
     let mut form = reqwest::multipart::Form::new();
     let mut total_size: usize = 0;
+    let mut duration_file = None;
     // Always hash the raw (original) bytes for signatures, matching the Python proxy.
     // When encryption is active, the prompt field is hashed in its encrypted form,
     // then decrypted for forwarding to the backend.
@@ -341,6 +342,9 @@ pub async fn audio_transcriptions(
             let data =
                 read_field_chunks(&mut field, &mut total_size, max_size, &mut hasher).await?;
             crate::model_list::guard_form_field(&state, &name, &data)?;
+            if name == "file" && auth.cloud_api_key.is_some() {
+                duration_file = Some(data.clone());
+            }
             let part = build_multipart_part(data, file_name, content_type)?;
             form = form.part(name, part);
         }
@@ -361,11 +365,19 @@ pub async fn audio_transcriptions(
         "/v1/audio/transcriptions",
     );
 
+    let duration_seconds = match duration_file {
+        Some(bytes) => tokio::task::spawn_blocking(move || crate::audio_duration::seconds(bytes))
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    let usage_type = UsageType::AudioTranscription { duration_seconds };
     let mut usage_reporter = make_usage_reporter(&auth, &state);
     if let Some(reporter) = &mut usage_reporter {
         crate::monetary_budget::admit(
             reporter,
-            &UsageType::AudioTranscription,
+            &usage_type,
             &serde_json::json!({"media_bytes": total_size}),
             1,
         )
@@ -380,7 +392,7 @@ pub async fn audio_transcriptions(
         model_label: None,
         model_request: None,
         usage_reporter,
-        usage_type: UsageType::AudioTranscription,
+        usage_type,
         request_hash: None,
         response_transform,
         chunk_transform: None,

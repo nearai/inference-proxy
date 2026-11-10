@@ -7,6 +7,8 @@ resolver = "3"
 publish = false
 
 [dependencies]
+# Demux uploaded audio for duration-only billing when the provider omits duration.
+symphonia = { version = "0.5.5", default-features = false, features = ["all-formats", "mp3", "flac"] }
 # Async runtime & web
 tokio = { version = "1.53.3", features = ["full"] }
 axum = { version = "0.8", features = ["multipart"] }
@@ -23,7 +25,7 @@ aws-sigv4 = { version = "1", default-features = false, features = ["sign-http", 
 aws-credential-types = "1.2"
 chrono = { version = "0.4", features = ["serde"] }
 # Usage envelope and payload, shared with the consumer
-cloud-platform-events = { git = "https://github.com/nearai/cloud-platform-events", rev = "e35e63b27e1fc000e4927e8de5b527c65fca1062" }
+cloud-platform-events = { git = "https://github.com/nearai/cloud-platform-events", rev = "ebf3d60357ecfc90be04c6fcb404ee22a2e17148" }
 
 # dstack SDK
 dstack-sdk = "0.1.3"

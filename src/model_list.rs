@@ -1097,12 +1097,22 @@ pub fn app_state(process: Process<'_>) -> anyhow::Result<AppState> {
         first_token_deadline_max_ms = config.first_token_deadline_max_ms,
         "Model list enabled"
     );
+    let usage_report_delivery = crate::usage_report::UsageReportDelivery::for_transport(
+        config.usage_report.clone(),
+        &config.usage_report_transport,
+    );
+    if config.cloud_api_url.is_some() {
+        usage_report_delivery.enable_outbox(
+            config.usage_outbox_dir.clone(),
+            http_client.clone(),
+            config.cloud_api_url.clone(),
+            config.cloud_api_usage_token.clone(),
+        )?;
+        usage_report_delivery.register_outbox_model_labels(models.iter().map(|model| model.label));
+    }
     Ok(AppState {
         api_key_cache: Default::default(),
-        usage_report_delivery: crate::usage_report::UsageReportDelivery::for_transport(
-            config.usage_report.clone(),
-            &config.usage_report_transport,
-        ),
+        usage_report_delivery,
         signing: Arc::new(signing),
         cache: Arc::new(crate::cache::ChatCache::new(
             &config.model_name,

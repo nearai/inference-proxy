@@ -4,3 +4,6 @@ oci.tar
 .DS_Store
 *.resolved.txt
 *.log
+
+# Durable local billing receipt spool (mount externally in production).
+/usage-outbox/

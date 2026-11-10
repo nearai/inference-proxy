@@ -640,6 +640,8 @@ pub struct Config {
     /// a bounded queue behind it, and a drain at shutdown. The default is one
     /// attempt with a 5 second timeout and none of the rest.
     pub usage_report: crate::usage_report::UsageReportPolicy,
+    /// Durable final receipts for admitted direct-key requests. Mount on persistent storage.
+    pub usage_outbox_dir: std::path::PathBuf,
     /// Where usage reports are sent (`VLLM_PROXY_USAGE_REPORT_TRANSPORT`):
     /// cloud-api over HTTP (the default) or the usage queue over SQS.
     pub usage_report_transport: crate::usage_report::UsageReportTransport,
@@ -1446,6 +1448,9 @@ impl Config {
                 .ok()
                 .filter(|s| !s.is_empty()),
             usage_report: usage_report_policy(&transport)?,
+            usage_outbox_dir: env::var_os("VLLM_PROXY_USAGE_OUTBOX_DIR")
+                .map(Into::into)
+                .unwrap_or_else(|| "usage-outbox".into()),
             usage_report_transport: transport,
             compose_manager_url,
             gpu_evidence_delegate_url: env::var("GPU_EVIDENCE_DELEGATE_URL")

@@ -578,9 +578,51 @@ queueing" refusal. The consequences are deliberate:
   startup: those modes place their own backend requests, which no tier
   restriction reaches.
 
+## Monetary admission and final receipts
+
+Direct Cloud API keys (`sk-`) call `POST {CLOUD_API_URL}/v1/internal/budget` before
+chat/completions, image generation/edit and audio transcription. A cached key check
+is identity validation only. The request carries authenticated IDs and locally
+measured counts, never prompts, outputs or media. Cloud API calculates the estimate
+and owns the shared organization/key hold. Trusted configuration-token requests
+already admitted by Cloud API do not reserve again. Inference parameters, output
+limits and existing multimedia support remain unchanged.
+
+The hold is fixed until settlement. Final usage carries its separate `admission_id`
+and the original provider ID. Cloud API or the queue worker charges full actual
+usage and clears the hold atomically; actual usage may exceed the estimate. An
+interrupted stream without final upstream usage retains its hold. Final counters
+already received are billable even if delivering them to the client fails.
+Audio needs an authoritative response duration; formats that omit it remain
+unsettled rather than being charged an invented duration.
+
+`VLLM_PROXY_USAGE_OUTBOX_DIR` (default `usage-outbox`) stores typed billing receipts
+before sending them through the configured HTTP/SQS transport. Use persistent
+storage unique to each replica; replacement instances must reopen that storage.
+It contains billing identifiers, counts, the configured discount and tracing metadata,
+not request content, API keys or credentials. Both single-model and model-list
+startup open the outbox. Failed writes/scans disable further monetary admission
+until storage is healthy. The proxy stores no balances or reservation ledger.
+
+A failed receipt stays on disk and is replayed on startup and every five seconds.
+Each pass uses the configured attempt timeout/retries/deadline, with up to eight
+receipts in parallel (fewer when `MAX_IN_FLIGHT` is lower). An accepted HTTP response
+or successful SQS send removes the file; a lost acknowledgement safely replays the
+same admission. Shutdown drain includes these files. Permanent rejections require
+operator repair; timeout does not release the monetary hold. The outbox pending
+metric and deferred receipt counter expose this backlog. A crash before final
+usage is durably captured leaves an unknown execution for reconciliation, never an
+automatic refund. No local mechanism can reconstruct an upstream bill that was
+never received.
+
+Embedding, rerank, privacy and score keep their existing report delivery. Admission
+requires the matching Cloud API endpoint and ledger schema, and SQS consumers must
+accept the additive `admission_id` and `audio_transcription` event before producers
+send them.
+
 ## Usage report delivery
 
-Every request made with a customer key ends with one usage report, to cloud-api
+For legacy reports without an admission, each customer-key request ends with one usage report, to cloud-api
 over HTTP (the default) or to the usage queue with `VLLM_PROXY_USAGE_REPORT_TRANSPORT=sqs`
 (step 6 above). Over SQS a report is validated and serialized once when it is
 submitted, and a report the queue cannot carry (over 256 KiB, or a field the

@@ -1,3 +1,5 @@
+#[path = "budget.rs"]
+pub(crate) mod budget_fixture;
 use std::sync::Arc;
 
 use axum::middleware;
@@ -33,6 +35,7 @@ pub(crate) fn test_signing_pair() -> signing::SigningPair {
 pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::Router {
     let base = mock_url.trim_end_matches('/');
     let config = config::Config {
+        usage_outbox_dir: "unused-test-outbox".into(),
         model_list: None,
         replica_state: None,
         model_name: "test-model".to_string(),
@@ -186,10 +189,11 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         mock_url.to_string(),
     ]));
 
+    let usage_report_delivery = budget_fixture::delivery(&config);
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),
-        usage_report_delivery: Default::default(),
+        usage_report_delivery,
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),

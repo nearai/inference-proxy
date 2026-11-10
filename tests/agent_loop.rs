@@ -5,6 +5,9 @@
 //! endpoint. The test app wires them up via `web_context_search_url` and
 //! `VLLM_BACKEND_URLS` in `Config`.
 
+#[path = "common/budget.rs"]
+mod budget_fixture;
+
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -39,6 +42,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
 ) -> axum::Router {
     let base = upstream_mock_url.trim_end_matches('/');
     let config = config::Config {
+        usage_outbox_dir: "unused-test-outbox".into(),
         model_list: None,
         replica_state: None,
         model_name: "test-model".to_string(),
@@ -189,10 +193,11 @@ fn build_agent_loop_app_with_cloud_and_idle(
         upstream_mock_url.to_string(),
     ]));
 
+    let usage_report_delivery = budget_fixture::delivery(&config);
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),
-        usage_report_delivery: Default::default(),
+        usage_report_delivery,
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),
@@ -1814,14 +1819,13 @@ async fn brave_formatted_output_is_truncated() {
     );
 }
 
-/// Regression test for nearai/infra#98: an interrupted agent loop (the final
-/// upstream turn carries usage but is cut off before `[DONE]`) must still bill
-/// the tokens already produced — while still withholding the signature, since
-/// the response is incomplete and cannot be verified.
+/// An interrupted loop must retain its admission: partial cumulative usage cannot
+/// release the unobserved remainder, and an incomplete response has no signature.
 #[tokio::test]
-async fn interrupted_agent_loop_reports_usage_without_signature() {
+async fn interrupted_agent_loop_retains_budget_without_final_receipt() {
     let upstream = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     // sk- key validation succeeds → usage reporter is active for this request.
     // Identity fields enable the service-token /v1/internal/usage reporting path.
@@ -1885,23 +1889,17 @@ async fn interrupted_agent_loop_reports_usage_without_signature() {
     // Drain the stream so the spawned loop task runs to completion.
     let _ = response.into_body().collect().await;
 
-    // Usage is reported (fire-and-forget) even though the stream never saw [DONE].
-    let mut usage_body = None;
-    for _ in 0..50 {
-        let reqs = cloud_api.received_requests().await.unwrap();
-        if let Some(req) = reqs.iter().find(|r| r.url.path() == "/v1/internal/usage") {
-            usage_body = Some(serde_json::from_slice::<serde_json::Value>(&req.body).unwrap());
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    let usage = usage_body.expect("interrupted agent loop must still report usage");
-    assert_eq!(usage["type"], "chat_completion");
-    // Latest cumulative usage, NOT the sum of the per-chunk cumulative values
-    // (summing the 3 chunks would overbill to 45 in / 6 out).
-    assert_eq!(usage["input_tokens"], 15);
-    assert_eq!(usage["output_tokens"], 3);
-    assert_eq!(usage["id"], "chatcmpl-INT");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let requests = cloud_api.received_requests().await.unwrap();
+    assert!(!requests
+        .iter()
+        .any(|r| r.url.path() == "/v1/internal/usage"));
+    let admission = requests
+        .iter()
+        .find(|r| r.url.path() == "/v1/internal/budget")
+        .expect("loop must reserve before dispatch");
+    let metadata: serde_json::Value = serde_json::from_slice(&admission.body).unwrap();
+    assert!(metadata["features"]["executions"].as_i64().unwrap() > 1);
 
     // ...but no signature is cached over the incomplete response.
     let sig_response = app_for_sig

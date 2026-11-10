@@ -75,6 +75,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
         cloud_api_usage_token: None,
+        usage_outbox_dir: "unused-benchmark-outbox".into(),
         usage_report: Default::default(),
         usage_report_transport: Default::default(),
         compose_manager_url: None,

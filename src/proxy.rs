@@ -322,9 +322,9 @@ fn message_is_allowed_media_domain_error(message: &str) -> bool {
 /// posting to a deleted endpoint.
 #[derive(Clone)]
 pub struct UsageReporter {
+    pub budget_report_id: Option<String>,
     pub http_client: reqwest::Client,
-    /// cloud-api's base URL. Required over HTTP; the SQS transport does not
-    /// post to cloud-api and carries none.
+    /// cloud-api's base URL. Required for synchronous admission with either report transport.
     pub cloud_api_url: Option<String>,
     pub model_name: String,
     /// Shared infrastructure token for the service-token reporting path.
@@ -544,6 +544,7 @@ pub enum UsageType {
     /// Privacy-filter responses report input usage per classified item under
     /// `data[].usage.input_tokens` rather than in a top-level usage object.
     PrivacyClassify,
+    AudioTranscription,
 }
 
 /// Shape of the reassembled non-streaming response when `proxy_json_request`
@@ -591,12 +592,6 @@ pub fn make_usage_reporter_for(
     usage_reporter(auth, state, model.id, model.discount_to_user, model.label)
 }
 
-/// Whether a reporter may exist: over HTTP the report is posted to cloud-api,
-/// so there must be its URL. The SQS transport sends to the queue and needs none.
-fn may_report(cloud_api_url: Option<&str>, is_http: bool) -> bool {
-    cloud_api_url.is_some() || !is_http
-}
-
 fn usage_reporter(
     auth: &crate::auth::RequireAuth,
     state: &AppState,
@@ -609,13 +604,8 @@ fn usage_reporter(
     // below, not the sk-.
     auth.cloud_api_key.as_ref()?;
     let cloud_api_url = state.config.cloud_api_url.clone();
-    if !may_report(
-        cloud_api_url.as_deref(),
-        state.usage_report_delivery.is_http(),
-    ) {
-        return None;
-    }
     Some(UsageReporter {
+        budget_report_id: None,
         http_client: state.http_client.clone(),
         cloud_api_url,
         model_name: model_name.to_string(),
@@ -688,6 +678,16 @@ pub(crate) fn build_usage_body(
                 "image_count": count,
                 "id": id,
             }))
+        }
+        UsageType::AudioTranscription => {
+            let seconds = response_data.get("duration")?.as_f64()?;
+            if !seconds.is_finite() || seconds <= 0.0 || seconds.ceil() > f64::from(i32::MAX) {
+                return None;
+            }
+            Some(
+                serde_json::json!({"type":"audio_transcription", "model":model_name,
+                "duration_seconds":seconds.ceil() as i32, "id":id}),
+            )
         }
         UsageType::Embedding => input_only_usage_body("embedding", response_data, model_name, id),
         UsageType::Rerank => input_only_usage_body("rerank", response_data, model_name, id),
@@ -812,11 +812,9 @@ pub(crate) fn report_chat_usage_if_present(
     true
 }
 
-/// Report token usage to cloud-api when a streaming response finalizes — even if
-/// it did NOT complete cleanly (client disconnect, upstream error, or no `[DONE]`).
-/// Billing must not depend on a clean `[DONE]` (nearai/infra#98): the tokens were
-/// already produced. The caller keeps signing/caching gated on clean completion;
-/// a partial response cannot be verified, but it was still billed.
+/// Settle admitted streaming work only with final usage. An interrupted stream's
+/// counters may omit billable upstream work, so its full reservation stays held.
+/// Legacy reporters without an admission retain their partial-usage behavior.
 ///
 /// The reporter only exists for direct `sk-` requests
 /// (`RequireAuth.cloud_api_key`); cloud-api's own `InterceptStream` is not in
@@ -825,7 +823,7 @@ fn report_stream_usage_on_finalize(
     usage_reporter: &Option<UsageReporter>,
     usage: Option<((i64, i64), Option<i64>)>,
     chat_id: Option<&str>,
-    completed_cleanly: bool,
+    has_final_usage: bool,
     log_request_id: &str,
     log_org_id: &str,
     log_workspace_id: &str,
@@ -833,6 +831,9 @@ fn report_stream_usage_on_finalize(
     let Some(reporter) = usage_reporter else {
         return;
     };
+    if reporter.budget_report_id.is_some() && !has_final_usage {
+        return;
+    }
     match (usage, chat_id) {
         (Some(((input, output), cache_read_tokens)), Some(id)) => {
             let body = serde_json::json!({
@@ -844,7 +845,7 @@ fn report_stream_usage_on_finalize(
                 "id": id,
             });
             spawn_usage_report(reporter, body);
-            if !completed_cleanly {
+            if !has_final_usage {
                 info!(
                     request_id = %log_request_id,
                     org_id = %log_org_id,
@@ -886,6 +887,9 @@ pub(crate) fn complete_usage_body(
         serde_json::Value::String(_) => return Err("string"),
         serde_json::Value::Array(_) => return Err("array"),
     };
+    if let Some(id) = &reporter.budget_report_id {
+        map.insert("admission_id".into(), serde_json::Value::String(id.clone()));
+    }
     let identity = [
         ("organization_id", &reporter.org_id),
         ("workspace_id", &reporter.workspace_id),
@@ -1272,6 +1276,15 @@ async fn send_upstream(
     opts: &mut ProxyOpts,
     endpoint: &'static str,
 ) -> Result<reqwest::Response, AppError> {
+    let admitted_kind = matches!(
+        opts.usage_type,
+        UsageType::ChatCompletion | UsageType::ImageGeneration
+    );
+    if let Some(reporter) = opts.usage_reporter.as_mut().filter(|_| admitted_kind) {
+        let json: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|_| AppError::BadRequest("Invalid JSON body".into()))?;
+        crate::monetary_budget::admit(reporter, &opts.usage_type, &json, 1).await?;
+    }
     let upstream_start = std::time::Instant::now();
     // The lane's time-to-first-token clock starts here. The engine sends the
     // SSE response headers only once it has something to say, so measuring
@@ -1782,6 +1795,7 @@ async fn proxy_json_request_inner(
         .map(|ct| ct.contains("text/event-stream"))
         .unwrap_or(false);
 
+    let mut has_final_usage = !is_sse;
     let mut response_data = if is_sse {
         // Consume the SSE stream and reassemble into a non-streaming response.
         let mut assembler = StreamingResponseAssembler::new(opts.response_shape);
@@ -1934,6 +1948,7 @@ async fn proxy_json_request_inner(
                 "Upstream stream terminated without declaring a finish reason"
             );
         }
+        has_final_usage = stream_parser.seen_done;
         assembler.into_response(&opts.id_prefix)
     } else {
         // Backend returned plain JSON — process as before.
@@ -1993,7 +2008,14 @@ async fn proxy_json_request_inner(
 
     // Report usage for cloud API key requests (before encryption, needs plaintext fields)
     let chat_id = response_data["id"].as_str().unwrap_or("").to_string();
-    try_report_usage(&response_data, &chat_id, &opts);
+    if has_final_usage
+        || opts
+            .usage_reporter
+            .as_ref()
+            .is_none_or(|reporter| reporter.budget_report_id.is_none())
+    {
+        try_report_usage(&response_data, &chat_id, &opts);
+    }
 
     // Keep plaintext usage values for bounded completion metrics after every
     // fallible transform, serialization, and signing step has succeeded.
@@ -3107,17 +3129,13 @@ async fn proxy_streaming_request_inner(
             );
         }
 
-        // Bill for the tokens the backend already produced, even when the stream
-        // did NOT finish cleanly (nearai/infra#98). With continuous_usage_stats
-        // forced on cloud-key streaming (routes/chat.rs, routes/completions.rs),
-        // `parser.usage` holds the running cumulative counts from the last chunk
-        // we saw — the best figure at the point of interruption. Signing/caching
-        // stays gated on a clean [DONE] below.
+        // Billing follows authoritative upstream completion, even if sending/encrypting
+        // the already-read final chunk failed. Signing still requires downstream success.
         report_stream_usage_on_finalize(
             &usage_reporter,
             parser.usage.map(|usage| (usage, parser.cached_tokens)),
             parser.chat_id.as_deref(),
-            completed_cleanly,
+            parser.seen_done && !error_event_seen,
             &log_request_id,
             &log_org_id,
             &log_workspace_id,
@@ -4061,6 +4079,7 @@ mod tests {
         api_key_id: Option<&str>,
     ) -> UsageReporter {
         UsageReporter {
+            budget_report_id: None,
             http_client: reqwest::Client::new(),
             cloud_api_url: Some("http://cloud-api.invalid".to_string()),
             model_name: "test-model".to_string(),
@@ -4079,6 +4098,187 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn monetary_admission_denial_never_dispatches_upstream() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let ledger = MockServer::start().await;
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/internal/budget"))
+            .respond_with(ResponseTemplate::new(402))
+            .expect(1)
+            .mount(&ledger)
+            .await;
+        let mut opts = test_proxy_opts();
+        let mut reporter = reporter_with(Some("test-token"), Some("org"), Some("ws"), Some("key"));
+        reporter.cloud_api_url = Some(ledger.uri());
+        let _outbox = tempfile::tempdir().unwrap();
+        reporter
+            .delivery
+            .enable_outbox(
+                _outbox.path().into(),
+                reporter.http_client.clone(),
+                reporter.cloud_api_url.clone(),
+                reporter.cloud_api_usage_token.clone(),
+            )
+            .unwrap();
+        opts.usage_reporter = Some(reporter);
+        let mut url = format!("{}/v1/chat/completions", upstream.uri());
+        let result = send_upstream(
+            &reqwest::Client::new(),
+            &mut url,
+            Bytes::from_static(br#"{"model":"test-model","messages":[]}"#),
+            &mut opts,
+            "test",
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::InsufficientCredits)));
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn monetary_admission_preserves_request_and_receipt_identity_is_stable() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+        let ledger = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/internal/budget"))
+            .respond_with(|request: &Request| {
+                let metadata: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert!(metadata.get("messages").is_none());
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id":metadata["id"], "model":"test-model", "max_output_tokens":16
+                }))
+            })
+            .expect(2)
+            .mount(&ledger)
+            .await;
+        let mut reporter = reporter_with(Some("test-token"), Some("org"), Some("ws"), Some("key"));
+        reporter.cloud_api_url = Some(ledger.uri());
+        let _outbox = tempfile::tempdir().unwrap();
+        reporter
+            .delivery
+            .enable_outbox(
+                _outbox.path().into(),
+                reporter.http_client.clone(),
+                reporter.cloud_api_url.clone(),
+                reporter.cloud_api_usage_token.clone(),
+            )
+            .unwrap();
+        let body = serde_json::json!({"messages":[{"role":"user","content":"synthetic"}],"max_completion_tokens":16});
+        crate::monetary_budget::admit(&mut reporter, &UsageType::ChatCompletion, &body, 1)
+            .await
+            .unwrap();
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(body["max_completion_tokens"], 16);
+        let original_id = reporter.budget_report_id.clone().unwrap();
+        let response = serde_json::json!({"usage":{"prompt_tokens":2,"completion_tokens":3}});
+        let mut first = build_usage_body(
+            &UsageType::ChatCompletion,
+            &response,
+            "test-model",
+            "provider-id",
+        )
+        .unwrap();
+        complete_usage_body(&reporter, &mut first).unwrap();
+        let mut retry = first.clone();
+        complete_usage_body(&reporter, &mut retry).unwrap();
+        assert_eq!(first, retry);
+        assert_eq!(first["id"], "provider-id");
+        assert_eq!(first["admission_id"], original_id);
+        crate::monetary_budget::admit(&mut reporter, &UsageType::ChatCompletion, &body, 1)
+            .await
+            .unwrap();
+        assert_ne!(
+            reporter.budget_report_id.as_deref(),
+            Some(original_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn monetary_admission_covers_batched_prompts_and_best_of() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+        let ledger = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/internal/budget"))
+            .respond_with(|request: &Request| {
+                let metadata: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(metadata["features"]["choices"], 5);
+                assert!(metadata.get("prompt").is_none());
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id":metadata["id"], "model":"test-model", "max_output_tokens":16
+                }))
+            })
+            .expect(3)
+            .mount(&ledger)
+            .await;
+        for (prompt, batch) in [
+            (serde_json::json!(["a", "b", "c"]), 3),
+            (serde_json::json!([[1, 2], [3, 4]]), 2),
+            (serde_json::json!([1, 2, 3]), 1),
+        ] {
+            let mut reporter =
+                reporter_with(Some("test-token"), Some("org"), Some("ws"), Some("key"));
+            reporter.cloud_api_url = Some(ledger.uri());
+            let _outbox = tempfile::tempdir().unwrap();
+            reporter
+                .delivery
+                .enable_outbox(
+                    _outbox.path().into(),
+                    reporter.http_client.clone(),
+                    reporter.cloud_api_url.clone(),
+                    reporter.cloud_api_usage_token.clone(),
+                )
+                .unwrap();
+            let body = serde_json::json!({"prompt":prompt,"n":2,"best_of":5,"max_tokens":16});
+            crate::monetary_budget::admit(&mut reporter, &UsageType::ChatCompletion, &body, 1)
+                .await
+                .unwrap();
+            let requests = ledger.received_requests().await.unwrap();
+            let metadata: serde_json::Value =
+                serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+            assert_eq!(metadata["features"]["batch_items"], batch);
+        }
+    }
+
+    #[tokio::test]
+    async fn monetary_admission_missing_configuration_or_bad_reply_fails_closed() {
+        let mut reporter = reporter_with(None, Some("org"), Some("ws"), Some("key"));
+        let body = serde_json::json!({});
+        assert!(
+            crate::monetary_budget::admit(&mut reporter, &UsageType::ChatCompletion, &body, 1)
+                .await
+                .is_err()
+        );
+        assert!(reporter.budget_report_id.is_none());
+        let ledger = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"id":"wrong","model":"test-model","max_output_tokens":16}),
+            ))
+            .mount(&ledger)
+            .await;
+        reporter.cloud_api_usage_token = Some("test-token".into());
+        reporter.cloud_api_url = Some(ledger.uri());
+        let _outbox = tempfile::tempdir().unwrap();
+        reporter
+            .delivery
+            .enable_outbox(
+                _outbox.path().into(),
+                reporter.http_client.clone(),
+                reporter.cloud_api_url.clone(),
+                reporter.cloud_api_usage_token.clone(),
+            )
+            .unwrap();
+        assert!(
+            crate::monetary_budget::admit(&mut reporter, &UsageType::ChatCompletion, &body, 1)
+                .await
+                .is_err()
+        );
+        assert!(reporter.budget_report_id.is_none());
+    }
     #[test]
     fn test_can_use_service_token_path_requires_all_fields() {
         // Token + all three identity fields: green light.
@@ -4110,15 +4310,6 @@ mod tests {
 
         // Nothing configured: reporting is skipped.
         assert!(!reporter_with(None, None, None, None).can_use_service_token_path());
-    }
-
-    /// The reporter's cloud-api URL is required over HTTP and not over SQS.
-    #[test]
-    fn the_reporter_gate_needs_cloud_api_only_over_http() {
-        assert!(may_report(Some("https://cloud"), true));
-        assert!(!may_report(None, true));
-        assert!(may_report(None, false));
-        assert!(may_report(Some("https://cloud"), false));
     }
 
     /// The SQS transport sends to the queue: it needs neither cloud-api's URL
@@ -4867,6 +5058,98 @@ mod tests {
         "\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
         "data: [DONE]\n\n"
     );
+
+    #[tokio::test]
+    async fn admitted_sse_receipts_require_upstream_completion_not_downstream_delivery() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+        for final_usage in [false, true] {
+            let ledger = MockServer::start().await;
+            let upstream = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/internal/budget"))
+                .respond_with(|request: &Request| {
+                    let metadata: serde_json::Value =
+                        serde_json::from_slice(&request.body).unwrap();
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id":metadata["id"], "model":"test-model"
+                    }))
+                })
+                .expect(1)
+                .mount(&ledger)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/v1/internal/usage"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(u64::from(final_usage))
+                .mount(&ledger)
+                .await;
+            let body = if final_usage {
+                VALID_CHAT_SSE
+            } else {
+                VALID_CHAT_SSE.strip_suffix("data: [DONE]\n\n").unwrap()
+            };
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+                .mount(&upstream)
+                .await;
+            let mut reporter =
+                reporter_with(Some("test-token"), Some("org"), Some("ws"), Some("key"));
+            reporter.cloud_api_url = Some(ledger.uri());
+            let outbox = tempfile::tempdir().unwrap();
+            reporter
+                .delivery
+                .enable_outbox(
+                    outbox.path().into(),
+                    reporter.http_client.clone(),
+                    reporter.cloud_api_url.clone(),
+                    reporter.cloud_api_usage_token.clone(),
+                )
+                .unwrap();
+            let delivery = reporter.delivery.clone();
+            let mut opts = test_proxy_opts();
+            opts.usage_reporter = Some(reporter);
+            let url = format!("{}/v1/chat/completions", upstream.uri());
+            if final_usage {
+                opts.chunk_transform = Some(Arc::new(|_| {
+                    Err(AppError::Internal(anyhow::anyhow!(
+                        "injected transform failure"
+                    )))
+                }));
+                let response = proxy_streaming_request(
+                    &reqwest::Client::new(),
+                    &url,
+                    br#"{"model":"test-model","stream":true,"messages":[]}"#.to_vec(),
+                    opts,
+                )
+                .await
+                .unwrap();
+                assert!(axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .is_err());
+            } else {
+                // The existing idle-timeout=0 behavior can assemble a partial JSON response.
+                // Preserve that response while retaining its unsettled reservation.
+                let response = proxy_json_request(
+                    &reqwest::Client::new(),
+                    &url,
+                    br#"{"model":"test-model","messages":[]}"#.to_vec(),
+                    opts,
+                )
+                .await
+                .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            assert_eq!(
+                delivery
+                    .drain(std::time::Duration::from_secs(5))
+                    .await
+                    .left(),
+                0
+            );
+            ledger.verify().await;
+        }
+    }
 
     const ROLE_ONLY_CHAT_SSE: &str = concat!(
         "data: {\"id\":\"chat-hidden-reasoning\",\"model\":\"test-model\",",

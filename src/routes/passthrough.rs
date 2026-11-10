@@ -200,6 +200,7 @@ pub async fn images_edits(
     let max_size = state.config.max_image_request_size;
     let mut form = reqwest::multipart::Form::new();
     let mut total_size: usize = 0;
+    let mut requested_images = 1_u64;
     let mut hasher = sha2::Sha256::new();
 
     while let Some(mut field) = multipart
@@ -228,6 +229,12 @@ pub async fn images_edits(
         } else {
             let data =
                 read_field_chunks(&mut field, &mut total_size, max_size, &mut hasher).await?;
+            if name == "n" {
+                requested_images = std::str::from_utf8(&data)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1);
+            }
             crate::model_list::guard_form_field(&state, &name, &data)?;
             let part = build_multipart_part(data, file_name, content_type)?;
             form = form.part(name, part);
@@ -249,6 +256,17 @@ pub async fn images_edits(
         "/v1/images/edits",
     );
 
+    let mut usage_reporter = make_usage_reporter(&auth, &state);
+    if let Some(reporter) = &mut usage_reporter {
+        crate::monetary_budget::admit(
+            reporter,
+            &UsageType::ImageGeneration,
+            &serde_json::json!({"n": requested_images}),
+            1,
+        )
+        .await?;
+    }
+
     let opts = ProxyOpts {
         signing: state.signing.clone(),
         cache: state.cache.clone(),
@@ -256,7 +274,7 @@ pub async fn images_edits(
         model_name: state.config.model_name.clone(),
         model_label: None,
         model_request: None,
-        usage_reporter: make_usage_reporter(&auth, &state),
+        usage_reporter,
         usage_type: UsageType::ImageGeneration,
         request_hash: None,
         response_transform,
@@ -343,6 +361,17 @@ pub async fn audio_transcriptions(
         "/v1/audio/transcriptions",
     );
 
+    let mut usage_reporter = make_usage_reporter(&auth, &state);
+    if let Some(reporter) = &mut usage_reporter {
+        crate::monetary_budget::admit(
+            reporter,
+            &UsageType::AudioTranscription,
+            &serde_json::json!({"media_bytes": total_size}),
+            1,
+        )
+        .await?;
+    }
+
     let opts = ProxyOpts {
         signing: state.signing.clone(),
         cache: state.cache.clone(),
@@ -350,8 +379,8 @@ pub async fn audio_transcriptions(
         model_name: state.config.model_name.clone(),
         model_label: None,
         model_request: None,
-        usage_reporter: make_usage_reporter(&auth, &state),
-        usage_type: UsageType::ChatCompletion,
+        usage_reporter,
+        usage_type: UsageType::AudioTranscription,
         request_hash: None,
         response_transform,
         chunk_transform: None,

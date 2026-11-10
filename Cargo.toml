@@ -23,7 +23,7 @@ aws-sigv4 = { version = "1", default-features = false, features = ["sign-http", 
 aws-credential-types = "1.2"
 chrono = { version = "0.4", features = ["serde"] }
 # Usage envelope and payload, shared with the consumer
-cloud-platform-events = { git = "https://github.com/nearai/cloud-platform-events", tag = "v1.1.0" }
+cloud-platform-events = { git = "https://github.com/nearai/cloud-platform-events", rev = "e35e63b27e1fc000e4927e8de5b527c65fca1062" }
 
 # dstack SDK
 dstack-sdk = "0.1.3"

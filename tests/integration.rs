@@ -206,7 +206,6 @@ fn build_test_app_inner_with_pool(
     };
 
     let config = config::Config {
-        usage_outbox_dir: "unused-test-outbox".into(),
         model_list: None,
         replica_state: None,
         model_name: "test-model".to_string(),
@@ -383,7 +382,8 @@ fn build_test_app_inner_with_pool(
         ),
     );
 
-    let usage_report_delivery = budget_fixture::delivery(&config);
+    let usage_report_delivery =
+        vllm_proxy_rs::usage_report::UsageReportDelivery::new(config.usage_report.clone());
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),
@@ -6551,7 +6551,6 @@ fn build_test_app_with_cloud_api_retries(
     let base = mock_url.trim_end_matches('/');
 
     let config = config::Config {
-        usage_outbox_dir: "unused-test-outbox".into(),
         model_list: None,
         replica_state: None,
         model_name: "test-model".to_string(),
@@ -6709,7 +6708,8 @@ fn build_test_app_with_cloud_api_retries(
         mock_url.to_string(),
     ]));
 
-    let usage_report_delivery = budget_fixture::delivery(&config);
+    let usage_report_delivery =
+        vllm_proxy_rs::usage_report::UsageReportDelivery::new(config.usage_report.clone());
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),
@@ -9223,7 +9223,6 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
     ];
 
     let config = config::Config {
-        usage_outbox_dir: "unused-test-outbox".into(),
         model_list: None,
         replica_state: None,
         model_name: "test-model".to_string(),
@@ -9376,7 +9375,8 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
 
     let backend_pool = Arc::new(backend_pool::BackendPool::new(vec![mock_url.to_string()]));
 
-    let usage_report_delivery = budget_fixture::delivery(&config);
+    let usage_report_delivery =
+        vllm_proxy_rs::usage_report::UsageReportDelivery::new(config.usage_report.clone());
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),
@@ -9700,7 +9700,6 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
     let port = listener.local_addr().unwrap().port();
 
     let config = config::Config {
-        usage_outbox_dir: "unused-test-outbox".into(),
         model_list: None,
         replica_state: None,
         model_name: "test-model".to_string(),
@@ -9844,7 +9843,8 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         .handle();
     let backend_pool = Arc::new(backend_pool::BackendPool::new(vec![mock_url.to_string()]));
 
-    let usage_report_delivery = budget_fixture::delivery(&config);
+    let usage_report_delivery =
+        vllm_proxy_rs::usage_report::UsageReportDelivery::new(config.usage_report.clone());
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),

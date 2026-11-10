@@ -27,9 +27,6 @@ pub(crate) async fn admit_for_model(
         message: "Monetary admission unavailable".into(),
         error_type: "budget_admission_error".into(),
     };
-    if !reporter.delivery.admission_ready() {
-        return Err(unavailable());
-    }
     let base = reporter.cloud_api_url.as_deref().ok_or_else(unavailable)?;
     let token = reporter
         .cloud_api_usage_token

@@ -42,7 +42,6 @@ fn build_agent_loop_app_with_cloud_and_idle(
 ) -> axum::Router {
     let base = upstream_mock_url.trim_end_matches('/');
     let config = config::Config {
-        usage_outbox_dir: "unused-test-outbox".into(),
         model_list: None,
         replica_state: None,
         model_name: "test-model".to_string(),
@@ -193,7 +192,8 @@ fn build_agent_loop_app_with_cloud_and_idle(
         upstream_mock_url.to_string(),
     ]));
 
-    let usage_report_delivery = budget_fixture::delivery(&config);
+    let usage_report_delivery =
+        vllm_proxy_rs::usage_report::UsageReportDelivery::new(config.usage_report.clone());
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),

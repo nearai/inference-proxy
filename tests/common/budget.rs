@@ -15,27 +15,3 @@ pub async fn mount(server: &MockServer) {
         .mount(server)
         .await;
 }
-
-/// Each test process uses an isolated spool, just as a deployed replica does.
-pub fn delivery(
-    config: &vllm_proxy_rs::config::Config,
-) -> std::sync::Arc<vllm_proxy_rs::usage_report::UsageReportDelivery> {
-    let delivery =
-        vllm_proxy_rs::usage_report::UsageReportDelivery::new(config.usage_report.clone());
-    if config.cloud_api_url.is_some() {
-        let dir = tempfile::Builder::new()
-            .prefix("nearai-estimated-admission-test-")
-            .tempdir()
-            .unwrap()
-            .keep();
-        delivery
-            .enable_outbox(
-                dir,
-                reqwest::Client::new(),
-                config.cloud_api_url.clone(),
-                config.cloud_api_usage_token.clone(),
-            )
-            .unwrap();
-    }
-    delivery
-}

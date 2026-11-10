@@ -100,15 +100,12 @@ impl Drop for Place {
 
 impl UsageReportDelivery {
     pub(super) fn is_idle(&self) -> bool {
-        self.state().is_idle() && self.outbox.get().is_none_or(|outbox| outbox.pending() == 0)
+        self.state().is_idle()
     }
 
     pub fn pending(&self) -> (usize, usize) {
         let state = self.state();
-        (
-            state.waiting.len() + self.outbox.get().map_or(0, |outbox| outbox.pending()),
-            state.in_flight,
-        )
+        (state.waiting.len(), state.in_flight)
     }
 
     pub(super) fn state(&self) -> MutexGuard<'_, State> {
@@ -118,12 +115,6 @@ impl UsageReportDelivery {
     }
 
     pub(crate) fn submit(self: &Arc<Self>, mut job: Job) {
-        if job.reporter.budget_report_id.is_some() {
-            if let Err(error) = self.persist_admitted(&job) {
-                tracing::error!(error = %error, "Final receipt persistence failed; hold retained and further admission disabled");
-            }
-            return;
-        }
         if let Err(refused) = self.sender.prepare(&mut job) {
             return self.give_up(&job, GiveUp::Refused(refused));
         }

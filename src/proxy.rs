@@ -4117,16 +4117,6 @@ mod tests {
         let mut opts = test_proxy_opts();
         let mut reporter = reporter_with(Some("test-token"), Some("org"), Some("ws"), Some("key"));
         reporter.cloud_api_url = Some(ledger.uri());
-        let _outbox = tempfile::tempdir().unwrap();
-        reporter
-            .delivery
-            .enable_outbox(
-                _outbox.path().into(),
-                reporter.http_client.clone(),
-                reporter.cloud_api_url.clone(),
-                reporter.cloud_api_usage_token.clone(),
-            )
-            .unwrap();
         opts.usage_reporter = Some(reporter);
         let mut url = format!("{}/v1/chat/completions", upstream.uri());
         let result = send_upstream(
@@ -4160,16 +4150,6 @@ mod tests {
             .await;
         let mut reporter = reporter_with(Some("test-token"), Some("org"), Some("ws"), Some("key"));
         reporter.cloud_api_url = Some(ledger.uri());
-        let _outbox = tempfile::tempdir().unwrap();
-        reporter
-            .delivery
-            .enable_outbox(
-                _outbox.path().into(),
-                reporter.http_client.clone(),
-                reporter.cloud_api_url.clone(),
-                reporter.cloud_api_usage_token.clone(),
-            )
-            .unwrap();
         let body = serde_json::json!({"messages":[{"role":"user","content":"synthetic"}],"max_completion_tokens":16});
         crate::monetary_budget::admit(&mut reporter, &UsageType::ChatCompletion, &body, 1)
             .await
@@ -4226,16 +4206,6 @@ mod tests {
             let mut reporter =
                 reporter_with(Some("test-token"), Some("org"), Some("ws"), Some("key"));
             reporter.cloud_api_url = Some(ledger.uri());
-            let _outbox = tempfile::tempdir().unwrap();
-            reporter
-                .delivery
-                .enable_outbox(
-                    _outbox.path().into(),
-                    reporter.http_client.clone(),
-                    reporter.cloud_api_url.clone(),
-                    reporter.cloud_api_usage_token.clone(),
-                )
-                .unwrap();
             let body = serde_json::json!({"prompt":prompt,"n":2,"best_of":5,"max_tokens":16});
             crate::monetary_budget::admit(&mut reporter, &UsageType::ChatCompletion, &body, 1)
                 .await
@@ -4266,16 +4236,6 @@ mod tests {
             .await;
         reporter.cloud_api_usage_token = Some("test-token".into());
         reporter.cloud_api_url = Some(ledger.uri());
-        let _outbox = tempfile::tempdir().unwrap();
-        reporter
-            .delivery
-            .enable_outbox(
-                _outbox.path().into(),
-                reporter.http_client.clone(),
-                reporter.cloud_api_url.clone(),
-                reporter.cloud_api_usage_token.clone(),
-            )
-            .unwrap();
         assert!(
             crate::monetary_budget::admit(&mut reporter, &UsageType::ChatCompletion, &body, 1)
                 .await
@@ -5100,16 +5060,6 @@ mod tests {
             let mut reporter =
                 reporter_with(Some("test-token"), Some("org"), Some("ws"), Some("key"));
             reporter.cloud_api_url = Some(ledger.uri());
-            let outbox = tempfile::tempdir().unwrap();
-            reporter
-                .delivery
-                .enable_outbox(
-                    outbox.path().into(),
-                    reporter.http_client.clone(),
-                    reporter.cloud_api_url.clone(),
-                    reporter.cloud_api_usage_token.clone(),
-                )
-                .unwrap();
             let delivery = reporter.delivery.clone();
             let mut opts = test_proxy_opts();
             opts.usage_reporter = Some(reporter);

@@ -109,13 +109,7 @@ fn start(list: Option<&Value>, env: &[(&str, &str)], metrics: Option<PrometheusH
     for (key, _) in &vars {
         std::env::remove_var(key);
     }
-    let mut config = config.expect("valid configuration");
-    config.usage_outbox_dir = tempfile::Builder::new()
-        .prefix("nearai-estimated-admission-test-")
-        .tempdir()
-        .unwrap()
-        .keep();
-    let config = Arc::new(config);
+    let config = Arc::new(config.expect("valid configuration"));
     assert_eq!(config.model_list.is_some(), list.is_some());
     // The total request bound `main` gives its HTTP clients.
     let timeout = Duration::from_secs(config.timeout_secs);
@@ -189,7 +183,8 @@ fn single_model_state(process: model_list::Process<'_>) -> AppState {
         backend_pool.len(),
         Duration::from_secs(config.backend_probe_interval_secs) * 3,
     ));
-    let usage_report_delivery = budget_fixture::delivery(&config);
+    let usage_report_delivery =
+        vllm_proxy_rs::usage_report::UsageReportDelivery::new(config.usage_report.clone());
     AppState {
         signing: Arc::new(signing),
         cache: Arc::new(cache::ChatCache::new(
@@ -3920,14 +3915,8 @@ impl Binary {
             let mut list_file = tempfile::NamedTempFile::new().unwrap();
             list_file.write_all(list.to_string().as_bytes()).unwrap();
             let log = tempfile::NamedTempFile::new().unwrap();
-            let outbox = tempfile::Builder::new()
-                .prefix("nearai-estimated-admission-test-")
-                .tempdir()
-                .unwrap()
-                .keep();
             let child = std::process::Command::new(env!("CARGO_BIN_EXE_vllm-proxy-rs"))
                 .env_clear()
-                .env("VLLM_PROXY_USAGE_OUTBOX_DIR", outbox)
                 .envs([
                     ("TOKEN", "test-token"),
                     ("NON_TEE_DEPLOYMENT", "1"),

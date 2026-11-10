@@ -38,7 +38,6 @@ use self::log::{source_labels, GiveUp};
 use self::queue::State;
 mod http_sender;
 mod log;
-mod outbox;
 mod queue;
 mod sqs_sender;
 
@@ -273,7 +272,6 @@ pub struct UsageReportDelivery {
     /// How an attempt is made: over HTTP to cloud-api, or onto the usage queue.
     sender: Arc<dyn UsageSender>,
     state: Mutex<State>,
-    outbox: std::sync::OnceLock<Arc<outbox::Outbox>>,
     /// Notified whenever nothing is pending any more.
     idle: tokio::sync::Notify,
 }
@@ -440,7 +438,6 @@ impl UsageReportDelivery {
             policy,
             sender,
             state: Mutex::default(),
-            outbox: std::sync::OnceLock::new(),
             idle: tokio::sync::Notify::new(),
         }
     }
@@ -478,7 +475,7 @@ impl UsageReportDelivery {
 
     /// Send `job` until the billing API accepts it, answers something final,
     /// the attempts run out or no attempt fits before its deadline any more.
-    async fn deliver(&self, job: &Job) -> bool {
+    async fn deliver(&self, job: &Job) {
         let reporter = &job.reporter;
         let timeout = self.policy.attempt_timeout;
         let mut attempts: u32 = 0;
@@ -491,14 +488,13 @@ impl UsageReportDelivery {
             // backlog as old as the deadline, send every report with almost
             // no time left and get none of them accepted.
             if self.time_left(job).is_some_and(|left| left < timeout) {
-                self.give_up(
+                return self.give_up(
                     job,
                     GiveUp::Deadline {
                         attempts,
                         last_attempt,
                     },
                 );
-                return false;
             }
             if let Some(reason) = retrying.take() {
                 self.count(
@@ -525,14 +521,13 @@ impl UsageReportDelivery {
                     .time_left(job)
                     .is_some_and(|left| left < delay + timeout)
                 {
-                    self.give_up(
+                    return self.give_up(
                         job,
                         GiveUp::Deadline {
                             attempts,
                             last_attempt,
                         },
                     );
-                    return false;
                 }
                 warn!(
                     request_id = %reporter.request_id.as_deref().unwrap_or(""),
@@ -568,7 +563,7 @@ impl UsageReportDelivery {
                 .extended
                 .then(|| job.completed_at.elapsed().as_millis() as u64);
             match answer {
-                Ok(status) if decision == SendOutcome::Accepted && status.is_success() => {
+                Ok(status) if decision == SendOutcome::Accepted => {
                     // Named by transport: "by Cloud API" is only true over HTTP.
                     // The HTTP text is the one it has always had.
                     let accepted = if self.is_http() {
@@ -599,7 +594,7 @@ impl UsageReportDelivery {
                         "{}",
                         accepted
                     );
-                    return true;
+                    return;
                 }
                 Ok(status) => {
                     warn!(
@@ -649,15 +644,11 @@ impl UsageReportDelivery {
                 SendOutcome::Accepted => "rejected",
             };
             self.count(
-                if reporter.budget_report_id.is_some() {
-                    "inference_proxy_usage_receipts_deferred_total"
-                } else {
-                    "inference_proxy_usage_reports_dropped_total"
-                },
+                "inference_proxy_usage_reports_dropped_total",
                 reporter,
                 ("reason", reason),
             );
-            return false;
+            return;
         }
     }
 }

@@ -597,29 +597,17 @@ Final counters
 already received are billable even if delivering them to the client fails.
 Audio prefers the provider's response duration; if absent, the proxy uses local
 frame/sample timing from the uploaded file. It neither changes the response
-format nor decodes/transcodes media. Unmeasurable usage needs reconciliation; the
-byte-based admission estimate is never billed as actual duration.
+format nor decodes/transcodes media. Missing actual usage is logged; the byte-based
+admission estimate is never billed as actual duration.
 The locally measured duration is also sent as optional numeric admission metadata,
 so Cloud API can quote it instead of relying on the compressed file size.
 
-`VLLM_PROXY_USAGE_OUTBOX_DIR` (default `usage-outbox`) stores typed billing receipts
-before sending them through the configured HTTP/SQS transport. Use persistent
-storage unique to each replica; replacement instances must reopen that storage.
-It contains billing identifiers, counts, the configured discount and tracing metadata,
-not request content, API keys or credentials. Both single-model and model-list
-startup open the outbox. Failed writes/scans disable further monetary admission
-until storage is healthy. The proxy stores no balances or reservation ledger.
-
-A failed receipt stays on disk and is replayed on startup and every five seconds.
-Each pass uses the configured attempt timeout/retries/deadline, with up to eight
-receipts in parallel (fewer when `MAX_IN_FLIGHT` is lower). An accepted HTTP response
-or successful SQS send removes the file; a lost acknowledgement safely replays the
-same admission. Shutdown drain includes these files. Permanent rejections require
-operator repair; a delivery timeout does not release the monetary hold early. The outbox pending
-metric and deferred receipt counter expose this backlog. A crash before final
-usage is durably captured leaves an unknown execution for reconciliation. Cloud
-API's expiry releases its admission capacity without reconstructing or cancelling
-the upstream bill. The proxy does not maintain a separate monetary expiry timer.
+Final usage uses the existing HTTP/SQS delivery policy: configured retries,
+backoff, queue bounds and shutdown drain apply equally to admitted reports.
+Retries carry the same admission ID so repeated delivery settles once. No local
+receipt storage or restart replay is added. If usage is lost before successful
+handoff, the hold remains until expiry; the estimate is never charged as actual
+usage. Successfully queued SQS reports retain the queue worker's existing recovery.
 
 Embedding, rerank, privacy and score keep their existing report delivery. Admission
 requires the matching Cloud API endpoint and ledger schema, and SQS consumers must

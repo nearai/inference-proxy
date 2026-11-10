@@ -87,7 +87,6 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         options.backend_urls.clone()
     };
     let config = config::Config {
-        usage_outbox_dir: "unused-test-outbox".into(),
         model_list: None,
         replica_state: None,
         model_name: "test-model".to_string(),
@@ -296,7 +295,8 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         config.backend_affinity_max_imbalance,
         1_200,
     ));
-    let usage_report_delivery = budget_fixture::delivery(&config);
+    let usage_report_delivery =
+        vllm_proxy_rs::usage_report::UsageReportDelivery::new(config.usage_report.clone());
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),
@@ -3022,7 +3022,7 @@ async fn gateway_with_usage_intake(
 }
 
 #[tokio::test]
-async fn an_admitted_receipt_is_replayed_even_with_the_default_attempt_policy() {
+async fn a_failed_usage_report_is_not_sent_again_unless_retries_are_configured() {
     let mock = MockServer::start().await;
     let (app, state) = gateway_with_usage_intake(&mock, &[503], Default::default()).await;
     assert_eq!(
@@ -3037,15 +3037,14 @@ async fn an_admitted_receipt_is_replayed_even_with_the_default_attempt_policy() 
     assert_eq!(response.status(), StatusCode::OK);
     json_body(response).await;
 
-    // The default attempt policy still uses one attempt per pass. A durable
-    // admitted receipt survives a failed pass and is replayed.
+    // One attempt, as always: the 503 is the report's final answer.
     let drained = state
         .usage_report_delivery
         .drain(Duration::from_secs(30))
         .await;
     assert_eq!(drained.left(), 0);
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(usage_reports(&mock).await.len(), 2);
+    assert_eq!(usage_reports(&mock).await.len(), 1);
 }
 
 #[tokio::test]

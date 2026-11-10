@@ -67,19 +67,6 @@ pub(super) fn source_labels(
 
 impl UsageReportDelivery {
     pub(super) fn give_up(&self, job: &Job, why: GiveUp) {
-        if job.reporter.budget_report_id.is_some() {
-            self.count(
-                "inference_proxy_usage_receipts_deferred_total",
-                &job.reporter,
-                ("reason", "delivery_pass_ended"),
-            );
-            warn!(
-                admission_id = job.reporter.budget_report_id.as_deref(),
-                "Usage receipt remains on disk for replay"
-            );
-            return;
-        }
-
         let reporter = &job.reporter;
         let since_completion_ms = job.completed_at.elapsed().as_millis() as u64;
         match why {

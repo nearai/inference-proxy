@@ -340,24 +340,14 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let usage_report_delivery = usage_report::UsageReportDelivery::for_transport(
-        config.usage_report.clone(),
-        &config.usage_report_transport,
-    );
-    if config.cloud_api_url.is_some() {
-        usage_report_delivery.enable_outbox(
-            config.usage_outbox_dir.clone(),
-            http_client.clone(),
-            config.cloud_api_url.clone(),
-            config.cloud_api_usage_token.clone(),
-        )?;
-    }
-
     // Build app state
     let model_name = config.model_name.clone();
     let state = AppState {
         api_key_cache: Default::default(),
-        usage_report_delivery,
+        usage_report_delivery: usage_report::UsageReportDelivery::for_transport(
+            config.usage_report.clone(),
+            &config.usage_report_transport,
+        ),
         config: Arc::new(config),
         signing: Arc::new(signing),
         cache: Arc::new(chat_cache),

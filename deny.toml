@@ -1,6 +1,9 @@
 [advisories]
 version = 2
 ignore = [
+    # Lofty uses this compile-time identifier macro. The advisory reports archival,
+    # not a vulnerability; remove when Lofty replaces paste with a maintained macro.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained build-time paste via lofty; no vulnerability reported" },
     # pin-utils is unmaintained (informational, not a vulnerability). It comes in only
     # through aws-smithy-http 0.63 / aws-smithy-types 1.5 (via aws-sigv4 and
     # aws-credential-types). Their releases without pin-utils (aws-sigv4 1.5+) need

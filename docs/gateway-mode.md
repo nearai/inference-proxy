@@ -596,7 +596,7 @@ expiry managed by Cloud API (two hours by default). Late receipts still charge o
 Final counters
 already received are billable even if delivering them to the client fails.
 Audio prefers the provider's response duration; if absent, the proxy uses local
-audio-frame durations from the uploaded file. It neither changes the response
+frame/sample timing from the uploaded file. It neither changes the response
 format nor decodes/transcodes media. Unmeasurable usage needs reconciliation; the
 byte-based admission estimate is never billed as actual duration.
 The locally measured duration is also sent as optional numeric admission metadata,

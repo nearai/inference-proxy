@@ -1,66 +1,58 @@
-//! Duration-only metering of an already uploaded file; no decoding, transcoding, or network I/O.
-use std::io::{Cursor, ErrorKind};
-use symphonia::core::{
-    codecs::CODEC_TYPE_OPUS,
-    errors::Error,
-    formats::FormatOptions,
-    io::{MediaSourceStream, MediaSourceStreamOptions},
-    meta::MetadataOptions,
-    probe::Hint,
-    units::TimeBase,
+//! Duration-only metering of an uploaded file; no decoding, transcoding, or network I/O.
+use lofty::{
+    config::{ParseOptions, ParsingMode},
+    file::{AudioFile, FileType},
+    probe::Probe,
 };
+use matroska_demuxer::{Frame, MatroskaFile};
+use std::io::Cursor;
 
 pub(crate) fn seconds(bytes: Vec<u8>) -> Option<i32> {
-    let source = MediaSourceStream::new(
-        Box::new(Cursor::new(bytes)),
-        MediaSourceStreamOptions::default(),
-    );
-    let mut format = symphonia::default::get_probe()
-        .format(
-            &Hint::new(),
-            source,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
-        )
-        .ok()?
-        .format;
-    let track = format
-        .tracks()
-        .iter()
-        .find(|track| track.codec_params.sample_rate.is_some())?;
-    let id = track.id;
-    let opus = track.codec_params.codec == CODEC_TYPE_OPUS;
-    let time_base = if opus {
-        TimeBase::new(1, 48_000)
-    } else {
-        track.codec_params.time_base?
-    };
-    let mut units = 0_u64;
-    loop {
-        match format.next_packet() {
-            Ok(packet) if packet.track_id() == id => {
-                // WebM often omits block durations. Opus stores the frame duration in its TOC.
-                let duration = if opus {
-                    opus_samples(&packet.data)?
-                } else {
-                    packet.dur
-                };
-                // Vorbis may emit an initial priming packet with zero duration.
-                units = units.checked_add(duration)?;
-            }
-            Ok(_) => {}
-            Err(Error::IoError(error)) if error.kind() == ErrorKind::UnexpectedEof => break,
-            Err(_) => return None,
-        }
+    if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        return webm_seconds(&bytes);
     }
-    // Count complete packets rather than n_frames, which can be a bitrate-based estimate.
-    // Round once in integer arithmetic to avoid a floating point sum billing an extra second.
-    if time_base.denom == 0 {
+    let options = ParseOptions::new()
+        .read_tags(false)
+        .read_cover_art(false)
+        .parsing_mode(ParsingMode::Strict);
+    let probe = Probe::new(Cursor::new(&bytes))
+        .guess_file_type()
+        .ok()?
+        .options(options);
+    let duration = match probe.file_type()? {
+        // Scan MPEG frames (or their explicit Xing/Info frame count). Lofty's MPEG fallback
+        // estimates duration from bitrate; such an estimate must not become an actual charge.
+        FileType::Mpeg => mp3_duration::from_read(&mut Cursor::new(&bytes)).ok()?,
+        // These containers carry sample counts or media timestamps. Ignore arbitrary tags.
+        FileType::Wav | FileType::Flac | FileType::Mp4 | FileType::Vorbis | FileType::Opus => {
+            probe.read().ok()?.properties().duration()
+        }
+        _ => return None,
+    };
+    // Round once, without floating point accumulation.
+    positive_seconds(duration.as_nanos().div_ceil(1_000_000_000))
+}
+
+fn positive_seconds(value: u128) -> Option<i32> {
+    i32::try_from(value).ok().filter(|seconds| *seconds > 0)
+}
+
+fn webm_seconds(bytes: &[u8]) -> Option<i32> {
+    let mut file = MatroskaFile::open(Cursor::new(bytes)).ok()?;
+    let track = file.tracks().iter().find(|track| track.audio().is_some())?;
+    if track.codec_id() != "A_OPUS" {
         return None;
     }
-    let seconds =
-        (u128::from(units) * u128::from(time_base.numer)).div_ceil(u128::from(time_base.denom));
-    i32::try_from(seconds).ok().filter(|seconds| *seconds > 0)
+    let id = track.track_number().get();
+    let mut samples = 0_u64;
+    let mut frame = Frame::default();
+    while file.next_frame(&mut frame).ok()? {
+        if frame.track == id {
+            // WebM may omit block durations; Opus has an explicit duration in every packet.
+            samples = samples.checked_add(opus_samples(&frame.data)?)?;
+        }
+    }
+    positive_seconds(u128::from(samples).div_ceil(48_000))
 }
 
 // RFC 6716 sections 3.1 and 3.2: frame size and count are in the packet header.
@@ -86,7 +78,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uploaded_formats_use_audio_frames_and_invalid_files_are_not_estimated_as_actual_usage() {
+    fn uploaded_formats_use_container_timing_and_invalid_files_are_not_estimated_as_actual_usage() {
         for bytes in [
             include_bytes!("../tests/fixtures/audio/silence.wav").as_slice(),
             include_bytes!("../tests/fixtures/audio/silence.mp3").as_slice(),

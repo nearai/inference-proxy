@@ -599,6 +599,8 @@ Audio prefers the provider's response duration; if absent, the proxy uses local
 audio-frame durations from the uploaded file. It neither changes the response
 format nor decodes/transcodes media. Unmeasurable usage needs reconciliation; the
 byte-based admission estimate is never billed as actual duration.
+The locally measured duration is also sent as optional numeric admission metadata,
+so Cloud API can quote it instead of relying on the compressed file size.
 
 `VLLM_PROXY_USAGE_OUTBOX_DIR` (default `usage-outbox`) stores typed billing receipts
 before sending them through the configured HTTP/SQS transport. Use persistent

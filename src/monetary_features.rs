@@ -22,6 +22,8 @@ pub struct UsageFeatures {
     pub requested_output_tokens: Option<u64>,
     pub model_output_tokens: Option<u64>,
     pub media_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_duration_seconds: Option<u64>,
     pub requested_images: u64,
     pub questions: u64,
 }
@@ -56,6 +58,7 @@ impl UsageFeatures {
                 .or(positive("max_tokens")?),
             model_output_tokens: None,
             media_bytes: 0,
+            audio_duration_seconds: None,
             requested_images: positive("n")?.unwrap_or(1),
             questions: 0,
         };

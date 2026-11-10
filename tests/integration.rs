@@ -6286,6 +6286,13 @@ async fn test_direct_audio_json_without_duration_bills_uploaded_file_before_encr
         assert_eq!(usage[0]["type"], "audio_transcription");
         assert_eq!(usage[0]["duration_seconds"], 2);
         assert!(usage[0]["admission_id"].as_str().is_some());
+        let admissions = cloud_api.received_requests().await.unwrap();
+        let admission = admissions
+            .iter()
+            .find(|request| request.url.path() == "/v1/internal/budget")
+            .unwrap();
+        let admission: serde_json::Value = serde_json::from_slice(&admission.body).unwrap();
+        assert_eq!(admission["features"]["audio_duration_seconds"], 2);
         let upstream = backend.received_requests().await.unwrap();
         assert!(upstream[0]
             .body

@@ -55,6 +55,9 @@ pub(crate) async fn admit_for_model(
         }
     };
     let mut features = crate::monetary_features::UsageFeatures::from_json(label.into(), body)?;
+    if let UsageType::AudioTranscription { duration_seconds } = kind {
+        features.audio_duration_seconds = duration_seconds.filter(|n| *n > 0).map(|n| n as u64);
+    }
     features.executions = u64::try_from(executions)
         .ok()
         .filter(|n| *n > 0)

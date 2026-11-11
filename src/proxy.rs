@@ -1271,6 +1271,19 @@ fn mark_backend_unreachable(pool: &crate::backend_pool::BackendPool, index: usiz
     }
 }
 
+async fn admit_json_attempt(opts: &mut ProxyOpts, body: &Bytes) -> Result<(), AppError> {
+    let admitted_kind = matches!(
+        opts.usage_type,
+        UsageType::ChatCompletion | UsageType::ImageGeneration
+    );
+    if let Some(reporter) = opts.usage_reporter.as_mut().filter(|_| admitted_kind) {
+        let json: serde_json::Value = serde_json::from_slice(body)
+            .map_err(|_| AppError::BadRequest("Invalid JSON body".into()))?;
+        crate::monetary_budget::admit(reporter, &opts.usage_type, &json, 1).await?;
+    }
+    Ok(())
+}
+
 /// Send the request to `url`. When the connection fails before anything was
 /// sent and `opts.connect_failover` is set, retry once on another healthy
 /// backend: `url` and `opts.backend_guard` then point at the replacement.
@@ -1283,15 +1296,7 @@ async fn send_upstream(
     opts: &mut ProxyOpts,
     endpoint: &'static str,
 ) -> Result<reqwest::Response, AppError> {
-    let admitted_kind = matches!(
-        opts.usage_type,
-        UsageType::ChatCompletion | UsageType::ImageGeneration
-    );
-    if let Some(reporter) = opts.usage_reporter.as_mut().filter(|_| admitted_kind) {
-        let json: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|_| AppError::BadRequest("Invalid JSON body".into()))?;
-        crate::monetary_budget::admit(reporter, &opts.usage_type, &json, 1).await?;
-    }
+    admit_json_attempt(opts, &body).await?;
     let upstream_start = std::time::Instant::now();
     // The lane's time-to-first-token clock starts here. The engine sends the
     // SSE response headers only once it has something to say, so measuring
@@ -1300,9 +1305,11 @@ async fn send_upstream(
     if let Some(permit) = opts.admission.as_ref() {
         permit.mark_dispatched();
     }
-    let first = build_upstream_request(client, url, body.clone(), opts)
-        .send()
-        .await;
+    let first = crate::monetary_budget::send(
+        build_upstream_request(client, url, body.clone(), opts),
+        opts.usage_reporter.as_ref(),
+    )
+    .await;
     let response = match first {
         Ok(response) => response,
         Err(error) if error.is_connect() && opts.connect_failover.is_some() => {
@@ -1448,7 +1455,14 @@ async fn send_upstream(
                 permit.attach_backend(next.index);
             }
             opts.backend_guard = Some(next.guard);
-            match build_upstream_request(client, url, body, opts).send().await {
+            // The failed connection released its hold. Admit the replacement dispatch separately.
+            admit_json_attempt(opts, &body).await?;
+            match crate::monetary_budget::send(
+                build_upstream_request(client, url, body, opts),
+                opts.usage_reporter.as_ref(),
+            )
+            .await
+            {
                 Ok(response) => {
                     if let Some((affinity, key)) = affinity {
                         // Later turns follow the request, not the dead host.
@@ -3434,7 +3448,9 @@ async fn proxy_multipart_request_inner(
 ) -> Result<Response, AppError> {
     let upstream_start = std::time::Instant::now();
     let req = apply_tracing_headers(client.post(url).multipart(form), opts.tracing_ids.as_ref());
-    let response = req.send().await.map_err(|e| AppError::Internal(e.into()))?;
+    let response = crate::monetary_budget::send(req, opts.usage_reporter.as_ref())
+        .await
+        .map_err(|e| AppError::Internal(e.into()))?;
     metrics::histogram!("upstream_request_duration_seconds", "endpoint" => "multipart")
         .record(upstream_start.elapsed().as_secs_f64());
 
@@ -4123,6 +4139,104 @@ mod tests {
         .await;
         assert!(matches!(result, Err(AppError::InsufficientCredits)));
         assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn monetary_admission_maps_metadata_and_capacity_errors() {
+        use axum::response::IntoResponse;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let ledger = MockServer::start().await;
+        for status in [400_u16, 403, 429, 503] {
+            ledger.reset().await;
+            Mock::given(wiremock::matchers::path("/v1/internal/budget"))
+                .respond_with(ResponseTemplate::new(status))
+                .expect(1)
+                .mount(&ledger)
+                .await;
+            let mut reporter = reporter_with(Some("token"), Some("org"), Some("ws"), Some("key"));
+            reporter.cloud_api_url = Some(ledger.uri());
+            let error = crate::monetary_budget::admit(
+                &mut reporter,
+                &UsageType::ChatCompletion,
+                &serde_json::json!({}),
+                1,
+            )
+            .await
+            .unwrap_err();
+            let response = error.into_response();
+            assert_eq!(response.status().as_u16(), status);
+            if status == 429 {
+                assert_eq!(response.headers()["retry-after"], "2");
+            }
+            assert!(reporter.budget_report_id.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn monetary_release_only_follows_known_pre_dispatch_failure() {
+        use wiremock::matchers::{body_json, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let ledger = MockServer::start().await;
+        let upstream = MockServer::start().await;
+        let mut reporter = reporter_with(Some("token"), Some("org"), Some("ws"), Some("key"));
+        reporter.cloud_api_url = Some(ledger.uri());
+        reporter.http_client = reqwest::Client::builder().no_proxy().build().unwrap();
+        reporter.budget_report_id = Some(uuid::Uuid::new_v4().to_string());
+        Mock::given(path("/v1/internal/budget/release"))
+            .and(body_json(
+                serde_json::json!({"organization_id":"org","id":reporter.budget_report_id}),
+            ))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(2)
+            .mount(&ledger)
+            .await;
+        Mock::given(path("/error"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&upstream)
+            .await;
+        Mock::given(path("/slow"))
+            .respond_with(
+                ResponseTemplate::new(200).set_delay(std::time::Duration::from_millis(100)),
+            )
+            .mount(&upstream)
+            .await;
+        let client = &reporter.http_client;
+        assert_eq!(
+            crate::monetary_budget::send(
+                client.post(format!("{}/error", upstream.uri())),
+                Some(&reporter)
+            )
+            .await
+            .unwrap()
+            .status(),
+            503
+        );
+        assert!(crate::monetary_budget::send(
+            client
+                .post(format!("{}/slow", upstream.uri()))
+                .timeout(std::time::Duration::from_millis(10)),
+            Some(&reporter)
+        )
+        .await
+        .unwrap_err()
+        .is_timeout());
+        assert!(ledger.received_requests().await.unwrap().is_empty());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        assert!(crate::monetary_budget::send(
+            client.post(format!("http://{address}")),
+            Some(&reporter)
+        )
+        .await
+        .unwrap_err()
+        .is_connect());
+        assert!(
+            crate::monetary_budget::send(client.post("invalid URL"), Some(&reporter))
+                .await
+                .unwrap_err()
+                .is_builder()
+        );
     }
 
     #[tokio::test]

@@ -148,7 +148,6 @@ pub async fn run_chat_completion(
     // Pick one backend; reuse it across every iteration so the engine can
     // prefix-cache across rounds (each iteration's prompt = prior iteration +
     // a few new messages, so the cache hit rate should be very high).
-    let (upstream_url, backend_guard) = state.backend_pool.select_url("/v1/chat/completions");
 
     // Send the first upstream request synchronously so its HTTP status
     // propagates to the caller. Without this, a 400/429/503 from upstream
@@ -169,11 +168,13 @@ pub async fn run_chat_completion(
     }
     let first_request_body =
         serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?;
+    let (upstream_url, backend_guard) = state.backend_pool.select_url("/v1/chat/completions");
     let first_response = send_upstream(
         &state.backend_client,
         &upstream_url,
         first_request_body,
         &tracing_ids,
+        usage_reporter.as_ref(),
     )
     .await
     .map_err(|err| err.for_encrypted_request(chunk_transform.is_some()))?;
@@ -433,7 +434,7 @@ async fn drive_loop(
                 let body = serde_json::to_vec(ctx.request_json)
                     .map_err(|e| AppError::Internal(e.into()))?;
                 let send_outcome = tokio::select! {
-                    r = send_upstream(ctx.backend_client, ctx.upstream_url, body, ctx.tracing_ids) => Some(r),
+                    r = send_upstream(ctx.backend_client, ctx.upstream_url, body, ctx.tracing_ids, None) => Some(r),
                     _ = ctx.tx.closed() => None,
                 };
                 let Some(send_outcome) = send_outcome else {
@@ -1118,6 +1119,7 @@ async fn send_upstream(
     upstream_url: &str,
     body: Vec<u8>,
     tracing_ids: &TracingIds,
+    reporter: Option<&crate::proxy::UsageReporter>,
 ) -> Result<reqwest::Response, AppError> {
     let mut req = client
         .post(upstream_url)
@@ -1126,9 +1128,8 @@ async fn send_upstream(
     for (k, v) in tracing_ids.upstream_headers() {
         req = req.header(k, v);
     }
-    let response = req
-        .body(body)
-        .send()
+    let request = req.body(body);
+    let response = crate::monetary_budget::send(request, reporter)
         .await
         .map_err(|e| AppError::Internal(e.into()))?;
 

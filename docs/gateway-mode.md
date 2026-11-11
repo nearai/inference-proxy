@@ -588,7 +588,7 @@ and owns the shared organization/key hold. Trusted configuration-token requests
 already admitted by Cloud API do not reserve again. Inference parameters, output
 limits and existing multimedia support remain unchanged.
 
-The hold is fixed until settlement. Final usage carries its separate `admission_id`
+The estimated amount is immutable. Final usage carries its separate `admission_id`
 and the original provider ID. Cloud API or the queue worker charges full actual
 usage and clears the hold atomically; actual usage may exceed the estimate. An
 interrupted stream keeps the existing usage reporting behavior: known counters
@@ -601,7 +601,7 @@ file. It neither changes the response format nor decodes/transcodes media.
 Missing actual usage is logged; the byte-based
 admission estimate is never billed as actual duration.
 The locally measured duration is also sent as optional numeric admission metadata,
-so Cloud API can quote it instead of relying on the compressed file size.
+so Cloud API can use it alongside the existing byte-based floor for the quote.
 
 Final usage uses the existing HTTP/SQS delivery policy: configured retries,
 backoff, queue bounds and shutdown drain apply equally to admitted reports.
@@ -614,6 +614,20 @@ Embedding, rerank, privacy and score keep their existing report delivery. Admiss
 requires the matching Cloud API endpoint and ledger schema, and SQS consumers must
 accept the additive `admission_id` and `audio_transcription` event before producers
 send them.
+
+Enabling `CLOUD_API_URL` also enables direct Cloud API keys and requires a nonempty
+`CLOUD_API_USAGE_TOKEN` at startup, including SQS deployments. Direct admitted routes
+depend on Cloud API and its ledger being available for every dispatch; cached key
+validation does not authorize spending. The admission request keeps its bounded
+12-second timeout. Capacity refusals return 429 with `Retry-After`; invalid estimate
+metadata returns 400. There is no fail-open mode.
+
+Connection and request-construction failures confirmed to precede dispatch release
+their hold through `/v1/internal/budget/release`. HTTP failures, post-connect timeouts
+and disconnects can already have incurred usage and retain the hold until settlement
+or expiry. Release is bounded and best effort; it adds no durable recovery queue.
+Local audio metering admits at most four parsers with a one-second parsing budget.
+If local metering cannot finish, the existing provider-usage fallback still applies.
 
 ## Usage report delivery
 

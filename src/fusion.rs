@@ -1049,18 +1049,19 @@ async fn post_chat_json(
             req = req.header(k, v);
         }
 
-        let response = match req.body(attempt_body).send().await {
-            Ok(response) => response,
-            Err(e) => {
-                record_upstream_attempt(label, attempt_started);
-                let retry = attempt < attempts && is_retryable_transport_error(&e);
-                if retry {
-                    sleep_before_fusion_retry(state, attempt).await;
-                    continue;
+        let response =
+            match crate::monetary_budget::send(req.body(attempt_body), reporter.as_ref()).await {
+                Ok(response) => response,
+                Err(e) => {
+                    record_upstream_attempt(label, attempt_started);
+                    let retry = attempt < attempts && is_retryable_transport_error(&e);
+                    if retry {
+                        sleep_before_fusion_retry(state, attempt).await;
+                        continue;
+                    }
+                    return Err(map_fusion_transport_error(e));
                 }
-                return Err(map_fusion_transport_error(e));
-            }
-        };
+            };
 
         let status = response.status();
         if !status.is_success() && attempt < attempts && status.is_server_error() {

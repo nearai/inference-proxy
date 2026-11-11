@@ -1228,6 +1228,11 @@ impl Config {
             .ok()
             .filter(|s| !s.is_empty())
             .map(|s| s.trim_end_matches('/').to_string());
+        if cloud_api_url.is_some()
+            && !env::var("CLOUD_API_USAGE_TOKEN").is_ok_and(|v| !v.trim().is_empty())
+        {
+            anyhow::bail!("CLOUD_API_URL enables direct Cloud API keys and requires CLOUD_API_USAGE_TOKEN for admission, including SQS reporting");
+        }
         // cloud-api's internal catalog answers 401 without the service token,
         // so a lane told to read it has to hold one: fail at startup instead
         // of serving a models document that can never be read.
@@ -2086,6 +2091,16 @@ mod tests {
             ],
             || {
                 Config::from_env().expect("sqs bills without cloud-api");
+                env::set_var("CLOUD_API_URL", "https://cloud-api.test");
+                assert!(Config::from_env()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires CLOUD_API_USAGE_TOKEN"));
+                env::set_var("CLOUD_API_USAGE_TOKEN", "usage-token");
+                Config::from_env()
+                    .expect("direct keys require admission credentials even with SQS");
+                env::remove_var("CLOUD_API_URL");
+                env::remove_var("CLOUD_API_USAGE_TOKEN");
             },
         );
         with_clean_env(&base, &[token], || {
@@ -2800,15 +2815,18 @@ mod tests {
             env::set_var("CLOUD_API_USAGE_TOKEN", "usage-secret");
             assert!(Config::from_env().is_ok());
 
-            // The public document needs no token.
+            // A public document needs no token, but enabling direct keys still does.
             env::remove_var("CLOUD_API_USAGE_TOKEN");
             env::set_var(
                 "VLLM_PROXY_MODELS_DOCUMENT_URL",
                 "https://cloud-api.test/v1/models",
             );
-            assert!(Config::from_env().is_ok());
-
+            assert!(Config::from_env()
+                .unwrap_err()
+                .to_string()
+                .contains("requires CLOUD_API_USAGE_TOKEN"));
             env::remove_var("CLOUD_API_URL");
+            assert!(Config::from_env().is_ok());
             gateway_env_cleanup();
         });
     }

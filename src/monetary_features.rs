@@ -30,11 +30,11 @@ pub struct UsageFeatures {
 
 impl UsageFeatures {
     pub fn from_json(kind: String, body: &Value) -> Result<Self, AppError> {
-        let positive = |name: &str| -> Result<Option<u64>, AppError> {
+        let number = |name: &str, allow_zero: bool| -> Result<Option<u64>, AppError> {
             body.get(name)
                 .filter(|v| !v.is_null())
                 .map(|v| {
-                    v.as_u64().filter(|n| *n > 0).ok_or_else(|| {
+                    v.as_u64().filter(|n| allow_zero || *n > 0).ok_or_else(|| {
                         AppError::BadRequest("invalid generation count or output limit".into())
                     })
                 })
@@ -49,17 +49,17 @@ impl UsageFeatures {
             video: 0,
             unknown_media: 0,
             batch_items: 1,
-            choices: positive("n")?
+            choices: number("n", false)?
                 .unwrap_or(1)
-                .max(positive("best_of")?.unwrap_or(1)),
+                .max(number("best_of", false)?.unwrap_or(1)),
             executions: 1,
-            requested_output_tokens: positive("max_completion_tokens")?
-                .or(positive("max_output_tokens")?)
-                .or(positive("max_tokens")?),
+            requested_output_tokens: number("max_completion_tokens", true)?
+                .or(number("max_output_tokens", true)?)
+                .or(number("max_tokens", true)?),
             model_output_tokens: None,
             media_bytes: 0,
             audio_duration_seconds: None,
-            requested_images: positive("n")?.unwrap_or(1),
+            requested_images: number("n", false)?.unwrap_or(1),
             questions: 0,
         };
         for name in [
@@ -134,18 +134,18 @@ impl UsageFeatures {
                     add(count, 1)?;
                 } else {
                     for (name, item) in fields {
-                        if !matches!(
-                            name.as_str(),
-                            "id" | "url"
-                                | "file_id"
-                                | "image_url"
-                                | "audio_url"
-                                | "data"
-                                | "b64_json"
-                        ) {
-                            self.count(item)?;
-                        } else if matches!(name.as_str(), "image_url" | "audio_url" | "file_id") {
-                            add(&mut self.unknown_media, 1)?;
+                        if item.is_null() {
+                            continue;
+                        }
+                        match name.as_str() {
+                            "image_url" | "input_image" | "image" => add(&mut self.images, 1)?,
+                            "audio_url" | "input_audio" | "audio" => add(&mut self.audio, 1)?,
+                            "video_url" | "input_video" | "video" => add(&mut self.video, 1)?,
+                            "file_id" | "file_url" | "file_data" | "url" | "data" | "b64_json" => {
+                                add(&mut self.unknown_media, 1)?
+                            }
+                            "id" => {}
+                            _ => self.count(item)?,
                         }
                     }
                 }
@@ -153,6 +153,26 @@ impl UsageFeatures {
             _ => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    #[test]
+    fn cloud_api_contract_fixtures_match() {
+        let cases: Vec<Value> =
+            serde_json::from_str(include_str!("../tests/fixtures/usage-features.json")).unwrap();
+        for case in cases {
+            let features =
+                UsageFeatures::from_json("chat_completion".into(), &case["body"]).unwrap();
+            assert_eq!(
+                serde_json::to_value(features).unwrap(),
+                case["expected"],
+                "{}",
+                case["name"]
+            );
+        }
     }
 }
 

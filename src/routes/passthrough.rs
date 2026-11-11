@@ -250,11 +250,6 @@ pub async fn images_edits(
             state.signing.clone(),
         )
     });
-    let target = passthrough_target(
-        &state,
-        state.config.images_edits_url_override.as_deref(),
-        "/v1/images/edits",
-    );
 
     let mut usage_reporter = make_usage_reporter(&auth, &state);
     if let Some(reporter) = &mut usage_reporter {
@@ -266,6 +261,12 @@ pub async fn images_edits(
         )
         .await?;
     }
+
+    let target = passthrough_target(
+        &state,
+        state.config.images_edits_url_override.as_deref(),
+        "/v1/images/edits",
+    );
 
     let opts = ProxyOpts {
         signing: state.signing.clone(),
@@ -361,17 +362,9 @@ pub async fn audio_transcriptions(
             state.signing.clone(),
         )
     });
-    let target = passthrough_target(
-        &state,
-        state.config.transcriptions_url_override.as_deref(),
-        "/v1/audio/transcriptions",
-    );
 
     let duration_seconds = match duration_file {
-        Some(bytes) => tokio::task::spawn_blocking(move || crate::audio_duration::seconds(&bytes))
-            .await
-            .ok()
-            .flatten(),
+        Some(bytes) => crate::audio_duration::measure(bytes).await,
         None => None,
     };
     let usage_type = UsageType::AudioTranscription { duration_seconds };
@@ -385,6 +378,12 @@ pub async fn audio_transcriptions(
         )
         .await?;
     }
+
+    let target = passthrough_target(
+        &state,
+        state.config.transcriptions_url_override.as_deref(),
+        "/v1/audio/transcriptions",
+    );
 
     let opts = ProxyOpts {
         signing: state.signing.clone(),

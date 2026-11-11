@@ -68,6 +68,20 @@ pub(crate) async fn admit_for_model(
     if response.status() == StatusCode::PAYMENT_REQUIRED {
         return Err(AppError::InsufficientCredits);
     }
+    if response.status() == StatusCode::TOO_MANY_REQUESTS {
+        return Err(AppError::Overloaded {
+            reason: "usage_capacity",
+            retry_after_secs: 2,
+        });
+    }
+    if response.status() == StatusCode::BAD_REQUEST {
+        return Err(AppError::BadRequest(
+            "Invalid admission metadata or estimate".into(),
+        ));
+    }
+    if response.status() == StatusCode::FORBIDDEN {
+        return Err(AppError::Forbidden);
+    }
     if !response.status().is_success() {
         return Err(unavailable());
     }
@@ -82,6 +96,49 @@ pub(crate) async fn admit_for_model(
     reporter.model_name = canonical;
     reporter.budget_report_id = Some(id.to_string());
     Ok(())
+}
+
+/// A transport failure before connection/request construction cannot have executed inference.
+/// All other failures, including HTTP statuses and timeouts after connection, retain the hold.
+pub(crate) async fn send(
+    request: reqwest::RequestBuilder,
+    reporter: Option<&UsageReporter>,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let response = request.send().await;
+    if response
+        .as_ref()
+        .is_err_and(|e| e.is_connect() || e.is_builder())
+    {
+        if let Some(reporter) = reporter {
+            release_not_dispatched(reporter).await;
+        }
+    }
+    response
+}
+
+async fn release_not_dispatched(reporter: &UsageReporter) {
+    let (Some(base), Some(token), Some(org), Some(id)) = (
+        reporter.cloud_api_url.as_deref(),
+        reporter.cloud_api_usage_token.as_deref(),
+        reporter.org_id.as_deref(),
+        reporter.budget_report_id.as_deref(),
+    ) else {
+        return;
+    };
+    let result = reporter
+        .http_client
+        .post(format!(
+            "{}/v1/internal/budget/release",
+            base.trim_end_matches('/')
+        ))
+        .bearer_auth(token)
+        .timeout(Duration::from_secs(2))
+        .json(&json!({"organization_id":org,"id":id}))
+        .send()
+        .await;
+    if !result.is_ok_and(|r| r.status().is_success()) {
+        tracing::warn!("Undispatched budget release failed; awaiting expiry");
+    }
 }
 
 // Fusion fans out in one task. Each actual HTTP attempt gets a fresh reservation and

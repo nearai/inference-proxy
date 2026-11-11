@@ -10,7 +10,6 @@ publish = false
 # Demux uploaded audio for duration-only billing when the provider omits duration.
 lofty = "0.25.5"
 matroska-demuxer = "0.8.1"
-mp3-duration = "0.1.10"
 # Async runtime & web
 tokio = { version = "1.53.3", features = ["full"] }
 axum = { version = "0.8", features = ["multipart"] }

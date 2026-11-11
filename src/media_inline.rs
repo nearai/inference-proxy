@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -230,30 +231,29 @@ pub async fn inline_remote_media(
     }
 
     let per_request = cfg.max_concurrency.clamp(1, 8);
-    let budget = cfg.max_total_bytes.saturating_sub(inline_bytes);
+    // Bytes this request may still take. Every download charges it chunk by
+    // chunk (once per use of its URL), so concurrent downloads of one request
+    // never hold more than the request cap between them.
+    let remaining = AtomicUsize::new(cfg.max_total_bytes.saturating_sub(inline_bytes));
+    let remaining = &remaining;
     let fetch_all = async {
         let mut out: HashMap<(String, Kind), String> = HashMap::new();
-        let mut total = 0usize;
         let mut results = stream::iter(unique)
             .map(|(url, kind)| async move {
-                let r = fetch_one(&url, kind, cfg).await;
+                let copies = uses.get(&(url.clone(), kind)).copied().unwrap_or(1);
+                let r = fetch_one(&url, kind, cfg, remaining, copies).await;
                 (url, kind, r)
             })
             .buffer_unordered(per_request);
         while let Some((url, kind, r)) = results.next().await {
             let (mime, bytes) = r.map_err(|reason| reject(reason, Some(kind)))?;
-            let copies = uses.get(&(url.clone(), kind)).copied().unwrap_or(1);
-            total = total.saturating_add(bytes.len().saturating_mul(copies));
-            if total > budget {
-                return Err(reject("request_too_large", None));
-            }
             let data_url = format!(
                 "data:{mime};base64,{}",
                 base64::engine::general_purpose::STANDARD.encode(&bytes)
             );
             out.insert((url, kind), data_url);
         }
-        Ok(out)
+        Ok::<_, AppError>(out)
     };
     let fetched = match tokio::time::timeout(cfg.request_deadline, fetch_all).await {
         Ok(r) => r?,
@@ -325,6 +325,8 @@ async fn fetch_one(
     url: &str,
     kind: Kind,
     cfg: &MediaInlineConfig,
+    remaining: &AtomicUsize,
+    copies: usize,
 ) -> Result<(&'static str, Vec<u8>), &'static str> {
     let mut current = reqwest::Url::parse(url).map_err(|_| "bad_url")?;
     let _permit =
@@ -335,7 +337,7 @@ async fn fetch_one(
     // One deadline for the whole item: every redirect hop and the body.
     tokio::time::timeout(
         cfg.timeout,
-        fetch_following_redirects(&mut current, kind, cfg),
+        fetch_following_redirects(&mut current, kind, cfg, remaining, copies),
     )
     .await
     .map_err(|_| "timeout")?
@@ -345,6 +347,8 @@ async fn fetch_following_redirects(
     current: &mut reqwest::Url,
     kind: Kind,
     cfg: &MediaInlineConfig,
+    remaining: &AtomicUsize,
+    copies: usize,
 ) -> Result<(&'static str, Vec<u8>), &'static str> {
     let cap = kind.max_bytes(cfg);
     let accept = match kind {
@@ -387,6 +391,11 @@ async fn fetch_following_redirects(
         if resp.content_length().is_some_and(|n| n as usize > cap) {
             return Err("too_large");
         }
+        if resp.content_length().is_some_and(|n| {
+            (n as usize).saturating_mul(copies) > remaining.load(Ordering::Relaxed)
+        }) {
+            return Err("request_too_large");
+        }
         let mut body = Vec::new();
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
@@ -400,6 +409,12 @@ async fn fetch_following_redirects(
             if body.len() + chunk.len() > cap {
                 return Err("too_large");
             }
+            let charge = chunk.len().saturating_mul(copies);
+            remaining
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                    left.checked_sub(charge)
+                })
+                .map_err(|_| "request_too_large")?;
             body.extend_from_slice(&chunk);
         }
         let mime = match kind {
@@ -648,6 +663,34 @@ mod tests {
             json!([{"type":"audio_url","audio_url":{"url": format!("{}/img.png", server.uri())}}]),
         );
         assert!(inline_remote_media(&mut req, &cfg()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn distinct_urls_share_one_request_budget() {
+        let server = MockServer::start().await;
+        for p in ["/a.png", "/b.png"] {
+            Mock::given(method("GET"))
+                .and(path(p))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(PNG_1X1))
+                .mount(&server)
+                .await;
+        }
+        let parts = json!([
+            {"type":"image_url","image_url":{"url": format!("{}/a.png", server.uri())}},
+            {"type":"image_url","image_url":{"url": format!("{}/b.png", server.uri())}}
+        ]);
+        let tight = MediaInlineConfig {
+            max_total_bytes: PNG_1X1.len() * 2 - 1,
+            ..cfg()
+        };
+        let mut req = chat(parts.clone());
+        assert!(inline_remote_media(&mut req, &tight).await.is_err());
+        let exact = MediaInlineConfig {
+            max_total_bytes: PNG_1X1.len() * 2,
+            ..cfg()
+        };
+        let mut req = chat(parts);
+        inline_remote_media(&mut req, &exact).await.unwrap();
     }
 
     #[tokio::test]

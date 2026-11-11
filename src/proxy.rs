@@ -4136,7 +4136,7 @@ mod tests {
                 let metadata: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
                 assert!(metadata.get("messages").is_none());
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "id":metadata["id"], "model":"test-model", "max_output_tokens":16
+                    "id":metadata["id"], "model":"test-model"
                 }))
             })
             .expect(2)
@@ -4186,7 +4186,7 @@ mod tests {
                 assert_eq!(metadata["features"]["choices"], 5);
                 assert!(metadata.get("prompt").is_none());
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "id":metadata["id"], "model":"test-model", "max_output_tokens":16
+                    "id":metadata["id"], "model":"test-model"
                 }))
             })
             .expect(3)
@@ -4223,9 +4223,10 @@ mod tests {
         assert!(reporter.budget_report_id.is_none());
         let ledger = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"id":"wrong","model":"test-model","max_output_tokens":16}),
-            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id":"wrong","model":"test-model"})),
+            )
             .mount(&ledger)
             .await;
         reporter.cloud_api_usage_token = Some("test-token".into());

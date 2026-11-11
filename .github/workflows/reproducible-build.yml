@@ -24,19 +24,15 @@ name: Reproducible Build
 # package archives and registries the build reads shows up between merges), and
 # manual dispatch.
 #
-# SECURITY: this is a public repo and the builds run on self-hosted `infra`
-# runners, which are production hosts, executing PR-controlled code
-# (build-image.sh / Dockerfile). Running untrusted PR code there would be an
-# infra-compromise risk, so this does NOT trigger on `pull_request` (matching
-# build.yml). It runs on push to main (post-merge, trusted), on the schedule and
-# on manual workflow_dispatch: a maintainer can dispatch it against a PR branch
-# (`--ref <branch>`) to verify reproducibility before merging. Dispatch build.yml
-# on the branch first to also get the published-digest comparison.
+# The builds run on GitHub-hosted runners, like build.yml. This still does NOT
+# trigger on `pull_request` (matching build.yml): it runs on push to main, on
+# the schedule and on manual workflow_dispatch. A maintainer can dispatch it
+# against a PR branch (`--ref <branch>`) to verify reproducibility before
+# merging. Dispatch build.yml on the branch first to also get the
+# published-digest comparison.
 #
-# Never add `docker system prune` / `docker builder prune` here: a global prune
-# on these hosts deletes images and volumes of other services. build-image.sh
-# builds with --no-cache in a builder of its own, so no build reuses another's
-# layers anyway.
+# build-image.sh builds with --no-cache in a builder of its own, so no build
+# reuses another's layers.
 on:
   push:
     branches: [main]
@@ -56,7 +52,7 @@ permissions:
 jobs:
   cross-machine:
     name: Cross-machine build ${{ matrix.instance }}
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -140,7 +136,7 @@ jobs:
           exit "$status"
 
       # build-image.sh removes its builder and temporary image on exit; the
-      # second half removes what a killed run left on this shared host (the
+      # second half removes what a killed run left behind (the
       # names start with their creation time; nothing older than 3 h is live).
       - name: Clean up build artifacts
         if: always()
@@ -163,7 +159,7 @@ jobs:
 
   sequential:
     name: Sequential builds
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
       - name: Checkout repository
@@ -282,7 +278,7 @@ jobs:
 
   verifier-parity:
     name: Verifier-parity rebuild
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     # External verifiers give each image rebuild 60 minutes.
     timeout-minutes: 60
     steps:
@@ -355,8 +351,7 @@ jobs:
           done
           true
 
-  # Runs on a GitHub-hosted runner: it only reads the API, and waiting for
-  # build.yml must not hold one of the self-hosted builders.
+  # Only reads the API; waits for build.yml to publish its digest.
   verify:
     name: Compare digests
     needs: [cross-machine, sequential, verifier-parity]

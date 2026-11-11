@@ -21,6 +21,8 @@ pub struct UsageFeatures {
     pub executions: u64,
     pub requested_output_tokens: Option<u64>,
     pub model_output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
     pub media_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_duration_seconds: Option<u64>,
@@ -57,6 +59,12 @@ impl UsageFeatures {
                 .or(number("max_output_tokens", true)?)
                 .or(number("max_tokens", true)?),
             model_output_tokens: None,
+            service_tier: body.get("service_tier").and_then(Value::as_str).map(
+                |value| match value {
+                    "default" | "auto" | "priority" | "fast" | "flex" => value.to_owned(),
+                    _ => "unknown".into(),
+                },
+            ),
             media_bytes: 0,
             audio_duration_seconds: None,
             requested_images: number("n", false)?.unwrap_or(1),

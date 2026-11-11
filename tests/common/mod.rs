@@ -35,6 +35,8 @@ pub(crate) fn test_signing_pair() -> signing::SigningPair {
 pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::Router {
     let base = mock_url.trim_end_matches('/');
     let config = config::Config {
+        monetary_admission_mode: Default::default(),
+        monetary_admission_timeout_ms: 2000,
         model_list: None,
         replica_state: None,
         model_name: "test-model".to_string(),

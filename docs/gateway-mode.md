@@ -593,8 +593,9 @@ and the original provider ID. Cloud API or the queue worker charges full actual
 usage and clears the hold atomically; actual usage may exceed the estimate. An
 interrupted stream keeps the existing usage reporting behavior: known counters
 can settle even without `[DONE]` or successful delivery to the client. If no
-billable usage is reported, the hold remains until the fixed expiry managed by
-Cloud API (two hours by default). Late receipts still charge once.
+billable usage is reported, an unknown-outcome notice removes the execution slot
+and shortens the funding hold to Cloud API's configured grace period (five minutes
+by default). Late receipts still charge once.
 Audio prefers the provider's `usage.seconds` for duration-based usage, then the
 verbose response's `duration`, then local frame/sample timing from the uploaded
 file. It neither changes the response format nor decodes/transcodes media.
@@ -607,25 +608,41 @@ Final usage uses the existing HTTP/SQS delivery policy: configured retries,
 backoff, queue bounds and shutdown drain apply equally to admitted reports.
 Retries carry the same admission ID so repeated delivery settles once. No local
 receipt storage or restart replay is added. If usage is lost before successful
-handoff, the hold remains until expiry; the estimate is never charged as actual
-usage. Successfully queued SQS reports retain the queue worker's existing recovery.
+handoff, the final delivery outcome triggers the same best-effort unknown notice;
+the estimate is never charged as actual usage. Successfully queued SQS reports retain the queue worker's existing recovery.
 
 Embedding, rerank, privacy and score keep their existing report delivery. Admission
 requires the matching Cloud API endpoint and ledger schema, and SQS consumers must
 accept the additive `admission_id` and `audio_transcription` event before producers
 send them.
 
-Enabling `CLOUD_API_URL` also enables direct Cloud API keys and requires a nonempty
-`CLOUD_API_USAGE_TOKEN` at startup, including SQS deployments. Direct admitted routes
-depend on Cloud API and its ledger being available for every dispatch; cached key
-validation does not authorize spending. The admission request keeps its bounded
-12-second timeout. Capacity refusals return 429 with `Retry-After`; invalid estimate
-metadata returns 400. There is no fail-open mode.
+`MONETARY_ADMISSION=enforce|audit|off` controls direct monetary admission and defaults
+to `enforce`. Enforce requires Cloud API and its ledger before every dispatch;
+cached key validation does not authorize spending. Audit estimates remotely and logs
+without reserving or rejecting on admission errors. Off skips the new admission call.
+Both audit and off preserve ordinary authentication and actual usage reporting, and
+intentionally disable the additional concurrent-spending protection. They do not release
+existing holds. Cloud API's operator policy may also return an explicit audit/off decision
+for an organization. A public request field cannot select any of these modes.
+
+`MONETARY_ADMISSION_TIMEOUT_MS` defaults to 2000 and accepts 100–10000 milliseconds.
+Invalid mode/timeout settings fail startup. With direct keys enabled (`CLOUD_API_URL`),
+enforce and audit also require `CLOUD_API_USAGE_TOKEN`, including SQS deployments.
+Off can use SQS without the admission token; HTTP usage delivery and internal catalog
+access retain their own token requirements. Capacity refusals return 429 with
+`Retry-After`; invalid admission metadata returns 400. Enforce fails closed on
+unavailable admission; switch mode deliberately for rollout or incident response.
 
 Connection and request-construction failures confirmed to precede dispatch release
-their hold through `/v1/internal/budget/release`. HTTP failures, post-connect timeouts
-and disconnects can already have incurred usage and retain the hold until settlement
-or expiry. Release is bounded and best effort; it adds no durable recovery queue.
+their hold through `/v1/internal/budget/release`. HTTP failures, post-connect timeouts,
+cancellation during dispatch and missing or undeliverable usage notify
+`/v1/internal/budget/unknown`, retaining money temporarily without occupying a running slot.
+Admission timeout/cancellation attempts release using the generated ID before inference
+starts. A cleanup racing an uncommitted admission may miss the row; process crashes or
+failed notices still rely on the original TTL (two hours by default). Repeated unknown
+notices never extend the grace period. These calls are bounded and best effort, with no
+new receipt storage. Request features are counted once and reused for connect failover;
+only sanitized service-tier metadata and numeric counts cross the admission boundary.
 Local audio metering admits at most four parsers with a one-second parsing budget.
 If local metering cannot finish, the existing provider-usage fallback still applies.
 

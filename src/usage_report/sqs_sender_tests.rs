@@ -104,6 +104,8 @@ pub(super) fn job_with(body: &Value, delivery: &Arc<UsageReportDelivery>) -> Job
     Job {
         reporter: UsageReporter {
             budget_report_id: None,
+            admission_mode: crate::monetary_budget::AdmissionMode::Enforce,
+            admission_timeout_ms: 2000,
             http_client: reqwest::Client::new(),
             cloud_api_url: None,
             model_name: "test-model".to_string(),

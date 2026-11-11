@@ -42,6 +42,8 @@ fn build_agent_loop_app_with_cloud_and_idle(
 ) -> axum::Router {
     let base = upstream_mock_url.trim_end_matches('/');
     let config = config::Config {
+        monetary_admission_mode: Default::default(),
+        monetary_admission_timeout_ms: 2000,
         model_list: None,
         replica_state: None,
         model_name: "test-model".to_string(),

@@ -206,6 +206,8 @@ fn build_test_app_inner_with_pool(
     };
 
     let config = config::Config {
+        monetary_admission_mode: Default::default(),
+        monetary_admission_timeout_ms: 2000,
         model_list: None,
         replica_state: None,
         model_name: "test-model".to_string(),
@@ -6574,6 +6576,8 @@ fn build_test_app_with_cloud_api_retries(
     let base = mock_url.trim_end_matches('/');
 
     let config = config::Config {
+        monetary_admission_mode: Default::default(),
+        monetary_admission_timeout_ms: 2000,
         model_list: None,
         replica_state: None,
         model_name: "test-model".to_string(),
@@ -9331,6 +9335,8 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
     ];
 
     let config = config::Config {
+        monetary_admission_mode: Default::default(),
+        monetary_admission_timeout_ms: 2000,
         model_list: None,
         replica_state: None,
         model_name: "test-model".to_string(),
@@ -9808,6 +9814,8 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
     let port = listener.local_addr().unwrap().port();
 
     let config = config::Config {
+        monetary_admission_mode: Default::default(),
+        monetary_admission_timeout_ms: 2000,
         model_list: None,
         replica_state: None,
         model_name: "test-model".to_string(),

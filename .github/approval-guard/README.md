@@ -36,7 +36,8 @@ Approvals from those people are shown in the check but don't count.
    - Deployment-branch rule type must be **branch**, not tag.
 2. **Merge the PR that adds the files above.**
 3. **Report-only period:** the check posts on every PR but is not required yet. Watch it for a few days; it should say `success` wherever a non-contributor approved.
-4. **Enforce:** branch ruleset on the default branch → *Require status checks* → `approval-guard`, with source set to the **approval-guard App** (not "any source"). Leave the bypass list empty.
+4. **Restrict review dismissal:** branch protection → *Require a pull request before merging* → *Restrict who can dismiss pull request reviews* with nobody added (admins only). Otherwise a writer can dismiss a reviewer's "changes requested" while stopping the guard's re-check, and merge on an earlier success.
+5. **Enforce:** branch ruleset on the default branch → *Require status checks* → `approval-guard`, with source set to the **approval-guard App** (not "any source"). Leave the bypass list empty.
 
 ## What it blocks / doesn't
 
@@ -59,7 +60,8 @@ Approvals from those people are shown in the check but don't count.
 | Author clicks "Commit suggestion" on B's suggestion | not covered: author accepted it |
 | Approval withdrawn while a run is mid-evaluation | blocked: reviews are re-read before posting; if they changed, the run fails and the queued run decides |
 | A PR changes approval-guard's own files | needs **two** untouched approvals |
-| Approval withdrawn after a success, and a writer then stops the re-check (cancels it before it marks the check *in progress*, disables the workflow, exhausts the App's rate limit, or an approved head weakened the trigger) | **not covered**: the earlier success stays on that commit. It was earned by an untouched approval of this exact commit; GitHub's own required review still applies |
+| A reviewer approves, then requests changes; a writer stops the guard's re-check and dismisses that change request | blocked only with step 4 (review dismissal restricted to admins): the change request then keeps GitHub's own required review failing |
+| Approval withdrawn after a success, and a writer stops the re-check (cancels it before it marks the check *in progress*, disables the workflow, exhausts the App's rate limit, or an approved head weakened the trigger) | **not covered by the check alone**: the earlier success stays on that commit. It was earned by an untouched approval of this exact commit; a reviewer who objects should request changes, which GitHub's required review enforces when dismissal is restricted (step 4) |
 | An admin edits the rules | **not covered** (admins can change rulesets) |
 | Two colluding / hacked accounts | **not covered** |
 

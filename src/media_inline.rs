@@ -212,13 +212,19 @@ pub async fn inline_remote_media(
         return Ok(());
     }
 
-    // Fetch each distinct URL once.
+    // Fetch each distinct URL once, but remember how many parts use it: every
+    // occurrence gets its own copy of the bytes in the forwarded body, so every
+    // occurrence is charged against the request budget.
     let mut unique: Vec<(String, Kind)> = Vec::new();
+    let mut uses: HashMap<(String, Kind), usize> = HashMap::new();
     for (slot, url) in &slots {
-        if !unique.iter().any(|(u, k)| u == url && *k == slot.kind) {
+        let n = uses.entry((url.clone(), slot.kind)).or_insert(0);
+        if *n == 0 {
             unique.push((url.clone(), slot.kind));
         }
+        *n += 1;
     }
+    let uses = &uses;
     if unique.len() > cfg.max_items {
         return Err(reject("too_many_items", None));
     }
@@ -236,7 +242,8 @@ pub async fn inline_remote_media(
             .buffer_unordered(per_request);
         while let Some((url, kind, r)) = results.next().await {
             let (mime, bytes) = r.map_err(|reason| reject(reason, Some(kind)))?;
-            total = total.saturating_add(bytes.len());
+            let copies = uses.get(&(url.clone(), kind)).copied().unwrap_or(1);
+            total = total.saturating_add(bytes.len().saturating_mul(copies));
             if total > budget {
                 return Err(reject("request_too_large", None));
             }
@@ -325,6 +332,20 @@ async fn fetch_one(
             .await
             .map_err(|_| "saturated")?
             .map_err(|_| "saturated")?;
+    // One deadline for the whole item: every redirect hop and the body.
+    tokio::time::timeout(
+        cfg.timeout,
+        fetch_following_redirects(&mut current, kind, cfg),
+    )
+    .await
+    .map_err(|_| "timeout")?
+}
+
+async fn fetch_following_redirects(
+    current: &mut reqwest::Url,
+    kind: Kind,
+    cfg: &MediaInlineConfig,
+) -> Result<(&'static str, Vec<u8>), &'static str> {
     let cap = kind.max_bytes(cfg);
     let accept = match kind {
         Kind::Image => "image/*,*/*;q=0.8",
@@ -332,7 +353,7 @@ async fn fetch_one(
     };
     let mut hops = 0;
     loop {
-        preflight(&current, cfg, hops > 0)?;
+        preflight(current, cfg, hops > 0)?;
         let resp = validation_client(cfg.allow_private_hosts)
             .get(current.clone())
             .timeout(cfg.timeout)
@@ -356,7 +377,7 @@ async fn fetch_one(
                 .get(reqwest::header::LOCATION)
                 .and_then(|v| v.to_str().ok())
                 .ok_or("bad_redirect")?;
-            current = current.join(loc).map_err(|_| "bad_redirect")?;
+            *current = current.join(loc).map_err(|_| "bad_redirect")?;
             hops += 1;
             continue;
         }
@@ -386,10 +407,11 @@ async fn fetch_one(
             Kind::Audio => audio_mime(&body).ok_or("unsupported_type")?,
         };
         if kind == Kind::Image && cfg.max_image_pixels > 0 {
-            if let Some((w, h)) = image_dimensions(&body) {
-                if (w as u64).saturating_mul(h as u64) > cfg.max_image_pixels {
-                    return Err("too_many_pixels");
-                }
+            // Fail closed: a header we cannot read cannot be checked against
+            // the cap, so it is refused rather than passed to the engine.
+            let (w, h) = image_dimensions(&body).ok_or("unknown_dimensions")?;
+            if (w as u64).saturating_mul(h as u64) > cfg.max_image_pixels {
+                return Err("too_many_pixels");
             }
         }
         return Ok((mime, body));
@@ -436,7 +458,7 @@ fn audio_mime(b: &[u8]) -> Option<&'static str> {
 }
 
 /// Width and height from the header of a PNG, GIF, JPEG or WebP. `None` when
-/// the header can't be read (the engine then decides).
+/// the header can't be read.
 fn image_dimensions(b: &[u8]) -> Option<(u32, u32)> {
     let be32 = |i: usize| {
         b.get(i..i + 4)
@@ -479,6 +501,11 @@ fn image_dimensions(b: &[u8]) -> Option<(u32, u32)> {
                 continue;
             }
             let marker = b[i + 1];
+            if marker == 0xFF {
+                // Fill byte before a marker (allowed by the JPEG spec).
+                i += 1;
+                continue;
+            }
             if matches!(marker, 0xD8 | 0x01) || (0xD0..=0xD7).contains(&marker) {
                 i += 2;
                 continue;
@@ -721,6 +748,106 @@ mod tests {
         let mut req =
             chat(json!([{"type":"image_url","image_url":{"url": format!("{}/r", server.uri())}}]));
         assert!(inline_remote_media(&mut req, &cfg()).await.is_err());
+    }
+
+    fn jpeg(w: u16, h: u16, fill: usize) -> Vec<u8> {
+        let mut v = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00];
+        v.extend(std::iter::repeat_n(0xFF, fill));
+        v.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x11, 0x08]);
+        v.extend_from_slice(&h.to_be_bytes());
+        v.extend_from_slice(&w.to_be_bytes());
+        v.extend_from_slice(&[0u8; 16]);
+        v
+    }
+
+    #[test]
+    fn jpeg_dimensions_survive_marker_fill_bytes() {
+        assert_eq!(image_dimensions(&jpeg(6000, 5000, 0)), Some((6000, 5000)));
+        assert_eq!(image_dimensions(&jpeg(6000, 5000, 1)), Some((6000, 5000)));
+        assert_eq!(image_dimensions(&jpeg(6000, 5000, 5)), Some((6000, 5000)));
+    }
+
+    #[tokio::test]
+    async fn padded_oversized_jpeg_and_unreadable_header_are_rejected() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/padded.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(jpeg(6000, 5000, 1)))
+            .mount(&server)
+            .await;
+        // A JPEG with no SOF segment: dimensions unknown.
+        Mock::given(method("GET"))
+            .and(path("/nosof.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![
+                0xFF, 0xD8, 0xFF, 0xE0, 0, 4, 0, 0, 0xFF, 0xD9, 0, 0, 0, 0,
+            ]))
+            .mount(&server)
+            .await;
+        for p in ["/padded.jpg", "/nosof.jpg"] {
+            let mut req = chat(
+                json!([{"type":"image_url","image_url":{"url": format!("{}{p}", server.uri())}}]),
+            );
+            assert!(inline_remote_media(&mut req, &cfg()).await.is_err(), "{p}");
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_url_is_fetched_once_but_charged_per_use() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/a.png"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(PNG_1X1))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let url = format!("{}/a.png", server.uri());
+        let parts = |n: usize| {
+            Value::Array(
+                (0..n)
+                    .map(|_| json!({"type":"image_url","image_url":{"url": url}}))
+                    .collect(),
+            )
+        };
+        // 3 uses of a 29-byte image fit a 100-byte budget, 4 do not.
+        let c = MediaInlineConfig {
+            max_total_bytes: 100,
+            ..cfg()
+        };
+        let mut ok = chat(parts(3));
+        inline_remote_media(&mut ok, &c).await.unwrap();
+        let mut too_many = chat(parts(4));
+        assert!(inline_remote_media(&mut too_many, &c).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn item_timeout_covers_the_redirect_chain() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/r"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", "/a.png")
+                    .set_delay(Duration::from_millis(700)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/a.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(PNG_1X1)
+                    .set_delay(Duration::from_millis(700)),
+            )
+            .mount(&server)
+            .await;
+        // Each hop is under the 1 s item timeout, the chain is not.
+        let c = MediaInlineConfig {
+            timeout: Duration::from_secs(1),
+            ..cfg()
+        };
+        let mut req =
+            chat(json!([{"type":"image_url","image_url":{"url": format!("{}/r", server.uri())}}]));
+        assert!(inline_remote_media(&mut req, &c).await.is_err());
     }
 
     #[test]

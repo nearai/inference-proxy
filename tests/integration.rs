@@ -18,6 +18,7 @@ struct TestAppOptions {
     rate_burst: u32,
     dstack_socket_path: String,
     image_validation: bool,
+    media_inline: bool,
     fusion_enabled: bool,
     fusion_endpoints_url: Option<String>,
     web_context_search_url: Option<String>,
@@ -52,6 +53,7 @@ impl Default for TestAppOptions {
             rate_burst: 200,
             dstack_socket_path: "/var/run/dstack.sock".to_string(),
             image_validation: false,
+            media_inline: false,
             fusion_enabled: false,
             fusion_endpoints_url: None,
             web_context_search_url: None,
@@ -238,6 +240,10 @@ fn build_test_app_inner_with_pool(
         image_validation_allowed_domains: Vec::new(),
         image_validation_reject_non_rgb_images: false,
         image_validation_reject_single_channel_images: false,
+        media_inline: vllm_proxy_rs::media_inline::MediaInlineConfig {
+            enabled: options.media_inline,
+            ..Default::default()
+        },
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
         dev_mode: true,
@@ -1342,6 +1348,136 @@ async fn test_chat_completions_image_validation_rejects_bad_image() {
         .as_str()
         .unwrap()
         .contains("/etc/passwd"));
+}
+
+#[tokio::test]
+async fn test_chat_completions_media_inline_forwards_data_urls_only() {
+    // With VLLM_PROXY_INLINE_MEDIA on, remote image/audio URLs are fetched by
+    // the proxy and the backend receives `data:` URLs only (air-gapped engine).
+    let mock_server = MockServer::start().await;
+    let png: Vec<u8> = vec![
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0x0D, b'I', b'H', b'D', b'R', 0,
+        0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0,
+    ];
+    let mut wav = b"RIFF\x24\x00\x00\x00WAVEfmt ".to_vec();
+    wav.extend_from_slice(&[0u8; 32]);
+    Mock::given(method("GET"))
+        .and(path("/media/a.png"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(png))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/media/a.wav"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(wav))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "x", "object": "chat.completion", "model": "test-model",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app_inner(
+        &mock_server.uri(),
+        TestAppOptions {
+            image_validation: true,
+            media_inline: true,
+            ..Default::default()
+        },
+    );
+    let base = mock_server.uri();
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {"url": format!("{base}/media/a.png")}},
+            {"type": "audio_url", "audio_url": {"url": format!("{base}/media/a.wav")}}
+        ]}],
+        "stream": false
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let reqs = mock_server.received_requests().await.unwrap();
+    let forwarded = reqs
+        .iter()
+        .find(|r| r.url.path() == "/v1/chat/completions")
+        .expect("backend was called");
+    let body: serde_json::Value = serde_json::from_slice(&forwarded.body).unwrap();
+    let parts = &body["messages"][0]["content"];
+    assert!(parts[1]["image_url"]["url"]
+        .as_str()
+        .unwrap()
+        .starts_with("data:image/png;base64,"));
+    assert!(parts[2]["audio_url"]["url"]
+        .as_str()
+        .unwrap()
+        .starts_with("data:audio/wav;base64,"));
+    assert!(!String::from_utf8_lossy(&forwarded.body).contains("/media/"));
+}
+
+#[tokio::test]
+async fn test_chat_completions_media_inline_rejects_unfetchable_url() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/media/gone.png"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"x"})))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+    let app = build_test_app_inner(
+        &mock_server.uri(),
+        TestAppOptions {
+            image_validation: true,
+            media_inline: true,
+            ..Default::default()
+        },
+    );
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": format!("{}/media/gone.png", mock_server.uri())}}
+        ]}]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(response).await;
+    assert!(!body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("gone.png"));
 }
 
 #[tokio::test]
@@ -6459,6 +6595,7 @@ fn build_test_app_with_cloud_api_retries(
         image_validation_allowed_domains: Vec::new(),
         image_validation_reject_non_rgb_images: false,
         image_validation_reject_single_channel_images: false,
+        media_inline: Default::default(),
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
         cloud_api_url: Some(cloud_api_url.to_string()),
@@ -9110,6 +9247,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         image_validation_allowed_domains: Vec::new(),
         image_validation_reject_non_rgb_images: false,
         image_validation_reject_single_channel_images: false,
+        media_inline: Default::default(),
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
         dev_mode: true,
@@ -9585,6 +9723,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         image_validation_allowed_domains: Vec::new(),
         image_validation_reject_non_rgb_images: false,
         image_validation_reject_single_channel_images: false,
+        media_inline: Default::default(),
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
         dev_mode: true,

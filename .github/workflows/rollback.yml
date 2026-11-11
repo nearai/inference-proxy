@@ -57,10 +57,11 @@ jobs:
       - name: Resolve rollback target
         id: resolve
         env:
+          VAR_DOCKER_REGISTRY_USER: ${{ vars.DOCKER_REGISTRY_USER }}
           TARGET_TAG_INPUT: ${{ inputs.target_tag }}
         run: |
           set -euo pipefail
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}"
+          IMAGE="${REGISTRY}/${IMAGE_REPOSITORY}"
           TARGET_TAG="$TARGET_TAG_INPUT"
 
           CURRENT_DIGEST=$(skopeo inspect "docker://${IMAGE}:prod" 2>/dev/null | jq -r '.Digest' || true)
@@ -71,7 +72,7 @@ jobs:
 
           if [ -z "$TARGET_TAG" ]; then
             TAGS_JSON=""
-            PAGE_URL="https://hub.docker.com/v2/namespaces/${{ vars.DOCKER_REGISTRY_USER }}/repositories/vllm-proxy-rs/tags?page_size=100"
+            PAGE_URL="https://hub.docker.com/v2/namespaces/${VAR_DOCKER_REGISTRY_USER}/repositories/vllm-proxy-rs/tags?page_size=100"
             PAGE_COUNT=0
             while [ -n "$PAGE_URL" ] && [ "$PAGE_URL" != "null" ] && [ "$PAGE_COUNT" -lt 50 ]; do
               RESP=$(curl -fsS --max-time 30 --retry 2 --retry-delay 2 "$PAGE_URL")
@@ -113,6 +114,9 @@ jobs:
           echo "audit_tag=${AUDIT_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Verify rollback target was built and signed by build.yml on main
+        env:
+          STEP_RESOLVE_IMAGE: ${{ steps.resolve.outputs.image }}
+          STEP_RESOLVE_TARGET_DIGEST: ${{ steps.resolve.outputs.target_digest }}
         run: |
           set -euo pipefail
           cosign verify \
@@ -120,23 +124,31 @@ jobs:
             --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
             --certificate-github-workflow-repository 'nearai/inference-proxy' \
             --certificate-github-workflow-ref 'refs/heads/main' \
-            "${{ steps.resolve.outputs.image }}@${{ steps.resolve.outputs.target_digest }}"
+            "${STEP_RESOLVE_IMAGE}@${STEP_RESOLVE_TARGET_DIGEST}"
 
       - name: Re-tag production aliases
+        env:
+          STEP_RESOLVE_IMAGE: ${{ steps.resolve.outputs.image }}
+          STEP_RESOLVE_TARGET_DIGEST: ${{ steps.resolve.outputs.target_digest }}
+          STEP_RESOLVE_AUDIT_TAG: ${{ steps.resolve.outputs.audit_tag }}
         run: |
           set -euo pipefail
-          IMAGE="${{ steps.resolve.outputs.image }}"
-          DIGEST="${{ steps.resolve.outputs.target_digest }}"
+          IMAGE="${STEP_RESOLVE_IMAGE}"
+          DIGEST="${STEP_RESOLVE_TARGET_DIGEST}"
           skopeo copy "docker://${IMAGE}@${DIGEST}" "docker://${IMAGE}:prod"
           skopeo copy "docker://${IMAGE}@${DIGEST}" "docker://${IMAGE}:latest"
-          skopeo copy "docker://${IMAGE}@${DIGEST}" "docker://${IMAGE}:${{ steps.resolve.outputs.audit_tag }}"
+          skopeo copy "docker://${IMAGE}@${DIGEST}" "docker://${IMAGE}:${STEP_RESOLVE_AUDIT_TAG}"
 
       - name: Confirm rollback tags resolve to the target digest
+        env:
+          STEP_RESOLVE_IMAGE: ${{ steps.resolve.outputs.image }}
+          STEP_RESOLVE_TARGET_DIGEST: ${{ steps.resolve.outputs.target_digest }}
+          STEP_RESOLVE_AUDIT_TAG: ${{ steps.resolve.outputs.audit_tag }}
         run: |
           set -euo pipefail
-          IMAGE="${{ steps.resolve.outputs.image }}"
-          DIGEST="${{ steps.resolve.outputs.target_digest }}"
-          for tag in prod latest "${{ steps.resolve.outputs.audit_tag }}"; do
+          IMAGE="${STEP_RESOLVE_IMAGE}"
+          DIGEST="${STEP_RESOLVE_TARGET_DIGEST}"
+          for tag in prod latest "${STEP_RESOLVE_AUDIT_TAG}"; do
             RESOLVED_DIGEST=$(skopeo inspect "docker://${IMAGE}:${tag}" | jq -r '.Digest')
             if [ "${RESOLVED_DIGEST}" != "${DIGEST}" ]; then
               echo "::error::${tag} resolved to ${RESOLVED_DIGEST}, expected ${DIGEST}"
@@ -146,21 +158,26 @@ jobs:
 
       - name: Create GitHub release
         env:
+          STEP_RESOLVE_AUDIT_TAG: ${{ steps.resolve.outputs.audit_tag }}
+          STEP_RESOLVE_IMAGE: ${{ steps.resolve.outputs.image }}
+          STEP_RESOLVE_TARGET_TAG: ${{ steps.resolve.outputs.target_tag }}
+          STEP_RESOLVE_TARGET_DIGEST: ${{ steps.resolve.outputs.target_digest }}
+          STEP_RESOLVE_PREVIOUS_DIGEST: ${{ steps.resolve.outputs.previous_digest }}
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          TAG="${{ steps.resolve.outputs.audit_tag }}"
+          TAG="${STEP_RESOLVE_AUDIT_TAG}"
           NOTES=$(cat <<EOF
           ## Production Rollback
 
-          - **Image**: \`${{ steps.resolve.outputs.image }}:prod\`
-          - **Compatibility alias**: \`${{ steps.resolve.outputs.image }}:latest\`
-          - **Rolled back to**: \`${{ steps.resolve.outputs.image }}:${{ steps.resolve.outputs.target_tag }}\`
-          - **Audit tag**: \`${{ steps.resolve.outputs.image }}:${TAG}\`
-          - **New digest**: \`${{ steps.resolve.outputs.target_digest }}\`
-          - **Previous digest**: \`${{ steps.resolve.outputs.previous_digest }}\`
-          - **Sigstore**: https://search.sigstore.dev/?hash=${{ steps.resolve.outputs.target_digest }}
+          - **Image**: \`${STEP_RESOLVE_IMAGE}:prod\`
+          - **Compatibility alias**: \`${STEP_RESOLVE_IMAGE}:latest\`
+          - **Rolled back to**: \`${STEP_RESOLVE_IMAGE}:${STEP_RESOLVE_TARGET_TAG}\`
+          - **Audit tag**: \`${STEP_RESOLVE_IMAGE}:${TAG}\`
+          - **New digest**: \`${STEP_RESOLVE_TARGET_DIGEST}\`
+          - **Previous digest**: \`${STEP_RESOLVE_PREVIOUS_DIGEST}\`
+          - **Sigstore**: https://search.sigstore.dev/?hash=${STEP_RESOLVE_TARGET_DIGEST}
           EOF
           )
           if gh release view "$TAG" >/dev/null 2>&1; then
@@ -170,11 +187,16 @@ jobs:
           fi
 
       - name: Summary
+        env:
+          STEP_RESOLVE_TARGET_TAG: ${{ steps.resolve.outputs.target_tag }}
+          STEP_RESOLVE_TARGET_DIGEST: ${{ steps.resolve.outputs.target_digest }}
+          STEP_RESOLVE_PREVIOUS_DIGEST: ${{ steps.resolve.outputs.previous_digest }}
+          STEP_RESOLVE_AUDIT_TAG: ${{ steps.resolve.outputs.audit_tag }}
         run: |
           {
-            echo "## Rollback: :prod -> ${{ steps.resolve.outputs.target_tag }}"
+            echo "## Rollback: :prod -> ${STEP_RESOLVE_TARGET_TAG}"
             echo ""
-            echo "- target digest: \`${{ steps.resolve.outputs.target_digest }}\`"
-            echo "- previous digest: \`${{ steps.resolve.outputs.previous_digest }}\`"
-            echo "- audit tag: \`${{ steps.resolve.outputs.audit_tag }}\`"
+            echo "- target digest: \`${STEP_RESOLVE_TARGET_DIGEST}\`"
+            echo "- previous digest: \`${STEP_RESOLVE_PREVIOUS_DIGEST}\`"
+            echo "- audit tag: \`${STEP_RESOLVE_AUDIT_TAG}\`"
           } >> "$GITHUB_STEP_SUMMARY"

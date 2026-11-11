@@ -239,9 +239,9 @@ pub async fn run_chat_completion(
                     completed_cleanly = result.completed_cleanly,
                     "agent loop completed"
                 );
-                // Only the final aggregate is authoritative. An interrupted loop retains
-                // its complete reservation until final usage can be reconciled.
-                if let Some(reporter) = usage_reporter.as_ref().filter(|_| result.has_final_usage) {
+                // Preserve the original billing of known cumulative usage, including
+                // interrupted loops. Admission must not discard that partial total.
+                if let Some(reporter) = usage_reporter.as_ref() {
                     let usage = (result.input_tokens > 0 || result.output_tokens > 0).then_some((
                         i64::try_from(result.input_tokens).unwrap_or(i64::MAX),
                         i64::try_from(result.output_tokens).unwrap_or(i64::MAX),
@@ -371,8 +371,6 @@ struct LoopResult {
     /// terminator) and the final `[DONE]` was sent downstream. False on
     /// client disconnect or upstream stream ending without a `[DONE]`.
     completed_cleanly: bool,
-    /// All dispatched iterations have authoritative usage, independent of client delivery.
-    has_final_usage: bool,
     downstream_error: Option<AppError>,
 }
 
@@ -389,8 +387,6 @@ async fn drive_loop(
     let mut iterations: u32 = 0;
     let terminated_by;
     let mut completed_cleanly = false;
-    let mut has_final_usage = false;
-    let mut all_iterations_have_usage = true;
     let mut downstream_error = None;
     // The iter-0 upstream Response is already in hand (see
     // `run_chat_completion`); subsequent iterations build their own via
@@ -428,10 +424,9 @@ async fn drive_loop(
             break;
         }
 
-        has_final_usage = false; // A new dispatch makes the aggregate uncertain again.
-                                 // Acquire the upstream Response for this iteration. Iter 0 reuses
-                                 // the synchronous first call from `run_chat_completion`; iter 1+
-                                 // sends now, racing the send against client disconnect.
+        // Acquire the upstream Response for this iteration. Iter 0 reuses
+        // the synchronous first call from `run_chat_completion`; iter 1+
+        // sends now, racing the send against client disconnect.
         let response = match next_response.take() {
             Some(r) => r,
             None => {
@@ -521,11 +516,6 @@ async fn drive_loop(
             upstream_ms = iter_started.elapsed().as_millis() as u64,
             "agent loop iteration"
         );
-
-        all_iterations_have_usage &= iter_outcome.saw_done
-            && iter_outcome.upstream_error.is_none()
-            && (iter_outcome.input_tokens > 0 || iter_outcome.output_tokens > 0);
-        has_final_usage = all_iterations_have_usage;
 
         if let Some(error) = iter_outcome.downstream_error {
             downstream_error = Some(error);
@@ -747,7 +737,6 @@ async fn drive_loop(
         output_tokens: total_output_tokens,
         terminated_by,
         completed_cleanly,
-        has_final_usage,
         downstream_error,
     })
 }
@@ -1570,7 +1559,6 @@ mod tests {
         assert!(std::str::from_utf8(&final_chunk).unwrap().contains("usage"));
         rx.close(); // Reject downstream [DONE] after the final upstream counters were read.
         let result = task.await.unwrap().unwrap();
-        assert!(result.has_final_usage);
         assert!(!result.completed_cleanly);
         assert_eq!((result.input_tokens, result.output_tokens), (3, 2));
     }

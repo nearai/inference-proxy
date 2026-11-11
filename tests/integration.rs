@@ -7474,7 +7474,7 @@ data: [DONE]\n\n";
 /// figure we bill. The signature must still be withheld — a partial response
 /// cannot be verified.
 #[tokio::test]
-async fn test_interrupted_stream_retains_budget_without_final_receipt() {
+async fn test_interrupted_stream_reports_known_usage_with_admission() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
     budget_fixture::mount(&cloud_api).await;
@@ -7546,17 +7546,23 @@ data: {\"id\":\"chatcmpl-interrupted\",\"choices\":[{\"delta\":{\"content\":\"lo
     use http_body_util::BodyExt;
     let _ = response.into_body().collect().await;
 
-    // Partial counters are not a final receipt: the ledger must keep the full hold.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert!(get_usage_requests(&cloud_api).await.is_empty());
-    let admissions = cloud_api
+    wait_for_usage_request(&cloud_api, 1).await;
+    let usage = get_usage_requests(&cloud_api).await;
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0]["id"], "chatcmpl-interrupted");
+    assert_eq!(usage[0]["input_tokens"], 8);
+    assert_eq!(usage[0]["output_tokens"], 2);
+    assert_eq!(usage[0]["cache_read_tokens"], 6);
+    let admissions: Vec<_> = cloud_api
         .received_requests()
         .await
         .unwrap()
         .into_iter()
         .filter(|r| r.url.path() == "/v1/internal/budget")
-        .count();
-    assert_eq!(admissions, 1);
+        .collect();
+    assert_eq!(admissions.len(), 1);
+    let admission: serde_json::Value = serde_json::from_slice(&admissions[0].body).unwrap();
+    assert_eq!(usage[0]["admission_id"], admission["id"]);
 
     // ...but the signature is still withheld: a partial stream cannot be verified.
     let sig_response = app

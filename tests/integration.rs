@@ -7751,6 +7751,85 @@ async fn test_usage_reported_for_image_generation() {
     assert_eq!(usage_reqs[0]["type"], "image_generation");
     assert_eq!(usage_reqs[0]["model"], "test-model");
     assert_eq!(usage_reqs[0]["image_count"], 2);
+    let requests = cloud_api.received_requests().await.unwrap();
+    let admissions: Vec<_> = requests
+        .iter()
+        .filter(|request| request.url.path() == "/v1/internal/budget")
+        .collect();
+    assert_eq!(
+        admissions.len(),
+        1,
+        "image generation reserves exactly once"
+    );
+    let admission: serde_json::Value = serde_json::from_slice(&admissions[0].body).unwrap();
+    assert_eq!(admission["features"]["inference_type"], "image_generation");
+    assert_eq!(usage_reqs[0]["admission_id"], admission["id"]);
+}
+
+#[tokio::test]
+async fn test_direct_image_generation_budget_denial_prevents_plain_and_encrypted_dispatch() {
+    use vllm_proxy_rs::encryption;
+
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id":"org-test", "workspace_id":"ws-test", "api_key_id":"key-test"
+        })))
+        .expect(1)
+        .mount(&cloud_api)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/internal/budget"))
+        .respond_with(ResponseTemplate::new(402))
+        .expect(2)
+        .mount(&cloud_api)
+        .await;
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+    let client_pair = test_client_signing_pair();
+    for encrypted in [false, true] {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/v1/images/generations")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer sk-test-valid-key-12345678901");
+        let prompt = if encrypted {
+            request = request
+                .header("x-signing-algo", "ed25519")
+                .header("x-client-pub-key", &client_pair.ed25519.signing_public_key);
+            encryption::encrypt_string(
+                "a cat",
+                &encryption::EncryptionContext {
+                    algo: encryption::EncryptionAlgo::Ed25519,
+                    client_pub_key: hex::decode(test_ed25519_pub_key_hex()).unwrap(),
+                    version: 1,
+                    encrypt_all_fields: false,
+                },
+                &client_pair,
+            )
+            .unwrap()
+        } else {
+            "a cat".to_owned()
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                request
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "model":"test-model", "prompt":prompt
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+    assert!(backend.received_requests().await.unwrap().is_empty());
+    assert!(get_usage_requests(&cloud_api).await.is_empty());
 }
 
 #[tokio::test]

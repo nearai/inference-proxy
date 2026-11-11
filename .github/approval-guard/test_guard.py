@@ -298,6 +298,11 @@ class WebFlow(unittest.TestCase):
 
 
 class Plumbing(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(guard, "touches_guard", return_value=False)
+        self.touches = patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_get_pages_follows_link_and_stops(self):
         pages = [([1, 2], '<https://x/next>; rel="next"'), ([3], '<https://x/n2>; rel="next"'), ([4], "")]
         with mock.patch.object(guard, "_request", side_effect=pages) as req:
@@ -341,7 +346,8 @@ class Plumbing(unittest.TestCase):
              mock.patch.object(guard, "gather", return_value=(
                  [commit("alice")], [review("carol"), review("outsider", "CHANGES_REQUESTED")],
                  [push("alice")])), \
-             mock.patch.object(guard, "post_check") as post:
+             mock.patch.object(guard, "start_check", return_value=7), \
+             mock.patch.object(guard, "finish_check") as post:
             guard.evaluate_pr("o/r", "main", 1)
         # carol is also a 404 here -> no write -> failure, but NOT "Changes requested"
         self.assertEqual("failure", post.call_args.args[2])
@@ -445,39 +451,164 @@ class Plumbing(unittest.TestCase):
     def test_evaluate_posts_failure_on_unexpected_error(self):
         with mock.patch.object(guard, "get", return_value=self._pr()), \
              mock.patch.object(guard, "gather", side_effect=KeyError("boom")), \
-             mock.patch.object(guard, "post_check") as post:
+             mock.patch.object(guard, "start_check", return_value=7), \
+             mock.patch.object(guard, "finish_check") as post:
             guard.evaluate_pr("o/r", "main", 1)
         self.assertEqual("failure", post.call_args.args[2])
 
     def test_evaluate_fork_fails(self):
         with mock.patch.object(guard, "get", return_value=self._pr(fork=True)), \
-             mock.patch.object(guard, "post_check") as post:
+             mock.patch.object(guard, "start_check", return_value=7), \
+             mock.patch.object(guard, "finish_check") as post:
             guard.evaluate_pr("o/r", "main", 1)
         self.assertEqual("failure", post.call_args.args[2])
 
-    def test_evaluate_skips_when_head_moved(self):
+    def test_evaluate_fails_superseded_when_head_moved(self):
         with mock.patch.object(guard, "get", side_effect=[self._pr(), self._pr(head=OLD)]), \
              mock.patch.object(guard, "gather", return_value=([], [], [])), \
-             mock.patch.object(guard, "post_check") as post:
+             mock.patch.object(guard, "start_check", return_value=7), \
+             mock.patch.object(guard, "finish_check") as post:
             guard.evaluate_pr("o/r", "main", 1)
+        self.assertEqual(("o/r", 7, "failure", "Superseded by a newer commit"), post.call_args.args[:4])
+
+    def test_in_progress_posted_before_evaluating(self):
+        calls = []
+        with mock.patch.object(guard, "get", return_value=self._pr()), \
+             mock.patch.object(guard, "start_check", side_effect=lambda *a: calls.append("start") or 7), \
+             mock.patch.object(guard, "gather", side_effect=lambda *a: calls.append("gather") or ([], [], [])), \
+             mock.patch.object(guard, "finish_check", side_effect=lambda *a: calls.append("finish")):
+            guard.evaluate_pr("o/r", "main", 1)
+        self.assertEqual(["start", "gather", "finish"], calls)
+
+    def test_start_check_failure_raises_before_evaluating(self):
+        with mock.patch.object(guard, "get", return_value=self._pr()), \
+             mock.patch.object(guard, "start_check", side_effect=guard.GuardError("rate limited")), \
+             mock.patch.object(guard, "gather") as g, \
+             mock.patch.object(guard, "finish_check") as post:
+            with self.assertRaises(guard.GuardError):
+                guard.evaluate_pr("o/r", "main", 1)
+        g.assert_not_called()
         post.assert_not_called()
+
+    def test_review_reread_failure_finishes_as_failure(self):
+        p = self._pr()
+        with mock.patch.object(guard, "get", side_effect=[p, {"permission": "write"}, p]), \
+             mock.patch.object(guard, "gather", return_value=([commit("alice")], [review("carol")], [push("alice")])), \
+             mock.patch.object(guard, "get_pages", side_effect=guard.GuardError("HTTP 502")), \
+             mock.patch.object(guard, "start_check", return_value=7), \
+             mock.patch.object(guard, "finish_check") as post:
+            guard.evaluate_pr("o/r", "main", 1)
+        self.assertEqual(("failure", "approval-guard could not confirm its verdict"), post.call_args.args[2:4])
+
+    def test_guard_change_needs_two_untouched_approvals(self):
+        p = self._pr()
+        self.touches.return_value = True
+        one = [review("carol")]
+        with mock.patch.object(guard, "get", side_effect=[p, {"permission": "write"}, p]), \
+             mock.patch.object(guard, "gather", return_value=([commit("alice")], one, [push("alice")])), \
+             mock.patch.object(guard, "get_pages", return_value=one), \
+             mock.patch.object(guard, "start_check", return_value=7), \
+             mock.patch.object(guard, "finish_check") as post:
+            guard.evaluate_pr("o/r", "main", 1)
+        self.assertEqual("failure", post.call_args.args[2])
+        two = [review("carol"), review("dave")]
+        with mock.patch.object(guard, "get", side_effect=[p, {"permission": "write"}, {"permission": "write"}, p]), \
+             mock.patch.object(guard, "gather", return_value=([commit("alice")], two, [push("alice")])), \
+             mock.patch.object(guard, "get_pages", return_value=[dict(r) for r in two]), \
+             mock.patch.object(guard, "start_check", return_value=7), \
+             mock.patch.object(guard, "finish_check") as post:
+            guard.evaluate_pr("o/r", "main", 1)
+        self.assertEqual("success", post.call_args.args[2])
+
+    def test_check_request_bodies(self):
+        with mock.patch.object(guard, "_request", return_value=({"id": 9}, "")) as req:
+            self.assertEqual(9, guard.start_check("o/r", HEAD))
+            guard.finish_check("o/r", 9, "success", "t", "s")
+        start_url, start_method, start_body = req.call_args_list[0].args
+        self.assertEqual(("POST", "approval-guard", HEAD, "in_progress"),
+                         (start_method, start_body["name"], start_body["head_sha"], start_body["status"]))
+        fin_url, fin_method, fin_body = req.call_args_list[1].args
+        self.assertTrue(fin_url.endswith("/check-runs/9"))
+        self.assertEqual(("PATCH", "completed", "success"),
+                         (fin_method, fin_body["status"], fin_body["conclusion"]))
+
+    def test_start_check_rejects_bad_response(self):
+        with mock.patch.object(guard, "_request", return_value=({"message": "x"}, "")):
+            with self.assertRaises(guard.GuardError):
+                guard.start_check("o/r", HEAD)
+
+
+    def test_cancelled_run_leaves_check_pending(self):
+        # Simulates cancellation mid-run: nothing after start_check completes.
+        with mock.patch.object(guard, "get", return_value=self._pr()), \
+             mock.patch.object(guard, "start_check", return_value=7) as start, \
+             mock.patch.object(guard, "gather", side_effect=KeyboardInterrupt), \
+             mock.patch.object(guard, "finish_check") as post:
+            with self.assertRaises(KeyboardInterrupt):
+                guard.evaluate_pr("o/r", "main", 1)
+        start.assert_called_once()
+        post.assert_not_called()
+
+    def test_success_downgraded_when_reviews_change_during_evaluation(self):
+        p = self._pr()
+        snap = [review("carol")]
+        dismissed = [dict(snap[0], state="DISMISSED")]
+        with mock.patch.object(guard, "get", side_effect=[p, {"permission": "write"}, p]), \
+             mock.patch.object(guard, "gather", return_value=([commit("alice")], snap, [push("alice")])), \
+             mock.patch.object(guard, "get_pages", return_value=dismissed), \
+             mock.patch.object(guard, "start_check", return_value=7), \
+             mock.patch.object(guard, "finish_check") as post:
+            guard.evaluate_pr("o/r", "main", 1)
+        self.assertEqual(("failure", "Reviews changed during evaluation"), post.call_args.args[2:4])
 
     def test_evaluate_success_path(self):
         p = self._pr()
+        reviews = [review("carol")]
         with mock.patch.object(guard, "get", side_effect=[p, {"permission": "write"}, p]), \
              mock.patch.object(guard, "gather",
-                               return_value=([commit("alice")], [review("carol")], [push("alice")])), \
-             mock.patch.object(guard, "post_check") as post:
+                               return_value=([commit("alice")], reviews, [push("alice")])), \
+             mock.patch.object(guard, "get_pages", return_value=[dict(r) for r in reviews]), \
+             mock.patch.object(guard, "start_check", return_value=7) as start, \
+             mock.patch.object(guard, "finish_check") as post:
             guard.evaluate_pr("o/r", "main", 1)
-        self.assertEqual(("o/r", HEAD, "success"), post.call_args.args[:3])
+        start.assert_called_once_with("o/r", HEAD)
+        self.assertEqual(("o/r", 7, "success"), post.call_args.args[:3])
 
     def test_evaluate_skips_pr_into_other_branch(self):
         p = self._pr()
         p["base"]["ref"] = "release"
         with mock.patch.object(guard, "get", return_value=p), \
-             mock.patch.object(guard, "post_check") as post:
+             mock.patch.object(guard, "start_check") as start, \
+             mock.patch.object(guard, "finish_check") as post:
             guard.evaluate_pr("o/r", "main", 1)
+        start.assert_not_called()
         post.assert_not_called()
+
+
+class TouchesGuard(unittest.TestCase):
+    def files(self, *names, prev=None):
+        out = [{"filename": n} for n in names]
+        if prev:
+            out[0]["previous_filename"] = prev
+        return out
+
+    def check(self, files, changed=None):
+        with mock.patch.object(guard, "get_pages", return_value=files):
+            return guard.touches_guard("o/r", 1, {"changed_files": len(files) if changed is None else changed})
+
+    def test_detects_workflow_and_script_changes(self):
+        self.assertTrue(self.check(self.files("src/main.rs", ".github/workflows/approval-guard-trigger.yml")))
+        self.assertTrue(self.check(self.files(".github/approval-guard/guard.py")))
+
+    def test_detects_rename_away(self):
+        self.assertTrue(self.check(self.files("x.yml", prev=".github/workflows/approval-guard.yml")))
+
+    def test_ordinary_change(self):
+        self.assertFalse(self.check(self.files("src/main.rs", ".github/workflows/ci.yml")))
+
+    def test_incomplete_list_fails(self):
+        with self.assertRaises(guard.GuardError):
+            self.check(self.files("src/main.rs"), changed=5)
 
 
 if __name__ == "__main__":

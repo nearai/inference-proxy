@@ -5,7 +5,7 @@
 "Touched" means any of:
 - the PR author;
 - any commit author or committer;
-- anyone who pushed to the PR branch (an unbroken push record from branch creation to the current head is required);
+- anyone who pushed to the PR branch, as recorded in an unbroken push record from branch creation to the current head (a push that changed nothing may be missing while GitHub's activity log lags);
 - whoever created a commit GitHub signed on their behalf (web UI / API commits), even on another branch that was later merged in.
 
 Approvals from those people are shown in the check but don't count.
@@ -44,7 +44,8 @@ Approvals from those people are shown in the check but don't count.
 |---|---|
 | B pushes to A's PR, then B approves (even if A pushes again afterwards) | blocked: B is a pusher/committer |
 | B commits through the API with A as the author | blocked: the activity log shows B pushed |
-| B makes that API commit on another branch and A merges or fast-forwards to it | blocked: every push that ever pointed at that commit counts, including B's (assumes GitHub keeps activity for deleted branches; confirm during report-only) |
+| B makes that API commit on another branch **in this repo** and A merges or fast-forwards to it | blocked: every push that ever pointed at that commit counts, including B's (assumes GitHub keeps activity for deleted branches; confirm during report-only) |
+| B makes an API commit in a fork or another repo and A fast-forwards to it | **not covered**: this repo's activity log never saw B's push; A took the commit in |
 | B renames the branch to hide their push | blocked: the push record no longer reaches branch creation, so the check fails |
 | Activity log hasn't caught up with B's latest push | blocked: record must reach the current head |
 | B has a workflow push for them (`github-actions[bot]`) | blocked: bot pushes/commits fail |
@@ -56,7 +57,9 @@ Approvals from those people are shown in the check but don't count.
 | "Update branch" button | whoever clicked it counts as having touched the PR |
 | A re-commits (cherry-pick / reset) B's change under their own name | not covered: A took ownership of the change |
 | Author clicks "Commit suggestion" on B's suggestion | not covered: author accepted it |
-| Approval withdrawn, then B cancels the re-check run | not covered: an untouched person did approve that commit |
+| Approval withdrawn while a run is mid-evaluation | blocked: reviews are re-read before posting; if they changed, the run fails and the queued run decides |
+| A PR changes approval-guard's own files | needs **two** untouched approvals |
+| Approval withdrawn after a success, and a writer then stops the re-check (cancels it before it marks the check *in progress*, disables the workflow, exhausts the App's rate limit, or an approved head weakened the trigger) | **not covered**: the earlier success stays on that commit. It was earned by an untouched approval of this exact commit; GitHub's own required review still applies |
 | An admin edits the rules | **not covered** (admins can change rulesets) |
 | Two colluding / hacked accounts | **not covered** |
 
@@ -77,6 +80,13 @@ The App key here is an **environment secret** (simplest). To move it to AWS KMS 
 - **Web/API commits whose creating push has aged out of GitHub's activity history** fail (the guard can't prove who made them). Re-push the change from git.
 - **Bot activity on a commit**: if any bot other than Dependabot ever pushed a branch to a web/API commit in the PR, the check fails.
 - **Activity log lag:** the guard retries for about 20 s; if it still lags, the check fails and you re-run it (below).
+
+## Verify during report-only
+
+- Order: after a *success*, a newer *in progress* `approval-guard` check on the same commit must block the merge (GitHub should use the latest check run of that name).
+- Whether GitHub's native required review blocks the merge when a writer requests changes after approving.
+- Dependabot-triggered runs get the environment secret.
+- Activity entries survive branch deletion; a branch rename fails closed; "Update branch" appears as a push entry.
 
 ## Re-running
 

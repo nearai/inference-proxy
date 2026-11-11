@@ -40,6 +40,10 @@ ZERO_SHA = "0" * 40
 WEB_FLOW_LOOKBACK = dt.timedelta(days=1)
 MAX_CLOCK_SKEW = dt.timedelta(minutes=5)
 MAX_REPO_ACTIVITY_PAGES = 30  # 3000 entries; beyond that we fail closed
+# PRs touching the guard itself need two untouched approvals: a weakened
+# trigger or handler on an approved head could stop later re-evaluation.
+GUARD_PATHS = (".github/workflows/approval-guard", ".github/approval-guard/")
+GUARD_CHANGE_APPROVALS = 2
 HEAD_RETRIES = 3
 HEAD_RETRY_SECONDS = 10
 
@@ -192,6 +196,7 @@ def decide(
     reviews: list[dict],
     pushes: list[dict],
     permission_of: Callable[[str], str],
+    required: int = 1,
 ) -> tuple[str, str, str]:
     """Return (conclusion, title, summary) for the check run."""
     head = pr["head"]["sha"]
@@ -236,9 +241,12 @@ def decide(
     summary = "Touched this PR (approvals do not count): " + ", ".join(sorted(touched))
     if ignored:
         summary += "\nIgnored approvals on this commit: " + ", ".join(ignored)
-    if eligible:
+    if required > 1:
+        summary += f"\nThis PR changes approval-guard itself: {required} untouched approvals required."
+    if len(eligible) >= required:
         return ("success", "Approved by " + ", ".join(eligible), summary)
-    return ("failure", "Needs an approval from someone who did not touch this PR", summary)
+    need = "an approval" if required == 1 else f"{required} approvals"
+    return ("failure", f"Needs {need} from people who did not touch this PR", summary)
 
 
 # --------------------------------------------------------------------------
@@ -298,14 +306,45 @@ def get_pages(path: str, stop: Callable[[dict], bool] | None = None,
     return out
 
 
-def post_check(repo: str, sha: str, conclusion: str, title: str, summary: str) -> None:
-    _request(f"{API}/repos/{repo}/check-runs", "POST", {
+def start_check(repo: str, sha: str) -> int:
+    """Post an in-progress check on the head before evaluating.
+
+    It supersedes any earlier result on this commit, so if this run is
+    cancelled the check stays pending (merge blocked) instead of leaving an
+    older success in place.
+    """
+    data, _ = _request(f"{API}/repos/{repo}/check-runs", "POST", {
         "name": CHECK_NAME,
         "head_sha": sha,
+        "status": "in_progress",
+        "output": {"title": "Evaluating approvals",
+                   "summary": "Re-evaluating after a push or review change."},
+    })
+    if not isinstance(data, dict) or not isinstance(data.get("id"), int):
+        raise GuardError("could not create the check run")
+    return data["id"]
+
+
+def finish_check(repo: str, check_id: int, conclusion: str, title: str, summary: str) -> None:
+    _request(f"{API}/repos/{repo}/check-runs/{check_id}", "PATCH", {
         "status": "completed",
         "conclusion": conclusion,
         "output": {"title": title[:200], "summary": summary[:60000]},
     })
+
+
+def touches_guard(repo: str, number: int, pr: dict) -> bool:
+    """True if the PR adds, changes, renames or deletes approval-guard files."""
+    files = get_pages(f"/repos/{repo}/pulls/{number}/files")
+    if len(files) != pr.get("changed_files", len(files)):
+        raise GuardError("changed-file list is incomplete")
+    names = [n for f in files for n in (f.get("filename"), f.get("previous_filename")) if n]
+    return any(n.startswith(GUARD_PATHS) for n in names)
+
+
+def review_state(reviews: list[dict]) -> list[tuple]:
+    """What a re-read must match for a verdict to still be current."""
+    return sorted((r.get("id"), r.get("state"), r.get("commit_id")) for r in reviews)
 
 
 def _ts(s: str) -> dt.datetime:
@@ -380,6 +419,8 @@ def evaluate_pr(repo: str, default_branch: str, number: int) -> None:
         print(f"PR #{number}: not an open PR into {default_branch}; skipped")
         return
     head = pr["head"]["sha"]
+    check_id = start_check(repo, head)
+    reviews = None
     try:
         commits, reviews, pushes = gather(repo, number, pr)
         perms: dict[str, str] = {}
@@ -394,16 +435,25 @@ def evaluate_pr(repo: str, default_branch: str, number: int) -> None:
                     perms[login] = "none"
             return perms[login]
 
-        conclusion, title, summary = decide(pr, commits, reviews, pushes, permission_of)
+        required = GUARD_CHANGE_APPROVALS if touches_guard(repo, number, pr) else 1
+        conclusion, title, summary = decide(pr, commits, reviews, pushes, permission_of, required)
     except Exception as e:  # noqa: BLE001 - every failure must become a failing check
         conclusion, title, summary = "failure", "approval-guard could not evaluate this PR", str(e)
 
-    # Post only if the head did not move while we were evaluating; the run
-    # triggered by the newer push will post for the new head.
-    if get(f"/repos/{repo}/pulls/{number}")["head"]["sha"] != head:
-        print(f"PR #{number}: head moved during evaluation; skipped")
-        return
-    post_check(repo, head, conclusion, title, summary)
+    # The verdict must still describe the live PR: same head and same
+    # reviews. Otherwise fail; the run triggered by that push or review
+    # (queued behind this one) posts the current verdict.
+    try:
+        if get(f"/repos/{repo}/pulls/{number}")["head"]["sha"] != head:
+            conclusion, title, summary = ("failure", "Superseded by a newer commit",
+                                          "The new head is evaluated separately.")
+        elif reviews is not None and conclusion == "success" and review_state(
+                get_pages(f"/repos/{repo}/pulls/{number}/reviews")) != review_state(reviews):
+            conclusion, title, summary = ("failure", "Reviews changed during evaluation",
+                                          "A newer run re-evaluates with the current reviews.")
+    except Exception as e:  # noqa: BLE001
+        conclusion, title, summary = ("failure", "approval-guard could not confirm its verdict", str(e))
+    finish_check(repo, check_id, conclusion, title, summary)
     print(f"PR #{number} @ {head[:8]}: {conclusion}: {title}")
 
 

@@ -4,11 +4,17 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
   cancel-in-progress: true
 
+# DISABLED: the review LLM's API key is rejected (401 "Invalid or expired API
+# key"), so every run fails, and the `ocr config set` step prints part of the
+# key into this public repo's logs. Only a manual trigger remains, and the
+# job's `if` below matches neither event, so nothing runs. To re-enable,
+# rotate OCR_LLM_AUTH_TOKEN, stop the key echo, and restore:
+#   pull_request_target: # zizmor: ignore[dangerous-triggers] Write access is checked; tools run from the default branch and PR commits are diff data only.
+#     types: [opened, ready_for_review]
+#   issue_comment: # zizmor: ignore[dangerous-triggers] Same permission check and trusted workspace as the automatic review.
+#     types: [created]
 on:
-  pull_request_target: # zizmor: ignore[dangerous-triggers] Write access is checked; tools run from the default branch and PR commits are diff data only.
-    types: [opened, ready_for_review]
-  issue_comment: # zizmor: ignore[dangerous-triggers] Same permission check and trusted workspace as the automatic review.
-    types: [created]
+  workflow_dispatch:
 
 permissions:
   contents: read

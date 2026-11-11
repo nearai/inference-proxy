@@ -23,7 +23,9 @@ jobs:
     runs-on: [self-hosted, infra]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Log in to Docker registry
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee
@@ -49,7 +51,7 @@ jobs:
             echo "Unable to parse image tag from ${GITHUB_REF_TYPE}: ${GITHUB_REF_NAME}" >&2
             exit 1
           fi
-          echo "IMAGE_REFERENCE=${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:${TAG}" >> "$GITHUB_ENV"
+          echo "IMAGE_REFERENCE=${REGISTRY}/${IMAGE_REPOSITORY}:${TAG}" >> "$GITHUB_ENV"
           if [[ "${GITHUB_REF_TYPE}" == 'branch' && "${GITHUB_REF_NAME}" == 'main' ]]; then
             echo "ALSO_TAG_STAGING_STAMP=true" >> "$GITHUB_ENV"
           fi
@@ -69,7 +71,7 @@ jobs:
           # via env-var change, no rebuild.
           ENABLE_NV_ATTESTATION_SDK: "1"
         run: |
-          ./build-image.sh --push "${{ env.IMAGE_REFERENCE }}"
+          ./build-image.sh --push "${IMAGE_REFERENCE}"
 
       # Read the digest from the archive's index.json, the way external
       # verifiers do. build-image.sh guarantees a single manifest, so this is
@@ -85,7 +87,7 @@ jobs:
           echo "IMAGE_DIGEST=${DIGEST}" >> "$GITHUB_ENV"
 
       - name: Generate artifact attestation
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}
           subject-digest: ${{ env.IMAGE_DIGEST }}
@@ -96,7 +98,7 @@ jobs:
 
       - name: Sign image with cosign (keyless)
         run: |
-          cosign sign --yes "${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}@${{ env.IMAGE_DIGEST }}"
+          cosign sign --yes "${REGISTRY}/${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
 
       - name: Push immutable staging tag
         if: env.ALSO_TAG_STAGING_STAMP == 'true'
@@ -104,7 +106,7 @@ jobs:
           set -euo pipefail
           SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
           STAMP=$(date -u +%Y%m%d)
-          STAGING_STAMPED_REF="${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:staging-${STAMP}-${SHORT_SHA}"
+          STAGING_STAMPED_REF="${REGISTRY}/${IMAGE_REPOSITORY}:staging-${STAMP}-${SHORT_SHA}"
           skopeo copy oci-archive:./oci.tar "docker://${STAGING_STAMPED_REF}"
           echo "STAGING_STAMPED_REFERENCE=${STAGING_STAMPED_REF}" >> "$GITHUB_ENV"
 
@@ -113,10 +115,10 @@ jobs:
           {
             echo "## vllm-proxy-rs docker image"
             echo ""
-            echo "- tag: \`${{ env.IMAGE_REFERENCE }}\`"
-            echo "- digest: \`${{ env.IMAGE_DIGEST }}\`"
-            echo "- sigstore: https://search.sigstore.dev/?hash=${{ env.IMAGE_DIGEST }}"
-            if [[ "${{ env.ALSO_TAG_STAGING_STAMP }}" == "true" ]]; then
-              echo "- staging stamped: \`${{ env.STAGING_STAMPED_REFERENCE }}\`"
+            echo "- tag: \`${IMAGE_REFERENCE}\`"
+            echo "- digest: \`${IMAGE_DIGEST}\`"
+            echo "- sigstore: https://search.sigstore.dev/?hash=${IMAGE_DIGEST}"
+            if [[ "${ALSO_TAG_STAGING_STAMP}" == "true" ]]; then
+              echo "- staging stamped: \`${STAGING_STAMPED_REFERENCE}\`"
             fi
           } >> "$GITHUB_STEP_SUMMARY"

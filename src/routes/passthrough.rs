@@ -342,6 +342,8 @@ pub async fn audio_transcriptions(
             let data =
                 read_field_chunks(&mut field, &mut total_size, max_size, &mut hasher).await?;
             crate::model_list::guard_form_field(&state, &name, &data)?;
+            // The multipart body and duration reader share this upload allocation.
+            let data = bytes::Bytes::from(data);
             if name == "file" && auth.cloud_api_key.is_some() {
                 duration_file = Some(data.clone());
             }
@@ -366,7 +368,7 @@ pub async fn audio_transcriptions(
     );
 
     let duration_seconds = match duration_file {
-        Some(bytes) => tokio::task::spawn_blocking(move || crate::audio_duration::seconds(bytes))
+        Some(bytes) => tokio::task::spawn_blocking(move || crate::audio_duration::seconds(&bytes))
             .await
             .ok()
             .flatten(),
@@ -520,11 +522,11 @@ async fn read_field_chunks(
 
 /// Build a multipart part with optional filename and content type.
 fn build_multipart_part(
-    data: Vec<u8>,
+    data: impl Into<reqwest::Body>,
     file_name: Option<String>,
     content_type: Option<String>,
 ) -> Result<reqwest::multipart::Part, AppError> {
-    let mut part = reqwest::multipart::Part::bytes(data);
+    let mut part = reqwest::multipart::Part::stream(data);
     if let Some(fname) = file_name {
         part = part.file_name(fname);
     }

@@ -682,10 +682,17 @@ pub(crate) fn build_usage_body(
             }))
         }
         UsageType::AudioTranscription { duration_seconds } => {
-            let seconds = response_data
+            let usage = &response_data["usage"];
+            let usage_seconds = (usage["type"] == "duration")
+                .then(|| usage["seconds"].as_f64())
+                .flatten();
+            let metadata_seconds = response_data
                 .get("duration")
-                .and_then(|value| value.as_f64().or_else(|| value.as_str()?.parse().ok()))
-                .filter(|n| n.is_finite() && *n > 0.0 && n.ceil() <= f64::from(i32::MAX))
+                .and_then(|value| value.as_f64().or_else(|| value.as_str()?.parse().ok()));
+            let seconds = [usage_seconds, metadata_seconds]
+                .into_iter()
+                .flatten()
+                .find(|n| n.is_finite() && *n > 0.0 && n.ceil() <= f64::from(i32::MAX))
                 .map(|n| n.ceil() as i32)
                 .or(*duration_seconds)?;
             Some(
@@ -816,9 +823,8 @@ pub(crate) fn report_chat_usage_if_present(
     true
 }
 
-/// Settle admitted streaming work only with final usage. An interrupted stream's
-/// counters may omit billable upstream work, so its full reservation stays held.
-/// Legacy reporters without an admission retain their partial-usage behavior.
+/// Report the upstream counters received before the stream ended, including
+/// interrupted streams. Admission does not change the existing usage reporting.
 ///
 /// The reporter only exists for direct `sk-` requests
 /// (`RequireAuth.cloud_api_key`); cloud-api's own `InterceptStream` is not in
@@ -835,9 +841,6 @@ fn report_stream_usage_on_finalize(
     let Some(reporter) = usage_reporter else {
         return;
     };
-    if reporter.budget_report_id.is_some() && !has_final_usage {
-        return;
-    }
     match (usage, chat_id) {
         (Some(((input, output), cache_read_tokens)), Some(id)) => {
             let body = serde_json::json!({
@@ -1799,7 +1802,6 @@ async fn proxy_json_request_inner(
         .map(|ct| ct.contains("text/event-stream"))
         .unwrap_or(false);
 
-    let mut has_final_usage = !is_sse;
     let mut response_data = if is_sse {
         // Consume the SSE stream and reassemble into a non-streaming response.
         let mut assembler = StreamingResponseAssembler::new(opts.response_shape);
@@ -1952,7 +1954,6 @@ async fn proxy_json_request_inner(
                 "Upstream stream terminated without declaring a finish reason"
             );
         }
-        has_final_usage = stream_parser.seen_done;
         assembler.into_response(&opts.id_prefix)
     } else {
         // Backend returned plain JSON — process as before.
@@ -2012,14 +2013,7 @@ async fn proxy_json_request_inner(
 
     // Report usage for cloud API key requests (before encryption, needs plaintext fields)
     let chat_id = response_data["id"].as_str().unwrap_or("").to_string();
-    if has_final_usage
-        || opts
-            .usage_reporter
-            .as_ref()
-            .is_none_or(|reporter| reporter.budget_report_id.is_none())
-    {
-        try_report_usage(&response_data, &chat_id, &opts);
-    }
+    try_report_usage(&response_data, &chat_id, &opts);
 
     // Keep plaintext usage values for bounded completion metrics after every
     // fallible transform, serialization, and signing step has succeeded.
@@ -3133,8 +3127,8 @@ async fn proxy_streaming_request_inner(
             );
         }
 
-        // Billing follows authoritative upstream completion, even if sending/encrypting
-        // the already-read final chunk failed. Signing still requires downstream success.
+        // Report known upstream usage even if the stream or its delivery failed.
+        // Signing still requires downstream success and upstream completion.
         report_stream_usage_on_finalize(
             &usage_reporter,
             parser.usage.map(|usage| (usage, parser.cached_tokens)),
@@ -4544,6 +4538,77 @@ mod tests {
     }
 
     #[test]
+    fn test_build_audio_usage_prefers_provider_seconds_then_duration_then_file() {
+        for (response, expected) in [
+            (
+                serde_json::json!({"usage":{"type":"duration","seconds":91}}),
+                Some(91),
+            ),
+            (
+                serde_json::json!({"usage":{"type":"duration","seconds":4},"duration":1.25}),
+                Some(4),
+            ),
+            (serde_json::json!({"duration":1.25}), Some(2)),
+            (serde_json::json!({"duration":"1.25"}), Some(2)),
+            (
+                serde_json::json!({"usage":{"type":"tokens","input_tokens":91}}),
+                None,
+            ),
+            (serde_json::json!({}), None),
+        ] {
+            for local_duration in [None, Some(3)] {
+                let report = build_usage_body(
+                    &UsageType::AudioTranscription {
+                        duration_seconds: local_duration,
+                    },
+                    &response,
+                    "audio-model",
+                    "transcription-id",
+                );
+                assert_eq!(
+                    report.as_ref().and_then(|r| r["duration_seconds"].as_i64()),
+                    expected.or(local_duration).map(i64::from),
+                    "{response}"
+                );
+                if let Some(report) = report {
+                    assert_eq!(report["type"], "audio_transcription");
+                    assert_eq!(report["id"], "transcription-id");
+                    assert_eq!(report["model"], "audio-model");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_audio_usage_invalid_seconds_allow_duration_and_file_fallback() {
+        for usage in [
+            serde_json::json!({"type":"duration","seconds":0}),
+            serde_json::json!({"type":"duration","seconds":-1}),
+            serde_json::json!({"type":"duration","seconds":2147483648_u64}),
+            serde_json::json!({"type":"duration","seconds":"bad"}),
+            serde_json::json!({"type":"duration"}),
+            serde_json::json!({"type":"tokens","seconds":91}),
+            serde_json::json!(null),
+            serde_json::json!([]),
+        ] {
+            for (duration, expected) in [(serde_json::json!(1.25), 2), (serde_json::json!(null), 3)]
+            {
+                let response = serde_json::json!({"usage":usage,"duration":duration});
+                let report = build_usage_body(
+                    &UsageType::AudioTranscription {
+                        duration_seconds: Some(3),
+                    },
+                    &response,
+                    "audio-model",
+                    "transcription-id",
+                )
+                .unwrap();
+                assert_eq!(report["duration_seconds"], expected, "{response}");
+            }
+        }
+    }
+
+    #[test]
     fn test_build_usage_body_returns_none_when_nothing_billable() {
         // No usage object at all.
         assert!(
@@ -5024,10 +5089,15 @@ mod tests {
     );
 
     #[tokio::test]
-    async fn admitted_sse_receipts_require_upstream_completion_not_downstream_delivery() {
+    async fn admitted_sse_reports_known_usage_without_done_or_downstream_delivery() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, Request, ResponseTemplate};
-        for final_usage in [false, true] {
+        for (streaming, final_usage, idle_timeout) in [
+            (false, false, 0),
+            (true, false, 0),
+            (true, false, 1),
+            (true, true, 0),
+        ] {
             let ledger = MockServer::start().await;
             let upstream = MockServer::start().await;
             Mock::given(method("POST"))
@@ -5045,7 +5115,7 @@ mod tests {
             Mock::given(method("POST"))
                 .and(path("/v1/internal/usage"))
                 .respond_with(ResponseTemplate::new(200))
-                .expect(u64::from(final_usage))
+                .expect(1)
                 .mount(&ledger)
                 .await;
             let body = if final_usage {
@@ -5063,13 +5133,16 @@ mod tests {
             let delivery = reporter.delivery.clone();
             let mut opts = test_proxy_opts();
             opts.usage_reporter = Some(reporter);
+            opts.stream_idle_timeout_secs = idle_timeout;
             let url = format!("{}/v1/chat/completions", upstream.uri());
-            if final_usage {
-                opts.chunk_transform = Some(Arc::new(|_| {
-                    Err(AppError::Internal(anyhow::anyhow!(
-                        "injected transform failure"
-                    )))
-                }));
+            if streaming {
+                if final_usage {
+                    opts.chunk_transform = Some(Arc::new(|_| {
+                        Err(AppError::Internal(anyhow::anyhow!(
+                            "injected transform failure"
+                        )))
+                    }));
+                }
                 let response = proxy_streaming_request(
                     &reqwest::Client::new(),
                     &url,
@@ -5078,12 +5151,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                assert!(axum::body::to_bytes(response.into_body(), 1024 * 1024)
-                    .await
-                    .is_err());
+                let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await;
+                assert_eq!(body.is_err(), final_usage || idle_timeout > 0);
             } else {
                 // The existing idle-timeout=0 behavior can assemble a partial JSON response.
-                // Preserve that response while retaining its unsettled reservation.
+                // Admission must preserve both that response and its usage reporting.
                 let response = proxy_json_request(
                     &reqwest::Client::new(),
                     &url,
@@ -5102,6 +5174,17 @@ mod tests {
                 0
             );
             ledger.verify().await;
+            let requests = ledger.received_requests().await.unwrap();
+            let body_for = |path| {
+                let request = requests.iter().find(|r| r.url.path() == path).unwrap();
+                serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()
+            };
+            let admission = body_for("/v1/internal/budget");
+            let usage = body_for("/v1/internal/usage");
+            assert_eq!(usage["admission_id"], admission["id"]);
+            assert_eq!(usage["id"], "chat-slow-prefill");
+            assert_eq!(usage["input_tokens"], 1);
+            assert_eq!(usage["output_tokens"], 1);
         }
     }
 

@@ -6194,113 +6194,136 @@ async fn test_images_edits_multipart() {
 }
 
 #[tokio::test]
-async fn test_direct_audio_json_without_duration_bills_uploaded_file_before_encryption() {
+async fn test_direct_audio_usage_and_local_fallback_bill_before_encryption() {
     use vllm_proxy_rs::encryption;
-    for encrypted in [false, true] {
-        let backend = MockServer::start().await;
-        let cloud_api = MockServer::start().await;
-        budget_fixture::mount(&cloud_api).await;
-        Mock::given(method("POST"))
-            .and(path("/v1/check_api_key"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "organization_id":"org-test", "workspace_id":"ws-test", "api_key_id":"key-test"
-            })))
-            .mount(&cloud_api)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/v1/internal/usage"))
-            .respond_with(ResponseTemplate::new(200))
-            .mount(&cloud_api)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/v1/audio/transcriptions"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"id":"audio-metered", "text":"hello"})),
-            )
-            .expect(1)
-            .mount(&backend)
-            .await;
-        let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
-        let pair = test_client_signing_pair();
-        let client_public = pair.ed25519.signing_public_key.clone();
-        let prompt = if encrypted {
-            encryption::encrypt_string(
-                "transcribe",
-                &encryption::EncryptionContext {
-                    algo: encryption::EncryptionAlgo::Ed25519,
-                    client_pub_key: hex::decode(test_ed25519_pub_key_hex()).unwrap(),
-                    version: 1,
-                    encrypt_all_fields: false,
-                },
-                &pair,
-            )
-            .unwrap()
-        } else {
-            "transcribe".into()
-        };
-        let boundary = "AudioDurationBoundary";
-        let mut body = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ntest-model\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\njson\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n{prompt}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"silence.wav\"\r\nContent-Type: audio/wav\r\n\r\n").into_bytes();
-        let audio = include_bytes!("fixtures/audio/silence.wav");
-        body.extend_from_slice(audio);
-        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-        let mut request = Request::builder()
-            .method("POST")
-            .uri("/v1/audio/transcriptions")
-            .header(
-                "content-type",
-                format!("multipart/form-data; boundary={boundary}"),
-            )
-            .header("authorization", "Bearer sk-test-valid-key-12345678901");
-        if encrypted {
-            request = request
-                .header("x-signing-algo", "ed25519")
-                .header("x-client-pub-key", &client_public);
+    for (audio, filename, mime, provider_usage, local_seconds, billed_seconds) in [
+        (
+            include_bytes!("fixtures/audio/silence.wav").as_slice(),
+            "silence.wav",
+            "audio/wav",
+            serde_json::Value::Null,
+            Some(2),
+            2,
+        ),
+        (
+            include_bytes!("fixtures/audio/silence-vorbis.webm").as_slice(),
+            "silence.webm",
+            "audio/webm",
+            serde_json::json!({"type":"duration","seconds":4}),
+            None,
+            4,
+        ),
+    ] {
+        for encrypted in [false, true] {
+            let backend = MockServer::start().await;
+            let cloud_api = MockServer::start().await;
+            budget_fixture::mount(&cloud_api).await;
+            Mock::given(method("POST"))
+                .and(path("/v1/check_api_key"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "organization_id":"org-test", "workspace_id":"ws-test", "api_key_id":"key-test"
+                })))
+                .mount(&cloud_api)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/v1/internal/usage"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&cloud_api)
+                .await;
+            let mut upstream_response = serde_json::json!({"id":"audio-metered", "text":"hello"});
+            if !provider_usage.is_null() {
+                upstream_response["usage"] = provider_usage.clone();
+            }
+            Mock::given(method("POST"))
+                .and(path("/v1/audio/transcriptions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response))
+                .expect(1)
+                .mount(&backend)
+                .await;
+            let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+            let pair = test_client_signing_pair();
+            let client_public = pair.ed25519.signing_public_key.clone();
+            let prompt = if encrypted {
+                encryption::encrypt_string(
+                    "transcribe",
+                    &encryption::EncryptionContext {
+                        algo: encryption::EncryptionAlgo::Ed25519,
+                        client_pub_key: hex::decode(test_ed25519_pub_key_hex()).unwrap(),
+                        version: 1,
+                        encrypt_all_fields: false,
+                    },
+                    &pair,
+                )
+                .unwrap()
+            } else {
+                "transcribe".into()
+            };
+            let boundary = "AudioDurationBoundary";
+            let mut body = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ntest-model\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\njson\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n{prompt}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: {mime}\r\n\r\n").into_bytes();
+            body.extend_from_slice(audio);
+            body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .header("authorization", "Bearer sk-test-valid-key-12345678901");
+            if encrypted {
+                request = request
+                    .header("x-signing-algo", "ed25519")
+                    .header("x-client-pub-key", &client_public);
+            }
+            let response = app
+                .oneshot(request.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let response = body_to_json(response).await;
+            assert!(response["duration"].is_null());
+            if encrypted {
+                let plaintext = encryption::decrypt_string(
+                    response["text"].as_str().unwrap(),
+                    &encryption::EncryptionContext {
+                        algo: encryption::EncryptionAlgo::Ed25519,
+                        client_pub_key: hex::decode(client_public).unwrap(),
+                        version: 1,
+                        encrypt_all_fields: false,
+                    },
+                    &pair,
+                )
+                .unwrap();
+                assert_eq!(plaintext, "hello");
+            } else {
+                assert_eq!(response["text"], "hello");
+            }
+            wait_for_usage_request(&cloud_api, 1).await;
+            let usage = get_usage_requests(&cloud_api).await;
+            assert_eq!(usage.len(), 1);
+            assert_eq!(usage[0]["type"], "audio_transcription");
+            assert_eq!(usage[0]["duration_seconds"], billed_seconds);
+            assert!(usage[0]["admission_id"].as_str().is_some());
+            let admissions = cloud_api.received_requests().await.unwrap();
+            let admission = admissions
+                .iter()
+                .find(|request| request.url.path() == "/v1/internal/budget")
+                .unwrap();
+            let admission: serde_json::Value = serde_json::from_slice(&admission.body).unwrap();
+            assert_eq!(
+                admission["features"]["audio_duration_seconds"].as_i64(),
+                local_seconds
+            );
+            assert_eq!(usage[0]["admission_id"], admission["id"]);
+            let upstream = backend.received_requests().await.unwrap();
+            assert!(upstream[0]
+                .body
+                .windows(audio.len())
+                .any(|bytes| bytes == audio));
+            let multipart = String::from_utf8_lossy(&upstream[0].body);
+            assert!(multipart.contains("\r\njson\r\n"));
+            assert!(!multipart.contains("verbose_json"));
         }
-        let response = app
-            .oneshot(request.body(Body::from(body)).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let response = body_to_json(response).await;
-        assert!(response["duration"].is_null());
-        if encrypted {
-            let plaintext = encryption::decrypt_string(
-                response["text"].as_str().unwrap(),
-                &encryption::EncryptionContext {
-                    algo: encryption::EncryptionAlgo::Ed25519,
-                    client_pub_key: hex::decode(client_public).unwrap(),
-                    version: 1,
-                    encrypt_all_fields: false,
-                },
-                &pair,
-            )
-            .unwrap();
-            assert_eq!(plaintext, "hello");
-        } else {
-            assert_eq!(response["text"], "hello");
-        }
-        wait_for_usage_request(&cloud_api, 1).await;
-        let usage = get_usage_requests(&cloud_api).await;
-        assert_eq!(usage.len(), 1);
-        assert_eq!(usage[0]["type"], "audio_transcription");
-        assert_eq!(usage[0]["duration_seconds"], 2);
-        assert!(usage[0]["admission_id"].as_str().is_some());
-        let admissions = cloud_api.received_requests().await.unwrap();
-        let admission = admissions
-            .iter()
-            .find(|request| request.url.path() == "/v1/internal/budget")
-            .unwrap();
-        let admission: serde_json::Value = serde_json::from_slice(&admission.body).unwrap();
-        assert_eq!(admission["features"]["audio_duration_seconds"], 2);
-        let upstream = backend.received_requests().await.unwrap();
-        assert!(upstream[0]
-            .body
-            .windows(audio.len())
-            .any(|bytes| bytes == audio));
-        let multipart = String::from_utf8_lossy(&upstream[0].body);
-        assert!(multipart.contains("\r\njson\r\n"));
-        assert!(!multipart.contains("verbose_json"));
     }
 }
 

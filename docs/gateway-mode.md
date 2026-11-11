@@ -591,13 +591,14 @@ limits and existing multimedia support remain unchanged.
 The hold is fixed until settlement. Final usage carries its separate `admission_id`
 and the original provider ID. Cloud API or the queue worker charges full actual
 usage and clears the hold atomically; actual usage may exceed the estimate. An
-interrupted stream without final upstream usage retains its hold until the fixed
-expiry managed by Cloud API (two hours by default). Late receipts still charge once.
-Final counters
-already received are billable even if delivering them to the client fails.
-Audio prefers the provider's response duration; if absent, the proxy uses local
-frame/sample timing from the uploaded file. It neither changes the response
-format nor decodes/transcodes media. Missing actual usage is logged; the byte-based
+interrupted stream keeps the existing usage reporting behavior: known counters
+can settle even without `[DONE]` or successful delivery to the client. If no
+billable usage is reported, the hold remains until the fixed expiry managed by
+Cloud API (two hours by default). Late receipts still charge once.
+Audio prefers the provider's `usage.seconds` for duration-based usage, then the
+verbose response's `duration`, then local frame/sample timing from the uploaded
+file. It neither changes the response format nor decodes/transcodes media.
+Missing actual usage is logged; the byte-based
 admission estimate is never billed as actual duration.
 The locally measured duration is also sent as optional numeric admission metadata,
 so Cloud API can quote it instead of relying on the compressed file size.

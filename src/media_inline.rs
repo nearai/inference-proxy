@@ -410,11 +410,19 @@ async fn fetch_following_redirects(
                 return Err("too_large");
             }
             let charge = chunk.len().saturating_mul(copies);
-            remaining
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
-                    left.checked_sub(charge)
-                })
-                .map_err(|_| "request_too_large")?;
+            let mut left = remaining.load(Ordering::Relaxed);
+            loop {
+                let next = left.checked_sub(charge).ok_or("request_too_large")?;
+                match remaining.compare_exchange_weak(
+                    left,
+                    next,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(seen) => left = seen,
+                }
+            }
             body.extend_from_slice(&chunk);
         }
         let mime = match kind {

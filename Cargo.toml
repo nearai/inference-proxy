@@ -42,7 +42,7 @@ chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 aes-gcm = "0.10"
 hkdf = "0.13"
 ohttp = { version = "0.7", features = ["server", "stream", "rust-hpke"] }
-bhttp = "0.7"
+bhttp = "0.8"
 
 # Rate limiting
 governor = "0.10"

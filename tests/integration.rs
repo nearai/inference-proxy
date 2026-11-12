@@ -12955,3 +12955,53 @@ async fn dropped_request_logs_one_cancel_line_with_its_ids() {
         assert!(!captured.contains(secret), "{secret}: {captured}");
     }
 }
+
+/// A trusted-only route records its caller too: its finish line says which
+/// config token was used, not `unknown`.
+#[tokio::test]
+async fn trusted_only_route_logs_its_caller() {
+    let mock = MockServer::start().await;
+    let app = build_test_app_inner(
+        &mock.uri(),
+        TestAppOptions {
+            token_labels: vec!["ops"],
+            ..TestAppOptions::default()
+        },
+    );
+    let logs = CallerLogs::default();
+    let writer = logs.clone();
+    let _subscriber = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("vllm_proxy_rs=info"))
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    let _registered = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/gpu_evidence")
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"nonce":"not-hex","no_gpu_mode":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let lines = json_log_lines(&logs);
+    let finished = lines_with_message(&lines, "request finished");
+    assert_eq!(finished.len(), 1, "{lines:#?}");
+    let fields = &finished[0]["fields"];
+    assert_eq!(fields["status"], 400);
+    assert_eq!(fields["auth_path"], "trusted_config_token");
+    assert_eq!(fields["caller"], "ops");
+    assert_eq!(fields["tenant_context"], "trusted_no_tenant");
+}

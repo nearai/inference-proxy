@@ -490,11 +490,20 @@ impl FromRequestParts<AppState> for RequireTrustedAuth {
             .and_then(|header| header.strip_prefix("Bearer "))
             .ok_or(AppError::Unauthorized)?;
 
-        if state.config.config_token_caller(token).is_some() {
-            Ok(Self)
-        } else {
-            Err(AppError::Unauthorized)
+        let Some(caller) = state.config.config_token_caller(token) else {
+            return Err(AppError::Unauthorized);
+        };
+        // Record the caller for the request's finish or cancel line, as
+        // `RequireAuth` does. A trusted-only route takes no tenant headers.
+        if let Some(ids) = parts.extensions.get::<TracingIds>() {
+            ids.with_request_source(RequestSource {
+                auth_path: AuthPath::TrustedConfigToken,
+                ingress_route: classify_ingress_route(parts),
+                caller,
+            })
+            .publish_identity();
         }
+        Ok(Self)
     }
 }
 

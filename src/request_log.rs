@@ -14,7 +14,9 @@
 //!   line was written for it (errors, routes without a completion line).
 //!
 //! A request whose `request completed` line was written gets no extra line, so
-//! successful inference adds no volume. Health, metrics, version and model-list
+//! successful inference adds no volume. The completion line is never held
+//! back: a streaming client that leaves after the last chunk but before the
+//! response is signed gets a cancel line, then its completion line. Health, metrics, version and model-list
 //! routes, and unmatched paths, never log here. The guard also owns the
 //! `active_connections` gauge, so a dropped request always decrements it.
 

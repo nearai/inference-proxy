@@ -1,9 +1,24 @@
+use axum::extract::MatchedPath;
 use axum::http::{HeaderMap, HeaderValue, Request};
 use axum::middleware::Next;
 use axum::response::Response;
 use tracing::Instrument;
 
 use crate::auth::{AuthPath, RequestSource, RequireAuth};
+
+/// Route label for requests that matched no registered route.
+pub const UNMATCHED_ROUTE: &str = "CATCH_ALL";
+
+/// The route template a request matched (for example
+/// `/v1/signature/{chat_id}`), or [`UNMATCHED_ROUTE`]. Used for metric labels
+/// and log fields. Only meaningful in middleware that runs after routing
+/// (`Router::layer`).
+pub fn route_label<B>(request: &Request<B>) -> &str {
+    request
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or(UNMATCHED_ROUTE, MatchedPath::as_str)
+}
 
 /// Tracing correlation IDs for a request, parsed once by `request_id_middleware`
 /// from `X-Request-Id` and inserted into the request extensions. Handlers that
@@ -192,7 +207,7 @@ pub async fn request_id_middleware(mut request: Request<axum::body::Body>, next:
         .insert(RequestStart(std::time::Instant::now()));
 
     let method = request.method().to_string();
-    let path = request.uri().path().to_string();
+    let path = route_label(&request).to_string();
     let span = tracing::info_span!(
         "request",
         request_id = %tracing_ids.request_id,
@@ -223,7 +238,12 @@ pub async fn request_id_middleware(mut request: Request<axum::body::Body>, next:
 mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderName, HeaderValue};
-    use axum::{body::Body, middleware::from_fn, routing::post, Router};
+    use axum::{
+        body::Body,
+        middleware::from_fn,
+        routing::{get, post},
+        Router,
+    };
     use std::io;
     use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
@@ -453,5 +473,55 @@ mod tests {
                 "captured logs must not contain {forbidden}; logs: {captured}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn request_span_uses_route_labels() {
+        let logs = CapturedLogs::default();
+        let writer_logs = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || writer_logs.writer())
+            .finish();
+        let app = Router::new()
+            .route(
+                "/v1/signature/{chat_id}",
+                get(|| async {
+                    tracing::warn!("inside handler");
+                    "ok"
+                }),
+            )
+            .fallback(|| async {
+                tracing::warn!("inside fallback");
+                axum::http::StatusCode::NOT_FOUND
+            })
+            .layer(from_fn(request_id_middleware));
+
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        for uri in ["/v1/signature/example-1", "/example-2"] {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("test request should build"),
+                )
+                .await
+                .expect("test request should complete");
+        }
+
+        let captured = logs.contents();
+        assert!(
+            captured.contains("path=/v1/signature/{chat_id}"),
+            "{captured}"
+        );
+        assert!(
+            captured.contains(&format!("path={UNMATCHED_ROUTE}")),
+            "{captured}"
+        );
+        assert!(captured.contains("inside handler"), "{captured}");
+        assert!(captured.contains("inside fallback"), "{captured}");
+        assert!(!captured.contains("example-"), "{captured}");
     }
 }

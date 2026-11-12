@@ -493,7 +493,7 @@ fn parse_bhttp_and_build_loopback(
             }
             _ => {
                 warn!(
-                    name = %String::from_utf8_lossy(name_bytes),
+                    name_len = name_bytes.len(),
                     "Skipping invalid inner OHTTP header"
                 );
             }

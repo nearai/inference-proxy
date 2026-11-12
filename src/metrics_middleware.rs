@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use axum::extract::{MatchedPath, State};
+use axum::extract::State;
 use axum::http::Request;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -24,11 +24,7 @@ pub fn setup_metrics_recorder() -> PrometheusHandle {
 /// Axum middleware that tracks HTTP request metrics.
 pub async fn metrics_middleware(request: Request<axum::body::Body>, next: Next) -> Response {
     let method = request.method().to_string();
-    let endpoint = request
-        .extensions()
-        .get::<MatchedPath>()
-        .map(|p| p.as_str().to_string())
-        .unwrap_or_else(|| "CATCH_ALL".to_string());
+    let endpoint = crate::request_tracing::route_label(&request).to_string();
 
     gauge!("active_connections").increment(1);
     let start = Instant::now();

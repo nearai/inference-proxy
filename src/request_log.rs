@@ -14,9 +14,11 @@
 //!   line was written for it (errors, routes without a completion line).
 //!
 //! A request whose `request completed` line was written gets no extra line, so
-//! successful inference adds no volume. The completion line is never held
-//! back: a streaming client that leaves after the last chunk but before the
-//! response is signed gets a cancel line, then its completion line. Health, metrics, version and model-list
+//! successful inference adds no volume. A streamed chat or text completion
+//! logs its completion line from its own task, possibly after a client that
+//! left on the last chunk dropped the body; its cancel line therefore waits
+//! until every holder of the record is done, and is dropped if the completion
+//! line came. Health, metrics, version and model-list
 //! routes, and unmatched paths, never log here. The guard also owns the
 //! `active_connections` gauge, so a dropped request always decrements it.
 
@@ -100,6 +102,8 @@ pub struct RequestRecord {
     route: Option<String>,
     policy: Option<LinePolicy>,
     identity: Mutex<Option<RequestIdentity>>,
+    /// A cancel line held until the last holder is done (see `RequestGuard`).
+    deferred: Mutex<Option<Outcome>>,
     completion_logged: AtomicBool,
 }
 
@@ -112,6 +116,7 @@ impl Default for RequestRecord {
             route: None,
             policy: None,
             identity: Mutex::new(None),
+            deferred: Mutex::new(None),
             completion_logged: AtomicBool::new(false),
         }
     }
@@ -125,6 +130,7 @@ impl RequestRecord {
             route,
             policy: Some(policy),
             identity: Mutex::new(None),
+            deferred: Mutex::new(None),
             completion_logged: AtomicBool::new(false),
         }
     }
@@ -221,31 +227,90 @@ impl RequestGuard {
         })
     }
 
-    fn write_line(&self) {
-        let policy = self.record.policy.unwrap_or(LinePolicy::Silent);
-        if policy == LinePolicy::Silent || self.record.completion_logged() {
+    /// What the request's line would say, as of now.
+    fn outcome(&self) -> Outcome {
+        Outcome {
+            request_id: self.request_id.clone(),
+            method: self.method.clone(),
+            request_bytes: self.request_bytes,
+            elapsed_ms: self.start.elapsed().as_millis() as u64,
+            status: self.status,
+            end: self.end,
+        }
+    }
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        metrics::gauge!("active_connections").decrement(1);
+        let outcome = self.outcome();
+        // A streamed completion is logged by a task that can still be signing
+        // after a client left on the last chunk. Leave that cancel to the
+        // record, which writes it once every holder is done and only if no
+        // completion line came.
+        let late_completion_possible = matches!(outcome.status, Some(status) if status < 400)
+            && outcome.end == BodyEnd::Pending
+            && self.record.route().is_some_and(completes_asynchronously);
+        if late_completion_possible {
+            self.record.defer(outcome);
+        } else {
+            self.record.write(&outcome);
+        }
+    }
+}
+
+/// Routes whose `request completed` line can be written after the response
+/// body has been dropped (the streaming path logs it from its own task).
+fn completes_asynchronously(route: &str) -> bool {
+    route == crate::routes::ROUTE_CHAT_COMPLETIONS || route == crate::routes::ROUTE_COMPLETIONS
+}
+
+/// The facts the guard knows when the request ends.
+#[derive(Debug)]
+struct Outcome {
+    request_id: String,
+    method: String,
+    request_bytes: Option<u64>,
+    elapsed_ms: u64,
+    status: Option<u16>,
+    end: BodyEnd,
+}
+
+impl RequestRecord {
+    /// Keep a cancel line until the last holder of this record is gone.
+    fn defer(&self, outcome: Outcome) {
+        if let Ok(mut slot) = self.deferred.lock() {
+            *slot = Some(outcome);
+        }
+    }
+
+    /// Write the request's finish or cancel line, unless the route is quiet
+    /// or a `request completed` line already stands for the request.
+    fn write(&self, outcome: &Outcome) {
+        let policy = self.policy.unwrap_or(LinePolicy::Silent);
+        if policy == LinePolicy::Silent || self.completion_logged() {
             return;
         }
-        let identity = self.record.identity();
-        let elapsed_ms = self.start.elapsed().as_millis() as u64;
-        let route = self.record.route().unwrap_or("");
+        let identity = self.identity();
+        let route = self.route().unwrap_or("");
         let org_id = identity.org_id.as_deref().unwrap_or("");
         let workspace_id = identity.workspace_id.as_deref().unwrap_or("");
-        self.record.span.in_scope(|| match (self.status, self.end) {
+        let elapsed_ms = outcome.elapsed_ms;
+        self.span.in_scope(|| match (outcome.status, outcome.end) {
             (None, _) | (Some(_), BodyEnd::Pending) => info!(
-                request_id = %self.request_id,
+                request_id = %outcome.request_id,
                 org_id = %org_id,
                 workspace_id = %workspace_id,
                 auth_path = identity.auth_path,
                 ingress_route = identity.ingress_route,
                 tenant_context = identity.tenant_context,
                 caller = identity.caller,
-                method = %self.method,
+                method = %outcome.method,
                 route = %route,
-                status = self.status,
-                request_bytes = self.request_bytes,
+                status = outcome.status,
+                request_bytes = outcome.request_bytes,
                 elapsed_ms,
-                phase = if self.status.is_none() {
+                phase = if outcome.status.is_none() {
                     "before_response"
                 } else {
                     "during_response"
@@ -257,17 +322,17 @@ impl RequestGuard {
                     return;
                 }
                 info!(
-                    request_id = %self.request_id,
+                    request_id = %outcome.request_id,
                     org_id = %org_id,
                     workspace_id = %workspace_id,
                     auth_path = identity.auth_path,
                     ingress_route = identity.ingress_route,
                     tenant_context = identity.tenant_context,
                     caller = identity.caller,
-                    method = %self.method,
+                    method = %outcome.method,
                     route = %route,
                     status,
-                    request_bytes = self.request_bytes,
+                    request_bytes = outcome.request_bytes,
                     duration_ms = elapsed_ms,
                     outcome = if end == BodyEnd::Complete {
                         "complete"
@@ -281,10 +346,12 @@ impl RequestGuard {
     }
 }
 
-impl Drop for RequestGuard {
+impl Drop for RequestRecord {
     fn drop(&mut self) {
-        metrics::gauge!("active_connections").decrement(1);
-        self.write_line();
+        let deferred = self.deferred.get_mut().ok().and_then(Option::take);
+        if let Some(outcome) = deferred {
+            self.write(&outcome);
+        }
     }
 }
 
@@ -433,6 +500,41 @@ mod tests {
         assert_eq!(lines[0]["workspace_id"], "ws-1");
         assert_eq!(lines[0]["caller"], "cloud-api");
         assert_eq!(lines[0]["request_bytes"], 12);
+    }
+
+    /// A streamed chat whose client leaves on the last chunk: the completion
+    /// task may still log `request completed`, so the cancel line waits for
+    /// it and is dropped if it comes.
+    #[tokio::test]
+    async fn streamed_completion_after_the_client_left_wins_over_the_cancel() {
+        use futures_util::StreamExt;
+        let (captured, _subscriber) = capture();
+        for completes in [true, false] {
+            let (record, guard) = guard_for(crate::routes::ROUTE_CHAT_COMPLETIONS);
+            record.publish_identity(identity());
+            // The streaming task's own handle on the record.
+            let producer = Arc::clone(&record);
+            drop(record);
+            let stream = futures_util::stream::iter([Ok::<_, std::io::Error>(Bytes::from("a"))])
+                .chain(futures_util::stream::pending());
+            let response = guard.attach(axum::response::Response::new(Body::from_stream(stream)));
+            let mut body = response.into_body();
+            body.frame().await.unwrap().unwrap();
+            drop(body);
+            assert!(
+                captured.messages().is_empty(),
+                "nothing before the task ends"
+            );
+            if completes {
+                producer.mark_completion_logged();
+            }
+            drop(producer);
+        }
+        let lines = captured.messages();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["message"], "request cancelled");
+        assert_eq!(lines[0]["phase"], "during_response");
+        assert_eq!(lines[0]["org_id"], "org-1");
     }
 
     #[tokio::test]

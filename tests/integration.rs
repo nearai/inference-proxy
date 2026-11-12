@@ -10828,6 +10828,7 @@ async fn request_content_never_reaches_logs_or_metrics() {
                 &backend.uri(),
                 TestAppOptions {
                     cloud_api_url: Some(cloud_api.uri()),
+                    token_labels: vec!["cloud-api"],
                     ..TestAppOptions::default()
                 },
             );
@@ -10921,6 +10922,10 @@ async fn request_content_never_reaches_logs_or_metrics() {
         leaked.join("\n")
     );
     let rendered = handle.render();
+    // The caller label is on the series; the token is not.
+    assert!(rendered.contains("caller=\"cloud-api\""), "{rendered}");
+    assert!(rendered.contains("caller=\"api_key\""), "{rendered}");
+    assert!(!captured.contains("test-token") && !rendered.contains("test-token"));
     assert!(
         !rendered.contains(ZDR_SENTINEL),
         "request content in metrics:\n{rendered}"

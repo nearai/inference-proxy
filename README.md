@@ -89,6 +89,13 @@ WARN request{request_id=abc-123 method=POST path=/v1/chat/completions}:
 
 **What is logged**: HTTP status codes, backend URLs, error messages (token counts, parameter names), error types, request IDs.
 
+**One line per request.** A successful inference request logs `request completed` (ids, tokens, duration, `auth_path`, `tenant_context`, `caller`). Any other request on an inference, signature, attestation, OHTTP or internal route logs exactly one of:
+
+- `request finished`: the response was sent and no `request completed` line was written (an error status, or a route without a completion line). Fields: `status`, `duration_ms`, `request_bytes` (from `Content-Length`), `outcome` (`complete`, or `body_error` when the body failed while sent), the route pattern, the method and the identity below. Signature and attestation lookups log it only for an error status.
+- `request cancelled`: the client went away before the response (`phase="before_response"`) or while its body was being sent (`phase="during_response"`), with `elapsed_ms` and the identity below.
+
+Identity on both lines and on the `request` span once auth has passed: `org_id`, `workspace_id`, `auth_path`, `ingress_route`, `tenant_context`, `caller`. Health, metrics, version, model-list and OHTTP key routes, and unmatched paths, log neither line. `active_connections` counts a request until its response body is sent or dropped.
+
 **What is never logged**: Request bodies, response bodies, prompt content, user messages, completion text.
 
 ## Configuration

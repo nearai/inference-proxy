@@ -1541,15 +1541,15 @@ fn log_ids_or_empty(tracing_ids: &Option<TracingIds>) -> (String, String, String
 }
 
 #[derive(Clone, Copy)]
-struct RequestMetricLabels {
-    auth_path: &'static str,
-    ingress_route: &'static str,
-    tenant_context: &'static str,
-    request_id_origin: &'static str,
-    caller: &'static str,
+pub(crate) struct RequestMetricLabels {
+    pub(crate) auth_path: &'static str,
+    pub(crate) ingress_route: &'static str,
+    pub(crate) tenant_context: &'static str,
+    pub(crate) request_id_origin: &'static str,
+    pub(crate) caller: &'static str,
 }
 
-fn request_metric_labels(tracing_ids: Option<&TracingIds>) -> RequestMetricLabels {
+pub(crate) fn request_metric_labels(tracing_ids: Option<&TracingIds>) -> RequestMetricLabels {
     match tracing_ids {
         Some(ids) => {
             let tenant_context = match (
@@ -1677,6 +1677,10 @@ pub(crate) fn record_completed_request_for(
     mode: &'static str,
 ) {
     let source_labels = request_metric_labels(tracing_ids);
+    if let Some(ids) = tracing_ids {
+        // This line stands for the request: its guard writes no other.
+        ids.record.mark_completion_logged();
+    }
     let total_ms = total_duration.as_millis();
     let (request_id, org_id, workspace_id) = match tracing_ids {
         Some(ids) => (
@@ -3995,6 +3999,7 @@ mod tests {
                 caller: crate::auth::CALLER_UNLABELED,
             }),
             forward_tenant_headers: true,
+            record: Default::default(),
         });
 
         let labels = request_metric_labels(tracing_ids.as_ref());
@@ -4016,6 +4021,7 @@ mod tests {
                 caller: crate::auth::CALLER_API_KEY,
             }),
             forward_tenant_headers: false,
+            record: Default::default(),
         });
         let direct_labels = request_metric_labels(direct_ids.as_ref());
         assert_eq!(direct_labels.auth_path, "cloud_api_key");
@@ -4037,6 +4043,7 @@ mod tests {
                 caller: crate::auth::CALLER_UNLABELED,
             }),
             forward_tenant_headers: true,
+            record: Default::default(),
         });
         assert_eq!(
             request_metric_labels(trusted_without_tenant.as_ref()).tenant_context,
@@ -4058,6 +4065,7 @@ mod tests {
                 caller: crate::auth::CALLER_API_KEY,
             }),
             forward_tenant_headers: false,
+            record: Default::default(),
         });
 
         let probe = Some(TracingIds {
@@ -4068,6 +4076,7 @@ mod tests {
             workspace_id: None,
             request_source: None,
             forward_tenant_headers: false,
+            record: Default::default(),
         });
 
         assert_eq!(tenant_context_label(customer.as_ref()), "verified");

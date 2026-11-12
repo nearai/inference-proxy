@@ -1,7 +1,12 @@
+use std::sync::Arc;
+
+use axum::extract::MatchedPath;
 use axum::http::{HeaderMap, HeaderValue, Request};
 use axum::middleware::Next;
 use axum::response::Response;
 use tracing::Instrument;
+
+use crate::request_log::{RequestGuard, RequestIdentity, RequestRecord};
 
 use crate::auth::{AuthPath, RequestSource, RequireAuth};
 
@@ -34,6 +39,9 @@ pub struct TracingIds {
     /// only for the trusted config-token/gateway path. Verified direct-key IDs
     /// are retained for logs but do not change the upstream wire contract.
     pub(crate) forward_tenant_headers: bool,
+    /// Shared with the request guard: the identity once authenticated, and
+    /// whether a completion line was written (`request_log`).
+    pub(crate) record: Arc<RequestRecord>,
 }
 
 impl TracingIds {
@@ -59,6 +67,7 @@ impl TracingIds {
             workspace_id: None,
             request_source: None,
             forward_tenant_headers: false,
+            record: Arc::default(),
         }
     }
 
@@ -81,6 +90,7 @@ impl TracingIds {
             workspace_id,
             request_source: self.request_source,
             forward_tenant_headers: true,
+            record: Arc::clone(&self.record),
         }
     }
 
@@ -96,6 +106,7 @@ impl TracingIds {
             workspace_id: non_empty(workspace_id),
             request_source: self.request_source,
             forward_tenant_headers: false,
+            record: Arc::clone(&self.record),
         }
     }
 
@@ -141,6 +152,20 @@ impl TracingIds {
             .flatten()
             .map(|v| ("x-workspace-id", v));
         req.into_iter().chain(org).chain(ws)
+    }
+
+    /// Record this request's authenticated identity for the request span and
+    /// the request's finish or cancel line. Called once auth has passed.
+    pub(crate) fn publish_identity(&self) {
+        let labels = crate::proxy::request_metric_labels(Some(self));
+        self.record.publish_identity(RequestIdentity {
+            org_id: self.org_id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            auth_path: labels.auth_path,
+            ingress_route: labels.ingress_route,
+            tenant_context: labels.tenant_context,
+            caller: labels.caller,
+        });
     }
 
     /// Return `org_id` for log fields, defaulting to `""` when absent.
@@ -191,38 +216,58 @@ impl RequestStart {
 /// the arrival instant in the request extensions for handlers, attaches the
 /// IDs to the tracing span so every log line carries them, and echoes
 /// `X-Request-Id` back to the caller.
+///
+/// The span declares the tenant and caller fields empty; the auth extractor
+/// records them once the caller is known. A [`RequestGuard`] follows the
+/// request to the end of its response body and writes its finish or cancel
+/// line (`request_log`).
 pub async fn request_id_middleware(mut request: Request<axum::body::Body>, next: Next) -> Response {
-    let tracing_ids = TracingIds::from_headers(request.headers());
-    request
-        .extensions_mut()
-        .insert(RequestStart(std::time::Instant::now()));
+    let mut tracing_ids = TracingIds::from_headers(request.headers());
+    let start = std::time::Instant::now();
+    request.extensions_mut().insert(RequestStart(start));
 
     let method = request.method().to_string();
     let path = request.uri().path().to_string();
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|matched| matched.as_str().to_string());
+    let request_bytes = request
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
     let span = tracing::info_span!(
         "request",
         request_id = %tracing_ids.request_id,
-        org_id = %tracing_ids.org_id_or_empty(),
-        workspace_id = %tracing_ids.workspace_id_or_empty(),
+        org_id = tracing::field::Empty,
+        workspace_id = tracing::field::Empty,
+        auth_path = tracing::field::Empty,
+        tenant_context = tracing::field::Empty,
+        caller = tracing::field::Empty,
         method = %method,
         path = %path,
     );
 
+    let record = Arc::new(RequestRecord::new(span.clone(), route));
+    tracing_ids.record = Arc::clone(&record);
     let echo_request_id = tracing_ids.request_id.clone();
+    let guard = RequestGuard::new(
+        record,
+        echo_request_id.clone(),
+        method,
+        request_bytes,
+        start,
+    );
     request.extensions_mut().insert(tracing_ids);
 
+    // If this future is dropped before the response exists, `guard` drops
+    // with it and writes the cancel line.
     let mut response = next.run(request).instrument(span).await;
     if let Ok(val) = HeaderValue::from_str(&echo_request_id) {
         response.headers_mut().insert("x-request-id", val);
     }
-    tracing::debug!(
-        request_id = %echo_request_id,
-        method = %method,
-        path = %path,
-        status = response.status().as_u16(),
-        "request completed"
-    );
-    response
+    guard.attach(response)
 }
 
 #[cfg(test)]
@@ -484,6 +529,10 @@ mod tests {
             .expect("test request should complete");
 
         assert_eq!(response.status().as_u16(), 200);
+        // The request's line is written once its response body has been sent.
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("test body should read");
         let captured = logs.contents();
         assert!(captured.contains(request_id));
         assert!(captured.contains("method=POST"));

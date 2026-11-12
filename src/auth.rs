@@ -372,6 +372,19 @@ impl FromRequestParts<AppState> for RequireAuth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        let auth = Self::authenticate(parts, state).await?;
+        // Every authenticated route passes here: record who the request is
+        // from on its span and for its finish or cancel line.
+        if let Some(ids) = parts.extensions.get::<TracingIds>() {
+            ids.with_authenticated_context(&parts.headers, &auth)
+                .publish_identity();
+        }
+        Ok(auth)
+    }
+}
+
+impl RequireAuth {
+    async fn authenticate(parts: &mut Parts, state: &AppState) -> Result<Self, AppError> {
         let ingress_route = classify_ingress_route(parts);
         // request_id_middleware has already normalized this to a UUID. Reuse it
         // for the Cloud API auth check so direct traffic is joinable across the

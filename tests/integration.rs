@@ -12823,3 +12823,135 @@ async fn config_token_label_is_the_caller_on_logs_and_metrics() {
         );
     }
 }
+
+fn json_log_lines(logs: &CallerLogs) -> Vec<serde_json::Value> {
+    String::from_utf8(logs.0.lock().unwrap().clone())
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+fn lines_with_message<'a>(
+    lines: &'a [serde_json::Value],
+    message: &str,
+) -> Vec<&'a serde_json::Value> {
+    lines
+        .iter()
+        .filter(|line| line["fields"]["message"] == message)
+        .collect()
+}
+
+/// A client that goes away before the backend answers leaves one
+/// `request cancelled` line that carries the request's ids, and a refused
+/// request leaves one `request finished` line.
+#[tokio::test]
+async fn dropped_request_logs_one_cancel_line_with_its_ids() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(30))
+                .set_body_json(serde_json::json!({})),
+        )
+        .mount(&mock)
+        .await;
+    let app = build_test_app_inner(
+        &mock.uri(),
+        TestAppOptions {
+            token_labels: vec!["cloud-api"],
+            ..TestAppOptions::default()
+        },
+    );
+
+    let logs = CallerLogs::default();
+    let writer = logs.clone();
+    let _subscriber = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("vllm_proxy_rs=info"))
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    let _registered = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+
+    let request_id = "3f1d2c4b-5a69-4788-9a0b-1c2d3e4f5a6b";
+    let body = serde_json::to_vec(&serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "CANCEL_PROMPT_SENTINEL"}],
+        "stream": false
+    }))
+    .unwrap();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("content-length", body.len())
+        .header("authorization", "Bearer test-token")
+        .header("x-request-id", request_id)
+        .header("x-org-id", "org-cancelled")
+        .header("x-workspace-id", "ws-cancelled")
+        .body(Body::from(body.clone()))
+        .unwrap();
+    let outcome =
+        tokio::time::timeout(Duration::from_millis(500), app.clone().oneshot(request)).await;
+    assert!(outcome.is_err(), "the backend is slower than the client");
+
+    let lines = json_log_lines(&logs);
+    let cancelled = lines_with_message(&lines, "request cancelled");
+    assert_eq!(cancelled.len(), 1, "{lines:#?}");
+    let fields = &cancelled[0]["fields"];
+    assert_eq!(fields["request_id"], request_id);
+    assert_eq!(fields["org_id"], "org-cancelled");
+    assert_eq!(fields["workspace_id"], "ws-cancelled");
+    assert_eq!(fields["auth_path"], "trusted_config_token");
+    assert_eq!(fields["tenant_context"], "trusted_headers");
+    assert_eq!(fields["caller"], "cloud-api");
+    assert_eq!(fields["route"], "/v1/chat/completions");
+    assert_eq!(fields["phase"], "before_response");
+    assert_eq!(fields["request_bytes"], body.len() as u64);
+    assert!(fields["elapsed_ms"].as_u64().unwrap() >= 400, "{fields}");
+    assert!(lines_with_message(&lines, "request finished").is_empty());
+    // The span carries the same ids for every other line of the request.
+    assert_eq!(cancelled[0]["span"]["org_id"], "org-cancelled");
+    assert_eq!(cancelled[0]["span"]["caller"], "cloud-api");
+
+    // A refused request: one finish line, no tenant, nothing from the body.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer wrong-token")
+                .header("x-org-id", "org-unauthenticated")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let lines = json_log_lines(&logs);
+    let finished = lines_with_message(&lines, "request finished");
+    assert_eq!(finished.len(), 1, "{lines:#?}");
+    let fields = &finished[0]["fields"];
+    assert_eq!(fields["status"], 401);
+    assert_eq!(fields["org_id"], "");
+    assert_eq!(fields["auth_path"], "unknown");
+    assert_eq!(fields["caller"], "unknown");
+    assert_eq!(fields["outcome"], "complete");
+
+    let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    for secret in [
+        "CANCEL_PROMPT_SENTINEL",
+        "test-token",
+        "wrong-token",
+        "org-unauthenticated",
+    ] {
+        assert!(!captured.contains(secret), "{secret}: {captured}");
+    }
+}

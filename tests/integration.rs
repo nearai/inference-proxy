@@ -10961,6 +10961,8 @@ async fn request_content_never_reaches_logs_or_metrics() {
     assert!(captured.contains("request completed"), "{captured}");
     assert!(captured.contains("request cancelled"), "{captured}");
     assert!(captured.contains("request finished"), "{captured}");
+    // Key-path lines name the backend's request id.
+    assert!(captured.contains("upstream_request_id"), "{captured}");
     assert!(
         captured.contains("Backend returned non-success status"),
         "{captured}"

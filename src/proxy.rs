@@ -194,6 +194,7 @@ pub(crate) fn log_upstream_error(
         request_id = %request_id,
         org_id = %org_id,
         workspace_id = %workspace_id,
+        upstream_request_id = tracing_ids.and_then(TracingIds::upstream_request_id_for_logs),
         upstream_status = %status,
         upstream_url = %upstream_url,
         upstream_error_parseable = info.is_some(),
@@ -1690,6 +1691,7 @@ pub(crate) fn record_completed_request_for(
         ),
         None => ("", "", ""),
     };
+    let upstream_request_id = tracing_ids.and_then(TracingIds::upstream_request_id_for_logs);
     record_completed_request_metrics(model_label, source_labels, input_tokens, total_ms, mode);
     info!(
         request_id = %request_id,
@@ -1705,6 +1707,7 @@ pub(crate) fn record_completed_request_for(
         tenant_context = source_labels.tenant_context,
         request_id_origin = source_labels.request_id_origin,
         caller = source_labels.caller,
+        upstream_request_id,
         mode,
         "request completed"
     );

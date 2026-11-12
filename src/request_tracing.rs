@@ -140,6 +140,11 @@ impl TracingIds {
     /// the middleware-selected UUID request ID; tenant IDs appear only when a
     /// handler explicitly attached trusted tenant metadata.
     pub fn upstream_headers(&self) -> impl Iterator<Item = (&'static str, &str)> + '_ {
+        // Every backend request takes its headers from here: remember the id
+        // it carries for this request's finish or cancel line.
+        if let Some(upstream_request_id) = self.upstream_request_id_for_logs() {
+            self.record.note_upstream_request_id(upstream_request_id);
+        }
         let req = Some(("x-request-id", self.upstream_request_id.as_str()));
         let org = self
             .forward_tenant_headers
@@ -166,6 +171,14 @@ impl TracingIds {
             tenant_context: labels.tenant_context,
             caller: labels.caller,
         });
+    }
+
+    /// The request id sent to the backend, for log lines, when it differs from
+    /// `request_id` (the direct key path, which the gateway serves). It joins
+    /// this request's lines to the backend's, which log it as their own
+    /// request id. `None` on the trusted path, where the two are the same.
+    pub(crate) fn upstream_request_id_for_logs(&self) -> Option<&str> {
+        (self.upstream_request_id != self.request_id).then_some(self.upstream_request_id.as_str())
     }
 
     /// Return `org_id` for log fields, defaulting to `""` when absent.

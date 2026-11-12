@@ -104,6 +104,8 @@ pub struct RequestRecord {
     identity: Mutex<Option<RequestIdentity>>,
     /// A cancel line held until the last holder is done (see `RequestGuard`).
     deferred: Mutex<Option<Outcome>>,
+    /// The request id sent to the backend, when it is not the request's own.
+    upstream_request_id: Mutex<Option<String>>,
     completion_logged: AtomicBool,
 }
 
@@ -117,6 +119,7 @@ impl Default for RequestRecord {
             policy: None,
             identity: Mutex::new(None),
             deferred: Mutex::new(None),
+            upstream_request_id: Mutex::new(None),
             completion_logged: AtomicBool::new(false),
         }
     }
@@ -131,6 +134,7 @@ impl RequestRecord {
             policy: Some(policy),
             identity: Mutex::new(None),
             deferred: Mutex::new(None),
+            upstream_request_id: Mutex::new(None),
             completion_logged: AtomicBool::new(false),
         }
     }
@@ -158,6 +162,23 @@ impl RequestRecord {
             .ok()
             .and_then(|slot| slot.clone())
             .unwrap_or_else(RequestIdentity::unauthenticated)
+    }
+
+    /// Remember the request id sent to the backend, so the finish or cancel
+    /// line can be joined to the backend's own lines.
+    pub(crate) fn note_upstream_request_id(&self, upstream_request_id: &str) {
+        if let Ok(mut slot) = self.upstream_request_id.lock() {
+            if slot.as_deref() != Some(upstream_request_id) {
+                *slot = Some(upstream_request_id.to_string());
+            }
+        }
+    }
+
+    fn upstream_request_id(&self) -> Option<String> {
+        self.upstream_request_id
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
     }
 
     /// A `request completed` line was written for this request.
@@ -309,6 +330,8 @@ impl RequestRecord {
         let org_id = identity.org_id.as_deref().unwrap_or("");
         let workspace_id = identity.workspace_id.as_deref().unwrap_or("");
         let elapsed_ms = outcome.elapsed_ms;
+        let upstream_request_id = self.upstream_request_id();
+        let upstream_request_id = upstream_request_id.as_deref();
         // Root events: they carry exactly the fields below and none of the
         // request span's (whose raw path can hold a client-chosen id).
         match (outcome.status, outcome.end) {
@@ -325,6 +348,7 @@ impl RequestRecord {
                 route = %route,
                 status = outcome.status,
                 request_bytes = outcome.request_bytes,
+                upstream_request_id,
                 elapsed_ms,
                 phase = if outcome.status.is_none() {
                     "before_response"
@@ -350,6 +374,7 @@ impl RequestRecord {
                     route = %route,
                     status,
                     request_bytes = outcome.request_bytes,
+                    upstream_request_id,
                     duration_ms = elapsed_ms,
                     outcome = if end == BodyEnd::Complete {
                         "complete"

@@ -43,6 +43,8 @@ struct TestAppOptions {
     priority_size_tiers: Option<String>,
     /// `VLLM_PROXY_PRIORITY_LOWER_FIRST`.
     priority_lower_first: bool,
+    /// `TOKEN_LABELS`, one per token.
+    token_labels: Vec<&'static str>,
 }
 
 impl Default for TestAppOptions {
@@ -71,6 +73,7 @@ impl Default for TestAppOptions {
             strict_request_model: false,
             priority_size_tiers: None,
             priority_lower_first: false,
+            token_labels: Vec::new(),
         }
     }
 }
@@ -213,6 +216,7 @@ fn build_test_app_inner_with_pool(
         } else {
             vec!["test-token".to_string()]
         },
+        token_labels: options.token_labels.clone(),
         vllm_base_url: mock_url.to_string(),
         chat_completions_url: format!("{base}/v1/chat/completions"),
         completions_url: format!("{base}/v1/completions"),
@@ -6568,6 +6572,7 @@ fn build_test_app_with_cloud_api_retries(
         replica_state: None,
         model_name: "test-model".to_string(),
         tokens: vec!["test-token".to_string()],
+        token_labels: vec![],
         vllm_base_url: mock_url.to_string(),
         chat_completions_url: format!("{base}/v1/chat/completions"),
         completions_url: format!("{base}/v1/completions"),
@@ -9220,6 +9225,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         replica_state: None,
         model_name: "test-model".to_string(),
         tokens: vec!["test-token".to_string()],
+        token_labels: vec![],
         vllm_base_url: mock_url.to_string(),
         chat_completions_url: format!("{base}/v1/chat/completions"),
         completions_url: format!("{base}/v1/completions"),
@@ -9696,6 +9702,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         replica_state: None,
         model_name: "test-model".to_string(),
         tokens: vec!["test-token".to_string()],
+        token_labels: vec![],
         vllm_base_url: mock_url.to_string(),
         chat_completions_url: format!("{base}/v1/chat/completions"),
         completions_url: format!("{base}/v1/completions"),
@@ -10137,6 +10144,92 @@ async fn test_ohttp_outer_authorization_relay_injected() {
         "Relay auth OK"
     );
     assert_eq!(resp_body["id"], "chatcmpl-relay");
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_ohttp_never_forwards_inner_tenant_or_request_id_headers() {
+    // The inner headers come from the end client. With a trusted outer bearer
+    // the loopback would believe X-Org-Id / X-Workspace-Id, so they are
+    // dropped; the loopback carries the outer request's id, not the inner one.
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-ohttp-tenant-strip",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+        })))
+        .mount(&mock)
+        .await;
+
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock.uri()).await;
+    let outer_request_id = "6f0c4d0e-8f2a-4c1e-9b7d-2a5e3c1f0a11";
+    let inner_request_id = "1b2c3d4e-5f60-4718-8293-a4b5c6d7e8f9";
+    let client = reqwest::Client::new();
+
+    for outer_auth in [true, false] {
+        let mut inner_req = bhttp::Message::request(
+            b"POST".to_vec(),
+            b"https".to_vec(),
+            b"localhost".to_vec(),
+            b"/v1/chat/completions".to_vec(),
+        );
+        inner_req.put_header("content-type", "application/json");
+        if !outer_auth {
+            inner_req.put_header("authorization", "Bearer test-token");
+        }
+        inner_req.put_header("x-org-id", "org-inner-spoof");
+        inner_req.put_header("x-workspace-id", "ws-inner-spoof");
+        inner_req.put_header("x-request-id", inner_request_id);
+        inner_req.write_content(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": false
+            }))
+            .unwrap(),
+        );
+
+        let (enc_request, client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+        let mut request = client
+            .post(format!("{base_url}/ohttp"))
+            .header("content-type", "message/ohttp-req")
+            .header("x-request-id", outer_request_id);
+        if outer_auth {
+            request = request.header("authorization", "Bearer test-token");
+        }
+        let response = request.body(enc_request).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let enc_response = response.bytes().await.unwrap();
+        let inner_resp = ohttp_decrypt_response(client_response, &enc_response);
+        assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+
+        let received = mock.received_requests().await.unwrap();
+        let upstream = received.last().expect("backend saw the inner request");
+        assert!(
+            !upstream.headers.contains_key("x-org-id"),
+            "outer_auth={outer_auth}"
+        );
+        assert!(
+            !upstream.headers.contains_key("x-workspace-id"),
+            "outer_auth={outer_auth}"
+        );
+        assert_eq!(
+            upstream
+                .headers
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok()),
+            Some(outer_request_id),
+            "outer_auth={outer_auth}"
+        );
+    }
 
     server_handle.abort();
 }
@@ -10597,6 +10690,310 @@ async fn test_ohttp_audio_transcriptions_allowed() {
     assert_eq!(mock.received_requests().await.unwrap().len(), 1);
 
     server_handle.abort();
+}
+
+// ---- Log privacy: request content never reaches logs or metrics ----
+
+/// Unique marker placed in every client-controlled part of a request.
+const ZDR_SENTINEL: &str = "zdrsentinel7f3a";
+
+#[derive(Clone, Default)]
+struct ZdrLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for ZdrLogs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The sentinel in a body, a model name, headers, a query string and, for
+/// multipart, a file name, a field name and a field value.
+fn zdr_json_body(stream: bool) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "model": format!("model-{ZDR_SENTINEL}"),
+        "messages": [{"role": "user", "content": format!("prompt {ZDR_SENTINEL}")}],
+        "prompt": format!("prompt {ZDR_SENTINEL}"),
+        "input": [format!("input {ZDR_SENTINEL}")],
+        "user": ZDR_SENTINEL,
+        "stream": stream
+    }))
+    .unwrap()
+}
+
+fn zdr_multipart_body(boundary: &str) -> Vec<u8> {
+    format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nmodel-{s}\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nprompt {s}\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"x_{s}\"\r\n\r\nvalue {s}\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{s}.wav\"\r\n\
+         Content-Type: audio/wav\r\n\r\nRIFF{s}\r\n--{boundary}--\r\n",
+        s = ZDR_SENTINEL
+    )
+    .into_bytes()
+}
+
+fn zdr_request(uri: &str, bearer: &str, content_type: &str, body: Vec<u8>) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(format!("{uri}?q={ZDR_SENTINEL}"))
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("content-type", content_type)
+        .header("content-length", body.len())
+        .header("user-agent", format!("client-{ZDR_SENTINEL}"))
+        .header("x-request-id", format!("rid-{ZDR_SENTINEL}"))
+        .header("x-zdr-probe", ZDR_SENTINEL)
+        .header("x-forwarded-for", "203.0.113.77")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// A backend that answers every route with the sentinel in its body, as a
+/// model answer or as an engine error that quotes the prompt.
+async fn zdr_backend(status: u16) -> MockServer {
+    let mock = MockServer::start().await;
+    let message = format!("engine error quoting the prompt: {ZDR_SENTINEL}");
+    let template = if status >= 400 {
+        ResponseTemplate::new(status).set_body_json(serde_json::json!({
+            "error": {"message": message, "type": "BadRequestError"}
+        }))
+    } else {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-zdr",
+            "object": "chat.completion",
+            "text": format!("transcript {ZDR_SENTINEL}"),
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": format!("answer {ZDR_SENTINEL}")},
+                "text": format!("answer {ZDR_SENTINEL}"),
+                "finish_reason": "stop"
+            }],
+            "data": [{"embedding": [0.1], "index": 0, "url": format!("https://x/{ZDR_SENTINEL}")}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+        }))
+    };
+    Mock::given(method("POST"))
+        .respond_with(template)
+        .mount(&mock)
+        .await;
+    mock
+}
+
+async fn zdr_send(app: axum::Router, request: Request<Body>) {
+    let response = app.oneshot(request).await.unwrap();
+    let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+}
+
+/// Every route, on success and on an engine error, with the sentinel in each
+/// part of the request and of the backend's answer: no log line at the
+/// default level and no metric series may contain it.
+#[tokio::test]
+async fn request_content_never_reaches_logs_or_metrics() {
+    let cloud_api = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-zdr",
+            "workspace_id": "ws-zdr",
+            "api_key_id": "key-zdr"
+        })))
+        .mount(&cloud_api)
+        .await;
+
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let logs = ZdrLogs::default();
+    let writer = logs.clone();
+    let _subscriber = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .json()
+            // Every level of this crate's own lines, the default for the rest.
+            .with_env_filter(tracing_subscriber::EnvFilter::new(
+                "info,vllm_proxy_rs=trace",
+            ))
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    let _registered = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+
+    let boundary = "zdrboundary";
+    let multipart = format!("multipart/form-data; boundary={boundary}");
+    let sk = format!("sk-test-{ZDR_SENTINEL}-0123456789");
+    for status in [200, 400, 500] {
+        for bearer in ["test-token", sk.as_str()] {
+            let backend = zdr_backend(status).await;
+            let app = build_test_app_inner(
+                &backend.uri(),
+                TestAppOptions {
+                    cloud_api_url: Some(cloud_api.uri()),
+                    token_labels: vec!["cloud-api"],
+                    ..TestAppOptions::default()
+                },
+            );
+            for (uri, json) in [
+                ("/v1/chat/completions", true),
+                ("/v1/completions", true),
+                ("/v1/embeddings", true),
+                ("/v1/rerank", true),
+                ("/v1/score", true),
+                ("/v1/tokenize", true),
+                ("/v1/privacy/classify", true),
+                ("/v1/images/generations", true),
+                ("/v1/audio/transcriptions", false),
+                ("/v1/images/edits", false),
+            ] {
+                let request = if json {
+                    zdr_request(uri, bearer, "application/json", zdr_json_body(false))
+                } else {
+                    zdr_request(uri, bearer, &multipart, zdr_multipart_body(boundary))
+                };
+                zdr_send(app.clone(), request).await;
+            }
+            zdr_send(
+                app.clone(),
+                zdr_request(
+                    "/v1/chat/completions",
+                    bearer,
+                    "application/json",
+                    zdr_json_body(true),
+                ),
+            )
+            .await;
+            // A client that leaves while the backend is still working.
+            let slow = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_secs(30))
+                        .set_body_json(serde_json::json!({})),
+                )
+                .mount(&slow)
+                .await;
+            let slow_app = build_test_app_inner(
+                &slow.uri(),
+                TestAppOptions {
+                    cloud_api_url: Some(cloud_api.uri()),
+                    token_labels: vec!["cloud-api"],
+                    ..TestAppOptions::default()
+                },
+            );
+            for (uri, json) in [
+                ("/v1/chat/completions", true),
+                ("/v1/privacy/classify", true),
+                ("/v1/audio/transcriptions", false),
+            ] {
+                let request = if json {
+                    zdr_request(uri, bearer, "application/json", zdr_json_body(false))
+                } else {
+                    zdr_request(uri, bearer, &multipart, zdr_multipart_body(boundary))
+                };
+                let dropped = tokio::time::timeout(
+                    Duration::from_millis(300),
+                    slow_app.clone().oneshot(request),
+                )
+                .await;
+                assert!(dropped.is_err(), "{uri}");
+            }
+            // Signature lookup with a client-chosen id.
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/v1/signature/{ZDR_SENTINEL}?q={ZDR_SENTINEL}"))
+                        .header("authorization", format!("Bearer {bearer}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        }
+    }
+
+    // Refused: a wrong token that carries the marker.
+    let backend = zdr_backend(200).await;
+    zdr_send(
+        build_test_app_inner(&backend.uri(), TestAppOptions::default()),
+        zdr_request(
+            "/v1/chat/completions",
+            &format!("wrong-{ZDR_SENTINEL}"),
+            "application/json",
+            zdr_json_body(false),
+        ),
+    )
+    .await;
+
+    // OHTTP: the same content inside the encrypted message.
+    let backend = zdr_backend(200).await;
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&backend.uri()).await;
+    let mut inner_req = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/chat/completions".to_vec(),
+    );
+    inner_req.put_header("content-type", "application/json");
+    inner_req.put_header("x-org-id", ZDR_SENTINEL);
+    inner_req.put_header("x-workspace-id", ZDR_SENTINEL);
+    inner_req.put_header("x-request-id", ZDR_SENTINEL);
+    inner_req.put_header("x-zdr-probe", ZDR_SENTINEL);
+    inner_req.write_content(zdr_json_body(false));
+    let (enc_request, _client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/ohttp"))
+        .header("content-type", "message/ohttp-req")
+        .header("authorization", "Bearer test-token")
+        .body(enc_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let _ = response.bytes().await;
+    server_handle.abort();
+
+    let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    // The success, engine-error, cancel and refusal paths all ran.
+    assert!(captured.contains("request completed"), "{captured}");
+    assert!(captured.contains("request cancelled"), "{captured}");
+    assert!(captured.contains("request finished"), "{captured}");
+    // A config-token request without an org id was counted and warned about.
+    assert!(
+        captured.contains("Trusted request on a customer route has no org id"),
+        "{captured}"
+    );
+    // Key-path lines name the backend's request id.
+    assert!(captured.contains("upstream_request_id"), "{captured}");
+    assert!(
+        captured.contains("Backend returned non-success status"),
+        "{captured}"
+    );
+    let leaked: Vec<&str> = captured
+        .lines()
+        .filter(|line| line.contains(ZDR_SENTINEL) || line.contains("203.0.113.77"))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "request content in logs:\n{}",
+        leaked.join("\n")
+    );
+    let rendered = handle.render();
+    assert!(
+        rendered.contains("inference_proxy_requests_without_tenant_total{"),
+        "{rendered}"
+    );
+    // The caller label is on the series; the token is not.
+    assert!(rendered.contains("caller=\"cloud-api\""), "{rendered}");
+    assert!(rendered.contains("caller=\"api_key\""), "{rendered}");
+    assert!(!captured.contains("test-token") && !rendered.contains("test-token"));
+    assert!(
+        !rendered.contains(ZDR_SENTINEL),
+        "request content in metrics:\n{rendered}"
+    );
 }
 
 // ---- Chunked OHTTP (streaming) tests ----
@@ -12409,4 +12806,265 @@ async fn size_tier_is_computed_from_the_decrypted_prompt() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[derive(Clone, Default)]
+struct CallerLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CallerLogs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A config token's `TOKEN_LABELS` entry is the request's `caller` on the
+/// completion line and on the completed-request metrics; the token itself
+/// appears in neither.
+#[tokio::test]
+async fn config_token_label_is_the_caller_on_logs_and_metrics() {
+    let mock = MockServer::start().await;
+    mount_chat_ok(&mock, "/v1/chat/completions", 1).await;
+    let app = build_test_app_inner(
+        &mock.uri(),
+        TestAppOptions {
+            token_labels: vec!["cloud-api"],
+            ..TestAppOptions::default()
+        },
+    );
+
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let logs = CallerLogs::default();
+    let writer = logs.clone();
+    let _subscriber = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("vllm_proxy_rs=info"))
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    let _registered = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+
+    let status = post_chat(
+        app,
+        "/v1/chat/completions",
+        &serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    let completed = captured
+        .lines()
+        .find(|line| line.contains("request completed"))
+        .unwrap_or_else(|| panic!("no completion line: {captured}"));
+    assert!(completed.contains("caller=\"cloud-api\""), "{completed}");
+    assert!(
+        completed.contains("auth_path=\"trusted_config_token\""),
+        "{completed}"
+    );
+
+    let rendered = handle.render();
+    let series = rendered
+        .lines()
+        .find(|line| line.starts_with("inference_proxy_completed_requests_total{"))
+        .unwrap_or_else(|| panic!("no completed series: {rendered}"));
+    assert!(series.contains("caller=\"cloud-api\""), "{series}");
+    for text in [&captured, &rendered] {
+        assert!(
+            !text.contains("test-token"),
+            "the token must never be logged"
+        );
+    }
+}
+
+fn json_log_lines(logs: &CallerLogs) -> Vec<serde_json::Value> {
+    String::from_utf8(logs.0.lock().unwrap().clone())
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+fn lines_with_message<'a>(
+    lines: &'a [serde_json::Value],
+    message: &str,
+) -> Vec<&'a serde_json::Value> {
+    lines
+        .iter()
+        .filter(|line| line["fields"]["message"] == message)
+        .collect()
+}
+
+/// A client that goes away before the backend answers leaves one
+/// `request cancelled` line that carries the request's ids, and a refused
+/// request leaves one `request finished` line.
+#[tokio::test]
+async fn dropped_request_logs_one_cancel_line_with_its_ids() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(30))
+                .set_body_json(serde_json::json!({})),
+        )
+        .mount(&mock)
+        .await;
+    let app = build_test_app_inner(
+        &mock.uri(),
+        TestAppOptions {
+            token_labels: vec!["cloud-api"],
+            ..TestAppOptions::default()
+        },
+    );
+
+    let logs = CallerLogs::default();
+    let writer = logs.clone();
+    let _subscriber = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("vllm_proxy_rs=info"))
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    let _registered = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+
+    let request_id = "3f1d2c4b-5a69-4788-9a0b-1c2d3e4f5a6b";
+    let body = serde_json::to_vec(&serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "CANCEL_PROMPT_SENTINEL"}],
+        "stream": false
+    }))
+    .unwrap();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("content-length", body.len())
+        .header("authorization", "Bearer test-token")
+        .header("x-request-id", request_id)
+        .header("x-org-id", "org-cancelled")
+        .header("x-workspace-id", "ws-cancelled")
+        .body(Body::from(body.clone()))
+        .unwrap();
+    let outcome =
+        tokio::time::timeout(Duration::from_millis(500), app.clone().oneshot(request)).await;
+    assert!(outcome.is_err(), "the backend is slower than the client");
+
+    let lines = json_log_lines(&logs);
+    let cancelled = lines_with_message(&lines, "request cancelled");
+    assert_eq!(cancelled.len(), 1, "{lines:#?}");
+    let fields = &cancelled[0]["fields"];
+    assert_eq!(fields["request_id"], request_id);
+    assert_eq!(fields["org_id"], "org-cancelled");
+    assert_eq!(fields["workspace_id"], "ws-cancelled");
+    assert_eq!(fields["auth_path"], "trusted_config_token");
+    assert_eq!(fields["tenant_context"], "trusted_headers");
+    assert_eq!(fields["caller"], "cloud-api");
+    assert_eq!(fields["route"], "/v1/chat/completions");
+    assert_eq!(fields["phase"], "before_response");
+    assert_eq!(fields["request_bytes"], body.len() as u64);
+    assert!(fields["elapsed_ms"].as_u64().unwrap() >= 400, "{fields}");
+    assert!(lines_with_message(&lines, "request finished").is_empty());
+    // A root event: only its own fields, nothing from the request span.
+    assert!(cancelled[0].get("span").is_none(), "{}", cancelled[0]);
+
+    // A refused request: one finish line, no tenant, nothing from the body.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer wrong-token")
+                .header("x-org-id", "org-unauthenticated")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let lines = json_log_lines(&logs);
+    let finished = lines_with_message(&lines, "request finished");
+    assert_eq!(finished.len(), 1, "{lines:#?}");
+    let fields = &finished[0]["fields"];
+    assert_eq!(fields["status"], 401);
+    assert_eq!(fields["org_id"], "");
+    assert_eq!(fields["auth_path"], "unknown");
+    assert_eq!(fields["caller"], "unknown");
+    assert_eq!(fields["outcome"], "complete");
+
+    let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    for secret in [
+        "CANCEL_PROMPT_SENTINEL",
+        "test-token",
+        "wrong-token",
+        "org-unauthenticated",
+    ] {
+        assert!(!captured.contains(secret), "{secret}: {captured}");
+    }
+}
+
+/// A trusted-only route records its caller too: its finish line says which
+/// config token was used, not `unknown`.
+#[tokio::test]
+async fn trusted_only_route_logs_its_caller() {
+    let mock = MockServer::start().await;
+    let app = build_test_app_inner(
+        &mock.uri(),
+        TestAppOptions {
+            token_labels: vec!["ops"],
+            ..TestAppOptions::default()
+        },
+    );
+    let logs = CallerLogs::default();
+    let writer = logs.clone();
+    let _subscriber = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("vllm_proxy_rs=info"))
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    let _registered = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/gpu_evidence")
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"nonce":"not-hex","no_gpu_mode":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let lines = json_log_lines(&logs);
+    let finished = lines_with_message(&lines, "request finished");
+    assert_eq!(finished.len(), 1, "{lines:#?}");
+    let fields = &finished[0]["fields"];
+    assert_eq!(fields["status"], 400);
+    assert_eq!(fields["auth_path"], "trusted_config_token");
+    assert_eq!(fields["caller"], "ops");
+    assert_eq!(fields["tenant_context"], "trusted_no_tenant");
 }

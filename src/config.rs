@@ -553,6 +553,10 @@ pub struct Config {
     /// Accepted admin tokens. Parsed from `TOKEN` (comma-separated) so multiple
     /// tokens can be active at once during a rotation.
     pub tokens: Vec<String>,
+    /// One caller label per entry of `tokens`, in the same order, from
+    /// `TOKEN_LABELS` (comma-separated). Empty when the variable is unset:
+    /// every token is then `unlabeled`. See [`Config::config_token_caller`].
+    pub token_labels: Vec<&'static str>,
 
     // Backend URLs
     pub vllm_base_url: String,
@@ -1062,6 +1066,7 @@ impl Config {
         if tokens.is_empty() {
             anyhow::bail!("TOKEN must contain at least one non-empty token");
         }
+        let token_labels = parse_token_labels(env::var("TOKEN_LABELS").ok().as_deref(), &tokens)?;
 
         // List mode has no engine of its own next to it: the single-model
         // backend is a name that cannot resolve (`UNROUTED_BACKEND_URL`).
@@ -1457,6 +1462,7 @@ impl Config {
             model_list: None,
             model_name,
             tokens,
+            token_labels,
             vllm_base_url: vllm_base_url.clone(),
             chat_completions_url: format!("{base}/v1/chat/completions"),
             completions_url: format!("{base}/v1/completions"),
@@ -1770,6 +1776,24 @@ impl Config {
     /// The one model of a single-model process, in the shape an entry of a
     /// model list resolves to: the same values configure the same model
     /// either way.
+    /// The caller label of the config token `token` presents, or `None` when it
+    /// is not one of `tokens`. Every token is compared, so the time taken does
+    /// not depend on which one matched.
+    pub fn config_token_caller(&self, token: &str) -> Option<&'static str> {
+        let mut matched = None;
+        for (index, trusted) in self.tokens.iter().enumerate() {
+            if crate::auth::token_eq(token, trusted) && matched.is_none() {
+                matched = Some(index);
+            }
+        }
+        matched.map(|index| {
+            self.token_labels
+                .get(index)
+                .copied()
+                .unwrap_or(crate::auth::CALLER_UNLABELED)
+        })
+    }
+
     pub fn single_model(&self) -> crate::model_list::ModelConfig {
         crate::model_list::ModelConfig {
             id: self.model_name.clone(),
@@ -1897,6 +1921,61 @@ impl Config {
     }
 }
 
+/// Longest caller label `TOKEN_LABELS` accepts.
+const MAX_TOKEN_LABEL_LEN: usize = 32;
+
+/// Parse `TOKEN_LABELS`: one label per non-empty `TOKEN` entry, in order.
+/// Unset or blank means no labels (every token is `unlabeled`), so a
+/// deployment without the variable runs exactly as before. A label is
+/// lowercase ASCII letters, digits, `-` and `_`, starts with a letter or
+/// digit, is at most 32 bytes, is not one of the values the proxy uses for
+/// other callers, and is never equal to a token. The labels are leaked once at
+/// startup so request paths can carry them as `&'static str` metric labels.
+fn parse_token_labels(raw: Option<&str>, tokens: &[String]) -> anyhow::Result<Vec<&'static str>> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let labels: Vec<&str> = raw.split(',').map(str::trim).collect();
+    if labels.len() != tokens.len() {
+        anyhow::bail!(
+            "TOKEN_LABELS has {} entries but TOKEN has {} tokens: give exactly one label per token, in the same order",
+            labels.len(),
+            tokens.len()
+        );
+    }
+    labels
+        .into_iter()
+        .enumerate()
+        .map(|(index, label)| {
+            let well_formed = !label.is_empty()
+                && label.len() <= MAX_TOKEN_LABEL_LEN
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+                && label
+                    .bytes()
+                    .next()
+                    .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+            if !well_formed {
+                anyhow::bail!(
+                    "TOKEN_LABELS entry {} is not a valid label: use 1-{MAX_TOKEN_LABEL_LEN} lowercase letters, digits, '-' or '_'",
+                    index + 1
+                );
+            }
+            if tokens.iter().any(|token| token == label) {
+                anyhow::bail!("TOKEN_LABELS entry {} must not be a token", index + 1);
+            }
+            if crate::auth::RESERVED_CALLERS.contains(&label) {
+                anyhow::bail!(
+                    "TOKEN_LABELS entry {} is a reserved caller value ({label})",
+                    index + 1
+                );
+            }
+            Ok(&*Box::leak(label.to_string().into_boxed_str()))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1991,6 +2070,84 @@ mod tests {
                 .to_string()
                 .contains("at least one non-empty token"));
         });
+    }
+
+    #[test]
+    fn test_config_token_labels_default_to_unlabeled() {
+        with_env_vars(&[("MODEL_NAME", "test"), ("TOKEN", "tok-a,tok-b")], || {
+            env::remove_var("TOKEN_LABELS");
+            let config = Config::from_env().unwrap();
+            assert!(config.token_labels.is_empty());
+            assert_eq!(config.config_token_caller("tok-a"), Some("unlabeled"));
+            assert_eq!(config.config_token_caller("tok-b"), Some("unlabeled"));
+            assert_eq!(config.config_token_caller("tok-c"), None);
+            assert_eq!(config.config_token_caller(""), None);
+        });
+        // Blank is the same as unset.
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "test"),
+                ("TOKEN", "tok-a"),
+                ("TOKEN_LABELS", "  "),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.config_token_caller("tok-a"), Some("unlabeled"));
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_token_labels_follow_token_order() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "test"),
+                ("TOKEN", "tok-a, ,tok-b,tok-c"),
+                ("TOKEN_LABELS", "cloud-api, gateway ,probe"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.token_labels, vec!["cloud-api", "gateway", "probe"]);
+                assert_eq!(config.config_token_caller("tok-a"), Some("cloud-api"));
+                assert_eq!(config.config_token_caller("tok-b"), Some("gateway"));
+                assert_eq!(config.config_token_caller("tok-c"), Some("probe"));
+                assert_eq!(config.config_token_caller("tok-d"), None);
+            },
+        );
+    }
+
+    #[test]
+    fn test_config_token_labels_rejects_bad_values() {
+        for (tokens, labels, expected) in [
+            ("tok-a,tok-b", "cloud-api", "exactly one label per token"),
+            ("tok-a", "cloud-api,gateway", "exactly one label per token"),
+            ("tok-a,tok-b", "cloud-api,", "not a valid label"),
+            ("tok-a", "Cloud-API", "not a valid label"),
+            ("tok-a", "-ops", "not a valid label"),
+            ("tok-a", "ops team", "not a valid label"),
+            (
+                "tok-a",
+                "a234567890123456789012345678901234",
+                "not a valid label",
+            ),
+            ("tok-a", "api_key", "reserved"),
+            ("tok-a", "unknown", "reserved"),
+            ("tok-a", "unlabeled", "reserved"),
+            ("secret1", "secret1", "must not be a token"),
+        ] {
+            with_env_vars(
+                &[
+                    ("MODEL_NAME", "test"),
+                    ("TOKEN", tokens),
+                    ("TOKEN_LABELS", labels),
+                ],
+                || {
+                    let error = Config::from_env().unwrap_err().to_string();
+                    assert!(error.contains(expected), "{labels}: {error}");
+                    assert!(!error.contains("secret1"), "{error}");
+                },
+            );
+        }
     }
 
     #[test]

@@ -194,6 +194,7 @@ pub(crate) fn log_upstream_error(
         request_id = %request_id,
         org_id = %org_id,
         workspace_id = %workspace_id,
+        upstream_request_id = tracing_ids.and_then(TracingIds::upstream_request_id_for_logs),
         upstream_status = %status,
         upstream_url = %upstream_url,
         upstream_error_parseable = info.is_some(),
@@ -1541,14 +1542,15 @@ fn log_ids_or_empty(tracing_ids: &Option<TracingIds>) -> (String, String, String
 }
 
 #[derive(Clone, Copy)]
-struct RequestMetricLabels {
-    auth_path: &'static str,
-    ingress_route: &'static str,
-    tenant_context: &'static str,
-    request_id_origin: &'static str,
+pub(crate) struct RequestMetricLabels {
+    pub(crate) auth_path: &'static str,
+    pub(crate) ingress_route: &'static str,
+    pub(crate) tenant_context: &'static str,
+    pub(crate) request_id_origin: &'static str,
+    pub(crate) caller: &'static str,
 }
 
-fn request_metric_labels(tracing_ids: Option<&TracingIds>) -> RequestMetricLabels {
+pub(crate) fn request_metric_labels(tracing_ids: Option<&TracingIds>) -> RequestMetricLabels {
     match tracing_ids {
         Some(ids) => {
             let tenant_context = match (
@@ -1582,6 +1584,10 @@ fn request_metric_labels(tracing_ids: Option<&TracingIds>) -> RequestMetricLabel
                 } else {
                     "generated"
                 },
+                caller: ids
+                    .request_source
+                    .map(|source| source.caller)
+                    .unwrap_or(crate::auth::CALLER_UNKNOWN),
             }
         }
         None => RequestMetricLabels {
@@ -1589,6 +1595,7 @@ fn request_metric_labels(tracing_ids: Option<&TracingIds>) -> RequestMetricLabel
             ingress_route: "unknown",
             tenant_context: "unknown",
             request_id_origin: "unknown",
+            caller: crate::auth::CALLER_UNKNOWN,
         },
     }
 }
@@ -1609,6 +1616,7 @@ fn record_completed_request_metrics(
         ("ingress_route", labels.ingress_route),
         ("tenant_context", labels.tenant_context),
         ("request_id_origin", labels.request_id_origin),
+        ("caller", labels.caller),
         ("mode", mode),
     ];
     let Some(model) = model_label else {
@@ -1670,6 +1678,10 @@ pub(crate) fn record_completed_request_for(
     mode: &'static str,
 ) {
     let source_labels = request_metric_labels(tracing_ids);
+    if let Some(ids) = tracing_ids {
+        // This line stands for the request: its guard writes no other.
+        ids.record.mark_completion_logged();
+    }
     let total_ms = total_duration.as_millis();
     let (request_id, org_id, workspace_id) = match tracing_ids {
         Some(ids) => (
@@ -1679,6 +1691,7 @@ pub(crate) fn record_completed_request_for(
         ),
         None => ("", "", ""),
     };
+    let upstream_request_id = tracing_ids.and_then(TracingIds::upstream_request_id_for_logs);
     record_completed_request_metrics(model_label, source_labels, input_tokens, total_ms, mode);
     info!(
         request_id = %request_id,
@@ -1693,6 +1706,8 @@ pub(crate) fn record_completed_request_for(
         ingress_route = source_labels.ingress_route,
         tenant_context = source_labels.tenant_context,
         request_id_origin = source_labels.request_id_origin,
+        caller = source_labels.caller,
+        upstream_request_id,
         mode,
         "request completed"
     );
@@ -3984,8 +3999,10 @@ mod tests {
             request_source: Some(RequestSource {
                 auth_path: AuthPath::TrustedConfigToken,
                 ingress_route: IngressRouteKind::LongIndexed,
+                caller: crate::auth::CALLER_UNLABELED,
             }),
             forward_tenant_headers: true,
+            record: Default::default(),
         });
 
         let labels = request_metric_labels(tracing_ids.as_ref());
@@ -3993,6 +4010,7 @@ mod tests {
         assert_eq!(labels.ingress_route, "long_indexed");
         assert_eq!(labels.tenant_context, "trusted_headers");
         assert_eq!(labels.request_id_origin, "inbound");
+        assert_eq!(labels.caller, "unlabeled");
 
         let direct_ids = Some(TracingIds {
             request_id: uuid::Uuid::new_v4().to_string(),
@@ -4003,14 +4021,18 @@ mod tests {
             request_source: Some(RequestSource {
                 auth_path: AuthPath::CloudApiKey,
                 ingress_route: IngressRouteKind::Canonical,
+                caller: crate::auth::CALLER_API_KEY,
             }),
             forward_tenant_headers: false,
+            record: Default::default(),
         });
         let direct_labels = request_metric_labels(direct_ids.as_ref());
         assert_eq!(direct_labels.auth_path, "cloud_api_key");
         assert_eq!(direct_labels.ingress_route, "canonical");
         assert_eq!(direct_labels.tenant_context, "verified");
         assert_eq!(direct_labels.request_id_origin, "generated");
+        assert_eq!(direct_labels.caller, "api_key");
+        assert_eq!(request_metric_labels(None).caller, "unknown");
 
         let trusted_without_tenant = Some(TracingIds {
             request_id: uuid::Uuid::new_v4().to_string(),
@@ -4021,8 +4043,10 @@ mod tests {
             request_source: Some(RequestSource {
                 auth_path: AuthPath::TrustedConfigToken,
                 ingress_route: IngressRouteKind::Canonical,
+                caller: crate::auth::CALLER_UNLABELED,
             }),
             forward_tenant_headers: true,
+            record: Default::default(),
         });
         assert_eq!(
             request_metric_labels(trusted_without_tenant.as_ref()).tenant_context,
@@ -4041,8 +4065,10 @@ mod tests {
             request_source: Some(RequestSource {
                 auth_path: AuthPath::CloudApiKey,
                 ingress_route: IngressRouteKind::Canonical,
+                caller: crate::auth::CALLER_API_KEY,
             }),
             forward_tenant_headers: false,
+            record: Default::default(),
         });
 
         let probe = Some(TracingIds {
@@ -4053,6 +4079,7 @@ mod tests {
             workspace_id: None,
             request_source: None,
             forward_tenant_headers: false,
+            record: Default::default(),
         });
 
         assert_eq!(tenant_context_label(customer.as_ref()), "verified");
@@ -4085,6 +4112,7 @@ mod tests {
             request_source: RequestSource {
                 auth_path: AuthPath::CloudApiKey,
                 ingress_route: IngressRouteKind::Canonical,
+                caller: crate::auth::CALLER_API_KEY,
             },
             delivery: Default::default(),
         }

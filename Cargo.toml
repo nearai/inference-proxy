@@ -17,6 +17,7 @@ url = "2"
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["compat", "io"] }
 futures-util = "0.3"
+http-body = "1"
 http-body-util = "0.1"
 # Usage reports to SQS (`usage_report/sqs_sender.rs`): SigV4 only, no AWS SDK
 aws-sigv4 = { version = "1", default-features = false, features = ["sign-http", "http1"] }

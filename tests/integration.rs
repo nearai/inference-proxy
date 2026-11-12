@@ -43,6 +43,8 @@ struct TestAppOptions {
     priority_size_tiers: Option<String>,
     /// `VLLM_PROXY_PRIORITY_LOWER_FIRST`.
     priority_lower_first: bool,
+    /// `TOKEN_LABELS`, one per token.
+    token_labels: Vec<&'static str>,
 }
 
 impl Default for TestAppOptions {
@@ -71,6 +73,7 @@ impl Default for TestAppOptions {
             strict_request_model: false,
             priority_size_tiers: None,
             priority_lower_first: false,
+            token_labels: Vec::new(),
         }
     }
 }
@@ -213,6 +216,7 @@ fn build_test_app_inner_with_pool(
         } else {
             vec!["test-token".to_string()]
         },
+        token_labels: options.token_labels.clone(),
         vllm_base_url: mock_url.to_string(),
         chat_completions_url: format!("{base}/v1/chat/completions"),
         completions_url: format!("{base}/v1/completions"),
@@ -6568,6 +6572,7 @@ fn build_test_app_with_cloud_api_retries(
         replica_state: None,
         model_name: "test-model".to_string(),
         tokens: vec!["test-token".to_string()],
+        token_labels: vec![],
         vllm_base_url: mock_url.to_string(),
         chat_completions_url: format!("{base}/v1/chat/completions"),
         completions_url: format!("{base}/v1/completions"),
@@ -9220,6 +9225,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         replica_state: None,
         model_name: "test-model".to_string(),
         tokens: vec!["test-token".to_string()],
+        token_labels: vec![],
         vllm_base_url: mock_url.to_string(),
         chat_completions_url: format!("{base}/v1/chat/completions"),
         completions_url: format!("{base}/v1/completions"),
@@ -9696,6 +9702,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         replica_state: None,
         model_name: "test-model".to_string(),
         tokens: vec!["test-token".to_string()],
+        token_labels: vec![],
         vllm_base_url: mock_url.to_string(),
         chat_completions_url: format!("{base}/v1/chat/completions"),
         completions_url: format!("{base}/v1/completions"),
@@ -12730,4 +12737,84 @@ async fn size_tier_is_computed_from_the_decrypted_prompt() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[derive(Clone, Default)]
+struct CallerLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CallerLogs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A config token's `TOKEN_LABELS` entry is the request's `caller` on the
+/// completion line and on the completed-request metrics; the token itself
+/// appears in neither.
+#[tokio::test]
+async fn config_token_label_is_the_caller_on_logs_and_metrics() {
+    let mock = MockServer::start().await;
+    mount_chat_ok(&mock, "/v1/chat/completions", 1).await;
+    let app = build_test_app_inner(
+        &mock.uri(),
+        TestAppOptions {
+            token_labels: vec!["cloud-api"],
+            ..TestAppOptions::default()
+        },
+    );
+
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let logs = CallerLogs::default();
+    let writer = logs.clone();
+    let _subscriber = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("vllm_proxy_rs=info"))
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    let _registered = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+
+    let status = post_chat(
+        app,
+        "/v1/chat/completions",
+        &serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    let completed = captured
+        .lines()
+        .find(|line| line.contains("request completed"))
+        .unwrap_or_else(|| panic!("no completion line: {captured}"));
+    assert!(completed.contains("caller=\"cloud-api\""), "{completed}");
+    assert!(
+        completed.contains("auth_path=\"trusted_config_token\""),
+        "{completed}"
+    );
+
+    let rendered = handle.render();
+    let series = rendered
+        .lines()
+        .find(|line| line.starts_with("inference_proxy_completed_requests_total{"))
+        .unwrap_or_else(|| panic!("no completed series: {rendered}"));
+    assert!(series.contains("caller=\"cloud-api\""), "{series}");
+    for text in [&captured, &rendered] {
+        assert!(
+            !text.contains("test-token"),
+            "the token must never be logged"
+        );
+    }
 }

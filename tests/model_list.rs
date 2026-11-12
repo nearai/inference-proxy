@@ -673,7 +673,7 @@ async fn text_completions_are_placed_billed_and_counted_as_their_model() {
         format!(
             "inference_proxy_completed_requests_total{{auth_path=\"cloud_api_key\",\
              ingress_route=\"missing\",tenant_context=\"verified\",\
-             request_id_origin=\"generated\",mode=\"json_via_stream\",model=\"{id}\"}} {count}"
+             request_id_origin=\"generated\",caller=\"api_key\",mode=\"json_via_stream\",model=\"{id}\"}} {count}"
         )
     };
     assert!(rendered.contains(&completed(ALPHA, 2)), "{rendered}");

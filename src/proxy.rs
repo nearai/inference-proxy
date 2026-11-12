@@ -1546,6 +1546,7 @@ struct RequestMetricLabels {
     ingress_route: &'static str,
     tenant_context: &'static str,
     request_id_origin: &'static str,
+    caller: &'static str,
 }
 
 fn request_metric_labels(tracing_ids: Option<&TracingIds>) -> RequestMetricLabels {
@@ -1582,6 +1583,10 @@ fn request_metric_labels(tracing_ids: Option<&TracingIds>) -> RequestMetricLabel
                 } else {
                     "generated"
                 },
+                caller: ids
+                    .request_source
+                    .map(|source| source.caller)
+                    .unwrap_or(crate::auth::CALLER_UNKNOWN),
             }
         }
         None => RequestMetricLabels {
@@ -1589,6 +1594,7 @@ fn request_metric_labels(tracing_ids: Option<&TracingIds>) -> RequestMetricLabel
             ingress_route: "unknown",
             tenant_context: "unknown",
             request_id_origin: "unknown",
+            caller: crate::auth::CALLER_UNKNOWN,
         },
     }
 }
@@ -1609,6 +1615,7 @@ fn record_completed_request_metrics(
         ("ingress_route", labels.ingress_route),
         ("tenant_context", labels.tenant_context),
         ("request_id_origin", labels.request_id_origin),
+        ("caller", labels.caller),
         ("mode", mode),
     ];
     let Some(model) = model_label else {
@@ -1693,6 +1700,7 @@ pub(crate) fn record_completed_request_for(
         ingress_route = source_labels.ingress_route,
         tenant_context = source_labels.tenant_context,
         request_id_origin = source_labels.request_id_origin,
+        caller = source_labels.caller,
         mode,
         "request completed"
     );
@@ -3984,6 +3992,7 @@ mod tests {
             request_source: Some(RequestSource {
                 auth_path: AuthPath::TrustedConfigToken,
                 ingress_route: IngressRouteKind::LongIndexed,
+                caller: crate::auth::CALLER_UNLABELED,
             }),
             forward_tenant_headers: true,
         });
@@ -3993,6 +4002,7 @@ mod tests {
         assert_eq!(labels.ingress_route, "long_indexed");
         assert_eq!(labels.tenant_context, "trusted_headers");
         assert_eq!(labels.request_id_origin, "inbound");
+        assert_eq!(labels.caller, "unlabeled");
 
         let direct_ids = Some(TracingIds {
             request_id: uuid::Uuid::new_v4().to_string(),
@@ -4003,6 +4013,7 @@ mod tests {
             request_source: Some(RequestSource {
                 auth_path: AuthPath::CloudApiKey,
                 ingress_route: IngressRouteKind::Canonical,
+                caller: crate::auth::CALLER_API_KEY,
             }),
             forward_tenant_headers: false,
         });
@@ -4011,6 +4022,8 @@ mod tests {
         assert_eq!(direct_labels.ingress_route, "canonical");
         assert_eq!(direct_labels.tenant_context, "verified");
         assert_eq!(direct_labels.request_id_origin, "generated");
+        assert_eq!(direct_labels.caller, "api_key");
+        assert_eq!(request_metric_labels(None).caller, "unknown");
 
         let trusted_without_tenant = Some(TracingIds {
             request_id: uuid::Uuid::new_v4().to_string(),
@@ -4021,6 +4034,7 @@ mod tests {
             request_source: Some(RequestSource {
                 auth_path: AuthPath::TrustedConfigToken,
                 ingress_route: IngressRouteKind::Canonical,
+                caller: crate::auth::CALLER_UNLABELED,
             }),
             forward_tenant_headers: true,
         });
@@ -4041,6 +4055,7 @@ mod tests {
             request_source: Some(RequestSource {
                 auth_path: AuthPath::CloudApiKey,
                 ingress_route: IngressRouteKind::Canonical,
+                caller: crate::auth::CALLER_API_KEY,
             }),
             forward_tenant_headers: false,
         });
@@ -4085,6 +4100,7 @@ mod tests {
             request_source: RequestSource {
                 auth_path: AuthPath::CloudApiKey,
                 ingress_route: IngressRouteKind::Canonical,
+                caller: crate::auth::CALLER_API_KEY,
             },
             delivery: Default::default(),
         }

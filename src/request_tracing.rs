@@ -313,12 +313,14 @@ mod tests {
         let classified = trusted_ids.with_request_source(RequestSource {
             auth_path: crate::auth::AuthPath::TrustedConfigToken,
             ingress_route: crate::auth::IngressRouteKind::LongIndexed,
+            caller: crate::auth::CALLER_UNLABELED,
         });
         assert_eq!(
             classified.request_source,
             Some(RequestSource {
                 auth_path: crate::auth::AuthPath::TrustedConfigToken,
                 ingress_route: crate::auth::IngressRouteKind::LongIndexed,
+                caller: crate::auth::CALLER_UNLABELED,
             })
         );
 
@@ -331,6 +333,7 @@ mod tests {
             request_source: RequestSource {
                 auth_path: crate::auth::AuthPath::CloudApiKey,
                 ingress_route: crate::auth::IngressRouteKind::Canonical,
+                caller: crate::auth::CALLER_API_KEY,
             },
         };
         let verified_ids = ids.with_authenticated_context(&h, &direct_auth);
@@ -373,6 +376,7 @@ mod tests {
             request_source: RequestSource {
                 auth_path: crate::auth::AuthPath::TrustedConfigToken,
                 ingress_route: crate::auth::IngressRouteKind::Canonical,
+                caller: crate::auth::CALLER_UNLABELED,
             },
         };
         let trusted_ids = ids.with_authenticated_context(&h, &trusted_auth);
@@ -409,6 +413,7 @@ mod tests {
             request_source: RequestSource {
                 auth_path: crate::auth::AuthPath::CloudApiKey,
                 ingress_route: crate::auth::IngressRouteKind::Canonical,
+                caller: crate::auth::CALLER_API_KEY,
             },
         };
         let ids = TracingIds::from_headers(&HeaderMap::new())

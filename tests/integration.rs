@@ -10685,6 +10685,241 @@ async fn test_ohttp_audio_transcriptions_allowed() {
     server_handle.abort();
 }
 
+// ---- Log privacy: request content never reaches logs or metrics ----
+
+/// Unique marker placed in every client-controlled part of a request.
+const ZDR_SENTINEL: &str = "zdrsentinel7f3a";
+
+#[derive(Clone, Default)]
+struct ZdrLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for ZdrLogs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The sentinel in a body, a model name, headers, a query string and, for
+/// multipart, a file name, a field name and a field value.
+fn zdr_json_body(stream: bool) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "model": format!("model-{ZDR_SENTINEL}"),
+        "messages": [{"role": "user", "content": format!("prompt {ZDR_SENTINEL}")}],
+        "prompt": format!("prompt {ZDR_SENTINEL}"),
+        "input": [format!("input {ZDR_SENTINEL}")],
+        "user": ZDR_SENTINEL,
+        "stream": stream
+    }))
+    .unwrap()
+}
+
+fn zdr_multipart_body(boundary: &str) -> Vec<u8> {
+    format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nmodel-{s}\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nprompt {s}\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"x_{s}\"\r\n\r\nvalue {s}\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{s}.wav\"\r\n\
+         Content-Type: audio/wav\r\n\r\nRIFF{s}\r\n--{boundary}--\r\n",
+        s = ZDR_SENTINEL
+    )
+    .into_bytes()
+}
+
+fn zdr_request(uri: &str, bearer: &str, content_type: &str, body: Vec<u8>) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(format!("{uri}?q={ZDR_SENTINEL}"))
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("content-type", content_type)
+        .header("content-length", body.len())
+        .header("user-agent", format!("client-{ZDR_SENTINEL}"))
+        .header("x-request-id", format!("rid-{ZDR_SENTINEL}"))
+        .header("x-zdr-probe", ZDR_SENTINEL)
+        .header("x-forwarded-for", "203.0.113.77")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// A backend that answers every route with the sentinel in its body, as a
+/// model answer or as an engine error that quotes the prompt.
+async fn zdr_backend(status: u16) -> MockServer {
+    let mock = MockServer::start().await;
+    let message = format!("engine error quoting the prompt: {ZDR_SENTINEL}");
+    let template = if status >= 400 {
+        ResponseTemplate::new(status).set_body_json(serde_json::json!({
+            "error": {"message": message, "type": "BadRequestError"}
+        }))
+    } else {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-zdr",
+            "object": "chat.completion",
+            "text": format!("transcript {ZDR_SENTINEL}"),
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": format!("answer {ZDR_SENTINEL}")},
+                "text": format!("answer {ZDR_SENTINEL}"),
+                "finish_reason": "stop"
+            }],
+            "data": [{"embedding": [0.1], "index": 0, "url": format!("https://x/{ZDR_SENTINEL}")}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+        }))
+    };
+    Mock::given(method("POST"))
+        .respond_with(template)
+        .mount(&mock)
+        .await;
+    mock
+}
+
+async fn zdr_send(app: axum::Router, request: Request<Body>) {
+    let response = app.oneshot(request).await.unwrap();
+    let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+}
+
+/// Every route, on success and on an engine error, with the sentinel in each
+/// part of the request and of the backend's answer: no log line at the
+/// default level and no metric series may contain it.
+#[tokio::test]
+async fn request_content_never_reaches_logs_or_metrics() {
+    let cloud_api = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-zdr",
+            "workspace_id": "ws-zdr",
+            "api_key_id": "key-zdr"
+        })))
+        .mount(&cloud_api)
+        .await;
+
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let logs = ZdrLogs::default();
+    let writer = logs.clone();
+    let _subscriber = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    let _registered = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+
+    let boundary = "zdrboundary";
+    let multipart = format!("multipart/form-data; boundary={boundary}");
+    let sk = format!("sk-test-{ZDR_SENTINEL}-0123456789");
+    for status in [200, 400, 500] {
+        for bearer in ["test-token", sk.as_str()] {
+            let backend = zdr_backend(status).await;
+            let app = build_test_app_inner(
+                &backend.uri(),
+                TestAppOptions {
+                    cloud_api_url: Some(cloud_api.uri()),
+                    ..TestAppOptions::default()
+                },
+            );
+            for (uri, json) in [
+                ("/v1/chat/completions", true),
+                ("/v1/completions", true),
+                ("/v1/embeddings", true),
+                ("/v1/rerank", true),
+                ("/v1/score", true),
+                ("/v1/tokenize", true),
+                ("/v1/privacy/classify", true),
+                ("/v1/images/generations", true),
+                ("/v1/audio/transcriptions", false),
+                ("/v1/images/edits", false),
+            ] {
+                let request = if json {
+                    zdr_request(uri, bearer, "application/json", zdr_json_body(false))
+                } else {
+                    zdr_request(uri, bearer, &multipart, zdr_multipart_body(boundary))
+                };
+                zdr_send(app.clone(), request).await;
+            }
+            zdr_send(
+                app.clone(),
+                zdr_request(
+                    "/v1/chat/completions",
+                    bearer,
+                    "application/json",
+                    zdr_json_body(true),
+                ),
+            )
+            .await;
+            // Signature lookup with a client-chosen id.
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/v1/signature/{ZDR_SENTINEL}?q={ZDR_SENTINEL}"))
+                        .header("authorization", format!("Bearer {bearer}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        }
+    }
+
+    // OHTTP: the same content inside the encrypted message.
+    let backend = zdr_backend(200).await;
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&backend.uri()).await;
+    let mut inner_req = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/chat/completions".to_vec(),
+    );
+    inner_req.put_header("content-type", "application/json");
+    inner_req.put_header("x-org-id", ZDR_SENTINEL);
+    inner_req.put_header("x-workspace-id", ZDR_SENTINEL);
+    inner_req.put_header("x-request-id", ZDR_SENTINEL);
+    inner_req.put_header("x-zdr-probe", ZDR_SENTINEL);
+    inner_req.write_content(zdr_json_body(false));
+    let (enc_request, _client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/ohttp"))
+        .header("content-type", "message/ohttp-req")
+        .header("authorization", "Bearer test-token")
+        .body(enc_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let _ = response.bytes().await;
+    server_handle.abort();
+
+    let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    // The success and the engine-error paths both ran.
+    assert!(captured.contains("request completed"), "{captured}");
+    assert!(
+        captured.contains("Backend returned non-success status"),
+        "{captured}"
+    );
+    let leaked: Vec<&str> = captured
+        .lines()
+        .filter(|line| line.contains(ZDR_SENTINEL) || line.contains("203.0.113.77"))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "request content in logs:\n{}",
+        leaked.join("\n")
+    );
+    let rendered = handle.render();
+    assert!(
+        !rendered.contains(ZDR_SENTINEL),
+        "request content in metrics:\n{rendered}"
+    );
+}
+
 // ---- Chunked OHTTP (streaming) tests ----
 
 /// Chunked OHTTP: encrypt a request, send it, decrypt the response.

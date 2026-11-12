@@ -673,7 +673,7 @@ async fn text_completions_are_placed_billed_and_counted_as_their_model() {
         format!(
             "inference_proxy_completed_requests_total{{auth_path=\"cloud_api_key\",\
              ingress_route=\"missing\",tenant_context=\"verified\",\
-             request_id_origin=\"generated\",mode=\"json_via_stream\",model=\"{id}\"}} {count}"
+             request_id_origin=\"generated\",caller=\"api_key\",mode=\"json_via_stream\",model=\"{id}\"}} {count}"
         )
     };
     assert!(rendered.contains(&completed(ALPHA, 2)), "{rendered}");
@@ -3515,6 +3515,40 @@ async fn a_client_that_leaves_is_no_stream_error_and_is_counted_only_once_it_was
     assert_eq!(samples(&rendered, MODEL_REQUESTS), expected, "{rendered}");
     // A client that left is not a failed stream.
     assert!(!rendered.contains(MODEL_STREAM_ERRORS), "{rendered}");
+}
+
+#[tokio::test]
+async fn http_metrics_use_route_labels() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let gateway = start_single(
+        &[
+            ("MODEL_NAME", ALPHA),
+            ("VLLM_BACKEND_URLS", "http://127.0.0.1:9"),
+        ],
+        Some(handle.clone()),
+    );
+
+    for uri in ["/v1/signature/example-1", "/example-2"] {
+        let request = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        gateway.app.clone().oneshot(request).await.unwrap();
+    }
+
+    let rendered = handle.render();
+    for expected in [
+        "http_requests_total{method=\"GET\",endpoint=\"/v1/signature/{chat_id}\",",
+        "http_requests_total{method=\"GET\",endpoint=\"CATCH_ALL\",",
+        "http_request_duration_seconds_count{method=\"GET\",endpoint=\"/v1/signature/{chat_id}\"}",
+        "http_request_duration_seconds_count{method=\"GET\",endpoint=\"CATCH_ALL\"}",
+    ] {
+        assert!(rendered.contains(expected), "{expected}: {rendered}");
+    }
+    assert!(!rendered.contains("example-"), "{rendered}");
 }
 
 #[tokio::test]

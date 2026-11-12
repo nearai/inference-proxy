@@ -89,6 +89,15 @@ WARN request{request_id=abc-123 method=POST path=/v1/chat/completions}:
 
 **What is logged**: HTTP status codes, backend URLs, error messages (token counts, parameter names), error types, request IDs.
 
+**One line per request.** A successful inference request logs `request completed` (ids, tokens, duration, `auth_path`, `tenant_context`, `caller`). Any other request on an inference, signature, attestation, OHTTP or internal route logs exactly one of:
+
+- `request finished`: the response was sent and no `request completed` line was written (an error status, or a route without a completion line). Fields: `status`, `duration_ms`, `request_bytes` (from `Content-Length`), `outcome` (`complete`, or `body_error` when the body failed while sent), the route pattern, the method and the identity below. Signature and attestation lookups log it only for an error status.
+- `request cancelled`: the client went away before the response (`phase="before_response"`) or while its body was being sent (`phase="during_response"`), with `elapsed_ms` and the identity below.
+
+Both lines carry `org_id`, `workspace_id`, `auth_path`, `ingress_route`, `tenant_context` and `caller` once auth has passed, and nothing taken from the request's content, headers, query string or raw path. The `request` span gets the bounded labels only (`auth_path`, `tenant_context`, `caller`), so other lines do not gain tenant ids. When the backend was sent a request id other than `request_id` (the Cloud API key path, which a gateway serves), the completion, finish, cancel and `Backend returned non-success status` lines also carry it as `upstream_request_id`: a server-generated UUID that the backend logs as its own `request_id`, so the two join even when the request failed. Health, metrics, version, model-list and OHTTP key routes, and unmatched paths, log neither line. `active_connections` counts a request until its response body is sent or dropped.
+
+**Missing tenant.** A request authenticated with a config token on a customer route (chat, completions, embeddings, rerank, score, tokenize, privacy classification, images, audio) that sends no `X-Org-Id` is counted in `inference_proxy_requests_without_tenant_total{route, ingress_route, caller}` and is never refused. A WARN `Trusted request on a customer route has no org id` is written at most once a minute per route and caller, with `suppressed` = how many it stands for. Callers labeled `probe` (or `probe-…`, `probe_…`, see `TOKEN_LABELS`) are not counted.
+
 **What is never logged**: Request bodies, response bodies, prompt content, user messages, completion text.
 
 ## Configuration
@@ -99,6 +108,7 @@ All configuration is via environment variables:
 |----------|----------|---------|-------------|
 | `MODEL_NAME` | Yes | — | Model name for cache key namespacing |
 | `TOKEN` | Yes | — | Bearer token for API authentication |
+| `TOKEN_LABELS` | No | unset | Comma-separated caller label for each `TOKEN` entry, in the same order (e.g. `cloud-api,gateway,probe`). The matched token's label is the request's `caller` on the completion line and on the `inference_proxy_completed_requests_total`, `inference_proxy_input_tokens*` and `inference_proxy_request_duration_seconds` series. Unset: every token is `unlabeled`. A label is 1-32 lowercase letters, digits, `-` or `_`, never a token; the count must match `TOKEN` or startup fails. `api_key` (Cloud API key requests), `unknown` and `unlabeled` are reserved |
 | `VLLM_BASE_URL` | No | `http://localhost:8000` | Backend base URL |
 | `VLLM_DATA_PARALLEL_SIZE` | No | unset | Number of independent vLLM DP engines in one backend. When set, assigns new chat conversations round-robin and keeps append-only turns on the same rank via `X-data-parallel-rank`, improving local prefix-cache reuse without trusting a client-supplied rank. Requires exactly one backend URL. |
 | `VLLM_BACKEND_CONVERSATION_AFFINITY` | No | `false` | With several `VLLM_BACKEND_URLS`, keep append-only chat conversations on the backend that served their first turn (same salted conversation digest as the DP affinity above) so multi-turn prompts reuse that engine's prefix cache instead of being re-prefilled after every least-connections switch. New conversations still go to the least-loaded healthy backend; an unhealthy pinned backend is skipped. Applies to the exact and alias `/v1/chat/completions` routes; other routes keep least-connections. Mutually exclusive with `VLLM_DATA_PARALLEL_SIZE`. |

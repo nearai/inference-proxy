@@ -116,6 +116,7 @@ pub(super) fn job_with(body: &Value, delivery: &Arc<UsageReportDelivery>) -> Job
             request_source: RequestSource {
                 auth_path: AuthPath::CloudApiKey,
                 ingress_route: IngressRouteKind::Canonical,
+                caller: crate::auth::CALLER_API_KEY,
             },
             delivery: delivery.clone(),
         },

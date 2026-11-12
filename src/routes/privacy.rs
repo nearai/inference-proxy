@@ -72,7 +72,7 @@ pub async fn classify(
     let response = request
         .send()
         .await
-        .map_err(|error| AppError::Internal(error.into()))?;
+        .map_err(|error| AppError::Internal(error.without_url().into()))?;
     metrics::histogram!(
         "upstream_request_duration_seconds",
         "endpoint" => "privacy_classify"

@@ -43,6 +43,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
         replica_state: None,
         model_name: "test-model".to_string(),
         tokens: vec!["test-token".to_string()],
+        token_labels: vec![],
         vllm_base_url: upstream_mock_url.to_string(),
         chat_completions_url: format!("{base}/v1/chat/completions"),
         completions_url: format!("{base}/v1/completions"),

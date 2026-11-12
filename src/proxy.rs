@@ -2104,6 +2104,8 @@ fn inject_streaming(body: &[u8]) -> Result<Vec<u8>, AppError> {
 ///   `text_completion` object with `choices[].text`.
 struct StreamingResponseAssembler {
     line_buffer: String,
+    /// Trailing bytes of a character split across chunks.
+    utf8_carry: Vec<u8>,
     id: Option<String>,
     model: Option<String>,
     created: Option<i64>,
@@ -2141,6 +2143,42 @@ struct ChoiceAssembler {
     extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Appends `chunk` to `text`. A character split across chunks is held in
+/// `carry` until its remaining bytes arrive; bytes that can never form a
+/// character become U+FFFD.
+fn push_utf8_chunk(text: &mut String, carry: &mut Vec<u8>, chunk: &[u8]) {
+    let joined;
+    let mut bytes: &[u8] = if carry.is_empty() {
+        chunk
+    } else {
+        carry.extend_from_slice(chunk);
+        joined = std::mem::take(carry);
+        &joined
+    };
+    loop {
+        match std::str::from_utf8(bytes) {
+            Ok(valid) => {
+                text.push_str(valid);
+                return;
+            }
+            Err(error) => {
+                let (valid, rest) = bytes.split_at(error.valid_up_to());
+                text.push_str(std::str::from_utf8(valid).unwrap_or_default());
+                match error.error_len() {
+                    Some(invalid_len) => {
+                        text.push(char::REPLACEMENT_CHARACTER);
+                        bytes = &rest[invalid_len..];
+                    }
+                    None => {
+                        carry.extend_from_slice(rest);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Merge preserved unknown fields into an assembled object, without
 /// overwriting fields we already populated.
 fn merge_extra(target: &mut serde_json::Value, extra: serde_json::Map<String, serde_json::Value>) {
@@ -2158,6 +2196,7 @@ impl StreamingResponseAssembler {
     fn new(shape: ResponseShape) -> Self {
         Self {
             line_buffer: String::new(),
+            utf8_carry: Vec::new(),
             id: None,
             model: None,
             created: None,
@@ -2176,10 +2215,7 @@ impl StreamingResponseAssembler {
     }
 
     fn process_chunk(&mut self, chunk: &[u8]) {
-        match std::str::from_utf8(chunk) {
-            Ok(s) => self.line_buffer.push_str(s),
-            Err(_) => self.line_buffer.push_str(&String::from_utf8_lossy(chunk)),
-        }
+        push_utf8_chunk(&mut self.line_buffer, &mut self.utf8_carry, chunk);
 
         while let Some(newline_pos) = self.line_buffer.find('\n') {
             let line_end =
@@ -3702,6 +3738,8 @@ impl Drop for StreamingGuard {
 /// Extracts `chat_id` from the first JSON chunk and detects the `[DONE]` marker.
 pub struct SseParser {
     line_buffer: String,
+    /// Trailing bytes of a character split across chunks.
+    utf8_carry: Vec<u8>,
     pub chat_id: Option<String>,
     pub seen_done: bool,
     /// Whether the stream has emitted client-visible generation progress.
@@ -3730,6 +3768,7 @@ impl SseParser {
     pub fn new() -> Self {
         Self {
             line_buffer: String::new(),
+            utf8_carry: Vec::new(),
             chat_id: None,
             seen_done: false,
             seen_generation_progress: false,
@@ -3747,10 +3786,7 @@ impl SseParser {
     }
 
     pub fn process_chunk(&mut self, chunk: &[u8]) -> bool {
-        match std::str::from_utf8(chunk) {
-            Ok(s) => self.line_buffer.push_str(s),
-            Err(_) => self.line_buffer.push_str(&String::from_utf8_lossy(chunk)),
-        }
+        push_utf8_chunk(&mut self.line_buffer, &mut self.utf8_carry, chunk);
 
         let mut chunk_has_generation_progress = false;
 
@@ -5904,6 +5940,48 @@ data: [DONE]
     }
 
     // ── StreamingResponseAssembler tests ──
+
+    #[test]
+    fn test_assembler_character_split_across_chunks() {
+        let event = "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"h\u{e9}llo \u{4f60}\u{597d} \u{1f30d}\"},\"finish_reason\":\"stop\"}]}\n\n"
+            .as_bytes();
+        // Cut at every byte offset, so each multi-byte character is split at
+        // each of its inner boundaries once.
+        for cut in 1..event.len() {
+            let mut asm = StreamingResponseAssembler::new(ResponseShape::ChatCompletion);
+            asm.process_chunk(&event[..cut]);
+            asm.process_chunk(&event[cut..]);
+            let resp = asm.into_response("chatcmpl");
+            assert_eq!(
+                resp["choices"][0]["message"]["content"], "h\u{e9}llo \u{4f60}\u{597d} \u{1f30d}",
+                "cut at byte {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_push_utf8_chunk_replaces_only_invalid_bytes() {
+        let mut text = String::new();
+        let mut carry = Vec::new();
+        push_utf8_chunk(&mut text, &mut carry, b"a\xffb\xe4\xbd");
+        assert_eq!(text, "a\u{fffd}b");
+        assert_eq!(carry, b"\xe4\xbd");
+        push_utf8_chunk(&mut text, &mut carry, b"\xa0c");
+        assert_eq!(text, "a\u{fffd}b\u{4f60}c");
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn test_sse_parser_reads_usage_from_line_with_split_character() {
+        let event = "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\u{4f60}\"}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n"
+            .as_bytes();
+        let cut = event.iter().position(|&b| b >= 0x80).unwrap() + 1;
+        let mut parser = SseParser::new();
+        parser.process_chunk(&event[..cut]);
+        parser.process_chunk(&event[cut..]);
+        assert_eq!(parser.chat_id.as_deref(), Some("c1"));
+        assert_eq!(parser.usage, Some((5, 2)));
+    }
 
     #[test]
     fn test_assembler_basic_content() {

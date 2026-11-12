@@ -46,6 +46,34 @@ fn parse_bool(v: &str) -> bool {
     matches!(v.to_lowercase().as_str(), "1" | "true" | "yes")
 }
 
+/// `VLLM_PROXY_INLINE_MEDIA` (default off) and its limits.
+fn media_inline_from_env() -> anyhow::Result<crate::media_inline::MediaInlineConfig> {
+    let d = crate::media_inline::MediaInlineConfig::default();
+    let secs = |name: &str, default: std::time::Duration| -> anyhow::Result<std::time::Duration> {
+        let v: u64 = env_parse(name, default.as_secs())?;
+        if v == 0 {
+            anyhow::bail!("{name} must be > 0");
+        }
+        Ok(std::time::Duration::from_secs(v))
+    };
+    Ok(crate::media_inline::MediaInlineConfig {
+        enabled: env_bool("VLLM_PROXY_INLINE_MEDIA"),
+        timeout: secs("VLLM_PROXY_INLINE_MEDIA_TIMEOUT_SECS", d.timeout)?,
+        request_deadline: secs("VLLM_PROXY_INLINE_MEDIA_DEADLINE_SECS", d.request_deadline)?,
+        max_items: env_parse("VLLM_PROXY_INLINE_MEDIA_MAX_ITEMS", d.max_items)?,
+        max_image_bytes: env_parse("VLLM_PROXY_INLINE_MEDIA_MAX_IMAGE_BYTES", d.max_image_bytes)?,
+        max_audio_bytes: env_parse("VLLM_PROXY_INLINE_MEDIA_MAX_AUDIO_BYTES", d.max_audio_bytes)?,
+        max_total_bytes: env_parse("VLLM_PROXY_INLINE_MEDIA_MAX_TOTAL_BYTES", d.max_total_bytes)?,
+        max_image_pixels: env_parse(
+            "VLLM_PROXY_INLINE_MEDIA_MAX_IMAGE_PIXELS",
+            d.max_image_pixels,
+        )?,
+        max_redirects: env_parse("VLLM_PROXY_INLINE_MEDIA_MAX_REDIRECTS", d.max_redirects)?,
+        max_concurrency: env_parse("VLLM_PROXY_INLINE_MEDIA_MAX_CONCURRENCY", d.max_concurrency)?,
+        ..d
+    })
+}
+
 fn env_bool(name: &str) -> bool {
     env::var(name).map(|v| parse_bool(&v)).unwrap_or(false)
 }
@@ -584,6 +612,10 @@ pub struct Config {
     pub image_validation_allowed_domains: Vec<String>,
     pub image_validation_reject_non_rgb_images: bool,
     pub image_validation_reject_single_channel_images: bool,
+    /// Fetch remote `image_url` / `audio_url` in the proxy and forward `data:`
+    /// URLs (`VLLM_PROXY_INLINE_MEDIA*`). The SSRF host rules and the domain
+    /// allowlist are taken from image validation, see [`Config::media_inline`].
+    pub media_inline: crate::media_inline::MediaInlineConfig,
 
     // Cache
     pub chat_cache_expiration_secs: u64,
@@ -1494,6 +1526,7 @@ impl Config {
             image_validation_allowed_domains,
             image_validation_reject_non_rgb_images,
             image_validation_reject_single_channel_images,
+            media_inline: media_inline_from_env()?,
             chat_cache_expiration_secs: env_int("CHAT_CACHE_EXPIRATION", 1200) as u64,
             attestation_cache_ttl_secs: env_int("ATTESTATION_CACHE_TTL", 300) as u64,
             dev_mode: env_bool("DEV"),
@@ -1857,6 +1890,16 @@ impl Config {
             return None;
         }
         Some(std::time::Duration::from_millis(deadline_ms))
+    }
+
+    /// Media inlining policy with the SSRF host rules and the domain allowlist
+    /// shared with image validation.
+    pub fn media_inline(&self) -> crate::media_inline::MediaInlineConfig {
+        crate::media_inline::MediaInlineConfig {
+            allow_private_hosts: self.image_validation_allow_private_hosts,
+            allowed_domains: self.image_validation_allowed_domains.clone(),
+            ..self.media_inline.clone()
+        }
     }
 
     /// Build the runtime config for pre-dispatch image validation.

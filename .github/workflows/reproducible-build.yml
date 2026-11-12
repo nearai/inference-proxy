@@ -24,19 +24,15 @@ name: Reproducible Build
 # package archives and registries the build reads shows up between merges), and
 # manual dispatch.
 #
-# SECURITY: this is a public repo and the builds run on self-hosted `infra`
-# runners, which are production hosts, executing PR-controlled code
-# (build-image.sh / Dockerfile). Running untrusted PR code there would be an
-# infra-compromise risk, so this does NOT trigger on `pull_request` (matching
-# build.yml). It runs on push to main (post-merge, trusted), on the schedule and
-# on manual workflow_dispatch: a maintainer can dispatch it against a PR branch
-# (`--ref <branch>`) to verify reproducibility before merging. Dispatch build.yml
-# on the branch first to also get the published-digest comparison.
+# The builds run on GitHub-hosted runners, like build.yml. This still does NOT
+# trigger on `pull_request` (matching build.yml): it runs on push to main, on
+# the schedule and on manual workflow_dispatch. A maintainer can dispatch it
+# against a PR branch (`--ref <branch>`) to verify reproducibility before
+# merging. Dispatch build.yml on the branch first to also get the
+# published-digest comparison.
 #
-# Never add `docker system prune` / `docker builder prune` here: a global prune
-# on these hosts deletes images and volumes of other services. build-image.sh
-# builds with --no-cache in a builder of its own, so no build reuses another's
-# layers anyway.
+# build-image.sh builds with --no-cache in a builder of its own, so no build
+# reuses another's layers.
 on:
   push:
     branches: [main]
@@ -56,7 +52,7 @@ permissions:
 jobs:
   cross-machine:
     name: Cross-machine build ${{ matrix.instance }}
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -64,7 +60,9 @@ jobs:
         instance: [1, 2]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Install build dependencies
         run: |
@@ -76,6 +74,7 @@ jobs:
       # The environment external verifiers build with.
       - name: Build
         env:
+          MATRIX_INSTANCE: ${{ matrix.instance }}
           ENABLE_NV_ATTESTATION_SDK: "1"
           SOURCE_DATE_EPOCH: "0"
           LOAD_IMAGE: ${{ matrix.instance == 1 && '1' || '0' }}
@@ -86,14 +85,14 @@ jobs:
           seconds=$(( $(date +%s) - start ))
           digest=$(tar -xOf oci.tar index.json | jq -r '.manifests[0].digest')
           echo "Image digest: ${digest} (${seconds} s on ${RUNNER_NAME}, LOAD_IMAGE=${LOAD_IMAGE})"
-          jq -n --arg label "Cross-machine ${{ matrix.instance }} (LOAD_IMAGE=${LOAD_IMAGE})" \
-            --argjson order "${{ matrix.instance }}" --arg digest "$digest" \
+          jq -n --arg label "Cross-machine ${MATRIX_INSTANCE} (LOAD_IMAGE=${LOAD_IMAGE})" \
+            --argjson order "${MATRIX_INSTANCE}" --arg digest "$digest" \
             --arg runner "$RUNNER_NAME" --argjson seconds "$seconds" \
             '{order: $order, label: $label, digest: $digest, runner: $runner, seconds: $seconds}' \
-            > "digest-cross-machine-${{ matrix.instance }}.json"
+            > "digest-cross-machine-${MATRIX_INSTANCE}.json"
 
       - name: Upload digest
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: digest-cross-machine-${{ matrix.instance }}
           path: digest-cross-machine-${{ matrix.instance }}.json
@@ -137,7 +136,7 @@ jobs:
           exit "$status"
 
       # build-image.sh removes its builder and temporary image on exit; the
-      # second half removes what a killed run left on this shared host (the
+      # second half removes what a killed run left behind (the
       # names start with their creation time; nothing older than 3 h is live).
       - name: Clean up build artifacts
         if: always()
@@ -160,11 +159,13 @@ jobs:
 
   sequential:
     name: Sequential builds
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Install build dependencies
         run: |
@@ -206,26 +207,29 @@ jobs:
             > digest-sequential-2.json
 
       - name: Upload digests
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: digest-sequential
           path: digest-sequential-*.json
           retention-days: 7
 
       - name: Compare builds
+        env:
+          STEP_FIRST_SHA: ${{ steps.first.outputs.sha }}
+          STEP_SECOND_SHA: ${{ steps.second.outputs.sha }}
         run: |
-          if [ "${{ steps.first.outputs.sha }}" = "${{ steps.second.outputs.sha }}" ]; then
+          if [ "${STEP_FIRST_SHA}" = "${STEP_SECOND_SHA}" ]; then
             {
               echo "## Sequential builds"
               echo ""
-              echo "- OCI archive sha256 (both builds): \`${{ steps.first.outputs.sha }}\`"
+              echo "- OCI archive sha256 (both builds): \`${STEP_FIRST_SHA}\`"
               echo "- ENABLE_NV_ATTESTATION_SDK: \`1\`"
             } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           echo "::error::Two builds of the same commit produced different OCI archives"
-          echo "first:  ${{ steps.first.outputs.sha }}"
-          echo "second: ${{ steps.second.outputs.sha }}"
+          echo "first:  ${STEP_FIRST_SHA}"
+          echo "second: ${STEP_SECOND_SHA}"
 
           # Localise the drift: which layer(s) differ, and which files within them.
           set +e
@@ -274,7 +278,7 @@ jobs:
 
   verifier-parity:
     name: Verifier-parity rebuild
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     # External verifiers give each image rebuild 60 minutes.
     timeout-minutes: 60
     steps:
@@ -321,7 +325,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload digest
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: digest-verifier-parity
           path: ${{ runner.temp }}/digest-verifier-parity.json
@@ -347,8 +351,7 @@ jobs:
           done
           true
 
-  # Runs on a GitHub-hosted runner: it only reads the API, and waiting for
-  # build.yml must not hold one of the self-hosted builders.
+  # Only reads the API; waits for build.yml to publish its digest.
   verify:
     name: Compare digests
     needs: [cross-machine, sequential, verifier-parity]
@@ -360,7 +363,7 @@ jobs:
       actions: read
     steps:
       - name: Download digests
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         continue-on-error: true
         with:
           pattern: digest-*
@@ -516,6 +519,10 @@ jobs:
     steps:
       - name: Send Slack notification
         env:
+          NEEDS_CROSS_MACHINE_RESULT: ${{ needs.cross-machine.result }}
+          NEEDS_SEQUENTIAL_RESULT: ${{ needs.sequential.result }}
+          NEEDS_VERIFIER_PARITY_RESULT: ${{ needs.verifier-parity.result }}
+          NEEDS_VERIFY_RESULT: ${{ needs.verify.result }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
         run: |
           if [ -z "${SLACK_BOT_TOKEN}" ]; then
@@ -523,10 +530,10 @@ jobs:
             exit 0
           fi
 
-          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          MSG=":red_circle: *Reproducible build check failed* on \`${{ github.repository }}\` (${{ github.event_name }})
-          Branch: \`${{ github.ref_name }}\` · Commit: \`${GITHUB_SHA:0:7}\`
-          Jobs — cross-machine: \`${{ needs.cross-machine.result }}\` · sequential: \`${{ needs.sequential.result }}\` · verifier-parity: \`${{ needs.verifier-parity.result }}\` · verify: \`${{ needs.verify.result }}\`
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          MSG=":red_circle: *Reproducible build check failed* on \`${GITHUB_REPOSITORY}\` (${GITHUB_EVENT_NAME})
+          Branch: \`${GITHUB_REF_NAME}\` · Commit: \`${GITHUB_SHA:0:7}\`
+          Jobs — cross-machine: \`${NEEDS_CROSS_MACHINE_RESULT}\` · sequential: \`${NEEDS_SEQUENTIAL_RESULT}\` · verifier-parity: \`${NEEDS_VERIFIER_PARITY_RESULT}\` · verify: \`${NEEDS_VERIFY_RESULT}\`
 
           <${RUN_URL}|GitHub Actions run>"
 

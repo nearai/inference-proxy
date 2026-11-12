@@ -86,6 +86,12 @@ pub async fn ohttp_relay(
         .ok_or_else(|| AppError::NotFound("OHTTP not enabled".to_string()))?;
 
     let outer_authorization = request.headers().get(header::AUTHORIZATION).cloned();
+    // The loopback request carries this request's id, so the inner request's log
+    // lines join the outer one. The inner message cannot choose it.
+    let outer_request_id = request
+        .extensions()
+        .get::<crate::TracingIds>()
+        .map(|ids| ids.request_id.clone());
 
     let chunked = request
         .headers()
@@ -105,9 +111,23 @@ pub async fn ohttp_relay(
     }
 
     if chunked {
-        ohttp_relay_chunked(&state, gateway, &enc_request, outer_authorization).await
+        ohttp_relay_chunked(
+            &state,
+            gateway,
+            &enc_request,
+            outer_authorization,
+            outer_request_id,
+        )
+        .await
     } else {
-        ohttp_relay_standard(&state, gateway, &enc_request, outer_authorization).await
+        ohttp_relay_standard(
+            &state,
+            gateway,
+            &enc_request,
+            outer_authorization,
+            outer_request_id,
+        )
+        .await
     }
 }
 
@@ -117,6 +137,7 @@ async fn ohttp_relay_standard(
     gateway: &crate::ohttp_gateway::OhttpGateway,
     enc_request: &[u8],
     outer_authorization: Option<HeaderValue>,
+    outer_request_id: Option<String>,
 ) -> Result<Response, AppError> {
     let start = Instant::now();
     metrics::counter!("ohttp_requests_total", "type" => "standard").increment(1);
@@ -131,8 +152,12 @@ async fn ohttp_relay_standard(
     metrics::histogram!("ohttp_decapsulation_duration_seconds")
         .record(decap_duration.as_secs_f64());
 
-    let (request_builder, path_str) =
-        parse_bhttp_and_build_loopback(state, &bhttp_request, outer_authorization.as_ref())?;
+    let (request_builder, path_str) = parse_bhttp_and_build_loopback(
+        state,
+        &bhttp_request,
+        outer_authorization.as_ref(),
+        outer_request_id.as_deref(),
+    )?;
 
     // Send the loopback request.
     let loopback_response = send_loopback(request_builder).await?;
@@ -194,6 +219,7 @@ async fn ohttp_relay_chunked(
     gateway: &crate::ohttp_gateway::OhttpGateway,
     enc_request: &[u8],
     outer_authorization: Option<HeaderValue>,
+    outer_request_id: Option<String>,
 ) -> Result<Response, AppError> {
     use futures_util::StreamExt;
 
@@ -219,8 +245,12 @@ async fn ohttp_relay_chunked(
     metrics::histogram!("ohttp_decapsulation_duration_seconds")
         .record(decap_duration.as_secs_f64());
 
-    let (request_builder, path_str) =
-        parse_bhttp_and_build_loopback(state, &bhttp_request, outer_authorization.as_ref())?;
+    let (request_builder, path_str) = parse_bhttp_and_build_loopback(
+        state,
+        &bhttp_request,
+        outer_authorization.as_ref(),
+        outer_request_id.as_deref(),
+    )?;
 
     let loopback_response = send_loopback(request_builder).await?;
     let response_status = loopback_response.status().as_u16();
@@ -424,11 +454,13 @@ fn collect_response_headers(response: &reqwest::Response) -> Vec<(Vec<u8>, Vec<u
 /// `Authorization` on `POST /ohttp`), it is attached to the loopback request,
 /// the inner `Authorization` field is skipped, and trusted-only inner headers
 /// (`X-Request-Hash`, `X-NearAI-Priority`) are scrubbed because the outer bearer
-/// establishes trusted-gateway semantics.
+/// establishes trusted-gateway semantics. Inner `X-Org-Id`, `X-Workspace-Id` and
+/// `X-Request-Id` are always dropped; the loopback carries the outer request id.
 fn parse_bhttp_and_build_loopback(
     state: &AppState,
     bhttp_request: &[u8],
     outer_authorization: Option<&HeaderValue>,
+    outer_request_id: Option<&str>,
 ) -> Result<(reqwest::RequestBuilder, String), AppError> {
     let inner_msg = bhttp::Message::read_bhttp(&mut Cursor::new(bhttp_request)).map_err(|e| {
         warn!(error = %e, "Failed to parse Binary HTTP request");
@@ -474,6 +506,7 @@ fn parse_bhttp_and_build_loopback(
         let skip = name_bytes.eq_ignore_ascii_case(b"host")
             || name_bytes.eq_ignore_ascii_case(b"transfer-encoding")
             || name_bytes.eq_ignore_ascii_case(b"connection")
+            || is_inner_correlation_header(name_bytes)
             || (relay_outer_bearer.is_some() && name_bytes.eq_ignore_ascii_case(b"authorization"))
             || (relay_outer_bearer.is_some() && name_bytes.eq_ignore_ascii_case(b"x-request-hash"))
             // The loopback authenticates as a trusted caller; the inner headers
@@ -503,6 +536,9 @@ fn parse_bhttp_and_build_loopback(
     if let Some(auth) = relay_outer_bearer {
         request_builder = request_builder.header(header::AUTHORIZATION, auth.clone());
     }
+    if let Some(request_id) = outer_request_id {
+        request_builder = request_builder.header("x-request-id", request_id);
+    }
 
     let inner_content = inner_msg.content().to_vec();
     if !inner_content.is_empty() {
@@ -510,6 +546,17 @@ fn parse_bhttp_and_build_loopback(
     }
 
     Ok((request_builder, path_str.to_string()))
+}
+
+/// Correlation and tenant headers inside the encrypted message are never
+/// forwarded. They come from the end client, while the loopback request may
+/// authenticate as a trusted caller whose `X-Org-Id` / `X-Workspace-Id` are
+/// believed, so the client could otherwise pick the tenant recorded for its
+/// request. The loopback carries the outer request's id instead.
+fn is_inner_correlation_header(name: &[u8]) -> bool {
+    name.eq_ignore_ascii_case(b"x-org-id")
+        || name.eq_ignore_ascii_case(b"x-workspace-id")
+        || name.eq_ignore_ascii_case(b"x-request-id")
 }
 
 /// Log and count an inner OHTTP request that was refused before any loopback call.
@@ -721,6 +768,23 @@ mod tests {
     use futures_util::io::Cursor as FuturesCursor;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn inner_correlation_headers_are_never_forwarded() {
+        for name in [
+            "x-org-id",
+            "X-Org-Id",
+            "x-workspace-id",
+            "X-WORKSPACE-ID",
+            "x-request-id",
+            "X-Request-Id",
+        ] {
+            assert!(is_inner_correlation_header(name.as_bytes()), "{name}");
+        }
+        for name in ["content-type", "x-org", "x-request-hash", "authorization"] {
+            assert!(!is_inner_correlation_header(name.as_bytes()), "{name}");
+        }
+    }
 
     #[test]
     fn ohttp_only_accepts_inference_routes_on_loopback() {

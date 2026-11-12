@@ -70,15 +70,8 @@ impl TracingIds {
             return self.clone();
         }
 
-        let org_id = headers
-            .get("x-org-id")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        let workspace_id = headers
-            .get("x-workspace-id")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+        let org_id = non_empty_header(headers, "x-org-id");
+        let workspace_id = non_empty_header(headers, "x-workspace-id");
 
         Self {
             request_id: self.request_id.clone(),
@@ -99,8 +92,8 @@ impl TracingIds {
             request_id: self.request_id.clone(),
             upstream_request_id: self.upstream_request_id.clone(),
             request_id_inbound: self.request_id_inbound,
-            org_id: org_id.map(str::to_string),
-            workspace_id: workspace_id.map(str::to_string),
+            org_id: non_empty(org_id),
+            workspace_id: non_empty(workspace_id),
             request_source: self.request_source,
             forward_tenant_headers: false,
         }
@@ -161,6 +154,19 @@ impl TracingIds {
     pub fn workspace_id_or_empty(&self) -> &str {
         self.workspace_id.as_deref().unwrap_or("")
     }
+}
+
+/// A tenant id header's value, or `None` when it is missing, not ASCII, or
+/// blank. A blank id names no tenant and must not count as one.
+fn non_empty_header(headers: &HeaderMap, name: &str) -> Option<String> {
+    non_empty(headers.get(name).and_then(|v| v.to_str().ok()))
+}
+
+fn non_empty(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
 }
 
 /// When the request reached the proxy, put in the request extensions by
@@ -373,6 +379,42 @@ mod tests {
         let trusted_headers = trusted_ids.upstream_headers().collect::<Vec<_>>();
         assert!(trusted_headers.contains(&("x-org-id", "org-uuid-123")));
         assert!(trusted_headers.contains(&("x-workspace-id", "ws-uuid-456")));
+    }
+
+    #[test]
+    fn blank_tenant_headers_count_as_absent() {
+        let h = headers_with(&[("x-org-id", ""), ("x-workspace-id", "   ")]);
+        let ids = TracingIds::from_headers(&h).with_trusted_tenant_headers(&h, true);
+        assert!(ids.org_id.is_none());
+        assert!(ids.workspace_id.is_none());
+        let forwarded: Vec<_> = ids.upstream_headers().collect();
+        assert_eq!(forwarded, vec![("x-request-id", ids.request_id.as_str())]);
+
+        // One blank, one set: only the set one is kept and forwarded.
+        let h = headers_with(&[("x-org-id", "org-1"), ("x-workspace-id", "")]);
+        let ids = TracingIds::from_headers(&h).with_trusted_tenant_headers(&h, true);
+        assert_eq!(ids.org_id.as_deref(), Some("org-1"));
+        assert!(ids.workspace_id.is_none());
+        let forwarded: Vec<_> = ids.upstream_headers().collect();
+        assert!(forwarded.contains(&("x-org-id", "org-1")));
+        assert!(!forwarded.iter().any(|(name, _)| *name == "x-workspace-id"));
+
+        // A verified identity with blank fields is no identity either.
+        let direct_auth = RequireAuth {
+            cloud_api_key: Some("sk-test-redacted".to_string()),
+            org_id: Some(String::new()),
+            workspace_id: Some(" ".to_string()),
+            api_key_id: None,
+            request_id: None,
+            request_source: RequestSource {
+                auth_path: crate::auth::AuthPath::CloudApiKey,
+                ingress_route: crate::auth::IngressRouteKind::Canonical,
+            },
+        };
+        let ids = TracingIds::from_headers(&HeaderMap::new())
+            .with_authenticated_context(&HeaderMap::new(), &direct_auth);
+        assert!(ids.org_id.is_none());
+        assert!(ids.workspace_id.is_none());
     }
 
     #[test]

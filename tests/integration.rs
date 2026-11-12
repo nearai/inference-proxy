@@ -10142,6 +10142,92 @@ async fn test_ohttp_outer_authorization_relay_injected() {
 }
 
 #[tokio::test]
+async fn test_ohttp_never_forwards_inner_tenant_or_request_id_headers() {
+    // The inner headers come from the end client. With a trusted outer bearer
+    // the loopback would believe X-Org-Id / X-Workspace-Id, so they are
+    // dropped; the loopback carries the outer request's id, not the inner one.
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-ohttp-tenant-strip",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+        })))
+        .mount(&mock)
+        .await;
+
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock.uri()).await;
+    let outer_request_id = "6f0c4d0e-8f2a-4c1e-9b7d-2a5e3c1f0a11";
+    let inner_request_id = "1b2c3d4e-5f60-4718-8293-a4b5c6d7e8f9";
+    let client = reqwest::Client::new();
+
+    for outer_auth in [true, false] {
+        let mut inner_req = bhttp::Message::request(
+            b"POST".to_vec(),
+            b"https".to_vec(),
+            b"localhost".to_vec(),
+            b"/v1/chat/completions".to_vec(),
+        );
+        inner_req.put_header("content-type", "application/json");
+        if !outer_auth {
+            inner_req.put_header("authorization", "Bearer test-token");
+        }
+        inner_req.put_header("x-org-id", "org-inner-spoof");
+        inner_req.put_header("x-workspace-id", "ws-inner-spoof");
+        inner_req.put_header("x-request-id", inner_request_id);
+        inner_req.write_content(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": false
+            }))
+            .unwrap(),
+        );
+
+        let (enc_request, client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+        let mut request = client
+            .post(format!("{base_url}/ohttp"))
+            .header("content-type", "message/ohttp-req")
+            .header("x-request-id", outer_request_id);
+        if outer_auth {
+            request = request.header("authorization", "Bearer test-token");
+        }
+        let response = request.body(enc_request).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let enc_response = response.bytes().await.unwrap();
+        let inner_resp = ohttp_decrypt_response(client_response, &enc_response);
+        assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+
+        let received = mock.received_requests().await.unwrap();
+        let upstream = received.last().expect("backend saw the inner request");
+        assert!(
+            !upstream.headers.contains_key("x-org-id"),
+            "outer_auth={outer_auth}"
+        );
+        assert!(
+            !upstream.headers.contains_key("x-workspace-id"),
+            "outer_auth={outer_auth}"
+        );
+        assert_eq!(
+            upstream
+                .headers
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok()),
+            Some(outer_request_id),
+            "outer_auth={outer_auth}"
+        );
+    }
+
+    server_handle.abort();
+}
+
+#[tokio::test]
 async fn test_ohttp_outer_bearer_scrubs_inner_x_nearai_priority() {
     // Behind a relay the loopback request authenticates with the relay's outer
     // bearer (trusted), while the inner headers come from the end customer:

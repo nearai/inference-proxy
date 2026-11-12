@@ -1,5 +1,9 @@
 # CLAUDE.md
 
+## Contribution privacy
+
+Keep contributions, including those prepared with AI agents, focused on the change and how it was tested. Before publishing, review all content and remove any confidential or sensitive information.
+
 ## Build & Test
 
 ```bash

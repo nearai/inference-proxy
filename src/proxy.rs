@@ -3295,14 +3295,17 @@ pub(crate) fn normalize_chat_chunk(val: &mut serde_json::Value) {
 /// and optionally applies an additional transform (e.g. encryption).
 /// Fail-closed: if a data line contains JSON that cannot be transformed, the stream errors.
 struct SseTransformer {
-    line_buffer: String,
+    /// Raw bytes of the line still being received. Kept as bytes because a
+    /// network chunk can end in the middle of a multi-byte character; a line
+    /// is only decoded once its newline has arrived.
+    line_buffer: Vec<u8>,
     extra_transform: Option<crate::encryption::ChunkTransform>,
 }
 
 impl SseTransformer {
     fn new(extra_transform: Option<crate::encryption::ChunkTransform>) -> Self {
         Self {
-            line_buffer: String::new(),
+            line_buffer: Vec::new(),
             extra_transform,
         }
     }
@@ -3310,17 +3313,20 @@ impl SseTransformer {
     /// Feed raw bytes into the buffer and return all complete transformed lines.
     /// Incomplete lines are buffered for the next call.
     fn process_chunk(&mut self, chunk: &[u8]) -> Result<Bytes, AppError> {
-        let s = std::str::from_utf8(chunk).map_err(|e| {
-            AppError::Internal(anyhow::anyhow!("Received invalid UTF-8 in SSE stream: {e}"))
-        })?;
-        self.line_buffer.push_str(s);
+        self.line_buffer.extend_from_slice(chunk);
 
         let mut output = String::new();
 
-        while let Some(newline_pos) = self.line_buffer.find('\n') {
-            // Extract the complete line including the newline
-            let full_line = self.line_buffer[..=newline_pos].to_string();
-            self.line_buffer.drain(..=newline_pos);
+        while let Some(newline_pos) = self.line_buffer.iter().position(|&b| b == b'\n') {
+            // Extract the complete line including the newline. Only a complete
+            // line is decoded, so a character split across chunks is whole here.
+            let line_bytes: Vec<u8> = self.line_buffer.drain(..=newline_pos).collect();
+            let full_line = String::from_utf8(line_bytes).map_err(|e| {
+                AppError::Internal(anyhow::anyhow!(
+                    "Received invalid UTF-8 in SSE stream: {}",
+                    e.utf8_error()
+                ))
+            })?;
 
             let trimmed = full_line.trim_end_matches(['\n', '\r']);
             let data = trimmed
@@ -3367,7 +3373,12 @@ impl SseTransformer {
         if self.line_buffer.is_empty() {
             return Ok(Bytes::new());
         }
-        let remaining = std::mem::take(&mut self.line_buffer);
+        let remaining = String::from_utf8(std::mem::take(&mut self.line_buffer)).map_err(|e| {
+            AppError::Internal(anyhow::anyhow!(
+                "Received invalid UTF-8 in SSE stream: {}",
+                e.utf8_error()
+            ))
+        })?;
         let trimmed = remaining.trim_end_matches(['\n', '\r']);
         let data = trimmed
             .strip_prefix("data: ")
@@ -5481,6 +5492,54 @@ data: [DONE]
         let before = v.clone();
         normalize_chat_chunk(&mut v);
         assert_eq!(v, before);
+    }
+
+    #[test]
+    fn test_sse_transformer_character_split_across_chunks() {
+        // A chunk boundary may fall inside a multi-byte character. Whatever the
+        // split point, the output must equal the unsplit output.
+        let stream = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"h\u{e9}llo \u{4f60}\u{597d} \u{1f44b}\"}}]}\n\ndata: [DONE]\n\n"
+            .as_bytes();
+        let mut whole = SseTransformer::new(None);
+        let mut expected = whole.process_chunk(stream).unwrap().to_vec();
+        expected.extend_from_slice(&whole.flush().unwrap());
+        assert!(std::str::from_utf8(&expected)
+            .unwrap()
+            .contains("\u{4f60}\u{597d}"));
+
+        for split in 1..stream.len() {
+            let mut transformer = SseTransformer::new(None);
+            let mut out = transformer
+                .process_chunk(&stream[..split])
+                .unwrap()
+                .to_vec();
+            out.extend_from_slice(&transformer.process_chunk(&stream[split..]).unwrap());
+            out.extend_from_slice(&transformer.flush().unwrap());
+            assert_eq!(out, expected, "split at byte {split}");
+        }
+
+        // One byte at a time.
+        let mut transformer = SseTransformer::new(None);
+        let mut out = Vec::new();
+        for byte in stream {
+            out.extend_from_slice(&transformer.process_chunk(&[*byte]).unwrap());
+        }
+        out.extend_from_slice(&transformer.flush().unwrap());
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn test_sse_transformer_invalid_utf8_line_still_fails() {
+        let mut transformer = SseTransformer::new(None);
+        assert!(transformer.process_chunk(b"data: \xff\xfe\n").is_err());
+
+        // A stream that ends inside a character is invalid, too.
+        let mut transformer = SseTransformer::new(None);
+        assert!(transformer
+            .process_chunk(b": note \xe4\xbd")
+            .unwrap()
+            .is_empty());
+        assert!(transformer.flush().is_err());
     }
 
     #[test]

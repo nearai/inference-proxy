@@ -1,7 +1,7 @@
 name: Promote Staging to Production
 
 permissions:
-  contents: write
+  contents: read
 
 on:
   workflow_dispatch:
@@ -37,7 +37,7 @@ jobs:
           fi
 
       - name: Log in to Docker registry
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ vars.DOCKER_REGISTRY_USER }}
@@ -53,9 +53,11 @@ jobs:
 
       - name: Resolve staging digest and source SHA
         id: resolve
+        env:
+          VAR_DOCKER_REGISTRY_USER: ${{ vars.DOCKER_REGISTRY_USER }}
         run: |
           set -euo pipefail
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}"
+          IMAGE="${REGISTRY}/${IMAGE_REPOSITORY}"
           DIGEST=$(skopeo inspect "docker://${IMAGE}:staging" | jq -r '.Digest')
           if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
             echo "::error::Failed to resolve ${IMAGE}:staging"
@@ -63,7 +65,7 @@ jobs:
           fi
 
           SHORT_SHA="unknown"
-          PAGE_URL="https://hub.docker.com/v2/namespaces/${{ vars.DOCKER_REGISTRY_USER }}/repositories/vllm-proxy-rs/tags?page_size=100"
+          PAGE_URL="https://hub.docker.com/v2/namespaces/${VAR_DOCKER_REGISTRY_USER}/repositories/vllm-proxy-rs/tags?page_size=100"
           PAGE_COUNT=0
           while [ -n "$PAGE_URL" ] && [ "$PAGE_URL" != "null" ] && [ "$PAGE_COUNT" -lt 50 ]; do
             RESP=$(curl -fsS --max-time 30 --retry 2 --retry-delay 2 "$PAGE_URL")
@@ -85,6 +87,9 @@ jobs:
           echo "source_short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Verify :staging was built and signed by build.yml on main
+        env:
+          STEP_RESOLVE_IMAGE: ${{ steps.resolve.outputs.image }}
+          STEP_RESOLVE_DIGEST: ${{ steps.resolve.outputs.digest }}
         run: |
           set -euo pipefail
           cosign verify \
@@ -92,15 +97,19 @@ jobs:
             --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
             --certificate-github-workflow-repository 'nearai/inference-proxy' \
             --certificate-github-workflow-ref 'refs/heads/main' \
-            "${{ steps.resolve.outputs.image }}@${{ steps.resolve.outputs.digest }}"
+            "${STEP_RESOLVE_IMAGE}@${STEP_RESOLVE_DIGEST}"
 
       - name: Re-tag staging digest to prod aliases
+        env:
+          STEP_RESOLVE_IMAGE: ${{ steps.resolve.outputs.image }}
+          STEP_RESOLVE_DIGEST: ${{ steps.resolve.outputs.digest }}
+          STEP_RESOLVE_SOURCE_SHORT_SHA: ${{ steps.resolve.outputs.source_short_sha }}
         run: |
           set -euo pipefail
-          IMAGE="${{ steps.resolve.outputs.image }}"
-          DIGEST="${{ steps.resolve.outputs.digest }}"
+          IMAGE="${STEP_RESOLVE_IMAGE}"
+          DIGEST="${STEP_RESOLVE_DIGEST}"
           STAMP=$(date -u +%Y%m%d)
-          PROD_STAMPED_TAG="prod-${STAMP}-${{ steps.resolve.outputs.source_short_sha }}"
+          PROD_STAMPED_TAG="prod-${STAMP}-${STEP_RESOLVE_SOURCE_SHORT_SHA}"
           PROD_STAMPED_REF="${IMAGE}:${PROD_STAMPED_TAG}"
 
           skopeo copy "docker://${IMAGE}@${DIGEST}" "docker://${IMAGE}:prod"
@@ -125,6 +134,7 @@ jobs:
 
       - name: Create GitHub release
         env:
+          STEP_RESOLVE_SOURCE_SHORT_SHA: ${{ steps.resolve.outputs.source_short_sha }}
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
@@ -136,7 +146,7 @@ jobs:
           - **Stamped image**: \`${PROD_STAMPED_REF}\`
           - **Compatibility alias**: \`${IMAGE}:latest\`
           - **Digest**: \`${IMAGE_DIGEST}\`
-          - **Source short-sha**: \`${{ steps.resolve.outputs.source_short_sha }}\`
+          - **Source short-sha**: \`${STEP_RESOLVE_SOURCE_SHORT_SHA}\`
           - **Sigstore**: https://search.sigstore.dev/?hash=${IMAGE_DIGEST}
           EOF
           )

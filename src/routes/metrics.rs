@@ -145,45 +145,68 @@ async fn models_document_for_list(
     };
     let mut listed = std::collections::HashSet::new();
     entries.retain_mut(|entry| {
-        let Some(model) = entry
-            .get("id")
-            .and_then(Value::as_str)
-            .and_then(|id| models.get(id))
-        else {
+        let Some(id) = entry.get("id").and_then(Value::as_str) else {
             return false;
         };
-        listed.insert(model.id());
-        if let Some(entry) = entry.as_object_mut() {
-            let capacity = capacity_entries_for(
+        // A served model publishes its admission budget as its concurrency; a
+        // listed-only one (served elsewhere) the capacity its entry declares.
+        let (id, concurrency, requests_per_minute, discount) = if let Some(model) = models.get(id) {
+            (
+                model.id(),
                 model.config.admission_max_inflight,
                 model.config.capacity_requests_per_minute,
-            );
+                model.config.discount_to_user,
+            )
+        } else if let Some(model) = models.get_listed(id) {
+            (
+                model.id(),
+                model.config.capacity_concurrency,
+                model.config.capacity_requests_per_minute,
+                model.config.discount_to_user,
+            )
+        } else {
+            return false;
+        };
+        listed.insert(id);
+        if let Some(entry) = entry.as_object_mut() {
+            let capacity = capacity_entries_for(concurrency, requests_per_minute);
             if !capacity.is_empty() {
                 entry.insert("capacity".to_string(), Value::Array(capacity));
             }
-            set_discount(entry, model.config.discount_to_user);
+            set_discount(entry, discount);
         }
         true
     });
     for model in models.iter() {
         let is_listed = listed.contains(model.id());
-        if !is_listed {
-            metrics::counter!("models_document_missing_models_total", "model" => model.id().to_string())
-                .increment(1);
-        }
-        match (model.note_listed(is_listed), is_listed) {
-            (true, false) => tracing::warn!(
-                model = %model.id(),
-                "Configured model is not in the models document, leaving it out of /v1/models"
-            ),
-            (true, true) => tracing::info!(
-                model = %model.id(),
-                "Configured model is in the models document again"
-            ),
-            (false, _) => {}
-        }
+        note_document_listing(model.id(), is_listed, model.note_listed(is_listed));
+    }
+    for model in models.listed() {
+        let is_listed = listed.contains(model.id());
+        note_document_listing(model.id(), is_listed, model.note_listed(is_listed));
     }
     Ok((StatusCode::OK, axum::Json(document)).into_response())
+}
+
+/// Count a configured model the models document left out, and log when that
+/// changed since the last read (`changed`): `/v1/models` is polled, so the
+/// change is worth a line and the steady state is not.
+fn note_document_listing(id: &str, is_listed: bool, changed: bool) {
+    if !is_listed {
+        metrics::counter!("models_document_missing_models_total", "model" => id.to_string())
+            .increment(1);
+    }
+    match (changed, is_listed) {
+        (true, false) => tracing::warn!(
+            model = %id,
+            "Configured model is not in the models document, leaving it out of /v1/models"
+        ),
+        (true, true) => tracing::info!(
+            model = %id,
+            "Configured model is in the models document again"
+        ),
+        (false, _) => {}
+    }
 }
 
 /// The service token for a read of the models document source, when the

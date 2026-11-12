@@ -33,7 +33,7 @@ fn parse_with(
     defaults: &ModelDefaults,
     process: &ProcessSettings,
 ) -> anyhow::Result<Vec<ModelConfig>> {
-    parse(&list.to_string(), defaults, process, &lookup)
+    parse(&list.to_string(), defaults, process, &lookup).map(|list| list.models)
 }
 
 fn parse_list(list: serde_json::Value) -> anyhow::Result<Vec<ModelConfig>> {
@@ -353,6 +353,154 @@ fn ids_must_be_exact_and_unique() {
         {"id": "org/M", "backend_urls": ["https://b.example"]}
     ]}))
     .unwrap();
+}
+
+/// `one({})` with `listed` as its `listed_models`, parsed to the listed-only
+/// models.
+fn listed_of(listed: serde_json::Value) -> anyhow::Result<Vec<ListedModelConfig>> {
+    let mut list = one(serde_json::json!({}));
+    list["listed_models"] = listed;
+    parse(&list.to_string(), &defaults(), &process(), &lookup).map(|list| list.listed)
+}
+
+fn listed_error_of(listed: serde_json::Value) -> String {
+    listed_of(listed)
+        .expect_err("the list must be refused")
+        .to_string()
+}
+
+#[test]
+fn a_listed_model_takes_its_own_capacity_and_discount_and_nothing_else() {
+    // Process-level values that a served entry would fall back to.
+    let defaults = ModelDefaults {
+        capacity_requests_per_minute: 150,
+        discount_to_user: Some(0.3),
+        ..defaults()
+    };
+    let mut list = one(serde_json::json!({}));
+    list["listed_models"] = serde_json::json!([
+        {
+            "id": "example/decider",
+            "capacity_concurrency": 64,
+            "capacity_requests_per_minute": 600,
+            "discount_to_user": 0.2
+        },
+        {"id": "example/other"}
+    ]);
+    let parsed = parse(&list.to_string(), &defaults, &process(), &lookup).unwrap();
+    assert_eq!(parsed.models.len(), 1);
+    assert_eq!(
+        parsed.listed,
+        [
+            ListedModelConfig {
+                id: "example/decider".to_string(),
+                capacity_concurrency: 64,
+                capacity_requests_per_minute: 600,
+                discount_to_user: Some(0.2),
+            },
+            // Nothing declared and the list price: no process-level value.
+            ListedModelConfig {
+                id: "example/other".to_string(),
+                capacity_concurrency: 0,
+                capacity_requests_per_minute: 0,
+                discount_to_user: None,
+            },
+        ]
+    );
+    // A file without the key lists nothing besides its models.
+    assert!(listed_of(serde_json::json!([])).unwrap().is_empty());
+    let parsed = parse(
+        &one(serde_json::json!({})).to_string(),
+        &defaults,
+        &process(),
+        &lookup,
+    )
+    .unwrap();
+    assert!(parsed.listed.is_empty());
+}
+
+/// The `listed_models` example of `docs/gateway-mode.md` is one this code
+/// accepts.
+#[test]
+fn the_documented_listed_model_example_parses() {
+    let doc = include_str!("../docs/gateway-mode.md");
+    let (_, after) = doc
+        .split_once("#### Models listed but served elsewhere")
+        .expect("the section");
+    let (_, after) = after.split_once("```json\n").expect("the example");
+    let (example, _) = after.split_once("```").expect("the example's end");
+    let parsed = parse(example, &defaults(), &process(), &lookup).unwrap();
+    assert_eq!(parsed.models.len(), 1);
+    assert_eq!(parsed.listed.len(), 1);
+    assert_eq!(parsed.listed[0].id, "example/decider");
+    assert_eq!(parsed.listed[0].capacity_concurrency, 64);
+}
+
+#[test]
+fn a_listed_model_is_validated_like_an_entry_and_has_no_backend_keys() {
+    for (listed, expected) in [
+        (
+            serde_json::json!([{"id": ""}]),
+            "exact cloud-api model name",
+        ),
+        (
+            serde_json::json!([{"id": " m2"}]),
+            "exact cloud-api model name",
+        ),
+        (serde_json::json!([{}]), "missing field `id`"),
+        (
+            serde_json::json!([{"id": "m2", "discount_to_user": 1}]),
+            "VLLM_PROXY_DISCOUNT_TO_USER must be a number in [0, 1)",
+        ),
+        (
+            serde_json::json!([{"id": "m2", "discount_to_user": 0.12345}]),
+            "VLLM_PROXY_DISCOUNT_TO_USER must have at most four decimal places",
+        ),
+        (
+            serde_json::json!([{"id": "m2", "capacity_concurrency": -1}]),
+            "not a valid model list",
+        ),
+        // Nothing is served for it, so no key of a served entry is taken.
+        (
+            serde_json::json!([{"id": "m2", "backend_urls": ["https://b.example"]}]),
+            "unknown field `backend_urls`",
+        ),
+        (
+            serde_json::json!([{"id": "m2", "admission_max_inflight": 8}]),
+            "unknown field `admission_max_inflight`",
+        ),
+        (serde_json::json!({"id": "m2"}), "not a valid model list"),
+    ] {
+        let error = listed_error_of(listed.clone());
+        assert!(error.contains(expected), "{listed}: {error}");
+    }
+    // The model is named in the error, as for a served entry.
+    let error = listed_error_of(serde_json::json!([{"id": "m2", "discount_to_user": 1}]));
+    assert!(error.contains("listed model \"m2\""), "{error}");
+}
+
+#[test]
+fn an_id_is_served_or_listed_once() {
+    // The id of a served model.
+    let error = listed_error_of(serde_json::json!([{"id": "m"}]));
+    assert!(
+        error.contains("model \"m\" is listed more than once"),
+        "{error}"
+    );
+    // Twice in the listed-only models.
+    let error = listed_error_of(serde_json::json!([{"id": "m2"}, {"id": "m2"}]));
+    assert!(
+        error.contains("model \"m2\" is listed more than once"),
+        "{error}"
+    );
+    // Byte for byte, as for served models.
+    assert_eq!(
+        listed_of(serde_json::json!([{"id": "M"}])).unwrap()[0].id,
+        "M"
+    );
+    // A file has to serve something: listed-only models alone are refused.
+    let error = error_of(serde_json::json!({"models": [], "listed_models": [{"id": "m2"}]}));
+    assert!(error.contains("`models` is empty"), "{error}");
 }
 
 #[test]

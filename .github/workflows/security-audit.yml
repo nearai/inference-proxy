@@ -10,7 +10,7 @@ on:
     - cron: "0 9 * * 1"
 
 permissions:
-  issues: write
+  contents: read
 
 jobs:
   audit:
@@ -21,8 +21,10 @@ jobs:
       checks: write
       issues: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: rustsec/audit-check@v2.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -30,5 +32,7 @@ jobs:
     name: cargo deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2

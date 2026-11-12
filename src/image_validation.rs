@@ -250,7 +250,7 @@ async fn validate_one(url: &str, cfg: &ImageValidationConfig) -> Verdict {
     }
 }
 
-fn normalize_image_url_input(url: &str) -> Cow<'_, str> {
+pub(crate) fn normalize_image_url_input(url: &str) -> Cow<'_, str> {
     let trimmed = url.trim_start_matches(|c: char| c.is_ascii_whitespace() || c.is_ascii_control());
     if trimmed
         .as_bytes()
@@ -551,7 +551,7 @@ fn global_fetch_semaphore(permits: usize) -> &'static tokio::sync::Semaphore {
 /// through [`SsrfResolver`] (rejects domains pointing at non-public ranges) and
 /// disables automatic redirects so each hop can be checked against the same
 /// SSRF and media-domain policies before it is fetched.
-fn validation_client(allow_private_hosts: bool) -> &'static reqwest::Client {
+pub(crate) fn validation_client(allow_private_hosts: bool) -> &'static reqwest::Client {
     static PUBLIC_ONLY_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     static PRIVATE_ALLOWED_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     let client = if allow_private_hosts {
@@ -791,7 +791,10 @@ fn is_video_content_type(ct: &str) -> bool {
         )
 }
 
-fn remote_host_matches_allowed_domains(parsed: &reqwest::Url, allowed_domains: &[String]) -> bool {
+pub(crate) fn remote_host_matches_allowed_domains(
+    parsed: &reqwest::Url,
+    allowed_domains: &[String],
+) -> bool {
     if allowed_domains.is_empty() {
         return true;
     }
@@ -807,7 +810,7 @@ fn normalize_host_for_domain_match(host: &str) -> String {
 }
 
 /// Magic-byte detection for the common raster formats SGLang/PIL decode.
-fn is_image_magic(b: &[u8]) -> bool {
+pub(crate) fn is_image_magic(b: &[u8]) -> bool {
     if b.len() < 4 {
         return false;
     }
@@ -936,7 +939,7 @@ fn looks_textual(b: &[u8]) -> bool {
         || s.starts_with(b"[")
 }
 
-fn is_disallowed_ip(ip: IpAddr) -> bool {
+pub(crate) fn is_disallowed_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();

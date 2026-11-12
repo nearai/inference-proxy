@@ -1,5 +1,13 @@
 [advisories]
 version = 2
+ignore = [
+    # pin-utils is unmaintained (informational, not a vulnerability). It comes in only
+    # through aws-smithy-http 0.63 / aws-smithy-types 1.5 (via aws-sigv4 and
+    # aws-credential-types). Their releases without pin-utils (aws-sigv4 1.5+) need
+    # Rust 1.94.1, and the reproducible Dockerfile pins Rust 1.93.0. Drop this entry
+    # when the toolchain moves to 1.94.1 and the AWS crates are updated.
+    { id = "RUSTSEC-2026-0441", reason = "unmaintained pin-utils via aws-smithy; fix needs Rust 1.94.1 (Dockerfile pins 1.93.0)" },
+]
 
 [licenses]
 version = 2

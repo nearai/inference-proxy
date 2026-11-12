@@ -345,6 +345,24 @@ mod tests {
     }
 
     #[test]
+    fn test_ed25519_sign_preserves_libsodium_wire_format() {
+        // Independently generated with libsodium 1.0.18 crypto_sign_detached:
+        // seed = [7; 32], message = "dependency wire compatibility".
+        let ctx = Ed25519Context::from_key_bytes(&[7; 32]).unwrap();
+        assert_eq!(
+            ctx.signing_public_key,
+            "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c"
+        );
+        assert_eq!(
+            ctx.sign("dependency wire compatibility").unwrap(),
+            concat!(
+                "09ff02e85af4bf66c096ee5047ddf3d762e8b60dc2a17187a6ccd8bc286a907d",
+                "6cc88c53d989173da69c919c7e616317a25f4b66ccbb14a804c091c725547e0b",
+            ),
+        );
+    }
+
+    #[test]
     fn test_ed25519_sign_and_verify() {
         let ctx = Ed25519Context::from_key_bytes(&TEST_ED25519_KEY).unwrap();
         let message = "hello world";

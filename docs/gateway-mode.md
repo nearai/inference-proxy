@@ -906,6 +906,37 @@ trailing dot), effective port and normalised path. `https://HOST.example`,
 under two models as well as in both tiers of one. Two names that resolve to
 the same host are still two backends as far as this check can tell.
 
+#### Models listed but served elsewhere
+
+`listed_models`, next to `models`, names models this gateway publishes in
+[`/v1/models`](#v1models) and serves nothing for: no backends, pool, probes,
+admission or client. It is for a model whose route is answered by something
+else on the same host, for example a path the host's front end sends straight
+to cloud-api, when the aggregator reads its whole catalog from this one
+document. A request naming one here is a `404 model_not_found`, as for any id
+the process does not serve.
+
+```json
+{
+  "models": [{"id": "example/alpha", "backend_urls": ["https://alpha-b1.inference.example"]}],
+  "listed_models": [
+    {"id": "example/decider", "capacity_concurrency": 64, "capacity_requests_per_minute": 600}
+  ]
+}
+```
+
+| Key | When omitted | Meaning |
+| --- | --- | --- |
+| `id` | required | The exact cloud-api model name, under the same rule as a served `id`. |
+| `capacity_concurrency` | not declared | Concurrency declared on the model's `/v1/models` entry. |
+| `capacity_requests_per_minute` | not declared | Requests per minute declared on it. |
+| `discount_to_user` | list price | Published on its entry, under the rules of `VLLM_PROXY_DISCOUNT_TO_USER`. |
+
+No key falls back to a process-level variable: those describe the models the
+process serves. Any other key is refused, an id may appear once across
+`models` and `listed_models`, and `models` still has to list at least one
+model.
+
 ### Reasoning efforts a model does not accept
 
 Which efforts a model takes is decided by its chat template, and some engines
@@ -1085,7 +1116,9 @@ of an undeclared route.
 One read of the models document per request. The entries of the configured
 models are kept, in the document's order, each completed with its own model's
 `capacity` (its `admission_max_inflight` and `capacity_requests_per_minute`)
-and `discount_to_user`. A configured model the document does not list is left
+and `discount_to_user`. A listed-only model (`listed_models`) is kept the same
+way, with the capacity and discount its entry declares. A configured model the
+document does not list is left
 out, so the catalog stays the switch for what is advertised. Every read it is
 missing from is counted in `models_document_missing_models_total{model}`; the
 log has one line when it drops out ("Configured model is not in the models

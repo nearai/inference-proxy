@@ -6,6 +6,8 @@ use axum::http::StatusCode;
 use serde_json::{json, Value};
 use std::time::Duration;
 
+mod metrics;
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdmissionMode {
@@ -94,7 +96,9 @@ pub(crate) async fn admit_features(
     if reporter.admission_mode == AdmissionMode::Off {
         return Ok(());
     }
+    let started = std::time::Instant::now();
     let result = request_admission(reporter, features, execution_model).await;
+    metrics::rpc_result(reporter.admission_mode, &result, started.elapsed());
     if result.is_err() {
         reporter.budget_report_id = None;
     }
@@ -102,7 +106,7 @@ pub(crate) async fn admit_features(
         tracing::warn!("Admission audit unavailable; continuing with normal usage reporting");
         Ok(())
     } else {
-        result
+        result.map(|_| ())
     }
 }
 
@@ -118,7 +122,7 @@ async fn request_admission(
     reporter: &mut UsageReporter,
     features: &crate::monetary_features::UsageFeatures,
     execution_model: Option<&str>,
-) -> Result<(), AppError> {
+) -> Result<AdmissionMode, AppError> {
     let unavailable = || AppError::UpstreamParsed {
         status: StatusCode::SERVICE_UNAVAILABLE,
         message: "Monetary admission unavailable".into(),
@@ -185,7 +189,7 @@ async fn request_admission(
     }
     reporter.model_name = admitted.model;
     cleanup.disarm();
-    Ok(())
+    Ok(admitted.mode)
 }
 
 struct AttemptCleanup {

@@ -323,6 +323,7 @@ fn message_is_allowed_media_domain_error(message: &str) -> bool {
 #[derive(Clone)]
 pub struct UsageReporter {
     pub budget_report_id: Option<String>,
+    pub admission_observation: Option<crate::monetary_budget::observation::Observation>,
     pub admission_mode: crate::monetary_budget::AdmissionMode,
     pub admission_timeout_ms: u64,
     pub http_client: reqwest::Client,
@@ -618,6 +619,7 @@ fn usage_reporter(
     let cloud_api_url = state.config.cloud_api_url.clone();
     Some(UsageReporter {
         budget_report_id: None,
+        admission_observation: None,
         admission_mode: state.config.monetary_admission_mode,
         admission_timeout_ms: state.config.monetary_admission_timeout_ms,
         http_client: state.http_client.clone(),
@@ -983,6 +985,10 @@ pub(crate) fn spawn_usage_report(reporter: &UsageReporter, mut body: serde_json:
              can't be injected, refusing to send unattributable report"
         );
         return;
+    }
+
+    if let Some(observation) = reporter.admission_observation {
+        observation.usage(reporter, &body);
     }
 
     // Serialized once: a retry sends exactly the bytes of the first attempt.
@@ -4129,6 +4135,7 @@ mod tests {
     ) -> UsageReporter {
         UsageReporter {
             budget_report_id: None,
+            admission_observation: None,
             admission_mode: crate::monetary_budget::AdmissionMode::Enforce,
             admission_timeout_ms: 2000,
             http_client: reqwest::Client::new(),
@@ -4373,6 +4380,10 @@ mod tests {
                 .mount(&ledger)
                 .await;
             let mut reporter = reporter_with(Some("token"), Some("org"), Some("ws"), Some("key"));
+            reporter.admission_observation = crate::monetary_budget::observation::Observation::new(
+                uuid::Uuid::from_u128(100),
+                Some(10),
+            );
             assert_eq!(reporter.admission_mode, AdmissionMode::default());
             reporter.cloud_api_url = Some(ledger.uri());
             crate::monetary_budget::admit(
@@ -4388,6 +4399,8 @@ mod tests {
                 mode == AdmissionMode::Enforce
             );
             assert_eq!(reporter.model_name, "canonical");
+            // Older responses omit the estimate: they remain valid and clear a previous sample.
+            assert!(reporter.admission_observation.is_none());
         }
     }
 
@@ -4467,7 +4480,7 @@ mod tests {
                 let metadata: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
                 assert!(metadata.get("messages").is_none());
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "id":metadata["id"], "model":"test-model"
+                    "id":metadata["id"], "model":"test-model", "estimated_amount":1234
                 }))
             })
             .expect(2)
@@ -4482,6 +4495,11 @@ mod tests {
         assert!(body.get("max_tokens").is_none());
         assert_eq!(body["max_completion_tokens"], 16);
         let original_id = reporter.budget_report_id.clone().unwrap();
+        let sampled = uuid::Uuid::parse_str(&original_id)
+            .unwrap()
+            .as_u128()
+            .is_multiple_of(100);
+        assert_eq!(reporter.admission_observation.is_some(), sampled);
         let response = serde_json::json!({"usage":{"prompt_tokens":2,"completion_tokens":3}});
         let mut first = build_usage_body(
             &UsageType::ChatCompletion,
@@ -4496,6 +4514,8 @@ mod tests {
         assert_eq!(first, retry);
         assert_eq!(first["id"], "provider-id");
         assert_eq!(first["admission_id"], original_id);
+        assert!(first.get("observation_id").is_none());
+        assert!(first.get("estimated_amount").is_none());
         crate::monetary_budget::admit(&mut reporter, &UsageType::ChatCompletion, &body, 1)
             .await
             .unwrap();

@@ -11,14 +11,25 @@ use crate::AppState;
 
 /// Create a Prometheus recorder and return its handle for rendering metrics.
 pub fn setup_metrics_recorder() -> PrometheusHandle {
-    PrometheusBuilder::new()
-        .install_recorder()
-        .unwrap_or_else(|err| {
-            panic!(
-                "failed to install Prometheus recorder. \
+    recorder_builder().install_recorder().unwrap_or_else(|err| {
+        panic!(
+            "failed to install Prometheus recorder. \
              This may occur if a recorder is already installed: {err}"
-            )
-        })
+        )
+    })
+}
+
+pub(crate) fn recorder_builder() -> PrometheusBuilder {
+    PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(
+                "inference_proxy_admission_duration_seconds".into(),
+            ),
+            &[
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0,
+            ],
+        )
+        .expect("admission histogram has nonempty buckets")
 }
 
 /// Axum middleware that tracks HTTP request metrics.

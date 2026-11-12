@@ -6,6 +6,8 @@ use axum::http::StatusCode;
 use serde_json::{json, Value};
 use std::time::Duration;
 
+pub mod observation;
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdmissionMode {
@@ -91,10 +93,13 @@ pub(crate) async fn admit_features(
 ) -> Result<(), AppError> {
     // Never carry an earlier attempt's ID into a new attempt or an audit-only receipt.
     reporter.budget_report_id = None;
+    reporter.admission_observation = None;
     if reporter.admission_mode == AdmissionMode::Off {
         return Ok(());
     }
+    let started = std::time::Instant::now();
     let result = request_admission(reporter, features, execution_model).await;
+    observation::rpc_result(reporter.admission_mode, &result, started.elapsed());
     if result.is_err() {
         reporter.budget_report_id = None;
     }
@@ -102,13 +107,14 @@ pub(crate) async fn admit_features(
         tracing::warn!("Admission audit unavailable; continuing with normal usage reporting");
         Ok(())
     } else {
-        result
+        result.map(|_| ())
     }
 }
 
 #[derive(serde::Deserialize)]
 struct AdmissionResponse {
     id: Option<String>,
+    estimated_amount: Option<i64>,
     model: String,
     #[serde(default)]
     mode: AdmissionMode,
@@ -118,7 +124,7 @@ async fn request_admission(
     reporter: &mut UsageReporter,
     features: &crate::monetary_features::UsageFeatures,
     execution_model: Option<&str>,
-) -> Result<(), AppError> {
+) -> Result<AdmissionMode, AppError> {
     let unavailable = || AppError::UpstreamParsed {
         status: StatusCode::SERVICE_UNAVAILABLE,
         message: "Monetary admission unavailable".into(),
@@ -184,8 +190,9 @@ async fn request_admission(
         return Err(unavailable());
     }
     reporter.model_name = admitted.model;
+    reporter.admission_observation = observation::Observation::new(id, admitted.estimated_amount);
     cleanup.disarm();
-    Ok(())
+    Ok(admitted.mode)
 }
 
 struct AttemptCleanup {
@@ -244,6 +251,9 @@ pub(crate) async fn unknown_outcome(reporter: &UsageReporter) {
 }
 
 async fn finish_attempt(reporter: &UsageReporter, unknown: bool) {
+    if let Some(observation) = reporter.admission_observation {
+        observation.end(if unknown { "unknown" } else { "not_executed" });
+    }
     let (Some(base), Some(token), Some(org), Some(id)) = (
         reporter.cloud_api_url.as_deref(),
         reporter.cloud_api_usage_token.as_deref(),

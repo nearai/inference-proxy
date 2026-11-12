@@ -189,6 +189,7 @@ impl Billing {
     fn report(&self, delivery: &Arc<UsageReportDelivery>, id: &str, model: ModelLabel) {
         let reporter = UsageReporter {
             budget_report_id: None,
+            admission_observation: None,
             admission_mode: crate::monetary_budget::AdmissionMode::Enforce,
             admission_timeout_ms: 2000,
             http_client: self.client.clone(),
@@ -1443,6 +1444,7 @@ async fn http_attempt(billing: &Billing, timeout: Duration) -> (SendOutcome, Att
 fn http_job(billing: &Billing) -> Job {
     let reporter = UsageReporter {
         budget_report_id: None,
+        admission_observation: None,
         admission_mode: crate::monetary_budget::AdmissionMode::Enforce,
         admission_timeout_ms: 2000,
         http_client: billing.client.clone(),

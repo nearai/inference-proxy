@@ -103,6 +103,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         backend_token: None,
         backend_priority: None,
         backend_health_path: "/health".to_string(),
+        systemone_upstream_model: None,
         non_tee_deployment: false,
         map_queue_full_to_429: false,
         priority_lower_first: false,

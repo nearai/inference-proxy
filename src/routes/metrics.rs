@@ -62,6 +62,9 @@ pub async fn models(
             }
         }
     }
+    if state.config.systemone_upstream_model.is_some() {
+        return super::systemone::models(&state).await;
+    }
     let (url, _guard) = state.backend_pool.select_url("/v1/models");
     let engine_list = proxy::proxy_simple(
         &state.http_client,

@@ -112,6 +112,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
         backend_token: None,
         backend_priority: None,
         backend_health_path: "/health".to_string(),
+        systemone_upstream_model: None,
         non_tee_deployment: false,
         map_queue_full_to_429: false,
         priority_lower_first: false,

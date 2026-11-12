@@ -4346,6 +4346,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_proxy_follows_the_organization_admission_decision() {
+        use crate::monetary_budget::AdmissionMode;
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+        let ledger = MockServer::start().await;
+        for mode in [
+            AdmissionMode::Audit,
+            AdmissionMode::Enforce,
+            AdmissionMode::Off,
+        ] {
+            ledger.reset().await;
+            Mock::given(path("/v1/internal/budget"))
+                .respond_with(move |request: &Request| {
+                    let request: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    assert_eq!(request["mode"], "enforce");
+                    let id = if mode == AdmissionMode::Enforce {
+                        request["id"].clone()
+                    } else {
+                        serde_json::Value::Null
+                    };
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"id":id,"mode":mode,"model":"canonical"}))
+                })
+                .expect(1)
+                .mount(&ledger)
+                .await;
+            let mut reporter = reporter_with(Some("token"), Some("org"), Some("ws"), Some("key"));
+            assert_eq!(reporter.admission_mode, AdmissionMode::default());
+            reporter.cloud_api_url = Some(ledger.uri());
+            crate::monetary_budget::admit(
+                &mut reporter,
+                &UsageType::ChatCompletion,
+                &serde_json::json!({}),
+                1,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                reporter.budget_report_id.is_some(),
+                mode == AdmissionMode::Enforce
+            );
+            assert_eq!(reporter.model_name, "canonical");
+        }
+    }
+
+    #[tokio::test]
     async fn monetary_timeout_and_cancellation_release_the_generated_id_without_dispatch() {
         use wiremock::matchers::path;
         use wiremock::{Mock, MockServer, Request, ResponseTemplate};

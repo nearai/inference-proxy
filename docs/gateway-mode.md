@@ -580,71 +580,33 @@ queueing" refusal. The consequences are deliberate:
 
 ## Monetary admission and final receipts
 
-Direct Cloud API keys (`sk-`) call `POST {CLOUD_API_URL}/v1/internal/budget` before
-chat/completions, image generation/edit and audio transcription. A cached key check
-is identity validation only. The request carries authenticated IDs and locally
-measured counts, never prompts, outputs or media. Cloud API calculates the estimate
-and owns the shared organization/key hold. Trusted configuration-token requests
-already admitted by Cloud API do not reserve again. Inference parameters, output
-limits and existing multimedia support remain unchanged.
+Direct requests obtain an admission decision before chat/completions, image generation/edit,
+and audio transcription. Requests already admitted by the API are not admitted twice.
+Inference parameters, output limits, media support, and response formats are preserved.
 
-The estimated amount is immutable. Final usage carries its separate `admission_id`
-and the original provider ID. Cloud API or the queue worker charges full actual
-usage and clears the hold atomically; actual usage may exceed the estimate. An
-interrupted stream keeps the existing usage reporting behavior: known counters
-can settle even without `[DONE]` or successful delivery to the client. If no
-billable usage is reported, an unknown-outcome notice removes the execution slot
-and shortens the funding hold to Cloud API's configured grace period (five minutes
-by default). Late receipts still charge once.
-Audio prefers the provider's `usage.seconds` for duration-based usage, then the
-verbose response's `duration`, then local frame/sample timing from the uploaded
-file. It neither changes the response format nor decodes/transcodes media.
-Missing actual usage is logged; the byte-based
-admission estimate is never billed as actual duration.
-The locally measured duration is also sent as optional numeric admission metadata,
-so Cloud API can use it alongside the existing byte-based floor for the quote.
-
-Final usage uses the existing HTTP/SQS delivery policy: configured retries,
-backoff, queue bounds and shutdown drain apply equally to admitted reports.
-Retries carry the same admission ID so repeated delivery settles once. No local
-receipt storage or restart replay is added. If usage is lost before successful
-handoff, the final delivery outcome triggers the same best-effort unknown notice;
-the estimate is never charged as actual usage. Successfully queued SQS reports retain the queue worker's existing recovery.
-
-Embedding, rerank, privacy and score keep their existing report delivery. Admission
-requires the matching Cloud API endpoint and ledger schema, and SQS consumers must
-accept the additive `admission_id` and `audio_transcription` event before producers
-send them.
-
-`MONETARY_ADMISSION=enforce|audit|off` controls direct monetary admission and defaults
-to `enforce`. Enforce requires Cloud API and its ledger before every dispatch;
-cached key validation does not authorize spending. Audit estimates remotely and logs
-without reserving or rejecting on admission errors. Off skips the new admission call.
-Both audit and off preserve ordinary authentication and actual usage reporting, and
-intentionally disable the additional concurrent-spending protection. They do not release
-existing holds. Cloud API's operator policy may also return an explicit audit/off decision
-for an organization. A public request field cannot select any of these modes.
+The API selects the organization policy. Its default policy is audit, which estimates
+without creating a hold. Explicitly enabled organizations can enforce reservations.
+`MONETARY_ADMISSION=enforce|audit|off` controls the proxy's participation and defaults to
+`enforce`: it follows the API's decision, including an explicit audit or off result.
+It does not force organizations to enforce. Setting the proxy to `audit` forces
+non-blocking audit behavior; `off` skips admission. Both retain actual usage reporting.
+An enforcing proxy fails closed when no valid decision is available.
 
 `MONETARY_ADMISSION_TIMEOUT_MS` defaults to 2000 and accepts 100–10000 milliseconds.
-Invalid mode/timeout settings fail startup. With direct keys enabled (`CLOUD_API_URL`),
-enforce and audit also require `CLOUD_API_USAGE_TOKEN`, including SQS deployments.
-Off can use SQS without the admission token; HTTP usage delivery and internal catalog
-access retain their own token requirements. Capacity refusals return 429 with
-`Retry-After`; invalid admission metadata returns 400. Enforce fails closed on
-unavailable admission; switch mode deliberately for rollout or incident response.
+Invalid mode or timeout settings fail startup. Capacity refusals return 429 with
+`Retry-After`; invalid admission metadata returns 400.
 
-Connection and request-construction failures confirmed to precede dispatch release
-their hold through `/v1/internal/budget/release`. HTTP failures, post-connect timeouts,
-cancellation during dispatch and missing or undeliverable usage notify
-`/v1/internal/budget/unknown`, retaining money temporarily without occupying a running slot.
-Admission timeout/cancellation attempts release using the generated ID before inference
-starts. A cleanup racing an uncommitted admission may miss the row; process crashes or
-failed notices still rely on the original TTL (two hours by default). Repeated unknown
-notices never extend the grace period. These calls are bounded and best effort, with no
-new receipt storage. Request features are counted once and reused for connect failover;
-only sanitized service-tier metadata and numeric counts cross the admission boundary.
-Local audio metering admits at most four parsers with a one-second parsing budget.
-If local metering cannot finish, the existing provider-usage fallback still applies.
+Final usage carries its admission identifier separately from the provider identifier.
+Actual usage remains authoritative and can exceed the estimate. Duplicate delivery
+settles once. Confirmed undispatched attempts release their holds; uncertain outcomes
+free execution slots while retaining funding for a bounded grace period. Failed cleanup
+retains the original expiry fallback. No receipt persistence is added.
+
+Request features are reused across connection retries. Audio duration prefers reported
+usage, then the response duration, then bounded local frame/sample timing. The byte-based
+estimate is never billed as actual duration. Existing usage delivery and media handling
+remain unchanged. Embedding, rerank, privacy, and score retain their existing admission
+behavior.
 
 ## Usage report delivery
 

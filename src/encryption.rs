@@ -253,7 +253,7 @@ mod nacl {
 
 mod nacl_v2 {
     use chacha20poly1305::{
-        aead::{Aead, AeadCore, KeyInit, OsRng, Payload},
+        aead::{Aead, Generate, KeyInit, Payload},
         XChaCha20Poly1305,
     };
     use hkdf::Hkdf;
@@ -272,7 +272,8 @@ mod nacl_v2 {
         aad: &[u8],
     ) -> Result<Vec<u8>, String> {
         let recipient = PublicKey::from(*recipient_pub);
-        let ephemeral_secret = EphemeralSecret::random_from_rng(OsRng);
+        let mut rng = rand::rand_core::UnwrapErr(rand::rngs::SysRng);
+        let ephemeral_secret = EphemeralSecret::random_from_rng(&mut rng);
         let ephemeral_public = PublicKey::from(&ephemeral_secret);
 
         let shared_secret = ephemeral_secret.diffie_hellman(&recipient);
@@ -284,7 +285,7 @@ mod nacl_v2 {
 
         let cipher = XChaCha20Poly1305::new_from_slice(&symmetric_key)
             .map_err(|e| format!("XChaCha20Poly1305 key init failed: {e}"))?;
-        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let nonce = chacha20poly1305::XNonce::generate();
         let ciphertext = cipher
             .encrypt(
                 &nonce,
@@ -319,8 +320,9 @@ mod nacl_v2 {
         }
 
         let ephemeral_pub = PublicKey::from(<[u8; 32]>::try_from(&data[..32]).unwrap());
-        #[allow(deprecated)] // generic-array 0.x from_slice deprecation; fixed when deps upgrade
-        let nonce = chacha20poly1305::XNonce::from_slice(&data[32..56]);
+        let nonce: &chacha20poly1305::XNonce = data[32..56]
+            .try_into()
+            .expect("nonce slice is exactly 24 bytes");
         let ciphertext = &data[56..];
 
         let secret = StaticSecret::from(*secret_key_bytes);
@@ -1578,6 +1580,41 @@ mod tests {
     }
 
     // ── NaCl v2 (HKDF + XChaCha20-Poly1305) tests ────────────────────
+
+    #[test]
+    fn test_nacl_v2_decrypts_libsodium_vectors() {
+        // Independent libsodium 1.0.18 X25519 + XChaCha20-Poly1305 vectors.
+        // Recipient secret = [7; 32], ephemeral secret = [9; 32], nonce = [11; 24].
+        // HKDF-SHA256 uses no salt and info "ed25519_encryption" (as on the wire).
+        let vectors = [
+            (
+                b"".as_slice(),
+                concat!(
+                    "57db4b359f23ae5e146e4e2512056704722506348c150c14753d0c933d04d421",
+                    "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b7f240af16084a632",
+                    "afdad6c8f69e56a47fc9be42688dcd5b9b18b5552baae308cb373b3ca7b6e8f6",
+                    "c17dad2dac",
+                ),
+            ),
+            (
+                b"compatibility-aad".as_slice(),
+                concat!(
+                    "57db4b359f23ae5e146e4e2512056704722506348c150c14753d0c933d04d421",
+                    "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b7f240af16084a632",
+                    "afdad6c8f69e56a47fc9be42688dcd5b9b18b5552b6d90280676c23f131316a2",
+                    "751a3ba693",
+                ),
+            ),
+        ];
+        for (aad, wire) in vectors {
+            let wire = hex::decode(wire).unwrap();
+            assert_eq!(
+                nacl_v2::decrypt_with_aad(&wire, &[7; 32], aad).unwrap(),
+                b"dependency wire compatibility",
+            );
+            assert!(nacl_v2::decrypt_with_aad(&wire, &[7; 32], b"wrong-aad").is_err());
+        }
+    }
 
     #[test]
     fn test_nacl_v2_round_trip() {

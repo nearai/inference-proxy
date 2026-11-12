@@ -196,6 +196,12 @@ async fn serve(
         .backend_affinity
         .key_for_chat_request(&request_json, model.id);
 
+    // Air-gapped engines: download remote images/audio here and forward
+    // `data:` URLs, so the engine never needs the network (fail closed, off
+    // unless VLLM_PROXY_INLINE_MEDIA=1). Before validation, which then only
+    // sees local `data:` URLs.
+    crate::media_inline::inline_remote_media(&mut request_json, &state.config.media_inline())
+        .await?;
     crate::image_validation::reject_invalid_images(&request_json, &state.config.image_validation())
         .await?;
 

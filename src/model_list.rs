@@ -174,6 +174,35 @@ impl std::fmt::Debug for ModelConfig {
 pub struct ModelListConfig {
     pub path: String,
     pub models: Vec<ModelConfig>,
+    /// The models published in `/v1/models` that this process does not serve
+    /// (`listed_models`).
+    pub listed: Vec<ListedModelConfig>,
+}
+
+/// A model this gateway lists in `/v1/models` and serves nothing for: no
+/// backends, pool, probes, admission or client. Something else on the same
+/// host answers for it, for example a route the host's front end sends to
+/// cloud-api, so the aggregator reading this one document still learns about
+/// it. A request naming it here is a `model_not_found`, as for any id the
+/// process does not serve. Every key has the image default, never a
+/// process-level variable: those describe the models this process serves.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ListedModelConfig {
+    /// The exact cloud-api model name, as for a served model.
+    pub id: String,
+    /// Declared concurrency on its `/v1/models` entry; `0` = none declared.
+    pub capacity_concurrency: u32,
+    /// Declared requests per minute; `0` = none declared.
+    pub capacity_requests_per_minute: u64,
+    pub discount_to_user: Option<f64>,
+}
+
+/// What `load` and `parse` read from a file: the served models and the
+/// listed-only ones.
+#[derive(Debug)]
+pub(crate) struct ParsedList {
+    pub models: Vec<ModelConfig>,
+    pub listed: Vec<ListedModelConfig>,
 }
 
 /// The process-level values of the per-model variables: what a list entry
@@ -219,6 +248,18 @@ pub struct ProcessSettings {
 #[serde(deny_unknown_fields)]
 struct ModelListFile {
     models: Vec<ModelEntry>,
+    #[serde(default)]
+    listed_models: Vec<ListedEntry>,
+}
+
+/// One `listed_models` entry as the file writes it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListedEntry {
+    id: String,
+    capacity_concurrency: Option<u32>,
+    capacity_requests_per_minute: Option<u64>,
+    discount_to_user: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -341,7 +382,7 @@ pub(crate) fn load(
     defaults: &ModelDefaults,
     process: &ProcessSettings,
     lookup: &dyn Fn(&str) -> Option<String>,
-) -> anyhow::Result<Vec<ModelConfig>> {
+) -> anyhow::Result<ParsedList> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("{MODEL_LIST_FILE_ENV}: cannot read {path}: {e}"))?;
     parse(&text, defaults, process, lookup)
@@ -354,7 +395,7 @@ pub(crate) fn parse(
     defaults: &ModelDefaults,
     process: &ProcessSettings,
     lookup: &dyn Fn(&str) -> Option<String>,
-) -> anyhow::Result<Vec<ModelConfig>> {
+) -> anyhow::Result<ParsedList> {
     let file: ModelListFile =
         serde_json::from_str(text).map_err(|e| anyhow::anyhow!("not a valid model list: {e}"))?;
     if file.models.is_empty() {
@@ -368,8 +409,43 @@ pub(crate) fn parse(
             .map_err(|e| anyhow::anyhow!("model {id:?}: {e}"))?;
         models.push(model);
     }
-    check_across_models(&models)?;
-    Ok(models)
+    let mut listed = Vec::with_capacity(file.listed_models.len());
+    for entry in file.listed_models {
+        let id = entry.id.clone();
+        let model =
+            resolve_listed(entry).map_err(|e| anyhow::anyhow!("listed model {id:?}: {e}"))?;
+        listed.push(model);
+    }
+    check_across_models(&models, &listed)?;
+    Ok(ParsedList { models, listed })
+}
+
+/// The id rule of every entry, served or listed: it is compared byte for byte
+/// with the request's `model` and with the models document's ids, and sent to
+/// cloud-api as the billing key, so it has to be written exactly.
+fn check_id(id: &str) -> anyhow::Result<()> {
+    if id.is_empty() || id.trim() != id || id.chars().any(char::is_control) {
+        anyhow::bail!(
+            "`id` must be the exact cloud-api model name: not empty, no surrounding whitespace"
+        );
+    }
+    Ok(())
+}
+
+/// A `listed_models` entry as the process keeps it. Nothing falls back to a
+/// process-level variable: an omitted capacity is not declared and an omitted
+/// discount is the list price.
+fn resolve_listed(entry: ListedEntry) -> anyhow::Result<ListedModelConfig> {
+    check_id(&entry.id)?;
+    Ok(ListedModelConfig {
+        id: entry.id,
+        capacity_concurrency: entry.capacity_concurrency.unwrap_or(0),
+        capacity_requests_per_minute: entry.capacity_requests_per_minute.unwrap_or(0),
+        discount_to_user: match entry.discount_to_user {
+            Some(discount) => validate_discount_to_user(discount, &discount.to_string())?,
+            None => None,
+        },
+    })
 }
 
 /// Fill in what the entry leaves out from the process-level defaults.
@@ -378,14 +454,7 @@ fn resolve(
     defaults: &ModelDefaults,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> anyhow::Result<ModelConfig> {
-    // The id is compared byte for byte with the request's `model` and sent to
-    // cloud-api as the billing key, so it has to be written exactly.
-    if entry.id.is_empty() || entry.id.trim() != entry.id || entry.id.chars().any(char::is_control)
-    {
-        anyhow::bail!(
-            "`id` must be the exact cloud-api model name: not empty, no surrounding whitespace"
-        );
-    }
+    check_id(&entry.id)?;
     let backend_urls = urls("backend_urls", entry.backend_urls)?;
     if backend_urls.is_empty() {
         anyhow::bail!("`backend_urls` is empty: a model needs at least one backend");
@@ -593,17 +662,22 @@ fn validate(model: &ModelConfig, process: &ProcessSettings) -> anyhow::Result<()
     Ok(())
 }
 
-/// What only shows across entries: an id listed twice, and a backend or an
-/// engine probe listed under two models. A backend serves one model; a
-/// request for another one sent there would be answered, and billed, as the
-/// wrong model, and a shared probe would count one engine's load twice.
-/// Backends and probes are compared by `endpoint`, not as strings: two
-/// spellings of one host are still one backend.
-fn check_across_models(models: &[ModelConfig]) -> anyhow::Result<()> {
+/// What only shows across entries: an id listed twice, served or listed
+/// only, and a backend or an engine probe listed under two models. One id is
+/// one `/v1/models` entry with one capacity and one discount. A backend
+/// serves one model; a request for another one sent there would be answered,
+/// and billed, as the wrong model, and a shared probe would count one
+/// engine's load twice. Backends and probes are compared by `endpoint`, not
+/// as strings: two spellings of one host are still one backend.
+fn check_across_models(models: &[ModelConfig], listed: &[ListedModelConfig]) -> anyhow::Result<()> {
     let mut ids = std::collections::HashSet::new();
-    for model in models {
-        if !ids.insert(model.id.as_str()) {
-            anyhow::bail!("model {:?} is listed more than once", model.id);
+    let all_ids = models
+        .iter()
+        .map(|model| &model.id)
+        .chain(listed.iter().map(|model| &model.id));
+    for id in all_ids {
+        if !ids.insert(id.as_str()) {
+            anyhow::bail!("model {id:?} is listed more than once");
         }
     }
     let (mut backends, mut probes) = (HashMap::new(), HashMap::new());
@@ -754,10 +828,31 @@ impl<'a> ModelView<'a> {
     }
 }
 
-/// The served models (`AppState::models`).
+/// A listed-only model at runtime (`ListedModelConfig`): what `/v1/models`
+/// publishes for it, and whether the last read of the models document had it.
+pub struct ListedModel {
+    pub config: ListedModelConfig,
+    unlisted: AtomicBool,
+}
+
+impl ListedModel {
+    pub fn id(&self) -> &str {
+        &self.config.id
+    }
+
+    /// As `ServedModel::note_listed`.
+    pub(crate) fn note_listed(&self, listed: bool) -> bool {
+        self.unlisted.swap(!listed, Ordering::Relaxed) == listed
+    }
+}
+
+/// The served models (`AppState::models`), and the listed-only ones that
+/// `/v1/models` publishes next to them.
 pub struct ModelList {
     models: Vec<ServedModel>,
     by_id: HashMap<String, usize>,
+    listed: Vec<ListedModel>,
+    listed_by_id: HashMap<String, usize>,
 }
 
 impl ModelList {
@@ -868,7 +963,34 @@ impl ModelList {
             .enumerate()
             .map(|(index, model)| (model.config.id.clone(), index))
             .collect();
-        Ok(Self { models, by_id })
+        let listed: Vec<ListedModel> = list
+            .listed
+            .iter()
+            .map(|model| {
+                info!(
+                    model = %model.id,
+                    capacity_concurrency = model.capacity_concurrency,
+                    capacity_requests_per_minute = model.capacity_requests_per_minute,
+                    discount_to_user = model.discount_to_user,
+                    "Listing model (served elsewhere)"
+                );
+                ListedModel {
+                    config: model.clone(),
+                    unlisted: AtomicBool::new(false),
+                }
+            })
+            .collect();
+        let listed_by_id = listed
+            .iter()
+            .enumerate()
+            .map(|(index, model)| (model.config.id.clone(), index))
+            .collect();
+        Ok(Self {
+            models,
+            by_id,
+            listed,
+            listed_by_id,
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -887,6 +1009,16 @@ impl ModelList {
 
     pub fn get(&self, id: &str) -> Option<&ServedModel> {
         self.by_id.get(id).map(|index| &self.models[*index])
+    }
+
+    /// The listed-only models in the order the file lists them. Never part
+    /// of `iter`, `get` or `select`: nothing is served for them.
+    pub fn listed(&self) -> impl Iterator<Item = &ListedModel> {
+        self.listed.iter()
+    }
+
+    pub fn get_listed(&self, id: &str) -> Option<&ListedModel> {
+        self.listed_by_id.get(id).map(|index| &self.listed[*index])
     }
 
     /// The model the request body names: an exact match of its `model`
@@ -948,6 +1080,7 @@ pub fn app_state(process: Process<'_>) -> anyhow::Result<AppState> {
     // "Serving model" line.
     info!(
         models = models.len(),
+        listed_models = models.listed.len(),
         admission_ramp_step = config.admission_ramp_step,
         admission_ramp_interval_secs = config.admission_ramp_interval_secs,
         admission_ttft_p95_max_ms = config.admission_ttft_p95_max_ms,

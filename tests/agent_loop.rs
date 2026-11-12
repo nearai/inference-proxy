@@ -68,6 +68,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
         image_validation_allowed_domains: Vec::new(),
         image_validation_reject_non_rgb_images: false,
         image_validation_reject_single_channel_images: false,
+        media_inline: Default::default(),
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
         dev_mode: true,

@@ -128,6 +128,7 @@ async fn main() -> anyhow::Result<()> {
     match &config.model_list {
         Some(list) => info!(
             models = ?list.models.iter().map(|model| model.id.as_str()).collect::<Vec<_>>(),
+            listed_models = ?list.listed.iter().map(|model| model.id.as_str()).collect::<Vec<_>>(),
             model_list_file = %list.path,
             listen_port,
             dev_mode = config.dev_mode,

@@ -18,6 +18,7 @@ struct TestAppOptions {
     rate_burst: u32,
     dstack_socket_path: String,
     image_validation: bool,
+    media_inline: bool,
     fusion_enabled: bool,
     fusion_endpoints_url: Option<String>,
     web_context_search_url: Option<String>,
@@ -52,6 +53,7 @@ impl Default for TestAppOptions {
             rate_burst: 200,
             dstack_socket_path: "/var/run/dstack.sock".to_string(),
             image_validation: false,
+            media_inline: false,
             fusion_enabled: false,
             fusion_endpoints_url: None,
             web_context_search_url: None,
@@ -238,6 +240,10 @@ fn build_test_app_inner_with_pool(
         image_validation_allowed_domains: Vec::new(),
         image_validation_reject_non_rgb_images: false,
         image_validation_reject_single_channel_images: false,
+        media_inline: vllm_proxy_rs::media_inline::MediaInlineConfig {
+            enabled: options.media_inline,
+            ..Default::default()
+        },
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
         dev_mode: true,
@@ -1342,6 +1348,136 @@ async fn test_chat_completions_image_validation_rejects_bad_image() {
         .as_str()
         .unwrap()
         .contains("/etc/passwd"));
+}
+
+#[tokio::test]
+async fn test_chat_completions_media_inline_forwards_data_urls_only() {
+    // With VLLM_PROXY_INLINE_MEDIA on, remote image/audio URLs are fetched by
+    // the proxy and the backend receives `data:` URLs only (air-gapped engine).
+    let mock_server = MockServer::start().await;
+    let png: Vec<u8> = vec![
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0x0D, b'I', b'H', b'D', b'R', 0,
+        0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0,
+    ];
+    let mut wav = b"RIFF\x24\x00\x00\x00WAVEfmt ".to_vec();
+    wav.extend_from_slice(&[0u8; 32]);
+    Mock::given(method("GET"))
+        .and(path("/media/a.png"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(png))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/media/a.wav"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(wav))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "x", "object": "chat.completion", "model": "test-model",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app_inner(
+        &mock_server.uri(),
+        TestAppOptions {
+            image_validation: true,
+            media_inline: true,
+            ..Default::default()
+        },
+    );
+    let base = mock_server.uri();
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {"url": format!("{base}/media/a.png")}},
+            {"type": "audio_url", "audio_url": {"url": format!("{base}/media/a.wav")}}
+        ]}],
+        "stream": false
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let reqs = mock_server.received_requests().await.unwrap();
+    let forwarded = reqs
+        .iter()
+        .find(|r| r.url.path() == "/v1/chat/completions")
+        .expect("backend was called");
+    let body: serde_json::Value = serde_json::from_slice(&forwarded.body).unwrap();
+    let parts = &body["messages"][0]["content"];
+    assert!(parts[1]["image_url"]["url"]
+        .as_str()
+        .unwrap()
+        .starts_with("data:image/png;base64,"));
+    assert!(parts[2]["audio_url"]["url"]
+        .as_str()
+        .unwrap()
+        .starts_with("data:audio/wav;base64,"));
+    assert!(!String::from_utf8_lossy(&forwarded.body).contains("/media/"));
+}
+
+#[tokio::test]
+async fn test_chat_completions_media_inline_rejects_unfetchable_url() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/media/gone.png"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"x"})))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+    let app = build_test_app_inner(
+        &mock_server.uri(),
+        TestAppOptions {
+            image_validation: true,
+            media_inline: true,
+            ..Default::default()
+        },
+    );
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": format!("{}/media/gone.png", mock_server.uri())}}
+        ]}]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(response).await;
+    assert!(!body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("gone.png"));
 }
 
 #[tokio::test]
@@ -6465,6 +6601,7 @@ fn build_test_app_with_cloud_api_retries(
         image_validation_allowed_domains: Vec::new(),
         image_validation_reject_non_rgb_images: false,
         image_validation_reject_single_channel_images: false,
+        media_inline: Default::default(),
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
         cloud_api_url: Some(cloud_api_url.to_string()),
@@ -9116,6 +9253,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         image_validation_allowed_domains: Vec::new(),
         image_validation_reject_non_rgb_images: false,
         image_validation_reject_single_channel_images: false,
+        media_inline: Default::default(),
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
         dev_mode: true,
@@ -9591,6 +9729,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         image_validation_allowed_domains: Vec::new(),
         image_validation_reject_non_rgb_images: false,
         image_validation_reject_single_channel_images: false,
+        media_inline: Default::default(),
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
         dev_mode: true,
@@ -9772,6 +9911,52 @@ fn ohttp_decrypt_response(
 ) -> bhttp::Message {
     let bhttp_bytes = client_response.decapsulate(enc_response).unwrap();
     bhttp::Message::read_bhttp(&mut Cursor::new(&bhttp_bytes[..])).unwrap()
+}
+
+#[tokio::test]
+async fn test_ohttp_rejects_non_allowlisted_inner_requests_before_forwarding() {
+    let target = MockServer::start().await;
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&target.uri()).await;
+    let client = reqwest::Client::new();
+
+    for (inner_method, inner_path) in [
+        (
+            "POST",
+            format!("@127.0.0.1:{}/secret", target.address().port()),
+        ),
+        (
+            "POST",
+            format!("//127.0.0.1:{}/secret", target.address().port()),
+        ),
+        ("GET", "/v1/chat/completions".to_string()),
+        ("POST", "/v1/models".to_string()),
+        ("GET", "/v1/completions".to_string()),
+        ("GET", "/v1/audio/transcriptions".to_string()),
+        ("POST", "/v1/embeddings".to_string()),
+        ("POST", "/update_weights_from_tensor".to_string()),
+        ("POST", "/v1/chat/completions?debug=1".to_string()),
+        ("POST", "/v1/chat/%63ompletions".to_string()),
+    ] {
+        let inner_req = bhttp::Message::request(
+            inner_method.as_bytes().to_vec(),
+            b"https".to_vec(),
+            b"localhost".to_vec(),
+            inner_path.into_bytes(),
+        );
+        let (enc_request, _) = ohttp_encrypt_request(&config_bytes, &inner_req);
+        let response = client
+            .post(format!("{base_url}/ohttp"))
+            .header("content-type", "message/ohttp-req")
+            .header("authorization", "Bearer test-token")
+            .body(enc_request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    assert!(target.received_requests().await.unwrap().is_empty());
+    server_handle.abort();
 }
 
 // Test 10: Full OHTTP roundtrip — encrypt chat completion, get real response
@@ -10279,7 +10464,7 @@ async fn test_ohttp_non_bearer_outer_auth_falls_back_to_inner_authorization() {
     server_handle.abort();
 }
 
-// Test 12: OHTTP with inner GET request (e.g. /v1/models)
+// OHTTP model discovery remains available to clients before completion.
 #[tokio::test]
 async fn test_ohttp_get_request_inner() {
     let mock = MockServer::start().await;
@@ -10294,7 +10479,6 @@ async fn test_ohttp_get_request_inner() {
 
     let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock.uri()).await;
 
-    // Build inner GET request — note: /v1/models is unauthenticated (passthrough)
     let inner_req = bhttp::Message::request(
         b"GET".to_vec(),
         b"https".to_vec(),
@@ -10321,6 +10505,102 @@ async fn test_ohttp_get_request_inner() {
     assert_eq!(inner_resp.control().status().unwrap().code(), 200);
     let resp_body: serde_json::Value = serde_json::from_slice(inner_resp.content()).unwrap();
     assert_eq!(resp_body["data"][0]["id"], "test-model");
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_ohttp_text_completions_allowed() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "cmpl-ohttp",
+            "choices": [{"text": "world", "finish_reason": "stop"}]
+        })))
+        .mount(&mock)
+        .await;
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock.uri()).await;
+
+    let mut inner_req = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/completions".to_vec(),
+    );
+    inner_req.put_header("content-type", "application/json");
+    inner_req.put_header("authorization", "Bearer test-token");
+    inner_req.write_content(br#"{"prompt":"hello "}"#);
+
+    let (enc_request, client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/ohttp"))
+        .header("content-type", "message/ohttp-req")
+        .body(enc_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let inner_resp = ohttp_decrypt_response(client_response, &response.bytes().await.unwrap());
+    assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+    let body: serde_json::Value = serde_json::from_slice(inner_resp.content()).unwrap();
+    assert_eq!(body["id"], "cmpl-ohttp");
+    assert_eq!(mock.received_requests().await.unwrap().len(), 1);
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_ohttp_audio_transcriptions_allowed() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "trans-ohttp",
+            "text": "Hello world"
+        })))
+        .mount(&mock)
+        .await;
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock.uri()).await;
+
+    let boundary = "----OhttpAudioBoundary";
+    let multipart_body = format!(
+        "--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"model\"\r\n\r\n\
+         whisper-1\r\n\
+         --{boundary}\r\n\
+         Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n\
+         Content-Type: audio/wav\r\n\r\n\
+         fakeaudiodata\r\n\
+         --{boundary}--\r\n"
+    );
+    let mut inner_req = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/audio/transcriptions".to_vec(),
+    );
+    inner_req.put_header(
+        "content-type",
+        format!("multipart/form-data; boundary={boundary}").as_bytes(),
+    );
+    inner_req.put_header("authorization", "Bearer test-token");
+    inner_req.write_content(multipart_body.into_bytes());
+
+    let (enc_request, client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/ohttp"))
+        .header("content-type", "message/ohttp-req")
+        .body(enc_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let inner_resp = ohttp_decrypt_response(client_response, &response.bytes().await.unwrap());
+    assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+    let body: serde_json::Value = serde_json::from_slice(inner_resp.content()).unwrap();
+    assert_eq!(body["id"], "trans-ohttp");
+    assert_eq!(mock.received_requests().await.unwrap().len(), 1);
 
     server_handle.abort();
 }

@@ -10812,7 +10812,10 @@ async fn request_content_never_reaches_logs_or_metrics() {
     let _subscriber = tracing::subscriber::set_default(
         tracing_subscriber::fmt()
             .json()
-            .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
+            // Every level of this crate's own lines, the default for the rest.
+            .with_env_filter(tracing_subscriber::EnvFilter::new(
+                "info,vllm_proxy_rs=trace",
+            ))
             .with_writer(move || writer.clone())
             .finish(),
     );
@@ -10861,6 +10864,41 @@ async fn request_content_never_reaches_logs_or_metrics() {
                 ),
             )
             .await;
+            // A client that leaves while the backend is still working.
+            let slow = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_secs(30))
+                        .set_body_json(serde_json::json!({})),
+                )
+                .mount(&slow)
+                .await;
+            let slow_app = build_test_app_inner(
+                &slow.uri(),
+                TestAppOptions {
+                    cloud_api_url: Some(cloud_api.uri()),
+                    token_labels: vec!["cloud-api"],
+                    ..TestAppOptions::default()
+                },
+            );
+            for (uri, json) in [
+                ("/v1/chat/completions", true),
+                ("/v1/privacy/classify", true),
+                ("/v1/audio/transcriptions", false),
+            ] {
+                let request = if json {
+                    zdr_request(uri, bearer, "application/json", zdr_json_body(false))
+                } else {
+                    zdr_request(uri, bearer, &multipart, zdr_multipart_body(boundary))
+                };
+                let dropped = tokio::time::timeout(
+                    Duration::from_millis(300),
+                    slow_app.clone().oneshot(request),
+                )
+                .await;
+                assert!(dropped.is_err(), "{uri}");
+            }
             // Signature lookup with a client-chosen id.
             let response = app
                 .clone()
@@ -10876,6 +10914,19 @@ async fn request_content_never_reaches_logs_or_metrics() {
             let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
         }
     }
+
+    // Refused: a wrong token that carries the marker.
+    let backend = zdr_backend(200).await;
+    zdr_send(
+        build_test_app_inner(&backend.uri(), TestAppOptions::default()),
+        zdr_request(
+            "/v1/chat/completions",
+            &format!("wrong-{ZDR_SENTINEL}"),
+            "application/json",
+            zdr_json_body(false),
+        ),
+    )
+    .await;
 
     // OHTTP: the same content inside the encrypted message.
     let backend = zdr_backend(200).await;
@@ -10906,8 +10957,10 @@ async fn request_content_never_reaches_logs_or_metrics() {
     server_handle.abort();
 
     let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-    // The success and the engine-error paths both ran.
+    // The success, engine-error, cancel and refusal paths all ran.
     assert!(captured.contains("request completed"), "{captured}");
+    assert!(captured.contains("request cancelled"), "{captured}");
+    assert!(captured.contains("request finished"), "{captured}");
     assert!(
         captured.contains("Backend returned non-success status"),
         "{captured}"
@@ -12913,9 +12966,8 @@ async fn dropped_request_logs_one_cancel_line_with_its_ids() {
     assert_eq!(fields["request_bytes"], body.len() as u64);
     assert!(fields["elapsed_ms"].as_u64().unwrap() >= 400, "{fields}");
     assert!(lines_with_message(&lines, "request finished").is_empty());
-    // The span carries the same ids for every other line of the request.
-    assert_eq!(cancelled[0]["span"]["org_id"], "org-cancelled");
-    assert_eq!(cancelled[0]["span"]["caller"], "cloud-api");
+    // A root event: only its own fields, nothing from the request span.
+    assert!(cancelled[0].get("span").is_none(), "{}", cancelled[0]);
 
     // A refused request: one finish line, no tenant, nothing from the body.
     let response = app

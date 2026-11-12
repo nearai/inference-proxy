@@ -140,14 +140,10 @@ impl RequestRecord {
         self.route.as_deref()
     }
 
-    /// Store the authenticated identity and record it on the request span.
+    /// Store the authenticated identity and record its bounded labels on the
+    /// request span. Tenant ids stay off the span, so no other line of the
+    /// request gains them; they are on this request's own lines only.
     pub(crate) fn publish_identity(&self, identity: RequestIdentity) {
-        self.span
-            .record("org_id", identity.org_id.as_deref().unwrap_or(""));
-        self.span.record(
-            "workspace_id",
-            identity.workspace_id.as_deref().unwrap_or(""),
-        );
         self.span.record("auth_path", identity.auth_path);
         self.span.record("tenant_context", identity.tenant_context);
         self.span.record("caller", identity.caller);
@@ -189,7 +185,7 @@ enum BodyEnd {
 pub(crate) struct RequestGuard {
     record: Arc<RequestRecord>,
     request_id: String,
-    method: String,
+    method: &'static str,
     request_bytes: Option<u64>,
     start: Instant,
     status: Option<u16>,
@@ -200,10 +196,11 @@ impl RequestGuard {
     pub(crate) fn new(
         record: Arc<RequestRecord>,
         request_id: String,
-        method: String,
+        method: &axum::http::Method,
         request_bytes: Option<u64>,
         start: Instant,
     ) -> Self {
+        let method = method_label(method);
         metrics::gauge!("active_connections").increment(1);
         Self {
             record,
@@ -231,7 +228,7 @@ impl RequestGuard {
     fn outcome(&self) -> Outcome {
         Outcome {
             request_id: self.request_id.clone(),
-            method: self.method.clone(),
+            method: self.method,
             request_bytes: self.request_bytes,
             elapsed_ms: self.start.elapsed().as_millis() as u64,
             status: self.status,
@@ -259,6 +256,22 @@ impl Drop for RequestGuard {
     }
 }
 
+/// The request method as a bounded label: a method outside the standard set
+/// is client-chosen text and becomes `other`.
+fn method_label(method: &axum::http::Method) -> &'static str {
+    use axum::http::Method;
+    match *method {
+        Method::GET => "GET",
+        Method::POST => "POST",
+        Method::PUT => "PUT",
+        Method::DELETE => "DELETE",
+        Method::HEAD => "HEAD",
+        Method::OPTIONS => "OPTIONS",
+        Method::PATCH => "PATCH",
+        _ => "other",
+    }
+}
+
 /// Routes whose `request completed` line can be written after the response
 /// body has been dropped (the streaming path logs it from its own task).
 fn completes_asynchronously(route: &str) -> bool {
@@ -269,7 +282,7 @@ fn completes_asynchronously(route: &str) -> bool {
 #[derive(Debug)]
 struct Outcome {
     request_id: String,
-    method: String,
+    method: &'static str,
     request_bytes: Option<u64>,
     elapsed_ms: u64,
     status: Option<u16>,
@@ -296,8 +309,11 @@ impl RequestRecord {
         let org_id = identity.org_id.as_deref().unwrap_or("");
         let workspace_id = identity.workspace_id.as_deref().unwrap_or("");
         let elapsed_ms = outcome.elapsed_ms;
-        self.span.in_scope(|| match (outcome.status, outcome.end) {
+        // Root events: they carry exactly the fields below and none of the
+        // request span's (whose raw path can hold a client-chosen id).
+        match (outcome.status, outcome.end) {
             (None, _) | (Some(_), BodyEnd::Pending) => info!(
+                parent: None,
                 request_id = %outcome.request_id,
                 org_id = %org_id,
                 workspace_id = %workspace_id,
@@ -305,7 +321,7 @@ impl RequestRecord {
                 ingress_route = identity.ingress_route,
                 tenant_context = identity.tenant_context,
                 caller = identity.caller,
-                method = %outcome.method,
+                method = outcome.method,
                 route = %route,
                 status = outcome.status,
                 request_bytes = outcome.request_bytes,
@@ -322,6 +338,7 @@ impl RequestRecord {
                     return;
                 }
                 info!(
+                    parent: None,
                     request_id = %outcome.request_id,
                     org_id = %org_id,
                     workspace_id = %workspace_id,
@@ -329,7 +346,7 @@ impl RequestRecord {
                     ingress_route = identity.ingress_route,
                     tenant_context = identity.tenant_context,
                     caller = identity.caller,
-                    method = %outcome.method,
+                    method = outcome.method,
                     route = %route,
                     status,
                     request_bytes = outcome.request_bytes,
@@ -342,7 +359,7 @@ impl RequestRecord {
                     "request finished"
                 );
             }
-        });
+        }
     }
 }
 
@@ -458,7 +475,7 @@ mod tests {
         let guard = RequestGuard::new(
             Arc::clone(&record),
             "req-1".to_string(),
-            "POST".to_string(),
+            &axum::http::Method::POST,
             Some(12),
             Instant::now(),
         );

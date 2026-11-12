@@ -226,7 +226,8 @@ pub async fn request_id_middleware(mut request: Request<axum::body::Body>, next:
     let start = std::time::Instant::now();
     request.extensions_mut().insert(RequestStart(start));
 
-    let method = request.method().to_string();
+    let http_method = request.method().clone();
+    let method = http_method.to_string();
     let path = request.uri().path().to_string();
     let route = request
         .extensions()
@@ -240,8 +241,6 @@ pub async fn request_id_middleware(mut request: Request<axum::body::Body>, next:
     let span = tracing::info_span!(
         "request",
         request_id = %tracing_ids.request_id,
-        org_id = tracing::field::Empty,
-        workspace_id = tracing::field::Empty,
         auth_path = tracing::field::Empty,
         tenant_context = tracing::field::Empty,
         caller = tracing::field::Empty,
@@ -255,7 +254,7 @@ pub async fn request_id_middleware(mut request: Request<axum::body::Body>, next:
     let guard = RequestGuard::new(
         record,
         echo_request_id.clone(),
-        method,
+        &http_method,
         request_bytes,
         start,
     );
@@ -535,9 +534,12 @@ mod tests {
             .expect("test body should read");
         let captured = logs.contents();
         assert!(captured.contains(request_id));
-        assert!(captured.contains("method=POST"));
-        assert!(captured.contains("path=/v1/chat/completions"));
-        assert!(captured.contains("status=200"));
+        assert!(captured.contains("method=\"POST\""), "{captured}");
+        assert!(
+            captured.contains("route=/v1/chat/completions"),
+            "{captured}"
+        );
+        assert!(captured.contains("status=200"), "{captured}");
         for forbidden in [
             "PROXY_PROMPT_SENTINEL",
             "sk-proxy-sentinel",

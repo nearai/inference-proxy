@@ -21,16 +21,20 @@
 //! line came. Health, metrics, version and model-list
 //! routes, and unmatched paths, never log here. The guard also owns the
 //! `active_connections` gauge, so a dropped request always decrements it.
+//!
+//! Publishing the identity also counts a trusted request on a customer route
+//! that names no organization ([`note_missing_tenant`]). It never rejects one.
 
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes, HttpBody};
 use http_body::{Frame, SizeHint};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Which lines a route writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,7 +147,14 @@ impl RequestRecord {
     /// Store the authenticated identity and record its bounded labels on the
     /// request span. Tenant ids stay off the span, so no other line of the
     /// request gains them; they are on this request's own lines only.
-    pub(crate) fn publish_identity(&self, identity: RequestIdentity) {
+    pub(crate) fn publish_identity(&self, request_id: &str, identity: RequestIdentity) {
+        note_missing_tenant(
+            &MISSING_TENANT_WARNINGS,
+            Instant::now(),
+            self.route(),
+            request_id,
+            &identity,
+        );
         self.span.record("auth_path", identity.auth_path);
         self.span.record("tenant_context", identity.tenant_context);
         self.span.record("caller", identity.caller);
@@ -167,6 +178,113 @@ impl RequestRecord {
 
     fn completion_logged(&self) -> bool {
         self.completion_logged.load(Ordering::Acquire)
+    }
+}
+
+/// The routes a customer's request arrives on. A trusted caller relaying a
+/// customer request on one of them is expected to send `X-Org-Id`.
+fn customer_route(route: &str) -> Option<&'static str> {
+    use crate::routes::*;
+    [
+        ROUTE_CHAT_COMPLETIONS,
+        ROUTE_COMPLETIONS,
+        ROUTE_EMBEDDINGS,
+        ROUTE_RERANK,
+        ROUTE_SCORE,
+        ROUTE_TOKENIZE,
+        ROUTE_PRIVACY_CLASSIFY,
+        ROUTE_IMAGES_GENERATIONS,
+        ROUTE_IMAGES_EDITS,
+        ROUTE_AUDIO_TRANSCRIPTIONS,
+    ]
+    .into_iter()
+    .find(|customer| *customer == route)
+}
+
+/// A caller labeled `probe` (or `probe-…` / `probe_…`) sends synthetic
+/// requests with no tenant by design.
+fn is_probe(caller: &str) -> bool {
+    caller == "probe" || caller.starts_with("probe-") || caller.starts_with("probe_")
+}
+
+/// How often the missing-tenant warning may repeat for one route and caller.
+const MISSING_TENANT_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Rate limit for the missing-tenant warning: one line per route and caller
+/// per interval, carrying how many it stood for. The counter has every one.
+/// `(route, caller)`.
+type WarnKey = (&'static str, &'static str);
+
+#[derive(Default)]
+struct WarnLimiter {
+    /// When each key last warned, and how many were held back since.
+    last: Mutex<HashMap<WarnKey, (Instant, u64)>>,
+}
+
+impl WarnLimiter {
+    /// `Some(suppressed)` when a warning is due now, with the number of
+    /// occurrences since the previous one; `None` while it is held back.
+    fn due(&self, key: WarnKey, now: Instant) -> Option<u64> {
+        let mut last = self.last.lock().ok()?;
+        match last.get_mut(&key) {
+            Some((at, suppressed)) if now.duration_since(*at) < MISSING_TENANT_WARN_INTERVAL => {
+                *suppressed += 1;
+                None
+            }
+            Some((at, suppressed)) => {
+                let held = *suppressed;
+                *at = now;
+                *suppressed = 0;
+                Some(held)
+            }
+            None => {
+                last.insert(key, (now, 0));
+                Some(0)
+            }
+        }
+    }
+}
+
+static MISSING_TENANT_WARNINGS: LazyLock<WarnLimiter> = LazyLock::new(WarnLimiter::default);
+
+/// Count, and warn about at a bounded rate, a request that authenticated with
+/// a config token on a customer route without naming its organization.
+/// Probes are excluded, and the request is never refused. The series is
+/// `inference_proxy_requests_without_tenant_total{route, ingress_route,
+/// caller}`: bounded labels only, never an id.
+fn note_missing_tenant(
+    limiter: &WarnLimiter,
+    now: Instant,
+    route: Option<&str>,
+    request_id: &str,
+    identity: &RequestIdentity,
+) {
+    if identity.auth_path != crate::auth::AuthPath::TrustedConfigToken.as_label()
+        || identity.org_id.is_some()
+        || is_probe(identity.caller)
+    {
+        return;
+    }
+    let Some(route) = route.and_then(customer_route) else {
+        return;
+    };
+    metrics::counter!(
+        "inference_proxy_requests_without_tenant_total",
+        "route" => route,
+        "ingress_route" => identity.ingress_route,
+        "caller" => identity.caller,
+    )
+    .increment(1);
+    if let Some(suppressed) = limiter.due((route, identity.caller), now) {
+        warn!(
+            parent: None,
+            request_id = %request_id,
+            route,
+            ingress_route = identity.ingress_route,
+            caller = identity.caller,
+            suppressed,
+            "Trusted request on a customer route has no org id"
+        );
     }
 }
 
@@ -493,11 +611,124 @@ mod tests {
         }
     }
 
+    fn trusted(org: Option<&str>, caller: &'static str) -> RequestIdentity {
+        RequestIdentity {
+            org_id: org.map(str::to_string),
+            workspace_id: None,
+            auth_path: "trusted_config_token",
+            ingress_route: "canonical",
+            tenant_context: if org.is_some() {
+                "trusted_headers"
+            } else {
+                "trusted_no_tenant"
+            },
+            caller,
+        }
+    }
+
+    #[test]
+    fn missing_tenant_is_counted_and_warned_at_a_bounded_rate() {
+        use crate::routes::*;
+        let (captured, _subscriber) = capture();
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let limiter = WarnLimiter::default();
+        let t0 = Instant::now();
+        ::metrics::with_local_recorder(&recorder, || {
+            // Counted: a trusted caller on a customer route without an org.
+            for offset in [0, 1, 2] {
+                note_missing_tenant(
+                    &limiter,
+                    t0 + Duration::from_secs(offset),
+                    Some(ROUTE_PRIVACY_CLASSIFY),
+                    "req-a",
+                    &trusted(None, "cloud-api"),
+                );
+            }
+            // Not counted: an org is named, a probe, a key-authenticated request,
+            // a route that is not a customer route, an unmatched path.
+            note_missing_tenant(
+                &limiter,
+                t0,
+                Some(ROUTE_PRIVACY_CLASSIFY),
+                "req-b",
+                &trusted(Some("org-1"), "cloud-api"),
+            );
+            for probe in ["probe", "probe-chat"] {
+                note_missing_tenant(
+                    &limiter,
+                    t0,
+                    Some(ROUTE_CHAT_COMPLETIONS),
+                    "req-c",
+                    &trusted(None, probe),
+                );
+            }
+            let mut direct = trusted(None, "api_key");
+            direct.auth_path = "cloud_api_key";
+            note_missing_tenant(&limiter, t0, Some(ROUTE_CHAT_COMPLETIONS), "req-d", &direct);
+            for route in [Some(ROUTE_V1_MODELS), Some(ROUTE_SIGNATURE), None] {
+                note_missing_tenant(&limiter, t0, route, "req-e", &trusted(None, "cloud-api"));
+            }
+        });
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(
+                "inference_proxy_requests_without_tenant_total{route=\"/v1/privacy/classify\",ingress_route=\"canonical\",caller=\"cloud-api\"} 3"
+            ),
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered
+                .lines()
+                .filter(|line| line.starts_with("inference_proxy_requests_without_tenant_total{"))
+                .count(),
+            1,
+            "{rendered}"
+        );
+
+        // One warning for the three, then the next after the interval with
+        // the count it stood for.
+        let warnings = |captured: &Captured| {
+            captured
+                .messages()
+                .into_iter()
+                .filter(|line| {
+                    line["message"] == "Trusted request on a customer route has no org id"
+                })
+                .collect::<Vec<_>>()
+        };
+        let lines = warnings(&captured);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["suppressed"], 0);
+        assert_eq!(lines[0]["caller"], "cloud-api");
+        assert_eq!(lines[0]["route"], ROUTE_PRIVACY_CLASSIFY);
+        note_missing_tenant(
+            &limiter,
+            t0 + MISSING_TENANT_WARN_INTERVAL + Duration::from_secs(1),
+            Some(ROUTE_PRIVACY_CLASSIFY),
+            "req-f",
+            &trusted(None, "cloud-api"),
+        );
+        let lines = warnings(&captured);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[1]["suppressed"], 2);
+        assert_eq!(lines[1]["request_id"], "req-f");
+        // Another caller on the same route warns on its own.
+        note_missing_tenant(
+            &limiter,
+            t0 + Duration::from_secs(3),
+            Some(ROUTE_PRIVACY_CLASSIFY),
+            "req-g",
+            &trusted(None, "gateway"),
+        );
+        assert_eq!(warnings(&captured).len(), 3);
+    }
+
     #[tokio::test]
     async fn body_dropped_mid_stream_logs_a_cancel_line() {
         let (captured, _subscriber) = capture();
         let (record, guard) = guard_for(crate::routes::ROUTE_PRIVACY_CLASSIFY);
-        record.publish_identity(identity());
+        record.publish_identity("req-1", identity());
         use futures_util::StreamExt;
         let stream = futures_util::stream::iter([Ok::<_, std::io::Error>(Bytes::from("a"))])
             .chain(futures_util::stream::pending());
@@ -528,7 +759,7 @@ mod tests {
         let (captured, _subscriber) = capture();
         for completes in [true, false] {
             let (record, guard) = guard_for(crate::routes::ROUTE_CHAT_COMPLETIONS);
-            record.publish_identity(identity());
+            record.publish_identity("req-1", identity());
             // The streaming task's own handle on the record.
             let producer = Arc::clone(&record);
             drop(record);
@@ -558,7 +789,7 @@ mod tests {
     async fn sent_body_logs_a_finish_line_unless_a_completion_line_was_written() {
         let (captured, _subscriber) = capture();
         let (record, guard) = guard_for(crate::routes::ROUTE_EMBEDDINGS);
-        record.publish_identity(identity());
+        record.publish_identity("req-1", identity());
         let response = guard.attach(axum::response::Response::new(Body::from("done")));
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await

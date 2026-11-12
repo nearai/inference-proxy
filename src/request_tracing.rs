@@ -158,14 +158,17 @@ impl TracingIds {
     /// the request's finish or cancel line. Called once auth has passed.
     pub(crate) fn publish_identity(&self) {
         let labels = crate::proxy::request_metric_labels(Some(self));
-        self.record.publish_identity(RequestIdentity {
-            org_id: self.org_id.clone(),
-            workspace_id: self.workspace_id.clone(),
-            auth_path: labels.auth_path,
-            ingress_route: labels.ingress_route,
-            tenant_context: labels.tenant_context,
-            caller: labels.caller,
-        });
+        self.record.publish_identity(
+            &self.request_id,
+            RequestIdentity {
+                org_id: self.org_id.clone(),
+                workspace_id: self.workspace_id.clone(),
+                auth_path: labels.auth_path,
+                ingress_route: labels.ingress_route,
+                tenant_context: labels.tenant_context,
+                caller: labels.caller,
+            },
+        );
     }
 
     /// Return `org_id` for log fields, defaulting to `""` when absent.

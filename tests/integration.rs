@@ -10961,6 +10961,11 @@ async fn request_content_never_reaches_logs_or_metrics() {
     assert!(captured.contains("request completed"), "{captured}");
     assert!(captured.contains("request cancelled"), "{captured}");
     assert!(captured.contains("request finished"), "{captured}");
+    // A config-token request without an org id was counted and warned about.
+    assert!(
+        captured.contains("Trusted request on a customer route has no org id"),
+        "{captured}"
+    );
     assert!(
         captured.contains("Backend returned non-success status"),
         "{captured}"
@@ -10975,6 +10980,10 @@ async fn request_content_never_reaches_logs_or_metrics() {
         leaked.join("\n")
     );
     let rendered = handle.render();
+    assert!(
+        rendered.contains("inference_proxy_requests_without_tenant_total{"),
+        "{rendered}"
+    );
     // The caller label is on the series; the token is not.
     assert!(rendered.contains("caller=\"cloud-api\""), "{rendered}");
     assert!(rendered.contains("caller=\"api_key\""), "{rendered}");

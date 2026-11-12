@@ -96,6 +96,8 @@ WARN request{request_id=abc-123 method=POST path=/v1/chat/completions}:
 
 Both lines carry `org_id`, `workspace_id`, `auth_path`, `ingress_route`, `tenant_context` and `caller` once auth has passed, and nothing taken from the request's content, headers, query string or raw path. The `request` span gets the bounded labels only (`auth_path`, `tenant_context`, `caller`), so other lines do not gain tenant ids. Health, metrics, version, model-list and OHTTP key routes, and unmatched paths, log neither line. `active_connections` counts a request until its response body is sent or dropped.
 
+**Missing tenant.** A request authenticated with a config token on a customer route (chat, completions, embeddings, rerank, score, tokenize, privacy classification, images, audio) that sends no `X-Org-Id` is counted in `inference_proxy_requests_without_tenant_total{route, ingress_route, caller}` and is never refused. A WARN `Trusted request on a customer route has no org id` is written at most once a minute per route and caller, with `suppressed` = how many it stands for. Callers labeled `probe` (or `probe-…`, `probe_…`, see `TOKEN_LABELS`) are not counted.
+
 **What is never logged**: Request bodies, response bodies, prompt content, user messages, completion text.
 
 ## Configuration

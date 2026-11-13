@@ -28,7 +28,7 @@ Rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-proxy) (Python).
 | POST | `/v1/rerank` | Yes | Reranking |
 | POST | `/v1/score` | Yes | Scoring |
 | POST | `/v1/privacy/classify` | Yes | Privacy classification |
-| POST | `/v1/images/generations` | Yes | Image generation |
+| POST | `/v1/images/generations` | Yes | Image generation. A top-level key outside the supported list (`IMAGE_GENERATION_FIELDS`) is a 400 |
 | POST | `/v1/images/edits` | Yes | Image editing (multipart). A form field outside the supported list (`IMAGE_EDIT_FORM_FIELDS`) is a 400 |
 | POST | `/v1/audio/transcriptions` | Yes | Audio transcription (multipart). A form field outside the supported list (`AUDIO_TRANSCRIPTION_FORM_FIELDS`) is a 400 |
 | GET | `/v1/signature/{chat_id}` | Yes | Retrieve cached signature |
@@ -151,6 +151,25 @@ All configuration is via environment variables:
 | `VLLM_PROXY_DISCOUNT_TO_USER` | No | empty (list price) | Gateway mode: the lane's discount off the list price, a fraction in `[0, 1)` with at most four decimal places (`0.2` = 20 % off; empty or `0` = none; an invalid value fails startup). Requires `VLLM_PROXY_MODELS_DOCUMENT_URL`. Published as `discount_to_user` on the models document entry (and on every entry of the engine list served while that source is unreadable) and sent as `discount_to_user` on every usage report, so the advertised and the billed price come from one setting |
 | `VLLM_PROXY_STRICT_REQUEST_MODEL` | No | off | Single-model mode: a body `model` must be `MODEL_NAME` byte for byte (404 `model_not_found` otherwise, 400 for a non-string; a missing `model` is still served), on chat, completions, the JSON routes and the `model` field of the multipart routes. Off, the process serves its one model whatever the body says. List mode always matches exactly |
 | `VLLM_PROXY_BACKEND_LORA` | No | unset | Single-model mode, SGLang with `--enable-lora`: the adapter that `MODEL_NAME` stands for, set as `lora_path` on the chat, completions and embeddings bodies forwarded to the engine. Requires `VLLM_PROXY_STRICT_REQUEST_MODEL=1` (startup fails otherwise). Independent of both, a request carrying `lora_path`, `lora_id` or `lora_name` (a form field on the multipart routes) is always a 400 |
+| `VLLM_PROXY_REQUEST_GUARD` | No | on | Request field guard (`src/request_guard.rs`) on chat, completions, the JSON routes and the multipart routes: out-of-bounds fields are a 400 `invalid_request_error` with `param` set, engine-internal fields are stripped, and `/v1/images/generations` forwards only `IMAGE_GENERATION_FIELDS`. `0` turns all of it off (the multipart form-field lists are separate and stay on); for each limit below, `0` turns that rule off |
+| `VLLM_PROXY_MAX_TOP_LOGPROBS` | No | `20` | Max `top_logprobs`, and `logprobs` when it is a number |
+| `VLLM_PROXY_MAX_N` | No | `8` | Max `n` (chat, completions) |
+| `VLLM_PROXY_MAX_LOGIT_BIAS_ENTRIES` / `VLLM_PROXY_MAX_LOGIT_BIAS_VALUE` | No | `300` / `100` | Max `logit_bias` entries and `\|value\|`; keys must be token ids, values finite |
+| `VLLM_PROXY_MAX_STOP_SEQUENCES` / `VLLM_PROXY_MAX_STOP_SEQUENCE_CHARS` | No | `16` / `1024` | Max `stop` entries and characters per entry |
+| `VLLM_PROXY_MAX_STOP_TOKEN_IDS` | No | `64` | Max `stop_token_ids` entries; each must be a non-negative token id |
+| `VLLM_PROXY_VOCAB_SIZE` | No | unset | Token ids in `logit_bias` and `stop_token_ids` must be below this (unset: below 2^31) |
+| `VLLM_PROXY_MAX_MODEL_NAME_CHARS` | No | `256` | Max characters in `model` (also the multipart `model` field) |
+| `VLLM_PROXY_MAX_CONTENT_PART_UUID_CHARS` | No | `256` | Max characters in a content part `uuid` |
+| `VLLM_PROXY_MAX_IMAGE_N` | No | `10` | Image routes: max `n` |
+| `VLLM_PROXY_MAX_IMAGE_SIDE` | No | `2048` | Image routes: max width and height in `size` |
+| `VLLM_PROXY_MAX_IMAGE_STEPS` | No | `100` | Image routes: max `num_inference_steps` |
+| `VLLM_PROXY_MAX_REGEX_NESTED_PRODUCT` | No | `64` | Structured-output regexes (also JSON-schema `pattern`): max outer bound × variable-range bound nested inside it; an unbounded outer repeat around a variable-range one is refused |
+| `VLLM_PROXY_MAX_REGEX_STAR_REPEAT` | No | `32` | Structured-output regexes: max bound of a group that contains `*`, `+` or `{m,}` |
+| `VLLM_PROXY_MAX_REGEX_BOUND` | No | `10000` | Structured-output regexes: max single repeat bound |
+| `VLLM_PROXY_MAX_REGEX_CHARS` | No | `8192` | Structured-output regexes: max pattern length |
+| `VLLM_PROXY_ALLOW_GRAMMAR` | No | off | Forward EBNF grammars (`grammar`, `ebnf`, `guided_grammar`); off = 400 |
+| `VLLM_PROXY_REJECT_LOCAL_MEDIA_URLS` | No | on | Chat `image_url`/`video_url`/`audio_url`/`input_image` URLs must be http, https or data (independent of `VLLM_PROXY_INLINE_MEDIA`) |
+| `VLLM_PROXY_STRIPPED_REQUEST_FIELDS` | No | see `DEFAULT_STRIPPED_FIELDS` | Top-level keys (and form fields) removed before dispatch. Default: `kv_transfer_params`, `ec_transfer_params`, `vllm_xargs`, `session_params`, `mm_hashes`, `return_hidden_states`, `custom_logit_processor`. Set to replace the list; empty = none. Not separately configurable (on with the guard): `min_tokens` <= `max_tokens`, `logprob_start_len` >= -1, finite sampling floats |
 | `VLLM_PROXY_USAGE_REPORT_TRANSPORT` | No | `http` | Where usage reports go. `http`: `POST {CLOUD_API_URL}/v1/internal/usage` with `CLOUD_API_USAGE_TOKEN`. `sqs`: a `SendMessage` to the usage queue, each report a usage envelope signed with SigV4; this needs `VLLM_PROXY_USAGE_REPORT_SQS_URL` and `VLLM_PROXY_AWS_CREDENTIALS_URL`, and not `CLOUD_API_URL` or the usage token. Any other value fails startup. If the usage queue fails its startup check and `CLOUD_API_URL` and `CLOUD_API_USAGE_TOKEN` are set, the process falls back to `http` for its life (ERROR log; `inference_proxy_usage_report_transport_info{transport="http"}` is 1); without them it refuses to start |
 | `VLLM_PROXY_USAGE_REPORT_SQS_URL` | With `sqs` | unset | The usage queue's URL |
 | `VLLM_PROXY_USAGE_REPORT_SQS_REGION` | No | `us-east-1` | The usage queue's AWS region (letters, digits and hyphens) |

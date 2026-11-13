@@ -20,6 +20,12 @@ pub enum AppError {
     #[error("{0}")]
     BadRequest(String),
 
+    /// A request field outside the bounds the proxy forwards
+    /// (`request_guard.rs`): OpenAI's 400 shape with `param` set. The message
+    /// never echoes the caller's value.
+    #[error("{message}")]
+    InvalidParam { param: String, message: String },
+
     #[error("unauthorized")]
     Unauthorized,
 
@@ -213,6 +219,19 @@ impl IntoResponse for AppError {
                 });
                 return (StatusCode::NOT_FOUND, axum::Json(body)).into_response();
             }
+            AppError::InvalidParam { param, message } => {
+                metrics::counter!("http_errors_total", "error_type" => "invalid_request_error")
+                    .increment(1);
+                let body = serde_json::json!({
+                    "error": {
+                        "message": message,
+                        "type": "invalid_request_error",
+                        "param": param,
+                        "code": null,
+                    }
+                });
+                return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
+            }
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone(), "bad_request"),
             AppError::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
@@ -321,6 +340,23 @@ mod tests {
         let bytes = body.collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         (status, json)
+    }
+
+    #[tokio::test]
+    async fn test_invalid_param_error() {
+        let err = AppError::InvalidParam {
+            param: "top_logprobs".to_string(),
+            message: "`top_logprobs` must be at most 20.".to_string(),
+        };
+        let (status, json) = response_to_json(err.into_response()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert_eq!(json["error"]["param"], "top_logprobs");
+        assert_eq!(
+            json["error"]["message"],
+            "`top_logprobs` must be at most 20."
+        );
+        assert!(json["error"]["code"].is_null());
     }
 
     #[tokio::test]

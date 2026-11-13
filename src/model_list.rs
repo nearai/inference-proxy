@@ -1329,6 +1329,43 @@ pub(crate) const IMAGE_EDIT_FORM_FIELDS: [&str; 17] = [
     "user",
 ];
 
+/// Top-level keys a client may send on `/v1/images/generations`.
+pub(crate) const IMAGE_GENERATION_FIELDS: [&str; 18] = [
+    "model",
+    "prompt",
+    "n",
+    "size",
+    "response_format",
+    "output_format",
+    "output_compression",
+    "quality",
+    "style",
+    "background",
+    "moderation",
+    "stream",
+    "partial_images",
+    "seed",
+    "negative_prompt",
+    "guidance_scale",
+    "num_inference_steps",
+    "user",
+];
+
+/// `guard_form_field_name` for each top-level key of a JSON body: any key not
+/// in `supported` is a 400, so engine-only fields never reach the engine.
+pub fn guard_json_field_names(
+    route: &str,
+    supported: &[&str],
+    body: &Value,
+) -> Result<(), AppError> {
+    if let Some(obj) = body.as_object() {
+        for key in obj.keys() {
+            guard_form_field_name(route, supported, key)?;
+        }
+    }
+    Ok(())
+}
+
 /// Form fields a client may send on `/v1/audio/transcriptions`.
 pub(crate) const AUDIO_TRANSCRIPTION_FORM_FIELDS: [&str; 7] = [
     "file",

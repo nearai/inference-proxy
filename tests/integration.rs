@@ -5974,7 +5974,7 @@ async fn test_attestation_invalid_nonce() {
 // ---- Streaming without [DONE] marker (incomplete stream) ----
 
 #[tokio::test]
-async fn test_streaming_without_done_marker_no_signature_cached() {
+async fn test_streaming_without_done_marker_fails_body_without_caching_signature() {
     let mock_server = MockServer::start().await;
 
     // Simulate a stream that ends abruptly without [DONE]
@@ -6013,8 +6013,14 @@ async fn test_streaming_without_done_marker_no_signature_cached() {
 
     assert_eq!(stream_response.status(), StatusCode::OK);
 
-    // Consume the stream
-    let _ = body_to_bytes(stream_response).await;
+    // HTTP 200 was already committed, so incomplete SSE must fail the body.
+    let error = axum::body::to_bytes(stream_response.into_body(), 1024 * 1024)
+        .await
+        .expect_err("EOF before [DONE] must be visible to the client");
+    assert_eq!(
+        error.to_string(),
+        "Upstream response stream ended before [DONE]"
+    );
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Signature should NOT be cached since [DONE] was never received

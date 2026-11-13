@@ -3096,21 +3096,17 @@ async fn proxy_streaming_request_inner(
             }
         }
 
-        // Once the watchdog is enabled, an upstream EOF without the protocol
-        // terminator is an explicit downstream body error rather than a
-        // successful-looking truncated HTTP 200.
-        if stream_idle_timeout_secs > 0
-            && !upstream_error
-            && !downstream_closed
-            && !parser.seen_done
-        {
+        // Protocol completion is independent of the idle watchdog: a slow,
+        // open stream may be allowed, but EOF before [DONE] is still a failure.
+        if !upstream_error && !downstream_closed && !parser.seen_done {
             incomplete_reason = Some("missing_done");
-            let _ = tx
+            downstream_closed = tx
                 .send(Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "Upstream response stream ended before [DONE]",
                 )))
-                .await;
+                .await
+                .is_err();
         }
 
         let completed_cleanly = !upstream_error && !downstream_closed && parser.seen_done;
@@ -4943,6 +4939,12 @@ mod tests {
         "data: [DONE]\n\n"
     );
 
+    const PARTIAL_CHAT_SSE: &str = concat!(
+        "data: {\"id\":\"chat-partial\",\"model\":\"test-model\",",
+        "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},",
+        "\"finish_reason\":null}]}\n\n"
+    );
+
     const ROLE_ONLY_CHAT_SSE: &str = concat!(
         "data: {\"id\":\"chat-hidden-reasoning\",\"model\":\"test-model\",",
         "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",",
@@ -5158,11 +5160,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_missing_done_fails_downstream_body_when_watchdog_enabled() {
-        let url = raw_sse_server_url("data: {\"id\":\"chat-1\",\"choices\":[]}\n\n").await;
+    async fn test_stream_completion_is_checked_with_and_without_idle_watchdog() {
+        use futures_util::StreamExt;
+
+        for timeout_secs in [0, 1] {
+            for completed in [false, true] {
+                let recorder =
+                    metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+                let handle = recorder.handle();
+                let _recorder = metrics::set_default_local_recorder(&recorder);
+                let url = raw_sse_server_url(if completed {
+                    VALID_CHAT_SSE
+                } else {
+                    PARTIAL_CHAT_SSE
+                })
+                .await;
+                let mut opts = test_proxy_opts();
+                opts.stream_idle_timeout_secs = timeout_secs;
+                let cache = opts.cache.clone();
+                let response = proxy_streaming_request(
+                    &reqwest::Client::new(),
+                    &url,
+                    br#"{"model":"test-model","stream":true}"#.to_vec(),
+                    opts,
+                )
+                .await
+                .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+
+                let chunks: Vec<_> = response.into_body().into_data_stream().collect().await;
+                assert!(chunks[0].is_ok(), "the content delta must reach the client");
+                let errors: Vec<_> = chunks
+                    .iter()
+                    .filter_map(|chunk| chunk.as_ref().err())
+                    .collect();
+                let rendered = handle.render();
+                if completed {
+                    assert!(errors.is_empty());
+                    let body: Vec<_> = chunks
+                        .into_iter()
+                        .flat_map(|chunk| chunk.unwrap())
+                        .collect();
+                    let body = std::str::from_utf8(&body).unwrap();
+                    assert!(body.contains("\"finish_reason\":\"stop\""));
+                    assert!(body.contains("\"usage\""));
+                    assert!(body.ends_with("data: [DONE]\n\n"));
+                    assert!(cache.get_chat("chat-slow-prefill").is_some());
+                    assert!(
+                        !rendered.contains("upstream_stream_incomplete_total"),
+                        "{rendered}"
+                    );
+                } else {
+                    assert_eq!(errors.len(), 1, "missing [DONE] must fail the body once");
+                    assert_eq!(
+                        errors[0].to_string(),
+                        "Upstream response stream ended before [DONE]"
+                    );
+                    assert!(
+                        chunks.last().unwrap().is_err(),
+                        "error must follow partial output"
+                    );
+                    assert!(cache.get_chat("chat-partial").is_none());
+                    assert!(rendered.contains("reason=\"missing_done\""), "{rendered}");
+                    let incomplete: Vec<_> = rendered
+                        .lines()
+                        .filter(|line| line.starts_with("upstream_stream_incomplete_total{"))
+                        .collect();
+                    assert_eq!(incomplete.len(), 1, "{rendered}");
+                    assert!(incomplete[0].ends_with(" 1"), "{rendered}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_disabled_idle_watchdog_allows_progress_after_a_long_gap() {
+        let url = sse_server_url_with_delayed_tail(
+            PARTIAL_CHAT_SSE,
+            "data: {\"id\":\"chat-partial\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            std::time::Duration::from_secs(2),
+        )
+        .await;
         let mut opts = test_proxy_opts();
-        opts.stream_idle_timeout_secs = 1;
-        opts.request_hash = Some("request-sha256".into());
+        opts.stream_idle_timeout_secs = 0;
         let response = proxy_streaming_request(
             &reqwest::Client::new(),
             &url,
@@ -5172,11 +5252,124 @@ mod tests {
         .await
         .unwrap();
 
-        let result = axum::body::to_bytes(response.into_body(), 1024 * 1024).await;
-        assert!(
-            result.is_err(),
-            "stream without [DONE] must fail the response body"
-        );
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            axum::body::to_bytes(response.into_body(), 1024 * 1024),
+        )
+        .await
+        .expect("the upstream should finish after the gap")
+        .expect("disabling the idle watchdog must still allow a slow open stream");
+        assert!(body.ends_with(b"data: [DONE]\n\n"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_errors_are_not_replaced_or_repeated_as_missing_done() {
+        use futures_util::StreamExt;
+
+        for timeout_secs in [0, 1] {
+            for transform_error in [false, true] {
+                let recorder =
+                    metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+                let handle = recorder.handle();
+                let _recorder = metrics::set_default_local_recorder(&recorder);
+                let url = if transform_error {
+                    raw_sse_server_url(PARTIAL_CHAT_SSE).await
+                } else {
+                    // Omit the HTTP chunked-body terminator, producing a read
+                    // error rather than a clean HTTP EOF without SSE [DONE].
+                    sse_server_url_then_stall(PARTIAL_CHAT_SSE, std::time::Duration::ZERO).await
+                };
+                let mut opts = test_proxy_opts();
+                opts.stream_idle_timeout_secs = timeout_secs;
+                if transform_error {
+                    opts.chunk_transform = Some(Arc::new(|_| {
+                        Err(AppError::Internal(anyhow::anyhow!(
+                            "test transform failure"
+                        )))
+                    }));
+                }
+                let response = proxy_streaming_request(
+                    &reqwest::Client::new(),
+                    &url,
+                    br#"{"model":"test-model","stream":true}"#.to_vec(),
+                    opts,
+                )
+                .await
+                .unwrap();
+                let chunks: Vec<_> = response.into_body().into_data_stream().collect().await;
+                let errors: Vec<_> = chunks
+                    .iter()
+                    .filter_map(|chunk| chunk.as_ref().err())
+                    .collect();
+                assert_eq!(errors.len(), 1);
+                assert!(!errors[0].to_string().contains("before [DONE]"));
+                let rendered = handle.render();
+                let reason = if transform_error {
+                    "transform_error"
+                } else {
+                    "upstream_read_error"
+                };
+                assert!(
+                    rendered.contains(&format!("reason=\"{reason}\"")),
+                    "{rendered}"
+                );
+                assert!(!rendered.contains("reason=\"missing_done\""), "{rendered}");
+                let incomplete: Vec<_> = rendered
+                    .lines()
+                    .filter(|line| line.starts_with("upstream_stream_incomplete_total{"))
+                    .collect();
+                assert_eq!(incomplete.len(), 1, "{rendered}");
+                assert!(incomplete[0].ends_with(" 1"), "{rendered}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stream_cancellation_is_not_counted_as_missing_done() {
+        use futures_util::StreamExt;
+
+        for timeout_secs in [0, 1] {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let _recorder = metrics::set_default_local_recorder(&recorder);
+            let url =
+                sse_server_url_then_stall(PARTIAL_CHAT_SSE, std::time::Duration::from_secs(3))
+                    .await;
+            let mut opts = test_proxy_opts();
+            opts.stream_idle_timeout_secs = timeout_secs;
+            opts.model_request =
+                crate::model_metrics::ModelRequest::of(Some("test-model"), "/v1/chat/completions");
+            let response = proxy_streaming_request(
+                &reqwest::Client::new(),
+                &url,
+                br#"{"model":"test-model","stream":true}"#.to_vec(),
+                opts,
+            )
+            .await
+            .unwrap();
+            let mut body = response.into_body().into_data_stream();
+            assert!(body.next().await.unwrap().is_ok());
+            drop(body);
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while !handle
+                    .render()
+                    .contains("stream_client_disconnects_total 1")
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the proxy must observe the cancelled response body");
+            let rendered = handle.render();
+            assert!(
+                !rendered.contains("upstream_stream_incomplete_total"),
+                "{rendered}"
+            );
+            assert!(
+                !rendered.contains("inference_proxy_model_stream_errors_total"),
+                "{rendered}"
+            );
+        }
     }
 
     #[tokio::test]

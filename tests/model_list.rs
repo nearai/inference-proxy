@@ -9,6 +9,9 @@
 //! and the HTTP clients are the test's own. One test starts the built binary
 //! itself.
 
+#[path = "common/budget.rs"]
+mod budget_fixture;
+
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -72,6 +75,7 @@ fn start(list: Option<&Value>, env: &[(&str, &str)], metrics: Option<PrometheusH
         ("DEV", "1"),
         ("GPU_NO_HW_MODE", "1"),
         ("CLOUD_API_AUTH_MAX_ATTEMPTS", "1"),
+        ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
         ("VLLM_PROXY_IMAGE_VALIDATION_DISABLED", "1"),
         // The pool health checkers stay out of the way unless a test is
         // about them: a probe must not land on a mock that expects none.
@@ -179,6 +183,8 @@ fn single_model_state(process: model_list::Process<'_>) -> AppState {
         backend_pool.len(),
         Duration::from_secs(config.backend_probe_interval_secs) * 3,
     ));
+    let usage_report_delivery =
+        vllm_proxy_rs::usage_report::UsageReportDelivery::new(config.usage_report.clone());
     AppState {
         signing: Arc::new(signing),
         cache: Arc::new(cache::ChatCache::new(
@@ -212,7 +218,7 @@ fn single_model_state(process: model_list::Process<'_>) -> AppState {
         vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(None, 1_200)),
         models: None,
         api_key_cache: Default::default(),
-        usage_report_delivery: usage_report::UsageReportDelivery::new(config.usage_report.clone()),
+        usage_report_delivery,
         config,
     }
 }
@@ -331,6 +337,7 @@ async fn assert_model_not_found(response: axum::response::Response) -> Value {
 /// and usage reports are accepted under the shared usage token.
 async fn cloud_api(key: &str) -> MockServer {
     let cloud = MockServer::start().await;
+    budget_fixture::mount(&cloud).await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
         .and(header("authorization", format!("Bearer {key}").as_str()))
@@ -988,7 +995,7 @@ async fn a_models_backend_token_and_priority_reach_only_its_own_backends() {
     for request in &to_cloud {
         let expected = match request.url.path() {
             "/v1/check_api_key" => Some("Bearer sk-live-customer"),
-            "/v1/internal/usage" => Some("Bearer usage-secret"),
+            "/v1/internal/usage" | "/v1/internal/budget" => Some("Bearer usage-secret"),
             "/v1/models" => None,
             other => panic!("unexpected request to cloud-api: {other}"),
         };
@@ -3952,6 +3959,7 @@ impl Binary {
                     ("LOG_FORMAT", "json"),
                     ("LISTEN_ADDR", "127.0.0.1"),
                     ("CLOUD_API_AUTH_MAX_ATTEMPTS", "1"),
+                    ("CLOUD_API_USAGE_TOKEN", "usage-secret"),
                     ("VLLM_PROXY_IMAGE_VALIDATION_DISABLED", "1"),
                 ])
                 .env("LISTEN_PORT", port.to_string())
@@ -4627,6 +4635,7 @@ async fn the_binary_waits_for_pending_usage_reports_at_shutdown_only_when_told_t
         // A cloud-api whose usage intake takes its time, after one failure
         // for the process that retries.
         let cloud = MockServer::start().await;
+        budget_fixture::mount(&cloud).await;
         Mock::given(method("POST"))
             .and(path("/v1/check_api_key"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({

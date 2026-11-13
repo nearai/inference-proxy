@@ -323,9 +323,11 @@ fn message_is_allowed_media_domain_error(message: &str) -> bool {
 /// posting to a deleted endpoint.
 #[derive(Clone)]
 pub struct UsageReporter {
+    pub budget_report_id: Option<String>,
+    pub admission_mode: crate::monetary_budget::AdmissionMode,
+    pub admission_timeout_ms: u64,
     pub http_client: reqwest::Client,
-    /// cloud-api's base URL. Required over HTTP; the SQS transport does not
-    /// post to cloud-api and carries none.
+    /// cloud-api's base URL. Required for synchronous admission with either report transport.
     pub cloud_api_url: Option<String>,
     pub model_name: String,
     /// Shared infrastructure token for the service-token reporting path.
@@ -497,6 +499,14 @@ pub(crate) fn record_usage_report_outcome(
     outcome: UsageReportOutcome,
     duration: Option<std::time::Duration>,
 ) {
+    if outcome != UsageReportOutcome::Accepted && reporter.budget_report_id.is_some() {
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let reporter = reporter.clone();
+            runtime.spawn(async move {
+                crate::monetary_budget::unknown_outcome(&reporter).await;
+            });
+        }
+    }
     let labels = [
         ("outcome", outcome.as_label()),
         ("auth_path", reporter.request_source.auth_path.as_label()),
@@ -545,6 +555,9 @@ pub enum UsageType {
     /// Privacy-filter responses report input usage per classified item under
     /// `data[].usage.input_tokens` rather than in a top-level usage object.
     PrivacyClassify,
+    AudioTranscription {
+        duration_seconds: Option<i32>,
+    },
 }
 
 /// Shape of the reassembled non-streaming response when `proxy_json_request`
@@ -592,12 +605,6 @@ pub fn make_usage_reporter_for(
     usage_reporter(auth, state, model.id, model.discount_to_user, model.label)
 }
 
-/// Whether a reporter may exist: over HTTP the report is posted to cloud-api,
-/// so there must be its URL. The SQS transport sends to the queue and needs none.
-fn may_report(cloud_api_url: Option<&str>, is_http: bool) -> bool {
-    cloud_api_url.is_some() || !is_http
-}
-
 fn usage_reporter(
     auth: &crate::auth::RequireAuth,
     state: &AppState,
@@ -610,13 +617,10 @@ fn usage_reporter(
     // below, not the sk-.
     auth.cloud_api_key.as_ref()?;
     let cloud_api_url = state.config.cloud_api_url.clone();
-    if !may_report(
-        cloud_api_url.as_deref(),
-        state.usage_report_delivery.is_http(),
-    ) {
-        return None;
-    }
     Some(UsageReporter {
+        budget_report_id: None,
+        admission_mode: state.config.monetary_admission_mode,
+        admission_timeout_ms: state.config.monetary_admission_timeout_ms,
         http_client: state.http_client.clone(),
         cloud_api_url,
         model_name: model_name.to_string(),
@@ -689,6 +693,25 @@ pub(crate) fn build_usage_body(
                 "image_count": count,
                 "id": id,
             }))
+        }
+        UsageType::AudioTranscription { duration_seconds } => {
+            let usage = &response_data["usage"];
+            let usage_seconds = (usage["type"] == "duration")
+                .then(|| usage["seconds"].as_f64())
+                .flatten();
+            let metadata_seconds = response_data
+                .get("duration")
+                .and_then(|value| value.as_f64().or_else(|| value.as_str()?.parse().ok()));
+            let seconds = [usage_seconds, metadata_seconds]
+                .into_iter()
+                .flatten()
+                .find(|n| n.is_finite() && *n > 0.0 && n.ceil() <= f64::from(i32::MAX))
+                .map(|n| n.ceil() as i32)
+                .or(*duration_seconds)?;
+            Some(
+                serde_json::json!({"type":"audio_transcription", "model":model_name,
+                "duration_seconds":seconds, "id":id}),
+            )
         }
         UsageType::Embedding => input_only_usage_body("embedding", response_data, model_name, id),
         UsageType::Rerank => input_only_usage_body("rerank", response_data, model_name, id),
@@ -813,11 +836,8 @@ pub(crate) fn report_chat_usage_if_present(
     true
 }
 
-/// Report token usage to cloud-api when a streaming response finalizes — even if
-/// it did NOT complete cleanly (client disconnect, upstream error, or no `[DONE]`).
-/// Billing must not depend on a clean `[DONE]` (nearai/infra#98): the tokens were
-/// already produced. The caller keeps signing/caching gated on clean completion;
-/// a partial response cannot be verified, but it was still billed.
+/// Report the upstream counters received before the stream ended, including
+/// interrupted streams. Admission does not change the existing usage reporting.
 ///
 /// The reporter only exists for direct `sk-` requests
 /// (`RequireAuth.cloud_api_key`); cloud-api's own `InterceptStream` is not in
@@ -826,7 +846,7 @@ fn report_stream_usage_on_finalize(
     usage_reporter: &Option<UsageReporter>,
     usage: Option<((i64, i64), Option<i64>)>,
     chat_id: Option<&str>,
-    completed_cleanly: bool,
+    has_final_usage: bool,
     log_request_id: &str,
     log_org_id: &str,
     log_workspace_id: &str,
@@ -845,7 +865,7 @@ fn report_stream_usage_on_finalize(
                 "id": id,
             });
             spawn_usage_report(reporter, body);
-            if !completed_cleanly {
+            if !has_final_usage {
                 info!(
                     request_id = %log_request_id,
                     org_id = %log_org_id,
@@ -887,6 +907,9 @@ pub(crate) fn complete_usage_body(
         serde_json::Value::String(_) => return Err("string"),
         serde_json::Value::Array(_) => return Err("array"),
     };
+    if let Some(id) = &reporter.budget_report_id {
+        map.insert("admission_id".into(), serde_json::Value::String(id.clone()));
+    }
     let identity = [
         ("organization_id", &reporter.org_id),
         ("workspace_id", &reporter.workspace_id),
@@ -1261,6 +1284,41 @@ fn mark_backend_unreachable(pool: &crate::backend_pool::BackendPool, index: usiz
     }
 }
 
+async fn admit_json_attempt(
+    opts: &mut ProxyOpts,
+    body: &Bytes,
+    measured: &mut Option<crate::monetary_features::UsageFeatures>,
+) -> Result<(), AppError> {
+    let admitted_kind = matches!(
+        opts.usage_type,
+        UsageType::ChatCompletion | UsageType::ImageGeneration
+    );
+    if let Some(reporter) = opts.usage_reporter.as_mut().filter(|_| admitted_kind) {
+        if reporter.admission_mode == crate::monetary_budget::AdmissionMode::Off {
+            return Ok(());
+        }
+        if measured.is_none() {
+            let features = serde_json::from_slice::<serde_json::Value>(body)
+                .map_err(|_| AppError::BadRequest("Invalid JSON body".into()))
+                .and_then(|json| crate::monetary_budget::features(&opts.usage_type, &json, 1));
+            match features {
+                Ok(features) => *measured = Some(features),
+                Err(_)
+                    if reporter.admission_mode == crate::monetary_budget::AdmissionMode::Audit =>
+                {
+                    tracing::warn!("Admission audit could not measure request");
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some(features) = measured.as_ref() {
+            crate::monetary_budget::admit_features(reporter, features, None).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Send the request to `url`. When the connection fails before anything was
 /// sent and `opts.connect_failover` is set, retry once on another healthy
 /// backend: `url` and `opts.backend_guard` then point at the replacement.
@@ -1272,7 +1330,9 @@ async fn send_upstream(
     body: Bytes,
     opts: &mut ProxyOpts,
     endpoint: &'static str,
-) -> Result<reqwest::Response, AppError> {
+) -> Result<(reqwest::Response, crate::monetary_budget::AttemptCleanup), AppError> {
+    let mut measured = None;
+    admit_json_attempt(opts, &body, &mut measured).await?;
     let upstream_start = std::time::Instant::now();
     // The lane's time-to-first-token clock starts here. The engine sends the
     // SSE response headers only once it has something to say, so measuring
@@ -1281,9 +1341,11 @@ async fn send_upstream(
     if let Some(permit) = opts.admission.as_ref() {
         permit.mark_dispatched();
     }
-    let first = build_upstream_request(client, url, body.clone(), opts)
-        .send()
-        .await;
+    let first = crate::monetary_budget::send(
+        build_upstream_request(client, url, body.clone(), opts),
+        opts.usage_reporter.as_ref(),
+    )
+    .await;
     let response = match first {
         Ok(response) => response,
         Err(error) if error.is_connect() && opts.connect_failover.is_some() => {
@@ -1429,7 +1491,14 @@ async fn send_upstream(
                 permit.attach_backend(next.index);
             }
             opts.backend_guard = Some(next.guard);
-            match build_upstream_request(client, url, body, opts).send().await {
+            // The failed connection released its hold. Admit the replacement dispatch separately.
+            admit_json_attempt(opts, &body, &mut measured).await?;
+            match crate::monetary_budget::send(
+                build_upstream_request(client, url, body, opts),
+                opts.usage_reporter.as_ref(),
+            )
+            .await
+            {
                 Ok(response) => {
                     if let Some((affinity, key)) = affinity {
                         // Later turns follow the request, not the dead host.
@@ -1759,7 +1828,7 @@ async fn proxy_json_request_inner(
 
     let upstream_start = std::time::Instant::now();
     let mut url = url.to_string();
-    let response = send_upstream(
+    let (response, mut attempt_cleanup) = send_upstream(
         client,
         &mut url,
         Bytes::from(streaming_body),
@@ -2009,6 +2078,7 @@ async fn proxy_json_request_inner(
     // Report usage for cloud API key requests (before encryption, needs plaintext fields)
     let chat_id = response_data["id"].as_str().unwrap_or("").to_string();
     try_report_usage(&response_data, &chat_id, &opts);
+    attempt_cleanup.disarm();
 
     // Keep plaintext usage values for bounded completion metrics after every
     // fallible transform, serialization, and signing step has succeeded.
@@ -2604,8 +2674,9 @@ async fn open_upstream_stream(
     url: &mut String,
     request_body: Vec<u8>,
     opts: &mut ProxyOpts,
-) -> Result<UpstreamByteStream, AppError> {
-    let response = send_upstream(client, url, Bytes::from(request_body), opts, "streaming").await?;
+) -> Result<(UpstreamByteStream, crate::monetary_budget::AttemptCleanup), AppError> {
+    let (response, attempt_cleanup) =
+        send_upstream(client, url, Bytes::from(request_body), opts, "streaming").await?;
 
     let status = response.status();
     if !status.is_success() {
@@ -2689,10 +2760,13 @@ async fn open_upstream_stream(
     }
 
     // Re-attach the peeked chunk so the pump sees the complete stream.
-    Ok(Box::pin(futures_util::stream::StreamExt::chain(
-        futures_util::stream::iter(first_chunk.map(Ok)),
-        byte_stream,
-    )))
+    Ok((
+        Box::pin(futures_util::stream::StreamExt::chain(
+            futures_util::stream::iter(first_chunk.map(Ok)),
+            byte_stream,
+        )),
+        attempt_cleanup,
+    ))
 }
 
 /// The upstream body, boxed so the peeked first chunk can be re-attached
@@ -2893,7 +2967,7 @@ async fn proxy_streaming_request_inner(
         // disconnect, not a failed stream.
         let stream_errors = opts.model_request.filter(|_| !tx.is_closed());
 
-        let byte_stream = match opened {
+        let (byte_stream, mut attempt_cleanup) = match opened {
             Ok(stream) => {
                 let delivered = start_tx
                     .take()
@@ -3158,21 +3232,18 @@ async fn proxy_streaming_request_inner(
             );
         }
 
-        // Bill for the tokens the backend already produced, even when the stream
-        // did NOT finish cleanly (nearai/infra#98). With continuous_usage_stats
-        // forced on cloud-key streaming (routes/chat.rs, routes/completions.rs),
-        // `parser.usage` holds the running cumulative counts from the last chunk
-        // we saw — the best figure at the point of interruption. Signing/caching
-        // stays gated on a clean [DONE] below.
+        // Report known upstream usage even if the stream or its delivery failed.
+        // Signing still requires downstream success and upstream completion.
         report_stream_usage_on_finalize(
             &usage_reporter,
             parser.usage.map(|usage| (usage, parser.cached_tokens)),
             parser.chat_id.as_deref(),
-            completed_cleanly,
+            parser.seen_done && !error_event_seen,
             &log_request_id,
             &log_org_id,
             &log_workspace_id,
         );
+        attempt_cleanup.disarm();
 
         // Only sign and cache for a fully completed stream
         if completed_cleanly {
@@ -3480,7 +3551,10 @@ async fn proxy_multipart_request_inner(
 ) -> Result<Response, AppError> {
     let upstream_start = std::time::Instant::now();
     let req = apply_tracing_headers(client.post(url).multipart(form), opts.tracing_ids.as_ref());
-    let response = req.send().await.map_err(|e| AppError::Internal(e.into()))?;
+    let (response, mut attempt_cleanup) =
+        crate::monetary_budget::send(req, opts.usage_reporter.as_ref())
+            .await
+            .map_err(|e| AppError::Internal(e.into()))?;
     metrics::histogram!("upstream_request_duration_seconds", "endpoint" => "multipart")
         .record(upstream_start.elapsed().as_secs_f64());
 
@@ -3523,6 +3597,7 @@ async fn proxy_multipart_request_inner(
 
     // Report usage for cloud API key requests (before encryption, needs plaintext fields)
     try_report_usage(&response_data, &response_id, &opts);
+    attempt_cleanup.disarm();
     let input_tokens = response_data
         .pointer("/usage/prompt_tokens")
         .and_then(|v| v.as_i64())
@@ -4135,6 +4210,9 @@ mod tests {
         api_key_id: Option<&str>,
     ) -> UsageReporter {
         UsageReporter {
+            budget_report_id: None,
+            admission_mode: crate::monetary_budget::AdmissionMode::Enforce,
+            admission_timeout_ms: 2000,
             http_client: reqwest::Client::new(),
             cloud_api_url: Some("http://cloud-api.invalid".to_string()),
             model_name: "test-model".to_string(),
@@ -4154,6 +4232,615 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn monetary_admission_denial_never_dispatches_upstream() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let ledger = MockServer::start().await;
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/internal/budget"))
+            .respond_with(ResponseTemplate::new(402))
+            .expect(1)
+            .mount(&ledger)
+            .await;
+        let mut opts = test_proxy_opts();
+        let mut reporter = reporter_with(Some("test-token"), Some("org"), Some("ws"), Some("key"));
+        reporter.cloud_api_url = Some(ledger.uri());
+        opts.usage_reporter = Some(reporter);
+        let mut url = format!("{}/v1/chat/completions", upstream.uri());
+        let result = send_upstream(
+            &reqwest::Client::new(),
+            &mut url,
+            Bytes::from_static(br#"{"model":"test-model","messages":[]}"#),
+            &mut opts,
+            "test",
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::InsufficientCredits)));
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn monetary_admission_maps_metadata_and_capacity_errors() {
+        use axum::response::IntoResponse;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let ledger = MockServer::start().await;
+        for status in [400_u16, 403, 429, 503] {
+            ledger.reset().await;
+            Mock::given(wiremock::matchers::path("/v1/internal/budget"))
+                .respond_with(ResponseTemplate::new(status))
+                .expect(1)
+                .mount(&ledger)
+                .await;
+            let mut reporter = reporter_with(Some("token"), Some("org"), Some("ws"), Some("key"));
+            reporter.cloud_api_url = Some(ledger.uri());
+            let error = crate::monetary_budget::admit(
+                &mut reporter,
+                &UsageType::ChatCompletion,
+                &serde_json::json!({}),
+                1,
+            )
+            .await
+            .unwrap_err();
+            let response = error.into_response();
+            assert_eq!(response.status().as_u16(), status);
+            if status == 429 {
+                assert_eq!(response.headers()["retry-after"], "2");
+            }
+            assert!(reporter.budget_report_id.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn monetary_failures_release_only_pre_dispatch_and_mark_other_outcomes_unknown() {
+        use wiremock::matchers::{body_json, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let ledger = MockServer::start().await;
+        let upstream = MockServer::start().await;
+        let mut reporter = reporter_with(Some("token"), Some("org"), Some("ws"), Some("key"));
+        reporter.cloud_api_url = Some(ledger.uri());
+        reporter.http_client = reqwest::Client::builder().no_proxy().build().unwrap();
+        reporter.budget_report_id = Some(uuid::Uuid::new_v4().to_string());
+        Mock::given(path("/v1/internal/budget/release"))
+            .and(body_json(
+                serde_json::json!({"organization_id":"org","id":reporter.budget_report_id}),
+            ))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(2)
+            .mount(&ledger)
+            .await;
+        Mock::given(path("/v1/internal/budget/unknown"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(2)
+            .mount(&ledger)
+            .await;
+        Mock::given(path("/error"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&upstream)
+            .await;
+        Mock::given(path("/slow"))
+            .respond_with(
+                ResponseTemplate::new(200).set_delay(std::time::Duration::from_millis(100)),
+            )
+            .mount(&upstream)
+            .await;
+        let client = &reporter.http_client;
+        assert_eq!(
+            crate::monetary_budget::send(
+                client.post(format!("{}/error", upstream.uri())),
+                Some(&reporter)
+            )
+            .await
+            .unwrap()
+            .0
+            .status(),
+            503
+        );
+        assert!(crate::monetary_budget::send(
+            client
+                .post(format!("{}/slow", upstream.uri()))
+                .timeout(std::time::Duration::from_millis(10)),
+            Some(&reporter)
+        )
+        .await
+        .err()
+        .unwrap()
+        .is_timeout());
+        let notices = ledger.received_requests().await.unwrap();
+        assert_eq!(notices.len(), 2);
+        assert!(notices
+            .iter()
+            .all(|request| request.url.path() == "/v1/internal/budget/unknown"));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        assert!(crate::monetary_budget::send(
+            client.post(format!("http://{address}")),
+            Some(&reporter)
+        )
+        .await
+        .err()
+        .unwrap()
+        .is_connect());
+        assert!(
+            crate::monetary_budget::send(client.post("invalid URL"), Some(&reporter))
+                .await
+                .err()
+                .unwrap()
+                .is_builder()
+        );
+    }
+
+    #[tokio::test]
+    async fn monetary_response_processing_finishes_the_attempt_once() {
+        use http_body_util::BodyExt;
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        for (kind, success) in [
+            ("json", false),
+            ("multipart", false),
+            ("sse", false),
+            ("json", true),
+            ("multipart", true),
+            ("sse", true),
+        ] {
+            let ledger = MockServer::start().await;
+            let upstream = MockServer::start().await;
+            Mock::given(path("/v1/internal/budget"))
+                .respond_with(|request: &Request| {
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id": body["id"], "model": "test-model", "mode": "enforce"
+                    }))
+                })
+                .expect(1)
+                .mount(&ledger)
+                .await;
+            Mock::given(path("/v1/internal/budget/unknown"))
+                .respond_with(ResponseTemplate::new(204))
+                .expect(u64::from(!success))
+                .mount(&ledger)
+                .await;
+            Mock::given(path("/v1/internal/usage"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(u64::from(success))
+                .mount(&ledger)
+                .await;
+            let completion = serde_json::json!({
+                "id":"test-response", "choices":[{"index":0,"delta":{},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":1,"completion_tokens":1}, "text":"ok"
+            });
+            let response = match (kind, success) {
+                ("sse", true) => ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!("data: {completion}\n\ndata: [DONE]\n\n")),
+                ("sse", false) => ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: {\"error\":{\"message\":\"failed\",\"code\":503}}\n\n"),
+                (_, true) => ResponseTemplate::new(200).set_body_json(completion),
+                (_, false) => ResponseTemplate::new(200).set_body_string("invalid json"),
+            };
+            Mock::given(path("/inference"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&upstream)
+                .await;
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let mut reporter = reporter_with(Some("token"), Some("org"), Some("ws"), Some("key"));
+            reporter.cloud_api_url = Some(ledger.uri());
+            reporter.http_client = client.clone();
+            let delivery = reporter.delivery.clone();
+            let mut opts = test_proxy_opts();
+            let body = serde_json::json!({"model":"test-model","messages":[]});
+            if kind == "multipart" {
+                opts.usage_type = UsageType::AudioTranscription {
+                    duration_seconds: Some(1),
+                };
+                crate::monetary_budget::admit(&mut reporter, &opts.usage_type, &body, 1)
+                    .await
+                    .unwrap();
+            }
+            opts.usage_reporter = Some(reporter);
+            opts.stream_error_peek_ms = 1000;
+            let url = format!("{}/inference", upstream.uri());
+            let body = serde_json::to_vec(&body).unwrap();
+            let result = match kind {
+                "multipart" => {
+                    proxy_multipart_request(
+                        &client,
+                        &url,
+                        reqwest::multipart::Form::new().text("model", "test-model"),
+                        "test-hash",
+                        opts,
+                    )
+                    .await
+                }
+                "sse" => proxy_streaming_request(&client, &url, body, opts).await,
+                _ => proxy_json_request(&client, &url, body, opts).await,
+            };
+            assert_eq!(result.is_ok(), success, "{kind}");
+            if let Ok(response) = result {
+                response.into_body().collect().await.unwrap();
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if ledger.received_requests().await.unwrap().len() == 2 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{kind} did not finish its attempt (success={success})"));
+            assert_eq!(
+                delivery
+                    .drain(std::time::Duration::from_secs(2))
+                    .await
+                    .left(),
+                0
+            );
+            let requests = ledger.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 2, "{kind}");
+            assert_eq!(
+                requests[1].url.path(),
+                if success {
+                    "/v1/internal/usage"
+                } else {
+                    "/v1/internal/budget/unknown"
+                }
+            );
+            let admission: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+            let notice: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+            let id_field = if success { "admission_id" } else { "id" };
+            assert_eq!(notice[id_field], admission["id"], "{kind}");
+        }
+    }
+
+    #[tokio::test]
+    async fn monetary_body_cancellation_marks_unknown_without_releasing() {
+        use tokio::io::AsyncWriteExt;
+        use wiremock::matchers::{body_json, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let ledger = MockServer::start().await;
+        let mut reporter = reporter_with(Some("token"), Some("org"), Some("ws"), Some("key"));
+        reporter.cloud_api_url = Some(ledger.uri());
+        reporter.http_client = reqwest::Client::builder().no_proxy().build().unwrap();
+        reporter.budget_report_id = Some(uuid::Uuid::new_v4().to_string());
+        Mock::given(path("/v1/internal/budget/unknown"))
+            .and(body_json(serde_json::json!({
+                "organization_id":"org", "id":reporter.budget_report_id
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&ledger)
+            .await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            assert_streaming_post(&mut socket).await;
+            socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{")
+                .await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let (response, cleanup) = crate::monetary_budget::send(
+            reporter
+                .http_client
+                .post(format!("http://{address}"))
+                .json(&serde_json::json!({"model":"test-model","stream":true})),
+            Some(&reporter),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(ledger.received_requests().await.unwrap().is_empty());
+        let task = tokio::spawn(async move {
+            let _cleanup = cleanup;
+            response.bytes().await
+        });
+        tokio::task::yield_now().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while ledger.received_requests().await.unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        server.abort();
+        let requests = ledger.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/v1/internal/budget/unknown");
+    }
+
+    #[tokio::test]
+    async fn monetary_modes_preserve_inference_without_attaching_a_reservation() {
+        use crate::monetary_budget::AdmissionMode;
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+        let ledger = MockServer::start().await;
+        let upstream = MockServer::start().await;
+        Mock::given(path("/chat"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(3)
+            .mount(&upstream)
+            .await;
+        for mode in [
+            AdmissionMode::Off,
+            AdmissionMode::Audit,
+            AdmissionMode::Enforce,
+        ] {
+            ledger.reset().await;
+            if mode != AdmissionMode::Off {
+                Mock::given(path("/v1/internal/budget"))
+                    .respond_with(move |request: &Request| {
+                        let request: serde_json::Value =
+                            serde_json::from_slice(&request.body).unwrap();
+                        assert_eq!(request["mode"], serde_json::to_value(mode).unwrap());
+                        // Audit continues through an unavailable ledger; a central audit policy
+                        // also tells an enforcing proxy explicitly that no reservation was made.
+                        if mode == AdmissionMode::Audit {
+                            ResponseTemplate::new(503)
+                        } else {
+                            ResponseTemplate::new(200).set_body_json(
+                                serde_json::json!({"id":null,"mode":"audit","model":"canonical"}),
+                            )
+                        }
+                    })
+                    .expect(1)
+                    .mount(&ledger)
+                    .await;
+            }
+            let mut reporter = reporter_with(Some("token"), Some("org"), Some("ws"), Some("key"));
+            reporter.cloud_api_url = Some(ledger.uri());
+            reporter.admission_mode = mode;
+            let mut opts = test_proxy_opts();
+            opts.usage_reporter = Some(reporter);
+            let (response, _cleanup) = send_upstream(
+                &reqwest::Client::new(),
+                &mut format!("{}/chat", upstream.uri()),
+                Bytes::from_static(br#"{"model":"test","messages":[],"max_tokens":1}"#),
+                &mut opts,
+                "test",
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), 200);
+            assert!(opts.usage_reporter.unwrap().budget_report_id.is_none());
+            if mode == AdmissionMode::Off {
+                assert!(ledger.received_requests().await.unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn default_proxy_follows_the_organization_admission_decision() {
+        use crate::monetary_budget::AdmissionMode;
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+        let ledger = MockServer::start().await;
+        for mode in [
+            AdmissionMode::Audit,
+            AdmissionMode::Enforce,
+            AdmissionMode::Off,
+        ] {
+            ledger.reset().await;
+            Mock::given(path("/v1/internal/budget"))
+                .respond_with(move |request: &Request| {
+                    let request: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    assert_eq!(request["mode"], "enforce");
+                    let id = if mode == AdmissionMode::Enforce {
+                        request["id"].clone()
+                    } else {
+                        serde_json::Value::Null
+                    };
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"id":id,"mode":mode,"model":"canonical"}))
+                })
+                .expect(1)
+                .mount(&ledger)
+                .await;
+            let mut reporter = reporter_with(Some("token"), Some("org"), Some("ws"), Some("key"));
+            assert_eq!(reporter.admission_mode, AdmissionMode::default());
+            reporter.cloud_api_url = Some(ledger.uri());
+            crate::monetary_budget::admit(
+                &mut reporter,
+                &UsageType::ChatCompletion,
+                &serde_json::json!({}),
+                1,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                reporter.budget_report_id.is_some(),
+                mode == AdmissionMode::Enforce
+            );
+            assert_eq!(reporter.model_name, "canonical");
+        }
+    }
+
+    #[tokio::test]
+    async fn monetary_timeout_and_cancellation_release_the_generated_id_without_dispatch() {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+        for cancel in [false, true] {
+            let ledger = MockServer::start().await;
+            Mock::given(path("/v1/internal/budget"))
+                .respond_with(|request: &Request| {
+                    let request: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    ResponseTemplate::new(200)
+                        .set_delay(std::time::Duration::from_secs(2))
+                        .set_body_json(serde_json::json!({"id":request["id"],"model":"test"}))
+                })
+                .expect(1)
+                .mount(&ledger)
+                .await;
+            Mock::given(path("/v1/internal/budget/release"))
+                .respond_with(ResponseTemplate::new(204))
+                .expect(1)
+                .mount(&ledger)
+                .await;
+            let mut reporter = reporter_with(Some("token"), Some("org"), Some("ws"), Some("key"));
+            reporter.cloud_api_url = Some(ledger.uri());
+            reporter.admission_timeout_ms = if cancel { 2000 } else { 20 };
+            let task = tokio::spawn(async move {
+                crate::monetary_budget::admit(
+                    &mut reporter,
+                    &UsageType::ChatCompletion,
+                    &serde_json::json!({}),
+                    1,
+                )
+                .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while ledger.received_requests().await.unwrap().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            if cancel {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            } else {
+                assert!(task.await.unwrap().is_err());
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    let requests = ledger.received_requests().await.unwrap();
+                    if requests.len() == 2 {
+                        let admit: serde_json::Value =
+                            serde_json::from_slice(&requests[0].body).unwrap();
+                        let release: serde_json::Value =
+                            serde_json::from_slice(&requests[1].body).unwrap();
+                        assert_eq!(admit["id"], release["id"]);
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn monetary_admission_preserves_request_and_receipt_identity_is_stable() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+        let ledger = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/internal/budget"))
+            .respond_with(|request: &Request| {
+                let metadata: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert!(metadata.get("messages").is_none());
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id":metadata["id"], "model":"test-model"
+                }))
+            })
+            .expect(2)
+            .mount(&ledger)
+            .await;
+        let mut reporter = reporter_with(Some("test-token"), Some("org"), Some("ws"), Some("key"));
+        reporter.cloud_api_url = Some(ledger.uri());
+        let body = serde_json::json!({"messages":[{"role":"user","content":"synthetic"}],"max_completion_tokens":16});
+        crate::monetary_budget::admit(&mut reporter, &UsageType::ChatCompletion, &body, 1)
+            .await
+            .unwrap();
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(body["max_completion_tokens"], 16);
+        let original_id = reporter.budget_report_id.clone().unwrap();
+        let response = serde_json::json!({"usage":{"prompt_tokens":2,"completion_tokens":3}});
+        let mut first = build_usage_body(
+            &UsageType::ChatCompletion,
+            &response,
+            "test-model",
+            "provider-id",
+        )
+        .unwrap();
+        complete_usage_body(&reporter, &mut first).unwrap();
+        let mut retry = first.clone();
+        complete_usage_body(&reporter, &mut retry).unwrap();
+        assert_eq!(first, retry);
+        assert_eq!(first["id"], "provider-id");
+        assert_eq!(first["admission_id"], original_id);
+        crate::monetary_budget::admit(&mut reporter, &UsageType::ChatCompletion, &body, 1)
+            .await
+            .unwrap();
+        assert_ne!(
+            reporter.budget_report_id.as_deref(),
+            Some(original_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn monetary_admission_covers_batched_prompts_and_best_of() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+        let ledger = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/internal/budget"))
+            .respond_with(|request: &Request| {
+                let metadata: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(metadata["features"]["choices"], 5);
+                assert!(metadata.get("prompt").is_none());
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id":metadata["id"], "model":"test-model"
+                }))
+            })
+            .expect(3)
+            .mount(&ledger)
+            .await;
+        for (prompt, batch) in [
+            (serde_json::json!(["a", "b", "c"]), 3),
+            (serde_json::json!([[1, 2], [3, 4]]), 2),
+            (serde_json::json!([1, 2, 3]), 1),
+        ] {
+            let mut reporter =
+                reporter_with(Some("test-token"), Some("org"), Some("ws"), Some("key"));
+            reporter.cloud_api_url = Some(ledger.uri());
+            let body = serde_json::json!({"prompt":prompt,"n":2,"best_of":5,"max_tokens":16});
+            crate::monetary_budget::admit(&mut reporter, &UsageType::ChatCompletion, &body, 1)
+                .await
+                .unwrap();
+            let requests = ledger.received_requests().await.unwrap();
+            let metadata: serde_json::Value =
+                serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+            assert_eq!(metadata["features"]["batch_items"], batch);
+        }
+    }
+
+    #[tokio::test]
+    async fn monetary_admission_missing_configuration_or_bad_reply_fails_closed() {
+        let mut reporter = reporter_with(None, Some("org"), Some("ws"), Some("key"));
+        let body = serde_json::json!({});
+        assert!(
+            crate::monetary_budget::admit(&mut reporter, &UsageType::ChatCompletion, &body, 1)
+                .await
+                .is_err()
+        );
+        assert!(reporter.budget_report_id.is_none());
+        let ledger = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id":"wrong","model":"test-model"})),
+            )
+            .mount(&ledger)
+            .await;
+        reporter.cloud_api_usage_token = Some("test-token".into());
+        reporter.cloud_api_url = Some(ledger.uri());
+        assert!(
+            crate::monetary_budget::admit(&mut reporter, &UsageType::ChatCompletion, &body, 1)
+                .await
+                .is_err()
+        );
+        assert!(reporter.budget_report_id.is_none());
+    }
     #[test]
     fn test_can_use_service_token_path_requires_all_fields() {
         // Token + all three identity fields: green light.
@@ -4185,15 +4872,6 @@ mod tests {
 
         // Nothing configured: reporting is skipped.
         assert!(!reporter_with(None, None, None, None).can_use_service_token_path());
-    }
-
-    /// The reporter's cloud-api URL is required over HTTP and not over SQS.
-    #[test]
-    fn the_reporter_gate_needs_cloud_api_only_over_http() {
-        assert!(may_report(Some("https://cloud"), true));
-        assert!(!may_report(None, true));
-        assert!(may_report(None, false));
-        assert!(may_report(Some("https://cloud"), false));
     }
 
     /// The SQS transport sends to the queue: it needs neither cloud-api's URL
@@ -4461,6 +5139,77 @@ mod tests {
         assert_eq!(body["model"], "privacy-model");
         assert_eq!(body["input_tokens"], 42);
         assert_eq!(body["id"], "id-4");
+    }
+
+    #[test]
+    fn test_build_audio_usage_prefers_provider_seconds_then_duration_then_file() {
+        for (response, expected) in [
+            (
+                serde_json::json!({"usage":{"type":"duration","seconds":91}}),
+                Some(91),
+            ),
+            (
+                serde_json::json!({"usage":{"type":"duration","seconds":4},"duration":1.25}),
+                Some(4),
+            ),
+            (serde_json::json!({"duration":1.25}), Some(2)),
+            (serde_json::json!({"duration":"1.25"}), Some(2)),
+            (
+                serde_json::json!({"usage":{"type":"tokens","input_tokens":91}}),
+                None,
+            ),
+            (serde_json::json!({}), None),
+        ] {
+            for local_duration in [None, Some(3)] {
+                let report = build_usage_body(
+                    &UsageType::AudioTranscription {
+                        duration_seconds: local_duration,
+                    },
+                    &response,
+                    "audio-model",
+                    "transcription-id",
+                );
+                assert_eq!(
+                    report.as_ref().and_then(|r| r["duration_seconds"].as_i64()),
+                    expected.or(local_duration).map(i64::from),
+                    "{response}"
+                );
+                if let Some(report) = report {
+                    assert_eq!(report["type"], "audio_transcription");
+                    assert_eq!(report["id"], "transcription-id");
+                    assert_eq!(report["model"], "audio-model");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_audio_usage_invalid_seconds_allow_duration_and_file_fallback() {
+        for usage in [
+            serde_json::json!({"type":"duration","seconds":0}),
+            serde_json::json!({"type":"duration","seconds":-1}),
+            serde_json::json!({"type":"duration","seconds":2147483648_u64}),
+            serde_json::json!({"type":"duration","seconds":"bad"}),
+            serde_json::json!({"type":"duration"}),
+            serde_json::json!({"type":"tokens","seconds":91}),
+            serde_json::json!(null),
+            serde_json::json!([]),
+        ] {
+            for (duration, expected) in [(serde_json::json!(1.25), 2), (serde_json::json!(null), 3)]
+            {
+                let response = serde_json::json!({"usage":usage,"duration":duration});
+                let report = build_usage_body(
+                    &UsageType::AudioTranscription {
+                        duration_seconds: Some(3),
+                    },
+                    &response,
+                    "audio-model",
+                    "transcription-id",
+                )
+                .unwrap();
+                assert_eq!(report["duration_seconds"], expected, "{response}");
+            }
+        }
     }
 
     #[test]
@@ -4942,6 +5691,106 @@ mod tests {
         "\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
         "data: [DONE]\n\n"
     );
+
+    #[tokio::test]
+    async fn admitted_sse_reports_known_usage_without_done_or_downstream_delivery() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+        for (streaming, final_usage, idle_timeout) in [
+            (false, false, 0),
+            (true, false, 0),
+            (true, false, 1),
+            (true, true, 0),
+        ] {
+            let ledger = MockServer::start().await;
+            let upstream = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/internal/budget"))
+                .respond_with(|request: &Request| {
+                    let metadata: serde_json::Value =
+                        serde_json::from_slice(&request.body).unwrap();
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id":metadata["id"], "model":"test-model"
+                    }))
+                })
+                .expect(1)
+                .mount(&ledger)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/v1/internal/usage"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&ledger)
+                .await;
+            let body = if final_usage {
+                VALID_CHAT_SSE
+            } else {
+                VALID_CHAT_SSE.strip_suffix("data: [DONE]\n\n").unwrap()
+            };
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+                .mount(&upstream)
+                .await;
+            let mut reporter =
+                reporter_with(Some("test-token"), Some("org"), Some("ws"), Some("key"));
+            reporter.cloud_api_url = Some(ledger.uri());
+            let delivery = reporter.delivery.clone();
+            let mut opts = test_proxy_opts();
+            opts.usage_reporter = Some(reporter);
+            opts.stream_idle_timeout_secs = idle_timeout;
+            let url = format!("{}/v1/chat/completions", upstream.uri());
+            if streaming {
+                if final_usage {
+                    opts.chunk_transform = Some(Arc::new(|_| {
+                        Err(AppError::Internal(anyhow::anyhow!(
+                            "injected transform failure"
+                        )))
+                    }));
+                }
+                let response = proxy_streaming_request(
+                    &reqwest::Client::new(),
+                    &url,
+                    br#"{"model":"test-model","stream":true,"messages":[]}"#.to_vec(),
+                    opts,
+                )
+                .await
+                .unwrap();
+                let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await;
+                assert_eq!(body.is_err(), final_usage || idle_timeout > 0);
+            } else {
+                // The existing idle-timeout=0 behavior can assemble a partial JSON response.
+                // Admission must preserve both that response and its usage reporting.
+                let response = proxy_json_request(
+                    &reqwest::Client::new(),
+                    &url,
+                    br#"{"model":"test-model","messages":[]}"#.to_vec(),
+                    opts,
+                )
+                .await
+                .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            assert_eq!(
+                delivery
+                    .drain(std::time::Duration::from_secs(5))
+                    .await
+                    .left(),
+                0
+            );
+            ledger.verify().await;
+            let requests = ledger.received_requests().await.unwrap();
+            let body_for = |path| {
+                let request = requests.iter().find(|r| r.url.path() == path).unwrap();
+                serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()
+            };
+            let admission = body_for("/v1/internal/budget");
+            let usage = body_for("/v1/internal/usage");
+            assert_eq!(usage["admission_id"], admission["id"]);
+            assert_eq!(usage["id"], "chat-slow-prefill");
+            assert_eq!(usage["input_tokens"], 1);
+            assert_eq!(usage["output_tokens"], 1);
+        }
+    }
 
     const ROLE_ONLY_CHAT_SSE: &str = concat!(
         "data: {\"id\":\"chat-hidden-reasoning\",\"model\":\"test-model\",",
@@ -6371,7 +7220,7 @@ data: [DONE]
         opts.admission = controller.try_admit(&pool, None).unwrap();
 
         let mut url = format!("http://{addr}/v1/chat/completions");
-        let response = send_upstream(
+        let (response, _cleanup) = send_upstream(
             &reqwest::Client::new(),
             &mut url,
             Bytes::from_static(b"{}"),

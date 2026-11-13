@@ -202,6 +202,14 @@ pub fn trusted_request_depth(headers: &axum::http::HeaderMap, state: &AppState) 
 
 pub async fn run_chat_completion(
     ctx: ChatCompletionContext,
+    request_json: Value,
+) -> Result<Response, AppError> {
+    let reporter = make_usage_reporter(&ctx.auth, &ctx.state);
+    crate::monetary_budget::scope(reporter, run_admitted_chat_completion(ctx, request_json)).await
+}
+
+async fn run_admitted_chat_completion(
+    ctx: ChatCompletionContext,
     mut request_json: Value,
 ) -> Result<Response, AppError> {
     let started = Instant::now();
@@ -1000,6 +1008,25 @@ async fn post_chat_json(
     let body = Bytes::from(body);
     let attempts = max_attempts.max(1);
     for attempt in 1..=attempts {
+        let mut reporter = crate::monetary_budget::scoped_reporter();
+        let attempt_body = if let Some(reporter) = reporter.as_mut() {
+            let json: Value =
+                serde_json::from_slice(&body).map_err(|e| AppError::Internal(e.into()))?;
+            // The existing Fusion tariff is the outer model's tariff. Every call
+            // receives an independent estimate and receipt under that same tariff.
+            let execution_model = json.get("model").and_then(Value::as_str).map(str::to_owned);
+            crate::monetary_budget::admit_for_model(
+                reporter,
+                &UsageType::ChatCompletion,
+                &json,
+                1,
+                execution_model.as_deref(),
+            )
+            .await?;
+            body.clone()
+        } else {
+            body.clone()
+        };
         let attempt_started = Instant::now();
         // Local (pool) calls carry the backend credential; direct panel/judge
         // calls to other endpoints use their own bearer on the plain client.
@@ -1022,18 +1049,19 @@ async fn post_chat_json(
             req = req.header(k, v);
         }
 
-        let response = match req.body(body.clone()).send().await {
-            Ok(response) => response,
-            Err(e) => {
-                record_upstream_attempt(label, attempt_started);
-                let retry = attempt < attempts && is_retryable_transport_error(&e);
-                if retry {
-                    sleep_before_fusion_retry(state, attempt).await;
-                    continue;
+        let (response, mut attempt_cleanup) =
+            match crate::monetary_budget::send(req.body(attempt_body), reporter.as_ref()).await {
+                Ok(response) => response,
+                Err(e) => {
+                    record_upstream_attempt(label, attempt_started);
+                    let retry = attempt < attempts && is_retryable_transport_error(&e);
+                    if retry {
+                        sleep_before_fusion_retry(state, attempt).await;
+                        continue;
+                    }
+                    return Err(map_fusion_transport_error(e));
                 }
-                return Err(map_fusion_transport_error(e));
-            }
-        };
+            };
 
         let status = response.status();
         if !status.is_success() && attempt < attempts && status.is_server_error() {
@@ -1062,7 +1090,24 @@ async fn post_chat_json(
                 body: bytes,
             });
         }
-        return serde_json::from_slice(&bytes).map_err(|e| AppError::Internal(e.into()));
+        let response: Value =
+            serde_json::from_slice(&bytes).map_err(|e| AppError::Internal(e.into()))?;
+        if let Some(reporter) = reporter.as_ref() {
+            let fallback_id = uuid::Uuid::new_v4().to_string();
+            if let Some(usage) = proxy::build_usage_body(
+                &UsageType::ChatCompletion,
+                &response,
+                &reporter.model_name,
+                response
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&fallback_id),
+            ) {
+                proxy::spawn_usage_report(reporter, usage);
+                attempt_cleanup.disarm();
+            }
+        }
+        return Ok(response);
     }
 
     unreachable!("fusion retry loop always returns early on the last attempt");
@@ -1509,7 +1554,7 @@ async fn finish_response(
         model_name: ctx.state.config.model_name.clone(),
         model_label: None,
         model_request: None,
-        usage_reporter: make_usage_reporter(&ctx.auth, &ctx.state),
+        usage_reporter: None, // Individual attempts were settled inside post_chat_json.
         usage_type: UsageType::ChatCompletion,
         request_hash: Some(ctx.request_hash.clone()),
         response_transform: ctx.response_transform,

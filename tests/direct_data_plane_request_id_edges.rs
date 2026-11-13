@@ -1,5 +1,6 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use common::budget_fixture;
 use tower::ServiceExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -104,6 +105,7 @@ async fn invalid_request_id_is_replaced_and_forwarded_to_score_upstream() {
 async fn public_cloud_api_key_tenant_headers_are_not_forwarded() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))

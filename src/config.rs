@@ -655,6 +655,8 @@ pub struct Config {
 
     // Cloud API for sk- key validation
     pub cloud_api_url: Option<String>,
+    pub monetary_admission_mode: crate::monetary_budget::AdmissionMode,
+    pub monetary_admission_timeout_ms: u64,
     /// Maximum attempts (initial + retries) for `POST /v1/check_api_key`.
     /// 1 disables retry. Retries are issued only on transport errors and 5xx.
     pub cloud_api_auth_max_attempts: usize,
@@ -1261,10 +1263,26 @@ impl Config {
                 }
             });
 
+        let monetary_admission_mode = env::var("MONETARY_ADMISSION")
+            .unwrap_or_else(|_| "enforce".into())
+            .parse::<crate::monetary_budget::AdmissionMode>()?;
+        let monetary_admission_timeout_ms = env::var("MONETARY_ADMISSION_TIMEOUT_MS")
+            .unwrap_or_else(|_| "2000".into())
+            .parse::<u64>()?;
+        anyhow::ensure!(
+            (100..=10000).contains(&monetary_admission_timeout_ms),
+            "MONETARY_ADMISSION_TIMEOUT_MS must be 100..10000"
+        );
         let cloud_api_url = env::var("CLOUD_API_URL")
             .ok()
             .filter(|s| !s.is_empty())
             .map(|s| s.trim_end_matches('/').to_string());
+        if cloud_api_url.is_some()
+            && monetary_admission_mode != crate::monetary_budget::AdmissionMode::Off
+            && !env::var("CLOUD_API_USAGE_TOKEN").is_ok_and(|v| !v.trim().is_empty())
+        {
+            anyhow::bail!("CLOUD_API_URL enables direct Cloud API keys and requires CLOUD_API_USAGE_TOKEN for admission, including SQS reporting");
+        }
         // cloud-api's internal catalog answers 401 without the service token,
         // so a lane told to read it has to hold one: fail at startup instead
         // of serving a models document that can never be read.
@@ -1480,6 +1498,8 @@ impl Config {
             cloud_api_auth_initial_backoff_ms: env_int("CLOUD_API_AUTH_INITIAL_BACKOFF_MS", 100)
                 as u64,
             cloud_api_auth_timeout_secs: env_int("CLOUD_API_AUTH_TIMEOUT_SECS", 5) as u64,
+            monetary_admission_mode,
+            monetary_admission_timeout_ms,
             cloud_api_usage_token: env::var("CLOUD_API_USAGE_TOKEN")
                 .ok()
                 .filter(|s| !s.is_empty()),
@@ -2286,6 +2306,16 @@ mod tests {
             ],
             || {
                 Config::from_env().expect("sqs bills without cloud-api");
+                env::set_var("CLOUD_API_URL", "https://cloud-api.test");
+                assert!(Config::from_env()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires CLOUD_API_USAGE_TOKEN"));
+                env::set_var("CLOUD_API_USAGE_TOKEN", "usage-token");
+                Config::from_env()
+                    .expect("direct keys require admission credentials even with SQS");
+                env::remove_var("CLOUD_API_URL");
+                env::remove_var("CLOUD_API_USAGE_TOKEN");
             },
         );
         with_clean_env(&base, &[token], || {
@@ -2985,6 +3015,40 @@ mod tests {
     }
 
     #[test]
+    fn test_monetary_admission_modes_and_timeout_are_validated() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "m"),
+                ("TOKEN", "t"),
+                ("MONETARY_ADMISSION", "enforce"),
+                ("MONETARY_ADMISSION_TIMEOUT_MS", "2000"),
+            ],
+            || {
+                gateway_env_cleanup();
+                assert_eq!(
+                    Config::from_env().unwrap().monetary_admission_timeout_ms,
+                    2000
+                );
+                for mode in ["enforce", "audit", "off"] {
+                    env::set_var("MONETARY_ADMISSION", mode);
+                    assert!(Config::from_env().is_ok());
+                }
+                env::set_var("MONETARY_ADMISSION", "typo");
+                assert!(Config::from_env()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("MONETARY_ADMISSION"));
+                env::set_var("MONETARY_ADMISSION", "enforce");
+                for timeout in ["0", "99", "10001", "invalid"] {
+                    env::set_var("MONETARY_ADMISSION_TIMEOUT_MS", timeout);
+                    assert!(Config::from_env().is_err());
+                }
+                gateway_env_cleanup();
+            },
+        );
+    }
+
+    #[test]
     fn test_internal_models_document_requires_the_usage_token() {
         with_env_vars(&[("MODEL_NAME", "m"), ("TOKEN", "t")], || {
             gateway_env_cleanup();
@@ -3000,15 +3064,18 @@ mod tests {
             env::set_var("CLOUD_API_USAGE_TOKEN", "usage-secret");
             assert!(Config::from_env().is_ok());
 
-            // The public document needs no token.
+            // A public document needs no token, but enabling direct keys still does.
             env::remove_var("CLOUD_API_USAGE_TOKEN");
             env::set_var(
                 "VLLM_PROXY_MODELS_DOCUMENT_URL",
                 "https://cloud-api.test/v1/models",
             );
-            assert!(Config::from_env().is_ok());
-
+            assert!(Config::from_env()
+                .unwrap_err()
+                .to_string()
+                .contains("requires CLOUD_API_USAGE_TOKEN"));
             env::remove_var("CLOUD_API_URL");
+            assert!(Config::from_env().is_ok());
             gateway_env_cleanup();
         });
     }

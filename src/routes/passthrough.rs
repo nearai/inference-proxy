@@ -200,6 +200,7 @@ pub async fn images_edits(
     let max_size = state.config.max_image_request_size;
     let mut form = reqwest::multipart::Form::new();
     let mut total_size: usize = 0;
+    let mut requested_images = 1_u64;
     let mut hasher = sha2::Sha256::new();
 
     while let Some(mut field) = multipart
@@ -228,6 +229,12 @@ pub async fn images_edits(
         } else {
             let data =
                 read_field_chunks(&mut field, &mut total_size, max_size, &mut hasher).await?;
+            if name == "n" {
+                requested_images = std::str::from_utf8(&data)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1);
+            }
             crate::model_list::guard_form_field(&state, &name, &data)?;
             let part = build_multipart_part(data, file_name, content_type)?;
             form = form.part(name, part);
@@ -243,6 +250,18 @@ pub async fn images_edits(
             state.signing.clone(),
         )
     });
+
+    let mut usage_reporter = make_usage_reporter(&auth, &state);
+    if let Some(reporter) = &mut usage_reporter {
+        crate::monetary_budget::admit(
+            reporter,
+            &UsageType::ImageGeneration,
+            &serde_json::json!({"n": requested_images}),
+            1,
+        )
+        .await?;
+    }
+
     let target = passthrough_target(
         &state,
         state.config.images_edits_url_override.as_deref(),
@@ -256,7 +275,7 @@ pub async fn images_edits(
         model_name: state.config.model_name.clone(),
         model_label: None,
         model_request: None,
-        usage_reporter: make_usage_reporter(&auth, &state),
+        usage_reporter,
         usage_type: UsageType::ImageGeneration,
         request_hash: None,
         response_transform,
@@ -291,6 +310,7 @@ pub async fn audio_transcriptions(
     let max_size = state.config.max_audio_request_size;
     let mut form = reqwest::multipart::Form::new();
     let mut total_size: usize = 0;
+    let mut duration_file = None;
     // Always hash the raw (original) bytes for signatures, matching the Python proxy.
     // When encryption is active, the prompt field is hashed in its encrypted form,
     // then decrypted for forwarding to the backend.
@@ -323,6 +343,11 @@ pub async fn audio_transcriptions(
             let data =
                 read_field_chunks(&mut field, &mut total_size, max_size, &mut hasher).await?;
             crate::model_list::guard_form_field(&state, &name, &data)?;
+            // The multipart body and duration reader share this upload allocation.
+            let data = bytes::Bytes::from(data);
+            if name == "file" && auth.cloud_api_key.is_some() {
+                duration_file = Some(data.clone());
+            }
             let part = build_multipart_part(data, file_name, content_type)?;
             form = form.part(name, part);
         }
@@ -337,6 +362,23 @@ pub async fn audio_transcriptions(
             state.signing.clone(),
         )
     });
+
+    let duration_seconds = match duration_file {
+        Some(bytes) => crate::audio_duration::measure(bytes).await,
+        None => None,
+    };
+    let usage_type = UsageType::AudioTranscription { duration_seconds };
+    let mut usage_reporter = make_usage_reporter(&auth, &state);
+    if let Some(reporter) = &mut usage_reporter {
+        crate::monetary_budget::admit(
+            reporter,
+            &usage_type,
+            &serde_json::json!({"media_bytes": total_size}),
+            1,
+        )
+        .await?;
+    }
+
     let target = passthrough_target(
         &state,
         state.config.transcriptions_url_override.as_deref(),
@@ -350,8 +392,8 @@ pub async fn audio_transcriptions(
         model_name: state.config.model_name.clone(),
         model_label: None,
         model_request: None,
-        usage_reporter: make_usage_reporter(&auth, &state),
-        usage_type: UsageType::ChatCompletion,
+        usage_reporter,
+        usage_type,
         request_hash: None,
         response_transform,
         chunk_transform: None,
@@ -479,11 +521,11 @@ async fn read_field_chunks(
 
 /// Build a multipart part with optional filename and content type.
 fn build_multipart_part(
-    data: Vec<u8>,
+    data: impl Into<reqwest::Body>,
     file_name: Option<String>,
     content_type: Option<String>,
 ) -> Result<reqwest::multipart::Part, AppError> {
-    let mut part = reqwest::multipart::Part::bytes(data);
+    let mut part = reqwest::multipart::Part::stream(data);
     if let Some(fname) = file_name {
         part = part.file_name(fname);
     }

@@ -11058,6 +11058,7 @@ async fn zdr_send(app: axum::Router, request: Request<Body>) {
 #[tokio::test]
 async fn request_content_never_reaches_logs_or_metrics() {
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({

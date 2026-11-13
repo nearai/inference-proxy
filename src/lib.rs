@@ -17,7 +17,6 @@ pub mod context_tier;
 pub mod encryption;
 pub mod engine_load;
 pub mod error;
-pub mod fusion;
 pub mod gpu_evidence_delegate;
 pub mod image_validation;
 pub mod media_inline;
@@ -69,7 +68,6 @@ pub struct AppState {
     pub backend_pool: Arc<backend_pool::BackendPool>,
     pub ohttp_gateway: Option<Arc<ohttp_gateway::OhttpGateway>>,
     pub ohttp_attestation_ed25519: Option<types::OhttpAttestation>,
-    pub fusion_caches: Arc<fusion::FusionCaches>,
     pub vllm_dp_affinity: Arc<vllm_dp_affinity::VllmDpAffinity>,
     /// Conversation → backend pinning across `backend_pool` (see
     /// `VLLM_BACKEND_CONVERSATION_AFFINITY`). Inactive with one backend.

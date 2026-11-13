@@ -5,7 +5,7 @@ use tokio::net::TcpListener;
 use tracing::info;
 use vllm_proxy_rs::ohttp_gateway::OhttpGateway;
 use vllm_proxy_rs::{
-    admission, attestation, backend_affinity, backend_pool, cache, config, engine_load, fusion,
+    admission, attestation, backend_affinity, backend_pool, cache, config, engine_load,
     metrics_middleware, model_list, routes, signing, startup_checks, usage_report,
     vllm_dp_affinity, AppState,
 };
@@ -362,7 +362,6 @@ async fn main() -> anyhow::Result<()> {
         backend_pool: backend_pool.clone(),
         ohttp_gateway: ohttp_gw,
         ohttp_attestation_ed25519: ohttp_attestation_ed25519.clone(),
-        fusion_caches: Arc::new(fusion::FusionCaches::default()),
         vllm_dp_affinity,
         backend_affinity,
         admission,

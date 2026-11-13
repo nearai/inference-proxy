@@ -208,7 +208,6 @@ fn single_model_state(process: model_list::Process<'_>) -> AppState {
         backend_pool,
         ohttp_gateway: None,
         ohttp_attestation_ed25519: None,
-        fusion_caches: Arc::new(fusion::FusionCaches::default()),
         vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(None, 1_200)),
         models: None,
         api_key_cache: Default::default(),

@@ -202,7 +202,7 @@ the variable. Unset or empty = off, and `priority` is exactly as above.
   tiers in this mode; it only forwards the caller header, and the CVM proxy
   in front of each engine adds the bonus.
 - **E2EE.** The bonus is computed after request-field decryption, from the
-  plaintext the engine will see, for plain, E2EE, fusion and agent-loop
+  plaintext the engine will see, for plain, E2EE and agent-loop
   requests alike (the caller-class value is still set before decryption, as
   it never depends on content). A field the proxy cannot decrypt is rejected
   before this step, so no path falls back to bonus 0 for ciphertext.
@@ -571,10 +571,9 @@ queueing" refusal. The consequences are deliberate:
   above the threshold contributes no time-to-first-generation sample, and that
   is fixed at admission: a request that falls back onto the base fleet does not
   start counting. Back-pressure marks and engine-queue avoidance still apply.
-- **Not for fusion or the agent loop.** `VLLM_BACKEND_LONG_CONTEXT_URLS`
-  together with `FUSION_ENABLED` or `WEB_CONTEXT_SEARCH_URL` is refused at
-  startup: those modes place their own backend requests, which no tier
-  restriction reaches.
+- **Not for the agent loop.** `VLLM_BACKEND_LONG_CONTEXT_URLS`
+  together with `WEB_CONTEXT_SEARCH_URL` is refused at startup: that mode
+  places its own backend requests, which no tier restriction reaches.
 
 ## Usage report delivery
 
@@ -875,7 +874,7 @@ The rest of the environment in list mode:
   backends, for which a list entry has no fallback. `VLLM_BASE_URL` is not
   read.
 - `NON_TEE_DEPLOYMENT=1` and `VLLM_PROXY_MODELS_DOCUMENT_URL` are required.
-- `FUSION_ENABLED`, `WEB_CONTEXT_SEARCH_URL`, `OHTTP_ENABLED`,
+- `WEB_CONTEXT_SEARCH_URL`, `OHTTP_ENABLED`,
   `VLLM_DATA_PARALLEL_SIZE`, `OPENAI_CHAT_COMPATIBILITY_CHECK` and
   `REPLICA_STATE_REDIS_URL` cannot be combined with a list: each assumes one
   model per process.

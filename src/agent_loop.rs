@@ -694,7 +694,7 @@ async fn drive_loop(
                                 "Web search timed out. Please answer using your existing knowledge or ask the user for more detail.".to_string(),
                             )
                         }
-                        Err(BraveError::Other(_)) => {
+                        Err(BraveError::Other) => {
                             warn!(
                                 tool = WEB_CONTEXT_SEARCH_TOOL_NAME,
                                 error_kind = "upstream_failure",
@@ -1306,7 +1306,7 @@ async fn forward_done(
 
 enum BraveError {
     Timeout,
-    Other(String),
+    Other,
 }
 
 /// Hit Brave's LLM Context endpoint and return a model-ready text block.
@@ -1356,13 +1356,13 @@ async fn brave_llm_context_search(
         if e.is_timeout() {
             BraveError::Timeout
         } else {
-            BraveError::Other(format!("brave request failed: {}", error_category(&e)))
+            BraveError::Other
         }
     })?;
 
     let status = response.status();
     if !status.is_success() {
-        return Err(BraveError::Other(format!("brave HTTP {}", status.as_u16())));
+        return Err(BraveError::Other);
     }
 
     // Read the body in chunks so we can enforce a hard size cap regardless
@@ -1372,59 +1372,17 @@ async fn brave_llm_context_search(
     let mut body_bytes: Vec<u8> = Vec::with_capacity(16 * 1024);
     let mut body_stream = response.bytes_stream();
     while let Some(chunk) = body_stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            BraveError::Other(format!("brave body read failed: {}", error_category(&e)))
-        })?;
+        let chunk = chunk.map_err(|_| BraveError::Other)?;
         if body_bytes.len().saturating_add(chunk.len()) > BRAVE_MAX_RESPONSE_BYTES {
-            return Err(BraveError::Other(format!(
-                "brave response exceeded {BRAVE_MAX_RESPONSE_BYTES}-byte cap"
-            )));
+            return Err(BraveError::Other);
         }
         body_bytes.extend_from_slice(&chunk);
     }
 
-    let parsed: BraveContextResponse = serde_json::from_slice(&body_bytes).map_err(|e| {
-        BraveError::Other(format!(
-            "brave JSON parse failed: {:?} at line {} column {}",
-            e.classify(),
-            e.line(),
-            e.column()
-        ))
-    })?;
+    let parsed: BraveContextResponse =
+        serde_json::from_slice(&body_bytes).map_err(|_| BraveError::Other)?;
 
     Ok(format_context_response(&parsed, count))
-}
-
-pub(crate) async fn brave_llm_context_search_text(
-    client: &reqwest::Client,
-    url: &str,
-    api_key: &str,
-    query: &str,
-    timeout: Duration,
-    tracing_ids: &TracingIds,
-) -> Result<String, String> {
-    brave_llm_context_search(client, url, api_key, query, None, timeout, tracing_ids)
-        .await
-        .map_err(|err| match err {
-            BraveError::Timeout => "timeout".to_string(),
-            BraveError::Other(msg) => msg,
-        })
-}
-
-fn error_category(e: &reqwest::Error) -> &'static str {
-    if e.is_timeout() {
-        "timeout"
-    } else if e.is_connect() {
-        "connect"
-    } else if e.is_request() {
-        "request"
-    } else if e.is_body() {
-        "body"
-    } else if e.is_decode() {
-        "decode"
-    } else {
-        "unknown"
-    }
 }
 
 /// Brave LLM Context response shape (subset). Mirror of cloud-api's

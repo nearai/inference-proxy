@@ -3842,7 +3842,7 @@ pub(crate) struct CompletionContext {
 }
 
 /// Sign already-fetched JSON response bytes, cache the signature, and return a JSON response.
-/// Used by Fusion and privacy classification after they assemble the upstream body.
+/// Used by privacy classification after it assembles the upstream body.
 pub(crate) async fn sign_and_cache_json_response(
     response_bytes: &[u8],
     request_sha256: &str,

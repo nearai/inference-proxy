@@ -6,6 +6,7 @@ use axum::Extension;
 
 use sha2::Digest;
 
+use crate::agent_loop;
 use crate::auth::RequireAuth;
 use crate::backend_affinity::parse_replica_hint;
 use crate::encryption::{self, Endpoint};
@@ -14,7 +15,6 @@ use crate::model_metrics::ModelRequest;
 use crate::proxy::{self, make_usage_reporter_for, ProxyOpts, ResponseShape, UsageType};
 use crate::routes::completion_placement::place_completion;
 use crate::routes::ROUTE_CHAT_COMPLETIONS;
-use crate::{agent_loop, fusion};
 use crate::{AppState, RequestStart, TracingIds};
 
 /// POST /v1/chat/completions
@@ -72,7 +72,7 @@ async fn serve(
 
     // Engine `priority`: the proxy decides it (trusted callers may set it via
     // header; any client value is discarded). Before any branch so the agent
-    // loop and fusion inherit it.
+    // loop inherits it.
     crate::priority::apply_priority(
         &mut request_json,
         &headers,
@@ -81,7 +81,7 @@ async fn serve(
     );
     // Engine prompt-cache namespace: set by the proxy for an `sk-` caller
     // (bound to its organization and workspace), left as sent by a trusted
-    // caller. Before any branch so fusion and the agent loop inherit it.
+    // caller. Before any branch so the agent loop inherits it.
     crate::cache_salt::apply(&mut request_json, &auth)?;
     // Gateway mode: an aggregator's `reasoning` object becomes the engine's
     // `reasoning_effort` switch (`enabled: false` → `none`), otherwise the
@@ -161,7 +161,7 @@ async fn serve(
     }
     // Size bonus on the engine `priority`: needs the plaintext prompt, so it
     // runs here (after decryption and the repairs) and before every branch
-    // that forwards the body: fusion, the agent loop and the plain proxy path.
+    // that forwards the body: the agent loop and the plain proxy path.
     if let Some(tiers) = &state.config.priority_size_tiers {
         crate::priority::apply_size_bonus(
             &mut request_json,
@@ -193,16 +193,11 @@ async fn serve(
         model.backend_tier_strict,
         || estimate.unwrap_or_else(|| crate::context_tier::chat_estimate(&request_json)),
     );
-    // A Fusion member call of a request this process admitted runs under
-    // that request's slot: neither admission half applies to it.
-    let under_outer_admission = fusion::holds_outer_admission(&headers, &state);
     // Lane admission (gateway mode), first half: the overload and budget
     // checks, so a request the lane cannot take is refused before any image
     // is fetched. The slot and the backend placement are taken on the normal
     // proxy path below, after the special branches, right before dispatch.
-    if !under_outer_admission {
-        model.admission.precheck(model.backend_pool, tier)?;
-    }
+    model.admission.precheck(model.backend_pool, tier)?;
     // Same conversation digest, applied across independent backends: later
     // turns follow the backend that already holds this conversation's prefix.
     let backend_affinity_key = model
@@ -217,46 +212,6 @@ async fn serve(
         .await?;
     crate::image_validation::reject_invalid_images(&request_json, &state.config.image_validation())
         .await?;
-
-    if state.config.fusion_enabled && fusion::has_fusion_tool(&request_json) {
-        let depth = fusion::trusted_request_depth(&headers, &state);
-        if depth >= state.config.fusion_max_depth {
-            return Err(AppError::BadRequest("fusion_depth_exceeded".to_string()));
-        }
-
-        let (response_transform, chunk_transform) = if let Some(ctx) = enc_ctx.clone() {
-            let signing = state.signing.clone();
-            (
-                Some(encryption::make_response_transform(
-                    Endpoint::ChatCompletions,
-                    ctx.clone(),
-                    signing.clone(),
-                )),
-                Some(encryption::make_chunk_transform(
-                    Endpoint::ChatCompletions,
-                    ctx,
-                    signing,
-                )),
-            )
-        } else {
-            (None, None)
-        };
-
-        return fusion::run_chat_completion(
-            fusion::ChatCompletionContext {
-                state,
-                auth,
-                tracing_ids,
-                request_hash,
-                is_stream,
-                response_transform,
-                chunk_transform,
-            },
-            request_json,
-        )
-        .await
-        .map_err(|err| err.for_encrypted_request(enc_ctx.is_some()));
-    }
 
     // Server-side agent loop opt-in: the request advertises exactly
     // `{"type":"web_context_search"}` and nothing else. Requires streaming
@@ -328,7 +283,7 @@ async fn serve(
 
     // The first-token deadline is sized by the same estimate, and needs it
     // only here: on the normal proxy path, for streams, when the feature is
-    // on. Fusion and the agent loop returned above without paying for it.
+    // on. The agent loop returned above without paying for it.
     let estimate = estimate.or_else(|| {
         (is_stream && state.config.first_token_deadline_ms > 0)
             .then(|| crate::context_tier::chat_estimate(&request_json))
@@ -378,7 +333,6 @@ async fn serve(
         tier,
         backend_affinity_key,
         hint,
-        !under_outer_admission,
     )?;
     let opts = ProxyOpts {
         signing: state.signing.clone(),

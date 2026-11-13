@@ -961,6 +961,12 @@ pub struct Config {
     pub rerank_url_override: Option<String>,
     pub score_url_override: Option<String>,
 
+    /// `/v1/rerank` in-flight limits (`rerank_limit.rs`):
+    /// `VLLM_PROXY_RERANK_MAX_INFLIGHT_PER_WORKSPACE` (default 2),
+    /// `_DIRECT` (16, all Cloud API keys together) and `_TRUSTED` (16, all
+    /// config tokens together). Each must be at least 1.
+    pub rerank_limits: crate::rerank_limit::RerankLimits,
+
     /// Path to the dstack guest agent unix socket. Probed by `/healthz` so
     /// upstream load balancers can detach this instance when the socket is
     /// unreachable (otherwise `/v1/attestation/report` silently 500s while
@@ -1597,6 +1603,20 @@ impl Config {
             transcriptions_url_override,
             rerank_url_override,
             score_url_override,
+            rerank_limits: crate::rerank_limit::RerankLimits {
+                per_workspace: env_parse(
+                    "VLLM_PROXY_RERANK_MAX_INFLIGHT_PER_WORKSPACE",
+                    crate::rerank_limit::DEFAULT_MAX_IN_FLIGHT_PER_WORKSPACE,
+                )?,
+                direct: env_parse(
+                    "VLLM_PROXY_RERANK_MAX_INFLIGHT_DIRECT",
+                    crate::rerank_limit::DEFAULT_MAX_IN_FLIGHT_DIRECT,
+                )?,
+                trusted: env_parse(
+                    "VLLM_PROXY_RERANK_MAX_INFLIGHT_TRUSTED",
+                    crate::rerank_limit::DEFAULT_MAX_IN_FLIGHT_TRUSTED,
+                )?,
+            },
             dstack_socket_path: env_or("DSTACK_SOCKET_PATH", "/var/run/dstack.sock"),
             web_context_search_url: env::var("WEB_CONTEXT_SEARCH_URL")
                 .ok()
@@ -1643,6 +1663,26 @@ impl Config {
                 "ATTESTATION_CACHE_TTL must be at least 2 (got {})",
                 config.attestation_cache_ttl_secs
             );
+        }
+
+        // A rerank limit of 0 would refuse every request of its pool.
+        for (name, value) in [
+            (
+                "VLLM_PROXY_RERANK_MAX_INFLIGHT_PER_WORKSPACE",
+                config.rerank_limits.per_workspace,
+            ),
+            (
+                "VLLM_PROXY_RERANK_MAX_INFLIGHT_DIRECT",
+                config.rerank_limits.direct,
+            ),
+            (
+                "VLLM_PROXY_RERANK_MAX_INFLIGHT_TRUSTED",
+                config.rerank_limits.trusted,
+            ),
+        ] {
+            if value == 0 {
+                anyhow::bail!("{name} must be at least 1");
+            }
         }
 
         // Validate startup check configuration
@@ -2036,6 +2076,44 @@ mod tests {
         assert_eq!(with("0").unwrap().ohttp_max_inflight, 0);
         let err = with("lots").unwrap_err().to_string();
         assert!(err.contains("OHTTP_MAX_INFLIGHT"), "{err}");
+    }
+
+    #[test]
+    fn test_rerank_limits_default_override_and_invalid() {
+        let base = [("MODEL_NAME", "m"), ("TOKEN", "t")];
+        let with = |extra: &[(&'static str, &'static str)]| {
+            let mut vars = base.to_vec();
+            vars.extend_from_slice(extra);
+            with_env_vars(&vars, Config::from_env)
+        };
+        assert_eq!(
+            with(&[]).unwrap().rerank_limits,
+            crate::rerank_limit::RerankLimits::default()
+        );
+        let config = with(&[
+            ("VLLM_PROXY_RERANK_MAX_INFLIGHT_PER_WORKSPACE", "4"),
+            ("VLLM_PROXY_RERANK_MAX_INFLIGHT_DIRECT", "32"),
+            ("VLLM_PROXY_RERANK_MAX_INFLIGHT_TRUSTED", "8"),
+        ])
+        .unwrap();
+        assert_eq!(
+            config.rerank_limits,
+            crate::rerank_limit::RerankLimits {
+                per_workspace: 4,
+                direct: 32,
+                trusted: 8,
+            }
+        );
+        for name in [
+            "VLLM_PROXY_RERANK_MAX_INFLIGHT_PER_WORKSPACE",
+            "VLLM_PROXY_RERANK_MAX_INFLIGHT_DIRECT",
+            "VLLM_PROXY_RERANK_MAX_INFLIGHT_TRUSTED",
+        ] {
+            let err = with(&[(name, "0")]).unwrap_err().to_string();
+            assert!(err.contains(name));
+            let err = with(&[(name, "many")]).unwrap_err().to_string();
+            assert!(err.contains(name));
+        }
     }
 
     #[test]

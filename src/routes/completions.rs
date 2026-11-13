@@ -178,7 +178,7 @@ async fn serve(
     } else {
         ReplicaHint::Absent
     };
-    let placed = place_completion(&state, &model, ROUTE_COMPLETIONS, tier, None, hint)?;
+    let placed = place_completion(&state, &model, ROUTE_COMPLETIONS, tier, None, hint, true)?;
 
     let opts = ProxyOpts {
         signing: state.signing.clone(),

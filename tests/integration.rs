@@ -45,6 +45,8 @@ struct TestAppOptions {
     priority_lower_first: bool,
     /// `TOKEN_LABELS`, one per token.
     token_labels: Vec<&'static str>,
+    /// `VLLM_PROXY_ADMISSION_MAX_INFLIGHT`, also the start budget; 0 = off.
+    admission_max_inflight: u32,
 }
 
 impl Default for TestAppOptions {
@@ -74,6 +76,7 @@ impl Default for TestAppOptions {
             priority_size_tiers: None,
             priority_lower_first: false,
             token_labels: Vec::new(),
+            admission_max_inflight: 0,
         }
     }
 }
@@ -287,6 +290,7 @@ fn build_test_app_inner_with_pool(
         transcriptions_url_override: None,
         rerank_url_override: None,
         score_url_override: None,
+        rerank_limits: Default::default(),
         ohttp_enabled: false,
         ohttp_max_inflight: 0,
         listen_port: 8000,
@@ -315,11 +319,11 @@ fn build_test_app_inner_with_pool(
         reasoning_off_effort: "none".to_string(),
         allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,
-        admission_max_inflight: 0,
+        admission_max_inflight: options.admission_max_inflight,
         admission_tier_borrowing: false,
         admission_long_max_inflight_per_host: 0,
         admission_long_reserved_inflight: 0,
-        admission_start_inflight: 0,
+        admission_start_inflight: options.admission_max_inflight,
         admission_ramp_step: 8,
         admission_ramp_interval_secs: 1800,
         admission_ttft_p95_max_ms: 30_000,
@@ -393,6 +397,11 @@ fn build_test_app_inner_with_pool(
         ),
     );
 
+    let admission = Arc::new(vllm_proxy_rs::admission::AdmissionController::new(
+        config.admission(),
+        backend_pool.len(),
+        Arc::new(vllm_proxy_rs::engine_load::EngineLoad::disabled()),
+    ));
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),
@@ -409,7 +418,7 @@ fn build_test_app_inner_with_pool(
             vllm_proxy_rs::attestation::TlsCertTracker::new(None).expect("tracker for None path"),
         ),
         backend_pool: backend_pool.clone(),
-        admission: Arc::new(vllm_proxy_rs::admission::AdmissionController::disabled()),
+        admission,
         ohttp_gateway: None,
         ohttp_attestation_ed25519: None,
         fusion_caches: Arc::new(fusion::FusionCaches::default()),
@@ -2810,20 +2819,47 @@ async fn test_forced_fusion_streaming_emits_usage_metadata_and_signature() {
 /// Panel, judge and synthesis stubs for a forced streaming Fusion run whose
 /// final chat ID is `chatcmpl-final-direct`. With `billable` the three calls
 /// report 2+3, 4+5 and 6+7 tokens; without it none reports any usage.
+fn fusion_stub_usage(billable: bool, prompt: i64, completion: i64) -> serde_json::Value {
+    if billable {
+        serde_json::json!({
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": prompt + completion
+        })
+    } else {
+        serde_json::json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+    }
+}
+
 async fn mount_forced_fusion_stream_stubs(mock_server: &MockServer, billable: bool) {
     use wiremock::matchers::body_string_contains;
 
-    let usage = |prompt: i64, completion: i64| {
-        if billable {
-            serde_json::json!({
-                "prompt_tokens": prompt,
-                "completion_tokens": completion,
-                "total_tokens": prompt + completion
-            })
-        } else {
-            serde_json::json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
-        }
-    };
+    mount_forced_fusion_member_stubs(mock_server, billable).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("final synthesis model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-final-direct",
+            "object": "chat.completion",
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Direct Fusion works."},
+                "finish_reason": "stop"
+            }],
+            "usage": fusion_stub_usage(billable, 6, 7)
+        })))
+        .with_priority(3)
+        .mount(mock_server)
+        .await;
+}
+
+/// Discovery (`panel-a` on the mock), attestation, panel (2 + 3 tokens) and
+/// judge (4 + 5 tokens) stubs, without the local synthesis.
+async fn mount_forced_fusion_member_stubs(mock_server: &MockServer, billable: bool) {
+    use wiremock::matchers::body_string_contains;
+
+    let usage = |prompt: i64, completion: i64| fusion_stub_usage(billable, prompt, completion);
 
     Mock::given(method("GET"))
         .and(path("/endpoints"))
@@ -2877,23 +2913,6 @@ async fn mount_forced_fusion_stream_stubs(mock_server: &MockServer, billable: bo
             "usage": usage(4, 5)
         })))
         .with_priority(2)
-        .mount(mock_server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_string_contains("final synthesis model"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-final-direct",
-            "object": "chat.completion",
-            "model": "test-model",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "Direct Fusion works."},
-                "finish_reason": "stop"
-            }],
-            "usage": usage(6, 7)
-        })))
-        .with_priority(3)
         .mount(mock_server)
         .await;
 }
@@ -3088,6 +3107,335 @@ async fn test_config_token_fusion_streaming_without_usage_is_served() {
 
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert!(get_usage_requests(&cloud_api).await.is_empty());
+}
+
+/// The single usage report of a direct-key Fusion request that ended
+/// without a served response: the summed usage of the calls that completed,
+/// under a request-scoped billing ID, with the key's identity.
+async fn assert_one_unserved_fusion_usage_report(cloud_api: &MockServer, input: i64, output: i64) {
+    wait_for_usage_request(cloud_api, 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let usage_reqs = get_usage_requests(cloud_api).await;
+    assert_eq!(usage_reqs.len(), 1, "exactly one usage report");
+    assert_eq!(usage_reqs[0]["type"], "chat_completion");
+    assert_eq!(usage_reqs[0]["input_tokens"], input);
+    assert_eq!(usage_reqs[0]["output_tokens"], output);
+    assert!(usage_reqs[0]["id"].as_str().unwrap().starts_with("stream-"));
+    assert_eq!(usage_reqs[0]["organization_id"], "org-test");
+    assert_eq!(usage_reqs[0]["workspace_id"], "ws-test");
+    assert_eq!(usage_reqs[0]["api_key_id"], "key-test");
+}
+
+/// A direct-key Fusion request whose local synthesis fails reports the
+/// panel and judge usage once; a config-token caller gets no report.
+#[tokio::test]
+async fn test_direct_key_fusion_synthesis_failure_reports_member_usage() {
+    use wiremock::matchers::body_string_contains;
+
+    let mock_server = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    mount_forced_fusion_member_stubs(&mock_server, true).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("final synthesis model"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .set_body_json(serde_json::json!({"error": {"message": "engine failed"}})),
+        )
+        .with_priority(3)
+        .mount(&mock_server)
+        .await;
+    mount_fusion_direct_key_cloud_api(&cloud_api).await;
+    let app = build_test_app_with_fusion_and_cloud_api(
+        &mock_server.uri(),
+        format!("{}/endpoints", mock_server.uri()),
+        &cloud_api.uri(),
+    );
+
+    let response = app
+        .clone()
+        .oneshot(forced_fusion_stream_request(FUSION_DIRECT_KEY_BEARER))
+        .await
+        .unwrap();
+    assert!(response.status().is_server_error(), "{}", response.status());
+    // The billed error carries the `inference-id` of its one usage report.
+    let inference_id = response
+        .headers()
+        .get("inference-id")
+        .expect("billed Fusion error carries inference-id")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let body = body_to_json(response).await;
+    assert_eq!(body["error"]["message"], "engine failed");
+    assert_one_unserved_fusion_usage_report(&cloud_api, 6, 8).await;
+    let usage_reqs = get_usage_requests(&cloud_api).await;
+    let namespace = uuid::Uuid::from_u128(0x1966acaf_9f95_5dab_b8f0_03a51c091314);
+    assert_eq!(
+        inference_id,
+        uuid::Uuid::new_v5(&namespace, usage_reqs[0]["id"].as_str().unwrap().as_bytes())
+            .to_string()
+    );
+
+    let response = app
+        .oneshot(forced_fusion_stream_request("Bearer test-token"))
+        .await
+        .unwrap();
+    assert!(response.status().is_server_error(), "{}", response.status());
+    assert!(response.headers().get("inference-id").is_none());
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(get_usage_requests(&cloud_api).await.len(), 1);
+}
+
+/// An empty synthesis answer is refused, and every call's usage, the
+/// synthesis included, is still reported once.
+#[tokio::test]
+async fn test_direct_key_fusion_empty_synthesis_reports_aggregate_usage() {
+    use wiremock::matchers::body_string_contains;
+
+    let mock_server = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    mount_forced_fusion_member_stubs(&mock_server, true).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("final synthesis model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-final-empty",
+            "object": "chat.completion",
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "  "},
+                "finish_reason": "stop"
+            }],
+            "usage": fusion_stub_usage(true, 6, 7)
+        })))
+        .with_priority(3)
+        .mount(&mock_server)
+        .await;
+    mount_fusion_direct_key_cloud_api(&cloud_api).await;
+    let app = build_test_app_with_fusion_and_cloud_api(
+        &mock_server.uri(),
+        format!("{}/endpoints", mock_server.uri()),
+        &cloud_api.uri(),
+    );
+
+    let response = app
+        .oneshot(forced_fusion_stream_request(FUSION_DIRECT_KEY_BEARER))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = body_to_json(response).await;
+    assert_eq!(body["error"]["message"], "fusion_synthesis_empty");
+    assert_one_unserved_fusion_usage_report(&cloud_api, 12, 15).await;
+}
+
+/// When every panel fails after the outer model invoked Fusion, the
+/// preflight call's usage is reported once.
+#[tokio::test]
+async fn test_direct_key_fusion_all_panels_failed_reports_preflight_usage() {
+    use wiremock::matchers::body_string_contains;
+
+    let mock_server = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/endpoints"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"endpoints": []})),
+        )
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("__nearai_fusion"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-fusion-preflight",
+            "object": "chat.completion",
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call-fusion",
+                        "type": "function",
+                        "function": {"name": "__nearai_fusion", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    mount_fusion_direct_key_cloud_api(&cloud_api).await;
+    let app = build_test_app_with_fusion_and_cloud_api(
+        &mock_server.uri(),
+        format!("{}/endpoints", mock_server.uri()),
+        &cloud_api.uri(),
+    );
+
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Deliberate"}],
+        "tools": [{"type": "nearai:fusion", "analysis_models": ["missing-panel"]}],
+        "stream": false
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", FUSION_DIRECT_KEY_BEARER)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = body_to_json(response).await;
+    assert_eq!(body["error"]["message"], "all_panels_failed");
+    assert_one_unserved_fusion_usage_report(&cloud_api, 2, 3).await;
+}
+
+/// With a one-slot admission budget, a Fusion request whose panel and judge
+/// resolve back to this same proxy is served: the member calls run under the
+/// request's own slot instead of being refused for a second one. The slot is
+/// free again afterwards, and the reservation header never reaches the engine.
+#[tokio::test]
+async fn test_fusion_member_calls_back_to_this_proxy_reuse_the_admission_slot() {
+    use wiremock::matchers::body_string_contains;
+
+    let backend = MockServer::start().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+
+    Mock::given(method("GET"))
+        .and(path("/endpoints"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "endpoints": [{"domain": proxy_url, "models": ["test-model"]}]
+        })))
+        .mount(&backend)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains(
+            "one member of a private multi-model panel",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-panel-local",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Panel answer."},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
+        })))
+        .with_priority(1)
+        .mount(&backend)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("strict JSON only"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-judge-local",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "{\"consensus\":\"local\",\"disagreements\":[],\"strengths\":[],\"risks\":[],\"synthesis_guidance\":\"local final\"}"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 5, "total_tokens": 9}
+        })))
+        .with_priority(2)
+        .mount(&backend)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-final-local",
+            "object": "chat.completion",
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Local Fusion works."},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 6, "completion_tokens": 7, "total_tokens": 13}
+        })))
+        .with_priority(3)
+        .mount(&backend)
+        .await;
+
+    let app = build_test_app_inner_with_fusion(
+        &backend.uri(),
+        TestAppOptions {
+            fusion_enabled: true,
+            fusion_endpoints_url: Some(format!("{}/endpoints", backend.uri())),
+            fusion_internal_max_attempts: 1,
+            admission_max_inflight: 1,
+            ..Default::default()
+        },
+    );
+    let served = app.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, served).await;
+    });
+
+    let fusion_request = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Deliberate locally"}],
+        "tools": [{
+            "type": "nearai:fusion",
+            "analysis_models": ["test-model"],
+            "model": "test-model"
+        }],
+        "tool_choice": "required",
+        "stream": false
+    });
+    let chat = |body: &serde_json::Value| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header(auth_header().0, auth_header().1)
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap()
+    };
+
+    let response = app.clone().oneshot(chat(&fusion_request)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_to_json(response).await;
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "Local Fusion works."
+    );
+    assert_eq!(body["nearai_fusion"]["panel"][0]["status"], "ok");
+    assert_eq!(body["nearai_fusion"]["judge"]["status"], "ok");
+    assert_eq!(body["usage"]["prompt_tokens"], 12);
+
+    // The slot was released with the Fusion request.
+    let plain = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Plain"}],
+        "stream": false
+    });
+    let response = app.oneshot(chat(&plain)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    for request in backend.received_requests().await.unwrap() {
+        assert!(request
+            .headers
+            .get(vllm_proxy_rs::fusion::ADMISSION_RESERVATION_HEADER)
+            .is_none());
+    }
 }
 
 #[tokio::test]
@@ -7235,6 +7583,7 @@ fn build_test_app_with_cloud_api_retries(
         transcriptions_url_override: None,
         rerank_url_override: None,
         score_url_override: None,
+        rerank_limits: Default::default(),
         ohttp_enabled: false,
         ohttp_max_inflight: 0,
         listen_port: 8000,
@@ -10559,6 +10908,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         transcriptions_url_override: None,
         rerank_url_override: None,
         score_url_override: None,
+        rerank_limits: Default::default(),
         ohttp_enabled: true,
         ohttp_max_inflight: 0,
         listen_port: 0, // not used in oneshot tests
@@ -11122,6 +11472,7 @@ async fn start_ohttp_server_with_relay_limit(
         transcriptions_url_override: None,
         rerank_url_override: None,
         score_url_override: None,
+        rerank_limits: Default::default(),
         ohttp_enabled: true,
         ohttp_max_inflight: 0,
         listen_port: port,

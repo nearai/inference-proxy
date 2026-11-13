@@ -21,7 +21,9 @@ pub(super) struct PlacedCompletion {
 /// The routes retain request adaptation and transport choices. This function
 /// owns the common gateway policy that must stay aligned across both routes.
 /// Budget, share, back-pressure, engine view and pool are `model`'s own, so
-/// one model at its limit refuses nothing for another.
+/// one model at its limit refuses nothing for another. `admit` is false only
+/// for a request that already runs under a budget slot (a Fusion member call
+/// of a request this process admitted): it is placed without a second slot.
 pub(super) fn place_completion(
     state: &AppState,
     model: &ModelView<'_>,
@@ -29,9 +31,14 @@ pub(super) fn place_completion(
     tier: Option<TierDecision>,
     affinity_key: Option<ConversationKey>,
     hint: ReplicaHint,
+    admit: bool,
 ) -> Result<PlacedCompletion, AppError> {
     let strict = model.backend_tier_strict;
-    let admission = model.admission.try_admit(model.backend_pool, tier)?;
+    let admission = if admit {
+        model.admission.try_admit(model.backend_pool, tier)?
+    } else {
+        None
+    };
     let limits = model.admission.backend_limits(model.backend_pool);
     let mut restrict = tier.and_then(|decision| decision.restrict);
     let requested_tier = tier.map(|decision| decision.estimated);

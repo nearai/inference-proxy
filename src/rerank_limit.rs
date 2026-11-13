@@ -16,6 +16,13 @@
 //! inserted on admission and removed when its last permit is dropped. The map
 //! therefore never holds more than `direct` entries, however many distinct
 //! workspaces call, and needs no expiry.
+//!
+//! The limits come from `VLLM_PROXY_RERANK_MAX_INFLIGHT_PER_WORKSPACE`,
+//! `_DIRECT` and `_TRUSTED` (`Config::rerank_limits`, defaults below; each
+//! at least 1). Sizing: `trusted + direct` is what the rerank engine may be
+//! asked to run at once, so keep it within the concurrency the engine serves
+//! at an acceptable latency; `per_workspace` bounds what one tenant can take
+//! of `direct`.
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;

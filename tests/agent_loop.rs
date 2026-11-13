@@ -106,6 +106,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
         transcriptions_url_override: None,
         rerank_url_override: None,
         score_url_override: None,
+        rerank_limits: Default::default(),
         ohttp_enabled: false,
         ohttp_max_inflight: 0,
         listen_port: 8000,

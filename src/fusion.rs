@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::StatusCode;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use bytes::{Bytes, BytesMut};
 use futures_util::{future::join_all, StreamExt};
 use serde::Deserialize;
@@ -17,7 +17,7 @@ use crate::agent_loop;
 use crate::auth::RequireAuth;
 use crate::encryption::{ChunkTransform, ResponseTransform};
 use crate::error::AppError;
-use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageType};
+use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageReporter, UsageType};
 use crate::{AppState, TracingIds};
 
 const FUSION_TYPES: [&str; 2] = ["openrouter:fusion", "nearai:fusion"];
@@ -27,11 +27,36 @@ const FUSION_PLUGIN_ID: &str = "fusion";
 // timeout budget even when the tool supplies a larger value or none at all.
 const FUSION_MEMBER_TOKEN_CAP: u64 = 512;
 const FUSION_TIMEOUT_TOKENS_PER_SECOND: u64 = 8;
+/// Header a member call carries when its Fusion request holds an admission
+/// slot in this process. Honoured only with the internal bearer and only while
+/// that slot is held, so a member call that lands back on this process runs
+/// under the outer slot instead of waiting for a second one.
+pub const ADMISSION_RESERVATION_HEADER: &str = "x-nearai-fusion-admission";
+/// Caller body fields a panel member receives. Model, messages, generation
+/// limit and stream flag are set by the proxy; everything else (tool choice,
+/// plugins, `n`, stream options, adapter selectors, engine extensions) stays
+/// here. `tools` keeps only `web_context_search` entries.
+const PANEL_FORWARDED_FIELDS: [&str; 12] = [
+    "temperature",
+    "top_p",
+    "stop",
+    "seed",
+    "presence_penalty",
+    "frequency_penalty",
+    "response_format",
+    "reasoning_effort",
+    "reasoning",
+    "max_tokens",
+    "max_completion_tokens",
+    crate::cache_salt::CACHE_SALT_FIELD,
+];
 
 pub struct FusionCaches {
     endpoint: Mutex<Option<EndpointSnapshot>>,
     endpoint_fetch: AsyncMutex<()>,
     attestation_capability: Mutex<HashMap<String, (Instant, bool)>>,
+    /// Reservation ids of the Fusion requests holding an admission slot now.
+    admission_reservations: Mutex<HashSet<String>>,
 }
 
 impl FusionCaches {
@@ -40,7 +65,113 @@ impl FusionCaches {
             endpoint: Mutex::new(None),
             endpoint_fetch: AsyncMutex::new(()),
             attestation_capability: Mutex::new(HashMap::new()),
+            admission_reservations: Mutex::new(HashSet::new()),
         }
+    }
+
+    fn holds_admission_reservation(&self, id: &str) -> bool {
+        self.admission_reservations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(id)
+    }
+}
+
+/// A Fusion request's admission slot, as its member calls name it. Registered
+/// while the slot is held and removed when this is dropped.
+struct AdmissionReservation {
+    caches: Arc<FusionCaches>,
+    id: String,
+}
+
+impl AdmissionReservation {
+    fn register(caches: &Arc<FusionCaches>) -> Self {
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        caches
+            .admission_reservations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id.clone());
+        Self {
+            caches: Arc::clone(caches),
+            id,
+        }
+    }
+}
+
+impl Drop for AdmissionReservation {
+    fn drop(&mut self) {
+        self.caches
+            .admission_reservations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.id);
+    }
+}
+
+/// Usage of the calls a Fusion request has made so far. Reported for a
+/// direct key when the request ends without a served response: an error
+/// after the first call, or the request being dropped (then with the calls
+/// whose usage was already added: a panel round counts once all its panels
+/// have returned). Disarmed once the final response, which reports the same
+/// aggregate itself, is built.
+struct UnservedUsage {
+    reporter: Option<UsageReporter>,
+    usage: Usage,
+    log_ids: (String, String, String),
+    armed: bool,
+}
+
+impl UnservedUsage {
+    fn new(reporter: Option<UsageReporter>, tracing_ids: &TracingIds) -> Self {
+        Self {
+            reporter,
+            usage: Usage::default(),
+            log_ids: (
+                tracing_ids.request_id.clone(),
+                tracing_ids.org_id_or_empty().to_string(),
+                tracing_ids.workspace_id_or_empty().to_string(),
+            ),
+            armed: true,
+        }
+    }
+}
+
+impl UnservedUsage {
+    /// Report the usage gathered so far, once. Returns the `inference-id`
+    /// the report maps to, or `None` when nothing was reported (no measured
+    /// usage, no direct key, already reported or disarmed, no runtime).
+    fn report(&mut self) -> Option<uuid::Uuid> {
+        if !self.armed || self.usage.total_tokens() <= 0 {
+            return None;
+        }
+        self.armed = false;
+        let reporter = self.reporter.as_ref()?;
+        // Delivery spawns a task; a drop outside the runtime cannot.
+        tokio::runtime::Handle::try_current().ok()?;
+        // Availability was checked before the first call.
+        let Ok(Some((billing_id, inference_id))) = proxy::direct_stream_billing_id(Some(reporter))
+        else {
+            return None;
+        };
+        proxy::report_stream_usage_on_finalize(
+            &self.reporter,
+            Some((
+                (self.usage.prompt_tokens, self.usage.completion_tokens),
+                None,
+            )),
+            Some(&billing_id),
+            false,
+            (&self.log_ids.0, &self.log_ids.1, &self.log_ids.2),
+        );
+        Some(inference_id)
+    }
+}
+
+impl Drop for UnservedUsage {
+    fn drop(&mut self) {
+        // A dropped (cancelled) request has no response to carry the header.
+        let _ = self.report();
     }
 }
 
@@ -201,17 +332,10 @@ pub fn has_fusion_tool(request: &Value) -> bool {
 /// with `FUSION_INTERNAL_BEARER_TOKEN`; regular clients cannot accidentally
 /// self-deny Fusion by sending these headers.
 pub fn trusted_request_depth(headers: &axum::http::HeaderMap, state: &AppState) -> u32 {
-    let Some(internal_token) = state.config.fusion_internal_bearer_token.as_deref() else {
-        return 0;
-    };
-    let Some(token) = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-    else {
-        return 0;
-    };
-    if !crate::auth::token_eq(token, internal_token) {
+    if !presents_internal_token(
+        headers,
+        state.config.fusion_internal_bearer_token.as_deref(),
+    ) {
         return 0;
     }
 
@@ -224,20 +348,99 @@ pub fn trusted_request_depth(headers: &axum::http::HeaderMap, state: &AppState) 
         .unwrap_or(0)
 }
 
+/// True when a member call of a Fusion request that holds an admission slot
+/// in this process presents that slot's reservation. Such a call runs under
+/// the outer slot: it is not admitted a second time. Anything else (no or an
+/// unknown reservation, another bearer) is admitted normally.
+pub fn holds_outer_admission(headers: &axum::http::HeaderMap, state: &AppState) -> bool {
+    presents_admission_reservation(
+        headers,
+        state.config.fusion_internal_bearer_token.as_deref(),
+        &state.fusion_caches,
+    )
+}
+
+fn presents_admission_reservation(
+    headers: &axum::http::HeaderMap,
+    internal_token: Option<&str>,
+    caches: &FusionCaches,
+) -> bool {
+    if !presents_internal_token(headers, internal_token) {
+        return false;
+    }
+    headers
+        .get(ADMISSION_RESERVATION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|id| caches.holds_admission_reservation(id))
+}
+
+fn presents_internal_token(headers: &axum::http::HeaderMap, internal_token: Option<&str>) -> bool {
+    let Some(internal_token) = internal_token else {
+        return false;
+    };
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .is_some_and(|token| crate::auth::token_eq(token, internal_token))
+}
+
 pub async fn run_chat_completion(
     ctx: ChatCompletionContext,
-    mut request_json: Value,
+    request_json: Value,
 ) -> Result<Response, AppError> {
     // The regular route only prechecks admission before selecting the Fusion
     // branch. Hold its budget slot until every member and synthesis has ended.
-    let _admission = ctx
+    let admission = ctx
         .state
         .admission
         .try_admit(&ctx.state.backend_pool, None)?;
+    // Member calls that come back to this process run under this slot.
+    let reservation = admission
+        .as_ref()
+        .map(|_| AdmissionReservation::register(&ctx.state.fusion_caches));
     // A direct-key request whose usage could not be reported is refused
     // before any panel, judge or synthesis call runs.
     let usage_reporter = make_usage_reporter(&ctx.auth, &ctx.state);
     proxy::ensure_direct_billing_available(usage_reporter.as_ref())?;
+    let mut unserved = UnservedUsage::new(usage_reporter, &ctx.tracing_ids);
+    // `routes::chat` builds both transforms exactly for an encrypted request.
+    let encrypted = ctx.response_transform.is_some();
+    match orchestrate(
+        ctx,
+        request_json,
+        reservation.as_ref().map(|r| r.id.as_str()),
+        &mut unserved.usage,
+    )
+    .await
+    {
+        Ok(response) => {
+            // The served response reported the aggregate.
+            unserved.armed = false;
+            Ok(response)
+        }
+        Err(error) => match unserved.report() {
+            // Measured usage was billed: the error carries the
+            // `inference-id` the charge can be looked up by. Rendered here,
+            // so the encrypted-request sanitization is applied here too.
+            Some(inference_id) => {
+                let mut response = error.for_encrypted_request(encrypted).into_response();
+                proxy::add_direct_inference_id(&mut response, Some(inference_id));
+                Ok(response)
+            }
+            None => Err(error),
+        },
+    }
+}
+
+/// Run the preflight, members and synthesis, adding every call's usage to
+/// `aggregate_usage` as it completes. On `Err`, nothing has been reported.
+async fn orchestrate(
+    ctx: ChatCompletionContext,
+    mut request_json: Value,
+    reservation: Option<&str>,
+    aggregate_usage: &mut Usage,
+) -> Result<Response, AppError> {
     let started = Instant::now();
     let fusion_tool = remove_fusion_tool(&mut request_json).ok_or_else(|| {
         AppError::BadRequest("Fusion was enabled but no Fusion tool was found".to_string())
@@ -246,7 +449,6 @@ pub async fn run_chat_completion(
     let config = parse_config(&fusion_tool, &ctx.state, outer_model.as_deref())?;
     let forced = is_required_tool_choice(&request_json);
 
-    let mut aggregate_usage = Usage::default();
     let mut preflight_status = "skipped".to_string();
 
     if !forced {
@@ -272,7 +474,14 @@ pub async fn run_chat_completion(
         preflight_status = "invoked".to_string();
     }
 
-    let panel_results = run_panels(&ctx.state, &ctx.tracing_ids, &request_json, &config).await;
+    let panel_results = run_panels(
+        &ctx.state,
+        &ctx.tracing_ids,
+        reservation,
+        &request_json,
+        &config,
+    )
+    .await;
     for panel in &panel_results {
         aggregate_usage.add(&panel.usage);
     }
@@ -292,6 +501,7 @@ pub async fn run_chat_completion(
     let judge = run_judge(
         &ctx.state,
         &ctx.tracing_ids,
+        reservation,
         &request_json,
         &config,
         &successful_panels,
@@ -303,9 +513,8 @@ pub async fn run_chat_completion(
 
     let synthesis_request =
         build_synthesis_request(&request_json, &successful_panels, judge.as_ref());
-    // TODO(billing): if synthesis fails here, panel and judge usage gathered
-    // above is not reported. V1 assumes local synthesis failures are rare; V2
-    // should report partial aggregate usage on this error path.
+    // A failure from here on still bills the usage gathered above
+    // (`UnservedUsage`).
     let mut synthesis =
         call_local_chat_json(&ctx.state, &ctx.tracing_ids, synthesis_request).await?;
     let synthesis_usage = Usage::from_response(&synthesis);
@@ -324,7 +533,7 @@ pub async fn run_chat_completion(
         panels: &panel_results,
         judge: judge.as_ref(),
         synthesis_usage: &synthesis_usage,
-        aggregate_usage: &aggregate_usage,
+        aggregate_usage: &*aggregate_usage,
         elapsed: started.elapsed(),
         max_tool_calls: config.max_tool_calls,
     });
@@ -619,6 +828,7 @@ fn contains_fusion_tool_call(response: &Value) -> bool {
 async fn run_panels(
     state: &AppState,
     tracing_ids: &TracingIds,
+    reservation: Option<&str>,
     request_json: &Value,
     config: &FusionConfig,
 ) -> Vec<PanelOutcome> {
@@ -628,7 +838,17 @@ async fn run_panels(
         let request_json = request_json.clone();
         let config = config.clone();
         let model = model.clone();
-        async move { call_panel(&state, &tracing_ids, &request_json, &config, model).await }
+        async move {
+            call_panel(
+                &state,
+                &tracing_ids,
+                reservation,
+                &request_json,
+                &config,
+                model,
+            )
+            .await
+        }
     });
     join_all(futures).await
 }
@@ -636,6 +856,7 @@ async fn run_panels(
 async fn call_panel(
     state: &AppState,
     tracing_ids: &TracingIds,
+    reservation: Option<&str>,
     request_json: &Value,
     config: &FusionConfig,
     model: String,
@@ -647,6 +868,7 @@ async fn call_panel(
             match call_direct_chat_with_web_tools(
                 state,
                 tracing_ids,
+                reservation,
                 &endpoint,
                 body,
                 config.max_tool_calls,
@@ -691,6 +913,7 @@ async fn call_panel(
 async fn run_judge(
     state: &AppState,
     tracing_ids: &TracingIds,
+    reservation: Option<&str>,
     request_json: &Value,
     config: &FusionConfig,
     panels: &[PanelOutcome],
@@ -719,6 +942,7 @@ async fn run_judge(
     match call_direct_chat_with_web_tools(
         state,
         tracing_ids,
+        reservation,
         &endpoint,
         body,
         config.max_tool_calls,
@@ -764,16 +988,32 @@ async fn run_judge(
 }
 
 fn build_panel_request(request_json: &Value, config: &FusionConfig, model: &str) -> Value {
-    let mut request = request_json.clone();
-    // The adapter `VLLM_PROXY_BACKEND_LORA` set is this engine's; a panel is
-    // another model behind another proxy, which refuses LoRA selector keys.
-    // Local synthesis keeps it (`build_synthesis_request`).
-    if let Some(object) = request.as_object_mut() {
-        for key in crate::model_list::LORA_SELECTOR_KEYS {
-            object.remove(key);
+    // A panel is another model behind another proxy: it gets the allowlisted
+    // fields only. That also leaves out the LoRA selector keys of this
+    // engine's `VLLM_PROXY_BACKEND_LORA` adapter, which another proxy refuses;
+    // local synthesis keeps them (`build_synthesis_request`).
+    let mut forwarded = serde_json::Map::new();
+    for key in PANEL_FORWARDED_FIELDS {
+        if let Some(value) = request_json.get(key) {
+            forwarded.insert(key.to_string(), value.clone());
         }
     }
+    if let Some(tools) = request_json.get("tools").and_then(|v| v.as_array()) {
+        let web_tools: Vec<Value> = tools
+            .iter()
+            .filter(|tool| {
+                tool.get("type").and_then(|v| v.as_str())
+                    == Some(agent_loop::WEB_CONTEXT_SEARCH_TOOL_NAME)
+            })
+            .cloned()
+            .collect();
+        if !web_tools.is_empty() {
+            forwarded.insert("tools".to_string(), Value::Array(web_tools));
+        }
+    }
+    let mut request = Value::Object(forwarded);
     request["model"] = Value::String(model.to_string());
+    request["stream"] = Value::Bool(false);
     request["messages"] = augmented_messages(
         request_json,
         "You are one member of a private multi-model panel. Answer the user's request independently, with concise reasoning and a concrete final answer.",
@@ -903,12 +1143,23 @@ async fn call_local_chat_json(
     remove_streaming_for_internal_call(&mut body);
     let body = serde_json::to_vec(&body).map_err(|e| AppError::Internal(e.into()))?;
     let (url, _guard) = state.backend_pool.select_url("/v1/chat/completions");
-    post_chat_json(state, &url, None, tracing_ids, body, "local_synthesis", 1).await
+    post_chat_json(
+        state,
+        &url,
+        None,
+        None,
+        tracing_ids,
+        body,
+        "local_synthesis",
+        1,
+    )
+    .await
 }
 
 async fn call_direct_chat_json(
     state: &AppState,
     tracing_ids: &TracingIds,
+    reservation: Option<&str>,
     endpoint: &EndpointInfo,
     body: Value,
 ) -> Result<Value, AppError> {
@@ -929,6 +1180,7 @@ async fn call_direct_chat_json(
         state,
         &url,
         Some(token),
+        reservation,
         tracing_ids,
         body,
         "fusion_direct",
@@ -940,13 +1192,14 @@ async fn call_direct_chat_json(
 async fn call_direct_chat_with_web_tools(
     state: &AppState,
     tracing_ids: &TracingIds,
+    reservation: Option<&str>,
     endpoint: &EndpointInfo,
     mut body: Value,
     max_tool_calls: u32,
 ) -> Result<InternalCallOutcome, InternalCallError> {
     if !has_web_context_search_tool(&body) || max_tool_calls == 0 {
         strip_tools_for_internal_call(&mut body);
-        let response = call_direct_chat_json(state, tracing_ids, endpoint, body)
+        let response = call_direct_chat_json(state, tracing_ids, reservation, endpoint, body)
             .await
             .map_err(|error| InternalCallError::new(error, &Usage::default(), 0))?;
         let usage = Usage::from_response(&response);
@@ -994,11 +1247,12 @@ async fn call_direct_chat_with_web_tools(
     let mut executed_tool_calls = 0u32;
 
     loop {
-        let response = call_direct_chat_json(state, tracing_ids, endpoint, body.clone())
-            .await
-            .map_err(|error| {
-                InternalCallError::new(error, &aggregate_usage, executed_tool_calls)
-            })?;
+        let response =
+            call_direct_chat_json(state, tracing_ids, reservation, endpoint, body.clone())
+                .await
+                .map_err(|error| {
+                    InternalCallError::new(error, &aggregate_usage, executed_tool_calls)
+                })?;
         aggregate_usage.add(&Usage::from_response(&response));
 
         let tool_calls = extract_web_context_tool_calls(&response);
@@ -1082,10 +1336,13 @@ async fn call_direct_chat_with_web_tools(
     }
 }
 
+// One parameter per call property; a struct would only rename them.
+#[allow(clippy::too_many_arguments)]
 async fn post_chat_json(
     state: &AppState,
     url: &str,
     bearer: Option<&str>,
+    reservation: Option<&str>,
     tracing_ids: &TracingIds,
     body: Vec<u8>,
     label: &'static str,
@@ -1111,6 +1368,10 @@ async fn post_chat_json(
             .header("x-nearai-fusion-depth", "1");
         if let Some(token) = bearer {
             req = req.bearer_auth(token);
+            // Only bearer (member) calls can come back through the route.
+            if let Some(reservation) = reservation {
+                req = req.header(ADMISSION_RESERVATION_HEADER, reservation);
+            }
         }
         for (k, v) in tracing_ids.upstream_headers() {
             req = req.header(k, v);
@@ -1880,6 +2141,138 @@ mod tests {
         assert!(panel.get("lora_path").is_none());
         let synthesis = build_synthesis_request(&request, &[], None);
         assert_eq!(synthesis["lora_path"], "local-adapter");
+    }
+
+    #[test]
+    fn panel_requests_forward_only_allowlisted_fields() {
+        let request = json!({
+            "model": "outer",
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "stop": ["END"],
+            "seed": 7,
+            "response_format": {"type": "json_object"},
+            "reasoning_effort": "low",
+            "n": 4,
+            "tool_choice": "required",
+            "parallel_tool_calls": true,
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "plugins": [{"id": "response-healing"}],
+            "priority": 9,
+            "user": "caller-supplied",
+            "logit_bias": {"1": 5},
+            "chat_template_kwargs": {"x": true},
+            "tools": [
+                {"type": "function", "function": {"name": "client_tool"}},
+                {"type": agent_loop::WEB_CONTEXT_SEARCH_TOOL_NAME}
+            ]
+        });
+        let config = FusionConfig {
+            analysis_models: vec!["panel".to_string()],
+            judge_model: None,
+            max_tool_calls: 0,
+            max_completion_tokens: Some(64),
+            temperature: None,
+            reasoning: None,
+        };
+        let panel = build_panel_request(&request, &config, "panel");
+        let mut keys: Vec<&str> = panel
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "max_completion_tokens",
+                "messages",
+                "model",
+                "reasoning_effort",
+                "response_format",
+                "seed",
+                "stop",
+                "stream",
+                "temperature",
+                "tools",
+                "top_p",
+            ]
+        );
+        assert_eq!(panel["stream"], false);
+        assert_eq!(panel["temperature"], 0.2);
+        assert_eq!(
+            panel["tools"],
+            json!([{"type": agent_loop::WEB_CONTEXT_SEARCH_TOOL_NAME}])
+        );
+
+        let without_web = json!({
+            "model": "outer",
+            "messages": [],
+            "tools": [{"type": "function", "function": {"name": "client_tool"}}]
+        });
+        assert!(build_panel_request(&without_web, &config, "panel")
+            .get("tools")
+            .is_none());
+    }
+
+    #[test]
+    fn admission_reservation_is_honoured_only_with_the_internal_bearer_while_held() {
+        use axum::http::{HeaderMap, HeaderValue};
+
+        let caches = Arc::new(FusionCaches::new());
+        let headers = |bearer: &str, reservation: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {bearer}")).unwrap(),
+            );
+            if let Some(reservation) = reservation {
+                headers.insert(
+                    ADMISSION_RESERVATION_HEADER,
+                    HeaderValue::from_str(reservation).unwrap(),
+                );
+            }
+            headers
+        };
+
+        let reservation = AdmissionReservation::register(&caches);
+        let id = reservation.id.clone();
+        assert!(presents_admission_reservation(
+            &headers("internal", Some(&id)),
+            Some("internal"),
+            &caches
+        ));
+        // Another bearer, no internal token configured, no or an unknown id.
+        assert!(!presents_admission_reservation(
+            &headers("config-token", Some(&id)),
+            Some("internal"),
+            &caches
+        ));
+        assert!(!presents_admission_reservation(
+            &headers("internal", Some(&id)),
+            None,
+            &caches
+        ));
+        assert!(!presents_admission_reservation(
+            &headers("internal", None),
+            Some("internal"),
+            &caches
+        ));
+        assert!(!presents_admission_reservation(
+            &headers("internal", Some("not-a-reservation")),
+            Some("internal"),
+            &caches
+        ));
+        // Released with the outer slot.
+        drop(reservation);
+        assert!(!presents_admission_reservation(
+            &headers("internal", Some(&id)),
+            Some("internal"),
+            &caches
+        ));
     }
 
     #[test]

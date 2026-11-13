@@ -101,6 +101,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         transcriptions_url_override: options.transcriptions_url_override,
         rerank_url_override: options.rerank_url_override,
         score_url_override: None,
+        rerank_limits: Default::default(),
         ohttp_enabled: false,
         ohttp_max_inflight: 0,
         listen_port: 8000,

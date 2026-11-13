@@ -720,8 +720,8 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cloud-platform-events"
-version = "1.1.0"
-source = "git+https://github.com/nearai/cloud-platform-events?rev=965c5cdd91f0b2e387b7317f2c67320305f4a0bb#965c5cdd91f0b2e387b7317f2c67320305f4a0bb"
+version = "1.2.0"
+source = "git+https://github.com/nearai/cloud-platform-events?tag=v1.2.0#b9081a8aba9360496fc18435353525c0b64a6971"
 dependencies = [
  "chrono",
  "serde",

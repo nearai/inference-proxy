@@ -193,11 +193,16 @@ async fn serve(
         model.backend_tier_strict,
         || estimate.unwrap_or_else(|| crate::context_tier::chat_estimate(&request_json)),
     );
+    // A Fusion member call of a request this process admitted runs under
+    // that request's slot: neither admission half applies to it.
+    let under_outer_admission = fusion::holds_outer_admission(&headers, &state);
     // Lane admission (gateway mode), first half: the overload and budget
     // checks, so a request the lane cannot take is refused before any image
     // is fetched. The slot and the backend placement are taken on the normal
     // proxy path below, after the special branches, right before dispatch.
-    model.admission.precheck(model.backend_pool, tier)?;
+    if !under_outer_admission {
+        model.admission.precheck(model.backend_pool, tier)?;
+    }
     // Same conversation digest, applied across independent backends: later
     // turns follow the backend that already holds this conversation's prefix.
     let backend_affinity_key = model
@@ -373,6 +378,7 @@ async fn serve(
         tier,
         backend_affinity_key,
         hint,
+        !under_outer_admission,
     )?;
     let opts = ProxyOpts {
         signing: state.signing.clone(),

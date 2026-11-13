@@ -25,7 +25,7 @@ Rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-proxy) (Python).
 | POST | `/v1/completions` | Yes | Text completions |
 | POST | `/v1/embeddings` | Yes | Embeddings |
 | POST | `/v1/tokenize` | Yes | Tokenization (no signing) |
-| POST | `/v1/rerank` | Yes | Reranking (at most 4,096 `documents`; more is a `400` before dispatch). Concurrent requests are limited: 2 per Cloud API organization + workspace, 16 for all Cloud API keys, 16 shared by the config tokens; over the limit is a `429` with `Retry-After` before dispatch (counted in `inference_proxy_rerank_refused_total{limit}`) |
+| POST | `/v1/rerank` | Yes | Reranking (at most 4,096 `documents`; more is a `400` before dispatch). Concurrent requests are limited: by default 2 per Cloud API organization + workspace, 16 for all Cloud API keys, 16 shared by the config tokens (`VLLM_PROXY_RERANK_MAX_INFLIGHT_*`); over the limit is a `429` with `Retry-After` before dispatch (counted in `inference_proxy_rerank_refused_total{limit}`) |
 | POST | `/v1/score` | Yes | Scoring |
 | POST | `/v1/privacy/classify` | Yes | Privacy classification |
 | POST | `/v1/images/generations` | Yes | Image generation |
@@ -187,6 +187,9 @@ All configuration is via environment variables:
 | `VLLM_IMAGES_EDITS_URL` | No | `{base}/v1/images/edits` | Override image edits endpoint |
 | `VLLM_TRANSCRIPTIONS_URL` | No | `{base}/v1/audio/transcriptions` | Override transcriptions endpoint |
 | `VLLM_RERANK_URL` | No | `{base}/v1/rerank` | Override rerank endpoint |
+| `VLLM_PROXY_RERANK_MAX_INFLIGHT_PER_WORKSPACE` | No | `2` | Concurrent `/v1/rerank` requests one Cloud API organization + workspace may run; more is a `429` with `Retry-After` before dispatch. At least 1 |
+| `VLLM_PROXY_RERANK_MAX_INFLIGHT_DIRECT` | No | `16` | Concurrent `/v1/rerank` requests all Cloud API keys together may run. At least 1 |
+| `VLLM_PROXY_RERANK_MAX_INFLIGHT_TRUSTED` | No | `16` | Concurrent `/v1/rerank` requests all config tokens together may run. At least 1. `DIRECT + TRUSTED` is the most the rerank engine is asked to run at once: keep it within the concurrency the engine serves at an acceptable latency |
 | `VLLM_SCORE_URL` | No | `{base}/v1/score` | Override score endpoint |
 | `REPLICA_STATE_REDIS_URL` | No | unset (feature off) | Redis URL for opt-in signed host-frame state publishing |
 | `REPLICA_STATE_HOST_ID` | Yes, if the URL is set | — | Host identifier used in Redis keys and every published frame |
@@ -218,6 +221,18 @@ Legacy flat tool fields continue to work for `nearai:fusion` and existing
 clients. `plugins[].enabled=false` is not treated as a Fusion invocation. The
 `openrouter/fusion` model alias is not resolved in inference-proxy because
 cloud-api routes by model name before pass-through.
+
+Panel members receive the conversation and a fixed set of caller fields:
+`temperature`, `top_p`, `stop`, `seed`, `presence_penalty`,
+`frequency_penalty`, `response_format`, `reasoning_effort`, `reasoning`,
+`max_tokens`, `max_completion_tokens`, `cache_salt` and `web_context_search`
+tool entries. Other fields (`n`,
+`tool_choice`, other tools, plugins, engine extensions) are used only by the
+local preflight and synthesis calls. With a direct API key, a Fusion request
+that fails after its first model call still reports the usage of the calls
+that completed. With lane admission enabled, a Fusion request holds one slot;
+a member call that comes back to the same proxy process runs under that slot
+instead of taking a second one.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|

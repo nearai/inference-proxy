@@ -151,6 +151,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         transcriptions_url_override: None,
         rerank_url_override: None,
         score_url_override: None,
+        rerank_limits: Default::default(),
         ohttp_enabled: false,
         ohttp_max_inflight: 0,
         listen_port: 8000,

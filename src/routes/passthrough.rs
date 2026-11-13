@@ -216,6 +216,11 @@ pub async fn images_edits(
         .map_err(|e| AppError::BadRequest(format!("Invalid multipart: {e}")))?
     {
         let name = field.name().unwrap_or("").to_string();
+        crate::model_list::guard_form_field_name(
+            super::ROUTE_IMAGES_EDITS,
+            &crate::model_list::IMAGE_EDIT_FORM_FIELDS,
+            &name,
+        )?;
         let file_name = field.file_name().map(|s| s.to_string());
         let content_type = field.content_type().map(|s| s.to_string());
 
@@ -317,6 +322,11 @@ pub async fn audio_transcriptions(
         .map_err(|e| AppError::BadRequest(format!("Invalid multipart: {e}")))?
     {
         let name = field.name().unwrap_or("").to_string();
+        crate::model_list::guard_form_field_name(
+            super::ROUTE_AUDIO_TRANSCRIPTIONS,
+            &crate::model_list::AUDIO_TRANSCRIPTION_FORM_FIELDS,
+            &name,
+        )?;
         let file_name = field.file_name().map(|s| s.to_string());
         let content_type = field.content_type().map(|s| s.to_string());
 

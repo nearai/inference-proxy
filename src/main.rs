@@ -408,8 +408,20 @@ async fn main() -> anyhow::Result<()> {
         if let Err(e) =
             startup_checks::run_startup_checks(&state.backend_client, &state.config).await
         {
-            tracing::error!(error = %e, "OpenAI chat compatibility check failed — exiting");
-            return Err(e.into());
+            let error_kind = match &e {
+                startup_checks::StartupCheckError::ConnectionFailed { .. } => "connection_failed",
+                startup_checks::StartupCheckError::UnexpectedStatus { .. } => "unexpected_status",
+                startup_checks::StartupCheckError::ModelNotFound { .. } => "model_not_found",
+                startup_checks::StartupCheckError::ChatCompletionFailed { .. } => {
+                    "chat_completion_failed"
+                }
+                startup_checks::StartupCheckError::RetriesExhausted { .. } => "retries_exhausted",
+            };
+            tracing::error!(
+                error_kind,
+                "OpenAI chat compatibility check failed — exiting"
+            );
+            return Err(anyhow::anyhow!("Startup checks failed: {error_kind}"));
         }
     } else {
         info!("OpenAI chat compatibility check disabled (set OPENAI_CHAT_COMPATIBILITY_CHECK=true to enable)");

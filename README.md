@@ -29,8 +29,8 @@ Rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-proxy) (Python).
 | POST | `/v1/score` | Yes | Scoring |
 | POST | `/v1/privacy/classify` | Yes | Privacy classification |
 | POST | `/v1/images/generations` | Yes | Image generation |
-| POST | `/v1/images/edits` | Yes | Image editing (multipart) |
-| POST | `/v1/audio/transcriptions` | Yes | Audio transcription (multipart) |
+| POST | `/v1/images/edits` | Yes | Image editing (multipart). A form field outside the supported list (`IMAGE_EDIT_FORM_FIELDS`) is a 400 |
+| POST | `/v1/audio/transcriptions` | Yes | Audio transcription (multipart). A form field outside the supported list (`AUDIO_TRANSCRIPTION_FORM_FIELDS`) is a 400 |
 | GET | `/v1/signature/{chat_id}` | Yes | Retrieve cached signature |
 | GET | `/v1/attestation/report` | No | TEE attestation report |
 | POST | `/internal/gpu_evidence` | Trusted token | Sibling-proxy GPU evidence |

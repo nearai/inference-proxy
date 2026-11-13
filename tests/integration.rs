@@ -10027,11 +10027,27 @@ async fn multipart_media_with_all_field_encryption_is_refused_before_dispatch() 
 
     let boundary = "----SyntheticMediaBoundary";
     let routes = [
-        ("/v1/images/edits", "image"),
-        ("/v1/images/edits", "mask"),
-        ("/v1/audio/transcriptions", "file"),
-        // Any part with a filename counts as media, whatever its name.
-        ("/v1/audio/transcriptions", "upload"),
+        (
+            "/v1/images/edits",
+            "image",
+            "not supported with all-field encryption",
+        ),
+        (
+            "/v1/images/edits",
+            "mask",
+            "not supported with all-field encryption",
+        ),
+        (
+            "/v1/audio/transcriptions",
+            "file",
+            "not supported with all-field encryption",
+        ),
+        // Unknown form fields are rejected before media handling.
+        (
+            "/v1/audio/transcriptions",
+            "upload",
+            "not a supported form field",
+        ),
     ];
 
     // v1/v2 with `X-Encrypt-All-Fields: true` (a valid encrypted prompt first),
@@ -10075,7 +10091,7 @@ async fn multipart_media_with_all_field_encryption_is_refused_before_dispatch() 
     }
 
     for (headers, prompt) in &refused {
-        for (route, media_name) in routes {
+        for (route, media_name, expected_error) in routes {
             let mut request = Request::builder()
                 .method("POST")
                 .uri(route)
@@ -10099,10 +10115,7 @@ async fn multipart_media_with_all_field_encryption_is_refused_before_dispatch() 
                 "{route} {media_name} {headers:?}"
             );
             let text = String::from_utf8(body_to_bytes(response).await).unwrap();
-            assert!(
-                text.contains("not supported with all-field encryption"),
-                "{text}"
-            );
+            assert!(text.contains(expected_error), "{text}");
             assert!(!text.contains("synthetic.bin"));
             assert!(!text.contains(SYNTHETIC_MEDIA));
         }
@@ -12074,13 +12087,26 @@ fn zdr_json_body(stream: bool) -> Vec<u8> {
     .unwrap()
 }
 
-fn zdr_multipart_body(boundary: &str) -> Vec<u8> {
+/// A form of supported fields only, so it reaches the backend: `file` is the
+/// name of the upload field (`file` for audio, `image` for image edits).
+fn zdr_multipart_body(boundary: &str, file: &str) -> Vec<u8> {
     format!(
         "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nmodel-{s}\r\n\
          --{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nprompt {s}\r\n\
-         --{boundary}\r\nContent-Disposition: form-data; name=\"x_{s}\"\r\n\r\nvalue {s}\r\n\
-         --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{s}.wav\"\r\n\
-         Content-Type: audio/wav\r\n\r\nRIFF{s}\r\n--{boundary}--\r\n",
+         --{boundary}\r\nContent-Disposition: form-data; name=\"{file}\"; filename=\"{s}.bin\"\r\n\
+         Content-Type: application/octet-stream\r\n\r\nRIFF{s}\r\n--{boundary}--\r\n",
+        s = ZDR_SENTINEL
+    )
+    .into_bytes()
+}
+
+/// A form whose first field has a name no multipart route supports, so the
+/// request is refused by name before anything is forwarded.
+fn zdr_refused_multipart_body(boundary: &str) -> Vec<u8> {
+    format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"x_{s}\"\r\n\r\nvalue {s}\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nmodel-{s}\r\n\
+         --{boundary}--\r\n",
         s = ZDR_SENTINEL
     )
     .into_bytes()
@@ -12191,34 +12217,34 @@ async fn request_content_never_reaches_logs_or_metrics() {
                     ..TestAppOptions::default()
                 },
             );
-            for (uri, json) in [
-                ("/v1/chat/completions", true),
-                ("/v1/completions", true),
-                ("/v1/embeddings", true),
-                ("/v1/rerank", true),
-                ("/v1/score", true),
-                ("/v1/tokenize", true),
-                ("/v1/privacy/classify", true),
-                ("/v1/images/generations", true),
-                ("/v1/audio/transcriptions", false),
-                ("/v1/images/edits", false),
+            for uri in [
+                "/v1/chat/completions",
+                "/v1/completions",
+                "/v1/embeddings",
+                "/v1/rerank",
+                "/v1/score",
+                "/v1/tokenize",
+                "/v1/privacy/classify",
+                "/v1/images/generations",
             ] {
-                let request = if json {
-                    zdr_request(
-                        uri,
-                        bearer,
-                        "application/json",
-                        zdr_body_with_routable_model(zdr_json_body(false)),
-                    )
-                } else {
-                    zdr_request(
-                        uri,
-                        bearer,
-                        &multipart,
-                        zdr_body_with_routable_model(zdr_multipart_body(boundary)),
-                    )
-                };
+                let request = zdr_request(
+                    uri,
+                    bearer,
+                    "application/json",
+                    zdr_body_with_routable_model(zdr_json_body(false)),
+                );
                 zdr_send(app.clone(), request).await;
+            }
+            for (uri, file) in [
+                ("/v1/audio/transcriptions", "file"),
+                ("/v1/images/edits", "image"),
+            ] {
+                for body in [
+                    zdr_body_with_routable_model(zdr_multipart_body(boundary, file)),
+                    zdr_refused_multipart_body(boundary),
+                ] {
+                    zdr_send(app.clone(), zdr_request(uri, bearer, &multipart, body)).await;
+                }
             }
             zdr_send(
                 app.clone(),
@@ -12265,7 +12291,7 @@ async fn request_content_never_reaches_logs_or_metrics() {
                         uri,
                         bearer,
                         &multipart,
-                        zdr_body_with_routable_model(zdr_multipart_body(boundary)),
+                        zdr_body_with_routable_model(zdr_multipart_body(boundary, "file")),
                     )
                 };
                 let dropped = tokio::time::timeout(
@@ -13870,6 +13896,177 @@ async fn single_model_process_refuses_a_colon_in_the_model_id() {
         }
     }
     assert_eq!(requests_seen(&backend).await, 0);
+}
+
+/// `(name, file name, value)` of one form part.
+type FormPart<'a> = (&'a str, Option<&'a str>, &'a str);
+
+/// A multipart body with boundary `B`; file parts are sent as `file_type`.
+fn form_body(parts: &[FormPart], file_type: &str) -> String {
+    let mut body = String::new();
+    for (name, file_name, value) in parts {
+        body.push_str(&format!(
+            "--B\r\nContent-Disposition: form-data; name=\"{name}\""
+        ));
+        if let Some(file_name) = file_name {
+            body.push_str(&format!(
+                "; filename=\"{file_name}\"\r\nContent-Type: {file_type}"
+            ));
+        }
+        body.push_str(&format!("\r\n\r\n{value}\r\n"));
+    }
+    body.push_str("--B--\r\n");
+    body
+}
+
+async fn post_form(app: &axum::Router, route: &str, body: String) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(route)
+                .header("content-type", "multipart/form-data; boundary=B")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// Posts `parts` to `route` and checks that the backend got one request with
+/// every part in the order sent: its name, file name, type and value.
+async fn assert_form_forwarded_unchanged(route: &str, parts: &[FormPart<'_>], file_type: &str) {
+    let backend = start_any_post_backend().await;
+    let app = build_test_app(&backend.uri());
+    let response = post_form(&app, route, form_body(parts, file_type)).await;
+    assert_eq!(response.status(), StatusCode::OK, "{route}");
+
+    let received = backend.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1, "{route}");
+    let forwarded = String::from_utf8_lossy(&received[0].body).into_owned();
+    let mut rest = forwarded.as_str();
+    for (name, file_name, value) in parts {
+        let part = match file_name {
+            Some(file_name) => format!(
+                "Content-Disposition: form-data; name=\"{name}\"; filename=\"{file_name}\"\r\n\
+                 Content-Type: {file_type}\r\n\r\n{value}\r\n"
+            ),
+            None => {
+                format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n")
+            }
+        };
+        let at = rest
+            .find(&part)
+            .unwrap_or_else(|| panic!("{route}: {name} not forwarded as sent:\n{forwarded}"));
+        rest = &rest[at + part.len()..];
+    }
+    assert_eq!(
+        forwarded.matches("Content-Disposition").count(),
+        parts.len()
+    );
+}
+
+/// Posts `supported` to `route` with each of `fields` added first, between
+/// and last: every form is a 400 that names the field, and the backend sees
+/// no request.
+async fn assert_form_fields_refused(route: &str, supported: [FormPart<'_>; 2], fields: &[&str]) {
+    let backend = start_any_post_backend().await;
+    let app = build_test_app(&backend.uri());
+    let [first, second] = supported;
+    for field in fields {
+        let extra = (*field, None, "value");
+        for parts in [
+            [extra, first, second],
+            [first, extra, second],
+            [first, second, extra],
+        ] {
+            let response = post_form(&app, route, form_body(&parts, "image/png")).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{route} {field}"
+            );
+            let body = body_to_json(response).await;
+            assert_eq!(
+                body["error"]["message"],
+                format!("`{field}` is not a supported form field on {route}")
+            );
+        }
+    }
+    assert_eq!(requests_seen(&backend).await, 0, "{route}");
+}
+
+#[tokio::test]
+async fn image_edit_forwards_supported_form_fields_unchanged() {
+    assert_form_forwarded_unchanged(
+        "/v1/images/edits",
+        &[
+            ("model", None, "test-model"),
+            ("prompt", None, "a cat wearing a hat"),
+            ("image[]", Some("first.png"), "firstpngdata"),
+            ("image[]", Some("second.png"), "secondpngdata"),
+            ("mask", Some("mask.png"), "maskpngdata"),
+            ("n", None, "2"),
+            ("size", None, "1024x1024"),
+            ("response_format", None, "b64_json"),
+            ("seed", None, "42"),
+            ("negative_prompt", None, "blurry"),
+        ],
+        "image/png",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn image_edit_refuses_unsupported_form_fields() {
+    assert_form_fields_refused(
+        "/v1/images/edits",
+        [
+            ("prompt", None, "a cat"),
+            ("image", Some("a.png"), "fakepngdata"),
+        ],
+        &[
+            "url",
+            "url[]",
+            "perf_dump_path",
+            "upscaling_model_path",
+            "enhance_prompt",
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn audio_transcription_forwards_supported_form_fields_unchanged() {
+    assert_form_forwarded_unchanged(
+        "/v1/audio/transcriptions",
+        &[
+            ("file", Some("speech.wav"), "fakewavdata"),
+            ("model", None, "test-model"),
+            ("language", None, "en"),
+            ("prompt", None, "names in this recording"),
+            ("response_format", None, "verbose_json"),
+            ("temperature", None, "0.2"),
+            ("timestamp_granularities[]", None, "word"),
+            ("timestamp_granularities[]", None, "segment"),
+        ],
+        "audio/wav",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn audio_transcription_refuses_unsupported_form_fields() {
+    assert_form_fields_refused(
+        "/v1/audio/transcriptions",
+        [
+            ("model", None, "test-model"),
+            ("file", Some("a.wav"), "fakewavdata"),
+        ],
+        &["url", "stream", "seed", "image", "unknown"],
+    )
+    .await;
 }
 
 async fn forwarded_lora_paths(backend: &MockServer) -> Vec<Option<String>> {

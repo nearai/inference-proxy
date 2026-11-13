@@ -1265,7 +1265,10 @@ impl Config {
                 if std::path::Path::new(&path).exists() {
                     Some(path)
                 } else {
-                    warn!(tls_cert_path = %path, "TLS_CERT_PATH is set but file does not exist");
+                    warn!(
+                        error_kind = "tls_cert_missing",
+                        "TLS_CERT_PATH is set but file does not exist"
+                    );
                     None
                 }
             });

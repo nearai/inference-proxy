@@ -10,13 +10,13 @@ mod aws_credentials;
 pub mod backend_affinity;
 pub mod backend_pool;
 pub mod cache;
+pub mod cache_salt;
 pub mod config;
 pub mod content_policy;
 pub mod context_tier;
 pub mod encryption;
 pub mod engine_load;
 pub mod error;
-pub mod fusion;
 pub mod gpu_evidence_delegate;
 pub mod image_validation;
 pub mod media_inline;
@@ -32,6 +32,7 @@ pub mod replica_state;
 pub mod request_guard;
 pub mod request_log;
 pub mod request_tracing;
+pub mod rerank_limit;
 pub mod response_format;
 pub mod routes;
 pub mod signing;
@@ -69,7 +70,6 @@ pub struct AppState {
     pub backend_pool: Arc<backend_pool::BackendPool>,
     pub ohttp_gateway: Option<Arc<ohttp_gateway::OhttpGateway>>,
     pub ohttp_attestation_ed25519: Option<types::OhttpAttestation>,
-    pub fusion_caches: Arc<fusion::FusionCaches>,
     pub vllm_dp_affinity: Arc<vllm_dp_affinity::VllmDpAffinity>,
     /// Conversation → backend pinning across `backend_pool` (see
     /// `VLLM_BACKEND_CONVERSATION_AFFINITY`). Inactive with one backend.
@@ -91,7 +91,10 @@ pub struct AppState {
     /// (`usage_report.rs`, `VLLM_PROXY_USAGE_REPORT_*`). One per process,
     /// shared by every model of a list.
     pub usage_report_delivery: Arc<usage_report::UsageReportDelivery>,
-    /// `sk-` keys cloud-api accepted, for 5 minutes (`api_key_cache.rs`).
+    /// Coalesces concurrent cloud-api checks for the same `sk-` key.
     /// One per process, shared by every model of a list.
     pub api_key_cache: Arc<api_key_cache::ApiKeyCache>,
+    /// In-flight limit for `/v1/rerank` (`rerank_limit.rs`): per workspace
+    /// for Cloud API keys, one shared pool for config tokens.
+    pub rerank_limiter: Arc<rerank_limit::RerankLimiter>,
 }

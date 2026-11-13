@@ -151,7 +151,9 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         transcriptions_url_override: None,
         rerank_url_override: None,
         score_url_override: None,
+        rerank_limits: Default::default(),
         ohttp_enabled: false,
+        ohttp_max_inflight: 0,
         listen_port: 8000,
         listen_addr: "127.0.0.1".to_string(),
         backend_token: options.backend_token.clone(),
@@ -209,17 +211,6 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         web_context_search_url: None,
         agent_loop_max_iterations: 5,
         web_context_search_timeout_secs: 30,
-        fusion_enabled: false,
-        fusion_endpoints_url: "https://completions.near.ai/endpoints".to_string(),
-        fusion_endpoints_ttl_secs: 300,
-        fusion_internal_bearer_token: None,
-        fusion_default_analysis_models: Vec::new(),
-        fusion_max_panel_models: 8,
-        fusion_max_depth: 1,
-        fusion_panel_timeout_secs: 120,
-        fusion_max_response_bytes: 10 * 1024 * 1024,
-        fusion_internal_max_attempts: 2,
-        fusion_internal_retry_initial_backoff_ms: 1,
     };
 
     let ecdsa_key: [u8; 32] = [
@@ -295,6 +286,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),
+        rerank_limiter: Default::default(),
         usage_report_delivery: usage_report::UsageReportDelivery::new(config.usage_report.clone()),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
@@ -309,7 +301,6 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         backend_pool,
         ohttp_gateway: None,
         ohttp_attestation_ed25519: None,
-        fusion_caches: Arc::new(fusion::FusionCaches::default()),
         vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(None, 1_200)),
         backend_affinity,
         admission,
@@ -655,6 +646,7 @@ async fn customer_key_cannot_set_priority() {
             &mock.uri(),
             GatewayOptions {
                 cloud_api_url: Some(mock.uri()),
+                cloud_api_usage_token: Some("test-usage-token".to_string()),
                 ..Default::default()
             },
         );
@@ -746,6 +738,7 @@ async fn org_allowlist_admits_partner_keys_and_refuses_others() {
         &mock.uri(),
         GatewayOptions {
             cloud_api_url: Some(mock.uri()),
+            cloud_api_usage_token: Some("test-usage-token".to_string()),
             allowed_org_ids: vec!["org-partner".to_string()],
             ..Default::default()
         },
@@ -784,6 +777,7 @@ async fn empty_org_allowlist_admits_every_valid_key() {
         &mock.uri(),
         GatewayOptions {
             cloud_api_url: Some(mock.uri()),
+            cloud_api_usage_token: Some("test-usage-token".to_string()),
             ..Default::default()
         },
     );
@@ -3835,6 +3829,7 @@ async fn a_deadline_spent_before_dispatch_refuses_without_asking_an_engine() {
         &mock.uri(),
         GatewayOptions {
             cloud_api_url: Some(mock.uri()),
+            cloud_api_usage_token: Some("test-usage-token".to_string()),
             first_token_deadline_ms: 300,
             ..Default::default()
         },

@@ -208,10 +208,10 @@ fn single_model_state(process: model_list::Process<'_>) -> AppState {
         backend_pool,
         ohttp_gateway: None,
         ohttp_attestation_ed25519: None,
-        fusion_caches: Arc::new(fusion::FusionCaches::default()),
         vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(None, 1_200)),
         models: None,
         api_key_cache: Default::default(),
+        rerank_limiter: Default::default(),
         usage_report_delivery: usage_report::UsageReportDelivery::new(config.usage_report.clone()),
         config,
     }
@@ -978,12 +978,12 @@ async fn a_models_backend_token_and_priority_reach_only_its_own_backends() {
     // cloud-api sees the customer key on the key check and the usage token on
     // the reports; no backend token on anything.
     let to_cloud = cloud.received_requests().await.unwrap();
-    // One key check: cloud-api's 200 is reused for the key's other requests.
+    // Each direct request revalidates the key so revocation is observed.
     let key_checks = to_cloud
         .iter()
         .filter(|request| request.url.path() == "/v1/check_api_key")
         .count();
-    assert_eq!(key_checks, 1);
+    assert_eq!(key_checks, 6);
     assert!(to_cloud.len() >= 6, "{}", to_cloud.len());
     for request in &to_cloud {
         let expected = match request.url.path() {
@@ -3670,10 +3670,10 @@ impl Logs {
 const REQUESTED: [&str; 2] = ["Example/ALPHA", "someone-elses/model-sentinel"];
 
 #[tokio::test]
-async fn a_single_model_lane_counts_how_the_requested_model_compares_and_serves_as_before() {
+async fn a_single_model_lane_counts_requested_models_and_limits_direct_callers() {
     let backend = MockServer::start().await;
     for route in ROUTES {
-        mount_completions(&backend, route, 6).await;
+        mount_completions(&backend, route, 2).await;
     }
     let cloud = cloud_api("sk-live-customer").await;
     let recorder = PrometheusBuilder::new().build_recorder();
@@ -3701,17 +3701,23 @@ async fn a_single_model_lane_counts_how_the_requested_model_compares_and_serves_
         Some(json!(42)),
     ];
     for route in ROUTES {
-        for model in &bodies {
-            // Whatever the body names, the one model answers — as it always has.
+        for (model, expected_status) in bodies.iter().zip([
+            StatusCode::OK,
+            StatusCode::NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            StatusCode::OK,
+            StatusCode::BAD_REQUEST,
+            StatusCode::BAD_REQUEST,
+        ]) {
             let request = post(route, Some("sk-live-customer"), &body_for(model.clone()));
             let response = gateway.app.clone().oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "{route} {model:?}");
+            assert_eq!(response.status(), expected_status, "{route} {model:?}");
             json_body(response).await;
         }
     }
     backend.verify().await;
-    // ... and is billed, under MODEL_NAME.
-    let reports = usage_reports(&cloud, 12).await;
+    // Accepted requests are billed under MODEL_NAME.
+    let reports = usage_reports(&cloud, 4).await;
     assert!(reports.iter().all(|report| report["model"] == ALPHA));
 
     let rendered = handle.render();

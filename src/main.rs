@@ -5,7 +5,7 @@ use tokio::net::TcpListener;
 use tracing::info;
 use vllm_proxy_rs::ohttp_gateway::OhttpGateway;
 use vllm_proxy_rs::{
-    admission, attestation, backend_affinity, backend_pool, cache, config, engine_load, fusion,
+    admission, attestation, backend_affinity, backend_pool, cache, config, engine_load,
     metrics_middleware, model_list, routes, signing, startup_checks, usage_report,
     vllm_dp_affinity, AppState,
 };
@@ -344,6 +344,9 @@ async fn main() -> anyhow::Result<()> {
     let model_name = config.model_name.clone();
     let state = AppState {
         api_key_cache: Default::default(),
+        rerank_limiter: Arc::new(vllm_proxy_rs::rerank_limit::RerankLimiter::new(
+            config.rerank_limits,
+        )),
         usage_report_delivery: usage_report::UsageReportDelivery::for_transport(
             config.usage_report.clone(),
             &config.usage_report_transport,
@@ -359,7 +362,6 @@ async fn main() -> anyhow::Result<()> {
         backend_pool: backend_pool.clone(),
         ohttp_gateway: ohttp_gw,
         ohttp_attestation_ed25519: ohttp_attestation_ed25519.clone(),
-        fusion_caches: Arc::new(fusion::FusionCaches::default()),
         vllm_dp_affinity,
         backend_affinity,
         admission,
@@ -407,8 +409,20 @@ async fn main() -> anyhow::Result<()> {
         if let Err(e) =
             startup_checks::run_startup_checks(&state.backend_client, &state.config).await
         {
-            tracing::error!(error = %e, "OpenAI chat compatibility check failed — exiting");
-            return Err(e.into());
+            let error_kind = match &e {
+                startup_checks::StartupCheckError::ConnectionFailed { .. } => "connection_failed",
+                startup_checks::StartupCheckError::UnexpectedStatus { .. } => "unexpected_status",
+                startup_checks::StartupCheckError::ModelNotFound { .. } => "model_not_found",
+                startup_checks::StartupCheckError::ChatCompletionFailed { .. } => {
+                    "chat_completion_failed"
+                }
+                startup_checks::StartupCheckError::RetriesExhausted { .. } => "retries_exhausted",
+            };
+            tracing::error!(
+                error_kind,
+                "OpenAI chat compatibility check failed — exiting"
+            );
+            return Err(anyhow::anyhow!("Startup checks failed: {error_kind}"));
         }
     } else {
         info!("OpenAI chat compatibility check disabled (set OPENAI_CHAT_COMPATIBILITY_CHECK=true to enable)");

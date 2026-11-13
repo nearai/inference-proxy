@@ -349,7 +349,6 @@ pub(crate) fn check_process(config: &Config) -> anyhow::Result<()> {
         );
     }
     let single_model_features = [
-        (config.fusion_enabled, "FUSION_ENABLED"),
         (
             config.web_context_search_url.is_some(),
             "WEB_CONTEXT_SEARCH_URL",
@@ -1099,6 +1098,9 @@ pub fn app_state(process: Process<'_>) -> anyhow::Result<AppState> {
     );
     Ok(AppState {
         api_key_cache: Default::default(),
+        rerank_limiter: Arc::new(crate::rerank_limit::RerankLimiter::new(
+            config.rerank_limits,
+        )),
         usage_report_delivery: crate::usage_report::UsageReportDelivery::for_transport(
             config.usage_report.clone(),
             &config.usage_report_transport,
@@ -1120,7 +1122,6 @@ pub fn app_state(process: Process<'_>) -> anyhow::Result<AppState> {
         backend_pool: Arc::new(BackendPool::new(vec![UNROUTED_BACKEND_URL.to_string()])),
         ohttp_gateway: None,
         ohttp_attestation_ed25519: None,
-        fusion_caches: Arc::new(crate::fusion::FusionCaches::default()),
         vllm_dp_affinity: Arc::new(crate::vllm_dp_affinity::VllmDpAffinity::new(
             None,
             config.chat_cache_expiration_secs,

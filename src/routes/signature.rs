@@ -4,6 +4,7 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::auth::RequireAuth;
+use crate::cache::{SignatureOwner, SignatureReader};
 use crate::error::AppError;
 use crate::types::{SignatureResponse, SignedChat};
 use crate::AppState;
@@ -16,7 +17,7 @@ pub struct SignatureQuery {
 /// GET /v1/signature/{chat_id}?signing_algo=ecdsa
 pub async fn signature(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    auth: RequireAuth,
     Path(chat_id): Path<String>,
     Query(query): Query<SignatureQuery>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -26,9 +27,12 @@ pub async fn signature(
                 .to_string(),
         ));
     }
-    let cache_value = state
-        .cache
-        .get_chat(&chat_id)
+    // A configured TOKEN caller reads any signature. A direct customer key
+    // reads only signatures recorded for its own organization and workspace;
+    // anything else answers exactly like an unknown id.
+    let owner = SignatureOwner::from_auth(&auth);
+    let cache_value = SignatureReader::for_auth(&auth, owner.as_ref())
+        .and_then(|reader| state.cache.get_chat(&chat_id, reader))
         .ok_or_else(|| AppError::NotFound("Chat id not found or expired".to_string()))?;
 
     let signed: SignedChat = serde_json::from_str(&cache_value)

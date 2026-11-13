@@ -42,12 +42,10 @@ It runs after the two repairs above. A process without a list never does it.
 
 1. `Authorization: Bearer sk-…` → `POST {CLOUD_API_URL}/v1/check_api_key`
    (retries on transport/5xx; 401/402/429 pass through). A 200 carrying the
-   key's full identity (organization, workspace, key id) is reused for 5
-   minutes per key, so a key revoked or out of credits keeps working here for
-   up to that long. Anything else is never kept: every request for the key is
-   checked until one gets such a 200 (the newest check decides). Concurrent
-   requests for a key wait for the check in flight; once a check is not a 200,
-   nobody waits and each request makes its own. With
+   key's full identity (organization, workspace, key id) is used for that
+   request. Later requests recheck credit and revocation state. Concurrent
+   requests for one key can share a check already in flight; once a check is
+   not a 200, nobody waits and each request makes its own. With
    `VLLM_PROXY_ALLOWED_ORG_IDS` set, a valid key from any other organization
    gets a 403 here.
 2. Policy: any content part whose `type` is in
@@ -204,7 +202,7 @@ the variable. Unset or empty = off, and `priority` is exactly as above.
   tiers in this mode; it only forwards the caller header, and the CVM proxy
   in front of each engine adds the bonus.
 - **E2EE.** The bonus is computed after request-field decryption, from the
-  plaintext the engine will see, for plain, E2EE, fusion and agent-loop
+  plaintext the engine will see, for plain, E2EE and agent-loop
   requests alike (the caller-class value is still set before decryption, as
   it never depends on content). A field the proxy cannot decrypt is rejected
   before this step, so no path falls back to bonus 0 for ciphertext.
@@ -573,10 +571,9 @@ queueing" refusal. The consequences are deliberate:
   above the threshold contributes no time-to-first-generation sample, and that
   is fixed at admission: a request that falls back onto the base fleet does not
   start counting. Back-pressure marks and engine-queue avoidance still apply.
-- **Not for fusion or the agent loop.** `VLLM_BACKEND_LONG_CONTEXT_URLS`
-  together with `FUSION_ENABLED` or `WEB_CONTEXT_SEARCH_URL` is refused at
-  startup: those modes place their own backend requests, which no tier
-  restriction reaches.
+- **Not for the agent loop.** `VLLM_BACKEND_LONG_CONTEXT_URLS`
+  together with `WEB_CONTEXT_SEARCH_URL` is refused at startup: that mode
+  places its own backend requests, which no tier restriction reaches.
 
 ## Usage report delivery
 
@@ -877,7 +874,7 @@ The rest of the environment in list mode:
   backends, for which a list entry has no fallback. `VLLM_BASE_URL` is not
   read.
 - `NON_TEE_DEPLOYMENT=1` and `VLLM_PROXY_MODELS_DOCUMENT_URL` are required.
-- `FUSION_ENABLED`, `WEB_CONTEXT_SEARCH_URL`, `OHTTP_ENABLED`,
+- `WEB_CONTEXT_SEARCH_URL`, `OHTTP_ENABLED`,
   `VLLM_DATA_PARALLEL_SIZE`, `OPENAI_CHAT_COMPATIBILITY_CHECK` and
   `REPLICA_STATE_REDIS_URL` cannot be combined with a list: each assumes one
   model per process.

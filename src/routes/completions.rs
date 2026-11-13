@@ -70,6 +70,8 @@ async fn serve(
         auth.cloud_api_key.is_none(),
         state.config.priority_lower_first,
     );
+    // Engine prompt-cache namespace; see the chat route.
+    crate::cache_salt::apply(&mut request_json, &auth)?;
 
     // Extract encryption context from headers
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
@@ -93,7 +95,11 @@ async fn serve(
     // See the chat route: the check runs on the body that is forwarded.
     crate::model_list::guard_request_body(
         &request_json,
-        crate::model_list::checked_model(&state, model.id),
+        if auth.cloud_api_key.is_some() {
+            Some(model.id)
+        } else {
+            crate::model_list::checked_model(&state, model.id)
+        },
     )?;
     crate::model_list::apply_backend_lora(&state, &mut request_json);
     // See the chat route (`request_guard.rs`).

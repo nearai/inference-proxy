@@ -32,6 +32,7 @@ pub mod proxy;
 pub mod rate_limit;
 pub mod reasoning;
 pub mod replica_state;
+pub mod request_log;
 pub mod request_tracing;
 pub mod response_format;
 pub mod routes;

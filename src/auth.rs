@@ -47,10 +47,24 @@ impl IngressRouteKind {
     }
 }
 
+/// Caller of a request authenticated with a config token that `TOKEN_LABELS`
+/// does not label.
+pub const CALLER_UNLABELED: &str = "unlabeled";
+/// Caller of a request authenticated with a Cloud API key.
+pub const CALLER_API_KEY: &str = "api_key";
+/// Caller value for a request that has not been authenticated.
+pub const CALLER_UNKNOWN: &str = "unknown";
+/// Values the proxy itself uses for `caller`; `TOKEN_LABELS` cannot use them.
+pub const RESERVED_CALLERS: &[&str] = &[CALLER_UNLABELED, CALLER_API_KEY, CALLER_UNKNOWN];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestSource {
     pub auth_path: AuthPath,
     pub ingress_route: IngressRouteKind,
+    /// Bounded caller label: the matched config token's `TOKEN_LABELS` entry
+    /// (`unlabeled` without one), or `api_key` for a Cloud API key. Never
+    /// derived from the token's value.
+    pub caller: &'static str,
 }
 
 fn classify_ingress_host(host: Option<&str>) -> IngressRouteKind {
@@ -155,7 +169,7 @@ pub(crate) fn presents_config_token(headers: &axum::http::HeaderMap, config: &Co
         .get("authorization")
         .and_then(|value| value.to_str().ok())
         .and_then(|header| header.strip_prefix("Bearer "))
-        .is_some_and(|token| config.tokens.iter().any(|trusted| token_eq(token, trusted)))
+        .is_some_and(|token| config.config_token_caller(token).is_some())
 }
 
 /// Classify a `reqwest::Error` into a coarse bucket so failure modes are
@@ -358,6 +372,19 @@ impl FromRequestParts<AppState> for RequireAuth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        let auth = Self::authenticate(parts, state).await?;
+        // Every authenticated route passes here: record who the request is
+        // from on its span and for its finish or cancel line.
+        if let Some(ids) = parts.extensions.get::<TracingIds>() {
+            ids.with_authenticated_context(&parts.headers, &auth)
+                .publish_identity();
+        }
+        Ok(auth)
+    }
+}
+
+impl RequireAuth {
+    async fn authenticate(parts: &mut Parts, state: &AppState) -> Result<Self, AppError> {
         let ingress_route = classify_ingress_route(parts);
         // request_id_middleware has already normalized this to a UUID. Reuse it
         // for the Cloud API auth check so direct traffic is joinable across the
@@ -376,7 +403,7 @@ impl FromRequestParts<AppState> for RequireAuth {
                 let token = &header[7..];
                 // Constant-time comparison against each configured admin token
                 // so multiple tokens can be active simultaneously (rotation).
-                if state.config.tokens.iter().any(|t| token_eq(token, t)) {
+                if let Some(caller) = state.config.config_token_caller(token) {
                     return Ok(RequireAuth {
                         cloud_api_key: None,
                         org_id: None,
@@ -386,6 +413,7 @@ impl FromRequestParts<AppState> for RequireAuth {
                         request_source: RequestSource {
                             auth_path: AuthPath::TrustedConfigToken,
                             ingress_route,
+                            caller,
                         },
                     });
                 }
@@ -435,6 +463,7 @@ impl FromRequestParts<AppState> for RequireAuth {
                             request_source: RequestSource {
                                 auth_path: AuthPath::CloudApiKey,
                                 ingress_route,
+                                caller: CALLER_API_KEY,
                             },
                         });
                     }
@@ -461,16 +490,20 @@ impl FromRequestParts<AppState> for RequireTrustedAuth {
             .and_then(|header| header.strip_prefix("Bearer "))
             .ok_or(AppError::Unauthorized)?;
 
-        if state
-            .config
-            .tokens
-            .iter()
-            .any(|trusted| token_eq(token, trusted))
-        {
-            Ok(Self)
-        } else {
-            Err(AppError::Unauthorized)
+        let Some(caller) = state.config.config_token_caller(token) else {
+            return Err(AppError::Unauthorized);
+        };
+        // Record the caller for the request's finish or cancel line, as
+        // `RequireAuth` does. A trusted-only route takes no tenant headers.
+        if let Some(ids) = parts.extensions.get::<TracingIds>() {
+            ids.with_request_source(RequestSource {
+                auth_path: AuthPath::TrustedConfigToken,
+                ingress_route: classify_ingress_route(parts),
+                caller,
+            })
+            .publish_identity();
         }
+        Ok(Self)
     }
 }
 

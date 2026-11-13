@@ -93,6 +93,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         replica_state: None,
         model_name: "test-model".to_string(),
         tokens: vec!["test-token".to_string()],
+        token_labels: vec![],
         vllm_base_url: mock_url.to_string(),
         chat_completions_url: format!("{base}/v1/chat/completions"),
         completions_url: format!("{base}/v1/completions"),

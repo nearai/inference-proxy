@@ -194,6 +194,7 @@ pub(crate) fn log_upstream_error(
         request_id = %request_id,
         org_id = %org_id,
         workspace_id = %workspace_id,
+        upstream_request_id = tracing_ids.and_then(TracingIds::upstream_request_id_for_logs),
         upstream_status = %status,
         upstream_url = %upstream_url,
         upstream_error_parseable = info.is_some(),
@@ -1610,14 +1611,15 @@ fn log_ids_or_empty(tracing_ids: &Option<TracingIds>) -> (String, String, String
 }
 
 #[derive(Clone, Copy)]
-struct RequestMetricLabels {
-    auth_path: &'static str,
-    ingress_route: &'static str,
-    tenant_context: &'static str,
-    request_id_origin: &'static str,
+pub(crate) struct RequestMetricLabels {
+    pub(crate) auth_path: &'static str,
+    pub(crate) ingress_route: &'static str,
+    pub(crate) tenant_context: &'static str,
+    pub(crate) request_id_origin: &'static str,
+    pub(crate) caller: &'static str,
 }
 
-fn request_metric_labels(tracing_ids: Option<&TracingIds>) -> RequestMetricLabels {
+pub(crate) fn request_metric_labels(tracing_ids: Option<&TracingIds>) -> RequestMetricLabels {
     match tracing_ids {
         Some(ids) => {
             let tenant_context = match (
@@ -1651,6 +1653,10 @@ fn request_metric_labels(tracing_ids: Option<&TracingIds>) -> RequestMetricLabel
                 } else {
                     "generated"
                 },
+                caller: ids
+                    .request_source
+                    .map(|source| source.caller)
+                    .unwrap_or(crate::auth::CALLER_UNKNOWN),
             }
         }
         None => RequestMetricLabels {
@@ -1658,6 +1664,7 @@ fn request_metric_labels(tracing_ids: Option<&TracingIds>) -> RequestMetricLabel
             ingress_route: "unknown",
             tenant_context: "unknown",
             request_id_origin: "unknown",
+            caller: crate::auth::CALLER_UNKNOWN,
         },
     }
 }
@@ -1678,6 +1685,7 @@ fn record_completed_request_metrics(
         ("ingress_route", labels.ingress_route),
         ("tenant_context", labels.tenant_context),
         ("request_id_origin", labels.request_id_origin),
+        ("caller", labels.caller),
         ("mode", mode),
     ];
     let Some(model) = model_label else {
@@ -1739,6 +1747,10 @@ pub(crate) fn record_completed_request_for(
     mode: &'static str,
 ) {
     let source_labels = request_metric_labels(tracing_ids);
+    if let Some(ids) = tracing_ids {
+        // This line stands for the request: its guard writes no other.
+        ids.record.mark_completion_logged();
+    }
     let total_ms = total_duration.as_millis();
     let (request_id, org_id, workspace_id) = match tracing_ids {
         Some(ids) => (
@@ -1748,6 +1760,7 @@ pub(crate) fn record_completed_request_for(
         ),
         None => ("", "", ""),
     };
+    let upstream_request_id = tracing_ids.and_then(TracingIds::upstream_request_id_for_logs);
     record_completed_request_metrics(model_label, source_labels, input_tokens, total_ms, mode);
     info!(
         request_id = %request_id,
@@ -1762,6 +1775,8 @@ pub(crate) fn record_completed_request_for(
         ingress_route = source_labels.ingress_route,
         tenant_context = source_labels.tenant_context,
         request_id_origin = source_labels.request_id_origin,
+        caller = source_labels.caller,
+        upstream_request_id,
         mode,
         "request completed"
     );
@@ -2159,6 +2174,8 @@ fn inject_streaming(body: &[u8]) -> Result<Vec<u8>, AppError> {
 ///   `text_completion` object with `choices[].text`.
 struct StreamingResponseAssembler {
     line_buffer: String,
+    /// Trailing bytes of a character split across chunks.
+    utf8_carry: Vec<u8>,
     id: Option<String>,
     model: Option<String>,
     created: Option<i64>,
@@ -2196,6 +2213,42 @@ struct ChoiceAssembler {
     extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Appends `chunk` to `text`. A character split across chunks is held in
+/// `carry` until its remaining bytes arrive; bytes that can never form a
+/// character become U+FFFD.
+fn push_utf8_chunk(text: &mut String, carry: &mut Vec<u8>, chunk: &[u8]) {
+    let joined;
+    let mut bytes: &[u8] = if carry.is_empty() {
+        chunk
+    } else {
+        carry.extend_from_slice(chunk);
+        joined = std::mem::take(carry);
+        &joined
+    };
+    loop {
+        match std::str::from_utf8(bytes) {
+            Ok(valid) => {
+                text.push_str(valid);
+                return;
+            }
+            Err(error) => {
+                let (valid, rest) = bytes.split_at(error.valid_up_to());
+                text.push_str(std::str::from_utf8(valid).unwrap_or_default());
+                match error.error_len() {
+                    Some(invalid_len) => {
+                        text.push(char::REPLACEMENT_CHARACTER);
+                        bytes = &rest[invalid_len..];
+                    }
+                    None => {
+                        carry.extend_from_slice(rest);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Merge preserved unknown fields into an assembled object, without
 /// overwriting fields we already populated.
 fn merge_extra(target: &mut serde_json::Value, extra: serde_json::Map<String, serde_json::Value>) {
@@ -2213,6 +2266,7 @@ impl StreamingResponseAssembler {
     fn new(shape: ResponseShape) -> Self {
         Self {
             line_buffer: String::new(),
+            utf8_carry: Vec::new(),
             id: None,
             model: None,
             created: None,
@@ -2231,10 +2285,7 @@ impl StreamingResponseAssembler {
     }
 
     fn process_chunk(&mut self, chunk: &[u8]) {
-        match std::str::from_utf8(chunk) {
-            Ok(s) => self.line_buffer.push_str(s),
-            Err(_) => self.line_buffer.push_str(&String::from_utf8_lossy(chunk)),
-        }
+        push_utf8_chunk(&mut self.line_buffer, &mut self.utf8_carry, chunk);
 
         while let Some(newline_pos) = self.line_buffer.find('\n') {
             let line_end =
@@ -3366,14 +3417,17 @@ pub(crate) fn normalize_chat_chunk(val: &mut serde_json::Value) {
 /// and optionally applies an additional transform (e.g. encryption).
 /// Fail-closed: if a data line contains JSON that cannot be transformed, the stream errors.
 struct SseTransformer {
-    line_buffer: String,
+    /// Raw bytes of the line still being received. Kept as bytes because a
+    /// network chunk can end in the middle of a multi-byte character; a line
+    /// is only decoded once its newline has arrived.
+    line_buffer: Vec<u8>,
     extra_transform: Option<crate::encryption::ChunkTransform>,
 }
 
 impl SseTransformer {
     fn new(extra_transform: Option<crate::encryption::ChunkTransform>) -> Self {
         Self {
-            line_buffer: String::new(),
+            line_buffer: Vec::new(),
             extra_transform,
         }
     }
@@ -3381,17 +3435,20 @@ impl SseTransformer {
     /// Feed raw bytes into the buffer and return all complete transformed lines.
     /// Incomplete lines are buffered for the next call.
     fn process_chunk(&mut self, chunk: &[u8]) -> Result<Bytes, AppError> {
-        let s = std::str::from_utf8(chunk).map_err(|e| {
-            AppError::Internal(anyhow::anyhow!("Received invalid UTF-8 in SSE stream: {e}"))
-        })?;
-        self.line_buffer.push_str(s);
+        self.line_buffer.extend_from_slice(chunk);
 
         let mut output = String::new();
 
-        while let Some(newline_pos) = self.line_buffer.find('\n') {
-            // Extract the complete line including the newline
-            let full_line = self.line_buffer[..=newline_pos].to_string();
-            self.line_buffer.drain(..=newline_pos);
+        while let Some(newline_pos) = self.line_buffer.iter().position(|&b| b == b'\n') {
+            // Extract the complete line including the newline. Only a complete
+            // line is decoded, so a character split across chunks is whole here.
+            let line_bytes: Vec<u8> = self.line_buffer.drain(..=newline_pos).collect();
+            let full_line = String::from_utf8(line_bytes).map_err(|e| {
+                AppError::Internal(anyhow::anyhow!(
+                    "Received invalid UTF-8 in SSE stream: {}",
+                    e.utf8_error()
+                ))
+            })?;
 
             let trimmed = full_line.trim_end_matches(['\n', '\r']);
             let data = trimmed
@@ -3438,7 +3495,12 @@ impl SseTransformer {
         if self.line_buffer.is_empty() {
             return Ok(Bytes::new());
         }
-        let remaining = std::mem::take(&mut self.line_buffer);
+        let remaining = String::from_utf8(std::mem::take(&mut self.line_buffer)).map_err(|e| {
+            AppError::Internal(anyhow::anyhow!(
+                "Received invalid UTF-8 in SSE stream: {}",
+                e.utf8_error()
+            ))
+        })?;
         let trimmed = remaining.trim_end_matches(['\n', '\r']);
         let data = trimmed
             .strip_prefix("data: ")
@@ -3751,6 +3813,8 @@ impl Drop for StreamingGuard {
 /// Extracts `chat_id` from the first JSON chunk and detects the `[DONE]` marker.
 pub struct SseParser {
     line_buffer: String,
+    /// Trailing bytes of a character split across chunks.
+    utf8_carry: Vec<u8>,
     pub chat_id: Option<String>,
     pub seen_done: bool,
     /// Whether the stream has emitted client-visible generation progress.
@@ -3779,6 +3843,7 @@ impl SseParser {
     pub fn new() -> Self {
         Self {
             line_buffer: String::new(),
+            utf8_carry: Vec::new(),
             chat_id: None,
             seen_done: false,
             seen_generation_progress: false,
@@ -3796,10 +3861,7 @@ impl SseParser {
     }
 
     pub fn process_chunk(&mut self, chunk: &[u8]) -> bool {
-        match std::str::from_utf8(chunk) {
-            Ok(s) => self.line_buffer.push_str(s),
-            Err(_) => self.line_buffer.push_str(&String::from_utf8_lossy(chunk)),
-        }
+        push_utf8_chunk(&mut self.line_buffer, &mut self.utf8_carry, chunk);
 
         let mut chunk_has_generation_progress = false;
 
@@ -4048,8 +4110,10 @@ mod tests {
             request_source: Some(RequestSource {
                 auth_path: AuthPath::TrustedConfigToken,
                 ingress_route: IngressRouteKind::LongIndexed,
+                caller: crate::auth::CALLER_UNLABELED,
             }),
             forward_tenant_headers: true,
+            record: Default::default(),
         });
 
         let labels = request_metric_labels(tracing_ids.as_ref());
@@ -4057,6 +4121,7 @@ mod tests {
         assert_eq!(labels.ingress_route, "long_indexed");
         assert_eq!(labels.tenant_context, "trusted_headers");
         assert_eq!(labels.request_id_origin, "inbound");
+        assert_eq!(labels.caller, "unlabeled");
 
         let direct_ids = Some(TracingIds {
             request_id: uuid::Uuid::new_v4().to_string(),
@@ -4067,14 +4132,18 @@ mod tests {
             request_source: Some(RequestSource {
                 auth_path: AuthPath::CloudApiKey,
                 ingress_route: IngressRouteKind::Canonical,
+                caller: crate::auth::CALLER_API_KEY,
             }),
             forward_tenant_headers: false,
+            record: Default::default(),
         });
         let direct_labels = request_metric_labels(direct_ids.as_ref());
         assert_eq!(direct_labels.auth_path, "cloud_api_key");
         assert_eq!(direct_labels.ingress_route, "canonical");
         assert_eq!(direct_labels.tenant_context, "verified");
         assert_eq!(direct_labels.request_id_origin, "generated");
+        assert_eq!(direct_labels.caller, "api_key");
+        assert_eq!(request_metric_labels(None).caller, "unknown");
 
         let trusted_without_tenant = Some(TracingIds {
             request_id: uuid::Uuid::new_v4().to_string(),
@@ -4085,8 +4154,10 @@ mod tests {
             request_source: Some(RequestSource {
                 auth_path: AuthPath::TrustedConfigToken,
                 ingress_route: IngressRouteKind::Canonical,
+                caller: crate::auth::CALLER_UNLABELED,
             }),
             forward_tenant_headers: true,
+            record: Default::default(),
         });
         assert_eq!(
             request_metric_labels(trusted_without_tenant.as_ref()).tenant_context,
@@ -4105,8 +4176,10 @@ mod tests {
             request_source: Some(RequestSource {
                 auth_path: AuthPath::CloudApiKey,
                 ingress_route: IngressRouteKind::Canonical,
+                caller: crate::auth::CALLER_API_KEY,
             }),
             forward_tenant_headers: false,
+            record: Default::default(),
         });
 
         let probe = Some(TracingIds {
@@ -4117,6 +4190,7 @@ mod tests {
             workspace_id: None,
             request_source: None,
             forward_tenant_headers: false,
+            record: Default::default(),
         });
 
         assert_eq!(tenant_context_label(customer.as_ref()), "verified");
@@ -4152,6 +4226,7 @@ mod tests {
             request_source: RequestSource {
                 auth_path: AuthPath::CloudApiKey,
                 ingress_route: IngressRouteKind::Canonical,
+                caller: crate::auth::CALLER_API_KEY,
             },
             delivery: Default::default(),
         }
@@ -6333,6 +6408,54 @@ data: [DONE]
     }
 
     #[test]
+    fn test_sse_transformer_character_split_across_chunks() {
+        // A chunk boundary may fall inside a multi-byte character. Whatever the
+        // split point, the output must equal the unsplit output.
+        let stream = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"h\u{e9}llo \u{4f60}\u{597d} \u{1f44b}\"}}]}\n\ndata: [DONE]\n\n"
+            .as_bytes();
+        let mut whole = SseTransformer::new(None);
+        let mut expected = whole.process_chunk(stream).unwrap().to_vec();
+        expected.extend_from_slice(&whole.flush().unwrap());
+        assert!(std::str::from_utf8(&expected)
+            .unwrap()
+            .contains("\u{4f60}\u{597d}"));
+
+        for split in 1..stream.len() {
+            let mut transformer = SseTransformer::new(None);
+            let mut out = transformer
+                .process_chunk(&stream[..split])
+                .unwrap()
+                .to_vec();
+            out.extend_from_slice(&transformer.process_chunk(&stream[split..]).unwrap());
+            out.extend_from_slice(&transformer.flush().unwrap());
+            assert_eq!(out, expected, "split at byte {split}");
+        }
+
+        // One byte at a time.
+        let mut transformer = SseTransformer::new(None);
+        let mut out = Vec::new();
+        for byte in stream {
+            out.extend_from_slice(&transformer.process_chunk(&[*byte]).unwrap());
+        }
+        out.extend_from_slice(&transformer.flush().unwrap());
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn test_sse_transformer_invalid_utf8_line_still_fails() {
+        let mut transformer = SseTransformer::new(None);
+        assert!(transformer.process_chunk(b"data: \xff\xfe\n").is_err());
+
+        // A stream that ends inside a character is invalid, too.
+        let mut transformer = SseTransformer::new(None);
+        assert!(transformer
+            .process_chunk(b": note \xe4\xbd")
+            .unwrap()
+            .is_empty());
+        assert!(transformer.flush().is_err());
+    }
+
+    #[test]
     fn test_sse_transformer_normalizes_without_extra_transform() {
         let mut transformer = SseTransformer::new(None);
         let chunk = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"think\"}}]}\n";
@@ -6666,6 +6789,48 @@ data: [DONE]
     }
 
     // ── StreamingResponseAssembler tests ──
+
+    #[test]
+    fn test_assembler_character_split_across_chunks() {
+        let event = "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"h\u{e9}llo \u{4f60}\u{597d} \u{1f30d}\"},\"finish_reason\":\"stop\"}]}\n\n"
+            .as_bytes();
+        // Cut at every byte offset, so each multi-byte character is split at
+        // each of its inner boundaries once.
+        for cut in 1..event.len() {
+            let mut asm = StreamingResponseAssembler::new(ResponseShape::ChatCompletion);
+            asm.process_chunk(&event[..cut]);
+            asm.process_chunk(&event[cut..]);
+            let resp = asm.into_response("chatcmpl");
+            assert_eq!(
+                resp["choices"][0]["message"]["content"], "h\u{e9}llo \u{4f60}\u{597d} \u{1f30d}",
+                "cut at byte {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_push_utf8_chunk_replaces_only_invalid_bytes() {
+        let mut text = String::new();
+        let mut carry = Vec::new();
+        push_utf8_chunk(&mut text, &mut carry, b"a\xffb\xe4\xbd");
+        assert_eq!(text, "a\u{fffd}b");
+        assert_eq!(carry, b"\xe4\xbd");
+        push_utf8_chunk(&mut text, &mut carry, b"\xa0c");
+        assert_eq!(text, "a\u{fffd}b\u{4f60}c");
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn test_sse_parser_reads_usage_from_line_with_split_character() {
+        let event = "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\u{4f60}\"}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n"
+            .as_bytes();
+        let cut = event.iter().position(|&b| b >= 0x80).unwrap() + 1;
+        let mut parser = SseParser::new();
+        parser.process_chunk(&event[..cut]);
+        parser.process_chunk(&event[cut..]);
+        assert_eq!(parser.chat_id.as_deref(), Some("c1"));
+        assert_eq!(parser.usage, Some((5, 2)));
+    }
 
     #[test]
     fn test_assembler_basic_content() {

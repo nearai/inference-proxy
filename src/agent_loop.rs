@@ -1370,8 +1370,14 @@ async fn brave_llm_context_search(
         body_bytes.extend_from_slice(&chunk);
     }
 
-    let parsed: BraveContextResponse = serde_json::from_slice(&body_bytes)
-        .map_err(|e| BraveError::Other(format!("brave JSON parse failed: {e}")))?;
+    let parsed: BraveContextResponse = serde_json::from_slice(&body_bytes).map_err(|e| {
+        BraveError::Other(format!(
+            "brave JSON parse failed: {:?} at line {} column {}",
+            e.classify(),
+            e.line(),
+            e.column()
+        ))
+    })?;
 
     Ok(format_context_response(&parsed, count))
 }

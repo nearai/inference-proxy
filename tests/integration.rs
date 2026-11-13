@@ -260,7 +260,10 @@ fn build_test_app_inner_with_pool(
         cloud_api_auth_max_attempts: 1,
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
-        cloud_api_usage_token: None,
+        cloud_api_usage_token: options
+            .cloud_api_url
+            .as_ref()
+            .map(|_| "test-usage-token".to_string()),
         usage_report: Default::default(),
         usage_report_transport: Default::default(),
         compose_manager_url: None,
@@ -1078,18 +1081,16 @@ async fn test_completions_replica_hint_routes_to_hinted_backend() {
     assert_eq!(requests_seen(&backend_a).await, 0);
 }
 
-/// cloud-api's 200 for an `sk-` key (with the identity usage reports need) is
-/// reused for 5 minutes: a second request with the same key does not check it
-/// again.
+/// A later request rechecks key authorization and credit state.
 #[tokio::test]
-async fn test_cloud_api_key_check_is_reused_across_requests() {
+async fn test_cloud_api_key_check_is_repeated_across_requests() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
     mount_completions_ok(&backend, 2).await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true, "organization_id": "org-1", "workspace_id": "ws-1", "api_key_id": "key-1"})))
-        .expect(1)
+        .expect(2)
         .mount(&cloud_api)
         .await;
     let (app, _pool) =
@@ -1115,7 +1116,7 @@ async fn test_cloud_api_key_check_is_reused_across_requests() {
 }
 
 /// A key cloud-api did not accept is checked on every request until a 200;
-/// only then is it reused.
+/// even after a successful check.
 #[tokio::test]
 async fn test_cloud_api_key_is_checked_on_every_request_until_accepted() {
     let backend = MockServer::start().await;
@@ -1134,7 +1135,7 @@ async fn test_cloud_api_key_is_checked_on_every_request_until_accepted() {
         .and(path("/v1/check_api_key"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true, "organization_id": "org-1", "workspace_id": "ws-1", "api_key_id": "key-1"})))
         .with_priority(2)
-        .expect(1)
+        .expect(2)
         .mount(&cloud_api)
         .await;
     let (app, _pool) =
@@ -1184,7 +1185,7 @@ async fn test_cloud_api_key_5xx_is_not_kept() {
         .and(path("/v1/check_api_key"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true, "organization_id": "org-1", "workspace_id": "ws-1", "api_key_id": "key-1"})))
         .with_priority(2)
-        .expect(1)
+        .expect(2)
         .mount(&cloud_api)
         .await;
     let (app, _pool) =
@@ -1218,7 +1219,7 @@ async fn test_completions_replica_hint_is_dropped_for_cloud_api_key_auth() {
     mount_completions_ok(&backend_b, 0).await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true, "organization_id": "org-1", "workspace_id": "ws-1", "api_key_id": "key-1"})))
         .mount(&cloud_api)
         .await;
     let (app, pool) = build_test_app_with_backends_and_cloud_api(
@@ -1264,7 +1265,7 @@ async fn test_chat_completions_replica_hint_is_dropped_for_cloud_api_key_auth() 
     mount_chat_ok(&backend_b, "/v1/chat/completions", 0).await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true, "organization_id": "org-1", "workspace_id": "ws-1", "api_key_id": "key-1"})))
         .mount(&cloud_api)
         .await;
     let (app, pool) = build_test_app_with_backends_and_cloud_api(
@@ -1279,6 +1280,8 @@ async fn test_chat_completions_replica_hint_is_dropped_for_cloud_api_key_auth() 
         .active_conns
         .store(3, std::sync::atomic::Ordering::Relaxed);
 
+    let mut body = affinity_chat_body(0);
+    body["model"] = serde_json::Value::String("test-model".to_string());
     let response = app
         .oneshot(
             Request::builder()
@@ -1287,9 +1290,7 @@ async fn test_chat_completions_replica_hint_is_dropped_for_cloud_api_key_auth() 
                 .header("content-type", "application/json")
                 .header("authorization", "Bearer sk-test-valid-key-12345678901")
                 .header(backend_affinity::REPLICA_HINT_HEADER, "1")
-                .body(Body::from(
-                    serde_json::to_vec(&affinity_chat_body(0)).unwrap(),
-                ))
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
         .await
@@ -5090,9 +5091,10 @@ async fn test_non_object_json_body_is_rejected_before_dispatch() {
             .header("content-type", "application/json")
             .header("authorization", "Bearer sk-test-valid-key-12345678901");
         if encrypted {
-            request = request
-                .header("x-signing-algo", "ed25519")
-                .header("x-client-pub-key", "11".repeat(32));
+            request = request.header("x-signing-algo", "ed25519").header(
+                "x-client-pub-key",
+                test_client_signing_pair().ed25519.signing_public_key,
+            );
         }
         app.clone().oneshot(request.body(Body::from(body)).unwrap())
     };
@@ -6136,6 +6138,33 @@ async fn test_images_generations_endpoint() {
     assert_eq!(body["id"], "img-test");
 }
 
+#[tokio::test]
+async fn test_images_generations_rejects_out_of_range_count_before_dispatch() {
+    let backend = MockServer::start().await;
+    let app = build_test_app(&backend.uri());
+
+    for count in [serde_json::json!(0), serde_json::json!(11)] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/images/generations")
+                    .header("content-type", "application/json")
+                    .header(auth_header().0, auth_header().1)
+                    .body(Body::from(
+                        serde_json::json!({"model": "test-model", "prompt": "synthetic", "n": count})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(requests_seen(&backend).await, 0);
+}
+
 // ---- Signature endpoint invalid algo ----
 
 #[tokio::test]
@@ -6329,7 +6358,8 @@ async fn test_audio_transcriptions_multipart() {
         .and(path("/v1/audio/transcriptions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "trans-test",
-            "text": "Hello world"
+            "text": "Hello world",
+            "usage": {"type": "duration", "seconds": 1}
         })))
         .mount(&mock_server)
         .await;
@@ -6384,6 +6414,134 @@ async fn test_audio_transcriptions_multipart() {
     assert_eq!(sig_response.status(), StatusCode::OK);
 }
 
+#[tokio::test]
+async fn test_direct_audio_transcription_reports_duration() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-test",
+            "workspace_id": "ws-test",
+            "api_key_id": "key-test"
+        })))
+        .mount(&cloud_api)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/internal/usage"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_api)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "trans-direct",
+            "text": "synthetic",
+            "usage": {"type": "duration", "seconds": 1.25}
+        })))
+        .mount(&backend)
+        .await;
+
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+    let boundary = "----SyntheticAudioBoundary";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ntest-model\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n\
+         Content-Type: audio/wav\r\n\r\nsynthetic-audio\r\n--{boundary}--\r\n"
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("inference-id").is_some());
+
+    wait_for_usage_request(&cloud_api, 1).await;
+    let usage_reqs = get_usage_requests(&cloud_api).await;
+    assert_eq!(usage_reqs.len(), 1);
+    assert_eq!(usage_reqs[0]["type"], "audio_transcription");
+    assert_eq!(usage_reqs[0]["duration_seconds"], 2);
+    assert_eq!(usage_reqs[0]["id"], "trans-direct");
+}
+
+#[tokio::test]
+async fn test_audio_transcriptions_missing_duration_is_direct_only() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-test",
+            "workspace_id": "ws-test",
+            "api_key_id": "key-test"
+        })))
+        .mount(&cloud_api)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "trans-without-usage", "text": "synthetic"
+        })))
+        .mount(&backend)
+        .await;
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+    let boundary = "----SyntheticMissingUsageBoundary";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ntest-model\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n\
+         Content-Type: audio/wav\r\n\r\nsynthetic-audio\r\n--{boundary}--\r\n"
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(response.headers().get("inference-id").is_none());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("inference-id").is_none());
+    assert_eq!(body_to_json(response).await["id"], "trans-without-usage");
+    assert!(get_usage_requests(&cloud_api).await.is_empty());
+}
+
 // Regression: a multipart audio body larger than axum's 2 MiB DefaultBodyLimit
 // must still be accepted (the route disables the default limit so the handler's
 // own `max_audio_request_size` is the only ceiling). Before the fix this failed
@@ -6396,7 +6554,8 @@ async fn test_audio_transcriptions_large_body_not_rejected() {
         .and(path("/v1/audio/transcriptions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "trans-large",
-            "text": "ok"
+            "text": "ok",
+            "usage": {"type": "duration", "seconds": 1}
         })))
         .mount(&mock_server)
         .await;
@@ -6777,7 +6936,7 @@ async fn test_cloud_api_key_valid() {
             "authorization",
             "Bearer sk-test-valid-key-12345678901",
         ))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true, "organization_id": "org-1", "workspace_id": "ws-1", "api_key_id": "key-1"})))
         .mount(&cloud_api)
         .await;
 
@@ -6785,7 +6944,7 @@ async fn test_cloud_api_key_valid() {
     let backend_response = serde_json::json!({
         "id": "chatcmpl-1",
         "object": "chat.completion",
-        "model": "test-model",
+        "model": "backend-alias",
         "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
     });
@@ -6816,6 +6975,178 @@ async fn test_cloud_api_key_valid() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("inference-id").is_some());
+    let body = body_to_json(response).await;
+    assert_eq!(body["model"], "test-model");
+}
+
+#[tokio::test]
+async fn direct_key_rejects_a_different_model_before_backend_dispatch() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-test",
+            "workspace_id": "ws-test",
+            "api_key_id": "key-test"
+        })))
+        .mount(&cloud_api)
+        .await;
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+
+    for (route, body) in [
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"model": "another-model", "messages": []}),
+        ),
+        (
+            "/v1/images/generations",
+            serde_json::json!({"model": "another-model", "prompt": "synthetic"}),
+        ),
+        (
+            "/v1/privacy/classify",
+            serde_json::json!({"model": "another-model", "input": "synthetic"}),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(route)
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{route}");
+    }
+    assert_eq!(requests_seen(&backend).await, 0);
+}
+
+#[tokio::test]
+async fn direct_privacy_classification_requires_billable_json() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-test",
+            "workspace_id": "ws-test",
+            "api_key_id": "key-test"
+        })))
+        .mount(&cloud_api)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/privacy/classify"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("synthetic-label", "text/plain"))
+        .mount(&backend)
+        .await;
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+    let body = serde_json::json!({"model": "test-model", "input": "synthetic"}).to_string();
+
+    let direct_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/privacy/classify")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(direct_response.status(), StatusCode::BAD_GATEWAY);
+    assert!(direct_response.headers().get("inference-id").is_none());
+
+    let trusted_response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/privacy/classify")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(trusted_response.status(), StatusCode::OK);
+    assert!(trusted_response.headers().get("inference-id").is_none());
+    assert_eq!(
+        body_to_bytes(trusted_response).await.as_slice(),
+        b"synthetic-label"
+    );
+    assert!(get_usage_requests(&cloud_api).await.is_empty());
+}
+
+#[tokio::test]
+async fn direct_key_requires_billing_identity_before_backend_dispatch() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})))
+        .mount(&cloud_api)
+        .await;
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .body(Body::from(r#"{"model":"test-model","messages":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(requests_seen(&backend).await, 0);
+}
+
+#[tokio::test]
+async fn direct_key_refuses_unbillable_backend_success() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-test",
+            "workspace_id": "ws-test",
+            "api_key_id": "key-test"
+        })))
+        .mount(&cloud_api)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "emb-without-usage", "data": [{"embedding": [0.5]}]
+        })))
+        .mount(&backend)
+        .await;
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .body(Body::from(r#"{"model":"test-model","input":"synthetic"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(response.headers().get("inference-id").is_none());
+    assert!(get_usage_requests(&cloud_api).await.is_empty());
 }
 
 #[tokio::test]
@@ -6923,7 +7254,7 @@ async fn test_cloud_api_key_retries_after_5xx() {
         .await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true, "organization_id": "org-1", "workspace_id": "ws-1", "api_key_id": "key-1"})))
         .with_priority(2)
         .mount(&cloud_api)
         .await;
@@ -7418,6 +7749,7 @@ data: [DONE]\n\n";
     });
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -7431,6 +7763,13 @@ data: [DONE]\n\n";
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    let inference_id = response
+        .headers()
+        .get("inference-id")
+        .expect("direct streaming response has an inference id")
+        .to_str()
+        .unwrap()
+        .to_string();
 
     // Consume the streaming body so the background task finishes
     use http_body_util::BodyExt;
@@ -7443,11 +7782,31 @@ data: [DONE]\n\n";
     assert_eq!(usage_reqs[0]["input_tokens"], 8);
     assert_eq!(usage_reqs[0]["output_tokens"], 3);
     assert_eq!(usage_reqs[0]["cache_read_tokens"], 6);
+    let usage_id = usage_reqs[0]["id"].as_str().unwrap();
+    assert!(usage_id.starts_with("stream-"));
+    assert_ne!(usage_id, "chatcmpl-stream-u1");
+    let namespace = uuid::Uuid::from_u128(0x1966acaf_9f95_5dab_b8f0_03a51c091314);
+    assert_eq!(
+        inference_id,
+        uuid::Uuid::new_v5(&namespace, usage_id.as_bytes()).to_string()
+    );
     // Reported via the service-token /v1/internal/usage path: cloud-api attributes
     // the usage from these identity fields in the body (not from an sk- bearer).
     assert_eq!(usage_reqs[0]["organization_id"], "org-test");
     assert_eq!(usage_reqs[0]["workspace_id"], "ws-test");
     assert_eq!(usage_reqs[0]["api_key_id"], "key-test");
+
+    let signature = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/signature/chatcmpl-stream-u1?signing_algo=ecdsa")
+                .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(signature.status(), StatusCode::OK);
 }
 
 /// Regression test for nearai/infra#98: an interrupted stream (no `[DONE]`,
@@ -7685,9 +8044,11 @@ async fn test_usage_reported_for_image_generation() {
         .and(path("/v1/images/generations"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "data": [
-                {"url": "https://example.com/img1.png"},
+                {"url": "https://example.com/img1.png", "file_path": "/synthetic/engine/path"},
                 {"url": "https://example.com/img2.png"}
-            ]
+            ],
+            "peak_memory_mb": 123,
+            "inference_time_s": 2.5
         })))
         .mount(&backend)
         .await;
@@ -7714,6 +8075,11 @@ async fn test_usage_reported_for_image_generation() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("inference-id").is_some());
+    let response_body = body_to_json(response).await;
+    assert!(response_body.get("peak_memory_mb").is_none());
+    assert!(response_body.get("inference_time_s").is_none());
+    assert!(response_body["data"][0].get("file_path").is_none());
 
     wait_for_usage_request(&cloud_api, 1).await;
     let usage_reqs = get_usage_requests(&cloud_api).await;
@@ -8899,7 +9265,8 @@ async fn test_encrypted_audio_transcription_signature_hashes_raw_request_and_res
 
     let backend_response = serde_json::json!({
         "id": "trans-enc1",
-        "text": "Hello world"
+        "text": "Hello world",
+        "usage": {"type": "duration", "seconds": 1}
     });
 
     Mock::given(method("POST"))
@@ -10644,7 +11011,8 @@ async fn test_ohttp_audio_transcriptions_allowed() {
         .and(path("/v1/audio/transcriptions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "trans-ohttp",
-            "text": "Hello world"
+            "text": "Hello world",
+            "usage": {"type": "duration", "seconds": 1}
         })))
         .mount(&mock)
         .await;

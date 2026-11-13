@@ -29,12 +29,15 @@ async fn direct_privacy_classify_observable_request_id_contract() {
         .mount(&cloud_api)
         .await;
     Mock::given(method("POST"))
+        .and(path("/v1/internal/usage"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_api)
+        .await;
+    Mock::given(method("POST"))
         .and(path("/v1/privacy/classify"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/plain")
-                .set_body_string("classify ok"),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"index": 0, "label": "synthetic", "usage": {"input_tokens": 3}}]
+        })))
         .mount(&backend)
         .await;
 
@@ -57,14 +60,13 @@ async fn direct_privacy_classify_observable_request_id_contract() {
                 .header("x-request-id", VALID_REQUEST_ID)
                 .header("x-org-id", "org-spoofed")
                 .header("x-workspace-id", "ws-spoofed")
-                .body(Body::from(
-                    r#"{"model":"openai/privacy-filter","input":"hello"}"#,
-                ))
+                .body(Body::from(r#"{"model":"test-model","input":"synthetic"}"#))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(valid.status(), StatusCode::OK);
+    assert!(valid.headers().get("inference-id").is_some());
     assert_eq!(
         valid.headers().get("x-request-id").unwrap(),
         VALID_REQUEST_ID
@@ -80,14 +82,13 @@ async fn direct_privacy_classify_observable_request_id_contract() {
                 .header("x-request-id", "not-a-uuid")
                 .header("x-org-id", "org-spoofed")
                 .header("x-workspace-id", "ws-spoofed")
-                .body(Body::from(
-                    r#"{"model":"openai/privacy-filter","input":"hello"}"#,
-                ))
+                .body(Body::from(r#"{"model":"test-model","input":"synthetic"}"#))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(invalid.status(), StatusCode::OK);
+    assert!(invalid.headers().get("inference-id").is_some());
     let replacement_id = request_id_from_response(&invalid);
     assert_uuid(&replacement_id);
     assert_ne!(replacement_id, "not-a-uuid");
@@ -140,7 +141,7 @@ async fn direct_privacy_classify_observable_request_id_contract() {
         .into_iter()
         .filter(|request| request.url.path() == "/v1/check_api_key")
         .collect();
-    // Two keys, because an accepted key is not checked again for 5 minutes.
+    // Two distinct direct keys each receive an auth check.
     assert_eq!(auth_checks.len(), 2, "expected one auth check per key");
     assert_eq!(
         auth_checks[0]

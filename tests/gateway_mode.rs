@@ -654,6 +654,7 @@ async fn customer_key_cannot_set_priority() {
             &mock.uri(),
             GatewayOptions {
                 cloud_api_url: Some(mock.uri()),
+                cloud_api_usage_token: Some("test-usage-token".to_string()),
                 ..Default::default()
             },
         );
@@ -745,6 +746,7 @@ async fn org_allowlist_admits_partner_keys_and_refuses_others() {
         &mock.uri(),
         GatewayOptions {
             cloud_api_url: Some(mock.uri()),
+            cloud_api_usage_token: Some("test-usage-token".to_string()),
             allowed_org_ids: vec!["org-partner".to_string()],
             ..Default::default()
         },
@@ -783,6 +785,7 @@ async fn empty_org_allowlist_admits_every_valid_key() {
         &mock.uri(),
         GatewayOptions {
             cloud_api_url: Some(mock.uri()),
+            cloud_api_usage_token: Some("test-usage-token".to_string()),
             ..Default::default()
         },
     );
@@ -3834,6 +3837,7 @@ async fn a_deadline_spent_before_dispatch_refuses_without_asking_an_engine() {
         &mock.uri(),
         GatewayOptions {
             cloud_api_url: Some(mock.uri()),
+            cloud_api_usage_token: Some("test-usage-token".to_string()),
             first_token_deadline_ms: 300,
             ..Default::default()
         },

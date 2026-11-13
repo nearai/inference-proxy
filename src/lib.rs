@@ -89,7 +89,7 @@ pub struct AppState {
     /// (`usage_report.rs`, `VLLM_PROXY_USAGE_REPORT_*`). One per process,
     /// shared by every model of a list.
     pub usage_report_delivery: Arc<usage_report::UsageReportDelivery>,
-    /// `sk-` keys cloud-api accepted, for 5 minutes (`api_key_cache.rs`).
+    /// Coalesces concurrent cloud-api checks for the same `sk-` key.
     /// One per process, shared by every model of a list.
     pub api_key_cache: Arc<api_key_cache::ApiKeyCache>,
 }

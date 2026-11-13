@@ -367,9 +367,16 @@ impl UsageReporter {
     /// transport does not post to cloud-api and does not need it, so only the
     /// HTTP transport checks it.
     fn service_path_unavailable_reason(&self) -> Option<UsageReportOutcome> {
-        if self.delivery.is_http() && self.cloud_api_usage_token.is_none() {
+        if self.delivery.is_http()
+            && self
+                .cloud_api_usage_token
+                .as_deref()
+                .is_none_or(str::is_empty)
+        {
             Some(UsageReportOutcome::MissingUsageToken)
-        } else if self.org_id.is_none() || self.workspace_id.is_none() || self.api_key_id.is_none()
+        } else if [&self.org_id, &self.workspace_id, &self.api_key_id]
+            .into_iter()
+            .any(|value| value.as_deref().is_none_or(str::is_empty))
         {
             Some(UsageReportOutcome::MissingAuthIdentity)
         } else {
@@ -545,6 +552,8 @@ pub enum UsageType {
     /// Privacy-filter responses report input usage per classified item under
     /// `data[].usage.input_tokens` rather than in a top-level usage object.
     PrivacyClassify,
+    /// Transcription responses report audio duration rather than token usage.
+    AudioTranscription,
 }
 
 /// Shape of the reassembled non-streaming response when `proxy_json_request`
@@ -662,7 +671,7 @@ pub(crate) fn build_usage_body(
                 .get("completion_tokens")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
-            if input == 0 && output == 0 {
+            if input < 0 || output < 0 || (input == 0 && output == 0) {
                 return None;
             }
             Some(serde_json::json!({
@@ -711,6 +720,70 @@ pub(crate) fn build_usage_body(
                 "id": id,
             }))
         }
+        UsageType::AudioTranscription => {
+            if response_data
+                .pointer("/usage/type")
+                .and_then(|v| v.as_str())
+                != Some("duration")
+            {
+                return None;
+            }
+            let seconds = response_data
+                .pointer("/usage/seconds")
+                .and_then(|v| v.as_f64())
+                .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+                .filter(|seconds| seconds.ceil() <= i32::MAX as f64)?;
+            Some(serde_json::json!({
+                "type": "audio_transcription",
+                "model": model_name,
+                "duration_seconds": seconds.ceil() as i32,
+                "id": id,
+            }))
+        }
+    }
+}
+
+// Keep direct-key response headers aligned with cloud-api's external usage
+// namespace. The usage endpoint derives its stored inference_id from `id`.
+const EXTERNAL_USAGE_ID_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x1966acaf_9f95_5dab_b8f0_03a51c091314);
+
+fn prepare_direct_usage(
+    response_data: &serde_json::Value,
+    id: &str,
+    opts: &ProxyOpts,
+) -> Result<Option<(uuid::Uuid, serde_json::Value)>, AppError> {
+    let Some(reporter) = opts.usage_reporter.as_ref() else {
+        return Ok(None);
+    };
+    if reporter.service_path_unavailable_reason().is_some() {
+        return Err(AppError::BillingUnavailable);
+    }
+    let usage_body = if id.is_empty() {
+        None
+    } else {
+        build_usage_body(&opts.usage_type, response_data, &reporter.model_name, id)
+    };
+    let Some(usage_body) = usage_body else {
+        return Err(AppError::UpstreamParsed {
+            status: StatusCode::BAD_GATEWAY,
+            message: "Upstream response did not include billable usage".into(),
+            error_type: "upstream_usage_missing".into(),
+        });
+    };
+    Ok(Some((
+        uuid::Uuid::new_v5(&EXTERNAL_USAGE_ID_NAMESPACE, id.as_bytes()),
+        usage_body,
+    )))
+}
+
+fn add_direct_inference_id(response: &mut Response, inference_id: Option<uuid::Uuid>) {
+    if let Some(inference_id) = inference_id {
+        response.headers_mut().insert(
+            "inference-id",
+            axum::http::HeaderValue::from_str(&inference_id.to_string())
+                .expect("UUID contains only header-safe ASCII"),
+        );
     }
 }
 
@@ -729,7 +802,7 @@ fn input_only_usage_body(
         .get("prompt_tokens")
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
-    if input == 0 {
+    if input <= 0 {
         return None;
     }
     Some(serde_json::json!({
@@ -738,6 +811,37 @@ fn input_only_usage_body(
         "input_tokens": input,
         "id": id,
     }))
+}
+
+/// Engine-only image diagnostics are not part of the customer response.
+fn remove_image_diagnostics(response_data: &mut serde_json::Value) {
+    fn remove_fields(value: &mut serde_json::Value) {
+        if let Some(object) = value.as_object_mut() {
+            for field in ["file_path", "peak_memory_mb", "inference_time_s"] {
+                object.remove(field);
+            }
+        }
+    }
+    remove_fields(response_data);
+    if let Some(items) = response_data.get_mut("data").and_then(|v| v.as_array_mut()) {
+        for item in items {
+            remove_fields(item);
+        }
+    }
+}
+
+fn set_direct_response_model(response_data: &mut serde_json::Value, opts: &ProxyOpts) {
+    if opts.usage_reporter.is_none() {
+        return;
+    }
+    if let Some(object) = response_data.as_object_mut() {
+        if matches!(opts.usage_type, UsageType::ChatCompletion) || object.contains_key("model") {
+            object.insert(
+                "model".to_string(),
+                serde_json::Value::String(opts.model_name.clone()),
+            );
+        }
+    }
 }
 
 /// Extract usage from a parsed JSON response and fire-and-forget a report to the cloud API.
@@ -825,23 +929,24 @@ pub(crate) fn report_chat_usage_if_present(
 fn report_stream_usage_on_finalize(
     usage_reporter: &Option<UsageReporter>,
     usage: Option<((i64, i64), Option<i64>)>,
-    chat_id: Option<&str>,
+    billing_id: Option<&str>,
     completed_cleanly: bool,
-    log_request_id: &str,
-    log_org_id: &str,
-    log_workspace_id: &str,
+    log_ids: (&str, &str, &str),
 ) {
+    let (log_request_id, log_org_id, log_workspace_id) = log_ids;
     let Some(reporter) = usage_reporter else {
         return;
     };
-    match (usage, chat_id) {
-        (Some(((input, output), cache_read_tokens)), Some(id)) => {
+    match (usage, billing_id) {
+        (Some(((input, output), cache_read_tokens)), Some(id))
+            if input >= 0 && output >= 0 && (input > 0 || output > 0) =>
+        {
             let body = serde_json::json!({
                 "type": "chat_completion",
                 "model": reporter.model_name,
                 "input_tokens": input,
                 "output_tokens": output,
-                "cache_read_tokens": cache_read_tokens.unwrap_or(0),
+                "cache_read_tokens": cache_read_tokens.unwrap_or(0).clamp(0, input),
                 "id": id,
             });
             spawn_usage_report(reporter, body);
@@ -850,19 +955,18 @@ fn report_stream_usage_on_finalize(
                     request_id = %log_request_id,
                     org_id = %log_org_id,
                     workspace_id = %log_workspace_id,
-                    chat_id = %id,
                     input_tokens = input,
                     output_tokens = output,
                     "Reported usage for interrupted stream"
                 );
             }
         }
-        // This arm is reached only when usage or chat_id is missing, so
-        // report_chat_usage_if_present records the appropriate missing-data outcome and
-        // returns without sending a usage report; discarding the cached component cannot
-        // lose billed data.
-        (usage, chat_id) => {
-            report_chat_usage_if_present(reporter, usage.map(|(usage, _)| usage), chat_id);
+        // Missing or invalid usage is recorded without sending a report.
+        (usage, billing_id) => {
+            let valid_usage = usage.map(|(usage, _)| usage).filter(|(input, output)| {
+                *input >= 0 && *output >= 0 && (*input > 0 || *output > 0)
+            });
+            report_chat_usage_if_present(reporter, valid_usage, billing_id);
         }
     }
 }
@@ -966,10 +1070,9 @@ pub(crate) fn spawn_usage_report(reporter: &UsageReporter, mut body: serde_json:
     // Serialized once: a retry sends exactly the bytes of the first attempt.
     let payload = match serde_json::to_vec(&body) {
         Ok(payload) => bytes::Bytes::from(payload),
-        Err(error) => {
+        Err(_error) => {
             record_usage_report_outcome(reporter, UsageReportOutcome::InvalidBody, None);
             warn!(
-                error = %error,
                 request_id = %reporter.request_id.as_deref().unwrap_or(""),
                 org_id = %reporter.org_id.as_deref().unwrap_or(""),
                 workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
@@ -1400,7 +1503,7 @@ async fn send_upstream(
                 crate::model_metrics::model_counter!(pool.model(), "backend_failover_total", "outcome" => "exhausted").increment(1);
                 warn!(
                     backend = %sanitized_upstream_url_for_logs(url),
-                    error = %error,
+                    error_kind = "connect",
                     "Backend unreachable and no other healthy backend to fail over to"
                 );
                 abandon_without_dispatch(opts.admission.as_ref());
@@ -1418,7 +1521,7 @@ async fn send_upstream(
             warn!(
                 failed_backend = %sanitized_upstream_url_for_logs(url),
                 next_backend = %sanitized_upstream_url_for_logs(&next.backend.base_url),
-                error = %error,
+                error_kind = "connect",
                 "Backend unreachable, failing over"
             );
             *url = next.backend.url(path);
@@ -1443,7 +1546,7 @@ async fn send_upstream(
                         .increment(1);
                     warn!(
                         backend = %sanitized_upstream_url_for_logs(url),
-                        error = %error,
+                        error_kind = "connect",
                         "Fail-over backend unreachable too"
                     );
                     abandon_without_dispatch(opts.admission.as_ref());
@@ -1671,7 +1774,7 @@ pub(crate) fn record_completed_request_for(
     model_label: crate::model_metrics::ModelLabel,
     tracing_ids: Option<&TracingIds>,
     model_name: &str,
-    response_id: &str,
+    _response_id: &str,
     input_tokens: i64,
     output_tokens: i64,
     total_duration: std::time::Duration,
@@ -1698,7 +1801,6 @@ pub(crate) fn record_completed_request_for(
         org_id = %org_id,
         workspace_id = %workspace_id,
         model = %model_name.to_lowercase(),
-        chat_id = %response_id,
         input_tokens,
         output_tokens,
         total_duration_ms = total_ms,
@@ -2006,9 +2108,15 @@ async fn proxy_json_request_inner(
         data
     };
 
-    // Report usage for cloud API key requests (before encryption, needs plaintext fields)
+    set_direct_response_model(&mut response_data, &opts);
+
+    // Prepare the report while plaintext usage is available. Submit it only
+    // after the response has been transformed, signed, and constructed.
     let chat_id = response_data["id"].as_str().unwrap_or("").to_string();
-    try_report_usage(&response_data, &chat_id, &opts);
+    let prepared_usage = prepare_direct_usage(&response_data, &chat_id, &opts)?;
+    if matches!(opts.usage_type, UsageType::ImageGeneration) {
+        remove_image_diagnostics(&mut response_data);
+    }
 
     // Keep plaintext usage values for bounded completion metrics after every
     // fallible transform, serialization, and signing step has succeeded.
@@ -2034,7 +2142,7 @@ async fn proxy_json_request_inner(
     // Sign and cache
     let text = format!("{}:{request_sha256}:{response_sha256}", opts.model_name);
     let signed = opts.signing.sign_chat(&text).map_err(|e| {
-        error!(error = %e, "Signing failed");
+        error!(error_kind = "signing", "Signing failed");
         AppError::Internal(e)
     })?;
     let signed_json = serde_json::to_string(&signed).map_err(|e| AppError::Internal(e.into()))?;
@@ -2051,12 +2159,22 @@ async fn proxy_json_request_inner(
         "json_via_stream",
     );
 
-    Ok((
+    let mut response = (
         StatusCode::OK,
         [("content-type", "application/json")],
         final_body,
     )
-        .into_response())
+        .into_response();
+    if let Some((inference_id, usage_body)) = prepared_usage {
+        add_direct_inference_id(&mut response, Some(inference_id));
+        spawn_usage_report(
+            opts.usage_reporter
+                .as_ref()
+                .expect("prepared direct usage has a reporter"),
+            usage_body,
+        );
+    }
+    Ok(response)
 }
 
 /// Parse a JSON request body, which must be an object. The routes and
@@ -2669,8 +2787,11 @@ async fn open_upstream_stream(
                 }
                 first_chunk = Some(chunk);
             }
-            Ok(Some(Err(e))) => {
-                warn!(error = %e, "Upstream stream failed before its first event");
+            Ok(Some(Err(_))) => {
+                warn!(
+                    error_kind = "upstream_read",
+                    "Upstream stream failed before its first event"
+                );
                 return Err(AppError::UpstreamParsed {
                     status: StatusCode::BAD_GATEWAY,
                     message: "Upstream response stream failed before completion".to_string(),
@@ -2776,6 +2897,24 @@ async fn proxy_streaming_request_inner(
         .request_hash
         .take()
         .unwrap_or_else(|| hex::encode(Sha256::digest(&request_body)));
+
+    if opts
+        .usage_reporter
+        .as_ref()
+        .is_some_and(|reporter| reporter.service_path_unavailable_reason().is_some())
+    {
+        return Err(AppError::BillingUnavailable);
+    }
+    // The response header must be known before the provider's SSE ID arrives.
+    // Billing uses this request-scoped ID; signature caching still uses the
+    // provider ID parsed from the stream.
+    let billing_id = opts
+        .usage_reporter
+        .as_ref()
+        .map(|_| format!("stream-{}", uuid::Uuid::new_v4().simple()));
+    let inference_id = billing_id
+        .as_deref()
+        .map(|id| uuid::Uuid::new_v5(&EXTERNAL_USAGE_ID_NAMESPACE, id.as_bytes()));
 
     let commit_after = if deadline.is_some() {
         0
@@ -2961,7 +3100,8 @@ async fn proxy_streaming_request_inner(
         let mut downstream_closed = false;
         let mut incomplete_reason = None;
         let mut received_upstream_progress = false;
-        let mut transformer = SseTransformer::new(chunk_transform);
+        let mut transformer = SseTransformer::new(chunk_transform)
+            .with_served_model(usage_reporter.as_ref().map(|_| model_name.clone()));
 
         // Keep-alive comments while the upstream is silent (queueing, long
         // prefill, grammar compilation): SSE consumers ignore comment lines,
@@ -3011,8 +3151,8 @@ async fn proxy_streaming_request_inner(
                             // what the client actually receives for signatures.
                             let to_send = match transformer.process_chunk(&chunk) {
                                 Ok(transformed) => transformed,
-                                Err(e) => {
-                                    error!(error = %e, "Stream transform failed");
+                                Err(_) => {
+                                    error!(error_kind = "transform", "Stream transform failed");
                                     let _ = tx.send(Err(std::io::Error::other(
                                         "Stream transform failed",
                                     ))).await;
@@ -3028,11 +3168,11 @@ async fn proxy_streaming_request_inner(
                                 break;
                             }
                         }
-                        Some(Err(e)) => {
-                            error!(error = %e, "Error reading upstream stream");
+                        Some(Err(_)) => {
+                            error!(error_kind = "upstream_read", "Error reading upstream stream");
                             upstream_error = true;
                             incomplete_reason = Some("upstream_read_error");
-                            let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
+                            let _ = tx.send(Err(std::io::Error::other("Upstream stream failed"))).await;
                             break;
                         }
                         None => break, // stream ended
@@ -3084,8 +3224,8 @@ async fn proxy_streaming_request_inner(
                         downstream_closed = true;
                     }
                 }
-                Err(e) => {
-                    error!(error = %e, "Stream transform flush failed");
+                Err(_) => {
+                    error!(error_kind = "transform", "Stream transform flush failed");
                     let _ = tx
                         .send(Err(std::io::Error::other("Stream transform failed")))
                         .await;
@@ -3133,7 +3273,6 @@ async fn proxy_streaming_request_inner(
                 request_id = %log_request_id,
                 org_id = %log_org_id,
                 workspace_id = %log_workspace_id,
-                chat_id = parser.chat_id.as_deref().unwrap_or(""),
                 model = %model_name.to_lowercase(),
                 reason,
                 mode = "streaming_request",
@@ -3151,7 +3290,6 @@ async fn proxy_streaming_request_inner(
                 request_id = %log_request_id,
                 org_id = %log_org_id,
                 workspace_id = %log_workspace_id,
-                chat_id = parser.chat_id.as_deref().unwrap_or(""),
                 model = %model_name.to_lowercase(),
                 mode = "streaming_request",
                 "Upstream stream terminated without declaring a finish reason"
@@ -3167,11 +3305,9 @@ async fn proxy_streaming_request_inner(
         report_stream_usage_on_finalize(
             &usage_reporter,
             parser.usage.map(|usage| (usage, parser.cached_tokens)),
-            parser.chat_id.as_deref(),
+            billing_id.as_deref(),
             completed_cleanly,
-            &log_request_id,
-            &log_org_id,
-            &log_workspace_id,
+            (&log_request_id, &log_org_id, &log_workspace_id),
         );
 
         // Only sign and cache for a fully completed stream
@@ -3185,13 +3321,19 @@ async fn proxy_streaming_request_inner(
                             cache.set_chat(id, &signed_json);
                             true
                         }
-                        Err(e) => {
-                            error!(error = %e, "Failed to serialize streaming signature");
+                        Err(_) => {
+                            error!(
+                                error_kind = "serialization",
+                                "Failed to serialize streaming signature"
+                            );
                             false
                         }
                     },
-                    Err(e) => {
-                        error!(error = %e, "Signing failed for streaming response");
+                    Err(_) => {
+                        error!(
+                            error_kind = "signing",
+                            "Signing failed for streaming response"
+                        );
                         false
                     }
                 };
@@ -3268,12 +3410,14 @@ async fn proxy_streaming_request_inner(
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let body = Body::from_stream(stream);
 
-    Ok(Response::builder()
+    let mut response = Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/event-stream")
         .header("cache-control", "no-cache")
         .body(body)
-        .unwrap())
+        .unwrap();
+    add_direct_inference_id(&mut response, inference_id);
+    Ok(response)
 }
 
 /// Copy the engine's top-level `usage.reasoning_tokens` into
@@ -3351,6 +3495,7 @@ struct SseTransformer {
     /// is only decoded once its newline has arrived.
     line_buffer: Vec<u8>,
     extra_transform: Option<crate::encryption::ChunkTransform>,
+    served_model: Option<String>,
 }
 
 impl SseTransformer {
@@ -3358,6 +3503,21 @@ impl SseTransformer {
         Self {
             line_buffer: Vec::new(),
             extra_transform,
+            served_model: None,
+        }
+    }
+
+    fn with_served_model(mut self, served_model: Option<String>) -> Self {
+        self.served_model = served_model;
+        self
+    }
+
+    fn normalize_chunk(&self, parsed: &mut serde_json::Value) {
+        normalize_chat_chunk(parsed);
+        if let (Some(model), Some(object)) = (&self.served_model, parsed.as_object_mut()) {
+            if let Some(current) = object.get_mut("model") {
+                *current = serde_json::Value::String(model.clone());
+            }
         }
     }
 
@@ -3394,7 +3554,7 @@ impl SseTransformer {
                                 "Failed to parse SSE data line: {e}"
                             ))
                         })?;
-                    normalize_chat_chunk(&mut parsed);
+                    self.normalize_chunk(&mut parsed);
                     if let Some(ref extra) = self.extra_transform {
                         (extra)(&mut parsed)?;
                     }
@@ -3441,7 +3601,7 @@ impl SseTransformer {
                 let mut parsed: serde_json::Value = serde_json::from_str(data).map_err(|e| {
                     AppError::Internal(anyhow::anyhow!("Failed to parse SSE data line: {e}"))
                 })?;
-                normalize_chat_chunk(&mut parsed);
+                self.normalize_chunk(&mut parsed);
                 if let Some(ref extra) = self.extra_transform {
                     (extra)(&mut parsed)?;
                 }
@@ -3521,8 +3681,33 @@ async fn proxy_multipart_request_inner(
         }
     };
 
-    // Report usage for cloud API key requests (before encryption, needs plaintext fields)
-    try_report_usage(&response_data, &response_id, &opts);
+    // A direct-key transcription without a positive duration cannot be
+    // settled. Return an upstream error instead of a free successful result.
+    if opts.usage_reporter.is_some()
+        && matches!(opts.usage_type, UsageType::AudioTranscription)
+        && build_usage_body(
+            &opts.usage_type,
+            &response_data,
+            &opts.model_name,
+            &response_id,
+        )
+        .is_none()
+    {
+        return Err(AppError::UpstreamParsed {
+            status: StatusCode::BAD_GATEWAY,
+            message: "Upstream response did not include billable audio duration".into(),
+            error_type: "upstream_usage_missing".into(),
+        });
+    }
+
+    set_direct_response_model(&mut response_data, &opts);
+
+    // Prepare the report while plaintext usage is available. Submit it only
+    // after the response has been transformed, signed, and constructed.
+    let prepared_usage = prepare_direct_usage(&response_data, &response_id, &opts)?;
+    if matches!(opts.usage_type, UsageType::ImageGeneration) {
+        remove_image_diagnostics(&mut response_data);
+    }
     let input_tokens = response_data
         .pointer("/usage/prompt_tokens")
         .and_then(|v| v.as_i64())
@@ -3546,7 +3731,7 @@ async fn proxy_multipart_request_inner(
     // Sign and cache
     let text = format!("{}:{request_sha256}:{response_sha256}", opts.model_name);
     let signed = opts.signing.sign_chat(&text).map_err(|e| {
-        error!(error = %e, "Signing failed");
+        error!(error_kind = "signing", "Signing failed");
         AppError::Internal(e)
     })?;
     let signed_json = serde_json::to_string(&signed).map_err(|e| AppError::Internal(e.into()))?;
@@ -3563,12 +3748,22 @@ async fn proxy_multipart_request_inner(
         "multipart",
     );
 
-    Ok((
+    let mut response = (
         StatusCode::OK,
         [("content-type", "application/json")],
         final_body,
     )
-        .into_response())
+        .into_response();
+    if let Some((inference_id, usage_body)) = prepared_usage {
+        add_direct_inference_id(&mut response, Some(inference_id));
+        spawn_usage_report(
+            opts.usage_reporter
+                .as_ref()
+                .expect("prepared direct usage has a reporter"),
+            usage_body,
+        );
+    }
+    Ok(response)
 }
 
 /// Simple proxy without signing (for tokenize, metrics, models).
@@ -3644,8 +3839,11 @@ pub(crate) async fn sign_and_cache_json_response(
     // generate an ID, sign, and cache.
     let mut response_data: serde_json::Value = match serde_json::from_slice(response_bytes) {
         Ok(data) => data,
-        Err(e) => {
-            debug!(error = %e, "Response body not valid JSON, wrapping in empty object");
+        Err(_) => {
+            debug!(
+                error_kind = "invalid_json",
+                "Response body not valid JSON, wrapping in empty object"
+            );
             serde_json::json!({})
         }
     };
@@ -3666,8 +3864,11 @@ pub(crate) async fn sign_and_cache_json_response(
         }
     };
 
-    // Report usage for cloud API key requests (before encryption, needs plaintext fields)
-    try_report_usage(&response_data, &chat_id, &opts);
+    set_direct_response_model(&mut response_data, &opts);
+
+    // Prepare the report while plaintext usage is available. Submit it only
+    // after the response has been transformed, signed, and constructed.
+    let prepared_usage = prepare_direct_usage(&response_data, &chat_id, &opts)?;
     let input_tokens = response_data
         .pointer("/usage/prompt_tokens")
         .and_then(|v| v.as_i64())
@@ -3691,7 +3892,7 @@ pub(crate) async fn sign_and_cache_json_response(
     // Sign and cache
     let text = format!("{}:{request_sha256}:{response_sha256}", opts.model_name);
     let signed = opts.signing.sign_chat(&text).map_err(|e| {
-        error!(error = %e, "Signing failed");
+        error!(error_kind = "signing", "Signing failed");
         AppError::Internal(e)
     })?;
     let signed_json = serde_json::to_string(&signed).map_err(|e| AppError::Internal(e.into()))?;
@@ -3710,11 +3911,21 @@ pub(crate) async fn sign_and_cache_json_response(
         );
     }
 
-    Ok(Response::builder()
+    let mut response = Response::builder()
         .status(status)
         .header("content-type", "application/json")
         .body(Body::from(final_body))
-        .unwrap())
+        .unwrap();
+    if let Some((inference_id, usage_body)) = prepared_usage {
+        add_direct_inference_id(&mut response, Some(inference_id));
+        spawn_usage_report(
+            opts.usage_reporter
+                .as_ref()
+                .expect("prepared direct usage has a reporter"),
+            usage_body,
+        );
+    }
+    Ok(response)
 }
 
 /// Drop guard that tracks the streaming_connections gauge.
@@ -4360,6 +4571,50 @@ mod tests {
     }
 
     #[test]
+    fn audio_usage_requires_positive_finite_duration() {
+        let resp = serde_json::json!({"usage": {"type": "duration", "seconds": 1.25}});
+        let body = build_usage_body(&UsageType::AudioTranscription, &resp, "m", "trans-1")
+            .expect("positive duration is billable");
+        assert_eq!(body["type"], "audio_transcription");
+        assert_eq!(body["duration_seconds"], 2);
+        assert_eq!(body["id"], "trans-1");
+
+        for seconds in [0.0, -1.0, f64::MAX] {
+            let resp = serde_json::json!({"usage": {"type": "duration", "seconds": seconds}});
+            assert!(build_usage_body(&UsageType::AudioTranscription, &resp, "m", "x").is_none());
+        }
+        assert!(build_usage_body(
+            &UsageType::AudioTranscription,
+            &serde_json::json!({}),
+            "m",
+            "x"
+        )
+        .is_none());
+        assert!(build_usage_body(
+            &UsageType::AudioTranscription,
+            &serde_json::json!({"usage": {"type": "tokens", "seconds": 1}}),
+            "m",
+            "x"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn image_response_drops_engine_diagnostics() {
+        let mut response = serde_json::json!({
+            "data": [{"b64_json": "image", "file_path": "/engine/image.jpg", "peak_memory_mb": 10}],
+            "peak_memory_mb": 10,
+            "inference_time_s": 1.5,
+            "id": "img-1"
+        });
+        remove_image_diagnostics(&mut response);
+        assert_eq!(
+            response,
+            serde_json::json!({"data": [{"b64_json": "image"}], "id": "img-1"})
+        );
+    }
+
+    #[test]
     fn test_build_usage_body_input_only_kinds_label_and_shape() {
         // embedding / rerank / score share the embeddings response shape
         // (top-level usage.prompt_tokens, no completion tokens) and report
@@ -4475,6 +4730,14 @@ mod tests {
         // Chat with both token counts zero.
         let zero_chat = serde_json::json!({"usage": {"prompt_tokens": 0, "completion_tokens": 0}});
         assert!(build_usage_body(&UsageType::ChatCompletion, &zero_chat, "m", "x").is_none());
+        let negative_input =
+            serde_json::json!({"usage": {"prompt_tokens": -1, "completion_tokens": 2}});
+        assert!(build_usage_body(&UsageType::ChatCompletion, &negative_input, "m", "x").is_none());
+        let negative_output =
+            serde_json::json!({"usage": {"prompt_tokens": 2, "completion_tokens": -1}});
+        assert!(build_usage_body(&UsageType::ChatCompletion, &negative_output, "m", "x").is_none());
+        let negative_input_only = serde_json::json!({"usage": {"prompt_tokens": -1}});
+        assert!(build_usage_body(&UsageType::Embedding, &negative_input_only, "m", "x").is_none());
         // Empty image data array.
         let no_images = serde_json::json!({"data": []});
         assert!(build_usage_body(&UsageType::ImageGeneration, &no_images, "m", "x").is_none());
@@ -4525,6 +4788,56 @@ mod tests {
             connect_failover: None,
             first_token_deadline: None,
         }
+    }
+
+    #[test]
+    fn direct_inference_header_uses_the_billing_record_id() {
+        let mut opts = test_proxy_opts();
+        opts.usage_reporter = Some(reporter_with(
+            Some("token"),
+            Some("org"),
+            Some("workspace"),
+            Some("key"),
+        ));
+        let response = serde_json::json!({"usage": {"prompt_tokens": 2, "completion_tokens": 1}});
+        let (inference_id, usage_body) = prepare_direct_usage(&response, "resp-test", &opts)
+            .expect("billable direct response is accepted")
+            .expect("billable direct response has a report");
+        assert_eq!(
+            inference_id.to_string(),
+            "9bd82ba0-6696-532a-b1df-732f2702bf69"
+        );
+        assert_eq!(usage_body["id"], "resp-test");
+
+        let mut http_response = Response::new(Body::empty());
+        add_direct_inference_id(&mut http_response, Some(inference_id));
+        assert_eq!(
+            http_response.headers().get("inference-id").unwrap(),
+            inference_id.to_string().as_str()
+        );
+        opts.usage_reporter = None;
+        assert!(prepare_direct_usage(&response, "resp-test", &opts)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn direct_response_without_billable_usage_is_refused() {
+        let mut opts = test_proxy_opts();
+        opts.usage_reporter = Some(reporter_with(
+            Some("token"),
+            Some("org"),
+            Some("workspace"),
+            Some("key"),
+        ));
+        let response = serde_json::json!({"usage": {"prompt_tokens": -1, "completion_tokens": 1}});
+        assert!(matches!(
+            prepare_direct_usage(&response, "resp-test", &opts),
+            Err(AppError::UpstreamParsed {
+                status: StatusCode::BAD_GATEWAY,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -4657,6 +4970,75 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn direct_usage_is_submitted_only_after_response_construction() {
+        use crate::usage_report::{
+            AttemptLog, Job, Refused, SendOutcome, TransportKind, UsageReportDelivery, UsageSender,
+        };
+        use futures_util::future::BoxFuture;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountPrepared(Arc<AtomicUsize>);
+
+        impl UsageSender for CountPrepared {
+            fn kind(&self) -> TransportKind {
+                TransportKind::Http
+            }
+
+            fn prepare(&self, _job: &mut Job) -> Result<(), Refused> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+
+            fn send<'a>(
+                &'a self,
+                _job: &'a Job,
+                _timeout: std::time::Duration,
+            ) -> BoxFuture<'a, (SendOutcome, AttemptLog)> {
+                Box::pin(async {
+                    (
+                        SendOutcome::Accepted,
+                        AttemptLog {
+                            answer: Ok(reqwest::StatusCode::OK),
+                            outcome: UsageReportOutcome::Accepted,
+                            duration: std::time::Duration::ZERO,
+                        },
+                    )
+                })
+            }
+        }
+
+        let prepared = Arc::new(AtomicUsize::new(0));
+        let mut reporter =
+            reporter_with(Some("token"), Some("org"), Some("workspace"), Some("key"));
+        reporter.delivery = UsageReportDelivery::with_sender(
+            Default::default(),
+            Arc::new(CountPrepared(prepared.clone())),
+        );
+        let body = br#"{"id":"resp-test","usage":{"prompt_tokens":2,"completion_tokens":1}}"#;
+        let request_sha256 = hex::encode(Sha256::digest(b"synthetic request"));
+
+        let mut opts = test_proxy_opts();
+        opts.usage_reporter = Some(reporter.clone());
+        opts.response_transform = Some(Box::new(|_| {
+            Err(AppError::BadRequest("synthetic transform failure".into()))
+        }));
+        let result =
+            sign_and_cache_json_response(body, &request_sha256, opts, StatusCode::OK, None).await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
+        assert_eq!(prepared.load(Ordering::SeqCst), 0);
+
+        let mut opts = test_proxy_opts();
+        opts.usage_reporter = Some(reporter);
+        let response =
+            sign_and_cache_json_response(body, &request_sha256, opts, StatusCode::OK, None)
+                .await
+                .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("inference-id").is_some());
+        assert_eq!(prepared.load(Ordering::SeqCst), 1);
     }
 
     /// A client that is gone before the upstream answers is a disconnect, in
@@ -5620,6 +6002,22 @@ data: [DONE]
             !out_str.contains("\"reasoning\":\"think\""),
             "Got: {out_str}"
         );
+    }
+
+    #[test]
+    fn direct_stream_chunks_echo_the_served_model() {
+        let mut transformer =
+            SseTransformer::new(None).with_served_model(Some("served-model".to_string()));
+        let out = transformer
+            .process_chunk(
+                b"data: {\"id\":\"chatcmpl-test\",\"model\":\"backend-alias\",\"choices\":[]}\n",
+            )
+            .unwrap();
+        let line = std::str::from_utf8(&out).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(line.trim().strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(value["model"], "served-model");
+        assert_eq!(value["id"], "chatcmpl-test");
     }
 
     #[test]

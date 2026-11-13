@@ -1698,11 +1698,9 @@ impl Config {
             }
         }
 
-        if config.admission_max_inflight > 0
-            && (config.fusion_enabled || config.web_context_search_url.is_some())
-        {
+        if config.admission_max_inflight > 0 && config.web_context_search_url.is_some() {
             anyhow::bail!(
-                "VLLM_PROXY_ADMISSION_MAX_INFLIGHT cannot be combined with FUSION_ENABLED or WEB_CONTEXT_SEARCH_URL: those execution modes run outside the lane budget"
+                "VLLM_PROXY_ADMISSION_MAX_INFLIGHT cannot be combined with WEB_CONTEXT_SEARCH_URL: that execution mode runs outside the lane budget"
             );
         }
         if !config.backend_long_context_urls.is_empty()
@@ -3544,6 +3542,23 @@ mod tests {
     }
 
     #[test]
+    fn test_fusion_may_hold_an_admission_slot() {
+        with_env_vars(
+            &[
+                ("MODEL_NAME", "model"),
+                ("TOKEN", "tok"),
+                ("FUSION_ENABLED", "true"),
+                ("FUSION_INTERNAL_BEARER_TOKEN", "internal"),
+                ("VLLM_PROXY_ADMISSION_MAX_INFLIGHT", "2"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.admission_max_inflight, 2);
+            },
+        );
+    }
+
+    #[test]
     fn test_config_rejects_zero_fusion_limits_when_enabled() {
         for (name, expected) in [
             (
@@ -4104,14 +4119,13 @@ mod tests {
                     "{err}"
                 );
                 env::set_var("VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS", "2");
-                // Unbudgeted execution modes cannot coexist with admission
-                // (each mode is otherwise fully configured, so this is the
-                // only reason the config can fail).
+                // Fusion can hold an admission slot; web context search cannot.
                 env::set_var("FUSION_ENABLED", "1");
                 env::set_var("FUSION_INTERNAL_BEARER_TOKEN", "fusion-secret");
                 env::set_var("FUSION_ENDPOINTS_URL", "https://fusion.example/endpoints");
-                let err = Config::from_env().unwrap_err().to_string();
-                assert!(err.contains("FUSION_ENABLED"), "{err}");
+                let config = Config::from_env().unwrap();
+                assert!(config.fusion_enabled);
+                assert_eq!(config.admission_max_inflight, 48);
                 env::remove_var("FUSION_ENABLED");
                 env::remove_var("FUSION_INTERNAL_BEARER_TOKEN");
                 env::remove_var("FUSION_ENDPOINTS_URL");

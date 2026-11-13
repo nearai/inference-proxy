@@ -1,6 +1,5 @@
-//! The `sk-` keys cloud-api accepted, kept for 5 minutes so `RequireAuth`
-//! (`auth.rs`) does not ask `/v1/check_api_key` about the same key on every
-//! request. A gateway sees one or two keys for all of its traffic.
+//! Coalesces concurrent checks for the same `sk-` key. Each later request
+//! revalidates credit and revocation state with cloud-api.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -13,28 +12,24 @@ use tokio::time::Instant;
 use crate::auth::AuthSubject;
 use crate::error::AppError;
 
-/// How long a key cloud-api accepted stays accepted without asking again.
-/// The cost: a key revoked or out of credits keeps working here for up to
-/// this long (usage is still reported per request), so it is kept short; one
-/// check per key every 5 minutes is still nothing next to one per request.
-const ACCEPTED_FOR: Duration = Duration::from_secs(300);
+/// No positive acceptance cache: cloud-api checks credit and revocation on
+/// each request. Requests already waiting for the same check still share it.
+const ACCEPTED_FOR: Duration = Duration::ZERO;
+
+/// Retain a key slot long enough to coalesce checks during an active burst.
+const SLOT_IDLE_FOR: Duration = Duration::from_secs(60);
 
 /// Keys tracked at once; a flood of random keys can only evict accepted
 /// ones, which then cost one more check.
 const CAPACITY: u64 = 10_000;
 
-/// Remembers the keys cloud-api accepted (200), for [`ACCEPTED_FOR`]. Nothing
-/// else is kept: a refusal, a 402, a 429 or an unreachable cloud-api drops the
-/// key's entry, and every request for the key goes to cloud-api until one gets
-/// a 200. Nor is a 200 whose identity is incomplete (a body that could not be
-/// read or parsed, an older cloud-api): that request gets in, but its usage
-/// cannot be reported, so the next one asks again. Keyed by the SHA-256 of
-/// the key, never the key itself.
+/// Remembers the outcome of checks long enough to share an in-flight 200.
+/// Later requests ask cloud-api again. A refusal or incomplete identity is
+/// never kept. Keyed by the SHA-256 of the key, never the key itself.
 ///
 /// Requests for a key that needs checking wait for the check in flight
-/// rather than each calling cloud-api: a 200 then serves them all. Once a
-/// key's last check was not a 200, nobody waits: each request makes its own
-/// call, side by side, as if there were no cache.
+/// rather than each calling cloud-api. Once a check is not a 200, nobody
+/// waits: each request makes its own call, side by side.
 pub struct ApiKeyCache {
     slots: moka::sync::Cache<[u8; 32], Arc<KeySlot>>,
     accepted_for: Duration,
@@ -78,6 +73,20 @@ impl Drop for Unfinished<'_> {
 }
 
 impl KeySlot {
+    fn recorded(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .recorded
+    }
+
+    fn accepted_after(&self, previous_recorded: u64) -> Option<AuthSubject> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        (state.recorded > previous_recorded)
+            .then(|| state.accepted.as_ref().map(|(subject, _)| subject.clone()))
+            .flatten()
+    }
+
     fn accepted(&self, accepted_for: Duration) -> Option<AuthSubject> {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state
@@ -118,7 +127,7 @@ impl KeySlot {
 /// Whether a 200's subject carries everything a usage report needs
 /// (`proxy::spawn_usage_report` skips the report otherwise).
 fn has_identity(subject: &AuthSubject) -> bool {
-    subject.org_id.is_some() && subject.workspace_id.is_some() && subject.api_key_id.is_some()
+    subject.has_billing_identity()
 }
 
 impl Default for ApiKeyCache {
@@ -136,7 +145,7 @@ impl ApiKeyCache {
         Self {
             slots: moka::sync::Cache::builder()
                 .max_capacity(CAPACITY)
-                .time_to_idle(accepted_for)
+                .time_to_idle(accepted_for.max(SLOT_IDLE_FOR))
                 .build(),
             accepted_for,
         }
@@ -160,11 +169,19 @@ impl ApiKeyCache {
             metrics::counter!("cloud_api_auth_cache_total", "outcome" => "hit").increment(1);
             return Ok(subject);
         }
+        let previous_recorded = slot.recorded();
         if !slot.failing.load(Ordering::Acquire) {
             let _turn = slot.in_flight.lock().await;
             if let Some(subject) = slot.accepted(self.accepted_for) {
                 metrics::counter!("cloud_api_auth_cache_total", "outcome" => "shared").increment(1);
                 return Ok(subject);
+            }
+            if self.accepted_for.is_zero() {
+                if let Some(subject) = slot.accepted_after(previous_recorded) {
+                    metrics::counter!("cloud_api_auth_cache_total", "outcome" => "shared")
+                        .increment(1);
+                    return Ok(subject);
+                }
             }
             if !slot.failing.load(Ordering::Acquire) {
                 metrics::counter!("cloud_api_auth_cache_total", "outcome" => "miss").increment(1);
@@ -259,9 +276,24 @@ mod tests {
     }
 
     #[test]
-    fn the_cache_accepts_for_five_minutes() {
-        assert_eq!(ACCEPTED_FOR, Duration::from_secs(300));
+    fn default_revalidates_each_sequential_request() {
+        assert_eq!(ACCEPTED_FOR, Duration::ZERO);
         assert_eq!(ApiKeyCache::new().accepted_for, ACCEPTED_FOR);
+    }
+
+    #[tokio::test]
+    async fn a_later_request_observes_revocation_without_a_cache_window() {
+        let cache = ApiKeyCache::new();
+        let calls = AtomicUsize::new(0);
+        assert_eq!(
+            org(ask(&cache, &calls, Duration::ZERO, Answer::Accepted("org-a")).await).as_deref(),
+            Some("org-a")
+        );
+        assert!(matches!(
+            ask(&cache, &calls, Duration::ZERO, Answer::Unauthorized).await,
+            Err(AppError::Unauthorized)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -281,8 +313,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
-    /// Every request for a key cloud-api did not accept asks cloud-api again,
-    /// until one gets a 200, which is then kept.
+    /// Every request for a key cloud-api did not accept asks cloud-api again.
     #[tokio::test]
     async fn asks_again_until_a_200() {
         let cache = ApiKeyCache::new();
@@ -301,7 +332,7 @@ mod tests {
             let got = ask(&cache, &calls, Duration::ZERO, Answer::Accepted("org-a")).await;
             assert_eq!(org(got).as_deref(), Some("org-a"));
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 7);
+        assert_eq!(calls.load(Ordering::SeqCst), 8);
     }
 
     #[tokio::test]
@@ -322,7 +353,7 @@ mod tests {
 
     #[tokio::test]
     async fn keeps_keys_apart() {
-        let cache = ApiKeyCache::new();
+        let cache = ApiKeyCache::accepting_for(Duration::from_secs(300));
         let calls = AtomicUsize::new(0);
         ask(&cache, &calls, Duration::ZERO, Answer::Accepted("org-a"))
             .await
@@ -407,7 +438,7 @@ mod tests {
     /// kept for everyone, like one from a request that waited.
     #[tokio::test]
     async fn keeps_a_200_from_a_request_that_did_not_wait() {
-        let cache = ApiKeyCache::new();
+        let cache = ApiKeyCache::accepting_for(Duration::from_secs(300));
         let calls = AtomicUsize::new(0);
         assert!(ask(&cache, &calls, Duration::ZERO, Answer::Unauthorized)
             .await
@@ -419,12 +450,12 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
-    /// A 200 without the identity a usage report needs (its body could not
-    /// be read) lets that request in but is not kept: the next request asks
-    /// again, and a complete 200 is then kept.
+    /// A 200 without the identity a usage report needs is not kept; the
+    /// request extractor rejects it before dispatch. A later check can
+    /// still accept the key when cloud-api returns a complete identity.
     #[tokio::test]
     async fn does_not_keep_a_200_without_identity() {
-        let cache = ApiKeyCache::new();
+        let cache = ApiKeyCache::accepting_for(Duration::from_secs(300));
         let calls = AtomicUsize::new(0);
         for _ in 0..2 {
             let got = ask(

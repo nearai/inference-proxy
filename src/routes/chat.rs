@@ -116,7 +116,11 @@ async fn serve(
     // decrypted fields are in it now.
     crate::model_list::guard_request_body(
         &request_json,
-        crate::model_list::checked_model(&state, model.id),
+        if auth.cloud_api_key.is_some() {
+            Some(model.id)
+        } else {
+            crate::model_list::checked_model(&state, model.id)
+        },
     )?;
     crate::model_list::apply_backend_lora(&state, &mut request_json);
 

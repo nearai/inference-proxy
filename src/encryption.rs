@@ -160,6 +160,9 @@ pub fn extract_encryption_context(
             if version == 3 {
                 // Validate/canonicalize before inference, including empty requests.
                 context.client_pub_key = context.canonical_reply_key()?;
+            } else if algo == EncryptionAlgo::Ed25519 {
+                // v1/v2: same Ed25519 point checks before inference; key bytes unchanged.
+                context.canonical_reply_key()?;
             }
             Ok(Some(context))
         }
@@ -241,10 +244,15 @@ mod nacl {
 
     /// Convert an Ed25519 public key (32 bytes) to an X25519 public key.
     /// Uses the birational map from Edwards to Montgomery form.
+    ///
+    /// Rejects bytes that are not a curve point and small-order (weak) points.
     pub fn ed25519_public_to_x25519(ed25519_pub: &[u8; 32]) -> Result<[u8; 32], String> {
         use ed25519_dalek::VerifyingKey;
         let vk = VerifyingKey::from_bytes(ed25519_pub)
-            .map_err(|e| format!("Invalid Ed25519 public key: {e}"))?;
+            .map_err(|_| "Invalid Ed25519 public key".to_string())?;
+        if vk.is_weak() {
+            return Err("Invalid Ed25519 public key: small-order point".to_string());
+        }
         Ok(vk.to_montgomery().to_bytes())
     }
 }
@@ -2196,6 +2204,158 @@ mod tests {
         let ctx = extract_encryption_context(&headers).unwrap().unwrap();
         assert_eq!(ctx.algo, EncryptionAlgo::Ed25519);
         assert_eq!(ctx.client_pub_key.len(), 32);
+    }
+
+    // ── Ed25519 client key validation ─────────────────────────────
+
+    /// No header (v1 default) and each explicit version.
+    const ED25519_KEY_VERSIONS: [Option<&str>; 4] = [None, Some("1"), Some("2"), Some("3")];
+
+    fn ed25519_key_headers(key: &[u8], version: Option<&str>) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-signing-algo", "ed25519".parse().unwrap());
+        headers.insert("x-client-pub-key", hex::encode(key).parse().unwrap());
+        if let Some(version) = version {
+            headers.insert("x-encryption-version", version.parse().unwrap());
+        }
+        headers
+    }
+
+    /// Encodings of small-order points, derived from the curve equation
+    /// -x^2 + y^2 = 1 + d*x^2*y^2 (bit 255 is the sign of x).
+    fn weak_ed25519_keys() -> Vec<[u8; 32]> {
+        // y = 1, x = 0: the identity (order 1), canonical and with the sign bit set.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let mut identity_signed = identity;
+        identity_signed[31] |= 0x80;
+        // y = 0, x = ±sqrt(-1): order 4.
+        let order4 = [0u8; 32];
+        let mut order4_signed = order4;
+        order4_signed[31] = 0x80;
+        // y = p - 1 = -1, x = 0: order 2.
+        let mut order2 = [0xffu8; 32];
+        order2[0] = 0xec;
+        order2[31] = 0x7f;
+        vec![identity, identity_signed, order4, order4_signed, order2]
+    }
+
+    /// A 32-byte value that is not the encoding of any curve point.
+    fn off_curve_ed25519_key() -> [u8; 32] {
+        (2u8..=255)
+            .map(|b| {
+                let mut key = [0u8; 32];
+                key[0] = b;
+                key
+            })
+            .find(|key| ed25519_dalek::VerifyingKey::from_bytes(key).is_err())
+            .expect("some small y is not on the curve")
+    }
+
+    #[test]
+    fn test_weak_ed25519_vectors_are_small_order_points() {
+        // Guards the vectors themselves: each must decode, and be weak, so the
+        // rejection tests below exercise the small-order check.
+        for key in weak_ed25519_keys() {
+            let vk = ed25519_dalek::VerifyingKey::from_bytes(&key).unwrap();
+            assert!(vk.is_weak(), "{}", hex::encode(key));
+        }
+    }
+
+    #[test]
+    fn test_extract_encryption_context_rejects_weak_ed25519_key_all_versions() {
+        for key in weak_ed25519_keys() {
+            for version in ED25519_KEY_VERSIONS {
+                let result = extract_encryption_context(&ed25519_key_headers(&key, version));
+                assert!(
+                    matches!(result, Err(AppError::BadRequest(_))),
+                    "key={} version={version:?}",
+                    hex::encode(key)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_extract_encryption_context_rejects_off_curve_ed25519_key_all_versions() {
+        let key = off_curve_ed25519_key();
+        for version in ED25519_KEY_VERSIONS {
+            let result = extract_encryption_context(&ed25519_key_headers(&key, version));
+            assert!(
+                matches!(result, Err(AppError::BadRequest(_))),
+                "version={version:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ed25519_key_error_does_not_echo_key() {
+        let mut keys = weak_ed25519_keys();
+        keys.push(off_curve_ed25519_key());
+        for key in keys {
+            for version in ED25519_KEY_VERSIONS {
+                let Err(AppError::BadRequest(message)) =
+                    extract_encryption_context(&ed25519_key_headers(&key, version))
+                else {
+                    panic!("expected BadRequest for version={version:?}");
+                };
+                assert!(!message.contains(&hex::encode(key)), "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_extract_encryption_context_accepts_valid_ed25519_key_all_versions() {
+        let server_pair = test_signing_pair();
+        let key = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        for (version, expected) in ED25519_KEY_VERSIONS.into_iter().zip([1u8, 1, 2, 3]) {
+            let ctx = extract_encryption_context(&ed25519_key_headers(&key, version))
+                .unwrap()
+                .unwrap();
+            assert_eq!(ctx.algo, EncryptionAlgo::Ed25519);
+            assert_eq!(ctx.version, expected);
+            // Key bytes are kept as sent for every version.
+            assert_eq!(ctx.client_pub_key, key, "version={version:?}");
+        }
+    }
+
+    #[test]
+    fn test_valid_ed25519_key_round_trips_v1_v2_after_validation() {
+        let server_pair = test_signing_pair();
+        let key = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        for version in ["1", "2"] {
+            let ctx = extract_encryption_context(&ed25519_key_headers(&key, Some(version)))
+                .unwrap()
+                .unwrap();
+            let encrypted = encrypt_string("still works", &ctx, &server_pair).unwrap();
+            let decrypted = decrypt_string(&encrypted, &ctx, &server_pair).unwrap();
+            assert_eq!(decrypted, "still works", "version={version}");
+        }
+    }
+
+    #[test]
+    fn test_encrypt_string_rejects_weak_ed25519_key_in_direct_context() {
+        // A context built without header extraction still refuses to encrypt
+        // to a small-order key.
+        let server_pair = test_signing_pair();
+        for key in weak_ed25519_keys() {
+            for version in 1..=3u8 {
+                let ctx = EncryptionContext {
+                    algo: EncryptionAlgo::Ed25519,
+                    client_pub_key: key.to_vec(),
+                    version,
+                    encrypt_all_fields: false,
+                };
+                assert!(
+                    matches!(
+                        encrypt_string("secret", &ctx, &server_pair),
+                        Err(AppError::BadRequest(_))
+                    ),
+                    "key={} version={version}",
+                    hex::encode(key)
+                );
+            }
+        }
     }
 
     // ── Fix 2: Completions streaming encryption ───────────────────

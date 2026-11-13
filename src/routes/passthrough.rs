@@ -55,7 +55,9 @@ pub async fn tokenize(
     let request_body = read_body_with_limit(body, state.config.max_request_size).await?;
     let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
     // Parsed only to be checked: the original bytes are what is forwarded.
-    crate::model_list::guard_passthrough_body(&state, &proxy::parse_json_object(&request_body)?)?;
+    let request_json = proxy::parse_json_object(&request_body)?;
+    crate::model_list::guard_passthrough_body(&state, &request_json)?;
+    guard_direct_model(&state, &request_json, auth.cloud_api_key.is_some())?;
 
     let (url, _guard) = state.backend_pool.select_url("/tokenize");
     proxy::proxy_simple(
@@ -96,6 +98,7 @@ pub async fn embeddings(
         tracing_ids,
         enc_ctx,
         Endpoint::Embeddings,
+        auth.cloud_api_key.is_some(),
     )
     .await
 }
@@ -125,6 +128,7 @@ pub async fn rerank(
         tracing_ids,
         enc_ctx,
         Endpoint::Rerank,
+        auth.cloud_api_key.is_some(),
     )
     .await
 }
@@ -154,6 +158,7 @@ pub async fn score(
         tracing_ids,
         enc_ctx,
         Endpoint::Score,
+        auth.cloud_api_key.is_some(),
     )
     .await
 }
@@ -183,6 +188,7 @@ pub async fn images_generations(
         tracing_ids,
         enc_ctx,
         Endpoint::ImagesGenerations,
+        auth.cloud_api_key.is_some(),
     )
     .await
 }
@@ -229,6 +235,7 @@ pub async fn images_edits(
             let data =
                 read_field_chunks(&mut field, &mut total_size, max_size, &mut hasher).await?;
             crate::model_list::guard_form_field(&state, &name, &data)?;
+            guard_direct_form_model(&state, &name, &data, auth.cloud_api_key.is_some())?;
             let part = build_multipart_part(data, file_name, content_type)?;
             form = form.part(name, part);
         }
@@ -323,6 +330,7 @@ pub async fn audio_transcriptions(
             let data =
                 read_field_chunks(&mut field, &mut total_size, max_size, &mut hasher).await?;
             crate::model_list::guard_form_field(&state, &name, &data)?;
+            guard_direct_form_model(&state, &name, &data, auth.cloud_api_key.is_some())?;
             let part = build_multipart_part(data, file_name, content_type)?;
             form = form.part(name, part);
         }
@@ -351,7 +359,7 @@ pub async fn audio_transcriptions(
         model_label: None,
         model_request: None,
         usage_reporter: make_usage_reporter(&auth, &state),
-        usage_type: UsageType::ChatCompletion,
+        usage_type: UsageType::AudioTranscription,
         request_hash: None,
         response_transform,
         chunk_transform: None,
@@ -386,6 +394,7 @@ async fn json_passthrough_encrypted(
     tracing_ids: TracingIds,
     enc_ctx: Option<encryption::EncryptionContext>,
     endpoint: Endpoint,
+    direct_key: bool,
 ) -> Result<Response, AppError> {
     let max_size = size_fn(&state.config);
     let request_body = read_body_with_limit(body, max_size).await?;
@@ -402,6 +411,8 @@ async fn json_passthrough_encrypted(
         let mut request_json = proxy::parse_json_object(&request_body)?;
         encryption::decrypt_request_fields(&mut request_json, endpoint, &ctx, &state.signing)?;
         crate::model_list::guard_passthrough_body(&state, &request_json)?;
+        guard_direct_model(&state, &request_json, direct_key)?;
+        validate_image_count(endpoint, &request_json)?;
         if with_lora {
             crate::model_list::apply_backend_lora(&state, &mut request_json);
         }
@@ -412,6 +423,8 @@ async fn json_passthrough_encrypted(
     } else {
         let mut request_json = proxy::parse_json_object(&request_body)?;
         crate::model_list::guard_passthrough_body(&state, &request_json)?;
+        guard_direct_model(&state, &request_json, direct_key)?;
+        validate_image_count(endpoint, &request_json)?;
         if with_lora {
             let original_hash = hex::encode(sha2::Sha256::digest(&request_body));
             crate::model_list::apply_backend_lora(&state, &mut request_json);
@@ -451,6 +464,50 @@ async fn json_passthrough_encrypted(
     };
 
     proxy::proxy_json_request(target.client, &target.url, forward_body, opts).await
+}
+
+fn guard_direct_model(
+    state: &AppState,
+    request: &serde_json::Value,
+    direct_key: bool,
+) -> Result<(), AppError> {
+    if direct_key && state.models.is_none() {
+        crate::model_list::guard_request_body(request, Some(&state.config.model_name))?;
+    }
+    Ok(())
+}
+
+fn guard_direct_form_model(
+    state: &AppState,
+    name: &str,
+    value: &[u8],
+    direct_key: bool,
+) -> Result<(), AppError> {
+    if direct_key
+        && state.models.is_none()
+        && name == "model"
+        && value != state.config.model_name.as_bytes()
+    {
+        return Err(AppError::ModelNotFound { model: None });
+    }
+    Ok(())
+}
+
+/// Keep the direct image endpoint aligned with the public API's 1..=10 range.
+/// The backend may silently truncate larger requests after allocating work.
+fn validate_image_count(endpoint: Endpoint, request: &serde_json::Value) -> Result<(), AppError> {
+    if !matches!(endpoint, Endpoint::ImagesGenerations) {
+        return Ok(());
+    }
+    let Some(value) = request.get("n").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    match value.as_i64() {
+        Some(1..=10) => Ok(()),
+        _ => Err(AppError::BadRequest(
+            "`n` must be an integer from 1 to 10".into(),
+        )),
+    }
 }
 
 /// Read a multipart field incrementally, enforcing the cumulative size limit and
@@ -493,4 +550,33 @@ fn build_multipart_part(
             .map_err(|_| AppError::BadRequest(format!("Invalid MIME type: {ct}")))?;
     }
     Ok(part)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_count_is_bounded_before_dispatch() {
+        for n in [1, 10] {
+            assert!(validate_image_count(
+                Endpoint::ImagesGenerations,
+                &serde_json::json!({"n": n}),
+            )
+            .is_ok());
+        }
+        for value in [
+            serde_json::json!(0),
+            serde_json::json!(11),
+            serde_json::json!(1.5),
+            serde_json::json!("2"),
+        ] {
+            assert!(validate_image_count(
+                Endpoint::ImagesGenerations,
+                &serde_json::json!({"n": value}),
+            )
+            .is_err());
+        }
+        assert!(validate_image_count(Endpoint::Embeddings, &serde_json::json!({"n": 32})).is_ok());
+    }
 }

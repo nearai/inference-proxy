@@ -31,6 +31,9 @@ pub enum AppError {
     #[error("insufficient credits")]
     InsufficientCredits,
 
+    #[error("usage accounting unavailable")]
+    BillingUnavailable,
+
     #[error("{0}")]
     NotFound(String),
 
@@ -229,6 +232,11 @@ impl IntoResponse for AppError {
                 "Insufficient credits".to_string(),
                 "insufficient_credits",
             ),
+            AppError::BillingUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Usage accounting is temporarily unavailable".to_string(),
+                "billing_unavailable",
+            ),
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone(), "not_found"),
             AppError::PayloadTooLarge { max_size } => (
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -250,8 +258,8 @@ impl IntoResponse for AppError {
                 "No healthy backend in the requested context tier".to_string(),
                 "tier_unavailable",
             ),
-            AppError::Internal(ref e) => {
-                error!(error = %e, "Internal server error");
+            AppError::Internal(_) => {
+                error!(error_kind = "internal", "Internal server error");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Internal server error".to_string(),

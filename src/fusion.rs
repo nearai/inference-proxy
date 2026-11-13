@@ -23,6 +23,10 @@ use crate::{AppState, TracingIds};
 const FUSION_TYPES: [&str; 2] = ["openrouter:fusion", "nearai:fusion"];
 const INTERNAL_FUNCTION_NAME: &str = "__nearai_fusion";
 const FUSION_PLUGIN_ID: &str = "fusion";
+// Keep each member's requested generation within a predictable cost and
+// timeout budget even when the tool supplies a larger value or none at all.
+const FUSION_MEMBER_TOKEN_CAP: u64 = 512;
+const FUSION_TIMEOUT_TOKENS_PER_SECOND: u64 = 8;
 
 pub struct FusionCaches {
     endpoint: Mutex<Option<EndpointSnapshot>>,
@@ -77,12 +81,14 @@ pub struct Usage {
 
 impl Usage {
     fn add(&mut self, other: &Usage) {
-        self.prompt_tokens += other.prompt_tokens;
-        self.completion_tokens += other.completion_tokens;
+        self.prompt_tokens = self.prompt_tokens.saturating_add(other.prompt_tokens);
+        self.completion_tokens = self
+            .completion_tokens
+            .saturating_add(other.completion_tokens);
     }
 
     fn total_tokens(&self) -> i64 {
-        self.prompt_tokens + self.completion_tokens
+        self.prompt_tokens.saturating_add(self.completion_tokens)
     }
 
     fn to_json(&self) -> Value {
@@ -99,11 +105,13 @@ impl Usage {
             prompt_tokens: usage
                 .get("prompt_tokens")
                 .and_then(|v| v.as_i64())
-                .unwrap_or(0),
+                .unwrap_or(0)
+                .max(0),
             completion_tokens: usage
                 .get("completion_tokens")
                 .and_then(|v| v.as_i64())
-                .unwrap_or(0),
+                .unwrap_or(0)
+                .max(0),
         }
     }
 }
@@ -146,6 +154,22 @@ struct InternalCallOutcome {
     response: Value,
     usage: Usage,
     web_tool_calls: u32,
+}
+
+struct InternalCallError {
+    error: AppError,
+    usage: Usage,
+    web_tool_calls: u32,
+}
+
+impl InternalCallError {
+    fn new(error: AppError, usage: &Usage, web_tool_calls: u32) -> Self {
+        Self {
+            error,
+            usage: usage.clone(),
+            web_tool_calls,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,6 +228,12 @@ pub async fn run_chat_completion(
     ctx: ChatCompletionContext,
     mut request_json: Value,
 ) -> Result<Response, AppError> {
+    // The regular route only prechecks admission before selecting the Fusion
+    // branch. Hold its budget slot until every member and synthesis has ended.
+    let _admission = ctx
+        .state
+        .admission
+        .try_admit(&ctx.state.backend_pool, None)?;
     let started = Instant::now();
     let fusion_tool = remove_fusion_tool(&mut request_json).ok_or_else(|| {
         AppError::BadRequest("Fusion was enabled but no Fusion tool was found".to_string())
@@ -276,6 +306,13 @@ pub async fn run_chat_completion(
         call_local_chat_json(&ctx.state, &ctx.tracing_ids, synthesis_request).await?;
     let synthesis_usage = Usage::from_response(&synthesis);
     aggregate_usage.add(&synthesis_usage);
+    if !has_nonempty_answer(&synthesis) {
+        return Err(AppError::UpstreamParsed {
+            status: StatusCode::BAD_GATEWAY,
+            message: "fusion_synthesis_empty".to_string(),
+            error_type: "fusion_error".to_string(),
+        });
+    }
     synthesis["usage"] = aggregate_usage.to_json();
     synthesis["nearai_fusion"] = metadata_json(MetadataJson {
         forced,
@@ -356,25 +393,54 @@ fn parse_config(
 
     let openrouter_fusion = tool.get("type").and_then(|v| v.as_str()) == Some("openrouter:fusion");
 
+    let judge_model = read_fusion_string(tool, "model")
+        .or_else(|| {
+            if openrouter_fusion {
+                outer_model.map(ToOwned::to_owned)
+            } else {
+                None
+            }
+        })
+        .map(|m| normalize_model_name(&m));
+    if judge_model
+        .as_deref()
+        .is_some_and(|judge| !judge_model_is_allowed(judge, &analysis_models, outer_model))
+    {
+        return Err(AppError::BadRequest(
+            "Fusion judge model must be a panel or the requested model".to_string(),
+        ));
+    }
+
+    let member_cap = fusion_member_token_cap(state.config.fusion_panel_timeout_secs);
+    let max_completion_tokens = read_fusion_u64(tool, "max_completion_tokens")
+        .unwrap_or(member_cap)
+        .min(member_cap);
+    if max_completion_tokens == 0 {
+        return Err(AppError::BadRequest(
+            "Fusion max_completion_tokens must be positive".to_string(),
+        ));
+    }
+
     Ok(FusionConfig {
         analysis_models,
-        judge_model: read_fusion_string(tool, "model")
-            .or_else(|| {
-                if openrouter_fusion {
-                    outer_model.map(ToOwned::to_owned)
-                } else {
-                    None
-                }
-            })
-            .map(|m| normalize_model_name(&m)),
+        judge_model,
         max_tool_calls: bounded_max_tool_calls(
             read_fusion_u32(tool, "max_tool_calls"),
             state.config.agent_loop_max_iterations,
         ),
-        max_completion_tokens: read_fusion_u64(tool, "max_completion_tokens"),
+        max_completion_tokens: Some(max_completion_tokens),
         temperature: read_fusion_f64(tool, "temperature"),
         reasoning: read_fusion_value(tool, "reasoning"),
     })
+}
+
+fn fusion_member_token_cap(timeout_secs: u64) -> u64 {
+    FUSION_MEMBER_TOKEN_CAP.min(timeout_secs.saturating_mul(FUSION_TIMEOUT_TOKENS_PER_SECOND))
+}
+
+fn judge_model_is_allowed(judge: &str, panels: &[String], outer_model: Option<&str>) -> bool {
+    panels.iter().any(|model| model == judge)
+        || outer_model.is_some_and(|model| normalize_model_name(model) == judge)
 }
 
 fn read_fusion_string_array(tool: &Value, key: &str) -> Option<Vec<String>> {
@@ -598,10 +664,10 @@ async fn call_panel(
                     domain: Some(endpoint.domain),
                     status: "failed".to_string(),
                     verifiable,
-                    usage: Usage::default(),
-                    web_tool_calls: 0,
+                    usage: e.usage,
+                    web_tool_calls: e.web_tool_calls,
                     answer: None,
-                    error: Some(e.to_string()),
+                    error: Some(e.error.to_string()),
                 },
             }
         }
@@ -685,10 +751,10 @@ async fn run_judge(
             domain: Some(endpoint.domain),
             status: "failed".to_string(),
             verifiable,
-            usage: Usage::default(),
-            web_tool_calls: 0,
+            usage: e.usage,
+            web_tool_calls: e.web_tool_calls,
             summary: None,
-            error: Some(e.to_string()),
+            error: Some(e.error.to_string()),
         }),
     }
 }
@@ -731,7 +797,7 @@ fn build_judge_request(
     let prompt = json!({
         "original_messages": request_json.get("messages").cloned().unwrap_or_else(|| json!([])),
         "panel_answers": panel_payload,
-        "instruction": "Return JSON with keys: consensus, disagreements, strengths, risks, synthesis_guidance. Do not include markdown fences."
+        "instruction": "Return strict JSON only: consensus and synthesis_guidance must be strings; disagreements, strengths and risks must be arrays of strings. Synthesis guidance must be nonempty. Do not include markdown fences."
     });
     let mut request = json!({
         "model": model,
@@ -804,6 +870,11 @@ fn augmented_messages(request_json: &Value, system: &str, deliberation: Option<&
 
 fn apply_generation_config(request: &mut Value, config: &FusionConfig) {
     if let Some(max_tokens) = config.max_completion_tokens {
+        // The outer request's max_tokens applies to the final synthesis.
+        // A member receives one bounded limit, never conflicting limit keys.
+        if let Some(object) = request.as_object_mut() {
+            object.remove("max_tokens");
+        }
         request["max_completion_tokens"] = Value::Number(max_tokens.into());
     }
     if let Some(temp) = config.temperature {
@@ -865,10 +936,12 @@ async fn call_direct_chat_with_web_tools(
     endpoint: &EndpointInfo,
     mut body: Value,
     max_tool_calls: u32,
-) -> Result<InternalCallOutcome, AppError> {
+) -> Result<InternalCallOutcome, InternalCallError> {
     if !has_web_context_search_tool(&body) || max_tool_calls == 0 {
         strip_tools_for_internal_call(&mut body);
-        let response = call_direct_chat_json(state, tracing_ids, endpoint, body).await?;
+        let response = call_direct_chat_json(state, tracing_ids, endpoint, body)
+            .await
+            .map_err(|error| InternalCallError::new(error, &Usage::default(), 0))?;
         let usage = Usage::from_response(&response);
         return Ok(InternalCallOutcome {
             response,
@@ -882,8 +955,12 @@ async fn call_direct_chat_with_web_tools(
         .web_context_search_url
         .as_deref()
         .ok_or_else(|| {
-            AppError::BadRequest(
-                "web_context_search is not configured on this deployment".to_string(),
+            InternalCallError::new(
+                AppError::BadRequest(
+                    "web_context_search is not configured on this deployment".to_string(),
+                ),
+                &Usage::default(),
+                0,
             )
         })?;
     let brave_key = state
@@ -891,8 +968,12 @@ async fn call_direct_chat_with_web_tools(
         .web_context_search_api_key
         .as_deref()
         .ok_or_else(|| {
-            AppError::BadRequest(
-                "web_context_search is not configured on this deployment".to_string(),
+            InternalCallError::new(
+                AppError::BadRequest(
+                    "web_context_search is not configured on this deployment".to_string(),
+                ),
+                &Usage::default(),
+                0,
             )
         })?;
     let tool_timeout = Duration::from_secs(state.config.web_context_search_timeout_secs);
@@ -906,7 +987,11 @@ async fn call_direct_chat_with_web_tools(
     let mut executed_tool_calls = 0u32;
 
     loop {
-        let response = call_direct_chat_json(state, tracing_ids, endpoint, body.clone()).await?;
+        let response = call_direct_chat_json(state, tracing_ids, endpoint, body.clone())
+            .await
+            .map_err(|error| {
+                InternalCallError::new(error, &aggregate_usage, executed_tool_calls)
+            })?;
         aggregate_usage.add(&Usage::from_response(&response));
 
         let tool_calls = extract_web_context_tool_calls(&response);
@@ -976,7 +1061,9 @@ async fn call_direct_chat_with_web_tools(
             tool_results.push((tool_call_id, status, output));
         }
 
-        append_tool_call_results(&mut body, tool_calls, tool_results)?;
+        append_tool_call_results(&mut body, tool_calls, tool_results).map_err(|error| {
+            InternalCallError::new(error, &aggregate_usage, executed_tool_calls)
+        })?;
         if executed_tool_calls >= max_tool_calls {
             if let Some(obj) = body.as_object_mut() {
                 obj.remove("tools");
@@ -1062,7 +1149,16 @@ async fn post_chat_json(
                 body: bytes,
             });
         }
-        return serde_json::from_slice(&bytes).map_err(|e| AppError::Internal(e.into()));
+        let parsed: Value =
+            serde_json::from_slice(&bytes).map_err(|e| AppError::Internal(e.into()))?;
+        if !parsed.is_object() {
+            return Err(AppError::UpstreamParsed {
+                status: StatusCode::BAD_GATEWAY,
+                message: "fusion_invalid_response".to_string(),
+                error_type: "fusion_error".to_string(),
+            });
+        }
+        return Ok(parsed);
     }
 
     unreachable!("fusion retry loop always returns early on the last attempt");
@@ -1085,7 +1181,11 @@ fn map_fusion_transport_error(error: reqwest::Error) -> AppError {
             error_type: "fusion_error".to_string(),
         }
     } else {
-        AppError::Internal(error.into())
+        AppError::UpstreamParsed {
+            status: StatusCode::BAD_GATEWAY,
+            message: "fusion_upstream_unavailable".to_string(),
+            error_type: "fusion_error".to_string(),
+        }
     }
 }
 
@@ -1328,7 +1428,11 @@ async fn endpoint_snapshot(state: &AppState) -> Result<EndpointSnapshot, AppErro
                     error_type: "fusion_error".to_string(),
                 }
             } else {
-                AppError::Internal(e.into())
+                AppError::UpstreamParsed {
+                    status: StatusCode::BAD_GATEWAY,
+                    message: "fusion_endpoint_unavailable".to_string(),
+                    error_type: "fusion_error".to_string(),
+                }
             }
         })?;
     let status = response.status();
@@ -1411,7 +1515,14 @@ async fn probe_attestation(state: &AppState, endpoint: &EndpointInfo) -> bool {
             false
         }
         Err(e) => {
-            debug!(domain = %endpoint.domain, error = %e, "Fusion attestation probe failed");
+            let error_kind = if e.is_timeout() {
+                "timeout"
+            } else if e.is_connect() {
+                "connect"
+            } else {
+                "request"
+            };
+            debug!(domain = %endpoint.domain, error_kind, "Fusion attestation probe failed");
             false
         }
     };
@@ -1434,9 +1545,35 @@ fn extract_message_content(response: &Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+fn has_nonempty_answer(response: &Value) -> bool {
+    extract_message_content(response).is_some_and(|content| !content.trim().is_empty())
+}
+
 fn parse_judge_summary(content: &str) -> Option<String> {
-    let parsed: Value = serde_json::from_str(content).ok()?;
-    Some(parsed.to_string())
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct JudgeSummary {
+        consensus: String,
+        disagreements: Vec<String>,
+        strengths: Vec<String>,
+        risks: Vec<String>,
+        synthesis_guidance: String,
+    }
+
+    let parsed: JudgeSummary = serde_json::from_str(content).ok()?;
+    if parsed.synthesis_guidance.trim().is_empty() {
+        return None;
+    }
+    Some(
+        json!({
+            "consensus": parsed.consensus,
+            "disagreements": parsed.disagreements,
+            "strengths": parsed.strengths,
+            "risks": parsed.risks,
+            "synthesis_guidance": parsed.synthesis_guidance,
+        })
+        .to_string(),
+    )
 }
 
 struct MetadataJson<'a> {
@@ -1649,7 +1786,7 @@ async fn stream_final_response(
     let response_sha256 = hex::encode(hasher.finalize());
     let text = format!("{}:{request_sha256}:{response_sha256}", opts.model_name);
     let signed = opts.signing.sign_chat(&text).map_err(|e| {
-        error!(error = %e, "Signing failed for Fusion stream");
+        error!(error_kind = "signing", "Signing failed for Fusion stream");
         AppError::Internal(e)
     })?;
     let signed_json = serde_json::to_string(&signed).map_err(|e| AppError::Internal(e.into()))?;
@@ -1667,7 +1804,6 @@ async fn stream_final_response(
     );
 
     info!(
-        chat_id = %id,
         model = %opts.model_name.to_lowercase(),
         "Fusion streaming request completed"
     );
@@ -1885,5 +2021,60 @@ mod tests {
         assert_eq!(bounded_max_tool_calls(Some(0), 5), 0);
         assert_eq!(bounded_max_tool_calls(Some(3), 5), 3);
         assert_eq!(bounded_max_tool_calls(Some(50), 5), 5);
+    }
+
+    #[test]
+    fn member_budget_is_bounded_by_timeout_and_server_cap() {
+        assert_eq!(fusion_member_token_cap(1), 8);
+        assert_eq!(fusion_member_token_cap(9), 72);
+        assert_eq!(fusion_member_token_cap(120), 512);
+    }
+
+    #[test]
+    fn member_request_has_one_bounded_generation_limit() {
+        let request = json!({
+            "model": "outer",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 10,
+        });
+        let config = FusionConfig {
+            analysis_models: vec!["panel".to_string()],
+            judge_model: None,
+            max_tool_calls: 0,
+            max_completion_tokens: Some(fusion_member_token_cap(120)),
+            temperature: None,
+            reasoning: None,
+        };
+        let panel = build_panel_request(&request, &config, "panel");
+        assert_eq!(panel["max_completion_tokens"], 512);
+        assert!(panel.get("max_tokens").is_none());
+        let synthesis = build_synthesis_request(&request, &[], None);
+        assert_eq!(synthesis["max_tokens"], 10);
+    }
+
+    #[test]
+    fn judge_model_is_confined_to_requested_or_panel_models() {
+        let panels = vec!["panel-a".to_string()];
+        assert!(judge_model_is_allowed("panel-a", &panels, Some("outer")));
+        assert!(judge_model_is_allowed("outer", &panels, Some("outer")));
+        assert!(!judge_model_is_allowed("other", &panels, Some("outer")));
+    }
+
+    #[test]
+    fn judge_summary_requires_the_expected_shape() {
+        let valid = r#"{"consensus":"blue","disagreements":[],"strengths":[],"risks":[],"synthesis_guidance":"answer blue"}"#;
+        assert!(parse_judge_summary(valid).is_some());
+        assert!(parse_judge_summary(r#"{"ignore_all_rules":true}"#).is_none());
+        assert!(parse_judge_summary(r#"{"consensus":"blue","disagreements":"none","strengths":[],"risks":[],"synthesis_guidance":"answer blue"}"#).is_none());
+    }
+
+    #[test]
+    fn empty_synthesis_is_rejected() {
+        assert!(!has_nonempty_answer(
+            &json!({"choices": [{"message": {"content": "  "}}]})
+        ));
+        assert!(has_nonempty_answer(
+            &json!({"choices": [{"message": {"content": "answer"}}]})
+        ));
     }
 }

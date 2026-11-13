@@ -230,6 +230,10 @@ fn the_queue_carries_the_body_the_proxy_builds_for_each_usage_type() {
         ),
         (UsageType::Rerank, json!({"usage": {"prompt_tokens": 2048}})),
         (UsageType::Score, json!({"usage": {"prompt_tokens": 96}})),
+        (
+            UsageType::AudioTranscription,
+            json!({"usage": {"type": "duration", "seconds": 1.25}}),
+        ),
     ];
     for (usage_type, response) in cases {
         let mut body = build_usage_body(&usage_type, &response, "test-model", "id-1")

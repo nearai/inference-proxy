@@ -98,6 +98,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         rerank_url_override: None,
         score_url_override: None,
         ohttp_enabled: false,
+        ohttp_max_inflight: 0,
         listen_port: 8000,
         listen_addr: "127.0.0.1".to_string(),
         backend_token: None,
@@ -179,6 +180,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),
+        rerank_limiter: Default::default(),
         usage_report_delivery: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
@@ -603,7 +605,7 @@ fn bench_response_signing_full(c: &mut Criterion) {
 
                     // 6. Serialize signature and cache
                     let signed_json = serde_json::to_string(&signed).unwrap();
-                    cache.set_chat(chat_id, &signed_json);
+                    cache.set_chat(chat_id, &signed_json, None);
 
                     black_box(final_body)
                 })

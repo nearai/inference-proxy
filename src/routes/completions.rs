@@ -70,6 +70,8 @@ async fn serve(
         auth.cloud_api_key.is_none(),
         state.config.priority_lower_first,
     );
+    // Engine prompt-cache namespace; see the chat route.
+    crate::cache_salt::apply(&mut request_json, &auth)?;
 
     // Extract encryption context from headers
     let enc_ctx = encryption::extract_encryption_context(&headers)?;

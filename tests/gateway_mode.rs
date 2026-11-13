@@ -152,6 +152,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         rerank_url_override: None,
         score_url_override: None,
         ohttp_enabled: false,
+        ohttp_max_inflight: 0,
         listen_port: 8000,
         listen_addr: "127.0.0.1".to_string(),
         backend_token: options.backend_token.clone(),
@@ -294,6 +295,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),
+        rerank_limiter: Default::default(),
         usage_report_delivery: usage_report::UsageReportDelivery::new(config.usage_report.clone()),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),

@@ -234,6 +234,10 @@ pub async fn run_chat_completion(
         .state
         .admission
         .try_admit(&ctx.state.backend_pool, None)?;
+    // A direct-key request whose usage could not be reported is refused
+    // before any panel, judge or synthesis call runs.
+    let usage_reporter = make_usage_reporter(&ctx.auth, &ctx.state);
+    proxy::ensure_direct_billing_available(usage_reporter.as_ref())?;
     let started = Instant::now();
     let fusion_tool = remove_fusion_tool(&mut request_json).ok_or_else(|| {
         AppError::BadRequest("Fusion was enabled but no Fusion tool was found".to_string())
@@ -818,6 +822,9 @@ fn build_judge_request(
         request["tools"] = json!([{
             "type": agent_loop::WEB_CONTEXT_SEARCH_TOOL_NAME
         }]);
+    }
+    if let Some(salt) = request_json.get(crate::cache_salt::CACHE_SALT_FIELD) {
+        request[crate::cache_salt::CACHE_SALT_FIELD] = salt.clone();
     }
     apply_generation_config(&mut request, config);
     request
@@ -1732,6 +1739,23 @@ async fn stream_final_response(
         .cloned()
         .unwrap_or_else(|| Value::String("stop".to_string()));
 
+    // Direct-key billing, prepared before anything is signed, cached or
+    // returned: a response whose usage cannot be reported is refused, never
+    // served unbilled. The report carries a request-scoped billing ID, the one
+    // the `inference-id` header is derived from, as on the regular streaming
+    // path; the chunks and the signature cache keep the chat ID above.
+    // Trusted callers have no reporter and get neither.
+    let prepared_usage = match proxy::direct_stream_billing_id(opts.usage_reporter.as_ref())? {
+        Some((billing_id, inference_id)) => {
+            let prepared = proxy::prepare_direct_usage(&response_json, &billing_id, &opts)?;
+            debug_assert!(prepared
+                .as_ref()
+                .is_none_or(|(prepared_id, _)| *prepared_id == inference_id));
+            prepared
+        }
+        None => None,
+    };
+
     let mut chunks = Vec::new();
     chunks.push(json!({
         "id": id,
@@ -1790,8 +1814,11 @@ async fn stream_final_response(
         AppError::Internal(e)
     })?;
     let signed_json = serde_json::to_string(&signed).map_err(|e| AppError::Internal(e.into()))?;
-    opts.cache.set_chat(&id, &signed_json);
-    proxy::try_report_usage(&response_json, &id, &opts);
+    opts.cache.set_chat(
+        &id,
+        &signed_json,
+        proxy::signature_owner(opts.usage_reporter.as_ref()),
+    );
 
     proxy::record_completed_request(
         opts.tracing_ids.as_ref(),
@@ -1809,12 +1836,23 @@ async fn stream_final_response(
     );
 
     let stream = tokio_stream::iter(bytes);
-    Ok(Response::builder()
+    let mut response = Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/event-stream")
         .header("cache-control", "no-cache")
         .body(Body::from_stream(stream))
-        .unwrap())
+        .expect("static response parts are valid");
+    // Submitted only once the response is fully built.
+    if let Some((inference_id, usage_body)) = prepared_usage {
+        proxy::add_direct_inference_id(&mut response, Some(inference_id));
+        proxy::spawn_usage_report(
+            opts.usage_reporter
+                .as_ref()
+                .expect("prepared direct usage has a reporter"),
+            usage_body,
+        );
+    }
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -1842,6 +1880,35 @@ mod tests {
         assert!(panel.get("lora_path").is_none());
         let synthesis = build_synthesis_request(&request, &[], None);
         assert_eq!(synthesis["lora_path"], "local-adapter");
+    }
+
+    #[test]
+    fn every_member_request_keeps_the_outer_cache_salt() {
+        let config = FusionConfig {
+            analysis_models: vec!["panel".to_string()],
+            judge_model: None,
+            max_tool_calls: 0,
+            max_completion_tokens: None,
+            temperature: None,
+            reasoning: None,
+        };
+        let request = json!({
+            "model": "outer",
+            "messages": [{"role": "user", "content": "hi"}],
+            "cache_salt": "outer-namespace"
+        });
+        let panel = build_panel_request(&request, &config, "panel");
+        let judge = build_judge_request(&request, &config, &[], "judge");
+        let synthesis = build_synthesis_request(&request, &[], None);
+        for body in [&panel, &judge, &synthesis] {
+            assert_eq!(body["cache_salt"], "outer-namespace");
+        }
+        let request = json!({"model": "outer", "messages": []});
+        let judge = build_judge_request(&request, &config, &[], "judge");
+        assert!(judge.get("cache_salt").is_none());
+        assert!(build_panel_request(&request, &config, "panel")
+            .get("cache_salt")
+            .is_none());
     }
 
     #[test]

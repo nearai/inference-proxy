@@ -344,6 +344,7 @@ async fn main() -> anyhow::Result<()> {
     let model_name = config.model_name.clone();
     let state = AppState {
         api_key_cache: Default::default(),
+        rerank_limiter: Default::default(),
         usage_report_delivery: usage_report::UsageReportDelivery::for_transport(
             config.usage_report.clone(),
             &config.usage_report_transport,

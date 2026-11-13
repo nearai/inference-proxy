@@ -3,6 +3,9 @@ use tracing::warn;
 
 const FUSION_INTERNAL_MAX_ATTEMPTS_LIMIT: usize = 5;
 const DEFAULT_GEMMA4_ALLOWED_MEDIA_DOMAIN: &str = "prod-files-secure.s3.us-west-2.amazonaws.com";
+/// Default `OHTTP_MAX_INFLIGHT`: high enough not to refuse normal relay
+/// traffic, while still bounding it.
+pub const DEFAULT_OHTTP_MAX_INFLIGHT: usize = 128;
 
 fn env_or(name: &str, default: &str) -> String {
     env::var(name).unwrap_or_else(|_| default.to_string())
@@ -739,6 +742,12 @@ pub struct Config {
 
     // OHTTP Gateway (RFC 9458)
     pub ohttp_enabled: bool,
+    /// Process-wide cap on `POST /ohttp` requests in flight
+    /// (`OHTTP_MAX_INFLIGHT`, default 128; 0 = no cap). A slot is taken
+    /// before reading the outer body and held until the relayed response is sent;
+    /// past the cap the relay answers 429 with `Retry-After`. See
+    /// `routes::ohttp::OhttpRelayLimit`.
+    pub ohttp_max_inflight: usize,
     /// Listen port for the proxy (used by OHTTP handler for loopback requests).
     pub listen_port: u16,
     /// Interface to bind (`LISTEN_ADDR`, default `0.0.0.0`). Gateway
@@ -1536,6 +1545,7 @@ impl Config {
             health_check_max_failures: env_int("HEALTH_CHECK_MAX_FAILURES", 3) as u32,
             health_check_timeout_secs: env_int("HEALTH_CHECK_TIMEOUT_SECS", 3) as u64,
             ohttp_enabled: env_bool("OHTTP_ENABLED"),
+            ohttp_max_inflight: env_parse("OHTTP_MAX_INFLIGHT", DEFAULT_OHTTP_MAX_INFLIGHT)?,
             listen_port,
             listen_addr,
             backend_token,
@@ -2003,6 +2013,26 @@ mod tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn test_ohttp_max_inflight_default_override_and_garbage() {
+        let base = [("MODEL_NAME", "m"), ("TOKEN", "t")];
+        let with = |value: &'static str| {
+            let mut vars = base.to_vec();
+            vars.push(("OHTTP_MAX_INFLIGHT", value));
+            with_env_vars(&vars, Config::from_env)
+        };
+        // Empty = unset: the default cap.
+        assert_eq!(
+            with("").unwrap().ohttp_max_inflight,
+            DEFAULT_OHTTP_MAX_INFLIGHT
+        );
+        assert_eq!(with("16").unwrap().ohttp_max_inflight, 16);
+        // 0 turns the cap off.
+        assert_eq!(with("0").unwrap().ohttp_max_inflight, 0);
+        let err = with("lots").unwrap_err().to_string();
+        assert!(err.contains("OHTTP_MAX_INFLIGHT"), "{err}");
     }
 
     #[test]

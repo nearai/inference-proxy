@@ -79,6 +79,10 @@ async fn serve(
         auth.cloud_api_key.is_none(),
         state.config.priority_lower_first,
     );
+    // Engine prompt-cache namespace: set by the proxy for an `sk-` caller
+    // (bound to its organization and workspace), left as sent by a trusted
+    // caller. Before any branch so fusion and the agent loop inherit it.
+    crate::cache_salt::apply(&mut request_json, &auth)?;
     // Gateway mode: an aggregator's `reasoning` object becomes the engine's
     // `reasoning_effort` switch (`enabled: false` → `none`), otherwise the
     // model keeps thinking and the caller pays for it.

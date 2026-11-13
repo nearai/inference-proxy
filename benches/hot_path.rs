@@ -140,7 +140,7 @@ fn bench_sse_parser(c: &mut Criterion) {
 }
 
 fn bench_cache(c: &mut Criterion) {
-    use vllm_proxy_rs::cache::ChatCache;
+    use vllm_proxy_rs::cache::{ChatCache, SignatureReader};
 
     let cache = ChatCache::new("test-model", 1200);
 
@@ -149,7 +149,7 @@ fn bench_cache(c: &mut Criterion) {
         let mut i = 0u64;
         b.iter(|| {
             let key = format!("chatcmpl-{i}");
-            cache.set_chat(black_box(&key), black_box(value));
+            cache.set_chat(black_box(&key), black_box(value), None);
             i += 1;
         })
     });
@@ -157,21 +157,21 @@ fn bench_cache(c: &mut Criterion) {
     // Pre-populate for get benchmark
     let cache = ChatCache::new("test-model", 1200);
     for i in 0..1000 {
-        cache.set_chat(&format!("chatcmpl-{i}"), "cached-value");
+        cache.set_chat(&format!("chatcmpl-{i}"), "cached-value", None);
     }
 
     c.bench_function("cache_get_hit", |b| {
         let mut i = 0u64;
         b.iter(|| {
             let key = format!("chatcmpl-{}", i % 1000);
-            let _ = cache.get_chat(black_box(&key));
+            let _ = cache.get_chat(black_box(&key), SignatureReader::Trusted);
             i += 1;
         })
     });
 
     c.bench_function("cache_get_miss", |b| {
         b.iter(|| {
-            let _ = cache.get_chat(black_box("nonexistent-key"));
+            let _ = cache.get_chat(black_box("nonexistent-key"), SignatureReader::Trusted);
         })
     });
 }

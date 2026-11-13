@@ -76,11 +76,18 @@ Other endpoint transforms:
 
 | Endpoint | Request fields | Response fields |
 | --- | --- | --- |
-| Image generation/editing | `prompt` | `data[].b64_json`, `data[].revised_prompt` |
+| Image generation | `prompt` | `data[].b64_json`, `data[].revised_prompt` |
+| Image editing | `prompt` | `data[].b64_json`, `data[].revised_prompt` |
 | Embeddings | `input` | `data[].embedding`, serialized as JSON |
 | Audio transcription | `prompt` | `text` |
 | Rerank | `query`, strings in `documents[]` or their `text` fields | `results[].document.text`, `results[].relevance_score` serialized as JSON |
 | Score | `text_1`, `text_2` | `score`, serialized as JSON |
+
+Image editing and audio transcription accept multipart media. Their uploaded
+image or audio bytes are not encrypted by this field protocol. Requests with
+multipart media and all-field encryption are refused until encrypted media
+uploads are supported. This includes every V3 media upload and V1/V2 uploads
+with `X-Encrypt-All-Fields: true`.
 
 Rerank results are sorted by relevance inside the model proxy before scores are
 encrypted. Gateways preserve that ordering.
@@ -104,8 +111,9 @@ fixed message and safe status/type information.
 
 ## Compatibility
 
-V1/v2 select the extended field policy with `X-Encrypt-All-Fields` and allow
-plaintext in extended request fields for compatibility with legacy clients.
+V1/v2 select the extended field policy with `X-Encrypt-All-Fields`; non-empty
+protected strings must decrypt successfully. Without that flag, legacy
+extended fields keep their existing behavior.
 V3 requires support in the model proxy and any gateway on the request path.
 Clients must not downgrade to an older protocol version on failure.
 

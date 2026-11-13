@@ -115,6 +115,8 @@ pub async fn rerank(
     let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
     let enc_ctx = encryption::extract_encryption_context(&headers)?;
     let url_override = state.config.rerank_url_override.clone();
+    // The permit is held until the complete upstream response is read.
+    let _permit = state.rerank_limiter.admit(&auth)?;
 
     json_passthrough_encrypted(
         state,
@@ -232,6 +234,12 @@ pub async fn images_edits(
             let part = build_multipart_part(data, file_name, content_type)?;
             form = form.part(name, part);
         } else {
+            refuse_media_with_all_fields(
+                enc_ctx.as_ref(),
+                &name,
+                file_name.as_deref(),
+                content_type.as_deref(),
+            )?;
             let data =
                 read_field_chunks(&mut field, &mut total_size, max_size, &mut hasher).await?;
             crate::model_list::guard_form_field(&state, &name, &data)?;
@@ -327,6 +335,12 @@ pub async fn audio_transcriptions(
             let part = build_multipart_part(data, file_name, content_type)?;
             form = form.part(name, part);
         } else {
+            refuse_media_with_all_fields(
+                enc_ctx.as_ref(),
+                &name,
+                file_name.as_deref(),
+                content_type.as_deref(),
+            )?;
             let data =
                 read_field_chunks(&mut field, &mut total_size, max_size, &mut hasher).await?;
             crate::model_list::guard_form_field(&state, &name, &data)?;
@@ -409,10 +423,12 @@ async fn json_passthrough_encrypted(
         // Hash original client-sent body before decryption for signatures
         let original_hash = hex::encode(sha2::Sha256::digest(&request_body));
         let mut request_json = proxy::parse_json_object(&request_body)?;
+        validate_rerank_document_count(endpoint, &request_json)?;
         encryption::decrypt_request_fields(&mut request_json, endpoint, &ctx, &state.signing)?;
         crate::model_list::guard_passthrough_body(&state, &request_json)?;
         guard_direct_model(&state, &request_json, direct_key)?;
         validate_image_count(endpoint, &request_json)?;
+        validate_rerank_document_count(endpoint, &request_json)?;
         if with_lora {
             crate::model_list::apply_backend_lora(&state, &mut request_json);
         }
@@ -422,6 +438,7 @@ async fn json_passthrough_encrypted(
         (modified, Some(original_hash), Some(transform))
     } else {
         let mut request_json = proxy::parse_json_object(&request_body)?;
+        validate_rerank_document_count(endpoint, &request_json)?;
         crate::model_list::guard_passthrough_body(&state, &request_json)?;
         guard_direct_model(&state, &request_json, direct_key)?;
         validate_image_count(endpoint, &request_json)?;
@@ -510,6 +527,67 @@ fn validate_image_count(endpoint: Endpoint, request: &serde_json::Value) -> Resu
     }
 }
 
+/// Maximum number of documents accepted by one rerank request.
+pub const MAX_RERANK_DOCUMENTS: usize = 4096;
+
+fn validate_rerank_document_count(
+    endpoint: Endpoint,
+    request: &serde_json::Value,
+) -> Result<(), AppError> {
+    if !matches!(endpoint, Endpoint::Rerank) {
+        return Ok(());
+    }
+    let Some(count) = request
+        .get("documents")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+    else {
+        return Ok(());
+    };
+    if count > MAX_RERANK_DOCUMENTS {
+        return Err(AppError::BadRequest(format!(
+            "documents must contain at most {MAX_RERANK_DOCUMENTS} items, got {count}"
+        )));
+    }
+    Ok(())
+}
+
+/// Fixed client-facing message; it never includes a part's name, filename or type.
+const ENCRYPTED_MEDIA_UNSUPPORTED: &str =
+    "Media uploads are not supported with all-field encryption on this endpoint";
+
+/// Whether a multipart part (other than `prompt`) carries uploaded media rather
+/// than a plain form value: it has a filename, a non-text content type, or a
+/// media field name used by the image-edit and transcription APIs.
+fn is_media_part(name: &str, file_name: Option<&str>, content_type: Option<&str>) -> bool {
+    let non_text = content_type.is_some_and(|ct| {
+        let essence = ct.split(';').next().unwrap_or("").trim();
+        !essence.eq_ignore_ascii_case("text/plain")
+    });
+    file_name.is_some()
+        || non_text
+        || matches!(name, "image" | "mask" | "file")
+        || name.starts_with("image[")
+}
+
+/// Media parts are not encrypted on the multipart endpoints. When the client
+/// asked for all-field encryption, refuse the request from the part header,
+/// before its bytes are read and before anything is forwarded.
+fn refuse_media_with_all_fields(
+    enc_ctx: Option<&encryption::EncryptionContext>,
+    name: &str,
+    file_name: Option<&str>,
+    content_type: Option<&str>,
+) -> Result<(), AppError> {
+    let all_fields = enc_ctx.is_some_and(|ctx| ctx.all_fields());
+    if all_fields && is_media_part(name, file_name, content_type) {
+        return Err(AppError::BadRequest(
+            ENCRYPTED_MEDIA_UNSUPPORTED.to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Read a multipart field incrementally, enforcing the cumulative size limit and
 /// hashing the original bytes before any encrypted field is transformed.
 async fn read_field_chunks(
@@ -578,5 +656,62 @@ mod tests {
             .is_err());
         }
         assert!(validate_image_count(Endpoint::Embeddings, &serde_json::json!({"n": 32})).is_ok());
+    }
+
+    fn ctx(version: u8, encrypt_all_fields: bool) -> encryption::EncryptionContext {
+        encryption::EncryptionContext {
+            algo: encryption::EncryptionAlgo::Ed25519,
+            client_pub_key: vec![0; 32],
+            version,
+            encrypt_all_fields,
+        }
+    }
+
+    #[test]
+    fn media_parts_are_recognised_from_the_part_header() {
+        for (name, file_name, content_type) in [
+            ("image", None, None),
+            ("image[]", None, None),
+            ("image[0]", None, None),
+            ("mask", None, None),
+            ("file", None, None),
+            ("other", Some("synthetic.bin"), None),
+            ("other", None, Some("image/png")),
+            ("other", None, Some("application/octet-stream")),
+        ] {
+            assert!(is_media_part(name, file_name, content_type), "{name}");
+        }
+        for (name, content_type) in [
+            ("model", None),
+            ("response_format", None),
+            ("language", Some("text/plain")),
+            ("size", Some("Text/Plain; charset=utf-8")),
+        ] {
+            assert!(!is_media_part(name, None, content_type), "{name}");
+        }
+    }
+
+    #[test]
+    fn media_is_refused_only_with_all_field_encryption() {
+        let media = ("file", Some("synthetic.bin"), Some("audio/wav"));
+        let refuse = |enc: Option<&encryption::EncryptionContext>| {
+            refuse_media_with_all_fields(enc, media.0, media.1, media.2)
+        };
+        // No encryption, and v1/v2 without the all-field flag: unchanged.
+        assert!(refuse(None).is_ok());
+        assert!(refuse(Some(&ctx(1, false))).is_ok());
+        assert!(refuse(Some(&ctx(2, false))).is_ok());
+        // All-field mode in every version.
+        for enc in [ctx(1, true), ctx(2, true), ctx(3, false), ctx(3, true)] {
+            match refuse(Some(&enc)) {
+                Err(AppError::BadRequest(message)) => {
+                    assert_eq!(message, ENCRYPTED_MEDIA_UNSUPPORTED);
+                    assert!(!message.contains("synthetic.bin"));
+                }
+                other => panic!("v{}: unexpected {other:?}", enc.version),
+            }
+        }
+        // Plain form values are still accepted in all-field mode.
+        assert!(refuse_media_with_all_fields(Some(&ctx(1, true)), "model", None, None).is_ok());
     }
 }

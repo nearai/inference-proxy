@@ -7,7 +7,7 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 
-use crate::cache::ChatCache;
+use crate::cache::{ChatCache, SignatureOwner};
 use crate::error::AppError;
 use crate::signing::SigningPair;
 use crate::{AppState, TracingIds};
@@ -545,7 +545,7 @@ pub enum UsageType {
     /// response shape (top-level `usage.prompt_tokens`, no completion
     /// tokens) and differ only in the reported label, so cloud-api records
     /// the correct `inference_type` instead of mislabeling them as
-    /// `chat_completion`. See nearai/infra#169.
+    /// `chat_completion`.
     Embedding,
     Rerank,
     Score,
@@ -570,6 +570,15 @@ pub enum ResponseShape {
     #[default]
     ChatCompletion,
     TextCompletion,
+}
+
+/// Owner recorded on a signature cached for a request: the organization and
+/// workspace of a direct customer key. A reporter exists only for direct-key
+/// requests, so a request without one stores an entry without an owner, which
+/// only configured `TOKEN` callers can read.
+pub(crate) fn signature_owner(reporter: Option<&UsageReporter>) -> Option<SignatureOwner> {
+    let reporter = reporter?;
+    SignatureOwner::new(reporter.org_id.as_deref(), reporter.workspace_id.as_deref())
 }
 
 /// Build a `UsageReporter` if the request was authenticated with a cloud API
@@ -652,7 +661,7 @@ fn cached_tokens(usage: &serde_json::Value, prompt_tokens: i64) -> Option<i64> {
 
 /// Build the `/v1/internal/usage` request body for a parsed response, or
 /// `None` when there is nothing billable to report. Pure (no I/O) so it can
-/// be unit-tested directly; `try_report_usage` wraps it with the
+/// be unit-tested directly; `prepare_direct_usage` wraps it before the
 /// fire-and-forget send.
 pub(crate) fn build_usage_body(
     usage_type: &UsageType,
@@ -748,7 +757,7 @@ pub(crate) fn build_usage_body(
 const EXTERNAL_USAGE_ID_NAMESPACE: uuid::Uuid =
     uuid::Uuid::from_u128(0x1966acaf_9f95_5dab_b8f0_03a51c091314);
 
-fn prepare_direct_usage(
+pub(crate) fn prepare_direct_usage(
     response_data: &serde_json::Value,
     id: &str,
     opts: &ProxyOpts,
@@ -777,7 +786,7 @@ fn prepare_direct_usage(
     )))
 }
 
-fn add_direct_inference_id(response: &mut Response, inference_id: Option<uuid::Uuid>) {
+pub(crate) fn add_direct_inference_id(response: &mut Response, inference_id: Option<uuid::Uuid>) {
     if let Some(inference_id) = inference_id {
         response.headers_mut().insert(
             "inference-id",
@@ -785,6 +794,34 @@ fn add_direct_inference_id(response: &mut Response, inference_id: Option<uuid::U
                 .expect("UUID contains only header-safe ASCII"),
         );
     }
+}
+
+/// Refuse a direct-key request whose usage could not be reported, before
+/// any work is dispatched. Trusted callers have no reporter and pass.
+pub(crate) fn ensure_direct_billing_available(
+    reporter: Option<&UsageReporter>,
+) -> Result<(), AppError> {
+    if reporter.is_some_and(|reporter| reporter.service_path_unavailable_reason().is_some()) {
+        return Err(AppError::BillingUnavailable);
+    }
+    Ok(())
+}
+
+/// Request-scoped billing ID for a direct-key streaming response and the
+/// `inference-id` header value cloud-api derives from it. A stream's headers
+/// leave before the provider's chat ID is known, so the usage report carries
+/// this ID instead; signing and the signature cache keep the provider ID.
+/// `None` for trusted callers (no reporter).
+pub(crate) fn direct_stream_billing_id(
+    reporter: Option<&UsageReporter>,
+) -> Result<Option<(String, uuid::Uuid)>, AppError> {
+    ensure_direct_billing_available(reporter)?;
+    if reporter.is_none() {
+        return Ok(None);
+    }
+    let billing_id = format!("stream-{}", uuid::Uuid::new_v4().simple());
+    let inference_id = uuid::Uuid::new_v5(&EXTERNAL_USAGE_ID_NAMESPACE, billing_id.as_bytes());
+    Ok(Some((billing_id, inference_id)))
 }
 
 /// Build the body for an input-token-billed, output-less kind
@@ -844,29 +881,6 @@ fn set_direct_response_model(response_data: &mut serde_json::Value, opts: &Proxy
     }
 }
 
-/// Extract usage from a parsed JSON response and fire-and-forget a report to the cloud API.
-pub(crate) fn try_report_usage(response_data: &serde_json::Value, id: &str, opts: &ProxyOpts) {
-    let Some(reporter) = &opts.usage_reporter else {
-        return;
-    };
-    match build_usage_body(&opts.usage_type, response_data, &reporter.model_name, id) {
-        Some(body) => spawn_usage_report(reporter, body),
-        None => {
-            record_usage_report_outcome(reporter, UsageReportOutcome::MissingBillableUsage, None);
-            warn!(
-                request_id = %reporter.request_id.as_deref().unwrap_or(""),
-                org_id = %reporter.org_id.as_deref().unwrap_or(""),
-                workspace_id = %reporter.workspace_id.as_deref().unwrap_or(""),
-                api_key_id = %reporter.api_key_id.as_deref().unwrap_or(""),
-                model = %reporter.model_name,
-                auth_path = reporter.request_source.auth_path.as_label(),
-                ingress_route = reporter.request_source.ingress_route.as_label(),
-                "Skipping direct-key usage report: response contained no billable usage"
-            );
-        }
-    }
-}
-
 /// Report chat-completion usage when both cumulative token counts and a
 /// provider response ID are available. Missing pieces become explicit terminal
 /// outcomes instead of silent gaps in the direct-key reporting funnel.
@@ -919,14 +933,14 @@ pub(crate) fn report_chat_usage_if_present(
 
 /// Report token usage to cloud-api when a streaming response finalizes — even if
 /// it did NOT complete cleanly (client disconnect, upstream error, or no `[DONE]`).
-/// Billing must not depend on a clean `[DONE]` (nearai/infra#98): the tokens were
+/// Billing must not depend on a clean `[DONE]`: the tokens were
 /// already produced. The caller keeps signing/caching gated on clean completion;
 /// a partial response cannot be verified, but it was still billed.
 ///
 /// The reporter only exists for direct `sk-` requests
 /// (`RequireAuth.cloud_api_key`); cloud-api's own `InterceptStream` is not in
 /// that path, so this is the sole biller and there is no double-billing.
-fn report_stream_usage_on_finalize(
+pub(crate) fn report_stream_usage_on_finalize(
     usage_reporter: &Option<UsageReporter>,
     usage: Option<((i64, i64), Option<i64>)>,
     billing_id: Option<&str>,
@@ -2146,7 +2160,11 @@ async fn proxy_json_request_inner(
         AppError::Internal(e)
     })?;
     let signed_json = serde_json::to_string(&signed).map_err(|e| AppError::Internal(e.into()))?;
-    opts.cache.set_chat(&chat_id, &signed_json);
+    opts.cache.set_chat(
+        &chat_id,
+        &signed_json,
+        signature_owner(opts.usage_reporter.as_ref()),
+    );
 
     record_completed_request_for(
         opts.model_label,
@@ -2898,23 +2916,13 @@ async fn proxy_streaming_request_inner(
         .take()
         .unwrap_or_else(|| hex::encode(Sha256::digest(&request_body)));
 
-    if opts
-        .usage_reporter
-        .as_ref()
-        .is_some_and(|reporter| reporter.service_path_unavailable_reason().is_some())
-    {
-        return Err(AppError::BillingUnavailable);
-    }
     // The response header must be known before the provider's SSE ID arrives.
     // Billing uses this request-scoped ID; signature caching still uses the
     // provider ID parsed from the stream.
-    let billing_id = opts
-        .usage_reporter
-        .as_ref()
-        .map(|_| format!("stream-{}", uuid::Uuid::new_v4().simple()));
-    let inference_id = billing_id
-        .as_deref()
-        .map(|id| uuid::Uuid::new_v5(&EXTERNAL_USAGE_ID_NAMESPACE, id.as_bytes()));
+    let (billing_id, inference_id) = match direct_stream_billing_id(opts.usage_reporter.as_ref())? {
+        Some((billing_id, inference_id)) => (Some(billing_id), Some(inference_id)),
+        None => (None, None),
+    };
 
     let commit_after = if deadline.is_some() {
         0
@@ -3297,7 +3305,7 @@ async fn proxy_streaming_request_inner(
         }
 
         // Bill for the tokens the backend already produced, even when the stream
-        // did NOT finish cleanly (nearai/infra#98). With continuous_usage_stats
+        // did NOT finish cleanly. With continuous_usage_stats
         // forced on cloud-key streaming (routes/chat.rs, routes/completions.rs),
         // `parser.usage` holds the running cumulative counts from the last chunk
         // we saw — the best figure at the point of interruption. Signing/caching
@@ -3318,7 +3326,11 @@ async fn proxy_streaming_request_inner(
                 let signature_cached = match signing.sign_chat(&text) {
                     Ok(signed) => match serde_json::to_string(&signed) {
                         Ok(signed_json) => {
-                            cache.set_chat(id, &signed_json);
+                            cache.set_chat(
+                                id,
+                                &signed_json,
+                                signature_owner(usage_reporter.as_ref()),
+                            );
                             true
                         }
                         Err(_) => {
@@ -3735,7 +3747,11 @@ async fn proxy_multipart_request_inner(
         AppError::Internal(e)
     })?;
     let signed_json = serde_json::to_string(&signed).map_err(|e| AppError::Internal(e.into()))?;
-    opts.cache.set_chat(&response_id, &signed_json);
+    opts.cache.set_chat(
+        &response_id,
+        &signed_json,
+        signature_owner(opts.usage_reporter.as_ref()),
+    );
 
     record_completed_request_for(
         opts.model_label,
@@ -3896,7 +3912,11 @@ pub(crate) async fn sign_and_cache_json_response(
         AppError::Internal(e)
     })?;
     let signed_json = serde_json::to_string(&signed).map_err(|e| AppError::Internal(e.into()))?;
-    opts.cache.set_chat(&chat_id, &signed_json);
+    opts.cache.set_chat(
+        &chat_id,
+        &signed_json,
+        signature_owner(opts.usage_reporter.as_ref()),
+    );
 
     if let Some(completion) = completion {
         record_completed_request_for(
@@ -4618,7 +4638,7 @@ mod tests {
     fn test_build_usage_body_input_only_kinds_label_and_shape() {
         // embedding / rerank / score share the embeddings response shape
         // (top-level usage.prompt_tokens, no completion tokens) and report
-        // input-only usage under their own label (nearai/infra#169).
+        // input-only usage under their own label.
         let resp = serde_json::json!({
             "usage": {"prompt_tokens": 42, "total_tokens": 42}
         });
@@ -4822,6 +4842,49 @@ mod tests {
     }
 
     #[test]
+    fn direct_stream_billing_id_matches_its_header_and_report() {
+        assert!(direct_stream_billing_id(None).unwrap().is_none());
+
+        let mut opts = test_proxy_opts();
+        opts.usage_reporter = Some(reporter_with(
+            Some("token"),
+            Some("org"),
+            Some("workspace"),
+            Some("key"),
+        ));
+        let (billing_id, inference_id) = direct_stream_billing_id(opts.usage_reporter.as_ref())
+            .unwrap()
+            .expect("direct request has a billing id");
+        assert!(billing_id.starts_with("stream-"));
+        // The report prepared under this ID maps to the same header value.
+        let response = serde_json::json!({"usage": {"prompt_tokens": 2, "completion_tokens": 1}});
+        let (prepared_id, usage_body) = prepare_direct_usage(&response, &billing_id, &opts)
+            .unwrap()
+            .expect("billable direct response has a report");
+        assert_eq!(prepared_id, inference_id);
+        assert_eq!(usage_body["id"], billing_id.as_str());
+        // Every request gets its own.
+        let (other_id, _) = direct_stream_billing_id(opts.usage_reporter.as_ref())
+            .unwrap()
+            .unwrap();
+        assert_ne!(other_id, billing_id);
+    }
+
+    #[test]
+    fn direct_stream_billing_id_refuses_unreportable_usage() {
+        let reporter = reporter_with(Some("token"), Some("org"), Some("workspace"), None);
+        assert!(matches!(
+            direct_stream_billing_id(Some(&reporter)),
+            Err(AppError::BillingUnavailable)
+        ));
+        assert!(matches!(
+            ensure_direct_billing_available(Some(&reporter)),
+            Err(AppError::BillingUnavailable)
+        ));
+        assert!(ensure_direct_billing_available(None).is_ok());
+    }
+
+    #[test]
     fn direct_response_without_billable_usage_is_refused() {
         let mut opts = test_proxy_opts();
         opts.usage_reporter = Some(reporter_with(
@@ -4934,7 +4997,9 @@ mod tests {
         assert_eq!(parsed["id"], "existing-id");
 
         // Signature should be cached under "existing-id"
-        assert!(cache.get_chat("existing-id").is_some());
+        assert!(cache
+            .get_chat("existing-id", crate::cache::SignatureReader::Trusted)
+            .is_some());
     }
 
     #[tokio::test]
@@ -4956,7 +5021,54 @@ mod tests {
         assert!(id.starts_with("test-"), "should generate id with prefix");
 
         // Signature should be cached under the generated id
-        assert!(cache.get_chat(id).is_some());
+        assert!(cache
+            .get_chat(id, crate::cache::SignatureReader::Trusted)
+            .is_some());
+    }
+
+    #[test]
+    fn signature_owner_comes_from_the_direct_key_reporter() {
+        assert!(signature_owner(None).is_none());
+        let reporter = reporter_with(Some("tok"), Some("org-a"), Some("ws-a"), Some("key"));
+        assert_eq!(
+            signature_owner(Some(&reporter)),
+            SignatureOwner::new(Some("org-a"), Some("ws-a"))
+        );
+        let partial = reporter_with(Some("tok"), Some("org-a"), None, Some("key"));
+        assert!(signature_owner(Some(&partial)).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sign_and_cache_json_records_direct_key_owner() {
+        use crate::cache::SignatureReader;
+
+        let mut opts = test_proxy_opts();
+        opts.usage_reporter = Some(reporter_with(
+            Some("tok"),
+            Some("org-a"),
+            Some("ws-a"),
+            Some("key-a"),
+        ));
+        let cache = opts.cache.clone();
+        let request_sha256 = hex::encode(Sha256::digest(b"test-request"));
+        let body =
+            br#"{"id":"owned-id","text":"hello","usage":{"prompt_tokens":2,"completion_tokens":1}}"#;
+
+        let _ = sign_and_cache_json_response(body, &request_sha256, opts, StatusCode::OK, None)
+            .await
+            .expect("valid JSON should succeed");
+
+        let same = SignatureOwner::new(Some("org-a"), Some("ws-a")).unwrap();
+        let other = SignatureOwner::new(Some("org-b"), Some("ws-b")).unwrap();
+        assert!(cache
+            .get_chat("owned-id", SignatureReader::Owner(&same))
+            .is_some());
+        assert!(cache
+            .get_chat("owned-id", SignatureReader::Owner(&other))
+            .is_none());
+        assert!(cache
+            .get_chat("owned-id", SignatureReader::Trusted)
+            .is_some());
     }
 
     #[tokio::test]
@@ -5417,7 +5529,10 @@ mod tests {
         assert!(body.ends_with(b"data: [DONE]\n\n"));
         let signed: crate::types::SignedChat = serde_json::from_str(
             &cache
-                .get_chat("chat-hidden-reasoning")
+                .get_chat(
+                    "chat-hidden-reasoning",
+                    crate::cache::SignatureReader::Trusted,
+                )
                 .expect("completed stream must cache its signature"),
         )
         .unwrap();

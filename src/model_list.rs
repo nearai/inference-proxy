@@ -1099,6 +1099,7 @@ pub fn app_state(process: Process<'_>) -> anyhow::Result<AppState> {
     );
     Ok(AppState {
         api_key_cache: Default::default(),
+        rerank_limiter: Default::default(),
         usage_report_delivery: crate::usage_report::UsageReportDelivery::for_transport(
             config.usage_report.clone(),
             &config.usage_report_transport,

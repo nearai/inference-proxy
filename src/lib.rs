@@ -10,6 +10,7 @@ mod aws_credentials;
 pub mod backend_affinity;
 pub mod backend_pool;
 pub mod cache;
+pub mod cache_salt;
 pub mod config;
 pub mod content_policy;
 pub mod context_tier;
@@ -31,6 +32,7 @@ pub mod reasoning;
 pub mod replica_state;
 pub mod request_log;
 pub mod request_tracing;
+pub mod rerank_limit;
 pub mod response_format;
 pub mod routes;
 pub mod signing;
@@ -92,4 +94,7 @@ pub struct AppState {
     /// Coalesces concurrent cloud-api checks for the same `sk-` key.
     /// One per process, shared by every model of a list.
     pub api_key_cache: Arc<api_key_cache::ApiKeyCache>,
+    /// In-flight limit for `/v1/rerank` (`rerank_limit.rs`): per workspace
+    /// for Cloud API keys, one shared pool for config tokens.
+    pub rerank_limiter: Arc<rerank_limit::RerankLimiter>,
 }

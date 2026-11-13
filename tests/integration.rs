@@ -288,6 +288,7 @@ fn build_test_app_inner_with_pool(
         rerank_url_override: None,
         score_url_override: None,
         ohttp_enabled: false,
+        ohttp_max_inflight: 0,
         listen_port: 8000,
         listen_addr: "127.0.0.1".to_string(),
         backend_token: None,
@@ -395,6 +396,7 @@ fn build_test_app_inner_with_pool(
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),
+        rerank_limiter: Default::default(),
         usage_report_delivery: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
@@ -2772,6 +2774,8 @@ async fn test_forced_fusion_streaming_emits_usage_metadata_and_signature() {
             .and_then(|v| v.to_str().ok()),
         Some("text/event-stream")
     );
+    // Trusted config-token callers are not billed here: no billing header.
+    assert!(response.headers().get("inference-id").is_none());
     let body = String::from_utf8(body_to_bytes(response).await).unwrap();
     assert!(body.contains("Streaming Fusion works."));
     let sse_events: Vec<serde_json::Value> = body
@@ -2801,6 +2805,289 @@ async fn test_forced_fusion_streaming_emits_usage_metadata_and_signature() {
         .await
         .unwrap();
     assert_eq!(sig_response.status(), StatusCode::OK);
+}
+
+/// Panel, judge and synthesis stubs for a forced streaming Fusion run whose
+/// final chat ID is `chatcmpl-final-direct`. With `billable` the three calls
+/// report 2+3, 4+5 and 6+7 tokens; without it none reports any usage.
+async fn mount_forced_fusion_stream_stubs(mock_server: &MockServer, billable: bool) {
+    use wiremock::matchers::body_string_contains;
+
+    let usage = |prompt: i64, completion: i64| {
+        if billable {
+            serde_json::json!({
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+                "total_tokens": prompt + completion
+            })
+        } else {
+            serde_json::json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+        }
+    };
+
+    Mock::given(method("GET"))
+        .and(path("/endpoints"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "endpoints": [{
+                "domain": mock_server.uri(),
+                "models": ["panel-a"]
+            }]
+        })))
+        .mount(mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/attestation/report"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+        .mount(mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", "Bearer fusion-token"))
+        .and(body_string_contains(
+            "one member of a private multi-model panel",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-panel-direct",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Panel answer."},
+                "finish_reason": "stop"
+            }],
+            "usage": usage(2, 3)
+        })))
+        .with_priority(1)
+        .mount(mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", "Bearer fusion-token"))
+        .and(body_string_contains("strict JSON only"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-judge-direct",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "{\"consensus\":\"direct\",\"disagreements\":[],\"strengths\":[],\"risks\":[],\"synthesis_guidance\":\"direct final\"}"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": usage(4, 5)
+        })))
+        .with_priority(2)
+        .mount(mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("final synthesis model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-final-direct",
+            "object": "chat.completion",
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Direct Fusion works."},
+                "finish_reason": "stop"
+            }],
+            "usage": usage(6, 7)
+        })))
+        .with_priority(3)
+        .mount(mock_server)
+        .await;
+}
+
+/// Fusion app that also authenticates `sk-` keys against `cloud_api_url`.
+fn build_test_app_with_fusion_and_cloud_api(
+    mock_url: &str,
+    endpoints_url: String,
+    cloud_api_url: &str,
+) -> axum::Router {
+    build_test_app_inner_with_fusion(
+        mock_url,
+        TestAppOptions {
+            fusion_enabled: true,
+            fusion_endpoints_url: Some(endpoints_url),
+            cloud_api_url: Some(cloud_api_url.to_string()),
+            ..Default::default()
+        },
+    )
+}
+
+/// Cloud API stub for a synthetic direct key with full billing identity,
+/// plus a usage sink.
+async fn mount_fusion_direct_key_cloud_api(cloud_api: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-test",
+            "workspace_id": "ws-test",
+            "api_key_id": "key-test"
+        })))
+        .mount(cloud_api)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/internal/usage"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(cloud_api)
+        .await;
+}
+
+const FUSION_DIRECT_KEY_BEARER: &str = "Bearer sk-test-fusion-direct-key-0001";
+
+fn forced_fusion_stream_request(bearer: &str) -> Request<Body> {
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Stream it"}],
+        "tools": [{
+            "type": "nearai:fusion",
+            "analysis_models": ["panel-a"],
+            "model": "panel-a"
+        }],
+        "tool_choice": "required",
+        "stream": true
+    });
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", bearer)
+        .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+        .unwrap()
+}
+
+/// A direct-key Fusion stream carries an `inference-id` header; its single
+/// usage report bills the aggregate usage under the billing ID the header was
+/// derived from, and the signature stays under the final chat ID.
+#[tokio::test]
+async fn test_direct_key_fusion_streaming_reports_under_inference_id() {
+    let mock_server = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    mount_forced_fusion_stream_stubs(&mock_server, true).await;
+    mount_fusion_direct_key_cloud_api(&cloud_api).await;
+    let app = build_test_app_with_fusion_and_cloud_api(
+        &mock_server.uri(),
+        format!("{}/endpoints", mock_server.uri()),
+        &cloud_api.uri(),
+    );
+
+    let response = app
+        .clone()
+        .oneshot(forced_fusion_stream_request(FUSION_DIRECT_KEY_BEARER))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let inference_id = response
+        .headers()
+        .get("inference-id")
+        .expect("direct-key Fusion stream carries an inference-id header")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let body = String::from_utf8(body_to_bytes(response).await).unwrap();
+    assert!(body.contains("Direct Fusion works."));
+    assert!(body.contains("\"id\":\"chatcmpl-final-direct\""));
+    assert!(body.ends_with("data: [DONE]\n\n"));
+
+    wait_for_usage_request(&cloud_api, 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let usage_reqs = get_usage_requests(&cloud_api).await;
+    assert_eq!(usage_reqs.len(), 1, "exactly one usage report");
+    assert_eq!(usage_reqs[0]["type"], "chat_completion");
+    assert_eq!(usage_reqs[0]["input_tokens"], 12);
+    assert_eq!(usage_reqs[0]["output_tokens"], 15);
+    let usage_id = usage_reqs[0]["id"].as_str().unwrap();
+    assert!(usage_id.starts_with("stream-"));
+    assert_ne!(usage_id, "chatcmpl-final-direct");
+    let namespace = uuid::Uuid::from_u128(0x1966acaf_9f95_5dab_b8f0_03a51c091314);
+    assert_eq!(
+        inference_id,
+        uuid::Uuid::new_v5(&namespace, usage_id.as_bytes()).to_string()
+    );
+    assert_eq!(usage_reqs[0]["organization_id"], "org-test");
+    assert_eq!(usage_reqs[0]["workspace_id"], "ws-test");
+    assert_eq!(usage_reqs[0]["api_key_id"], "key-test");
+
+    let sig_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/signature/chatcmpl-final-direct?signing_algo=ecdsa")
+                .header("authorization", FUSION_DIRECT_KEY_BEARER)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sig_response.status(), StatusCode::OK);
+}
+
+/// A direct-key Fusion stream with nothing billable is refused: no 200, no
+/// header, no report, and no signature cached for the final chat ID.
+#[tokio::test]
+async fn test_direct_key_fusion_streaming_without_usage_fails_closed() {
+    let mock_server = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    mount_forced_fusion_stream_stubs(&mock_server, false).await;
+    mount_fusion_direct_key_cloud_api(&cloud_api).await;
+    let app = build_test_app_with_fusion_and_cloud_api(
+        &mock_server.uri(),
+        format!("{}/endpoints", mock_server.uri()),
+        &cloud_api.uri(),
+    );
+
+    let response = app
+        .clone()
+        .oneshot(forced_fusion_stream_request(FUSION_DIRECT_KEY_BEARER))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(response.headers().get("inference-id").is_none());
+    let body = body_to_json(response).await;
+    assert_eq!(body["error"]["type"], "upstream_usage_missing");
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(get_usage_requests(&cloud_api).await.is_empty());
+
+    let sig_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/signature/chatcmpl-final-direct?signing_algo=ecdsa")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sig_response.status(), StatusCode::NOT_FOUND);
+}
+
+/// Trusted config-token callers are unaffected by the direct-key usage gate:
+/// the same unbillable Fusion stream is served, with no billing header.
+#[tokio::test]
+async fn test_config_token_fusion_streaming_without_usage_is_served() {
+    let mock_server = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    mount_forced_fusion_stream_stubs(&mock_server, false).await;
+    mount_fusion_direct_key_cloud_api(&cloud_api).await;
+    let app = build_test_app_with_fusion_and_cloud_api(
+        &mock_server.uri(),
+        format!("{}/endpoints", mock_server.uri()),
+        &cloud_api.uri(),
+    );
+
+    let response = app
+        .oneshot(forced_fusion_stream_request("Bearer test-token"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("inference-id").is_none());
+    let body = String::from_utf8(body_to_bytes(response).await).unwrap();
+    assert!(body.contains("Direct Fusion works."));
+    assert!(body.ends_with("data: [DONE]\n\n"));
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(get_usage_requests(&cloud_api).await.is_empty());
 }
 
 #[tokio::test]
@@ -6068,6 +6355,156 @@ async fn test_rerank_endpoint() {
     assert_eq!(body["id"], "rerank-test");
 }
 
+fn rerank_request_with_documents(count: usize) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "model": "m",
+        "query": "q",
+        "documents": vec!["a"; count],
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_rerank_document_count_up_to_limit_reaches_backend() {
+    use vllm_proxy_rs::routes::passthrough::MAX_RERANK_DOCUMENTS;
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/rerank"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "rerank-test",
+            "results": [{"index": 0, "relevance_score": 0.95}]
+        })))
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    for count in [2_000, MAX_RERANK_DOCUMENTS] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/rerank")
+                    .header("content-type", "application/json")
+                    .header(auth_header().0, auth_header().1)
+                    .body(Body::from(rerank_request_with_documents(count)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK, "{count} documents");
+        let body = body_to_json(response).await;
+        assert_eq!(body["id"], "rerank-test");
+        assert_eq!(body["results"][0]["index"], 0);
+    }
+
+    let received = mock_server.received_requests().await.unwrap();
+    assert_eq!(received.len(), 2);
+    for (upstream, expected_count) in received.iter().zip([2_000, MAX_RERANK_DOCUMENTS]) {
+        let body: serde_json::Value = serde_json::from_slice(&upstream.body).unwrap();
+        assert_eq!(body["model"], "m");
+        assert_eq!(body["documents"].as_array().unwrap().len(), expected_count);
+    }
+}
+
+#[tokio::test]
+async fn test_rerank_rejects_too_many_documents_before_dispatch() {
+    use vllm_proxy_rs::routes::passthrough::MAX_RERANK_DOCUMENTS;
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "x"})))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    for count in [MAX_RERANK_DOCUMENTS + 1, 50_000] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/rerank")
+                    .header("content-type", "application/json")
+                    .header(auth_header().0, auth_header().1)
+                    .body(Body::from(rerank_request_with_documents(count)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{count} documents"
+        );
+        let body = body_to_json(response).await;
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains(&format!("at most {MAX_RERANK_DOCUMENTS}")),
+            "unexpected message: {message}"
+        );
+        assert_eq!(body["error"]["type"], "bad_request");
+    }
+
+    assert!(
+        mock_server.received_requests().await.unwrap().is_empty(),
+        "a rejected rerank request must not reach the backend"
+    );
+}
+
+#[tokio::test]
+async fn test_encrypted_rerank_rejects_too_many_documents_before_decrypt() {
+    use vllm_proxy_rs::routes::passthrough::MAX_RERANK_DOCUMENTS;
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "x"})))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+    let client_pub_hex = test_client_signing_pair()
+        .ed25519
+        .signing_public_key
+        .clone();
+
+    // The documents are not ciphertext: decrypting them would fail with a
+    // different error, so the limit message shows the count check ran first.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/rerank")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header("x-signing-algo", "ed25519")
+                .header("x-client-pub-key", &client_pub_hex)
+                .body(Body::from(rerank_request_with_documents(
+                    MAX_RERANK_DOCUMENTS + 1,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(response).await;
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains(&format!("at most {MAX_RERANK_DOCUMENTS}")),
+        "unexpected message: {message}"
+    );
+    assert!(mock_server.received_requests().await.unwrap().is_empty());
+}
+
 // ---- Score endpoint ----
 
 #[tokio::test]
@@ -6799,6 +7236,7 @@ fn build_test_app_with_cloud_api_retries(
         rerank_url_override: None,
         score_url_override: None,
         ohttp_enabled: false,
+        ohttp_max_inflight: 0,
         listen_port: 8000,
         listen_addr: "127.0.0.1".to_string(),
         backend_token: None,
@@ -6889,6 +7327,7 @@ fn build_test_app_with_cloud_api_retries(
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),
+        rerank_limiter: Default::default(),
         usage_report_delivery: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
@@ -7809,7 +8248,166 @@ data: [DONE]\n\n";
     assert_eq!(signature.status(), StatusCode::OK);
 }
 
-/// Regression test for nearai/infra#98: an interrupted stream (no `[DONE]`,
+// Synthetic direct keys for the signature owner tests: the first two belong to
+// one organization and workspace, the third to another.
+const OWNER_A_BEARER: &str = "Bearer sk-test-owner-a-000000000001";
+const OWNER_A_SECOND_BEARER: &str = "Bearer sk-test-owner-a-000000000002";
+const OWNER_B_BEARER: &str = "Bearer sk-test-owner-b-000000000003";
+
+/// Cloud API stub for the three synthetic owner keys, plus a usage sink.
+async fn mount_signature_owner_cloud_api(cloud_api: &MockServer) {
+    for (bearer, org, workspace, key_id) in [
+        (OWNER_A_BEARER, "org-a", "ws-a", "key-a1"),
+        (OWNER_A_SECOND_BEARER, "org-a", "ws-a", "key-a2"),
+        (OWNER_B_BEARER, "org-b", "ws-b", "key-b"),
+    ] {
+        Mock::given(method("POST"))
+            .and(path("/v1/check_api_key"))
+            .and(header("authorization", bearer))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "organization_id": org,
+                "workspace_id": workspace,
+                "api_key_id": key_id
+            })))
+            .mount(cloud_api)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path("/v1/internal/usage"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(cloud_api)
+        .await;
+}
+
+/// Backend stream answering requests whose body contains `marker` with a
+/// completion that has the response id `chat_id`.
+async fn mount_signature_owner_stream(backend: &MockServer, marker: &str, chat_id: &str) {
+    let sse_body = format!(
+        "data: {{\"id\":\"{chat_id}\",\"choices\":[{{\"delta\":{{\"content\":\"hi\"}},\"index\":0}}]}}\n\n\
+         data: {{\"id\":\"{chat_id}\",\"choices\":[],\"usage\":{{\"prompt_tokens\":4,\"completion_tokens\":1,\"total_tokens\":5}}}}\n\n\
+         data: [DONE]\n\n"
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(wiremock::matchers::body_string_contains(marker))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_body),
+        )
+        .mount(backend)
+        .await;
+}
+
+/// Send a streaming chat request with `bearer` and read the stream to its end,
+/// so the background task has stored the signature.
+async fn stream_chat_for_signature(app: &axum::Router, bearer: &str, marker: &str) {
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": marker}],
+        "stream": true
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", bearer)
+                .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = body_to_bytes(response).await;
+}
+
+async fn get_signature(app: &axum::Router, bearer: &str, chat_id: &str) -> (StatusCode, Vec<u8>) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/signature/{chat_id}?signing_algo=ecdsa"))
+                .header("authorization", bearer)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    (status, body_to_bytes(response).await)
+}
+
+/// A direct key's signature is readable by keys of the same organization and
+/// workspace and by a configured TOKEN caller, and answers a key of another
+/// owner exactly like an unknown id.
+#[tokio::test]
+async fn test_signature_lookup_is_scoped_to_direct_key_owner() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    mount_signature_owner_cloud_api(&cloud_api).await;
+    mount_signature_owner_stream(&backend, "owner-a-request", "chatcmpl-owner-a").await;
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+
+    stream_chat_for_signature(&app, OWNER_A_BEARER, "owner-a-request").await;
+
+    let (status, owner_body) = get_signature(&app, OWNER_A_BEARER, "chatcmpl-owner-a").await;
+    assert_eq!(status, StatusCode::OK);
+    let owner_json: serde_json::Value = serde_json::from_slice(&owner_body).unwrap();
+    assert!(owner_json["text"]
+        .as_str()
+        .unwrap()
+        .starts_with("test-model:"));
+
+    // Another key of the same organization and workspace.
+    let (status, same_owner_body) =
+        get_signature(&app, OWNER_A_SECOND_BEARER, "chatcmpl-owner-a").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(same_owner_body, owner_body);
+
+    // A key of another owner: the same answer as an id that does not exist.
+    let (status, other_owner_body) = get_signature(&app, OWNER_B_BEARER, "chatcmpl-owner-a").await;
+    let (missing_status, missing_body) =
+        get_signature(&app, OWNER_B_BEARER, "chatcmpl-does-not-exist").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(status, missing_status);
+    assert_eq!(other_owner_body, missing_body);
+
+    // The configured TOKEN caller (internal gateway) reads it unchanged.
+    let (status, trusted_body) = get_signature(&app, "Bearer test-token", "chatcmpl-owner-a").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(trusted_body, owner_body);
+}
+
+/// An entry stored without an owner (a configured TOKEN caller's response, or
+/// one stored before owners were recorded) stays readable by the TOKEN caller
+/// and is refused to every direct key.
+#[tokio::test]
+async fn test_signature_without_owner_is_refused_to_direct_keys() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    mount_signature_owner_cloud_api(&cloud_api).await;
+    mount_signature_owner_stream(&backend, "trusted-request", "chatcmpl-unowned").await;
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+
+    stream_chat_for_signature(&app, "Bearer test-token", "trusted-request").await;
+
+    let (status, _) = get_signature(&app, "Bearer test-token", "chatcmpl-unowned").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (missing_status, missing_body) =
+        get_signature(&app, OWNER_A_BEARER, "chatcmpl-does-not-exist").await;
+    for bearer in [OWNER_A_BEARER, OWNER_B_BEARER] {
+        let (status, body) = get_signature(&app, bearer, "chatcmpl-unowned").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(status, missing_status);
+        assert_eq!(body, missing_body);
+    }
+}
+
+/// An interrupted stream (no `[DONE]`,
 /// e.g. client disconnect or mid-stream upstream error) must still report the
 /// tokens already produced. cloud-api enables `continuous_usage_stats`, so each
 /// chunk carries running cumulative usage; the last value seen is the partial
@@ -8146,7 +8744,7 @@ async fn test_usage_reported_for_embeddings() {
     let usage_reqs = get_usage_requests(&cloud_api).await;
     assert_eq!(usage_reqs.len(), 1, "Expected exactly one usage report");
     // Embeddings now report under their own input-only label instead of
-    // being mislabeled as chat_completion (nearai/infra#169). The
+    // being mislabeled as chat_completion. The
     // input-only wire variant carries no output_tokens field.
     assert_eq!(usage_reqs[0]["type"], "embedding");
     assert_eq!(usage_reqs[0]["input_tokens"], 4);
@@ -9373,6 +9971,297 @@ async fn test_encrypted_audio_transcription_signature_hashes_raw_request_and_res
     );
 }
 
+// ---- Multipart media with all-field encryption ----
+
+const SYNTHETIC_MEDIA: &str = "synthetic-media-bytes";
+
+/// A multipart body with an optional `prompt`, a `model` field, then one media part.
+fn media_form(boundary: &str, prompt: Option<&str>, media_name: &str, filename: &str) -> String {
+    let mut body = String::new();
+    if let Some(prompt) = prompt {
+        body.push_str(&format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n{prompt}\r\n"
+        ));
+    }
+    body.push_str(&format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ntest-model\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"{media_name}\"; filename=\"{filename}\"\r\n\
+         Content-Type: application/octet-stream\r\n\r\n{SYNTHETIC_MEDIA}\r\n--{boundary}--\r\n"
+    ));
+    body
+}
+
+async fn mount_multipart_backends(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/v1/images/edits"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "img-media-control",
+            "data": [{"url": "https://example.com/synthetic.png"}]
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "trans-media-control",
+            "text": "synthetic",
+            "usage": {"type": "duration", "seconds": 1}
+        })))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn multipart_media_with_all_field_encryption_is_refused_before_dispatch() {
+    use vllm_proxy_rs::encryption;
+
+    let backend = MockServer::start().await;
+    mount_multipart_backends(&backend).await;
+    let app = build_test_app(&backend.uri());
+    let client_pair = test_client_signing_pair();
+    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
+    let server_pub = hex::decode(test_ed25519_pub_key_hex()).unwrap();
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/e2ee-v3.json")).unwrap();
+    let v3 = &fixture["vectors"][0];
+
+    let boundary = "----SyntheticMediaBoundary";
+    let routes = [
+        ("/v1/images/edits", "image"),
+        ("/v1/images/edits", "mask"),
+        ("/v1/audio/transcriptions", "file"),
+        // Any part with a filename counts as media, whatever its name.
+        ("/v1/audio/transcriptions", "upload"),
+    ];
+
+    // v1/v2 with `X-Encrypt-All-Fields: true` (a valid encrypted prompt first),
+    // and v3, which always uses the extended field set.
+    let mut refused = Vec::new();
+    for version in [1u8, 2] {
+        let seal_ctx = encryption::EncryptionContext {
+            algo: encryption::EncryptionAlgo::Ed25519,
+            client_pub_key: server_pub.clone(),
+            version,
+            encrypt_all_fields: true,
+        };
+        let prompt =
+            encryption::encrypt_string("synthetic prompt", &seal_ctx, &client_pair).unwrap();
+        refused.push((
+            vec![
+                ("x-signing-algo", "ed25519".to_string()),
+                ("x-client-pub-key", client_pub_hex.clone()),
+                ("x-encryption-version", version.to_string()),
+                ("x-encrypt-all-fields", "true".to_string()),
+            ],
+            Some(prompt),
+        ));
+    }
+    for flag in [None, Some("false")] {
+        let mut headers = vec![
+            (
+                "x-signing-algo",
+                v3["signing_algo"].as_str().unwrap().to_string(),
+            ),
+            (
+                "x-client-pub-key",
+                v3["reply_public"].as_str().unwrap().to_string(),
+            ),
+            ("x-encryption-version", "3".to_string()),
+        ];
+        if let Some(flag) = flag {
+            headers.push(("x-encrypt-all-fields", flag.to_string()));
+        }
+        refused.push((headers, None));
+    }
+
+    for (headers, prompt) in &refused {
+        for (route, media_name) in routes {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(route)
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .header(auth_header().0, auth_header().1);
+            for (name, value) in headers {
+                request = request.header(*name, value);
+            }
+            let body = media_form(boundary, prompt.as_deref(), media_name, "synthetic.bin");
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{route} {media_name} {headers:?}"
+            );
+            let text = String::from_utf8(body_to_bytes(response).await).unwrap();
+            assert!(
+                text.contains("not supported with all-field encryption"),
+                "{text}"
+            );
+            assert!(!text.contains("synthetic.bin"));
+            assert!(!text.contains(SYNTHETIC_MEDIA));
+        }
+    }
+    assert_eq!(requests_seen(&backend).await, 0, "nothing was dispatched");
+
+    // Controls: no encryption, and v1 encryption without the all-field flag
+    // (only the prompt is encrypted), still reach the backend with the media.
+    let seal_ctx = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: server_pub,
+        version: 1,
+        encrypt_all_fields: false,
+    };
+    let prompt = encryption::encrypt_string("synthetic prompt", &seal_ctx, &client_pair).unwrap();
+    let controls = [
+        (Vec::new(), None),
+        (
+            vec![
+                ("x-signing-algo", "ed25519".to_string()),
+                ("x-client-pub-key", client_pub_hex.clone()),
+            ],
+            Some(prompt),
+        ),
+    ];
+    for (headers, prompt) in &controls {
+        for (route, media_name) in [
+            ("/v1/images/edits", "image"),
+            ("/v1/audio/transcriptions", "file"),
+        ] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(route)
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .header(auth_header().0, auth_header().1);
+            for (name, value) in headers {
+                request = request.header(*name, value);
+            }
+            let body = media_form(boundary, prompt.as_deref(), media_name, "synthetic.bin");
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{route} {headers:?}");
+        }
+    }
+    let received = backend.received_requests().await.unwrap();
+    assert_eq!(received.len(), 4);
+    for request in &received {
+        assert!(String::from_utf8_lossy(&request.body).contains(SYNTHETIC_MEDIA));
+    }
+}
+
+#[tokio::test]
+async fn legacy_all_fields_undecryptable_tool_field_is_refused_before_dispatch() {
+    use vllm_proxy_rs::encryption;
+
+    let backend = start_any_post_backend().await;
+    let app = build_test_app(&backend.uri());
+    let client_pair = test_client_signing_pair();
+    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
+    let server_pub = hex::decode(test_ed25519_pub_key_hex()).unwrap();
+    let marker = "synthetic plaintext marker";
+
+    let send = |version: u8, body: serde_json::Value| {
+        let app = app.clone();
+        let client_pub_hex = client_pub_hex.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .header(auth_header().0, auth_header().1)
+                        .header("x-signing-algo", "ed25519")
+                        .header("x-client-pub-key", &client_pub_hex)
+                        .header("x-encryption-version", version.to_string())
+                        .header("x-encrypt-all-fields", "true")
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            (
+                status,
+                String::from_utf8(body_to_bytes(response).await).unwrap(),
+            )
+        }
+    };
+
+    for (served, version) in [1u8, 2].into_iter().enumerate() {
+        let ctx = encryption::EncryptionContext {
+            algo: encryption::EncryptionAlgo::Ed25519,
+            client_pub_key: server_pub.clone(),
+            version,
+            encrypt_all_fields: true,
+        };
+        let seal = |plain: &str| encryption::encrypt_string(plain, &ctx, &client_pair).unwrap();
+        let valid = serde_json::json!({
+            "model": "test-model",
+            "stream": false,
+            "messages": [
+                {"role": "user", "content": seal("synthetic question")},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": seal("synthetic_tool"), "arguments": seal("{}")}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": seal("synthetic result")}
+            ],
+            "tools": [{"type": "function", "function": {
+                "name": seal("synthetic_tool"),
+                "description": seal("synthetic description"),
+                "parameters": seal("{\"type\":\"object\"}")
+            }}]
+        });
+
+        for pointer in [
+            "/messages/1/tool_calls/0/function/arguments",
+            "/messages/1/tool_calls/0/function/name",
+            "/tools/0/function/name",
+            "/tools/0/function/description",
+            "/tools/0/function/parameters",
+        ] {
+            for invalid in [marker, "deadbeef"] {
+                let mut body = valid.clone();
+                *body.pointer_mut(pointer).unwrap() = serde_json::json!(invalid);
+                let (status, text) = send(version, body).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "v{version} {pointer}");
+                assert!(!text.contains(invalid), "v{version} {pointer}");
+            }
+        }
+        // Only the earlier versions' controls reached the backend.
+        assert_eq!(requests_seen(&backend).await, served, "v{version}");
+
+        // Control: the same request with every field sealed is served, and the
+        // backend sees the decrypted values.
+        let (status, _) = send(version, valid).await;
+        assert_eq!(status, StatusCode::OK, "v{version}");
+        let received = backend.received_requests().await.unwrap();
+        assert_eq!(received.len(), served + 1, "v{version}");
+        let forwarded: serde_json::Value =
+            serde_json::from_slice(&received.last().unwrap().body).unwrap();
+        assert_eq!(
+            forwarded["messages"][1]["tool_calls"][0]["function"]["name"],
+            "synthetic_tool"
+        );
+        assert_eq!(
+            forwarded["tools"][0]["function"]["parameters"],
+            serde_json::json!({"type": "object"})
+        );
+    }
+}
+
 /// End-to-end test: a legacy client sends a Salsa20-encrypted request.
 /// The server's ChaCha20-first decrypt should fall back to Salsa20 and succeed.
 /// The response (encrypted by the server with ChaCha20) should be decryptable by the client.
@@ -9658,6 +10547,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         rerank_url_override: None,
         score_url_override: None,
         ohttp_enabled: true,
+        ohttp_max_inflight: 0,
         listen_port: 0, // not used in oneshot tests
         listen_addr: "127.0.0.1".to_string(),
         backend_token: None,
@@ -9745,6 +10635,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),
+        rerank_limiter: Default::default(),
         usage_report_delivery: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
@@ -9925,6 +10816,81 @@ async fn test_ohttp_relay_garbage_body_returns_400() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn test_ohttp_relay_refuses_at_capacity_before_decapsulation_and_recovers() {
+    let mock = MockServer::start().await;
+    let limit = routes::ohttp::OhttpRelayLimit::new(1).unwrap();
+    let app = build_test_app_with_ohttp(&mock.uri()).layer(axum::Extension(limit.clone()));
+    let garbage = |content_type: &str| {
+        Request::post("/ohttp")
+            .header("content-type", content_type)
+            .body(Body::from(vec![0xDEu8; 100]))
+            .unwrap()
+    };
+
+    let held = limit.try_acquire().expect("the test takes the only slot");
+    for content_type in ["message/ohttp-req", "message/ohttp-chunked-req"] {
+        let response = app.clone().oneshot(garbage(content_type)).await.unwrap();
+        // Undecryptable bytes are a 400 once decapsulation runs; a 429 shows
+        // the slot is checked first.
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "{content_type}"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "{content_type}"
+        );
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["type"], "overloaded", "{content_type}");
+    }
+    assert_eq!(limit.available(), 0);
+
+    // Once the slot is free, requests are decapsulated again, and a failed
+    // decapsulation gives the slot back each time.
+    drop(held);
+    for content_type in [
+        "message/ohttp-req",
+        "message/ohttp-chunked-req",
+        "message/ohttp-req",
+    ] {
+        let response = app.clone().oneshot(garbage(content_type)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{content_type}");
+        assert_eq!(limit.available(), 1, "{content_type}");
+    }
+    assert!(mock.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_ohttp_relay_rejects_oversized_outer_body() {
+    let mock = MockServer::start().await;
+    let app = build_test_app_with_ohttp(&mock.uri());
+
+    // The test config accepts inner bodies up to 10 MiB (audio); the outer body
+    // may add framing headroom on top (about 10.7 MiB in all), and nothing
+    // beyond it is read.
+    let response = app
+        .oneshot(
+            Request::post("/ohttp")
+                .header("content-type", "message/ohttp-req")
+                .body(Body::from(vec![0xDEu8; 12 * 1024 * 1024]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(mock.received_requests().await.unwrap().is_empty());
+}
+
 fn assert_ohttp_attestation_fields(json: &serde_json::Value) {
     let ohttp_attestation = &json["ohttp_attestation"];
     assert!(
@@ -10047,6 +11013,15 @@ async fn test_ohttp_attestation_present_for_default_route() {
 /// Returns (base_url, server_handle, key_config_bytes).
 /// The server runs in the background; drop the handle to stop it.
 async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<()>, Vec<u8>) {
+    start_ohttp_server_with_relay_limit(mock_url, None).await
+}
+
+/// `start_ohttp_server` with an optional `POST /ohttp` in-flight cap installed
+/// the way `routes::build_app` installs it.
+async fn start_ohttp_server_with_relay_limit(
+    mock_url: &str,
+    relay_limit: Option<routes::ohttp::OhttpRelayLimit>,
+) -> (String, tokio::task::JoinHandle<()>, Vec<u8>) {
     let base = mock_url.trim_end_matches('/');
 
     let ed25519_key: [u8; 32] = [
@@ -10135,6 +11110,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         rerank_url_override: None,
         score_url_override: None,
         ohttp_enabled: true,
+        ohttp_max_inflight: 0,
         listen_port: port,
         listen_addr: "127.0.0.1".to_string(),
         backend_token: None,
@@ -10213,6 +11189,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),
+        rerank_limiter: Default::default(),
         usage_report_delivery: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
@@ -10241,7 +11218,11 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         trust_proxy_headers: true,
     };
 
-    let app = routes::build_router()
+    let mut router = routes::build_router();
+    if let Some(limit) = relay_limit {
+        router = router.layer(axum::Extension(limit));
+    }
+    let app = router
         .layer(middleware::from_fn(rate_limit::rate_limit_middleware))
         .layer(axum::Extension(rate_limit_state))
         .layer(middleware::from_fn(request_id_middleware))
@@ -11105,6 +12086,13 @@ fn zdr_multipart_body(boundary: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+fn zdr_body_with_routable_model(body: Vec<u8>) -> Vec<u8> {
+    String::from_utf8(body)
+        .unwrap()
+        .replace(&format!("model-{ZDR_SENTINEL}"), "test-model")
+        .into_bytes()
+}
+
 fn zdr_request(uri: &str, bearer: &str, content_type: &str, body: Vec<u8>) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -11216,9 +12204,19 @@ async fn request_content_never_reaches_logs_or_metrics() {
                 ("/v1/images/edits", false),
             ] {
                 let request = if json {
-                    zdr_request(uri, bearer, "application/json", zdr_json_body(false))
+                    zdr_request(
+                        uri,
+                        bearer,
+                        "application/json",
+                        zdr_body_with_routable_model(zdr_json_body(false)),
+                    )
                 } else {
-                    zdr_request(uri, bearer, &multipart, zdr_multipart_body(boundary))
+                    zdr_request(
+                        uri,
+                        bearer,
+                        &multipart,
+                        zdr_body_with_routable_model(zdr_multipart_body(boundary)),
+                    )
                 };
                 zdr_send(app.clone(), request).await;
             }
@@ -11256,15 +12254,28 @@ async fn request_content_never_reaches_logs_or_metrics() {
                 ("/v1/audio/transcriptions", false),
             ] {
                 let request = if json {
-                    zdr_request(uri, bearer, "application/json", zdr_json_body(false))
+                    zdr_request(
+                        uri,
+                        bearer,
+                        "application/json",
+                        zdr_body_with_routable_model(zdr_json_body(false)),
+                    )
                 } else {
-                    zdr_request(uri, bearer, &multipart, zdr_multipart_body(boundary))
+                    zdr_request(
+                        uri,
+                        bearer,
+                        &multipart,
+                        zdr_body_with_routable_model(zdr_multipart_body(boundary)),
+                    )
                 };
                 let dropped = tokio::time::timeout(
                     Duration::from_millis(300),
                     slow_app.clone().oneshot(request),
                 )
                 .await;
+                if let Ok(Ok(response)) = &dropped {
+                    panic!("{uri} returned {} before the deadline", response.status());
+                }
                 assert!(dropped.is_err(), "{uri}");
             }
             // Signature lookup with a client-chosen id.
@@ -11479,6 +12490,142 @@ async fn test_ohttp_chunked_chat_completion() {
         resp_body["choices"][0]["message"]["content"],
         "Chunked OHTTP works!"
     );
+
+    server_handle.abort();
+}
+
+/// Wait (bounded) until every relay slot is free again.
+async fn wait_for_free_relay_slots(limit: &routes::ohttp::OhttpRelayLimit) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while limit.available() < limit.max_inflight() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "relay slot not released"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Chat completions the mock backend has received.
+async fn forwarded_chat_requests(mock: &MockServer) -> usize {
+    mock.received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/v1/chat/completions")
+        .count()
+}
+
+#[tokio::test]
+async fn test_ohttp_relay_limit_releases_slots_and_refuses_valid_requests_when_full() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-ohttp-limit",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+        })))
+        .mount(&mock)
+        .await;
+
+    let limit = routes::ohttp::OhttpRelayLimit::new(1).unwrap();
+    let (base_url, server_handle, config_bytes) =
+        start_ohttp_server_with_relay_limit(&mock.uri(), Some(limit.clone())).await;
+
+    let mut inner_req = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/chat/completions".to_vec(),
+    );
+    inner_req.put_header("content-type", "application/json");
+    inner_req.write_content(
+        serde_json::to_vec(&serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": false
+        }))
+        .unwrap(),
+    );
+    let client = reqwest::Client::new();
+
+    // Standard OHTTP: served with the only slot, which is free again after.
+    for _ in 0..2 {
+        let (enc_request, client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+        let response = client
+            .post(format!("{base_url}/ohttp"))
+            .header("content-type", "message/ohttp-req")
+            .header("authorization", "Bearer test-token")
+            .body(enc_request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let enc_response = response.bytes().await.unwrap();
+        let inner_resp = ohttp_decrypt_response(client_response, &enc_response);
+        assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+        wait_for_free_relay_slots(&limit).await;
+    }
+
+    // Chunked OHTTP: the slot is held by the streaming task and returned when
+    // the stream ends.
+    for _ in 0..2 {
+        let (status, _, inner_resp) = ohttp_chunked_roundtrip(
+            &base_url,
+            &config_bytes,
+            &inner_req,
+            Some("Bearer test-token"),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+        wait_for_free_relay_slots(&limit).await;
+    }
+    assert_eq!(forwarded_chat_requests(&mock).await, 4);
+
+    // With every slot taken, a valid request is refused and never forwarded.
+    let held = limit.try_acquire().expect("the test takes the only slot");
+    let (enc_request, _) = ohttp_encrypt_request(&config_bytes, &inner_req);
+    let response = client
+        .post(format!("{base_url}/ohttp"))
+        .header("content-type", "message/ohttp-req")
+        .header("authorization", "Bearer test-token")
+        .body(enc_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+        Some("1")
+    );
+    assert_eq!(forwarded_chat_requests(&mock).await, 4);
+
+    // And served again once the slot is free.
+    drop(held);
+    let (enc_request, client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+    let response = client
+        .post(format!("{base_url}/ohttp"))
+        .header("content-type", "message/ohttp-req")
+        .header("authorization", "Bearer test-token")
+        .body(enc_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let enc_response = response.bytes().await.unwrap();
+    let inner_resp = ohttp_decrypt_response(client_response, &enc_response);
+    assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+    assert_eq!(forwarded_chat_requests(&mock).await, 5);
 
     server_handle.abort();
 }

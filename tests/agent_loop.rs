@@ -107,6 +107,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
         rerank_url_override: None,
         score_url_override: None,
         ohttp_enabled: false,
+        ohttp_max_inflight: 0,
         listen_port: 8000,
         listen_addr: "127.0.0.1".to_string(),
         backend_token: None,
@@ -194,6 +195,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),
+        rerank_limiter: Default::default(),
         usage_report_delivery: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
@@ -567,6 +569,8 @@ async fn happy_path_executes_search_and_continues() {
             .and_then(|v| v.to_str().ok()),
         Some("text/event-stream")
     );
+    // Trusted config-token callers are not billed here: no billing header.
+    assert!(response.headers().get("inference-id").is_none());
     let body = body_to_string(response).await;
 
     // Sanity: tool-call chunks from iteration 1, our synthetic tool-result
@@ -1816,7 +1820,7 @@ async fn brave_formatted_output_is_truncated() {
     );
 }
 
-/// Regression test for nearai/infra#98: an interrupted agent loop (the final
+/// An interrupted agent loop (the final
 /// upstream turn carries usage but is cut off before `[DONE]`) must still bill
 /// the tokens already produced — while still withholding the signature, since
 /// the response is incomplete and cannot be verified.
@@ -1883,27 +1887,21 @@ async fn interrupted_agent_loop_reports_usage_without_signature() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    let inference_id = inference_id_header(&response);
 
     // Drain the stream so the spawned loop task runs to completion.
     let _ = response.into_body().collect().await;
 
     // Usage is reported (fire-and-forget) even though the stream never saw [DONE].
-    let mut usage_body = None;
-    for _ in 0..50 {
-        let reqs = cloud_api.received_requests().await.unwrap();
-        if let Some(req) = reqs.iter().find(|r| r.url.path() == "/v1/internal/usage") {
-            usage_body = Some(serde_json::from_slice::<serde_json::Value>(&req.body).unwrap());
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    let usage = usage_body.expect("interrupted agent loop must still report usage");
+    let reports = settled_usage_reports(&cloud_api).await;
+    assert_eq!(reports.len(), 1, "exactly one usage report per loop");
+    let usage = &reports[0];
     assert_eq!(usage["type"], "chat_completion");
     // Latest cumulative usage, NOT the sum of the per-chunk cumulative values
     // (summing the 3 chunks would overbill to 45 in / 6 out).
     assert_eq!(usage["input_tokens"], 15);
     assert_eq!(usage["output_tokens"], 3);
-    assert_eq!(usage["id"], "chatcmpl-INT");
+    assert_report_matches_header(usage, &inference_id, "chatcmpl-INT");
 
     // ...but no signature is cached over the incomplete response.
     let sig_response = app_for_sig
@@ -1918,4 +1916,278 @@ async fn interrupted_agent_loop_reports_usage_without_signature() {
         .await
         .unwrap();
     assert_eq!(sig_response.status(), StatusCode::NOT_FOUND);
+}
+
+// ── direct-key billing correlation ──────────────────────────────────
+
+/// Namespace cloud-api derives a stored inference ID from a report's `id`.
+const EXTERNAL_USAGE_ID_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x1966acaf_9f95_5dab_b8f0_03a51c091314);
+
+/// Synthetic direct key; the cloud API stub accepts any `sk-` key.
+const DIRECT_KEY_BEARER: &str = "Bearer sk-test-agent-loop-direct-0001";
+
+/// Cloud API stub: key check with full billing identity, plus a usage sink.
+async fn mount_direct_key_cloud_api(cloud_api: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-test",
+            "workspace_id": "ws-test",
+            "api_key_id": "key-test"
+        })))
+        .mount(cloud_api)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/internal/usage"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(cloud_api)
+        .await;
+}
+
+async fn usage_reports(cloud_api: &MockServer) -> Vec<serde_json::Value> {
+    cloud_api
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == "/v1/internal/usage")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect()
+}
+
+/// Wait for the first usage report, then a little longer, so a second
+/// (duplicate) report would have arrived too before the caller counts.
+async fn settled_usage_reports(cloud_api: &MockServer) -> Vec<serde_json::Value> {
+    for _ in 0..100 {
+        if !usage_reports(cloud_api).await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    usage_reports(cloud_api).await
+}
+
+fn inference_id_header(response: &axum::response::Response) -> String {
+    response
+        .headers()
+        .get("inference-id")
+        .expect("direct-key agent-loop stream carries an inference-id header")
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+/// The report's `id` is the request-scoped billing ID the header was derived
+/// from, not the provider chat ID.
+fn assert_report_matches_header(
+    report: &serde_json::Value,
+    inference_id: &str,
+    provider_chat_id: &str,
+) {
+    let report_id = report["id"].as_str().expect("usage report has an id");
+    assert!(report_id.starts_with("stream-"));
+    assert_ne!(report_id, provider_chat_id);
+    assert_eq!(
+        inference_id,
+        uuid::Uuid::new_v5(&EXTERNAL_USAGE_ID_NAMESPACE, report_id.as_bytes()).to_string()
+    );
+    assert_eq!(report["organization_id"], "org-test");
+    assert_eq!(report["workspace_id"], "ws-test");
+    assert_eq!(report["api_key_id"], "key-test");
+}
+
+/// Upstream that sends one usage-bearing chunk (cumulative 12 in / 4 out)
+/// and then stalls, so the idle watchdog ends the iteration with an error
+/// after the 200 was committed.
+async fn stalled_sse_with_usage_upstream_url() -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = socket.read(&mut request).await;
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let first_chunk = concat!(
+            "data: {\"id\":\"chatcmpl-PARTIAL\",\"object\":\"chat.completion.chunk\",",
+            "\"created\":1,\"model\":\"test-model\",\"choices\":[{\"index\":0,",
+            "\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"},",
+            "\"finish_reason\":null}],",
+            "\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":4,\"total_tokens\":16}}\n\n"
+        );
+        let encoded = format!("{:X}\r\n{}\r\n", first_chunk.len(), first_chunk);
+        socket.write_all(encoded.as_bytes()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    });
+    format!("http://{address}")
+}
+
+/// A direct-key loop over two upstream calls: the 200 carries an
+/// `inference-id`, one report bills both calls under the billing ID the header
+/// was derived from, and the signature stays under the provider chat ID.
+#[tokio::test]
+async fn direct_key_agent_loop_reports_once_under_header_billing_id() {
+    let upstream = MockServer::start().await;
+    let brave = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    mount_direct_key_cloud_api(&cloud_api).await;
+    mount_search_then_answer(&upstream, "chatcmpl-DIRECT").await;
+    Mock::given(method("GET"))
+        .and(path("/res/v1/llm/context"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(brave_context_json()))
+        .mount(&brave)
+        .await;
+
+    let brave_url = format!("{}/res/v1/llm/context", brave.uri());
+    let app =
+        build_agent_loop_app_with_cloud(&upstream.uri(), Some(&brave_url), Some(&cloud_api.uri()));
+    let app_for_sig = app.clone();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", DIRECT_KEY_BEARER)
+                .header("content-type", "application/json")
+                .body(Body::from(agent_loop_request_body(true).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let inference_id = inference_id_header(&response);
+    let body = body_to_string(response).await;
+    assert!(body.ends_with("data: [DONE]\n\n"));
+    // The stream keeps the provider chat ID; the billing ID is not exposed.
+    assert!(body.contains("\"id\":\"chatcmpl-DIRECT\""));
+    assert!(!body.contains("stream-"));
+
+    let reports = settled_usage_reports(&cloud_api).await;
+    assert_eq!(reports.len(), 1, "exactly one usage report per loop");
+    // Both calls: 10 + 15 in, 5 + 3 out.
+    assert_eq!(reports[0]["type"], "chat_completion");
+    assert_eq!(reports[0]["input_tokens"], 25);
+    assert_eq!(reports[0]["output_tokens"], 8);
+    assert_report_matches_header(&reports[0], &inference_id, "chatcmpl-DIRECT");
+
+    let sig_response = app_for_sig
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/signature/chatcmpl-DIRECT?signing_algo=ecdsa")
+                .header("authorization", DIRECT_KEY_BEARER)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sig_response.status(), StatusCode::OK);
+}
+
+/// The stream fails after its 200 (idle watchdog, an `Err` out of the loop):
+/// the usage already observed is billed exactly once, under the billing ID
+/// the header was derived from, and nothing is signed.
+#[tokio::test]
+async fn direct_key_agent_loop_failure_after_headers_bills_partial_usage_once() {
+    let upstream_url = stalled_sse_with_usage_upstream_url().await;
+    let cloud_api = MockServer::start().await;
+    mount_direct_key_cloud_api(&cloud_api).await;
+
+    let app = build_agent_loop_app_with_cloud_and_idle(
+        &upstream_url,
+        Some("http://brave.invalid/res/v1/llm/context"),
+        Some(&cloud_api.uri()),
+        1,
+    );
+    let app_for_sig = app.clone();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", DIRECT_KEY_BEARER)
+                .header("content-type", "application/json")
+                .body(Body::from(agent_loop_request_body(true).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let inference_id = inference_id_header(&response);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        response.into_body().collect(),
+    )
+    .await
+    .expect("agent-loop idle watchdog should fire before the test timeout");
+    assert!(result.is_err(), "stalled agent-loop body must fail");
+
+    let reports = settled_usage_reports(&cloud_api).await;
+    assert_eq!(reports.len(), 1, "partial usage is billed exactly once");
+    assert_eq!(reports[0]["input_tokens"], 12);
+    assert_eq!(reports[0]["output_tokens"], 4);
+    assert_report_matches_header(&reports[0], &inference_id, "chatcmpl-PARTIAL");
+
+    let sig_response = app_for_sig
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/signature/chatcmpl-PARTIAL")
+                .header("authorization", "Bearer test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sig_response.status(), StatusCode::NOT_FOUND);
+}
+
+/// A direct-key loop whose upstream produced no usage at all sends no report
+/// (nothing to bill), but still carries the header on its 200.
+#[tokio::test]
+async fn direct_key_agent_loop_without_usage_sends_no_report() {
+    let upstream_url = stalled_sse_upstream_url().await;
+    let cloud_api = MockServer::start().await;
+    mount_direct_key_cloud_api(&cloud_api).await;
+
+    let app = build_agent_loop_app_with_cloud_and_idle(
+        &upstream_url,
+        Some("http://brave.invalid/res/v1/llm/context"),
+        Some(&cloud_api.uri()),
+        1,
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", DIRECT_KEY_BEARER)
+                .header("content-type", "application/json")
+                .body(Body::from(agent_loop_request_body(true).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = inference_id_header(&response);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        response.into_body().collect(),
+    )
+    .await
+    .expect("agent-loop idle watchdog should fire before the test timeout");
+    assert!(result.is_err(), "stalled agent-loop body must fail");
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(usage_reports(&cloud_api).await.is_empty());
 }

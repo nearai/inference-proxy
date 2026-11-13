@@ -25,7 +25,7 @@ Rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-proxy) (Python).
 | POST | `/v1/completions` | Yes | Text completions |
 | POST | `/v1/embeddings` | Yes | Embeddings |
 | POST | `/v1/tokenize` | Yes | Tokenization (no signing) |
-| POST | `/v1/rerank` | Yes | Reranking |
+| POST | `/v1/rerank` | Yes | Reranking (at most 4,096 `documents`; more is a `400` before dispatch). Concurrent requests are limited: 2 per Cloud API organization + workspace, 16 for all Cloud API keys, 16 shared by the config tokens; over the limit is a `429` with `Retry-After` before dispatch (counted in `inference_proxy_rerank_refused_total{limit}`) |
 | POST | `/v1/score` | Yes | Scoring |
 | POST | `/v1/privacy/classify` | Yes | Privacy classification |
 | POST | `/v1/images/generations` | Yes | Image generation |
@@ -491,5 +491,11 @@ Every signed response produces a `SignedChat` cached by response ID:
 
 - **ECDSA**: EIP-191 `personal_sign` format, recoverable secp256k1 signature
 - **Ed25519**: Direct message signing, 64-byte signature
+
+`GET /v1/signature/{id}` with a configured `TOKEN` returns any cached signature. With a
+Cloud API key (`sk-`) it returns only signatures of responses served to a key of the same
+organization and workspace; any other id, including one cached for a `TOKEN` caller,
+answers 404 like an unknown id. The cache is per process: a signature is only found on
+the instance that served the response.
 
 In production, signing keys are derived from dstack KMS (`DstackClient::get_key`). In dev mode (`DEV=1`), random keys are generated at startup.

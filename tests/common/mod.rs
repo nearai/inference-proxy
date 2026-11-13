@@ -12,6 +12,7 @@ pub(crate) struct TestAppOptions {
     pub(crate) images_edits_url_override: Option<String>,
     pub(crate) transcriptions_url_override: Option<String>,
     pub(crate) rerank_url_override: Option<String>,
+    pub(crate) rerank_limiter: Option<Arc<rerank_limit::RerankLimiter>>,
 }
 
 pub(crate) fn test_signing_pair() -> signing::SigningPair {
@@ -101,6 +102,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         rerank_url_override: options.rerank_url_override,
         score_url_override: None,
         ohttp_enabled: false,
+        ohttp_max_inflight: 0,
         listen_port: 8000,
         listen_addr: "127.0.0.1".to_string(),
         backend_token: options.backend_token,
@@ -191,6 +193,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),
+        rerank_limiter: options.rerank_limiter.unwrap_or_default(),
         usage_report_delivery: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),

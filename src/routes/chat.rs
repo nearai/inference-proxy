@@ -119,6 +119,13 @@ async fn serve(
         crate::model_list::checked_model(&state, model.id),
     )?;
     crate::model_list::apply_backend_lora(&state, &mut request_json);
+    // Bounds on sampling fields, `model` and content parts, and
+    // engine-internal fields stripped (`request_guard.rs`). On the decrypted
+    // body, before anything below reads it.
+    state
+        .config
+        .request_guard
+        .apply_completion_body(&mut request_json)?;
 
     // Repair tool-call `arguments` the engine would refuse (empty, missing,
     // double-encoded, non-object): one odd historical turn must not 400 the

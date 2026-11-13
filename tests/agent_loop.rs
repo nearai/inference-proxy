@@ -127,6 +127,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
         discount_to_user: None,
         backend_lora: None,
         strict_request_model: false,
+        request_guard: Default::default(),
         reasoning_off_effort: "none".to_string(),
         allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,

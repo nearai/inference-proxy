@@ -74,6 +74,58 @@ fn media_inline_from_env() -> anyhow::Result<crate::media_inline::MediaInlineCon
     })
 }
 
+/// `VLLM_PROXY_REQUEST_GUARD` (default on) and its limits; see `request_guard.rs`.
+fn request_guard_from_env() -> anyhow::Result<crate::request_guard::RequestGuardConfig> {
+    let d = crate::request_guard::RequestGuardConfig::default();
+    let max_logit_bias_value: f64 =
+        env_parse("VLLM_PROXY_MAX_LOGIT_BIAS_VALUE", d.max_logit_bias_value)?;
+    if !max_logit_bias_value.is_finite() || max_logit_bias_value < 0.0 {
+        anyhow::bail!("VLLM_PROXY_MAX_LOGIT_BIAS_VALUE must be a finite number >= 0");
+    }
+    Ok(crate::request_guard::RequestGuardConfig {
+        enabled: env_bool_optional("VLLM_PROXY_REQUEST_GUARD").unwrap_or(d.enabled),
+        max_top_logprobs: env_parse("VLLM_PROXY_MAX_TOP_LOGPROBS", d.max_top_logprobs)?,
+        max_n: env_parse("VLLM_PROXY_MAX_N", d.max_n)?,
+        max_logit_bias_entries: env_parse(
+            "VLLM_PROXY_MAX_LOGIT_BIAS_ENTRIES",
+            d.max_logit_bias_entries,
+        )?,
+        max_logit_bias_value,
+        max_stop_sequences: env_parse("VLLM_PROXY_MAX_STOP_SEQUENCES", d.max_stop_sequences)?,
+        max_stop_chars: env_parse("VLLM_PROXY_MAX_STOP_SEQUENCE_CHARS", d.max_stop_chars)?,
+        max_stop_token_ids: env_parse("VLLM_PROXY_MAX_STOP_TOKEN_IDS", d.max_stop_token_ids)?,
+        vocab_size: env_parse("VLLM_PROXY_VOCAB_SIZE", d.vocab_size)?,
+        max_model_chars: env_parse("VLLM_PROXY_MAX_MODEL_NAME_CHARS", d.max_model_chars)?,
+        max_content_part_uuid_chars: env_parse(
+            "VLLM_PROXY_MAX_CONTENT_PART_UUID_CHARS",
+            d.max_content_part_uuid_chars,
+        )?,
+        max_image_n: env_parse("VLLM_PROXY_MAX_IMAGE_N", d.max_image_n)?,
+        max_image_side: env_parse("VLLM_PROXY_MAX_IMAGE_SIDE", d.max_image_side)?,
+        max_image_steps: env_parse("VLLM_PROXY_MAX_IMAGE_STEPS", d.max_image_steps)?,
+        regex: crate::structured_regex::RegexLimits {
+            max_nested_product: env_parse(
+                "VLLM_PROXY_MAX_REGEX_NESTED_PRODUCT",
+                d.regex.max_nested_product,
+            )?,
+            max_star_repeat: env_parse(
+                "VLLM_PROXY_MAX_REGEX_STAR_REPEAT",
+                d.regex.max_star_repeat,
+            )?,
+            max_bound: env_parse("VLLM_PROXY_MAX_REGEX_BOUND", d.regex.max_bound)?,
+            max_chars: env_parse("VLLM_PROXY_MAX_REGEX_CHARS", d.regex.max_chars)?,
+        },
+        allow_grammar: env_bool_optional("VLLM_PROXY_ALLOW_GRAMMAR").unwrap_or(d.allow_grammar),
+        reject_local_media_urls: env_bool_optional("VLLM_PROXY_REJECT_LOCAL_MEDIA_URLS")
+            .unwrap_or(d.reject_local_media_urls),
+        // Unset = the default list; set (even empty) = exactly that list.
+        stripped_fields: match env::var("VLLM_PROXY_STRIPPED_REQUEST_FIELDS") {
+            Ok(raw) => crate::request_guard::parse_field_list(&raw),
+            Err(_) => d.stripped_fields,
+        },
+    })
+}
+
 fn env_bool(name: &str) -> bool {
     env::var(name).map(|v| parse_bool(&v)).unwrap_or(false)
 }
@@ -846,6 +898,10 @@ pub struct Config {
     /// Required by `VLLM_PROXY_BACKEND_LORA`: SGLang resolves `base:adapter`
     /// in `model` to an adapter. LoRA selector keys are refused either way.
     pub strict_request_model: bool,
+    /// Request field guard (`request_guard.rs`): bounds on sampling fields,
+    /// `model` and content parts, and engine-internal fields stripped. On by
+    /// default (`VLLM_PROXY_REQUEST_GUARD=0` turns it off).
+    pub request_guard: crate::request_guard::RequestGuardConfig,
     /// Gateway mode: the `reasoning_effort` that stands for "as little
     /// reasoning as possible" on the served model
     /// (`VLLM_PROXY_REASONING_OFF_EFFORT`, default `none`). Applied to an
@@ -1556,6 +1612,7 @@ impl Config {
             discount_to_user,
             backend_lora,
             strict_request_model,
+            request_guard: request_guard_from_env()?,
             reasoning_off_effort,
             allowed_org_ids,
             sse_keepalive_secs: env_int("VLLM_PROXY_SSE_KEEPALIVE_SECS", 0) as u64,

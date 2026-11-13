@@ -1049,7 +1049,7 @@ async fn post_chat_json(
             req = req.header(k, v);
         }
 
-        let response =
+        let (response, mut attempt_cleanup) =
             match crate::monetary_budget::send(req.body(attempt_body), reporter.as_ref()).await {
                 Ok(response) => response,
                 Err(e) => {
@@ -1104,6 +1104,7 @@ async fn post_chat_json(
                     .unwrap_or(&fallback_id),
             ) {
                 proxy::spawn_usage_report(reporter, usage);
+                attempt_cleanup.disarm();
             }
         }
         return Ok(response);

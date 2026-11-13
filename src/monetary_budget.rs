@@ -146,7 +146,7 @@ async fn request_admission(
     // cleaned up by the generated ID; cancellation races still have the database TTL fallback.
     let mut cleanup_reporter = reporter.clone();
     cleanup_reporter.budget_report_id = Some(id.to_string());
-    let mut cleanup = AttemptCleanup::new(&cleanup_reporter, false);
+    let mut cleanup = AttemptCleanup::new(Some(&cleanup_reporter), false);
     let response = reporter.http_client.post(format!("{}/v1/internal/budget", base.trim_end_matches('/')))
         .bearer_auth(token).timeout(Duration::from_millis(reporter.admission_timeout_ms)).json(&json!({
             "id": id.to_string(), "organization_id": org, "workspace_id": workspace, "api_key_id": key,
@@ -192,18 +192,18 @@ async fn request_admission(
     Ok(admitted.mode)
 }
 
-struct AttemptCleanup {
+pub(crate) struct AttemptCleanup {
     reporter: Option<UsageReporter>,
     unknown: bool,
 }
 impl AttemptCleanup {
-    fn new(reporter: &UsageReporter, unknown: bool) -> Self {
+    fn new(reporter: Option<&UsageReporter>, unknown: bool) -> Self {
         Self {
-            reporter: Some(reporter.clone()),
+            reporter: reporter.cloned(),
             unknown,
         }
     }
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         self.reporter = None;
     }
 }
@@ -220,27 +220,27 @@ impl Drop for AttemptCleanup {
     }
 }
 
-/// Preserve upstream transport semantics; only a connect/build failure proves no execution.
+/// Keep cleanup armed until the caller hands usage to the existing reporting path.
+/// Only a connect/build failure proves no execution.
 pub(crate) async fn send(
     request: reqwest::RequestBuilder,
     reporter: Option<&UsageReporter>,
-) -> Result<reqwest::Response, reqwest::Error> {
-    let mut cleanup = reporter.map(|reporter| AttemptCleanup::new(reporter, true));
+) -> Result<(reqwest::Response, AttemptCleanup), reqwest::Error> {
+    let mut cleanup = AttemptCleanup::new(reporter, true);
     let response = request.send().await;
-    if let Some(guard) = cleanup.as_mut() {
-        guard.disarm();
-    }
-    if let Some(reporter) = reporter {
-        match &response {
-            Err(error) if error.is_connect() || error.is_builder() => {
-                finish_attempt(reporter, false).await
+    match &response {
+        Ok(response) if response.status().is_success() => {}
+        _ => {
+            cleanup.unknown = !response
+                .as_ref()
+                .is_err_and(|error| error.is_connect() || error.is_builder());
+            if let Some(reporter) = reporter {
+                finish_attempt(reporter, cleanup.unknown).await;
             }
-            Err(_) => finish_attempt(reporter, true).await,
-            Ok(response) if !response.status().is_success() => finish_attempt(reporter, true).await,
-            _ => {}
+            cleanup.disarm();
         }
     }
-    response
+    response.map(|response| (response, cleanup))
 }
 
 pub(crate) async fn unknown_outcome(reporter: &UsageReporter) {

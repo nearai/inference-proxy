@@ -169,7 +169,7 @@ pub async fn run_chat_completion(
     let first_request_body =
         serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?;
     let (upstream_url, backend_guard) = state.backend_pool.select_url("/v1/chat/completions");
-    let first_response = send_upstream(
+    let (first_response, mut attempt_cleanup) = send_upstream(
         &state.backend_client,
         &upstream_url,
         first_request_body,
@@ -249,6 +249,7 @@ pub async fn run_chat_completion(
                     ));
                     report_chat_usage_if_present(reporter, usage, result.chat_id.as_deref());
                 }
+                attempt_cleanup.disarm();
 
                 if let Some(error) = result.downstream_error {
                     error!(error = %error, "Agent loop failed");
@@ -442,7 +443,7 @@ async fn drive_loop(
                     break;
                 };
                 match send_outcome {
-                    Ok(r) => r,
+                    Ok((response, _cleanup)) => response,
                     Err(AppError::Upstream { status, body }) => {
                         warn!(
                             status = %status,
@@ -1120,7 +1121,7 @@ async fn send_upstream(
     body: Vec<u8>,
     tracing_ids: &TracingIds,
     reporter: Option<&crate::proxy::UsageReporter>,
-) -> Result<reqwest::Response, AppError> {
+) -> Result<(reqwest::Response, crate::monetary_budget::AttemptCleanup), AppError> {
     let mut req = client
         .post(upstream_url)
         .header("content-type", "application/json")
@@ -1129,7 +1130,7 @@ async fn send_upstream(
         req = req.header(k, v);
     }
     let request = req.body(body);
-    let response = crate::monetary_budget::send(request, reporter)
+    let (response, attempt_cleanup) = crate::monetary_budget::send(request, reporter)
         .await
         .map_err(|e| AppError::Internal(e.into()))?;
 
@@ -1141,7 +1142,7 @@ async fn send_upstream(
             body,
         });
     }
-    Ok(response)
+    Ok((response, attempt_cleanup))
 }
 
 // ── synthetic chunks ────────────────────────────────────────────────

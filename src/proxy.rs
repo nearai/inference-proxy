@@ -1329,7 +1329,7 @@ async fn send_upstream(
     body: Bytes,
     opts: &mut ProxyOpts,
     endpoint: &'static str,
-) -> Result<reqwest::Response, AppError> {
+) -> Result<(reqwest::Response, crate::monetary_budget::AttemptCleanup), AppError> {
     let mut measured = None;
     admit_json_attempt(opts, &body, &mut measured).await?;
     let upstream_start = std::time::Instant::now();
@@ -1813,7 +1813,7 @@ async fn proxy_json_request_inner(
 
     let upstream_start = std::time::Instant::now();
     let mut url = url.to_string();
-    let response = send_upstream(
+    let (response, mut attempt_cleanup) = send_upstream(
         client,
         &mut url,
         Bytes::from(streaming_body),
@@ -2063,6 +2063,7 @@ async fn proxy_json_request_inner(
     // Report usage for cloud API key requests (before encryption, needs plaintext fields)
     let chat_id = response_data["id"].as_str().unwrap_or("").to_string();
     try_report_usage(&response_data, &chat_id, &opts);
+    attempt_cleanup.disarm();
 
     // Keep plaintext usage values for bounded completion metrics after every
     // fallible transform, serialization, and signing step has succeeded.
@@ -2622,8 +2623,9 @@ async fn open_upstream_stream(
     url: &mut String,
     request_body: Vec<u8>,
     opts: &mut ProxyOpts,
-) -> Result<UpstreamByteStream, AppError> {
-    let response = send_upstream(client, url, Bytes::from(request_body), opts, "streaming").await?;
+) -> Result<(UpstreamByteStream, crate::monetary_budget::AttemptCleanup), AppError> {
+    let (response, attempt_cleanup) =
+        send_upstream(client, url, Bytes::from(request_body), opts, "streaming").await?;
 
     let status = response.status();
     if !status.is_success() {
@@ -2707,10 +2709,13 @@ async fn open_upstream_stream(
     }
 
     // Re-attach the peeked chunk so the pump sees the complete stream.
-    Ok(Box::pin(futures_util::stream::StreamExt::chain(
-        futures_util::stream::iter(first_chunk.map(Ok)),
-        byte_stream,
-    )))
+    Ok((
+        Box::pin(futures_util::stream::StreamExt::chain(
+            futures_util::stream::iter(first_chunk.map(Ok)),
+            byte_stream,
+        )),
+        attempt_cleanup,
+    ))
 }
 
 /// The upstream body, boxed so the peeked first chunk can be re-attached
@@ -2911,7 +2916,7 @@ async fn proxy_streaming_request_inner(
         // disconnect, not a failed stream.
         let stream_errors = opts.model_request.filter(|_| !tx.is_closed());
 
-        let byte_stream = match opened {
+        let (byte_stream, mut attempt_cleanup) = match opened {
             Ok(stream) => {
                 let delivered = start_tx
                     .take()
@@ -3187,6 +3192,7 @@ async fn proxy_streaming_request_inner(
             &log_org_id,
             &log_workspace_id,
         );
+        attempt_cleanup.disarm();
 
         // Only sign and cache for a fully completed stream
         if completed_cleanly {
@@ -3483,9 +3489,10 @@ async fn proxy_multipart_request_inner(
 ) -> Result<Response, AppError> {
     let upstream_start = std::time::Instant::now();
     let req = apply_tracing_headers(client.post(url).multipart(form), opts.tracing_ids.as_ref());
-    let response = crate::monetary_budget::send(req, opts.usage_reporter.as_ref())
-        .await
-        .map_err(|e| AppError::Internal(e.into()))?;
+    let (response, mut attempt_cleanup) =
+        crate::monetary_budget::send(req, opts.usage_reporter.as_ref())
+            .await
+            .map_err(|e| AppError::Internal(e.into()))?;
     metrics::histogram!("upstream_request_duration_seconds", "endpoint" => "multipart")
         .record(upstream_start.elapsed().as_secs_f64());
 
@@ -3528,6 +3535,7 @@ async fn proxy_multipart_request_inner(
 
     // Report usage for cloud API key requests (before encryption, needs plaintext fields)
     try_report_usage(&response_data, &response_id, &opts);
+    attempt_cleanup.disarm();
     let input_tokens = response_data
         .pointer("/usage/prompt_tokens")
         .and_then(|v| v.as_i64())
@@ -4250,6 +4258,7 @@ mod tests {
             )
             .await
             .unwrap()
+            .0
             .status(),
             503
         );
@@ -4260,7 +4269,8 @@ mod tests {
             Some(&reporter)
         )
         .await
-        .unwrap_err()
+        .err()
+        .unwrap()
         .is_timeout());
         let notices = ledger.received_requests().await.unwrap();
         assert_eq!(notices.len(), 2);
@@ -4275,14 +4285,201 @@ mod tests {
             Some(&reporter)
         )
         .await
-        .unwrap_err()
+        .err()
+        .unwrap()
         .is_connect());
         assert!(
             crate::monetary_budget::send(client.post("invalid URL"), Some(&reporter))
                 .await
-                .unwrap_err()
+                .err()
+                .unwrap()
                 .is_builder()
         );
+    }
+
+    #[tokio::test]
+    async fn monetary_response_processing_finishes_the_attempt_once() {
+        use http_body_util::BodyExt;
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        for (kind, success) in [
+            ("json", false),
+            ("multipart", false),
+            ("sse", false),
+            ("json", true),
+            ("multipart", true),
+            ("sse", true),
+        ] {
+            let ledger = MockServer::start().await;
+            let upstream = MockServer::start().await;
+            Mock::given(path("/v1/internal/budget"))
+                .respond_with(|request: &Request| {
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id": body["id"], "model": "test-model", "mode": "enforce"
+                    }))
+                })
+                .expect(1)
+                .mount(&ledger)
+                .await;
+            Mock::given(path("/v1/internal/budget/unknown"))
+                .respond_with(ResponseTemplate::new(204))
+                .expect(u64::from(!success))
+                .mount(&ledger)
+                .await;
+            Mock::given(path("/v1/internal/usage"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(u64::from(success))
+                .mount(&ledger)
+                .await;
+            let completion = serde_json::json!({
+                "id":"test-response", "choices":[{"index":0,"delta":{},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":1,"completion_tokens":1}, "text":"ok"
+            });
+            let response = match (kind, success) {
+                ("sse", true) => ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!("data: {completion}\n\ndata: [DONE]\n\n")),
+                ("sse", false) => ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: {\"error\":{\"message\":\"failed\",\"code\":503}}\n\n"),
+                (_, true) => ResponseTemplate::new(200).set_body_json(completion),
+                (_, false) => ResponseTemplate::new(200).set_body_string("invalid json"),
+            };
+            Mock::given(path("/inference"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&upstream)
+                .await;
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let mut reporter = reporter_with(Some("token"), Some("org"), Some("ws"), Some("key"));
+            reporter.cloud_api_url = Some(ledger.uri());
+            reporter.http_client = client.clone();
+            let delivery = reporter.delivery.clone();
+            let mut opts = test_proxy_opts();
+            let body = serde_json::json!({"model":"test-model","messages":[]});
+            if kind == "multipart" {
+                opts.usage_type = UsageType::AudioTranscription {
+                    duration_seconds: Some(1),
+                };
+                crate::monetary_budget::admit(&mut reporter, &opts.usage_type, &body, 1)
+                    .await
+                    .unwrap();
+            }
+            opts.usage_reporter = Some(reporter);
+            opts.stream_error_peek_ms = 1000;
+            let url = format!("{}/inference", upstream.uri());
+            let body = serde_json::to_vec(&body).unwrap();
+            let result = match kind {
+                "multipart" => {
+                    proxy_multipart_request(
+                        &client,
+                        &url,
+                        reqwest::multipart::Form::new().text("model", "test-model"),
+                        "test-hash",
+                        opts,
+                    )
+                    .await
+                }
+                "sse" => proxy_streaming_request(&client, &url, body, opts).await,
+                _ => proxy_json_request(&client, &url, body, opts).await,
+            };
+            assert_eq!(result.is_ok(), success, "{kind}");
+            if let Ok(response) = result {
+                response.into_body().collect().await.unwrap();
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if ledger.received_requests().await.unwrap().len() == 2 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{kind} did not finish its attempt (success={success})"));
+            assert_eq!(
+                delivery
+                    .drain(std::time::Duration::from_secs(2))
+                    .await
+                    .left(),
+                0
+            );
+            let requests = ledger.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 2, "{kind}");
+            assert_eq!(
+                requests[1].url.path(),
+                if success {
+                    "/v1/internal/usage"
+                } else {
+                    "/v1/internal/budget/unknown"
+                }
+            );
+            let admission: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+            let notice: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+            let id_field = if success { "admission_id" } else { "id" };
+            assert_eq!(notice[id_field], admission["id"], "{kind}");
+        }
+    }
+
+    #[tokio::test]
+    async fn monetary_body_cancellation_marks_unknown_without_releasing() {
+        use tokio::io::AsyncWriteExt;
+        use wiremock::matchers::{body_json, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let ledger = MockServer::start().await;
+        let mut reporter = reporter_with(Some("token"), Some("org"), Some("ws"), Some("key"));
+        reporter.cloud_api_url = Some(ledger.uri());
+        reporter.http_client = reqwest::Client::builder().no_proxy().build().unwrap();
+        reporter.budget_report_id = Some(uuid::Uuid::new_v4().to_string());
+        Mock::given(path("/v1/internal/budget/unknown"))
+            .and(body_json(serde_json::json!({
+                "organization_id":"org", "id":reporter.budget_report_id
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&ledger)
+            .await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            assert_streaming_post(&mut socket).await;
+            socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{")
+                .await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let (response, cleanup) = crate::monetary_budget::send(
+            reporter
+                .http_client
+                .post(format!("http://{address}"))
+                .json(&serde_json::json!({"model":"test-model","stream":true})),
+            Some(&reporter),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(ledger.received_requests().await.unwrap().is_empty());
+        let task = tokio::spawn(async move {
+            let _cleanup = cleanup;
+            response.bytes().await
+        });
+        tokio::task::yield_now().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while ledger.received_requests().await.unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        server.abort();
+        let requests = ledger.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/v1/internal/budget/unknown");
     }
 
     #[tokio::test]
@@ -4328,7 +4525,7 @@ mod tests {
             reporter.admission_mode = mode;
             let mut opts = test_proxy_opts();
             opts.usage_reporter = Some(reporter);
-            let response = send_upstream(
+            let (response, _cleanup) = send_upstream(
                 &reqwest::Client::new(),
                 &mut format!("{}/chat", upstream.uri()),
                 Bytes::from_static(br#"{"model":"test","messages":[],"max_tokens":1}"#),
@@ -6858,7 +7055,7 @@ data: [DONE]
         opts.admission = controller.try_admit(&pool, None).unwrap();
 
         let mut url = format!("http://{addr}/v1/chat/completions");
-        let response = send_upstream(
+        let (response, _cleanup) = send_upstream(
             &reqwest::Client::new(),
             &mut url,
             Bytes::from_static(b"{}"),

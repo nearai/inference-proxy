@@ -1308,6 +1308,61 @@ pub fn guard_form_field(state: &AppState, name: &str, value: &[u8]) -> Result<()
     Ok(())
 }
 
+/// Form fields a client may send on `/v1/images/edits`.
+pub(crate) const IMAGE_EDIT_FORM_FIELDS: [&str; 17] = [
+    "model",
+    "prompt",
+    "image",
+    "image[]",
+    "mask",
+    "n",
+    "size",
+    "response_format",
+    "output_format",
+    "output_compression",
+    "quality",
+    "background",
+    "seed",
+    "negative_prompt",
+    "guidance_scale",
+    "num_inference_steps",
+    "user",
+];
+
+/// Form fields a client may send on `/v1/audio/transcriptions`.
+pub(crate) const AUDIO_TRANSCRIPTION_FORM_FIELDS: [&str; 7] = [
+    "file",
+    "model",
+    "language",
+    "prompt",
+    "response_format",
+    "temperature",
+    "timestamp_granularities[]",
+];
+
+/// Longest field name repeated in the refusal of `guard_form_field_name`.
+const FORM_FIELD_ECHO_MAX_BYTES: usize = 64;
+
+/// The name check of one form field of a multipart route, run before the
+/// field is read: a field is forwarded to the engine only if its name is one
+/// of `supported`, byte for byte. A LoRA key keeps the refusal it has on every
+/// route; any other name is a 400. It is refused, not dropped, so a caller who
+/// sends one learns it did nothing.
+pub fn guard_form_field_name(route: &str, supported: &[&str], name: &str) -> Result<(), AppError> {
+    if let Some(key) = LORA_SELECTOR_KEYS.iter().find(|key| **key == name) {
+        return Err(lora_selector_refused(key));
+    }
+    if supported.contains(&name) {
+        return Ok(());
+    }
+    let named = !name.is_empty() && name.len() <= FORM_FIELD_ECHO_MAX_BYTES;
+    Err(AppError::BadRequest(if named {
+        format!("`{name}` is not a supported form field on {route}")
+    } else {
+        format!("The form has a field that is not supported on {route}")
+    }))
+}
+
 /// `guard_request_body` for a route outside `model_for` (tokenize, embeddings,
 /// rerank, score, images): in a strict single-model process the body's
 /// `model` is compared with `MODEL_NAME`; a gateway list has no one model for

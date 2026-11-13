@@ -271,6 +271,7 @@ fn build_test_app_inner_with_pool(
         discount_to_user: None,
         backend_lora: options.backend_lora.clone(),
         strict_request_model: options.strict_request_model,
+        request_guard: Default::default(),
         reasoning_off_effort: "none".to_string(),
         allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,
@@ -4643,6 +4644,7 @@ fn build_test_app_with_cloud_api_retries(
         discount_to_user: None,
         backend_lora: None,
         strict_request_model: false,
+        request_guard: Default::default(),
         reasoning_off_effort: "none".to_string(),
         allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,
@@ -7956,6 +7958,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         discount_to_user: None,
         backend_lora: None,
         strict_request_model: false,
+        request_guard: Default::default(),
         reasoning_off_effort: "none".to_string(),
         allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,
@@ -8508,6 +8511,7 @@ async fn start_ohttp_server_with_relay_limit(
         discount_to_user: None,
         backend_lora: None,
         strict_request_model: false,
+        request_guard: Default::default(),
         reasoning_off_effort: "none".to_string(),
         allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,
@@ -12131,4 +12135,257 @@ async fn trusted_only_route_logs_its_caller() {
     assert_eq!(fields["auth_path"], "trusted_config_token");
     assert_eq!(fields["caller"], "ops");
     assert_eq!(fields["tenant_context"], "trusted_no_tenant");
+}
+
+// ---- Request field guard (request_guard.rs) ----
+
+#[tokio::test]
+async fn request_guard_refuses_out_of_bounds_fields_before_dispatch() {
+    let backend = start_any_post_backend().await;
+    let app = build_test_app(&backend.uri());
+    let cases = [
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"top_logprobs": 1000000}),
+            "top_logprobs",
+        ),
+        (
+            "/v1/completions",
+            serde_json::json!({"prompt": "x", "logprobs": 21}),
+            "logprobs",
+        ),
+        ("/v1/chat/completions", serde_json::json!({"n": 64}), "n"),
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"logit_bias": {"5": 1e39}}),
+            "logit_bias",
+        ),
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"stop_token_ids": [-1]}),
+            "stop_token_ids",
+        ),
+        (
+            "/v1/completions",
+            serde_json::json!({"prompt": "x", "logprob_start_len": -5}),
+            "logprob_start_len",
+        ),
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"min_tokens": 9, "max_tokens": 1}),
+            "min_tokens",
+        ),
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"temperature": "nan"}),
+            "temperature",
+        ),
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"model": "/a".repeat(4096)}),
+            "model",
+        ),
+        (
+            "/v1/embeddings",
+            serde_json::json!({"model": "/a".repeat(4096), "input": "x"}),
+            "model",
+        ),
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "file:///etc/passwd"}}
+            ]}]}),
+            "image_url",
+        ),
+    ];
+    for (route, mut body, param) in cases {
+        if body.get("messages").is_none() && route == "/v1/chat/completions" {
+            body["messages"] = serde_json::json!([{"role": "user", "content": "hi"}]);
+        }
+        let (status, response) = post_guarded(&app, route, &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{route} {param}");
+        assert_eq!(
+            response["error"]["type"], "invalid_request_error",
+            "{param}"
+        );
+        assert_eq!(response["error"]["param"], param, "{route}");
+    }
+    assert_eq!(requests_seen(&backend).await, 0);
+}
+
+#[tokio::test]
+async fn request_guard_strips_engine_internal_fields() {
+    let backend = start_any_post_backend().await;
+    let app = build_test_app(&backend.uri());
+    for route in ["/v1/chat/completions", "/v1/embeddings"] {
+        let body = serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "input": "x",
+            "kv_transfer_params": {"do_remote_prefill": true, "remote_prefill_cached_tokens": 99},
+            "vllm_xargs": {"kv_transfer_params": "x"},
+            "return_hidden_states": true,
+        });
+        let (status, _) = post_guarded(&app, route, &body).await;
+        assert_eq!(status, StatusCode::OK, "{route}");
+    }
+    let requests = backend.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        let forwarded: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        for key in ["kv_transfer_params", "vllm_xargs", "return_hidden_states"] {
+            assert!(forwarded.get(key).is_none(), "{} kept {key}", request.url);
+        }
+        assert_eq!(forwarded["model"], "test-model");
+    }
+}
+
+#[tokio::test]
+async fn image_routes_refuse_engine_only_fields() {
+    let backend = start_any_post_backend().await;
+    let app = build_test_app(&backend.uri());
+    let boundary = "----GuardBoundary";
+    let form = |extra: &str| {
+        format!(
+            "--{boundary}\r\n\
+             Content-Disposition: form-data; name=\"prompt\"\r\n\r\n\
+             a cat\r\n\
+             --{boundary}\r\n\
+             Content-Disposition: form-data; name=\"{extra}\"\r\n\r\n\
+             /tmp/value\r\n\
+             --{boundary}--\r\n"
+        )
+    };
+    let form_value = |name: &str, value: &str| {
+        format!(
+            "--{boundary}\r\n\
+             Content-Disposition: form-data; name=\"prompt\"\r\n\r\n\
+             a cat\r\n\
+             --{boundary}\r\n\
+             Content-Disposition: form-data; name=\"{name}\"\r\n\r\n\
+             {value}\r\n\
+             --{boundary}--\r\n"
+        )
+    };
+    let send = |body: String| {
+        app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/images/edits")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+    };
+
+    for field in [
+        "url",
+        "url[]",
+        "num_frames",
+        "upscaling_scale",
+        "enable_upscaling",
+        "perf_dump_path",
+        "cache_dit_params",
+        "upscaling_model_path",
+    ] {
+        let response = send(form(field)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{field}");
+    }
+    assert_eq!(requests_seen(&backend).await, 0);
+
+    let generate = |body: serde_json::Value| {
+        app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/images/generations")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+    };
+    for field in [
+        "diffusers_kwargs",
+        "perf_dump_path",
+        "upscaling_model_path",
+        "enable_upscaling",
+        "url",
+        "url[]",
+        "profile",
+        "cache_dit_params",
+        "attention_backend_override",
+    ] {
+        let mut body = serde_json::json!({"model": "test-model", "prompt": "a cat"});
+        body[field] = serde_json::json!({"x": 1});
+        let response = generate(body).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{field}");
+        let json = body_to_json(response).await;
+        assert!(json["error"]["message"].as_str().unwrap().contains(field));
+    }
+    assert_eq!(requests_seen(&backend).await, 0);
+
+    for (field, value) in [
+        ("n", serde_json::json!(64)),
+        ("n", serde_json::json!(11)),
+        ("size", serde_json::json!("8192x8192")),
+        ("num_inference_steps", serde_json::json!(100000)),
+    ] {
+        let mut body = serde_json::json!({"model": "test-model", "prompt": "a cat"});
+        body[field] = value;
+        let response = generate(body).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{field}");
+    }
+    let response = send(form_value("num_inference_steps", "100000"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(requests_seen(&backend).await, 0);
+
+    let response = generate(serde_json::json!({
+        "model": "test-model", "prompt": "a cat", "size": "512x512", "seed": 1
+    }))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(requests_seen(&backend).await, 1);
+}
+
+#[tokio::test]
+async fn structured_output_patterns_are_bounded_on_chat_and_completions() {
+    let backend = start_any_post_backend().await;
+    let app = build_test_app(&backend.uri());
+    let slow = "^(.{0,500}){0,500}$";
+    for (route, body) in [
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"messages": [{"role": "user", "content": "hi"}],
+                "structured_outputs": {"regex": slow}}),
+        ),
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"messages": [{"role": "user", "content": "hi"}],
+                "response_format": {"type": "json_schema", "json_schema": {"name": "x",
+                    "schema": {"type": "string", "pattern": slow}}}}),
+        ),
+        (
+            "/v1/completions",
+            serde_json::json!({"prompt": "hi", "regex": "a{1000000}"}),
+        ),
+    ] {
+        let (status, response) = post_guarded(&app, route, &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{route} {body}");
+        assert_eq!(response["error"]["type"], "invalid_request_error");
+    }
+    assert_eq!(requests_seen(&backend).await, 0);
+
+    let body = serde_json::json!({"messages": [{"role": "user", "content": "hi"}],
+        "response_format": {"type": "json_schema", "json_schema": {"name": "x",
+            "schema": {"type": "string", "pattern": "^[a-z]{1,64}$"}}}});
+    let (status, _) = post_guarded(&app, "/v1/chat/completions", &body).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(requests_seen(&backend).await, 1);
 }

@@ -176,6 +176,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         discount_to_user: options.discount_to_user,
         backend_lora: None,
         strict_request_model: false,
+        request_guard: Default::default(),
         reasoning_off_effort: options
             .reasoning_off_effort
             .clone()

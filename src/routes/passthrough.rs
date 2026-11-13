@@ -58,6 +58,9 @@ pub async fn tokenize(
     let request_json = proxy::parse_json_object(&request_body)?;
     crate::model_list::guard_passthrough_body(&state, &request_json)?;
     guard_direct_model(&state, &request_json, auth.cloud_api_key.is_some())?;
+    if let Some(model) = request_json.get("model").and_then(|m| m.as_str()) {
+        state.config.request_guard.check_model_name(model)?;
+    }
 
     let (url, _guard) = state.backend_pool.select_url("/tokenize");
     proxy::proxy_simple(
@@ -249,6 +252,16 @@ pub async fn images_edits(
                 read_field_chunks(&mut field, &mut total_size, max_size, &mut hasher).await?;
             crate::model_list::guard_form_field(&state, &name, &data)?;
             guard_direct_form_model(&state, &name, &data, auth.cloud_api_key.is_some())?;
+            if crate::request_guard::IMAGE_BOUNDED_FIELDS.contains(&name.as_str()) {
+                state
+                    .config
+                    .request_guard
+                    .check_image_field(&name, &String::from_utf8_lossy(&data))?;
+            }
+            // Engine-internal fields are dropped (`request_guard.rs`). The hash above still binds what was sent.
+            if !state.config.request_guard.keep_form_field(&name, &data)? {
+                continue;
+            }
             let part = build_multipart_part(data, file_name, content_type)?;
             form = form.part(name, part);
         }
@@ -355,6 +368,10 @@ pub async fn audio_transcriptions(
                 read_field_chunks(&mut field, &mut total_size, max_size, &mut hasher).await?;
             crate::model_list::guard_form_field(&state, &name, &data)?;
             guard_direct_form_model(&state, &name, &data, auth.cloud_api_key.is_some())?;
+            // Engine-internal fields are dropped (`request_guard.rs`). The hash above still binds what was sent.
+            if !state.config.request_guard.keep_form_field(&name, &data)? {
+                continue;
+            }
             let part = build_multipart_part(data, file_name, content_type)?;
             form = form.part(name, part);
         }
@@ -404,6 +421,23 @@ pub async fn audio_transcriptions(
     proxy::proxy_multipart_request(target.client, &target.url, form, &request_sha256, opts).await
 }
 
+/// `/v1/images/generations` forwards only the keys in `IMAGE_GENERATION_FIELDS`.
+fn guard_image_generation_fields(
+    state: &AppState,
+    endpoint: Endpoint,
+    request_json: &serde_json::Value,
+) -> Result<(), AppError> {
+    if matches!(endpoint, Endpoint::ImagesGenerations) && state.config.request_guard.enabled {
+        crate::model_list::guard_json_field_names(
+            super::ROUTE_IMAGES_GENERATIONS,
+            &crate::model_list::IMAGE_GENERATION_FIELDS,
+            request_json,
+        )?;
+        state.config.request_guard.check_image_body(request_json)?;
+    }
+    Ok(())
+}
+
 /// Generic JSON passthrough with signing and optional encryption support.
 #[allow(clippy::too_many_arguments)]
 async fn json_passthrough_encrypted(
@@ -435,10 +469,15 @@ async fn json_passthrough_encrypted(
         let mut request_json = proxy::parse_json_object(&request_body)?;
         validate_rerank_document_count(endpoint, &request_json)?;
         encryption::decrypt_request_fields(&mut request_json, endpoint, &ctx, &state.signing)?;
+        guard_image_generation_fields(&state, endpoint, &request_json)?;
         crate::model_list::guard_passthrough_body(&state, &request_json)?;
         guard_direct_model(&state, &request_json, direct_key)?;
         validate_image_count(endpoint, &request_json)?;
         validate_rerank_document_count(endpoint, &request_json)?;
+        state
+            .config
+            .request_guard
+            .apply_passthrough_body(&mut request_json)?;
         if with_lora {
             crate::model_list::apply_backend_lora(&state, &mut request_json);
         }
@@ -449,12 +488,21 @@ async fn json_passthrough_encrypted(
     } else {
         let mut request_json = proxy::parse_json_object(&request_body)?;
         validate_rerank_document_count(endpoint, &request_json)?;
+        guard_image_generation_fields(&state, endpoint, &request_json)?;
         crate::model_list::guard_passthrough_body(&state, &request_json)?;
         guard_direct_model(&state, &request_json, direct_key)?;
         validate_image_count(endpoint, &request_json)?;
-        if with_lora {
+        // A stripped field (`request_guard.rs`) means the body is re-serialized,
+        // like the adapter below; otherwise the original bytes go through.
+        let stripped = state
+            .config
+            .request_guard
+            .apply_passthrough_body(&mut request_json)?;
+        if with_lora || stripped {
             let original_hash = hex::encode(sha2::Sha256::digest(&request_body));
-            crate::model_list::apply_backend_lora(&state, &mut request_json);
+            if with_lora {
+                crate::model_list::apply_backend_lora(&state, &mut request_json);
+            }
             let modified =
                 serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?;
             (modified, Some(original_hash), None)

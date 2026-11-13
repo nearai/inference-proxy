@@ -102,6 +102,11 @@ async fn serve(
         },
     )?;
     crate::model_list::apply_backend_lora(&state, &mut request_json);
+    // See the chat route (`request_guard.rs`).
+    state
+        .config
+        .request_guard
+        .apply_completion_body(&mut request_json)?;
     // Size bonus on the engine `priority`, from the decrypted prompt; see the
     // chat route.
     if let Some(tiers) = &state.config.priority_size_tiers {

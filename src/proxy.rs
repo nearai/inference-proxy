@@ -730,18 +730,25 @@ pub(crate) fn build_usage_body(
             }))
         }
         UsageType::AudioTranscription => {
-            if response_data
-                .pointer("/usage/type")
-                .and_then(|v| v.as_str())
-                != Some("duration")
-            {
+            // JSON responses carry usage.seconds; verbose JSON carries the
+            // input duration at the top level, sometimes as a string.
+            let seconds = match response_data.get("usage") {
+                Some(usage) if usage.get("type").and_then(|v| v.as_str()) == Some("duration") => {
+                    usage.get("seconds")?.as_f64()?
+                }
+                Some(_) => return None,
+                None => {
+                    let duration = response_data.get("duration")?;
+                    duration.as_f64().or_else(|| {
+                        duration
+                            .as_str()
+                            .and_then(|value| value.parse::<f64>().ok())
+                    })?
+                }
+            };
+            if !seconds.is_finite() || seconds <= 0.0 || seconds.ceil() > i32::MAX as f64 {
                 return None;
             }
-            let seconds = response_data
-                .pointer("/usage/seconds")
-                .and_then(|v| v.as_f64())
-                .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
-                .filter(|seconds| seconds.ceil() <= i32::MAX as f64)?;
             Some(serde_json::json!({
                 "type": "audio_transcription",
                 "model": model_name,
@@ -4599,6 +4606,13 @@ mod tests {
         assert_eq!(body["duration_seconds"], 2);
         assert_eq!(body["id"], "trans-1");
 
+        for duration in [serde_json::json!(1.25), serde_json::json!("1.25")] {
+            let resp = serde_json::json!({"text": "synthetic", "duration": duration});
+            let body = build_usage_body(&UsageType::AudioTranscription, &resp, "m", "trans-2")
+                .expect("verbose transcription duration is billable");
+            assert_eq!(body["duration_seconds"], 2);
+        }
+
         for seconds in [0.0, -1.0, f64::MAX] {
             let resp = serde_json::json!({"usage": {"type": "duration", "seconds": seconds}});
             assert!(build_usage_body(&UsageType::AudioTranscription, &resp, "m", "x").is_none());
@@ -4613,6 +4627,23 @@ mod tests {
         assert!(build_usage_body(
             &UsageType::AudioTranscription,
             &serde_json::json!({"usage": {"type": "tokens", "seconds": 1}}),
+            "m",
+            "x"
+        )
+        .is_none());
+        for duration in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!("NaN"),
+            serde_json::json!("not-a-number"),
+            serde_json::json!(i32::MAX as f64 + 1.0),
+        ] {
+            let resp = serde_json::json!({"duration": duration});
+            assert!(build_usage_body(&UsageType::AudioTranscription, &resp, "m", "x").is_none());
+        }
+        assert!(build_usage_body(
+            &UsageType::AudioTranscription,
+            &serde_json::json!({"duration": 1, "usage": {"type": "tokens", "seconds": 1}}),
             "m",
             "x"
         )

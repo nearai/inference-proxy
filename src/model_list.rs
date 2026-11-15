@@ -349,7 +349,6 @@ pub(crate) fn check_process(config: &Config) -> anyhow::Result<()> {
         );
     }
     let single_model_features = [
-        (config.fusion_enabled, "FUSION_ENABLED"),
         (
             config.web_context_search_url.is_some(),
             "WEB_CONTEXT_SEARCH_URL",
@@ -1099,6 +1098,9 @@ pub fn app_state(process: Process<'_>) -> anyhow::Result<AppState> {
     );
     Ok(AppState {
         api_key_cache: Default::default(),
+        rerank_limiter: Arc::new(crate::rerank_limit::RerankLimiter::new(
+            config.rerank_limits,
+        )),
         usage_report_delivery: crate::usage_report::UsageReportDelivery::for_transport(
             config.usage_report.clone(),
             &config.usage_report_transport,
@@ -1120,7 +1122,6 @@ pub fn app_state(process: Process<'_>) -> anyhow::Result<AppState> {
         backend_pool: Arc::new(BackendPool::new(vec![UNROUTED_BACKEND_URL.to_string()])),
         ohttp_gateway: None,
         ohttp_attestation_ed25519: None,
-        fusion_caches: Arc::new(crate::fusion::FusionCaches::default()),
         vllm_dp_affinity: Arc::new(crate::vllm_dp_affinity::VllmDpAffinity::new(
             None,
             config.chat_cache_expiration_secs,
@@ -1306,6 +1307,98 @@ pub fn guard_form_field(state: &AppState, name: &str, value: &[u8]) -> Result<()
         });
     }
     Ok(())
+}
+
+/// Form fields a client may send on `/v1/images/edits`.
+pub(crate) const IMAGE_EDIT_FORM_FIELDS: [&str; 17] = [
+    "model",
+    "prompt",
+    "image",
+    "image[]",
+    "mask",
+    "n",
+    "size",
+    "response_format",
+    "output_format",
+    "output_compression",
+    "quality",
+    "background",
+    "seed",
+    "negative_prompt",
+    "guidance_scale",
+    "num_inference_steps",
+    "user",
+];
+
+/// Top-level keys a client may send on `/v1/images/generations`.
+pub(crate) const IMAGE_GENERATION_FIELDS: [&str; 18] = [
+    "model",
+    "prompt",
+    "n",
+    "size",
+    "response_format",
+    "output_format",
+    "output_compression",
+    "quality",
+    "style",
+    "background",
+    "moderation",
+    "stream",
+    "partial_images",
+    "seed",
+    "negative_prompt",
+    "guidance_scale",
+    "num_inference_steps",
+    "user",
+];
+
+/// `guard_form_field_name` for each top-level key of a JSON body: any key not
+/// in `supported` is a 400, so engine-only fields never reach the engine.
+pub fn guard_json_field_names(
+    route: &str,
+    supported: &[&str],
+    body: &Value,
+) -> Result<(), AppError> {
+    if let Some(obj) = body.as_object() {
+        for key in obj.keys() {
+            guard_form_field_name(route, supported, key)?;
+        }
+    }
+    Ok(())
+}
+
+/// Form fields a client may send on `/v1/audio/transcriptions`.
+pub(crate) const AUDIO_TRANSCRIPTION_FORM_FIELDS: [&str; 7] = [
+    "file",
+    "model",
+    "language",
+    "prompt",
+    "response_format",
+    "temperature",
+    "timestamp_granularities[]",
+];
+
+/// Longest field name repeated in the refusal of `guard_form_field_name`.
+const FORM_FIELD_ECHO_MAX_BYTES: usize = 64;
+
+/// The name check of one form field of a multipart route, run before the
+/// field is read: a field is forwarded to the engine only if its name is one
+/// of `supported`, byte for byte. A LoRA key keeps the refusal it has on every
+/// route; any other name is a 400. It is refused, not dropped, so a caller who
+/// sends one learns it did nothing.
+pub fn guard_form_field_name(route: &str, supported: &[&str], name: &str) -> Result<(), AppError> {
+    if let Some(key) = LORA_SELECTOR_KEYS.iter().find(|key| **key == name) {
+        return Err(lora_selector_refused(key));
+    }
+    if supported.contains(&name) {
+        return Ok(());
+    }
+    let named = !name.is_empty() && name.len() <= FORM_FIELD_ECHO_MAX_BYTES;
+    Err(AppError::BadRequest(if named {
+        format!("`{name}` is not a supported form field on {route}")
+    } else {
+        format!("The form has a field that is not supported on {route}")
+    }))
 }
 
 /// `guard_request_body` for a route outside `model_for` (tokenize, embeddings,

@@ -62,22 +62,12 @@ pub(crate) async fn admit(
     body: &Value,
     executions: i32,
 ) -> Result<(), AppError> {
-    admit_for_model(reporter, kind, body, executions, None).await
-}
-
-pub(crate) async fn admit_for_model(
-    reporter: &mut UsageReporter,
-    kind: &UsageType,
-    body: &Value,
-    executions: i32,
-    execution_model: Option<&str>,
-) -> Result<(), AppError> {
     if reporter.admission_mode == AdmissionMode::Off {
         return Ok(());
     }
     let measured = features(kind, body, executions);
     match measured {
-        Ok(features) => admit_features(reporter, &features, execution_model).await,
+        Ok(features) => admit_features(reporter, &features).await,
         Err(_) if reporter.admission_mode == AdmissionMode::Audit => {
             tracing::warn!("Admission audit could not measure request");
             Ok(())
@@ -89,7 +79,6 @@ pub(crate) async fn admit_for_model(
 pub(crate) async fn admit_features(
     reporter: &mut UsageReporter,
     features: &crate::monetary_features::UsageFeatures,
-    execution_model: Option<&str>,
 ) -> Result<(), AppError> {
     // Never carry an earlier attempt's ID into a new attempt or an audit-only receipt.
     reporter.budget_report_id = None;
@@ -97,7 +86,7 @@ pub(crate) async fn admit_features(
         return Ok(());
     }
     let started = std::time::Instant::now();
-    let result = request_admission(reporter, features, execution_model).await;
+    let result = request_admission(reporter, features).await;
     metrics::rpc_result(reporter.admission_mode, &result, started.elapsed());
     if result.is_err() {
         reporter.budget_report_id = None;
@@ -121,7 +110,6 @@ struct AdmissionResponse {
 async fn request_admission(
     reporter: &mut UsageReporter,
     features: &crate::monetary_features::UsageFeatures,
-    execution_model: Option<&str>,
 ) -> Result<AdmissionMode, AppError> {
     let unavailable = || AppError::UpstreamParsed {
         status: StatusCode::SERVICE_UNAVAILABLE,
@@ -150,7 +138,7 @@ async fn request_admission(
     let response = reporter.http_client.post(format!("{}/v1/internal/budget", base.trim_end_matches('/')))
         .bearer_auth(token).timeout(Duration::from_millis(reporter.admission_timeout_ms)).json(&json!({
             "id": id.to_string(), "organization_id": org, "workspace_id": workspace, "api_key_id": key,
-            "model": reporter.model_name, "execution_model": execution_model, "features": features,
+            "model": reporter.model_name, "features": features,
             "mode": reporter.admission_mode,
         })).send().await.map_err(|_| unavailable())?;
     let status = response.status();
@@ -271,17 +259,4 @@ async fn finish_attempt(reporter: &UsageReporter, unknown: bool) {
     if !result.is_ok_and(|r| r.status().is_success()) {
         tracing::warn!(operation, "Budget lifecycle update failed; awaiting expiry");
     }
-}
-
-// Fusion fans out in one task. Each actual HTTP attempt gets a fresh reservation and
-// final receipt, so a failed panel or synthesis cannot discard another panel's cost.
-tokio::task_local! { static FUSION_REPORTER: Option<UsageReporter>; }
-pub(crate) async fn scope<F: std::future::Future>(
-    reporter: Option<UsageReporter>,
-    future: F,
-) -> F::Output {
-    FUSION_REPORTER.scope(reporter, future).await
-}
-pub(crate) fn scoped_reporter() -> Option<UsageReporter> {
-    FUSION_REPORTER.try_with(Clone::clone).ok().flatten()
 }

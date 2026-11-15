@@ -52,6 +52,8 @@ async fn unknown_route() -> AppError {
 /// What the process serves: the router for `state` behind the middleware
 /// stack, outermost first: HTTP metrics, the request id, the per-IP rate
 /// limit. `main` serves exactly this, and the list-mode tests drive it.
+/// With OHTTP enabled, the process-wide `POST /ohttp` in-flight cap
+/// (`OHTTP_MAX_INFLIGHT`) is installed here for the relay handler to read.
 pub fn build_app(state: AppState) -> Router {
     let rate_limit_state = crate::rate_limit::RateLimitState {
         limiter: crate::rate_limit::build_rate_limiter(
@@ -60,7 +62,13 @@ pub fn build_app(state: AppState) -> Router {
         ),
         trust_proxy_headers: state.config.rate_limit_trust_proxy_headers,
     };
-    build_router_for(&state)
+    let mut router = build_router_for(&state);
+    if state.ohttp_gateway.is_some() {
+        if let Some(limit) = ohttp::OhttpRelayLimit::new(state.config.ohttp_max_inflight) {
+            router = router.layer(axum::Extension(limit));
+        }
+    }
+    router
         .layer(axum::middleware::from_fn(
             crate::rate_limit::rate_limit_middleware,
         ))

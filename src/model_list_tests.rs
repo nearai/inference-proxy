@@ -1425,3 +1425,122 @@ fn a_single_models_log_lines_carry_no_model_field() {
         ]
     );
 }
+
+const FORM_ROUTES: [(&str, &[&str]); 2] = [
+    ("/v1/images/edits", &IMAGE_EDIT_FORM_FIELDS),
+    ("/v1/audio/transcriptions", &AUDIO_TRANSCRIPTION_FORM_FIELDS),
+];
+
+fn form_field_refusal(route: &str, supported: &[&str], name: &str) -> String {
+    match guard_form_field_name(route, supported, name) {
+        Err(AppError::BadRequest(message)) => message,
+        other => panic!("{route} {name:?}: expected a 400, got {other:?}"),
+    }
+}
+
+#[test]
+fn form_fields_on_a_routes_list_are_accepted() {
+    for (route, supported) in FORM_ROUTES {
+        for name in supported {
+            assert!(
+                guard_form_field_name(route, supported, name).is_ok(),
+                "{route} {name}"
+            );
+        }
+    }
+    for name in ["model", "prompt", "image", "image[]", "mask", "size"] {
+        assert!(IMAGE_EDIT_FORM_FIELDS.contains(&name), "{name}");
+    }
+    for name in [
+        "file",
+        "model",
+        "language",
+        "prompt",
+        "response_format",
+        "temperature",
+        "timestamp_granularities[]",
+    ] {
+        assert!(AUDIO_TRANSCRIPTION_FORM_FIELDS.contains(&name), "{name}");
+    }
+}
+
+#[test]
+fn a_form_field_off_a_routes_list_is_refused_by_name() {
+    for (route, supported, names) in [
+        (
+            "/v1/images/edits",
+            &IMAGE_EDIT_FORM_FIELDS[..],
+            &[
+                "url",
+                "url[]",
+                "perf_dump_path",
+                "upscaling_model_path",
+                "enhance_prompt",
+                "file",
+                "unknown",
+            ][..],
+        ),
+        (
+            "/v1/audio/transcriptions",
+            &AUDIO_TRANSCRIPTION_FORM_FIELDS[..],
+            &["url", "stream", "seed", "image", "user", "unknown"][..],
+        ),
+    ] {
+        for name in names {
+            assert_eq!(
+                form_field_refusal(route, supported, name),
+                format!("`{name}` is not a supported form field on {route}")
+            );
+        }
+    }
+}
+
+#[test]
+fn a_form_field_name_is_matched_byte_for_byte() {
+    for (route, supported, names) in [
+        (
+            "/v1/images/edits",
+            &IMAGE_EDIT_FORM_FIELDS[..],
+            &["Prompt", "IMAGE", " image", "image ", "image[0]", "mask[]"][..],
+        ),
+        (
+            "/v1/audio/transcriptions",
+            &AUDIO_TRANSCRIPTION_FORM_FIELDS[..],
+            &["File", " file", "file[]", "timestamp_granularities"][..],
+        ),
+    ] {
+        for name in names {
+            assert!(
+                form_field_refusal(route, supported, name).contains(name),
+                "{route} {name:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_form_field_without_a_name_or_with_a_long_one_is_refused_unnamed() {
+    let long = "x".repeat(FORM_FIELD_ECHO_MAX_BYTES + 1);
+    let longest = "x".repeat(FORM_FIELD_ECHO_MAX_BYTES);
+    for (route, supported) in FORM_ROUTES {
+        for name in ["", long.as_str()] {
+            assert_eq!(
+                form_field_refusal(route, supported, name),
+                format!("The form has a field that is not supported on {route}")
+            );
+        }
+        assert!(form_field_refusal(route, supported, &longest).contains(&longest));
+    }
+}
+
+#[test]
+fn a_lora_form_field_keeps_the_lora_refusal() {
+    for (route, supported) in FORM_ROUTES {
+        for name in LORA_SELECTOR_KEYS {
+            assert_eq!(
+                form_field_refusal(route, supported, name),
+                format!("`{name}` is not supported: the model is chosen by `model` alone")
+            );
+        }
+    }
+}

@@ -35,10 +35,10 @@ This is a Rust rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-pro
 - `config.rs` — `Config::from_env()`, all env vars loaded at startup
 - `signing.rs` — `EcdsaContext` (secp256k1 EIP-191), `Ed25519Context`, `SigningPair`
 - `proxy.rs` — `proxy_json_request()`, `proxy_streaming_request()`, `proxy_multipart_request()`, `proxy_simple()` — the core proxy+sign+cache helpers that routes delegate to
-- `cache.rs` — `ChatCache` wrapping moka with TTL, key format `{model}:chat:{id}`
+- `cache.rs` — `ChatCache` wrapping moka with TTL, key format `{model}:chat:{id}`; each entry records the direct-key owner (`SignatureOwner`: org + workspace, from the request's `UsageReporter` via `proxy::signature_owner`). A config `TOKEN` reads every entry, an `sk-` key only its owner's (`SignatureReader`)
 - `attestation.rs` — `AttestationCache`, `generate_attestation()`, GPU evidence collection with retry/serialization, dstack TDX quotes
 - `auth.rs` — `RequireAuth` axum extractor (validates Bearer token)
-- `api_key_cache.rs` — `ApiKeyCache`: cloud-api's 200 for an `sk-` key, kept 5 minutes (one per process, on `AppState`)
+- `api_key_cache.rs` — `ApiKeyCache`: coalesces concurrent `sk-` key checks; later requests revalidate so revocation is observed
 - `routes/` — thin handlers that parse request, call proxy helpers
 - `replica_state/` — opt-in publishing of one signed host frame per tick to Redis (`spawn_replica_state_publisher`)
 - `usage_report.rs` — delivery of usage reports to cloud-api off the request path (`UsageReportDelivery`, one per process): per-attempt timeout, retries, a cap on reports in flight with a bounded queue, a drain at shutdown (`VLLM_PROXY_USAGE_REPORT_*`)
@@ -74,7 +74,7 @@ This is a Rust rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-pro
 - Internal errors hide details from clients (returns generic "Internal server error")
 - Named route upstream errors are passed through verbatim (status code + body)
 - `parse_upstream_error()` in `proxy.rs` handles both vLLM flat (`{"message":"..."}`) and nested (`{"error":{"message":"..."}}`) formats
-- All upstream errors logged with `warn!` including `error_message` and `error_type` (never body content)
+- Log upstream status and a bounded error kind; raw upstream error messages may contain request data
 - `request_id_middleware` wraps requests in a tracing span — all log lines automatically include `request_id`, `method`, `path`
 - Unit tests live in `#[cfg(test)] mod tests` within each source file
 - Integration tests in `tests/integration.rs` use `tower::ServiceExt::oneshot` with wiremock
@@ -174,6 +174,6 @@ nothing may change for it.
 
 ### Cloud API integration
 
-- `CLOUD_API_URL` enables two features: (1) `sk-live-`/`sk-test-` API key validation via `POST /v1/check_api_key` (a 200 carrying the full identity is reused for 5 minutes per key, `api_key_cache.rs`; any other answer is never kept: every request is checked until one gets a 200; concurrent requests wait for the check in flight and share only its 200), (2) fire-and-forget usage reporting via `POST /v1/internal/usage` (over HTTP, the default; with `VLLM_PROXY_USAGE_REPORT_TRANSPORT=sqs` reports go to the usage queue instead, which needs `VLLM_PROXY_USAGE_REPORT_SQS_URL` and `VLLM_PROXY_AWS_CREDENTIALS_URL` (the base URL of an IMDSv2 endpoint such as `aws_signing_helper serve`, e.g. `http://127.0.0.1:9911`; the gateway does the token, role-name, credentials flow, `src/aws_credentials.rs`) and no `CLOUD_API_URL`)
+- `CLOUD_API_URL` enables two features: (1) `sk-live-`/`sk-test-` API key validation via `POST /v1/check_api_key` (concurrent requests can share one in-flight check; a later request revalidates the key, `api_key_cache.rs`), (2) fire-and-forget usage reporting via `POST /v1/internal/usage` (over HTTP, the default; with `VLLM_PROXY_USAGE_REPORT_TRANSPORT=sqs` reports go to the usage queue instead, which needs `VLLM_PROXY_USAGE_REPORT_SQS_URL` and `VLLM_PROXY_AWS_CREDENTIALS_URL` (the base URL of an IMDSv2 endpoint such as `aws_signing_helper serve`, e.g. `http://127.0.0.1:9911`; the gateway does the token, role-name, credentials flow, `src/aws_credentials.rs`) and no `CLOUD_API_URL`)
 - Usage reporting is in `proxy.rs`: `spawn_usage_report()` posts (over HTTP) to `/v1/internal/usage` with the shared `CLOUD_API_USAGE_TOKEN` as Bearer and the subject identity (org/workspace/api_key_id, from the `/v1/check_api_key` response) in the body, plus a top-level `discount_to_user` when `VLLM_PROXY_DISCOUNT_TO_USER` is set (`complete_usage_body`). The legacy `sk-`-authenticated `POST /v1/usage` endpoint was removed from cloud-api; over HTTP, if `CLOUD_API_USAGE_TOKEN` (or any identity field) is missing, reporting is **skipped with an error log** — there is no fallback. Failures are logged as warnings. The checked report is serialized once and handed to `AppState.usage_report_delivery` (`usage_report.rs`), which sends it: one attempt with a 5 s timeout by default, and with `VLLM_PROXY_USAGE_REPORT_*` a longer timeout, retries with backoff (timeout, connection, transport, 5xx, 429; never another 4xx), an overall deadline (an attempt only starts while its whole timeout fits before it), a cap on reports in flight with a bounded queue (full = the report that waited longest is dropped and counted; a longer timeout and retries require the cap) and a drain at shutdown. With none of those set, the request, the log lines and the metric series must stay exactly what they were; the delivery series and the extra log fields exist only for a process whose policy differs from the default (docs/gateway-mode.md, "Usage report delivery").
 - **MODEL_NAME must exactly match `model_name` in cloud-api's model table** — cloud-api does NOT check model aliases, so a mismatch causes silent 404s on usage reporting

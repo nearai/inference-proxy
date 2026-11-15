@@ -11,7 +11,6 @@ Rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-proxy) (Python).
 - **Backend-agnostic** — works with any OpenAI-compatible backend (vLLM, sglang, etc.).
 - **Streaming support** — SSE streams are hashed incrementally and signed on completion.
 - **In-memory cache** — moka-based TTL cache for signatures (no Redis dependency).
-- **Fusion orchestration** — optional server-side multi-model deliberation for `/v1/chat/completions`, gated by `FUSION_ENABLED`.
 
 ## Endpoints
 
@@ -25,12 +24,12 @@ Rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-proxy) (Python).
 | POST | `/v1/completions` | Yes | Text completions |
 | POST | `/v1/embeddings` | Yes | Embeddings |
 | POST | `/v1/tokenize` | Yes | Tokenization (no signing) |
-| POST | `/v1/rerank` | Yes | Reranking |
+| POST | `/v1/rerank` | Yes | Reranking (at most 4,096 `documents`; more is a `400` before dispatch). Concurrent requests are limited: by default 2 per Cloud API organization + workspace, 16 for all Cloud API keys, 16 shared by the config tokens (`VLLM_PROXY_RERANK_MAX_INFLIGHT_*`); over the limit is a `429` with `Retry-After` before dispatch (counted in `inference_proxy_rerank_refused_total{limit}`) |
 | POST | `/v1/score` | Yes | Scoring |
 | POST | `/v1/privacy/classify` | Yes | Privacy classification |
-| POST | `/v1/images/generations` | Yes | Image generation |
-| POST | `/v1/images/edits` | Yes | Image editing (multipart) |
-| POST | `/v1/audio/transcriptions` | Yes | Audio transcription (multipart) |
+| POST | `/v1/images/generations` | Yes | Image generation. A top-level key outside the supported list (`IMAGE_GENERATION_FIELDS`) is a 400 |
+| POST | `/v1/images/edits` | Yes | Image editing (multipart). A form field outside the supported list (`IMAGE_EDIT_FORM_FIELDS`) is a 400 |
+| POST | `/v1/audio/transcriptions` | Yes | Audio transcription (multipart). A form field outside the supported list (`AUDIO_TRANSCRIPTION_FORM_FIELDS`) is a 400 |
 | GET | `/v1/signature/{chat_id}` | Yes | Retrieve cached signature |
 | GET | `/v1/attestation/report` | No | TEE attestation report |
 | POST | `/internal/gpu_evidence` | Trusted token | Sibling-proxy GPU evidence |
@@ -151,6 +150,25 @@ All configuration is via environment variables:
 | `VLLM_PROXY_DISCOUNT_TO_USER` | No | empty (list price) | Gateway mode: the lane's discount off the list price, a fraction in `[0, 1)` with at most four decimal places (`0.2` = 20 % off; empty or `0` = none; an invalid value fails startup). Requires `VLLM_PROXY_MODELS_DOCUMENT_URL`. Published as `discount_to_user` on the models document entry (and on every entry of the engine list served while that source is unreadable) and sent as `discount_to_user` on every usage report, so the advertised and the billed price come from one setting |
 | `VLLM_PROXY_STRICT_REQUEST_MODEL` | No | off | Single-model mode: a body `model` must be `MODEL_NAME` byte for byte (404 `model_not_found` otherwise, 400 for a non-string; a missing `model` is still served), on chat, completions, the JSON routes and the `model` field of the multipart routes. Off, the process serves its one model whatever the body says. List mode always matches exactly |
 | `VLLM_PROXY_BACKEND_LORA` | No | unset | Single-model mode, SGLang with `--enable-lora`: the adapter that `MODEL_NAME` stands for, set as `lora_path` on the chat, completions and embeddings bodies forwarded to the engine. Requires `VLLM_PROXY_STRICT_REQUEST_MODEL=1` (startup fails otherwise). Independent of both, a request carrying `lora_path`, `lora_id` or `lora_name` (a form field on the multipart routes) is always a 400 |
+| `VLLM_PROXY_REQUEST_GUARD` | No | on | Request field guard (`src/request_guard.rs`) on chat, completions, the JSON routes and the multipart routes: out-of-bounds fields are a 400 `invalid_request_error` with `param` set, engine-internal fields are stripped, and `/v1/images/generations` forwards only `IMAGE_GENERATION_FIELDS`. `0` turns all of it off (the multipart form-field lists are separate and stay on); for each limit below, `0` turns that rule off |
+| `VLLM_PROXY_MAX_TOP_LOGPROBS` | No | `20` | Max `top_logprobs`, and `logprobs` when it is a number |
+| `VLLM_PROXY_MAX_N` | No | `8` | Max `n` (chat, completions) |
+| `VLLM_PROXY_MAX_LOGIT_BIAS_ENTRIES` / `VLLM_PROXY_MAX_LOGIT_BIAS_VALUE` | No | `300` / `100` | Max `logit_bias` entries and `\|value\|`; keys must be token ids, values finite |
+| `VLLM_PROXY_MAX_STOP_SEQUENCES` / `VLLM_PROXY_MAX_STOP_SEQUENCE_CHARS` | No | `16` / `1024` | Max `stop` entries and characters per entry |
+| `VLLM_PROXY_MAX_STOP_TOKEN_IDS` | No | `64` | Max `stop_token_ids` entries; each must be a non-negative token id |
+| `VLLM_PROXY_VOCAB_SIZE` | No | unset | Token ids in `logit_bias` and `stop_token_ids` must be below this (unset: below 2^31) |
+| `VLLM_PROXY_MAX_MODEL_NAME_CHARS` | No | `256` | Max characters in `model` (also the multipart `model` field) |
+| `VLLM_PROXY_MAX_CONTENT_PART_UUID_CHARS` | No | `256` | Max characters in a content part `uuid` |
+| `VLLM_PROXY_MAX_IMAGE_N` | No | `10` | Image routes: max `n` |
+| `VLLM_PROXY_MAX_IMAGE_SIDE` | No | `2048` | Image routes: max width and height in `size` |
+| `VLLM_PROXY_MAX_IMAGE_STEPS` | No | `100` | Image routes: max `num_inference_steps` |
+| `VLLM_PROXY_MAX_REGEX_NESTED_PRODUCT` | No | `64` | Structured-output regexes (also JSON-schema `pattern`): max outer bound × variable-range bound nested inside it; an unbounded outer repeat around a variable-range one is refused |
+| `VLLM_PROXY_MAX_REGEX_STAR_REPEAT` | No | `32` | Structured-output regexes: max bound of a group that contains `*`, `+` or `{m,}` |
+| `VLLM_PROXY_MAX_REGEX_BOUND` | No | `10000` | Structured-output regexes: max single repeat bound |
+| `VLLM_PROXY_MAX_REGEX_CHARS` | No | `8192` | Structured-output regexes: max pattern length |
+| `VLLM_PROXY_ALLOW_GRAMMAR` | No | off | Forward EBNF grammars (`grammar`, `ebnf`, `guided_grammar`); off = 400 |
+| `VLLM_PROXY_REJECT_LOCAL_MEDIA_URLS` | No | on | Chat `image_url`/`video_url`/`audio_url`/`input_image` URLs must be http, https or data (independent of `VLLM_PROXY_INLINE_MEDIA`) |
+| `VLLM_PROXY_STRIPPED_REQUEST_FIELDS` | No | see `DEFAULT_STRIPPED_FIELDS` | Top-level keys (and form fields) removed before dispatch. Default: `kv_transfer_params`, `ec_transfer_params`, `vllm_xargs`, `session_params`, `mm_hashes`, `return_hidden_states`, `custom_logit_processor`. Set to replace the list; empty = none. Not separately configurable (on with the guard): `min_tokens` <= `max_tokens`, `logprob_start_len` >= -1, finite sampling floats |
 | `MONETARY_ADMISSION` | No | `enforce` | Direct-key monetary admission: `enforce` reserves before dispatch, `audit` estimates without rejecting, `off` skips admission. Actual usage reporting runs in every mode. Invalid values fail startup. See [monetary admission](docs/gateway-mode.md#monetary-admission-and-final-receipts) |
 | `MONETARY_ADMISSION_TIMEOUT_MS` | No | `2000` | Admission RPC deadline, 100–10000 milliseconds; invalid values fail startup |
 | `VLLM_PROXY_USAGE_REPORT_TRANSPORT` | No | `http` | Where usage reports go. `http`: `POST {CLOUD_API_URL}/v1/internal/usage` with `CLOUD_API_USAGE_TOKEN`. `sqs`: a `SendMessage` to the usage queue, each report a usage envelope signed with SigV4; this needs `VLLM_PROXY_USAGE_REPORT_SQS_URL` and `VLLM_PROXY_AWS_CREDENTIALS_URL`, and does not use the Cloud API usage endpoint for delivery. Direct monetary admission in enforce/audit mode still requires `CLOUD_API_URL` and `CLOUD_API_USAGE_TOKEN`. Any other value fails startup. If the usage queue fails its startup check and `CLOUD_API_URL` and `CLOUD_API_USAGE_TOKEN` are set, the process falls back to `http` for its life (ERROR log; `inference_proxy_usage_report_transport_info{transport="http"}` is 1); without them it refuses to start |
@@ -183,12 +201,15 @@ All configuration is via environment variables:
 | `VLLM_BACKEND_PROBE_INTERVAL_SECS` | No | `2` | Poll interval for the probes; a sample older than three intervals counts as unknown |
 | `VLLM_BACKEND_LONG_CONTEXT_URLS` | No | empty | Gateway mode: backends of the long-context tier — the same hosts' handle URLs under the model's `-long` model-proxy domain — appended to the pool after `VLLM_BACKEND_URLS` so their indexes do not move. Requests estimated above `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` are placed there, everything else on the base backends. Mutually exclusive with `VLLM_DATA_PARALLEL_SIZE` |
 | `VLLM_BACKEND_LONG_CONTEXT_PROBE_URLS` | No | empty | One engine-load probe base URL per long-context backend, same order. Required when `VLLM_BACKEND_PROBE_URLS` is set, empty when it is not |
-| `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` | No | `0` (off) | Estimated input tokens above which a request goes to the long-context tier, using cloud-api's own routing estimate (text, tool calls and tool definitions at bytes/4 with its 1.2 safety factor, plus a flat cost per media part, per-message template overhead and the reserved output window; `prompt` token ids counted exactly). By default a tier with no healthy backend falls back to the other one (`VLLM_BACKEND_TIER_STRICT` turns that off); a full one refuses with 429. Not combinable with `FUSION_ENABLED` or `WEB_CONTEXT_SEARCH_URL` |
+| `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` | No | `0` (off) | Estimated input tokens above which a request goes to the long-context tier, using cloud-api's own routing estimate (text, tool calls and tool definitions at bytes/4 with its 1.2 safety factor, plus a flat cost per media part, per-message template overhead and the reserved output window; `prompt` token ids counted exactly). By default a tier with no healthy backend falls back to the other one (`VLLM_BACKEND_TIER_STRICT` turns that off); a full one refuses with 429. Not combinable with `WEB_CONTEXT_SEARCH_URL` |
 | `VLLM_BACKEND_TIER_STRICT` | No | `false` | Isolate the context tiers in both directions instead of falling back: a request whose tier has no healthy backend is refused rather than placed on the other one — 429 with `Retry-After` when admission is enabled (`admission_rejections_total{reason="tier_unavailable"}`), 503 (`error_type: "tier_unavailable"`) when it is not. Only meaningful with `VLLM_BACKEND_LONG_CONTEXT_URLS` set; without one it is ignored (a startup warning is logged) |
 | `VLLM_IMAGES_URL` | No | `{base}/v1/images/generations` | Override images endpoint |
 | `VLLM_IMAGES_EDITS_URL` | No | `{base}/v1/images/edits` | Override image edits endpoint |
 | `VLLM_TRANSCRIPTIONS_URL` | No | `{base}/v1/audio/transcriptions` | Override transcriptions endpoint |
 | `VLLM_RERANK_URL` | No | `{base}/v1/rerank` | Override rerank endpoint |
+| `VLLM_PROXY_RERANK_MAX_INFLIGHT_PER_WORKSPACE` | No | `2` | Concurrent `/v1/rerank` requests one Cloud API organization + workspace may run; more is a `429` with `Retry-After` before dispatch. At least 1 |
+| `VLLM_PROXY_RERANK_MAX_INFLIGHT_DIRECT` | No | `16` | Concurrent `/v1/rerank` requests all Cloud API keys together may run. At least 1 |
+| `VLLM_PROXY_RERANK_MAX_INFLIGHT_TRUSTED` | No | `16` | Concurrent `/v1/rerank` requests all config tokens together may run. At least 1. `DIRECT + TRUSTED` is the most the rerank engine is asked to run at once: keep it within the concurrency the engine serves at an acceptable latency |
 | `VLLM_SCORE_URL` | No | `{base}/v1/score` | Override score endpoint |
 | `REPLICA_STATE_REDIS_URL` | No | unset (feature off) | Redis URL for opt-in signed host-frame state publishing |
 | `REPLICA_STATE_HOST_ID` | Yes, if the URL is set | — | Host identifier used in Redis keys and every published frame |
@@ -197,80 +218,20 @@ All configuration is via environment variables:
 
 `x-nearai-replica: <index>` (the backend's position in `VLLM_BACKEND_URLS`, then the long-context URLs) is honoured only from callers using the proxy's `TOKEN` (same as `X-NearAI-Priority`), under the guard above. It is ignored for API-key callers. Metrics: `placement_hint_honored_total`, `placement_hint_overridden_total{reason}`.
 
-### Fusion
+### Server-side web search
 
-Fusion is disabled by default. When enabled, `/v1/chat/completions` intercepts
-OpenRouter-compatible `openrouter:fusion` server tools, NEAR `nearai:fusion`
-tools, and OpenRouter plugin entries with `{"id":"fusion"}`; all other routes
-and non-Fusion chat requests keep the normal proxy behavior. Cloud API remains a
-pass-through: billing observes the single final response, whose `usage` contains
-the aggregate token usage from panel, judge, and synthesis calls. Direct customer-key
-Fusion reserves and reports each actual child attempt under the outer model tariff;
-its final aggregate is not reported a second time. Per-attempt rounding and billing
-of completed children remain visible even when a later synthesis fails.
-
-Supported request shapes:
-
-```json
-{"tools":[{"type":"openrouter:fusion","parameters":{"analysis_models":["model-a"],"model":"judge-model"}}]}
-```
-
-```json
-{"plugins":[{"id":"fusion","analysis_models":["model-a"],"model":"judge-model"}]}
-```
-
-Legacy flat tool fields continue to work for `nearai:fusion` and existing
-clients. `plugins[].enabled=false` is not treated as a Fusion invocation. The
-`openrouter/fusion` model alias is not resolved in inference-proxy because
-cloud-api routes by model name before pass-through.
+A `/v1/chat/completions` request whose only tool is
+`{"type":"web_context_search"}` runs a server-side tool loop against the Brave
+LLM Context API. It requires `stream: true` and the variables below; otherwise
+it is refused with 400.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `FUSION_ENABLED` | No | `false` | Enables server-side Fusion orchestration |
-| `FUSION_INTERNAL_BEARER_TOKEN` | Yes, when enabled | — | Bearer token used for internal direct completions calls |
-| `FUSION_ENDPOINTS_URL` | No | `https://completions.near.ai/endpoints` | Endpoint discovery source |
-| `FUSION_ENDPOINTS_TTL_SECS` | No | `300` | Discovery cache TTL |
-| `FUSION_DEFAULT_ANALYSIS_MODELS` | No | — | Comma-separated fallback panel models |
-| `FUSION_MAX_PANEL_MODELS` | No | `8` | Hard cap on panel fan-out |
-| `FUSION_MAX_DEPTH` | No | `1` | Recursion guard for Fusion-to-Fusion calls |
-| `FUSION_PANEL_TIMEOUT_SECS` | No | `120` | Timeout for Fusion panel, judge, and synthesis chat calls |
-| `FUSION_MAX_RESPONSE_BYTES` | No | `10485760` | Max bytes buffered from Fusion endpoint discovery and internal model responses |
-| `FUSION_INTERNAL_MAX_ATTEMPTS` | No | `2` | Attempts for transient Fusion direct model HTTP calls; `1` disables retries; max `5` |
-| `FUSION_INTERNAL_RETRY_INITIAL_BACKOFF_MS` | No | `250` | Initial backoff for Fusion direct model retries; doubles per attempt with full jitter |
-| `AGENT_LOOP_MAX_ITERATIONS` | No | `5` | Also caps Fusion `web_context_search` tool calls |
-| `WEB_CONTEXT_SEARCH_URL` | If Fusion web search is used | — | Brave LLM Context endpoint |
-| `WEB_CONTEXT_SEARCH_API_KEY` | If Fusion web search is used | — | Brave LLM Context API key |
+| `WEB_CONTEXT_SEARCH_URL` | If web search is used | — | Brave LLM Context endpoint |
+| `WEB_CONTEXT_SEARCH_API_KEY` | If web search is used | — | Brave LLM Context API key |
 | `BRAVE_LLM_CONTEXT_API_KEY` | No | — | Alias for `WEB_CONTEXT_SEARCH_API_KEY` |
-
-Production launch checklist:
-
-- Keep `FUSION_ENABLED=false` until the direct completions token and Brave key
-  are provisioned in the deployment secret store.
-- Set `FUSION_INTERNAL_BEARER_TOKEN` to a token accepted by the direct model
-  proxies listed by `FUSION_ENDPOINTS_URL`.
-- Treat `FUSION_ENDPOINTS_URL` as a trust anchor. Every returned panel or judge
-  domain receives `FUSION_INTERNAL_BEARER_TOKEN`; do not point it at
-  user-controlled endpoint lists or allow per-request endpoint overrides.
-- V1 does not SSRF-filter discovered panel domains beyond trusting
-  `FUSION_ENDPOINTS_URL`. Keep the endpoint list operator-controlled and use
-  network policy if a deployment needs additional egress restrictions.
-- V1 attestation covers the synthesis proxy response. Panel attestation is an
-  informational `/attestation/report` liveness check and is not
-  cryptographically bound into the final response signature.
-- For Fusion requests that include `{"type":"web_context_search"}`, set
-  `WEB_CONTEXT_SEARCH_URL=https://api.search.brave.com/res/v1/llm/context`
-  and either `WEB_CONTEXT_SEARCH_API_KEY` or `BRAVE_LLM_CONTEXT_API_KEY`.
-- Run the local/live smoke test before flipping the feature flag:
-
-```bash
-FUSION_INTERNAL_BEARER_TOKEN=... \
-WEB_CONTEXT_SEARCH_API_KEY=... \
-scripts/fusion_e2e.py --real-brave
-```
-
-The smoke test starts only local helper processes, calls live direct model
-proxies, verifies non-streaming and streaming Fusion, checks aggregate usage,
-and retrieves the final response signature. It does not deploy production.
+| `AGENT_LOOP_MAX_ITERATIONS` | No | `5` | Caps `web_context_search` tool calls per request |
+| `WEB_CONTEXT_SEARCH_TIMEOUT_SECS` | No | `30` | Timeout for one search call |
 
 ## Running
 
@@ -449,9 +410,9 @@ cargo test
 ```
 
 The suite includes unit tests for signing, cache, config, errors,
-attestation helpers, SSE parsing, Fusion orchestration, and integration tests
+attestation helpers, SSE parsing, and integration tests
 with wiremock mock backends for cryptographic signature verification,
-multipart endpoints, streaming completions, E2EE, web tools, and Fusion.
+multipart endpoints, streaming completions, E2EE, and web tools.
 
 ## Project Structure
 
@@ -496,5 +457,11 @@ Every signed response produces a `SignedChat` cached by response ID:
 
 - **ECDSA**: EIP-191 `personal_sign` format, recoverable secp256k1 signature
 - **Ed25519**: Direct message signing, 64-byte signature
+
+`GET /v1/signature/{id}` with a configured `TOKEN` returns any cached signature. With a
+Cloud API key (`sk-`) it returns only signatures of responses served to a key of the same
+organization and workspace; any other id, including one cached for a `TOKEN` caller,
+answers 404 like an unknown id. The cache is per process: a signature is only found on
+the instance that served the response.
 
 In production, signing keys are derived from dstack KMS (`DstackClient::get_key`). In dev mode (`DEV=1`), random keys are generated at startup.

@@ -32,7 +32,8 @@ pub struct EncryptionContext {
 }
 
 impl EncryptionContext {
-    fn all_fields(&self) -> bool {
+    /// True when the extended field set applies: always in v3, opt-in in v1/v2.
+    pub(crate) fn all_fields(&self) -> bool {
         self.version == 3 || self.encrypt_all_fields
     }
 
@@ -160,6 +161,9 @@ pub fn extract_encryption_context(
             if version == 3 {
                 // Validate/canonicalize before inference, including empty requests.
                 context.client_pub_key = context.canonical_reply_key()?;
+            } else if algo == EncryptionAlgo::Ed25519 {
+                // v1/v2: same Ed25519 point checks before inference; key bytes unchanged.
+                context.canonical_reply_key()?;
             }
             Ok(Some(context))
         }
@@ -241,10 +245,15 @@ mod nacl {
 
     /// Convert an Ed25519 public key (32 bytes) to an X25519 public key.
     /// Uses the birational map from Edwards to Montgomery form.
+    ///
+    /// Rejects bytes that are not a curve point and small-order (weak) points.
     pub fn ed25519_public_to_x25519(ed25519_pub: &[u8; 32]) -> Result<[u8; 32], String> {
         use ed25519_dalek::VerifyingKey;
         let vk = VerifyingKey::from_bytes(ed25519_pub)
-            .map_err(|e| format!("Invalid Ed25519 public key: {e}"))?;
+            .map_err(|_| "Invalid Ed25519 public key".to_string())?;
+        if vk.is_weak() {
+            return Err("Invalid Ed25519 public key: small-order point".to_string());
+        }
         Ok(vk.to_montgomery().to_bytes())
     }
 }
@@ -969,7 +978,8 @@ fn retain_completion_fields(value: &mut serde_json::Value, endpoint: Endpoint, s
 /// Decrypt tool/function definitions in the request.
 /// `tools[].function.name`, `.description`, and `.parameters` (serialized JSON schema)
 /// are user-defined and reveal what capabilities are exposed to the model.
-/// v3 requires authentication; v1/v2 retain plaintext compatibility.
+/// Only called with the extended field set active. A non-empty string must
+/// decrypt in every version; v3 also requires a string that decrypts to JSON.
 fn decrypt_tools_definitions(
     value: &mut serde_json::Value,
     ctx: &EncryptionContext,
@@ -1009,27 +1019,26 @@ fn decrypt_tools_definitions(
                         }
                         continue;
                     }
-                    if let Some(s) = params.as_str() {
-                        if !s.is_empty() {
-                            if let Ok(decrypted) = decrypt_string_for_field(
-                                s,
+                    if !params.is_null() {
+                        let ciphertext = params.as_str().ok_or_else(|| {
+                            AppError::BadRequest(
+                                "Encrypted tool parameters must be a string".into(),
+                            )
+                        })?;
+                        if !ciphertext.is_empty() {
+                            let decrypted = decrypt_string_for_field(
+                                ciphertext,
                                 ctx,
                                 signing,
                                 "tools[].function.parameters",
-                            ) {
-                                // Restore the JSON schema object from the decrypted string
-                                if let Ok(parsed) =
-                                    serde_json::from_str::<serde_json::Value>(&decrypted)
-                                {
-                                    *params = parsed;
-                                } else {
-                                    *params = serde_json::Value::String(decrypted);
-                                }
-                            }
-                            // On failure, leave original value (already a JSON object)
+                            )?;
+                            *params = serde_json::from_str(&decrypted).map_err(|_| {
+                                AppError::BadRequest(
+                                    "Decrypted tool parameters must be valid JSON".into(),
+                                )
+                            })?;
                         }
                     }
-                    // If parameters is already an object, it was not encrypted — pass through
                 }
             }
         }
@@ -1084,8 +1093,8 @@ fn decrypt_chat_message_fields(
         decrypt_field(audio, "data", "messages[].audio.data", ctx, signing)?;
     }
 
-    // v3 authenticates every protected field; legacy clients retain opt-in,
-    // lenient handling of the extended fields.
+    // Extended fields: always in v3, opt-in in v1/v2. Once selected, a
+    // non-empty string must decrypt in every version.
     if ctx.all_fields() {
         try_decrypt_field(msg, "refusal", "messages[].refusal", ctx, signing)?;
         // Top-level name field used in tool/function role messages
@@ -1291,9 +1300,9 @@ fn decrypt_field(
     Ok(())
 }
 
-/// Decrypt an extended request field in-place.
-/// V3 requires successful decryption. V1/v2 preserve the original value on failure
-/// to support clients that send extended fields as plaintext.
+/// Decrypt an extended request field in-place. Only called with the extended
+/// field set active, so a decryption failure rejects the request in every
+/// version instead of forwarding the original value.
 fn try_decrypt_field(
     obj: &mut serde_json::Value,
     field: &str,
@@ -1301,20 +1310,15 @@ fn try_decrypt_field(
     ctx: &EncryptionContext,
     signing: &SigningPair,
 ) -> Result<(), AppError> {
-    if ctx.version == 3 {
-        return decrypt_field(obj, field, label, ctx, signing);
+    if obj
+        .get(field)
+        .is_some_and(|value| !value.is_string() && !value.is_null())
+    {
+        return Err(AppError::BadRequest(format!(
+            "Encrypted {field} must be a string"
+        )));
     }
-    if let Some(val) = obj.get_mut(field) {
-        if let Some(s) = val.as_str() {
-            if !s.is_empty() {
-                if let Ok(decrypted) = decrypt_string_for_field(s, ctx, signing, label) {
-                    *val = serde_json::Value::String(decrypted);
-                }
-                // On failure, leave original value — assume plaintext
-            }
-        }
-    }
-    Ok(())
+    decrypt_field(obj, field, label, ctx, signing)
 }
 
 /// Decrypt a field that may be a string or an array of encrypted strings.
@@ -2198,6 +2202,158 @@ mod tests {
         assert_eq!(ctx.client_pub_key.len(), 32);
     }
 
+    // ── Ed25519 client key validation ─────────────────────────────
+
+    /// No header (v1 default) and each explicit version.
+    const ED25519_KEY_VERSIONS: [Option<&str>; 4] = [None, Some("1"), Some("2"), Some("3")];
+
+    fn ed25519_key_headers(key: &[u8], version: Option<&str>) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-signing-algo", "ed25519".parse().unwrap());
+        headers.insert("x-client-pub-key", hex::encode(key).parse().unwrap());
+        if let Some(version) = version {
+            headers.insert("x-encryption-version", version.parse().unwrap());
+        }
+        headers
+    }
+
+    /// Encodings of small-order points, derived from the curve equation
+    /// -x^2 + y^2 = 1 + d*x^2*y^2 (bit 255 is the sign of x).
+    fn weak_ed25519_keys() -> Vec<[u8; 32]> {
+        // y = 1, x = 0: the identity (order 1), canonical and with the sign bit set.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let mut identity_signed = identity;
+        identity_signed[31] |= 0x80;
+        // y = 0, x = ±sqrt(-1): order 4.
+        let order4 = [0u8; 32];
+        let mut order4_signed = order4;
+        order4_signed[31] = 0x80;
+        // y = p - 1 = -1, x = 0: order 2.
+        let mut order2 = [0xffu8; 32];
+        order2[0] = 0xec;
+        order2[31] = 0x7f;
+        vec![identity, identity_signed, order4, order4_signed, order2]
+    }
+
+    /// A 32-byte value that is not the encoding of any curve point.
+    fn off_curve_ed25519_key() -> [u8; 32] {
+        (2u8..=255)
+            .map(|b| {
+                let mut key = [0u8; 32];
+                key[0] = b;
+                key
+            })
+            .find(|key| ed25519_dalek::VerifyingKey::from_bytes(key).is_err())
+            .expect("some small y is not on the curve")
+    }
+
+    #[test]
+    fn test_weak_ed25519_vectors_are_small_order_points() {
+        // Guards the vectors themselves: each must decode, and be weak, so the
+        // rejection tests below exercise the small-order check.
+        for key in weak_ed25519_keys() {
+            let vk = ed25519_dalek::VerifyingKey::from_bytes(&key).unwrap();
+            assert!(vk.is_weak(), "{}", hex::encode(key));
+        }
+    }
+
+    #[test]
+    fn test_extract_encryption_context_rejects_weak_ed25519_key_all_versions() {
+        for key in weak_ed25519_keys() {
+            for version in ED25519_KEY_VERSIONS {
+                let result = extract_encryption_context(&ed25519_key_headers(&key, version));
+                assert!(
+                    matches!(result, Err(AppError::BadRequest(_))),
+                    "key={} version={version:?}",
+                    hex::encode(key)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_extract_encryption_context_rejects_off_curve_ed25519_key_all_versions() {
+        let key = off_curve_ed25519_key();
+        for version in ED25519_KEY_VERSIONS {
+            let result = extract_encryption_context(&ed25519_key_headers(&key, version));
+            assert!(
+                matches!(result, Err(AppError::BadRequest(_))),
+                "version={version:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ed25519_key_error_does_not_echo_key() {
+        let mut keys = weak_ed25519_keys();
+        keys.push(off_curve_ed25519_key());
+        for key in keys {
+            for version in ED25519_KEY_VERSIONS {
+                let Err(AppError::BadRequest(message)) =
+                    extract_encryption_context(&ed25519_key_headers(&key, version))
+                else {
+                    panic!("expected BadRequest for version={version:?}");
+                };
+                assert!(!message.contains(&hex::encode(key)), "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_extract_encryption_context_accepts_valid_ed25519_key_all_versions() {
+        let server_pair = test_signing_pair();
+        let key = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        for (version, expected) in ED25519_KEY_VERSIONS.into_iter().zip([1u8, 1, 2, 3]) {
+            let ctx = extract_encryption_context(&ed25519_key_headers(&key, version))
+                .unwrap()
+                .unwrap();
+            assert_eq!(ctx.algo, EncryptionAlgo::Ed25519);
+            assert_eq!(ctx.version, expected);
+            // Key bytes are kept as sent for every version.
+            assert_eq!(ctx.client_pub_key, key, "version={version:?}");
+        }
+    }
+
+    #[test]
+    fn test_valid_ed25519_key_round_trips_v1_v2_after_validation() {
+        let server_pair = test_signing_pair();
+        let key = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        for version in ["1", "2"] {
+            let ctx = extract_encryption_context(&ed25519_key_headers(&key, Some(version)))
+                .unwrap()
+                .unwrap();
+            let encrypted = encrypt_string("still works", &ctx, &server_pair).unwrap();
+            let decrypted = decrypt_string(&encrypted, &ctx, &server_pair).unwrap();
+            assert_eq!(decrypted, "still works", "version={version}");
+        }
+    }
+
+    #[test]
+    fn test_encrypt_string_rejects_weak_ed25519_key_in_direct_context() {
+        // A context built without header extraction still refuses to encrypt
+        // to a small-order key.
+        let server_pair = test_signing_pair();
+        for key in weak_ed25519_keys() {
+            for version in 1..=3u8 {
+                let ctx = EncryptionContext {
+                    algo: EncryptionAlgo::Ed25519,
+                    client_pub_key: key.to_vec(),
+                    version,
+                    encrypt_all_fields: false,
+                };
+                assert!(
+                    matches!(
+                        encrypt_string("secret", &ctx, &server_pair),
+                        Err(AppError::BadRequest(_))
+                    ),
+                    "key={} version={version}",
+                    hex::encode(key)
+                );
+            }
+        }
+    }
+
     // ── Fix 2: Completions streaming encryption ───────────────────
 
     #[test]
@@ -2966,6 +3122,180 @@ mod tests {
             .unwrap();
 
         assert_eq!(request["function_call"].as_str().unwrap(), "auto");
+    }
+
+    /// Every extended request field in v1/v2 all-field mode, with a valid
+    /// ciphertext for each. Synthetic values only.
+    fn legacy_all_fields_request(ctx: &EncryptionContext, pair: &SigningPair) -> serde_json::Value {
+        let seal = |plain: &str| encrypt_string(plain, ctx, pair).unwrap();
+        serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": seal("synthetic content"),
+                "name": seal("synthetic-name"),
+                "refusal": seal("synthetic refusal"),
+                "tool_calls": [{"id": "c1", "type": "function", "function": {
+                    "name": seal("synthetic_tool"), "arguments": seal("{\"k\":1}")
+                }}],
+                "function_call": {"name": seal("synthetic_legacy"), "arguments": seal("{}")}
+            }],
+            "tools": [{"type": "function", "function": {
+                "name": seal("synthetic_tool"),
+                "description": seal("synthetic description"),
+                "parameters": seal("{\"type\":\"object\"}")
+            }}],
+            "tool_choice": {"type": "function", "function": {"name": seal("synthetic_tool")}},
+            "function_call": {"name": seal("synthetic_legacy")}
+        })
+    }
+
+    const LEGACY_EXTENDED_FIELDS: [&str; 11] = [
+        "/messages/0/name",
+        "/messages/0/refusal",
+        "/messages/0/tool_calls/0/function/name",
+        "/messages/0/tool_calls/0/function/arguments",
+        "/messages/0/function_call/name",
+        "/messages/0/function_call/arguments",
+        "/tools/0/function/name",
+        "/tools/0/function/description",
+        "/tools/0/function/parameters",
+        "/tool_choice/function/name",
+        "/function_call/name",
+    ];
+
+    #[test]
+    fn test_legacy_all_fields_rejects_undecryptable_extended_fields() {
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        for version in [1u8, 2] {
+            let ctx = EncryptionContext {
+                algo: EncryptionAlgo::Ed25519,
+                client_pub_key: client_pub.clone(),
+                version,
+                encrypt_all_fields: true,
+            };
+            let original = legacy_all_fields_request(&ctx, &server_pair);
+
+            // Control: valid ciphertexts decrypt in place.
+            let mut ok = original.clone();
+            decrypt_request_fields(&mut ok, Endpoint::ChatCompletions, &ctx, &server_pair).unwrap();
+            assert_eq!(
+                ok["messages"][0]["tool_calls"][0]["function"]["arguments"],
+                "{\"k\":1}"
+            );
+            assert_eq!(
+                ok["tools"][0]["function"]["parameters"],
+                serde_json::json!({"type": "object"})
+            );
+
+            // A ciphertext for the other protocol version does not decrypt either.
+            let other_version = EncryptionContext {
+                version: if version == 1 { 2 } else { 1 },
+                ..ctx.clone()
+            };
+            let wrong_version =
+                encrypt_string("synthetic other", &other_version, &server_pair).unwrap();
+            let mut tampered = encrypt_string("synthetic tampered", &ctx, &server_pair).unwrap();
+            let last = tampered.pop().unwrap();
+            tampered.push(if last == '0' { '1' } else { '0' });
+
+            for path in LEGACY_EXTENDED_FIELDS {
+                for invalid in [
+                    "synthetic plaintext marker",
+                    "deadbeef",
+                    tampered.as_str(),
+                    wrong_version.as_str(),
+                ] {
+                    let mut request = original.clone();
+                    *request.pointer_mut(path).unwrap() = serde_json::json!(invalid);
+                    let err = decrypt_request_fields(
+                        &mut request,
+                        Endpoint::ChatCompletions,
+                        &ctx,
+                        &server_pair,
+                    )
+                    .expect_err(path);
+                    match err {
+                        AppError::BadRequest(message) => {
+                            assert!(!message.contains(invalid), "v{version} {path}");
+                        }
+                        other => panic!("v{version} {path}: unexpected error {other:?}"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_legacy_all_fields_rejects_undecryptable_tool_parameters() {
+        // The string `parameters` path has its own branch; check it alone too.
+        let server_pair = test_signing_pair();
+        let client_pub = hex::decode(&server_pair.ed25519.signing_public_key).unwrap();
+        for version in [1u8, 2] {
+            let ctx = EncryptionContext {
+                algo: EncryptionAlgo::Ed25519,
+                client_pub_key: client_pub.clone(),
+                version,
+                encrypt_all_fields: true,
+            };
+            for invalid in ["{\"type\":\"object\"}", "00", "not hex at all"] {
+                let mut request = serde_json::json!({
+                    "messages": [],
+                    "tools": [{"type": "function", "function": {
+                        "name": encrypt_string("synthetic_tool", &ctx, &server_pair).unwrap(),
+                        "parameters": invalid
+                    }}]
+                });
+                assert!(
+                    decrypt_request_fields(
+                        &mut request,
+                        Endpoint::ChatCompletions,
+                        &ctx,
+                        &server_pair
+                    )
+                    .is_err(),
+                    "v{version}"
+                );
+            }
+
+            // A schema object is plaintext under the all-field contract.
+            let mut request = serde_json::json!({
+                "messages": [],
+                "tools": [{"type": "function", "function": {
+                    "parameters": {"type": "object"}
+                }}]
+            });
+            assert!(
+                decrypt_request_fields(&mut request, Endpoint::ChatCompletions, &ctx, &server_pair)
+                    .is_err(),
+                "v{version}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_fields_predicate() {
+        let base = EncryptionContext {
+            algo: EncryptionAlgo::Ed25519,
+            client_pub_key: vec![0; 32],
+            version: 1,
+            encrypt_all_fields: false,
+        };
+        assert!(!base.all_fields());
+        for version in [1u8, 2] {
+            assert!(!EncryptionContext {
+                version,
+                ..base.clone()
+            }
+            .all_fields());
+            assert!(EncryptionContext {
+                version,
+                encrypt_all_fields: true,
+                ..base.clone()
+            }
+            .all_fields());
+        }
+        assert!(EncryptionContext { version: 3, ..base }.all_fields());
     }
 }
 

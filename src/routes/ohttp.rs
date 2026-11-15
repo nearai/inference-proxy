@@ -1,5 +1,5 @@
 use std::io::Cursor;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
@@ -8,11 +8,78 @@ use axum::http::{header, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::{AsyncReadExt, AsyncWriteExt};
 use http_body_util::BodyExt;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 use tracing::{info, warn};
 
 use crate::error::AppError;
 use crate::AppState;
+
+/// Fixed room for OHTTP and Binary HTTP framing on top of the largest inner
+/// body a relayed route accepts.
+const OHTTP_FRAMING_HEADROOM: usize = 64 * 1024;
+/// Room proportional to the inner body (1/16 of it): chunked OHTTP adds a
+/// length and an AEAD tag to every chunk, so the overhead grows with the body.
+const OHTTP_CHUNK_OVERHEAD_DIVISOR: usize = 16;
+
+/// `Retry-After` on a relay refusal: slots free up as soon as a relayed
+/// request finishes.
+const OHTTP_RELAY_RETRY_AFTER_SECS: u64 = 1;
+
+/// Process-wide cap on `POST /ohttp` requests in flight (`OHTTP_MAX_INFLIGHT`).
+///
+/// A slot is taken before the outer body is read or HPKE is decoded, and is
+/// held until the relayed response has been sent (for
+/// chunked OHTTP, until the response stream ends). When every slot is taken
+/// the request is refused with 429 and `Retry-After` without being decrypted.
+/// The cap is shared by all callers: it needs no credential and is not keyed
+/// on any client address.
+#[derive(Clone, Debug)]
+pub struct OhttpRelayLimit {
+    permits: Arc<Semaphore>,
+    max_inflight: usize,
+}
+
+impl OhttpRelayLimit {
+    /// `None` when `max_inflight` is 0 (no cap).
+    pub fn new(max_inflight: usize) -> Option<Self> {
+        if max_inflight == 0 {
+            return None;
+        }
+        let max_inflight = max_inflight.min(Semaphore::MAX_PERMITS);
+        Some(Self {
+            permits: Arc::new(Semaphore::new(max_inflight)),
+            max_inflight,
+        })
+    }
+
+    pub fn max_inflight(&self) -> usize {
+        self.max_inflight
+    }
+
+    /// Slots not taken right now.
+    pub fn available(&self) -> usize {
+        self.permits.available_permits()
+    }
+
+    /// Take a slot without waiting; `None` when all are taken. The slot is
+    /// returned when the permit is dropped.
+    pub fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
+        self.permits.clone().try_acquire_owned().ok()
+    }
+}
+
+/// Largest outer `POST /ohttp` body read: the largest inner body any relayed
+/// route accepts, plus framing.
+fn max_outer_body_bytes(config: &crate::config::Config) -> usize {
+    outer_body_cap(config.max_request_size.max(config.max_audio_request_size))
+}
+
+fn outer_body_cap(max_inner: usize) -> usize {
+    max_inner
+        .saturating_add(max_inner / OHTTP_CHUNK_OVERHEAD_DIVISOR)
+        .saturating_add(OHTTP_FRAMING_HEADROOM)
+}
 
 // OHTTP must never follow an inner request away from the local proxy, including
 // redirects returned by a local route. Keep this client separate from the
@@ -66,16 +133,20 @@ pub async fn ohttp_config(State(state): State<AppState>) -> Result<Response, App
 /// uses the deployment `config.token` (and not cloud `sk-` keys)—for example
 /// honoring inner `X-Request-Hash` for signing in chat routes—will apply once
 /// the relay injects that token. Encrypted inner headers still come from the end
-/// client. If the relay sits between an untrusted client and this server, **the relay
-/// must strip or override sensitive inner headers** (for example `X-Request-Hash`)
-/// when building BHTTP so clients cannot forge trusted-gateway-only behavior while
-/// the relay supplies the shared secret. Hash binding rules are documented on
+/// client, so with an outer `Bearer` this server drops the inner headers that only
+/// a trusted caller may set (`X-Request-Hash`, `X-NearAI-Priority`,
+/// `x-nearai-replica`; see `skip_inner_header`). A relay between untrusted
+/// clients and this server should still strip or override sensitive inner
+/// headers when building BHTTP. Hash binding rules are documented on
 /// [`resolve_request_hash_for_signing`].
 ///
 /// [`resolve_request_hash_for_signing`]: crate::routes::chat::resolve_request_hash_for_signing
 ///
 /// Auth, rate limiting, and signing are applied on the inner loopback request
 /// via the normal middleware stack.
+///
+/// A relay slot is taken before reading the outer body (429 when full).
+/// That body is bounded by `max_outer_body_bytes` (413 above it).
 pub async fn ohttp_relay(
     State(state): State<AppState>,
     request: axum::extract::Request,
@@ -85,6 +156,8 @@ pub async fn ohttp_relay(
         .as_ref()
         .ok_or_else(|| AppError::NotFound("OHTTP not enabled".to_string()))?;
 
+    // Installed by `build_app`; routers built without it have no cap.
+    let relay_limit = request.extensions().get::<OhttpRelayLimit>().cloned();
     let outer_authorization = request.headers().get(header::AUTHORIZATION).cloned();
     // The loopback request carries this request's id, so the inner request's log
     // lines join the outer one. The inner message cannot choose it.
@@ -99,12 +172,32 @@ pub async fn ohttp_relay(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.contains("ohttp-chunked"));
 
-    let enc_request = request
-        .into_body()
-        .collect()
-        .await
-        .map_err(|e| AppError::BadRequest(format!("Failed to read request body: {e}")))?
-        .to_bytes();
+    // Admission precedes body buffering as well as HPKE work.
+    let relay_permit = match &relay_limit {
+        Some(limit) => Some(limit.try_acquire().ok_or_else(|| {
+            metrics::counter!("ohttp_errors_total", "reason" => "relay_at_capacity").increment(1);
+            AppError::Overloaded {
+                reason: "ohttp_relay",
+                retry_after_secs: OHTTP_RELAY_RETRY_AFTER_SECS,
+            }
+        })?),
+        None => None,
+    };
+
+    let max_body = max_outer_body_bytes(&state.config);
+    let limited_body = http_body_util::Limited::new(request.into_body(), max_body);
+    let enc_request = match limited_body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) if e.is::<http_body_util::LengthLimitError>() => {
+            metrics::counter!("ohttp_errors_total", "reason" => "body_too_large").increment(1);
+            return Err(AppError::PayloadTooLarge { max_size: max_body });
+        }
+        Err(_) => {
+            return Err(AppError::BadRequest(
+                "Failed to read request body".to_string(),
+            ));
+        }
+    };
 
     if enc_request.is_empty() {
         return Err(AppError::BadRequest("Empty OHTTP request".to_string()));
@@ -117,17 +210,22 @@ pub async fn ohttp_relay(
             &enc_request,
             outer_authorization,
             outer_request_id,
+            relay_permit,
         )
         .await
     } else {
-        ohttp_relay_standard(
+        // The standard response is fully built before it is returned, so the
+        // slot is held for the whole relay and released here.
+        let response = ohttp_relay_standard(
             &state,
             gateway,
             &enc_request,
             outer_authorization,
             outer_request_id,
         )
-        .await
+        .await;
+        drop(relay_permit);
+        response
     }
 }
 
@@ -142,17 +240,17 @@ async fn ohttp_relay_standard(
     let start = Instant::now();
     metrics::counter!("ohttp_requests_total", "type" => "standard").increment(1);
 
-    let (bhttp_request, server_response) = gateway.decapsulate(enc_request).map_err(|e| {
+    let (bhttp_request, server_response) = gateway.decapsulate(enc_request).map_err(|_| {
         metrics::counter!("ohttp_errors_total", "reason" => "decapsulation_failed").increment(1);
-        warn!(error = %e, "OHTTP decapsulation failed");
-        AppError::BadRequest(format!("OHTTP decapsulation failed: {e}"))
+        warn!(error_kind = "decapsulation", "OHTTP decapsulation failed");
+        AppError::BadRequest("OHTTP decapsulation failed".to_string())
     })?;
 
     let decap_duration = start.elapsed();
     metrics::histogram!("ohttp_decapsulation_duration_seconds")
         .record(decap_duration.as_secs_f64());
 
-    let (request_builder, path_str) = parse_bhttp_and_build_loopback(
+    let (request_builder, _path_str) = parse_bhttp_and_build_loopback(
         state,
         &bhttp_request,
         outer_authorization.as_ref(),
@@ -169,9 +267,12 @@ async fn ohttp_relay_standard(
     let mut bhttp_response = bhttp::Message::response(bhttp_status);
     copy_response_headers(&loopback_response, &mut bhttp_response);
 
-    let response_body = loopback_response.bytes().await.map_err(|e| {
-        warn!(error = %e, "Failed to read loopback response body");
-        AppError::Internal(e.into())
+    let response_body = loopback_response.bytes().await.map_err(|_| {
+        warn!(
+            error_kind = "loopback_body",
+            "Failed to read loopback response body"
+        );
+        AppError::Internal(anyhow::anyhow!("loopback response body failed"))
     })?;
     bhttp_response.write_content(&response_body);
 
@@ -179,18 +280,17 @@ async fn ohttp_relay_standard(
     let mut bhttp_bytes = Vec::new();
     bhttp_response
         .write_bhttp(bhttp::Mode::KnownLength, &mut bhttp_bytes)
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("Binary HTTP encoding failed: {e}")))?;
+        .map_err(|_| AppError::Internal(anyhow::anyhow!("Binary HTTP encoding failed")))?;
 
-    let enc_response = server_response.encapsulate(&bhttp_bytes).map_err(|e| {
+    let enc_response = server_response.encapsulate(&bhttp_bytes).map_err(|_| {
         metrics::counter!("ohttp_errors_total", "reason" => "encapsulation_failed").increment(1);
-        AppError::Internal(anyhow::anyhow!("OHTTP encapsulation failed: {e}"))
+        AppError::Internal(anyhow::anyhow!("OHTTP encapsulation failed"))
     })?;
 
     info!(
         decap_ms = decap_duration.as_millis(),
         total_ms = start.elapsed().as_millis(),
         inner_status = response_status,
-        inner_path = path_str,
         "OHTTP request processed"
     );
 
@@ -214,12 +314,17 @@ async fn ohttp_relay_standard(
 /// while the upstream is still producing — the previous implementation
 /// buffered the whole upstream body before emitting any framing, which
 /// collapsed back to the same TTFT as standard OHTTP.
+///
+/// `relay_permit` (the request's [`OhttpRelayLimit`] slot) moves into the
+/// streaming task and is released when the response stream ends, or on return
+/// if the request fails before streaming starts.
 async fn ohttp_relay_chunked(
     state: &AppState,
     gateway: &crate::ohttp_gateway::OhttpGateway,
     enc_request: &[u8],
     outer_authorization: Option<HeaderValue>,
     outer_request_id: Option<String>,
+    relay_permit: Option<OwnedSemaphorePermit>,
 ) -> Result<Response, AppError> {
     use futures_util::StreamExt;
 
@@ -234,18 +339,21 @@ async fn ohttp_relay_chunked(
     server_request
         .read_to_end(&mut bhttp_request)
         .await
-        .map_err(|e| {
+        .map_err(|_| {
             metrics::counter!("ohttp_errors_total", "reason" => "decapsulation_failed")
                 .increment(1);
-            warn!(error = %e, "Chunked OHTTP decapsulation failed");
-            AppError::BadRequest(format!("Chunked OHTTP decapsulation failed: {e}"))
+            warn!(
+                error_kind = "decapsulation",
+                "Chunked OHTTP decapsulation failed"
+            );
+            AppError::BadRequest("Chunked OHTTP decapsulation failed".to_string())
         })?;
 
     let decap_duration = start.elapsed();
     metrics::histogram!("ohttp_decapsulation_duration_seconds")
         .record(decap_duration.as_secs_f64());
 
-    let (request_builder, path_str) = parse_bhttp_and_build_loopback(
+    let (request_builder, _path_str) = parse_bhttp_and_build_loopback(
         state,
         &bhttp_request,
         outer_authorization.as_ref(),
@@ -266,15 +374,17 @@ async fn ohttp_relay_chunked(
 
     let mut ohttp_writer = server_request
         .response(write_half.compat_write())
-        .map_err(|e| {
-            warn!(error = %e, "Failed to create chunked OHTTP response writer");
-            AppError::Internal(anyhow::anyhow!("OHTTP stream setup failed: {e}"))
+        .map_err(|_| {
+            warn!(
+                error_kind = "stream_setup",
+                "Failed to create chunked OHTTP response writer"
+            );
+            AppError::Internal(anyhow::anyhow!("OHTTP stream setup failed"))
         })?;
 
     info!(
         decap_ms = decap_duration.as_millis(),
         inner_status = response_status,
-        inner_path = path_str,
         "Chunked OHTTP request processed"
     );
 
@@ -282,15 +392,21 @@ async fn ohttp_relay_chunked(
     // BHTTP indeterminate-length framing lets us emit each upstream chunk as a
     // length-prefixed content chunk without knowing the total body size up front.
     tokio::spawn(async move {
+        // Held until this task ends, whichever way it returns.
+        let _relay_permit = relay_permit;
         // Header section: framing indicator + status + headers + terminator.
-        if let Err(e) = write_indeterminate_response_header(
+        if write_indeterminate_response_header(
             &mut ohttp_writer,
             response_status,
             &response_headers,
         )
         .await
+        .is_err()
         {
-            warn!(error = %e, "Failed to write BHTTP response header");
+            warn!(
+                error_kind = "response_header_write",
+                "Failed to write BHTTP response header"
+            );
             let _ = ohttp_writer.close().await;
             return;
         }
@@ -301,9 +417,9 @@ async fn ohttp_relay_chunked(
             match chunk_result {
                 Ok(chunk) if chunk.is_empty() => continue,
                 Ok(chunk) => {
-                    if let Err(e) = bhttp_write_vec(&mut ohttp_writer, &chunk).await {
+                    if bhttp_write_vec(&mut ohttp_writer, &chunk).await.is_err() {
                         warn!(
-                            error = %e,
+                            error_kind = "body_write",
                             "Failed to write BHTTP body chunk (client may have disconnected)"
                         );
                         let _ = ohttp_writer.close().await;
@@ -312,14 +428,17 @@ async fn ohttp_relay_chunked(
                     // Push the encrypted bytes downstream as soon as the OHTTP
                     // layer has accumulated a full AEAD chunk — without flush
                     // it only writes when its 16KB seal buffer fills up.
-                    if let Err(e) = ohttp_writer.flush().await {
-                        warn!(error = %e, "Failed to flush OHTTP stream");
+                    if ohttp_writer.flush().await.is_err() {
+                        warn!(error_kind = "stream_flush", "Failed to flush OHTTP stream");
                         let _ = ohttp_writer.close().await;
                         return;
                     }
                 }
-                Err(e) => {
-                    warn!(error = %e, "Error reading backend response stream");
+                Err(_) => {
+                    warn!(
+                        error_kind = "backend_stream_read",
+                        "Error reading backend response stream"
+                    );
                     break;
                 }
             }
@@ -327,19 +446,25 @@ async fn ohttp_relay_chunked(
 
         // Body terminator (also serves as "empty body" if no chunks were written)
         // followed by an empty trailer field section.
-        if let Err(e) = bhttp_write_varint(&mut ohttp_writer, 0).await {
-            warn!(error = %e, "Failed to write BHTTP body terminator");
+        if bhttp_write_varint(&mut ohttp_writer, 0).await.is_err() {
+            warn!(
+                error_kind = "body_terminator_write",
+                "Failed to write BHTTP body terminator"
+            );
             let _ = ohttp_writer.close().await;
             return;
         }
-        if let Err(e) = bhttp_write_varint(&mut ohttp_writer, 0).await {
-            warn!(error = %e, "Failed to write BHTTP trailer terminator");
+        if bhttp_write_varint(&mut ohttp_writer, 0).await.is_err() {
+            warn!(
+                error_kind = "trailer_terminator_write",
+                "Failed to write BHTTP trailer terminator"
+            );
             let _ = ohttp_writer.close().await;
             return;
         }
 
-        if let Err(e) = ohttp_writer.close().await {
-            warn!(error = %e, "Failed to close OHTTP stream");
+        if ohttp_writer.close().await.is_err() {
+            warn!(error_kind = "stream_close", "Failed to close OHTTP stream");
         }
     });
 
@@ -453,18 +578,22 @@ fn collect_response_headers(response: &reqwest::Response) -> Vec<(Vec<u8>, Vec<u
 /// `outer_authorization`: if it is a usable `Bearer` value (e.g. relay-injected
 /// `Authorization` on `POST /ohttp`), it is attached to the loopback request,
 /// the inner `Authorization` field is skipped, and trusted-only inner headers
-/// (`X-Request-Hash`, `X-NearAI-Priority`) are scrubbed because the outer bearer
-/// establishes trusted-gateway semantics. Inner `X-Org-Id`, `X-Workspace-Id` and
-/// `X-Request-Id` are always dropped; the loopback carries the outer request id.
+/// (`X-Request-Hash`, `X-NearAI-Priority`, `x-nearai-replica`) are scrubbed
+/// because the outer bearer establishes trusted-gateway semantics. Inner
+/// `X-Org-Id`, `X-Workspace-Id` and `X-Request-Id` are always dropped; the
+/// loopback carries the outer request id. See [`skip_inner_header`].
 fn parse_bhttp_and_build_loopback(
     state: &AppState,
     bhttp_request: &[u8],
     outer_authorization: Option<&HeaderValue>,
     outer_request_id: Option<&str>,
 ) -> Result<(reqwest::RequestBuilder, String), AppError> {
-    let inner_msg = bhttp::Message::read_bhttp(&mut Cursor::new(bhttp_request)).map_err(|e| {
-        warn!(error = %e, "Failed to parse Binary HTTP request");
-        AppError::BadRequest(format!("Invalid Binary HTTP request: {e}"))
+    let inner_msg = bhttp::Message::read_bhttp(&mut Cursor::new(bhttp_request)).map_err(|_| {
+        warn!(
+            error_kind = "binary_http_parse",
+            "Failed to parse Binary HTTP request"
+        );
+        AppError::BadRequest("Invalid Binary HTTP request".to_string())
     })?;
 
     let control = inner_msg.control();
@@ -503,17 +632,7 @@ fn parse_bhttp_and_build_loopback(
         let name_bytes = field.name();
         let value_bytes = field.value();
 
-        let skip = name_bytes.eq_ignore_ascii_case(b"host")
-            || name_bytes.eq_ignore_ascii_case(b"transfer-encoding")
-            || name_bytes.eq_ignore_ascii_case(b"connection")
-            || is_inner_correlation_header(name_bytes)
-            || (relay_outer_bearer.is_some() && name_bytes.eq_ignore_ascii_case(b"authorization"))
-            || (relay_outer_bearer.is_some() && name_bytes.eq_ignore_ascii_case(b"x-request-hash"))
-            // The loopback authenticates as a trusted caller; the inner headers
-            // come from the end customer, who must not pick the engine priority.
-            || (relay_outer_bearer.is_some()
-                && name_bytes.eq_ignore_ascii_case(crate::priority::PRIORITY_HEADER.as_bytes()));
-        if skip {
+        if skip_inner_header(name_bytes, relay_outer_bearer.is_some()) {
             continue;
         }
 
@@ -548,6 +667,30 @@ fn parse_bhttp_and_build_loopback(
     Ok((request_builder, path_str.to_string()))
 }
 
+/// Whether an inner Binary HTTP header is left off the loopback request.
+///
+/// Hop-by-hop fields and the correlation and tenant headers are always dropped.
+/// With an outer relay bearer the loopback authenticates as that (possibly
+/// trusted) caller while the inner headers come from the end client, so the
+/// headers only a trusted caller may set are dropped too.
+fn skip_inner_header(name: &[u8], relay_outer_bearer: bool) -> bool {
+    name.eq_ignore_ascii_case(b"host")
+        || name.eq_ignore_ascii_case(b"transfer-encoding")
+        || name.eq_ignore_ascii_case(b"connection")
+        || is_inner_correlation_header(name)
+        || (relay_outer_bearer && is_trusted_caller_header(name))
+}
+
+/// Headers honoured only from a trusted (config-token) caller, plus the inner
+/// `Authorization` the outer bearer replaces: request-hash binding for
+/// signing, engine priority, and the backend placement hint.
+fn is_trusted_caller_header(name: &[u8]) -> bool {
+    name.eq_ignore_ascii_case(b"authorization")
+        || name.eq_ignore_ascii_case(b"x-request-hash")
+        || name.eq_ignore_ascii_case(crate::priority::PRIORITY_HEADER.as_bytes())
+        || name.eq_ignore_ascii_case(crate::backend_affinity::REPLICA_HINT_HEADER.as_bytes())
+}
+
 /// Correlation and tenant headers inside the encrypted message are never
 /// forwarded. They come from the end client, while the loopback request may
 /// authenticate as a trusted caller whose `X-Org-Id` / `X-Workspace-Id` are
@@ -561,12 +704,7 @@ fn is_inner_correlation_header(name: &[u8]) -> bool {
 
 /// Log and count an inner OHTTP request that was refused before any loopback call.
 ///
-/// Inner paths are attacker-controlled and have carried scripts and tokens (incident
-/// 2026-11-07), so the raw path is never logged. The log carries only what is needed to
-/// spot and correlate an attack: the method (standard methods only), the path's shape, any
-/// `@host:port` / `//host` / `scheme://host` forward target (host and port only, no
-/// userinfo), the path with long segments and the query removed, the path length, and a
-/// SHA-256 prefix of the exact bytes so repeated attempts can be matched.
+/// Inner paths may contain customer data. Record only a bounded shape and lengths.
 fn log_rejected_inner_request(reason: &'static str, method: &str, path: &[u8]) {
     metrics::counter!("ohttp_rejected_inner_requests_total", "reason" => reason).increment(1);
     let summary = summarize_inner_path(path);
@@ -581,123 +719,47 @@ fn log_rejected_inner_request(reason: &'static str, method: &str, path: &[u8]) {
         reason,
         inner_method = method,
         inner_path_shape = summary.shape,
-        inner_target = summary.target.as_deref().unwrap_or("-"),
-        inner_path_redacted = %summary.redacted,
         inner_path_len = path.len(),
         inner_query_len = summary.query_len,
-        inner_path_sha256 = %summary.sha256_prefix,
         "OHTTP inner request rejected"
     );
 }
 
 struct InnerPathSummary {
-    /// `origin` (/...), `userinfo` (@...), `scheme_relative` (//...), `absolute` (x://...),
-    /// `empty`, or `other`.
+    /// One of a fixed set of path shapes.
     shape: &'static str,
-    /// Forward target host[:port] for `userinfo`, `scheme_relative` and `absolute` shapes.
-    target: Option<String>,
-    /// Path without query or fragment. A segment is kept if it is at most 24 bytes of
-    /// `[A-Za-z0-9._-]`, or at most 48 bytes of `[a-z_-]` (route names); anything else
-    /// becomes `<N>` (its length). At most 8 segments are kept.
-    redacted: String,
     query_len: usize,
-    sha256_prefix: String,
 }
 
 fn summarize_inner_path(path: &[u8]) -> InnerPathSummary {
-    use sha2::{Digest, Sha256};
-
-    const MAX_SEGMENT: usize = 24;
-    const MAX_ROUTE_SEGMENT: usize = 48;
-    const MAX_SEGMENTS: usize = 8;
-
-    let sha256_prefix = hex::encode(&Sha256::digest(path)[..8]);
     let text = String::from_utf8_lossy(path);
     let (before_fragment, _) = text.split_once('#').unwrap_or((&text, ""));
-    let (path_part, query) = match before_fragment.split_once('?') {
+    let (path_part, query_len) = match before_fragment.split_once('?') {
         Some((p, q)) => (p, q.len()),
         None => (before_fragment, 0),
     };
-
-    let (shape, rest) = if path_part.is_empty() {
-        ("empty", "")
-    } else if let Some(r) = path_part.strip_prefix('@') {
-        ("userinfo", r)
-    } else if let Some(r) = path_part.strip_prefix("//") {
-        ("scheme_relative", r)
-    } else if let Some((scheme, r)) = path_part.split_once("://") {
+    let shape = if path_part.is_empty() {
+        "empty"
+    } else if path_part.starts_with('@') {
+        "userinfo"
+    } else if path_part.starts_with("//") {
+        "scheme_relative"
+    } else if let Some((scheme, _)) = path_part.split_once("://") {
         if !scheme.is_empty()
             && scheme
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b))
         {
-            ("absolute", r)
+            "absolute"
         } else {
-            ("other", path_part)
+            "other"
         }
     } else if path_part.starts_with('/') {
-        ("origin", path_part)
+        "origin"
     } else {
-        ("other", path_part)
+        "other"
     };
-
-    let (target, path_rest) = match shape {
-        "userinfo" | "scheme_relative" | "absolute" => {
-            let (authority, tail) = match rest.find('/') {
-                Some(i) => (&rest[..i], &rest[i..]),
-                None => (rest, ""),
-            };
-            // Drop any userinfo (user:password@) in front of the host.
-            let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-            let safe = !host_port.is_empty()
-                && host_port.len() <= 64
-                && host_port
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b".-:[]_".contains(&b));
-            let target = if safe {
-                host_port.to_ascii_lowercase()
-            } else {
-                format!("<{}>", host_port.len())
-            };
-            (Some(target), tail)
-        }
-        _ => (None, rest),
-    };
-
-    let segments: Vec<&str> = path_rest.split('/').skip(1).collect();
-    let mut redacted = String::new();
-    for segment in segments.iter().take(MAX_SEGMENTS) {
-        redacted.push('/');
-        // Short plain segments, or longer route-like names (lowercase letters and
-        // `_`/`-` only, e.g. update_weights_from_tensor). Tokens mix digits or case.
-        let plain = (segment.len() <= MAX_SEGMENT
-            && segment
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)))
-            || (segment.len() <= MAX_ROUTE_SEGMENT
-                && segment
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b == b'_' || b == b'-'));
-        if plain {
-            redacted.push_str(segment);
-        } else {
-            redacted.push_str(&format!("<{}>", segment.len()));
-        }
-    }
-    if segments.len() > MAX_SEGMENTS {
-        redacted.push_str(&format!("/...+{}", segments.len() - MAX_SEGMENTS));
-    }
-    if redacted.is_empty() && shape == "other" {
-        redacted = format!("<{}>", path_part.len());
-    }
-
-    InnerPathSummary {
-        shape,
-        target,
-        redacted,
-        query_len: query,
-        sha256_prefix,
-    }
+    InnerPathSummary { shape, query_len }
 }
 
 /// Accept only GET /v1/models and POST to chat, text, or audio completions.
@@ -740,10 +802,13 @@ fn validated_loopback_url(
 async fn send_loopback(
     request_builder: reqwest::RequestBuilder,
 ) -> Result<reqwest::Response, AppError> {
-    request_builder.send().await.map_err(|e| {
+    request_builder.send().await.map_err(|_| {
         metrics::counter!("ohttp_errors_total", "reason" => "loopback_failed").increment(1);
-        warn!(error = %e, "OHTTP loopback request failed");
-        AppError::Internal(e.into())
+        warn!(
+            error_kind = "loopback_request",
+            "OHTTP loopback request failed"
+        );
+        AppError::Internal(anyhow::anyhow!("OHTTP loopback request failed"))
     })
 }
 
@@ -784,6 +849,94 @@ mod tests {
         for name in ["content-type", "x-org", "x-request-hash", "authorization"] {
             assert!(!is_inner_correlation_header(name.as_bytes()), "{name}");
         }
+    }
+
+    #[test]
+    fn outer_bearer_scrubs_every_trusted_caller_inner_header() {
+        let trusted_only = [
+            "authorization",
+            "Authorization",
+            "x-request-hash",
+            "X-Request-Hash",
+            "x-nearai-priority",
+            "X-NearAI-Priority",
+            "x-nearai-replica",
+            "X-NearAI-Replica",
+            "X-NEARAI-REPLICA",
+        ];
+        for name in trusted_only {
+            // With a relay bearer the inner value comes from the end client.
+            assert!(skip_inner_header(name.as_bytes(), true), "{name}");
+            // Without one the inner request authenticates itself, so a trusted
+            // client keeps its own headers.
+            assert!(!skip_inner_header(name.as_bytes(), false), "{name}");
+        }
+        assert!(skip_inner_header(
+            crate::backend_affinity::REPLICA_HINT_HEADER.as_bytes(),
+            true
+        ));
+        assert!(skip_inner_header(
+            crate::priority::PRIORITY_HEADER.as_bytes(),
+            true
+        ));
+
+        for name in [
+            "host",
+            "transfer-encoding",
+            "connection",
+            "x-org-id",
+            "x-workspace-id",
+            "x-request-id",
+        ] {
+            assert!(skip_inner_header(name.as_bytes(), true), "{name}");
+            assert!(skip_inner_header(name.as_bytes(), false), "{name}");
+        }
+
+        for name in ["content-type", "accept", "x-nearai-replicas", "x-replica"] {
+            assert!(!skip_inner_header(name.as_bytes(), true), "{name}");
+            assert!(!skip_inner_header(name.as_bytes(), false), "{name}");
+        }
+    }
+
+    #[test]
+    fn outer_body_cap_leaves_room_for_chunked_framing() {
+        let max_inner = 100 * 1024 * 1024;
+        // One 16 KiB chunk carries a 16-byte AEAD tag and a length of up to
+        // 8 bytes; the cap must leave room for that across the whole body.
+        let chunk = 16 * 1024;
+        let chunked_overhead = (max_inner / chunk + 1) * (16 + 8);
+        assert!(outer_body_cap(max_inner) >= max_inner + chunked_overhead + 4096);
+        assert_eq!(outer_body_cap(0), OHTTP_FRAMING_HEADROOM);
+        assert_eq!(outer_body_cap(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn relay_limit_refuses_when_full_and_recovers_on_release() {
+        assert!(OhttpRelayLimit::new(0).is_none(), "0 means no cap");
+
+        let limit = OhttpRelayLimit::new(2).unwrap();
+        assert_eq!(limit.max_inflight(), 2);
+        let first = limit.try_acquire().expect("first slot");
+        let second = limit.try_acquire().expect("second slot");
+        assert_eq!(limit.available(), 0);
+        assert!(limit.try_acquire().is_none(), "third request is refused");
+
+        // Clones share the same slots.
+        let shared = limit.clone();
+        assert!(shared.try_acquire().is_none());
+
+        drop(first);
+        assert_eq!(limit.available(), 1);
+        let third = shared.try_acquire().expect("a released slot is reusable");
+        assert!(limit.try_acquire().is_none());
+
+        drop(second);
+        drop(third);
+        assert_eq!(limit.available(), 2);
+
+        // Values beyond the semaphore's maximum are clamped, not a panic.
+        let huge = OhttpRelayLimit::new(usize::MAX).unwrap();
+        assert_eq!(huge.max_inflight(), Semaphore::MAX_PERMITS);
     }
 
     #[test]
@@ -848,60 +1001,19 @@ mod tests {
     }
 
     #[test]
-    fn rejected_inner_path_summary_keeps_the_target_and_drops_secrets() {
-        // The 2026-11 attack shape: userinfo forward to a webshell with a command in the query.
-        let s =
-            summarize_inner_path(b"@172.18.0.5:9998/run?cmd=curl%20-H%20Bearer%20sk-SECRETSECRET");
-        assert_eq!(s.shape, "userinfo");
-        assert_eq!(s.target.as_deref(), Some("172.18.0.5:9998"));
-        assert_eq!(s.redacted, "/run");
-        assert_eq!(
-            s.query_len,
-            "cmd=curl%20-H%20Bearer%20sk-SECRETSECRET".len()
-        );
-        assert_eq!(s.sha256_prefix.len(), 16);
-
-        // Userinfo inside the authority is dropped; long or odd segments become lengths.
-        let s = summarize_inner_path(
-            b"//admin:hunter2@10.0.2.2:8443/prpc/CreateVm/eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig",
-        );
-        assert_eq!(s.shape, "scheme_relative");
-        assert_eq!(s.target.as_deref(), Some("10.0.2.2:8443"));
-        assert_eq!(s.redacted, "/prpc/CreateVm/<40>");
-
-        let s = summarize_inner_path(b"http://Example.COM/x");
-        assert_eq!(
-            (s.shape, s.target.as_deref()),
-            ("absolute", Some("example.com"))
-        );
-
-        let s = summarize_inner_path(b"/update_weights_from_tensor");
-        assert_eq!((s.shape, s.target.as_deref()), ("origin", None));
-        assert_eq!(s.redacted, "/update_weights_from_tensor");
-
-        let s = summarize_inner_path(b"/v1/chat/%63ompletions#frag");
-        assert_eq!(s.redacted, "/v1/chat/<13>");
-
-        let s = summarize_inner_path(b"");
-        assert_eq!((s.shape, s.redacted.as_str()), ("empty", ""));
-
-        let s = summarize_inner_path(b"@bad host with spaces/x");
-        assert_eq!(s.target.as_deref(), Some("<20>"));
-
-        let deep = "/a".repeat(12);
-        let s = summarize_inner_path(deep.as_bytes());
-        assert_eq!(s.redacted, format!("{}/...+4", "/a".repeat(8)));
-
-        // No byte of a secret ever reaches the redacted fields.
-        for secret_path in [
-            "@h:1/x?token=SECRETSECRET".as_bytes(),
-            b"/SECRETSECRETSECRETSECRETSECRET",
-            b"/x/sk-SECRET0a1b2c3d4e5f6a7b8c9d0e",
-            b"//u:SECRETSECRET@h/x",
-        ] {
-            let s = summarize_inner_path(secret_path);
-            let all = format!("{} {:?} {}", s.redacted, s.target, s.shape);
-            assert!(!all.contains("SECRET"), "{all}");
+    fn rejected_inner_path_summary_has_only_bounded_shapes_and_lengths() {
+        let cases: &[(&[u8], &str, usize)] = &[
+            (b"@host:9998/run?query=synthetic", "userinfo", 15),
+            (b"//host/path", "scheme_relative", 0),
+            (b"http://host/path", "absolute", 0),
+            (b"/v1/chat/completions", "origin", 0),
+            (b"", "empty", 0),
+            (b"unexpected", "other", 0),
+        ];
+        for (path, shape, query_len) in cases {
+            let summary = summarize_inner_path(path);
+            assert_eq!(summary.shape, *shape);
+            assert_eq!(summary.query_len, *query_len);
         }
     }
 

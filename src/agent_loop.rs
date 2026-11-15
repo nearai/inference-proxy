@@ -33,8 +33,9 @@ use crate::auth::RequireAuth;
 use crate::encryption::ChunkTransform;
 use crate::error::AppError;
 use crate::proxy::{
-    make_usage_reporter, normalize_chat_chunk, record_completed_request,
-    report_chat_usage_if_present, tenant_context_label, StreamingGuard,
+    add_direct_inference_id, direct_stream_billing_id, make_usage_reporter, normalize_chat_chunk,
+    record_completed_request, report_stream_usage_on_finalize, tenant_context_label,
+    StreamingGuard,
 };
 use crate::{AppState, TracingIds};
 
@@ -132,7 +133,7 @@ pub async fn run_chat_completion(
     // and report aggregated token usage at the end. continuous_usage_stats is
     // required (not just include_usage) so every chunk carries running cumulative
     // usage: on an interrupted loop (client disconnect before the final chunk) we
-    // still have token counts to bill (nearai/infra#98). Because the counts are
+    // still have token counts to bill. Because the counts are
     // cumulative per chunk, `ingest_chunk_metadata` keeps the latest value rather
     // than summing — otherwise this would overbill.
     request_json["stream"] = true.into();
@@ -149,12 +150,24 @@ pub async fn run_chat_completion(
     // prefix-cache across rounds (each iteration's prompt = prior iteration +
     // a few new messages, so the cache hit rate should be very high).
 
+    // Direct-key billing: refuse before dispatch when usage could not be
+    // reported, and fix the billing ID now so the `inference-id` header on the
+    // 200 and the usage report name the same inference. The provider chat ID
+    // is still what the response carries and what the signature is cached
+    // under. Trusted callers have no reporter, no billing ID and no header.
+    let mut usage_reporter = make_usage_reporter(&auth, &state);
+    let (billing_id, inference_id) = match direct_stream_billing_id(usage_reporter.as_ref())
+        .map_err(|err| err.for_encrypted_request(chunk_transform.is_some()))?
+    {
+        Some((billing_id, inference_id)) => (Some(billing_id), Some(inference_id)),
+        None => (None, None),
+    };
+
     // Send the first upstream request synchronously so its HTTP status
     // propagates to the caller. Without this, a 400/429/503 from upstream
     // on iteration 0 would arrive as a 200 text/event-stream followed by a
     // broken / empty body, hiding the real failure from the client. Only
     // when this first call succeeds do we return 200 + spawn the loop.
-    let mut usage_reporter = make_usage_reporter(&auth, &state);
     if let Some(reporter) = usage_reporter.as_mut() {
         let executions = i32::try_from(state.config.agent_loop_max_iterations)
             .map_err(|_| AppError::BadRequest("Too many agent iterations".into()))?;
@@ -205,6 +218,9 @@ pub async fn run_chat_completion(
         // duration, the same way `proxy_streaming_request` does.
         let _streaming_guard = StreamingGuard::new();
         let _backend_guard = backend_guard;
+        // Owned here, not by `drive_loop`, so the usage observed before a
+        // mid-loop failure survives the `Err` and is still billed.
+        let mut usage = UsageTally::default();
         let outcome = drive_loop(
             LoopCtx {
                 client: &http_client,
@@ -222,8 +238,37 @@ pub async fn run_chat_completion(
                 tracing_ids: &tracing_ids,
             },
             first_response,
+            &mut usage,
         )
         .await;
+
+        let (input_tokens, output_tokens) = usage.totals();
+        let input_tokens = i64::try_from(input_tokens).unwrap_or(i64::MAX);
+        let output_tokens = i64::try_from(output_tokens).unwrap_or(i64::MAX);
+        let completed_cleanly = outcome
+            .as_ref()
+            .is_ok_and(|result| result.completed_cleanly);
+        // Bill for the tokens already produced, even when the loop did NOT
+        // finish cleanly (client disconnect, mid-loop error, or a failure that
+        // ended `drive_loop` with `Err`): this must not be gated on a clean
+        // [DONE], mirroring `proxy_streaming_request`. This
+        // is the only report for the loop, under the billing ID the
+        // `inference-id` header was derived from. The reporter only exists
+        // for direct sk- requests; cloud-api's own InterceptStream is not in
+        // that path, so this is the sole biller.
+        report_stream_usage_on_finalize(
+            &usage_reporter,
+            Some(((input_tokens, output_tokens), None)),
+            billing_id.as_deref(),
+            completed_cleanly,
+            (
+                &tracing_ids.request_id,
+                tracing_ids.org_id_or_empty(),
+                tracing_ids.workspace_id_or_empty(),
+            ),
+        );
+
+        attempt_cleanup.disarm();
 
         match outcome {
             Ok(result) => {
@@ -232,24 +277,13 @@ pub async fn run_chat_completion(
                     org_id = %tracing_ids.org_id_or_empty(),
                     workspace_id = %tracing_ids.workspace_id_or_empty(),
                     model = %model_name,
-                    chat_id = %result.chat_id.as_deref().unwrap_or(""),
                     iterations = result.iterations,
                     terminated_by = %result.terminated_by,
-                    input_tokens = result.input_tokens,
-                    output_tokens = result.output_tokens,
+                    input_tokens,
+                    output_tokens,
                     completed_cleanly = result.completed_cleanly,
                     "agent loop completed"
                 );
-                // Preserve the original billing of known cumulative usage, including
-                // interrupted loops. Admission must not discard that partial total.
-                if let Some(reporter) = usage_reporter.as_ref() {
-                    let usage = (result.input_tokens > 0 || result.output_tokens > 0).then_some((
-                        i64::try_from(result.input_tokens).unwrap_or(i64::MAX),
-                        i64::try_from(result.output_tokens).unwrap_or(i64::MAX),
-                    ));
-                    report_chat_usage_if_present(reporter, usage, result.chat_id.as_deref());
-                }
-                attempt_cleanup.disarm();
 
                 if let Some(error) = result.downstream_error {
                     error!(error = %error, "Agent loop failed");
@@ -273,28 +307,36 @@ pub async fn run_chat_completion(
                 match signing.sign_chat(&text) {
                     Ok(signed) => match serde_json::to_string(&signed) {
                         Ok(signed_json) => {
-                            cache.set_chat(chat_id, &signed_json);
+                            cache.set_chat(
+                                chat_id,
+                                &signed_json,
+                                crate::proxy::signature_owner(usage_reporter.as_ref()),
+                            );
                             record_completed_request(
                                 Some(&tracing_ids),
                                 &model_name,
                                 chat_id,
-                                i64::try_from(result.input_tokens).unwrap_or(i64::MAX),
-                                i64::try_from(result.output_tokens).unwrap_or(i64::MAX),
+                                input_tokens,
+                                output_tokens,
                                 request_started_at.elapsed(),
                                 "agent_loop",
                             );
                         }
-                        Err(e) => {
-                            error!(error = %e, "Failed to serialize agent-loop signature")
-                        }
+                        Err(_) => error!(
+                            error_kind = "serialization",
+                            "Failed to serialize agent-loop signature"
+                        ),
                     },
-                    Err(e) => error!(error = %e, "Signing failed for agent loop response"),
+                    Err(_) => error!(
+                        error_kind = "signing",
+                        "Signing failed for agent loop response"
+                    ),
                 }
             }
-            Err(e) => {
-                error!(error = %e, "Agent loop failed");
+            Err(_) => {
+                error!(error_kind = "agent_loop", "Agent loop failed");
                 let _ = tx
-                    .send(Err(std::io::Error::other(format!("agent loop: {e}"))))
+                    .send(Err(std::io::Error::other("agent loop failed")))
                     .await;
             }
         }
@@ -302,12 +344,14 @@ pub async fn run_chat_completion(
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let body = Body::from_stream(stream);
-    Ok(Response::builder()
+    let mut response = Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/event-stream")
         .header("cache-control", "no-cache")
         .body(body)
-        .expect("response builder"))
+        .expect("response builder");
+    add_direct_inference_id(&mut response, inference_id);
+    Ok(response)
 }
 
 /// Replace `{"type":"web_context_search"}` with a standard function tool so
@@ -362,12 +406,47 @@ struct LoopCtx<'a> {
     tracing_ids: &'a TracingIds,
 }
 
+/// Token usage observed so far in one loop. Each upstream call reports
+/// cumulative counts on every chunk (continuous_usage_stats), so the latest
+/// value of the call in progress replaces the previous one, and finished calls
+/// add up: each iteration is a separate upstream call with its own counts.
+/// Updated as chunks arrive, so the totals stay right when an iteration fails
+/// part-way.
+#[derive(Debug, Default)]
+struct UsageTally {
+    finished: (u64, u64),
+    current: (u64, u64),
+}
+
+impl UsageTally {
+    /// Latest cumulative (input, output) counts of the call in progress.
+    fn observe(&mut self, input: u64, output: u64) {
+        self.current = (input, output);
+    }
+
+    /// The call in progress ended: its latest counts are final.
+    fn finish_iteration(&mut self) {
+        self.finished = (
+            self.finished.0.saturating_add(self.current.0),
+            self.finished.1.saturating_add(self.current.1),
+        );
+        self.current = (0, 0);
+    }
+
+    /// (input, output) tokens over every call so far, the one in progress
+    /// included.
+    fn totals(&self) -> (u64, u64) {
+        (
+            self.finished.0.saturating_add(self.current.0),
+            self.finished.1.saturating_add(self.current.1),
+        )
+    }
+}
+
 struct LoopResult {
     chat_id: Option<String>,
     hasher: Sha256,
     iterations: u32,
-    input_tokens: u64,
-    output_tokens: u64,
     terminated_by: &'static str,
     /// True only if the loop closed cleanly (model stop / max_iterations
     /// terminator) and the final `[DONE]` was sent downstream. False on
@@ -379,13 +458,12 @@ struct LoopResult {
 async fn drive_loop(
     ctx: LoopCtx<'_>,
     first_response: reqwest::Response,
+    usage: &mut UsageTally,
 ) -> Result<LoopResult, AppError> {
     let mut hasher = Sha256::new();
     let mut chat_id: Option<String> = None;
     let mut model_echo: Option<String> = None;
     let mut created: Option<i64> = None;
-    let mut total_input_tokens: u64 = 0;
-    let mut total_output_tokens: u64 = 0;
     let mut iterations: u32 = 0;
     let terminated_by;
     let mut completed_cleanly = false;
@@ -493,10 +571,12 @@ async fn drive_loop(
                 },
                 stream_idle_timeout_secs: ctx.stream_idle_timeout_secs,
                 tracing_ids: ctx.tracing_ids,
+                usage: &mut *usage,
             },
             response,
         )
         .await?;
+        usage.finish_iteration();
 
         if chat_id.is_none() {
             chat_id = iter_outcome.chat_id.clone();
@@ -507,12 +587,14 @@ async fn drive_loop(
         if created.is_none() {
             created = iter_outcome.created;
         }
-        total_input_tokens = total_input_tokens.saturating_add(iter_outcome.input_tokens);
-        total_output_tokens = total_output_tokens.saturating_add(iter_outcome.output_tokens);
 
         debug!(
             iteration = iterations,
-            finish_reason = iter_outcome.finish_reason.as_deref().unwrap_or(""),
+            finish_reason_kind = iter_outcome
+                .finish_reason
+                .as_deref()
+                .map(str_to_static)
+                .unwrap_or("missing"),
             tool_calls = iter_outcome.tool_calls.len(),
             saw_done = iter_outcome.saw_done,
             upstream_ms = iter_started.elapsed().as_millis() as u64,
@@ -604,7 +686,6 @@ async fn drive_loop(
                 Some(q) if !q.is_empty() && ctx.count == Some(0) => {
                     debug!(
                         tool = WEB_CONTEXT_SEARCH_TOOL_NAME,
-                        tool_call_id = %tool_call_id,
                         "count is 0; skipping search"
                     );
                     ("ok", NO_RESULTS.to_string())
@@ -630,7 +711,6 @@ async fn drive_loop(
                     let Some(brave_result) = brave_result else {
                         info!(
                             tool = WEB_CONTEXT_SEARCH_TOOL_NAME,
-                            tool_call_id = %tool_call_id,
                             "client disconnected during tool execution"
                         );
                         disconnected_in_tool = true;
@@ -640,7 +720,6 @@ async fn drive_loop(
                         Ok(text) => {
                             info!(
                                 tool = WEB_CONTEXT_SEARCH_TOOL_NAME,
-                                tool_call_id = %tool_call_id,
                                 elapsed_ms = started.elapsed().as_millis() as u64,
                                 output_chars = text.len(),
                                 "tool ok"
@@ -648,21 +727,16 @@ async fn drive_loop(
                             ("ok", text)
                         }
                         Err(BraveError::Timeout) => {
-                            warn!(
-                                tool = WEB_CONTEXT_SEARCH_TOOL_NAME,
-                                tool_call_id = %tool_call_id,
-                                "tool timeout"
-                            );
+                            warn!(tool = WEB_CONTEXT_SEARCH_TOOL_NAME, "tool timeout");
                             (
                                 "timeout",
                                 "Web search timed out. Please answer using your existing knowledge or ask the user for more detail.".to_string(),
                             )
                         }
-                        Err(BraveError::Other(msg)) => {
+                        Err(BraveError::Other) => {
                             warn!(
                                 tool = WEB_CONTEXT_SEARCH_TOOL_NAME,
-                                tool_call_id = %tool_call_id,
-                                error = %msg,
+                                error_kind = "upstream_failure",
                                 "tool error"
                             );
                             (
@@ -675,7 +749,6 @@ async fn drive_loop(
                 _ => {
                     warn!(
                         tool = WEB_CONTEXT_SEARCH_TOOL_NAME,
-                        tool_call_id = %tool_call_id,
                         "tool arguments missing or invalid; skipping search"
                     );
                     (
@@ -735,8 +808,6 @@ async fn drive_loop(
         chat_id,
         hasher,
         iterations,
-        input_tokens: total_input_tokens,
-        output_tokens: total_output_tokens,
         terminated_by,
         completed_cleanly,
         downstream_error,
@@ -748,6 +819,9 @@ async fn drive_loop(
 /// reasons; anything else collapses to a single bucket for metrics.
 fn str_to_static(reason: &str) -> &'static str {
     match reason {
+        "stop" => "stop",
+        "tool_calls" => "tool_calls",
+        "length" => "length",
         "content_filter" => "content_filter",
         _ => "other",
     }
@@ -782,6 +856,9 @@ struct IterCtx<'a> {
     rewrite_id_to: Option<&'a str>,
     stream_idle_timeout_secs: u64,
     tracing_ids: &'a TracingIds,
+    /// The loop's usage, updated on every usage-bearing chunk so a failure
+    /// later in this iteration does not lose what was already observed.
+    usage: &'a mut UsageTally,
 }
 
 struct IterOutcome {
@@ -877,12 +954,13 @@ async fn run_iteration(
                                 }
                                 let mut parsed: Value = match serde_json::from_str(data) {
                                     Ok(v) => v,
-                                    Err(e) => {
-                                        warn!(error = %e, "agent loop: failed to parse upstream SSE line");
+                                    Err(_) => {
+                                        warn!(error_kind = "invalid_upstream_sse_json", "agent loop: failed to parse upstream SSE line");
                                         continue;
                                     }
                                 };
                                 ingest_chunk_metadata(&parsed, &mut outcome);
+                                ctx.usage.observe(outcome.input_tokens, outcome.output_tokens);
 
                                 // SGLang and friends emit top-level
                                 // `{"error": {...}}` chunks on aborts.
@@ -1047,7 +1125,7 @@ fn ingest_chunk_metadata(event: &Value, outcome: &mut IterOutcome) {
     // would multiply-count the cumulative total and overbill. The last
     // usage-bearing chunk holds the iteration's final totals. (With plain
     // include_usage there is only one usage chunk, so this is equivalent.)
-    // drive_loop sums these per-iteration totals across iterations, which is
+    // `UsageTally` sums these per-iteration totals across iterations, which is
     // correct: each iteration is a separate upstream call with its own counts.
     if let Some(usage) = event.get("usage").filter(|v| v.is_object()) {
         if let Some(p) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
@@ -1293,7 +1371,7 @@ async fn forward_done(
 
 enum BraveError {
     Timeout,
-    Other(String),
+    Other,
 }
 
 /// Hit Brave's LLM Context endpoint and return a model-ready text block.
@@ -1343,13 +1421,13 @@ async fn brave_llm_context_search(
         if e.is_timeout() {
             BraveError::Timeout
         } else {
-            BraveError::Other(format!("brave request failed: {}", error_category(&e)))
+            BraveError::Other
         }
     })?;
 
     let status = response.status();
     if !status.is_success() {
-        return Err(BraveError::Other(format!("brave HTTP {}", status.as_u16())));
+        return Err(BraveError::Other);
     }
 
     // Read the body in chunks so we can enforce a hard size cap regardless
@@ -1359,59 +1437,17 @@ async fn brave_llm_context_search(
     let mut body_bytes: Vec<u8> = Vec::with_capacity(16 * 1024);
     let mut body_stream = response.bytes_stream();
     while let Some(chunk) = body_stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            BraveError::Other(format!("brave body read failed: {}", error_category(&e)))
-        })?;
+        let chunk = chunk.map_err(|_| BraveError::Other)?;
         if body_bytes.len().saturating_add(chunk.len()) > BRAVE_MAX_RESPONSE_BYTES {
-            return Err(BraveError::Other(format!(
-                "brave response exceeded {BRAVE_MAX_RESPONSE_BYTES}-byte cap"
-            )));
+            return Err(BraveError::Other);
         }
         body_bytes.extend_from_slice(&chunk);
     }
 
-    let parsed: BraveContextResponse = serde_json::from_slice(&body_bytes).map_err(|e| {
-        BraveError::Other(format!(
-            "brave JSON parse failed: {:?} at line {} column {}",
-            e.classify(),
-            e.line(),
-            e.column()
-        ))
-    })?;
+    let parsed: BraveContextResponse =
+        serde_json::from_slice(&body_bytes).map_err(|_| BraveError::Other)?;
 
     Ok(format_context_response(&parsed, count))
-}
-
-pub(crate) async fn brave_llm_context_search_text(
-    client: &reqwest::Client,
-    url: &str,
-    api_key: &str,
-    query: &str,
-    timeout: Duration,
-    tracing_ids: &TracingIds,
-) -> Result<String, String> {
-    brave_llm_context_search(client, url, api_key, query, None, timeout, tracing_ids)
-        .await
-        .map_err(|err| match err {
-            BraveError::Timeout => "timeout".to_string(),
-            BraveError::Other(msg) => msg,
-        })
-}
-
-fn error_category(e: &reqwest::Error) -> &'static str {
-    if e.is_timeout() {
-        "timeout"
-    } else if e.is_connect() {
-        "connect"
-    } else if e.is_request() {
-        "request"
-    } else if e.is_body() {
-        "body"
-    } else if e.is_decode() {
-        "decode"
-    } else {
-        "unknown"
-    }
 }
 
 /// Brave LLM Context response shape (subset). Mirror of cloud-api's
@@ -1542,7 +1578,8 @@ mod tests {
         let task = tokio::spawn(async move {
             let mut request = json!({"messages":[]});
             let tracing = TracingIds::from_headers(&Default::default());
-            drive_loop(
+            let mut usage = UsageTally::default();
+            let result = drive_loop(
                 LoopCtx {
                     client: &client,
                     backend_client: &client,
@@ -1559,16 +1596,19 @@ mod tests {
                     tracing_ids: &tracing,
                 },
                 response,
+                &mut usage,
             )
-            .await
+            .await;
+            (result, usage)
         });
         rx.recv().await.unwrap().unwrap();
         let final_chunk = rx.recv().await.unwrap().unwrap();
         assert!(std::str::from_utf8(&final_chunk).unwrap().contains("usage"));
         rx.close(); // Reject downstream [DONE] after the final upstream counters were read.
-        let result = task.await.unwrap().unwrap();
+        let (result, usage) = task.await.unwrap();
+        let result = result.unwrap();
         assert!(!result.completed_cleanly);
-        assert_eq!((result.input_tokens, result.output_tokens), (3, 2));
+        assert_eq!(usage.totals(), (3, 2));
     }
 
     #[tokio::test]
@@ -1594,8 +1634,10 @@ mod tests {
         });
         let mut hasher = Sha256::new();
         let tracing = TracingIds::from_headers(&Default::default());
+        let mut usage = UsageTally::default();
         let outcome = run_iteration(
             IterCtx {
+                usage: &mut usage,
                 tx: &tx,
                 hasher: &mut hasher,
                 chunk_transform: Some(&transform),
@@ -1610,6 +1652,24 @@ mod tests {
         assert!(outcome.downstream_error.is_some());
         assert!(outcome.saw_done);
         assert_eq!((outcome.input_tokens, outcome.output_tokens), (3, 2));
+    }
+
+    #[test]
+    fn usage_tally_keeps_latest_cumulative_and_sums_calls() {
+        let mut usage = UsageTally::default();
+        // First call: cumulative counts on every chunk, latest wins.
+        usage.observe(10, 1);
+        usage.observe(10, 5);
+        assert_eq!(usage.totals(), (10, 5));
+        usage.finish_iteration();
+        // Second call interrupted part-way: its latest counts still count.
+        usage.observe(15, 2);
+        assert_eq!(usage.totals(), (25, 7));
+        usage.finish_iteration();
+        assert_eq!(usage.totals(), (25, 7));
+        // A call that observed nothing adds nothing.
+        usage.finish_iteration();
+        assert_eq!(usage.totals(), (25, 7));
     }
 
     #[test]

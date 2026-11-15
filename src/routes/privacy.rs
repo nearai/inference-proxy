@@ -52,6 +52,10 @@ pub async fn classify(
     body: Body,
 ) -> Result<Response, AppError> {
     let request_body = read_body_with_limit(body, state.config.max_request_size).await?;
+    if auth.cloud_api_key.is_some() {
+        let request_json = proxy::parse_json_object(&request_body)?;
+        crate::model_list::guard_request_body(&request_json, Some(&state.config.model_name))?;
+    }
     let request_sha256 = hex::encode(Sha256::digest(&request_body));
     let path_with_query = match uri.query() {
         Some(query) => format!("{}?{query}", super::ROUTE_PRIVACY_CLASSIFY),
@@ -152,6 +156,14 @@ pub async fn classify(
         )
         .await
     } else {
+        // The passthrough body has no usage counters to report for a direct key.
+        if auth.cloud_api_key.is_some() {
+            return Err(AppError::UpstreamParsed {
+                status: axum::http::StatusCode::BAD_GATEWAY,
+                message: "Upstream response did not include billable usage".into(),
+                error_type: "upstream_usage_missing".into(),
+            });
+        }
         let mut builder = Response::builder().status(axum_status);
         for (name, value) in response.headers() {
             if !EXCLUDED_RESPONSE_HEADERS.contains(&name.as_str()) {

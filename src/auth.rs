@@ -47,10 +47,24 @@ impl IngressRouteKind {
     }
 }
 
+/// Caller of a request authenticated with a config token that `TOKEN_LABELS`
+/// does not label.
+pub const CALLER_UNLABELED: &str = "unlabeled";
+/// Caller of a request authenticated with a Cloud API key.
+pub const CALLER_API_KEY: &str = "api_key";
+/// Caller value for a request that has not been authenticated.
+pub const CALLER_UNKNOWN: &str = "unknown";
+/// Values the proxy itself uses for `caller`; `TOKEN_LABELS` cannot use them.
+pub const RESERVED_CALLERS: &[&str] = &[CALLER_UNLABELED, CALLER_API_KEY, CALLER_UNKNOWN];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestSource {
     pub auth_path: AuthPath,
     pub ingress_route: IngressRouteKind,
+    /// Bounded caller label: the matched config token's `TOKEN_LABELS` entry
+    /// (`unlabeled` without one), or `api_key` for a Cloud API key. Never
+    /// derived from the token's value.
+    pub caller: &'static str,
 }
 
 fn classify_ingress_host(host: Option<&str>) -> IngressRouteKind {
@@ -127,6 +141,14 @@ pub struct AuthSubject {
     pub api_key_id: Option<String>,
 }
 
+impl AuthSubject {
+    pub(crate) fn has_billing_identity(&self) -> bool {
+        [&self.org_id, &self.workspace_id, &self.api_key_id]
+            .into_iter()
+            .all(|value| value.as_deref().is_some_and(|value| !value.is_empty()))
+    }
+}
+
 /// On-the-wire shape of `/v1/check_api_key`'s success body. Cloud-api uses
 /// `organization_id` (and PR #635 onward also `workspace_id`); `api_key_id`
 /// is a follow-up addition. We deserialize lenient on all of them.
@@ -155,7 +177,7 @@ pub(crate) fn presents_config_token(headers: &axum::http::HeaderMap, config: &Co
         .get("authorization")
         .and_then(|value| value.to_str().ok())
         .and_then(|header| header.strip_prefix("Bearer "))
-        .is_some_and(|token| config.tokens.iter().any(|trusted| token_eq(token, trusted)))
+        .is_some_and(|token| config.config_token_caller(token).is_some())
 }
 
 /// Classify a `reqwest::Error` into a coarse bucket so failure modes are
@@ -176,19 +198,6 @@ fn classify_reqwest_error(e: &reqwest::Error) -> &'static str {
     } else {
         "other"
     }
-}
-
-/// Render the full error chain (`source()` → `source()` → ...) so we don't
-/// lose the underlying hyper / rustls / io::Error message that reqwest hides.
-fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
-    let mut out = e.to_string();
-    let mut src = e.source();
-    while let Some(inner) = src {
-        out.push_str(" | ");
-        out.push_str(&inner.to_string());
-        src = inner.source();
-    }
-    out
 }
 
 /// Validate an `sk-` prefixed API key against the cloud API.
@@ -235,7 +244,6 @@ async fn check_cloud_api_key(
             }
             Err(e) => {
                 let kind = classify_reqwest_error(&e);
-                let chain = error_chain(&e);
                 metrics::counter!(
                     "cloud_api_auth_attempts_total",
                     "outcome" => "transport_error",
@@ -245,8 +253,6 @@ async fn check_cloud_api_key(
                 if attempt < max_attempts {
                     let delay = backoff_delay(initial_backoff_ms, attempt);
                     warn!(
-                        error = %e,
-                        error_chain = %chain,
                         error_kind = kind,
                         is_connect = e.is_connect(),
                         is_timeout = e.is_timeout(),
@@ -261,8 +267,6 @@ async fn check_cloud_api_key(
                     continue;
                 }
                 warn!(
-                    error = %e,
-                    error_chain = %chain,
                     error_kind = kind,
                     is_connect = e.is_connect(),
                     is_timeout = e.is_timeout(),
@@ -278,10 +282,8 @@ async fn check_cloud_api_key(
         match status {
             200 => {
                 metrics::counter!("cloud_api_auth_attempts_total", "outcome" => "ok").increment(1);
-                // Older cloud-api builds may return a non-JSON body or omit
-                // identity fields. Tolerate both shapes: any parse failure
-                // or missing field downgrades to `None` and the caller
-                // keeps using the legacy reporting path.
+                // A malformed body or missing identity is rejected by the
+                // authenticated request path before backend dispatch.
                 let subject = serde_json::from_slice::<CheckApiKeyResponse>(&body_bytes)
                     .map(|r| AuthSubject {
                         org_id: r.organization_id,
@@ -358,6 +360,19 @@ impl FromRequestParts<AppState> for RequireAuth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        let auth = Self::authenticate(parts, state).await?;
+        // Every authenticated route passes here: record who the request is
+        // from on its span and for its finish or cancel line.
+        if let Some(ids) = parts.extensions.get::<TracingIds>() {
+            ids.with_authenticated_context(&parts.headers, &auth)
+                .publish_identity();
+        }
+        Ok(auth)
+    }
+}
+
+impl RequireAuth {
+    async fn authenticate(parts: &mut Parts, state: &AppState) -> Result<Self, AppError> {
         let ingress_route = classify_ingress_route(parts);
         // request_id_middleware has already normalized this to a UUID. Reuse it
         // for the Cloud API auth check so direct traffic is joinable across the
@@ -376,7 +391,7 @@ impl FromRequestParts<AppState> for RequireAuth {
                 let token = &header[7..];
                 // Constant-time comparison against each configured admin token
                 // so multiple tokens can be active simultaneously (rotation).
-                if state.config.tokens.iter().any(|t| token_eq(token, t)) {
+                if let Some(caller) = state.config.config_token_caller(token) {
                     return Ok(RequireAuth {
                         cloud_api_key: None,
                         org_id: None,
@@ -386,6 +401,7 @@ impl FromRequestParts<AppState> for RequireAuth {
                         request_source: RequestSource {
                             auth_path: AuthPath::TrustedConfigToken,
                             ingress_route,
+                            caller,
                         },
                     });
                 }
@@ -393,8 +409,8 @@ impl FromRequestParts<AppState> for RequireAuth {
                 // Fallback: validate sk- tokens against cloud API
                 if token.starts_with("sk-") {
                     if let Some(cloud_api_url) = &state.config.cloud_api_url {
-                        // A key cloud-api accepted is not checked again for
-                        // 5 minutes; any other answer is never kept.
+                        // Cloud API checks credit and revocation for each
+                        // request; concurrent checks for one key coalesce.
                         let subject = state
                             .api_key_cache
                             .subject(token, || {
@@ -407,16 +423,13 @@ impl FromRequestParts<AppState> for RequireAuth {
                                 )
                             })
                             .await?;
-                        // Partner lane: only allow-listed organizations may use
-                        // this deployment. A key without an organization id is
-                        // refused too, since it cannot be matched.
+                        // Apply lane policy before checking accounting readiness;
+                        // a refused key cannot start billable work.
                         if !state.config.allowed_org_ids.is_empty()
                             && !subject.org_id.as_deref().is_some_and(|org| {
                                 state.config.allowed_org_ids.iter().any(|a| a == org)
                             })
                         {
-                            // Separate from cloud_api_auth_attempts_total: the attempt
-                            // itself succeeded (cloud-api said 200), this is policy.
                             metrics::counter!("cloud_api_org_allowlist_rejections_total")
                                 .increment(1);
                             tracing::warn!(
@@ -425,6 +438,26 @@ impl FromRequestParts<AppState> for RequireAuth {
                                 "Cloud API key belongs to an organization that is not allowed on this deployment"
                             );
                             return Err(AppError::Forbidden);
+                        }
+                        // A direct-key response must have enough server-side
+                        // identity and transport configuration to record usage.
+                        // Otherwise successful inference would be unattributable.
+                        if !subject.has_billing_identity()
+                            || (state.usage_report_delivery.is_http()
+                                && state
+                                    .config
+                                    .cloud_api_usage_token
+                                    .as_deref()
+                                    .is_none_or(str::is_empty))
+                        {
+                            tracing::error!(
+                                has_org = subject.org_id.is_some(),
+                                has_workspace = subject.workspace_id.is_some(),
+                                has_api_key_id = subject.api_key_id.is_some(),
+                                has_usage_token = state.config.cloud_api_usage_token.is_some(),
+                                "Direct-key usage accounting is unavailable"
+                            );
+                            return Err(AppError::BillingUnavailable);
                         }
                         return Ok(RequireAuth {
                             cloud_api_key: Some(token.to_string()),
@@ -435,6 +468,7 @@ impl FromRequestParts<AppState> for RequireAuth {
                             request_source: RequestSource {
                                 auth_path: AuthPath::CloudApiKey,
                                 ingress_route,
+                                caller: CALLER_API_KEY,
                             },
                         });
                     }
@@ -461,22 +495,38 @@ impl FromRequestParts<AppState> for RequireTrustedAuth {
             .and_then(|header| header.strip_prefix("Bearer "))
             .ok_or(AppError::Unauthorized)?;
 
-        if state
-            .config
-            .tokens
-            .iter()
-            .any(|trusted| token_eq(token, trusted))
-        {
-            Ok(Self)
-        } else {
-            Err(AppError::Unauthorized)
+        let Some(caller) = state.config.config_token_caller(token) else {
+            return Err(AppError::Unauthorized);
+        };
+        // Record the caller for the request's finish or cancel line, as
+        // `RequireAuth` does. A trusted-only route takes no tenant headers.
+        if let Some(ids) = parts.extensions.get::<TracingIds>() {
+            ids.with_request_source(RequestSource {
+                auth_path: AuthPath::TrustedConfigToken,
+                ingress_route: classify_ingress_route(parts),
+                caller,
+            })
+            .publish_identity();
         }
+        Ok(Self)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn billing_identity_requires_nonempty_fields() {
+        let mut subject = AuthSubject {
+            org_id: Some("org".into()),
+            workspace_id: Some("workspace".into()),
+            api_key_id: Some("key".into()),
+        };
+        assert!(subject.has_billing_identity());
+        subject.api_key_id = Some(String::new());
+        assert!(!subject.has_billing_identity());
+    }
     use std::hint::black_box;
     use std::time::Instant;
 
@@ -522,48 +572,6 @@ mod tests {
         }
         durations.sort_unstable();
         durations[durations.len() / 2]
-    }
-
-    #[test]
-    fn test_error_chain_walks_source_chain() {
-        #[derive(Debug)]
-        struct Wrap {
-            msg: &'static str,
-            inner: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
-        }
-        impl std::fmt::Display for Wrap {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str(self.msg)
-            }
-        }
-        impl std::error::Error for Wrap {
-            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-                self.inner.as_deref().map(|e| e as _)
-            }
-        }
-
-        let inner = Wrap {
-            msg: "peer reset",
-            inner: None,
-        };
-        let middle = Wrap {
-            msg: "tls write",
-            inner: Some(Box::new(inner)),
-        };
-        let outer = Wrap {
-            msg: "send failed",
-            inner: Some(Box::new(middle)),
-        };
-
-        let s = error_chain(&outer);
-        assert!(s.contains("send failed"), "must include outer: {s}");
-        assert!(s.contains("tls write"), "must include middle: {s}");
-        assert!(s.contains("peer reset"), "must include innermost: {s}");
-        assert_eq!(
-            s.matches('|').count(),
-            2,
-            "two separators for three frames: {s}"
-        );
     }
 
     #[tokio::test]

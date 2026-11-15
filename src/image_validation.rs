@@ -444,7 +444,6 @@ fn preflight_http_url(
     if !remote_host_matches_allowed_domains(parsed, &cfg.allowed_domains) {
         tracing::info!(
             reason = "disallowed_media_domain",
-            host = parsed.host_str().unwrap_or("<missing>"),
             "image validation rejected"
         );
         return Some(Verdict::Reject);

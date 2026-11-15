@@ -19,13 +19,6 @@ struct TestAppOptions {
     dstack_socket_path: String,
     image_validation: bool,
     media_inline: bool,
-    fusion_enabled: bool,
-    fusion_endpoints_url: Option<String>,
-    web_context_search_url: Option<String>,
-    fusion_panel_timeout_secs: u64,
-    fusion_max_response_bytes: usize,
-    fusion_internal_max_attempts: usize,
-    fusion_internal_retry_initial_backoff_ms: u64,
     vllm_data_parallel_size: Option<usize>,
     /// Backend URLs for the pool; empty means "just the mock URL".
     backend_urls: Vec<String>,
@@ -43,6 +36,8 @@ struct TestAppOptions {
     priority_size_tiers: Option<String>,
     /// `VLLM_PROXY_PRIORITY_LOWER_FIRST`.
     priority_lower_first: bool,
+    /// `TOKEN_LABELS`, one per token.
+    token_labels: Vec<&'static str>,
 }
 
 impl Default for TestAppOptions {
@@ -54,13 +49,6 @@ impl Default for TestAppOptions {
             dstack_socket_path: "/var/run/dstack.sock".to_string(),
             image_validation: false,
             media_inline: false,
-            fusion_enabled: false,
-            fusion_endpoints_url: None,
-            web_context_search_url: None,
-            fusion_panel_timeout_secs: 120,
-            fusion_max_response_bytes: 10 * 1024 * 1024,
-            fusion_internal_max_attempts: 2,
-            fusion_internal_retry_initial_backoff_ms: 1,
             vllm_data_parallel_size: None,
             backend_urls: Vec::new(),
             backend_conversation_affinity: false,
@@ -71,6 +59,7 @@ impl Default for TestAppOptions {
             strict_request_model: false,
             priority_size_tiers: None,
             priority_lower_first: false,
+            token_labels: Vec::new(),
         }
     }
 }
@@ -130,30 +119,6 @@ fn build_test_app_with_rate_limit(
 }
 
 fn build_test_app_inner(mock_url: &str, options: TestAppOptions) -> axum::Router {
-    build_test_app_inner_with_fusion(mock_url, options)
-}
-
-fn build_test_app_with_fusion(mock_url: &str, endpoints_url: String) -> axum::Router {
-    build_test_app_with_fusion_and_web(mock_url, endpoints_url, None)
-}
-
-fn build_test_app_with_fusion_and_web(
-    mock_url: &str,
-    endpoints_url: String,
-    web_context_search_url: Option<String>,
-) -> axum::Router {
-    build_test_app_inner_with_fusion(
-        mock_url,
-        TestAppOptions {
-            fusion_enabled: true,
-            fusion_endpoints_url: Some(endpoints_url),
-            web_context_search_url,
-            ..Default::default()
-        },
-    )
-}
-
-fn build_test_app_inner_with_fusion(mock_url: &str, options: TestAppOptions) -> axum::Router {
     build_test_app_inner_with_pool(mock_url, options).0
 }
 
@@ -208,11 +173,8 @@ fn build_test_app_inner_with_pool(
         model_list: None,
         replica_state: None,
         model_name: "test-model".to_string(),
-        tokens: if options.fusion_enabled {
-            vec!["test-token".to_string(), "fusion-token".to_string()]
-        } else {
-            vec!["test-token".to_string()]
-        },
+        tokens: vec!["test-token".to_string()],
+        token_labels: options.token_labels.clone(),
         vllm_base_url: mock_url.to_string(),
         chat_completions_url: format!("{base}/v1/chat/completions"),
         completions_url: format!("{base}/v1/completions"),
@@ -256,7 +218,10 @@ fn build_test_app_inner_with_pool(
         cloud_api_auth_max_attempts: 1,
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
-        cloud_api_usage_token: None,
+        cloud_api_usage_token: options
+            .cloud_api_url
+            .as_ref()
+            .map(|_| "test-usage-token".to_string()),
         usage_report: Default::default(),
         usage_report_transport: Default::default(),
         compose_manager_url: None,
@@ -280,7 +245,9 @@ fn build_test_app_inner_with_pool(
         transcriptions_url_override: None,
         rerank_url_override: None,
         score_url_override: None,
+        rerank_limits: Default::default(),
         ohttp_enabled: false,
+        ohttp_max_inflight: 0,
         listen_port: 8000,
         listen_addr: "127.0.0.1".to_string(),
         backend_token: None,
@@ -304,6 +271,7 @@ fn build_test_app_inner_with_pool(
         discount_to_user: None,
         backend_lora: options.backend_lora.clone(),
         strict_request_model: options.strict_request_model,
+        request_guard: Default::default(),
         reasoning_off_effort: "none".to_string(),
         allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,
@@ -329,26 +297,10 @@ fn build_test_app_inner_with_pool(
         dstack_socket_path: options.dstack_socket_path,
         gpu_evidence_delegate_url: None,
         gpu_evidence_delegate_timeout_secs: 30,
-        web_context_search_api_key: options
-            .web_context_search_url
-            .as_ref()
-            .map(|_| "brave-test-key".to_string()),
-        web_context_search_url: options.web_context_search_url,
+        web_context_search_api_key: None,
+        web_context_search_url: None,
         agent_loop_max_iterations: 5,
         web_context_search_timeout_secs: 30,
-        fusion_enabled: options.fusion_enabled,
-        fusion_endpoints_url: options
-            .fusion_endpoints_url
-            .unwrap_or_else(|| "https://completions.near.ai/endpoints".to_string()),
-        fusion_endpoints_ttl_secs: 300,
-        fusion_internal_bearer_token: options.fusion_enabled.then(|| "fusion-token".to_string()),
-        fusion_default_analysis_models: Vec::new(),
-        fusion_max_panel_models: 8,
-        fusion_max_depth: 1,
-        fusion_panel_timeout_secs: options.fusion_panel_timeout_secs,
-        fusion_max_response_bytes: options.fusion_max_response_bytes,
-        fusion_internal_max_attempts: options.fusion_internal_max_attempts,
-        fusion_internal_retry_initial_backoff_ms: options.fusion_internal_retry_initial_backoff_ms,
     };
 
     // Use fixed keys for deterministic tests
@@ -385,9 +337,15 @@ fn build_test_app_inner_with_pool(
         ),
     );
 
+    let admission = Arc::new(vllm_proxy_rs::admission::AdmissionController::new(
+        config.admission(),
+        backend_pool.len(),
+        Arc::new(vllm_proxy_rs::engine_load::EngineLoad::disabled()),
+    ));
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),
+        rerank_limiter: Default::default(),
         usage_report_delivery: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
@@ -400,10 +358,9 @@ fn build_test_app_inner_with_pool(
             vllm_proxy_rs::attestation::TlsCertTracker::new(None).expect("tracker for None path"),
         ),
         backend_pool: backend_pool.clone(),
-        admission: Arc::new(vllm_proxy_rs::admission::AdmissionController::disabled()),
+        admission,
         ohttp_gateway: None,
         ohttp_attestation_ed25519: None,
-        fusion_caches: Arc::new(fusion::FusionCaches::default()),
         vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(
             options.vllm_data_parallel_size,
             1_200,
@@ -1074,18 +1031,16 @@ async fn test_completions_replica_hint_routes_to_hinted_backend() {
     assert_eq!(requests_seen(&backend_a).await, 0);
 }
 
-/// cloud-api's 200 for an `sk-` key (with the identity usage reports need) is
-/// reused for 5 minutes: a second request with the same key does not check it
-/// again.
+/// A later request rechecks key authorization and credit state.
 #[tokio::test]
-async fn test_cloud_api_key_check_is_reused_across_requests() {
+async fn test_cloud_api_key_check_is_repeated_across_requests() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
     mount_completions_ok(&backend, 2).await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true, "organization_id": "org-1", "workspace_id": "ws-1", "api_key_id": "key-1"})))
-        .expect(1)
+        .expect(2)
         .mount(&cloud_api)
         .await;
     let (app, _pool) =
@@ -1111,7 +1066,7 @@ async fn test_cloud_api_key_check_is_reused_across_requests() {
 }
 
 /// A key cloud-api did not accept is checked on every request until a 200;
-/// only then is it reused.
+/// even after a successful check.
 #[tokio::test]
 async fn test_cloud_api_key_is_checked_on_every_request_until_accepted() {
     let backend = MockServer::start().await;
@@ -1130,7 +1085,7 @@ async fn test_cloud_api_key_is_checked_on_every_request_until_accepted() {
         .and(path("/v1/check_api_key"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true, "organization_id": "org-1", "workspace_id": "ws-1", "api_key_id": "key-1"})))
         .with_priority(2)
-        .expect(1)
+        .expect(2)
         .mount(&cloud_api)
         .await;
     let (app, _pool) =
@@ -1180,7 +1135,7 @@ async fn test_cloud_api_key_5xx_is_not_kept() {
         .and(path("/v1/check_api_key"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true, "organization_id": "org-1", "workspace_id": "ws-1", "api_key_id": "key-1"})))
         .with_priority(2)
-        .expect(1)
+        .expect(2)
         .mount(&cloud_api)
         .await;
     let (app, _pool) =
@@ -1214,7 +1169,7 @@ async fn test_completions_replica_hint_is_dropped_for_cloud_api_key_auth() {
     mount_completions_ok(&backend_b, 0).await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true, "organization_id": "org-1", "workspace_id": "ws-1", "api_key_id": "key-1"})))
         .mount(&cloud_api)
         .await;
     let (app, pool) = build_test_app_with_backends_and_cloud_api(
@@ -1260,7 +1215,7 @@ async fn test_chat_completions_replica_hint_is_dropped_for_cloud_api_key_auth() 
     mount_chat_ok(&backend_b, "/v1/chat/completions", 0).await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true, "organization_id": "org-1", "workspace_id": "ws-1", "api_key_id": "key-1"})))
         .mount(&cloud_api)
         .await;
     let (app, pool) = build_test_app_with_backends_and_cloud_api(
@@ -1275,6 +1230,8 @@ async fn test_chat_completions_replica_hint_is_dropped_for_cloud_api_key_auth() 
         .active_conns
         .store(3, std::sync::atomic::Ordering::Relaxed);
 
+    let mut body = affinity_chat_body(0);
+    body["model"] = serde_json::Value::String("test-model".to_string());
     let response = app
         .oneshot(
             Request::builder()
@@ -1283,9 +1240,7 @@ async fn test_chat_completions_replica_hint_is_dropped_for_cloud_api_key_auth() 
                 .header("content-type", "application/json")
                 .header("authorization", "Bearer sk-test-valid-key-12345678901")
                 .header(backend_affinity::REPLICA_HINT_HEADER, "1")
-                .body(Body::from(
-                    serde_json::to_vec(&affinity_chat_body(0)).unwrap(),
-                ))
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
         .await
@@ -1567,2283 +1522,6 @@ async fn test_chat_completions_image_validation_allows_text_only() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn test_fusion_tool_passes_through_when_disabled() {
-    use wiremock::matchers::body_string_contains;
-
-    let mock_server = MockServer::start().await;
-
-    let backend_response = serde_json::json!({
-        "id": "chatcmpl-fusion-disabled",
-        "object": "chat.completion",
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": "pass-through"},
-            "finish_reason": "stop"
-        }],
-        "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
-    });
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_string_contains("\"type\":\"openrouter:fusion\""))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&backend_response))
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app(&mock_server.uri());
-
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": "Hi"}],
-        "tools": [{
-            "type": "openrouter:fusion",
-            "analysis_models": ["~panel-model"]
-        }],
-        "stream": false
-    });
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_to_json(response).await;
-    assert_eq!(body["id"], "chatcmpl-fusion-disabled");
-    assert!(body.get("nearai_fusion").is_none());
-}
-
-#[tokio::test]
-async fn test_non_forced_fusion_skips_when_outer_model_does_not_call_tool() {
-    use wiremock::matchers::body_string_contains;
-
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/endpoints"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("should not discover endpoints"))
-        .expect(0)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_string_contains("openrouter:fusion"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("fusion leaked"))
-        .expect(0)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_string_contains("\"type\":\"web_context_search\""))
-        .respond_with(ResponseTemplate::new(500).set_body_string("web marker leaked to preflight"))
-        .expect(0)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_string_contains("__nearai_fusion"))
-        .and(body_string_contains("client_tool"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-fusion-skipped",
-            "object": "chat.completion",
-            "model": "test-model",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "Plain answer."},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
-        })))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app_with_fusion(
-        &mock_server.uri(),
-        format!("{}/endpoints", mock_server.uri()),
-    );
-
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": "Answer directly"}],
-        "tools": [
-            {
-                "type": "openrouter:fusion",
-                "analysis_models": ["panel-a"]
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "client_tool",
-                    "description": "A client-owned tool.",
-                    "parameters": {"type": "object"}
-                }
-            },
-            {"type": "web_context_search"}
-        ],
-        "stream": false
-    });
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_to_json(response).await;
-    assert_eq!(body["id"], "chatcmpl-fusion-skipped");
-    assert_eq!(body["choices"][0]["message"]["content"], "Plain answer.");
-    assert_eq!(body["nearai_fusion"]["status"], "skipped");
-    assert_eq!(
-        body["nearai_fusion"]["reason"],
-        "outer_model_did_not_call_fusion"
-    );
-    assert_eq!(body["nearai_fusion"]["forced"], false);
-    assert_eq!(body["usage"]["total_tokens"], 10);
-}
-
-#[tokio::test]
-async fn test_non_forced_fusion_runs_when_outer_model_calls_internal_tool() {
-    use wiremock::matchers::body_string_contains;
-
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/endpoints"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "endpoints": [{
-                "domain": mock_server.uri(),
-                "models": ["panel-a"]
-            }]
-        })))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_string_contains("openrouter:fusion"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("fusion leaked"))
-        .expect(0)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_string_contains("__nearai_fusion"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-fusion-preflight",
-            "object": "chat.completion",
-            "model": "test-model",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": null,
-                    "tool_calls": [{
-                        "id": "call-fusion",
-                        "type": "function",
-                        "function": {
-                            "name": "__nearai_fusion",
-                            "arguments": "{}"
-                        }
-                    }]
-                },
-                "finish_reason": "tool_calls"
-            }],
-            "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
-        })))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(header("authorization", "Bearer fusion-token"))
-        .and(body_string_contains(
-            "one member of a private multi-model panel",
-        ))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-panel",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "Panel answer."},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12}
-        })))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(header("authorization", "Bearer fusion-token"))
-        .and(body_string_contains("strict JSON only"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-judge",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": "{\"consensus\":\"panel\",\"disagreements\":[],\"strengths\":[],\"risks\":[],\"synthesis_guidance\":\"use panel\"}"
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 11, "completion_tokens": 13, "total_tokens": 24}
-        })))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_string_contains("final synthesis model"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-final",
-            "object": "chat.completion",
-            "model": "test-model",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "Synthesized."},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 17, "completion_tokens": 19, "total_tokens": 36}
-        })))
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app_with_fusion(
-        &mock_server.uri(),
-        format!("{}/endpoints", mock_server.uri()),
-    );
-
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": "Deliberate if useful"}],
-        "tools": [{
-            "type": "openrouter:fusion",
-            "analysis_models": ["panel-a"],
-            "model": "panel-a"
-        }],
-        "stream": false
-    });
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_to_json(response).await;
-    assert_eq!(body["choices"][0]["message"]["content"], "Synthesized.");
-    assert_eq!(body["nearai_fusion"]["status"], "invoked");
-    assert_eq!(body["nearai_fusion"]["forced"], false);
-    assert_eq!(body["nearai_fusion"]["preflight_status"], "invoked");
-    assert_eq!(body["usage"]["prompt_tokens"], 35);
-    assert_eq!(body["usage"]["completion_tokens"], 42);
-    assert_eq!(body["usage"]["total_tokens"], 77);
-}
-
-#[tokio::test]
-async fn test_forced_fusion_runs_panel_judge_and_synthesis() {
-    use wiremock::matchers::body_string_contains;
-
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/endpoints"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "endpoints": [{
-                "domain": mock_server.uri(),
-                "models": ["panel-a"]
-            }]
-        })))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/v1/attestation/report"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_string_contains("openrouter:fusion"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("fusion leaked"))
-        .expect(0)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(header("authorization", "Bearer fusion-token"))
-        .and(body_string_contains(
-            "one member of a private multi-model panel",
-        ))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-panel",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "Panel says blue."},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
-        })))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(header("authorization", "Bearer fusion-token"))
-        .and(body_string_contains("strict JSON only"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-judge",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": "{\"consensus\":\"blue\",\"disagreements\":[],\"strengths\":[],\"risks\":[],\"synthesis_guidance\":\"answer blue\"}"
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
-        })))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_string_contains("\"model\":\"test-model\""))
-        .and(body_string_contains("final synthesis model"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-final",
-            "object": "chat.completion",
-            "model": "test-model",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "Blue."},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11}
-        })))
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app_with_fusion(
-        &mock_server.uri(),
-        format!("{}/endpoints", mock_server.uri()),
-    );
-
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": "Pick a color"}],
-        "tools": [{
-            "type": "openrouter:fusion",
-            "parameters": {
-                "analysis_models": ["~panel-a"],
-                "model": "panel-a",
-                "max_completion_tokens": 16
-            }
-        }],
-        "tool_choice": "required",
-        "stream": false
-    });
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_to_json(response).await;
-    assert_eq!(body["id"], "chatcmpl-final");
-    assert_eq!(body["choices"][0]["message"]["content"], "Blue.");
-    assert_eq!(body["usage"]["prompt_tokens"], 9);
-    assert_eq!(body["usage"]["completion_tokens"], 12);
-    assert_eq!(body["usage"]["total_tokens"], 21);
-    assert_eq!(body["nearai_fusion"]["status"], "invoked");
-    assert_eq!(body["nearai_fusion"]["panel"][0]["model"], "panel-a");
-    assert_eq!(body["nearai_fusion"]["judge"]["status"], "ok");
-}
-
-#[tokio::test]
-async fn test_forced_openrouter_fusion_flat_tool_runs_panel_judge_and_synthesis() {
-    use wiremock::matchers::body_string_contains;
-
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/endpoints"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "endpoints": [{
-                "domain": mock_server.uri(),
-                "models": ["panel-a"]
-            }]
-        })))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/v1/attestation/report"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_string_contains("openrouter:fusion"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("fusion leaked"))
-        .expect(0)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(header("authorization", "Bearer fusion-token"))
-        .and(body_string_contains("\"model\":\"panel-a\""))
-        .and(body_string_contains("\"max_completion_tokens\":16"))
-        .and(body_string_contains(
-            "one member of a private multi-model panel",
-        ))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-panel-flat",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "Flat panel says green."},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
-        })))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(header("authorization", "Bearer fusion-token"))
-        .and(body_string_contains("\"model\":\"panel-a\""))
-        .and(body_string_contains("\"max_completion_tokens\":16"))
-        .and(body_string_contains("strict JSON only"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-judge-flat",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": "{\"consensus\":\"green\",\"disagreements\":[],\"strengths\":[],\"risks\":[],\"synthesis_guidance\":\"answer green\"}"
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 4, "completion_tokens": 5, "total_tokens": 9}
-        })))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_string_contains("\"model\":\"test-model\""))
-        .and(body_string_contains("final synthesis model"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-final-flat",
-            "object": "chat.completion",
-            "model": "test-model",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "Green."},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 6, "completion_tokens": 7, "total_tokens": 13}
-        })))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app_with_fusion(
-        &mock_server.uri(),
-        format!("{}/endpoints", mock_server.uri()),
-    );
-
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": "Pick a flat color"}],
-        "tools": [{
-            "type": "openrouter:fusion",
-            "analysis_models": ["~panel-a"],
-            "model": "panel-a",
-            "max_completion_tokens": 16
-        }],
-        "tool_choice": "required",
-        "stream": false
-    });
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_to_json(response).await;
-    assert_eq!(body["id"], "chatcmpl-final-flat");
-    assert_eq!(body["choices"][0]["message"]["content"], "Green.");
-    assert_eq!(body["usage"]["prompt_tokens"], 12);
-    assert_eq!(body["usage"]["completion_tokens"], 15);
-    assert_eq!(body["usage"]["total_tokens"], 27);
-    assert_eq!(body["nearai_fusion"]["status"], "invoked");
-    assert_eq!(body["nearai_fusion"]["panel"][0]["model"], "panel-a");
-    assert_eq!(body["nearai_fusion"]["panel"][0]["status"], "ok");
-    assert_eq!(body["nearai_fusion"]["judge"]["model"], "panel-a");
-    assert_eq!(body["nearai_fusion"]["judge"]["status"], "ok");
-}
-
-#[tokio::test]
-async fn test_forced_fusion_retries_transient_panel_5xx() {
-    use wiremock::matchers::body_string_contains;
-
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/endpoints"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "endpoints": [{
-                "domain": mock_server.uri(),
-                "models": ["panel-a"]
-            }]
-        })))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/v1/attestation/report"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(header("authorization", "Bearer fusion-token"))
-        .and(body_string_contains(
-            "one member of a private multi-model panel",
-        ))
-        .respond_with(ResponseTemplate::new(503).set_body_string("loading".repeat(512)))
-        .expect(1)
-        .up_to_n_times(1)
-        .with_priority(1)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(header("authorization", "Bearer fusion-token"))
-        .and(body_string_contains(
-            "one member of a private multi-model panel",
-        ))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-panel",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "Panel retry succeeded."},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
-        })))
-        .expect(1)
-        .with_priority(2)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(header("authorization", "Bearer fusion-token"))
-        .and(body_string_contains("strict JSON only"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-judge",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": "{\"consensus\":\"retry ok\",\"disagreements\":[],\"strengths\":[],\"risks\":[],\"synthesis_guidance\":\"answer retry ok\"}"
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
-        })))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_string_contains("\"model\":\"test-model\""))
-        .and(body_string_contains("final synthesis model"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-final",
-            "object": "chat.completion",
-            "model": "test-model",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "Retry ok."},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11}
-        })))
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app_inner(
-        &mock_server.uri(),
-        TestAppOptions {
-            fusion_enabled: true,
-            fusion_endpoints_url: Some(format!("{}/endpoints", mock_server.uri())),
-            fusion_max_response_bytes: 512,
-            ..Default::default()
-        },
-    );
-
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": "Retry the panel if needed"}],
-        "tools": [{
-            "type": "nearai:fusion",
-            "analysis_models": ["panel-a"],
-            "model": "panel-a",
-            "max_completion_tokens": 16
-        }],
-        "tool_choice": "required",
-        "stream": false
-    });
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_to_json(response).await;
-    assert_eq!(body["choices"][0]["message"]["content"], "Retry ok.");
-    assert_eq!(body["usage"]["prompt_tokens"], 9);
-    assert_eq!(body["usage"]["completion_tokens"], 12);
-    assert_eq!(body["usage"]["total_tokens"], 21);
-    assert_eq!(body["nearai_fusion"]["panel"][0]["status"], "ok");
-    assert_eq!(
-        body["nearai_fusion"]["panel"][0]["error"],
-        serde_json::Value::Null
-    );
-}
-
-#[tokio::test]
-async fn test_forced_fusion_exhausts_transient_panel_5xx_retries() {
-    use wiremock::matchers::body_string_contains;
-
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/endpoints"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "endpoints": [{
-                "domain": mock_server.uri(),
-                "models": ["panel-a"]
-            }]
-        })))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/v1/attestation/report"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(header("authorization", "Bearer fusion-token"))
-        .and(body_string_contains(
-            "one member of a private multi-model panel",
-        ))
-        .respond_with(ResponseTemplate::new(503).set_body_string("still loading"))
-        .expect(2)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_string_contains("strict JSON only"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "nope"})))
-        .expect(0)
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app_inner(
-        &mock_server.uri(),
-        TestAppOptions {
-            fusion_enabled: true,
-            fusion_endpoints_url: Some(format!("{}/endpoints", mock_server.uri())),
-            fusion_internal_max_attempts: 2,
-            ..Default::default()
-        },
-    );
-
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": "Retry exhaustion"}],
-        "tools": [{
-            "type": "nearai:fusion",
-            "analysis_models": ["panel-a"],
-            "model": "panel-a"
-        }],
-        "tool_choice": "required",
-        "stream": false
-    });
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    let body = body_to_json(response).await;
-    assert_eq!(body["error"]["message"], "all_panels_failed");
-    assert_eq!(body["error"]["type"], "fusion_error");
-}
-
-#[tokio::test]
-async fn test_forced_fusion_does_not_retry_when_attempts_one() {
-    use wiremock::matchers::body_string_contains;
-
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/endpoints"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "endpoints": [{
-                "domain": mock_server.uri(),
-                "models": ["panel-a"]
-            }]
-        })))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/v1/attestation/report"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(header("authorization", "Bearer fusion-token"))
-        .and(body_string_contains(
-            "one member of a private multi-model panel",
-        ))
-        .respond_with(ResponseTemplate::new(503).set_body_string("loading"))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app_inner(
-        &mock_server.uri(),
-        TestAppOptions {
-            fusion_enabled: true,
-            fusion_endpoints_url: Some(format!("{}/endpoints", mock_server.uri())),
-            fusion_internal_max_attempts: 1,
-            fusion_internal_retry_initial_backoff_ms: 0,
-            ..Default::default()
-        },
-    );
-
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": "No retry"}],
-        "tools": [{
-            "type": "nearai:fusion",
-            "analysis_models": ["panel-a"],
-            "model": "panel-a"
-        }],
-        "tool_choice": "required",
-        "stream": false
-    });
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    let body = body_to_json(response).await;
-    assert_eq!(body["error"]["message"], "all_panels_failed");
-    assert_eq!(body["error"]["type"], "fusion_error");
-}
-
-#[tokio::test]
-async fn test_forced_fusion_runs_panel_web_context_search() {
-    use wiremock::matchers::{body_string_contains, query_param};
-
-    let mock_server = MockServer::start().await;
-    let brave = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/endpoints"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "endpoints": [{
-                "domain": mock_server.uri(),
-                "models": ["panel-a"]
-            }]
-        })))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/v1/attestation/report"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_string_contains("openrouter:fusion"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("fusion leaked"))
-        .expect(0)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(header("authorization", "Bearer fusion-token"))
-        .and(body_string_contains(
-            "one member of a private multi-model panel",
-        ))
-        .and(body_string_contains("web_context_search"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-panel-tool",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "tool_calls": [{
-                        "id": "call_search",
-                        "type": "function",
-                        "function": {
-                            "name": "web_context_search",
-                            "arguments": "{\"query\":\"near ai latest release\"}"
-                        }
-                    }]
-                },
-                "finish_reason": "tool_calls"
-            }],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
-        })))
-        .up_to_n_times(1)
-        .with_priority(1)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/res/v1/llm/context"))
-        .and(header("X-Subscription-Token", "brave-test-key"))
-        .and(query_param("q", "near ai latest release"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "grounding": {
-                "generic": [{
-                    "url": "https://near.ai/news",
-                    "title": "NEAR AI News",
-                    "snippets": ["Brave says today is a good day for source-grounded Fusion."]
-                }]
-            },
-            "sources": {}
-        })))
-        .expect(1)
-        .mount(&brave)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(header("authorization", "Bearer fusion-token"))
-        .and(body_string_contains("Brave says today"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-panel-final",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "Panel used web context."},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
-        })))
-        .up_to_n_times(1)
-        .with_priority(1)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(header("authorization", "Bearer fusion-token"))
-        .and(body_string_contains("strict JSON only"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-judge",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": "{\"consensus\":\"use web context\",\"disagreements\":[],\"strengths\":[],\"risks\":[],\"synthesis_guidance\":\"mention the web-grounded result\"}"
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11}
-        })))
-        .with_priority(2)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_string_contains("final synthesis model"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-final-web",
-            "object": "chat.completion",
-            "model": "test-model",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "Web-grounded Fusion works."},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 7, "completion_tokens": 8, "total_tokens": 15}
-        })))
-        .with_priority(3)
-        .mount(&mock_server)
-        .await;
-
-    let brave_url = format!("{}/res/v1/llm/context", brave.uri());
-    let app = build_test_app_with_fusion_and_web(
-        &mock_server.uri(),
-        format!("{}/endpoints", mock_server.uri()),
-        Some(brave_url),
-    );
-
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": "Use the web and answer"}],
-        "tools": [
-            {
-                "type": "openrouter:fusion",
-                "analysis_models": ["panel-a"],
-                "model": "panel-a",
-                "max_tool_calls": 1
-            },
-            {"type": "web_context_search"}
-        ],
-        "tool_choice": "required",
-        "stream": false
-    });
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_to_json(response).await;
-    assert_eq!(body["id"], "chatcmpl-final-web");
-    assert_eq!(
-        body["choices"][0]["message"]["content"],
-        "Web-grounded Fusion works."
-    );
-    assert_eq!(body["usage"]["prompt_tokens"], 16);
-    assert_eq!(body["usage"]["completion_tokens"], 20);
-    assert_eq!(body["usage"]["total_tokens"], 36);
-    assert_eq!(body["nearai_fusion"]["panel"][0]["web_tool_calls"], 1);
-    assert_eq!(body["nearai_fusion"]["max_tool_calls"], 1);
-}
-
-#[tokio::test]
-async fn test_forced_fusion_streaming_emits_usage_metadata_and_signature() {
-    use wiremock::matchers::body_string_contains;
-
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/endpoints"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "endpoints": [{
-                "domain": mock_server.uri(),
-                "models": ["panel-a"]
-            }]
-        })))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/v1/attestation/report"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(header("authorization", "Bearer fusion-token"))
-        .and(body_string_contains(
-            "one member of a private multi-model panel",
-        ))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-panel-stream",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "Panel stream answer."},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
-        })))
-        .with_priority(1)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(header("authorization", "Bearer fusion-token"))
-        .and(body_string_contains("strict JSON only"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-judge-stream",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": "{\"consensus\":\"stream\",\"disagreements\":[],\"strengths\":[],\"risks\":[],\"synthesis_guidance\":\"stream final\"}"
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 4, "completion_tokens": 5, "total_tokens": 9}
-        })))
-        .with_priority(2)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_string_contains("final synthesis model"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-final-stream",
-            "object": "chat.completion",
-            "model": "test-model",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "Streaming Fusion works."},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 6, "completion_tokens": 7, "total_tokens": 13}
-        })))
-        .with_priority(3)
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app_with_fusion(
-        &mock_server.uri(),
-        format!("{}/endpoints", mock_server.uri()),
-    );
-
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": "Stream it"}],
-        "tools": [{
-            "type": "nearai:fusion",
-            "analysis_models": ["panel-a"],
-            "model": "panel-a"
-        }],
-        "tool_choice": "required",
-        "stream": true
-    });
-
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok()),
-        Some("text/event-stream")
-    );
-    let body = String::from_utf8(body_to_bytes(response).await).unwrap();
-    assert!(body.contains("Streaming Fusion works."));
-    let sse_events: Vec<serde_json::Value> = body
-        .lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .filter(|data| *data != "[DONE]")
-        .map(|data| serde_json::from_str(data).unwrap())
-        .collect();
-    let usage_chunk = sse_events
-        .iter()
-        .find(|event| event.get("usage").is_some())
-        .expect("missing usage chunk");
-    assert_eq!(usage_chunk["usage"]["prompt_tokens"], 12);
-    assert_eq!(usage_chunk["usage"]["completion_tokens"], 15);
-    assert_eq!(usage_chunk["usage"]["total_tokens"], 27);
-    assert_eq!(usage_chunk["nearai_fusion"]["status"], "invoked");
-    assert!(body.ends_with("data: [DONE]\n\n"));
-
-    let sig_response = app
-        .oneshot(
-            Request::builder()
-                .uri("/v1/signature/chatcmpl-final-stream?signing_algo=ecdsa")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(sig_response.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn test_forced_fusion_partial_panel_failure_still_synthesizes() {
-    use wiremock::matchers::body_string_contains;
-
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/endpoints"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "endpoints": [{
-                "domain": mock_server.uri(),
-                "models": ["panel-ok"]
-            }]
-        })))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/v1/attestation/report"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(header("authorization", "Bearer fusion-token"))
-        .and(body_string_contains(
-            "one member of a private multi-model panel",
-        ))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-panel-ok",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "Only one panel succeeded."},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
-        })))
-        .with_priority(1)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(header("authorization", "Bearer fusion-token"))
-        .and(body_string_contains("strict JSON only"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-judge-partial",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": "{\"consensus\":\"one success\",\"disagreements\":[],\"strengths\":[],\"risks\":[],\"synthesis_guidance\":\"use successful panel\"}"
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
-        })))
-        .with_priority(2)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_string_contains("final synthesis model"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-final-partial",
-            "object": "chat.completion",
-            "model": "test-model",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "Partial success final."},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11}
-        })))
-        .with_priority(3)
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app_with_fusion(
-        &mock_server.uri(),
-        format!("{}/endpoints", mock_server.uri()),
-    );
-
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": "Handle partial panel failure"}],
-        "tools": [{
-            "type": "nearai:fusion",
-            "analysis_models": ["panel-ok", "panel-missing"],
-            "model": "panel-ok"
-        }],
-        "tool_choice": "required",
-        "stream": false
-    });
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_to_json(response).await;
-    assert_eq!(
-        body["choices"][0]["message"]["content"],
-        "Partial success final."
-    );
-    assert_eq!(body["usage"]["prompt_tokens"], 9);
-    assert_eq!(body["usage"]["completion_tokens"], 12);
-    assert_eq!(body["nearai_fusion"]["panel"][0]["status"], "ok");
-    assert_eq!(body["nearai_fusion"]["panel"][1]["status"], "failed");
-}
-
-#[tokio::test]
-async fn test_forced_fusion_invalid_judge_json_degrades_to_panel_summaries() {
-    use wiremock::matchers::body_string_contains;
-
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/endpoints"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "endpoints": [{
-                "domain": mock_server.uri(),
-                "models": ["panel-a"]
-            }]
-        })))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/v1/attestation/report"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(header("authorization", "Bearer fusion-token"))
-        .and(body_string_contains("one member of a private multi-model panel"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-panel-invalid-judge",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "Panel summary survives invalid judge."},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
-        })))
-        .with_priority(1)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(header("authorization", "Bearer fusion-token"))
-        .and(body_string_contains("strict JSON only"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-judge-invalid-json",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "not json"},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
-        })))
-        .with_priority(2)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_string_contains("Panel summaries"))
-        .and(body_string_contains(
-            "Panel summary survives invalid judge.",
-        ))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-final-invalid-judge",
-            "object": "chat.completion",
-            "model": "test-model",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "Invalid judge degraded."},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11}
-        })))
-        .with_priority(3)
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app_with_fusion(
-        &mock_server.uri(),
-        format!("{}/endpoints", mock_server.uri()),
-    );
-
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": "Handle invalid judge JSON"}],
-        "tools": [{
-            "type": "openrouter:fusion",
-            "analysis_models": ["panel-a"],
-            "model": "panel-a"
-        }],
-        "tool_choice": "required",
-        "stream": false
-    });
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_to_json(response).await;
-    assert_eq!(
-        body["choices"][0]["message"]["content"],
-        "Invalid judge degraded."
-    );
-    assert_eq!(
-        body["nearai_fusion"]["judge"]["status"],
-        "invalid_json_degraded"
-    );
-    assert_eq!(body["usage"]["prompt_tokens"], 9);
-    assert_eq!(body["usage"]["completion_tokens"], 12);
-}
-
-#[tokio::test]
-async fn test_forced_fusion_all_panels_failed_returns_taxonomy_error() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/endpoints"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "endpoints": []
-        })))
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app_with_fusion(
-        &mock_server.uri(),
-        format!("{}/endpoints", mock_server.uri()),
-    );
-
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": "All panels fail"}],
-        "tools": [{
-            "type": "openrouter:fusion",
-            "analysis_models": ["missing-panel"]
-        }],
-        "tool_choice": "required",
-        "stream": false
-    });
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    let body = body_to_json(response).await;
-    assert_eq!(body["error"]["message"], "all_panels_failed");
-    assert_eq!(body["error"]["type"], "fusion_error");
-}
-
-#[tokio::test]
-async fn test_forced_fusion_accepts_openrouter_plugin_config() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/endpoints"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "endpoints": []
-        })))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "nope"})))
-        .expect(0)
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app_with_fusion(
-        &mock_server.uri(),
-        format!("{}/endpoints", mock_server.uri()),
-    );
-
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": "Plugin Fusion"}],
-        "plugins": [{
-            "id": "fusion",
-            "analysis_models": ["missing-panel"],
-            "model": "missing-panel",
-            "max_completion_tokens": 16,
-            "max_tool_calls": 0
-        }],
-        "tool_choice": "required",
-        "stream": false
-    });
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    let body = body_to_json(response).await;
-    assert_eq!(body["error"]["message"], "all_panels_failed");
-    assert_eq!(body["error"]["type"], "fusion_error");
-}
-
-#[tokio::test]
-async fn test_forced_fusion_parameters_fall_back_to_config_per_field() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/endpoints"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "endpoints": []
-        })))
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app_with_fusion(
-        &mock_server.uri(),
-        format!("{}/endpoints", mock_server.uri()),
-    );
-
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": "Use fallback config"}],
-        "tools": [{
-            "type": "openrouter:fusion",
-            "parameters": {
-                "max_completion_tokens": 16
-            },
-            "config": {
-                "analysis_models": ["missing-panel"],
-                "model": "missing-panel"
-            }
-        }],
-        "tool_choice": "required",
-        "stream": false
-    });
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    let body = body_to_json(response).await;
-    assert_eq!(body["error"]["message"], "all_panels_failed");
-    assert_eq!(body["error"]["type"], "fusion_error");
-}
-
-#[tokio::test]
-async fn test_forced_fusion_plugin_defaults_judge_to_outer_model() {
-    use wiremock::matchers::body_string_contains;
-
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/endpoints"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "endpoints": [{
-                "domain": mock_server.uri(),
-                "models": ["panel-a", "test-model"]
-            }]
-        })))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/v1/attestation/report"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(header("authorization", "Bearer fusion-token"))
-        .and(body_string_contains("\"model\":\"panel-a\""))
-        .and(body_string_contains(
-            "one member of a private multi-model panel",
-        ))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-panel",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "Panel answer."},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
-        })))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(header("authorization", "Bearer fusion-token"))
-        .and(body_string_contains("\"model\":\"test-model\""))
-        .and(body_string_contains("strict JSON only"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-judge",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": "{\"consensus\":\"outer judge\",\"disagreements\":[],\"strengths\":[],\"risks\":[],\"synthesis_guidance\":\"answer outer judge\"}"
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
-        })))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_string_contains("\"model\":\"test-model\""))
-        .and(body_string_contains("final synthesis model"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-final",
-            "object": "chat.completion",
-            "model": "test-model",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "Outer judge."},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11}
-        })))
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app_with_fusion(
-        &mock_server.uri(),
-        format!("{}/endpoints", mock_server.uri()),
-    );
-
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": "Plugin Fusion"}],
-        "plugins": [{
-            "id": "fusion",
-            "analysis_models": ["panel-a"],
-            "max_completion_tokens": 16
-        }],
-        "tool_choice": "required",
-        "stream": false
-    });
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_to_json(response).await;
-    assert_eq!(body["choices"][0]["message"]["content"], "Outer judge.");
-    assert_eq!(body["nearai_fusion"]["judge"]["model"], "test-model");
-    assert_eq!(body["nearai_fusion"]["judge"]["status"], "ok");
-}
-
-#[tokio::test]
-async fn test_forced_fusion_rejects_oversized_endpoint_discovery_response() {
-    let mock_server = MockServer::start().await;
-    let mut oversized_models: Vec<String> = (0..64).map(|i| format!("panel-{i}")).collect();
-    oversized_models.push("panel-a".to_string());
-    Mock::given(method("GET"))
-        .and(path("/endpoints"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "endpoints": [{
-                "domain": mock_server.uri(),
-                "models": oversized_models
-            }]
-        })))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "nope"})))
-        .expect(0)
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app_inner(
-        &mock_server.uri(),
-        TestAppOptions {
-            fusion_enabled: true,
-            fusion_endpoints_url: Some(format!("{}/endpoints", mock_server.uri())),
-            fusion_max_response_bytes: 128,
-            ..Default::default()
-        },
-    );
-
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": "Too large endpoint list"}],
-        "tools": [{
-            "type": "openrouter:fusion",
-            "analysis_models": ["panel-a"]
-        }],
-        "tool_choice": "required",
-        "stream": false
-    });
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    let body = body_to_json(response).await;
-    assert_eq!(body["error"]["message"], "all_panels_failed");
-    assert_eq!(body["error"]["type"], "fusion_error");
-}
-
-#[tokio::test]
-async fn test_forced_fusion_rejects_oversized_panel_response() {
-    let mock_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/endpoints"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "endpoints": [{
-                "domain": mock_server.uri(),
-                "models": ["panel-a"]
-            }]
-        })))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/v1/attestation/report"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(2048)))
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app_inner(
-        &mock_server.uri(),
-        TestAppOptions {
-            fusion_enabled: true,
-            fusion_endpoints_url: Some(format!("{}/endpoints", mock_server.uri())),
-            fusion_max_response_bytes: 512,
-            ..Default::default()
-        },
-    );
-
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": "Too large panel"}],
-        "tools": [{
-            "type": "openrouter:fusion",
-            "analysis_models": ["panel-a"]
-        }],
-        "tool_choice": "required",
-        "stream": false
-    });
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    let body = body_to_json(response).await;
-    assert_eq!(body["error"]["message"], "all_panels_failed");
-    assert_eq!(body["error"]["type"], "fusion_error");
-}
-
-#[tokio::test]
-async fn test_forced_fusion_panel_timeout_returns_failure() {
-    let mock_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/endpoints"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "endpoints": [{
-                "domain": mock_server.uri(),
-                "models": ["panel-a"]
-            }]
-        })))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"id": "late"}))
-                .set_delay(Duration::from_secs(2)),
-        )
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app_inner(
-        &mock_server.uri(),
-        TestAppOptions {
-            fusion_enabled: true,
-            fusion_endpoints_url: Some(format!("{}/endpoints", mock_server.uri())),
-            fusion_panel_timeout_secs: 1,
-            ..Default::default()
-        },
-    );
-
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": "Timeout panel"}],
-        "tools": [{
-            "type": "openrouter:fusion",
-            "analysis_models": ["panel-a"]
-        }],
-        "tool_choice": "required",
-        "stream": false
-    });
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    let body = body_to_json(response).await;
-    assert_eq!(body["error"]["message"], "all_panels_failed");
-    assert_eq!(body["error"]["type"], "fusion_error");
-}
-
-#[tokio::test]
-async fn test_client_supplied_fusion_depth_header_is_ignored() {
-    let mock_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/endpoints"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "endpoints": [{
-                "domain": mock_server.uri(),
-                "models": ["panel-a"]
-            }]
-        })))
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app_with_fusion(
-        &mock_server.uri(),
-        format!("{}/endpoints", mock_server.uri()),
-    );
-
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": "No client recursion spoof"}],
-        "tools": [{
-            "type": "nearai:fusion",
-            "analysis_models": ["panel-a"]
-        }],
-        "tool_choice": "required",
-        "stream": false
-    });
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .header("x-nearai-fusion-depth", "1")
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    let body = body_to_json(response).await;
-    assert_eq!(body["error"]["message"], "all_panels_failed");
-}
-
-#[tokio::test]
-async fn test_fusion_depth_guard_rejects_internal_recursive_request() {
-    let app = build_test_app_with_fusion(
-        "http://127.0.0.1:1",
-        "http://127.0.0.1:1/endpoints".to_string(),
-    );
-
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": "No recursion"}],
-        "tools": [{
-            "type": "nearai:fusion",
-            "analysis_models": ["panel-a"]
-        }],
-        "tool_choice": "required",
-        "stream": false
-    });
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header("authorization", "Bearer fusion-token")
-                .header("x-nearai-fusion-depth", "1")
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = body_to_json(response).await;
-    assert_eq!(body["error"]["message"], "fusion_depth_exceeded");
-}
-
-#[tokio::test]
-async fn test_encrypted_forced_fusion_decrypts_request_and_encrypts_final_answer() {
-    use vllm_proxy_rs::encryption;
-
-    let mock_server = MockServer::start().await;
-    let client_pair = test_client_signing_pair();
-
-    Mock::given(method("GET"))
-        .and(path("/endpoints"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "endpoints": [{
-                "domain": mock_server.uri(),
-                "models": ["panel-a"]
-            }]
-        })))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/v1/attestation/report"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(header("authorization", "Bearer fusion-token"))
-        .and(wiremock::matchers::body_string_contains(
-            "secret fusion prompt",
-        ))
-        .and(wiremock::matchers::body_string_contains(
-            "one member of a private multi-model panel",
-        ))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-panel-e2ee",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "Panel saw decrypted input."},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
-        })))
-        .with_priority(1)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(header("authorization", "Bearer fusion-token"))
-        .and(wiremock::matchers::body_string_contains("strict JSON only"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-judge-e2ee",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": "{\"consensus\":\"encrypted\",\"disagreements\":[],\"strengths\":[],\"risks\":[],\"synthesis_guidance\":\"answer encrypted\"}"
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
-        })))
-        .with_priority(2)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(wiremock::matchers::body_string_contains(
-            "final synthesis model",
-        ))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "chatcmpl-final-e2ee",
-            "object": "chat.completion",
-            "model": "test-model",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "Encrypted fusion final."},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11}
-        })))
-        .with_priority(3)
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app_with_fusion(
-        &mock_server.uri(),
-        format!("{}/endpoints", mock_server.uri()),
-    );
-
-    let server_pub_bytes = hex::decode(test_ed25519_pub_key_hex()).unwrap();
-    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
-    let client_pub_bytes = hex::decode(&client_pub_hex).unwrap();
-
-    let enc_for_request = encryption::EncryptionContext {
-        algo: encryption::EncryptionAlgo::Ed25519,
-        client_pub_key: server_pub_bytes,
-        version: 1,
-        encrypt_all_fields: false,
-    };
-    let dec_for_response = encryption::EncryptionContext {
-        algo: encryption::EncryptionAlgo::Ed25519,
-        client_pub_key: client_pub_bytes,
-        version: 1,
-        encrypt_all_fields: false,
-    };
-
-    let encrypted_content =
-        encryption::encrypt_string("secret fusion prompt", &enc_for_request, &client_pair).unwrap();
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": encrypted_content}],
-        "tools": [{
-            "type": "nearai:fusion",
-            "analysis_models": ["panel-a"],
-            "model": "panel-a"
-        }],
-        "tool_choice": "required",
-        "stream": false
-    });
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .header("x-signing-algo", "ed25519")
-                .header("x-client-pub-key", &client_pub_hex)
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_to_json(response).await;
-    let encrypted_response = body["choices"][0]["message"]["content"].as_str().unwrap();
-    assert_ne!(encrypted_response, "Encrypted fusion final.");
-    let decrypted =
-        encryption::decrypt_string(encrypted_response, &dec_for_response, &client_pair).unwrap();
-    assert_eq!(decrypted, "Encrypted fusion final.");
-}
-
-#[tokio::test]
-async fn test_e2ee_fusion_errors_are_redacted_in_preflight_and_synthesis() {
-    use wiremock::matchers::body_string_contains;
-
-    let fixture: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/e2ee-v3.json")).unwrap();
-    for vector in fixture["vectors"].as_array().unwrap() {
-        let plaintext = vector["plaintext"].as_str().unwrap();
-        for streaming in [false, true] {
-            for synthesis in [false, true] {
-                let upstream = MockServer::start().await;
-                if synthesis {
-                    Mock::given(method("GET"))
-                        .and(path("/endpoints"))
-                        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                            "endpoints": [{"domain": upstream.uri(), "models": ["panel-a"]}]
-                        })))
-                        .expect(1)
-                        .mount(&upstream)
-                        .await;
-                    Mock::given(method("GET"))
-                        .and(path("/v1/attestation/report"))
-                        .respond_with(
-                            ResponseTemplate::new(200)
-                                .set_body_json(serde_json::json!({"ok": true})),
-                        )
-                        .mount(&upstream)
-                        .await;
-                    Mock::given(method("POST"))
-                        .and(path("/v1/chat/completions"))
-                        .and(header("authorization", "Bearer fusion-token"))
-                        .and(body_string_contains("one member of a private multi-model panel"))
-                        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                            "id": "panel-e2ee-error-test",
-                            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Panel answer"}, "finish_reason": "stop"}]
-                        })))
-                        .expect(1)
-                        .mount(&upstream)
-                        .await;
-                }
-
-                let stage = if synthesis {
-                    "final synthesis model"
-                } else {
-                    "__nearai_fusion"
-                };
-                Mock::given(method("POST"))
-                    .and(path("/v1/chat/completions"))
-                    .and(body_string_contains(stage))
-                    .and(body_string_contains(plaintext))
-                    .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
-                        "error": {"message": format!("Invalid request value: {plaintext}"), "type": "invalid_request_error"}
-                    })))
-                    .expect(1)
-                    .mount(&upstream)
-                    .await;
-
-                let app = build_test_app_with_fusion(
-                    &upstream.uri(),
-                    format!("{}/endpoints", upstream.uri()),
-                );
-                let body = serde_json::json!({
-                    "model": "test-model",
-                    "messages": [{"role": "user", "content": vector["ciphertext"]}],
-                    "tools": [{"type": "nearai:fusion", "analysis_models": ["panel-a"]}],
-                    "tool_choice": if synthesis { "required" } else { "auto" },
-                    "stream": streaming
-                });
-                let response = app
-                    .oneshot(
-                        Request::builder()
-                            .method("POST")
-                            .uri("/v1/chat/completions")
-                            .header(auth_header().0, auth_header().1)
-                            .header("content-type", "application/json")
-                            .header("x-signing-algo", vector["signing_algo"].as_str().unwrap())
-                            .header("x-client-pub-key", vector["reply_public"].as_str().unwrap())
-                            .header("x-encryption-version", "3")
-                            .body(Body::from(body.to_string()))
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-                let body = body_to_json(response).await;
-                assert_eq!(
-                    body["error"]["message"], "Upstream request failed",
-                    "algo={}, stream={streaming}, stage={stage}",
-                    vector["signing_algo"]
-                );
-                assert_eq!(body["error"]["type"], "invalid_request_error");
-                assert!(!body.to_string().contains(plaintext));
-            }
-        }
-    }
 }
 
 // ---- Streaming chat completions ----
@@ -5086,9 +2764,10 @@ async fn test_non_object_json_body_is_rejected_before_dispatch() {
             .header("content-type", "application/json")
             .header("authorization", "Bearer sk-test-valid-key-12345678901");
         if encrypted {
-            request = request
-                .header("x-signing-algo", "ed25519")
-                .header("x-client-pub-key", "11".repeat(32));
+            request = request.header("x-signing-algo", "ed25519").header(
+                "x-client-pub-key",
+                test_client_signing_pair().ed25519.signing_public_key,
+            );
         }
         app.clone().oneshot(request.body(Body::from(body)).unwrap())
     };
@@ -6068,6 +3747,156 @@ async fn test_rerank_endpoint() {
     assert_eq!(body["id"], "rerank-test");
 }
 
+fn rerank_request_with_documents(count: usize) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "model": "m",
+        "query": "q",
+        "documents": vec!["a"; count],
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_rerank_document_count_up_to_limit_reaches_backend() {
+    use vllm_proxy_rs::routes::passthrough::MAX_RERANK_DOCUMENTS;
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/rerank"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "rerank-test",
+            "results": [{"index": 0, "relevance_score": 0.95}]
+        })))
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    for count in [2_000, MAX_RERANK_DOCUMENTS] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/rerank")
+                    .header("content-type", "application/json")
+                    .header(auth_header().0, auth_header().1)
+                    .body(Body::from(rerank_request_with_documents(count)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK, "{count} documents");
+        let body = body_to_json(response).await;
+        assert_eq!(body["id"], "rerank-test");
+        assert_eq!(body["results"][0]["index"], 0);
+    }
+
+    let received = mock_server.received_requests().await.unwrap();
+    assert_eq!(received.len(), 2);
+    for (upstream, expected_count) in received.iter().zip([2_000, MAX_RERANK_DOCUMENTS]) {
+        let body: serde_json::Value = serde_json::from_slice(&upstream.body).unwrap();
+        assert_eq!(body["model"], "m");
+        assert_eq!(body["documents"].as_array().unwrap().len(), expected_count);
+    }
+}
+
+#[tokio::test]
+async fn test_rerank_rejects_too_many_documents_before_dispatch() {
+    use vllm_proxy_rs::routes::passthrough::MAX_RERANK_DOCUMENTS;
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "x"})))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+
+    for count in [MAX_RERANK_DOCUMENTS + 1, 50_000] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/rerank")
+                    .header("content-type", "application/json")
+                    .header(auth_header().0, auth_header().1)
+                    .body(Body::from(rerank_request_with_documents(count)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{count} documents"
+        );
+        let body = body_to_json(response).await;
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains(&format!("at most {MAX_RERANK_DOCUMENTS}")),
+            "unexpected message: {message}"
+        );
+        assert_eq!(body["error"]["type"], "bad_request");
+    }
+
+    assert!(
+        mock_server.received_requests().await.unwrap().is_empty(),
+        "a rejected rerank request must not reach the backend"
+    );
+}
+
+#[tokio::test]
+async fn test_encrypted_rerank_rejects_too_many_documents_before_decrypt() {
+    use vllm_proxy_rs::routes::passthrough::MAX_RERANK_DOCUMENTS;
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "x"})))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_test_app(&mock_server.uri());
+    let client_pub_hex = test_client_signing_pair()
+        .ed25519
+        .signing_public_key
+        .clone();
+
+    // The documents are not ciphertext: decrypting them would fail with a
+    // different error, so the limit message shows the count check ran first.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/rerank")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .header("x-signing-algo", "ed25519")
+                .header("x-client-pub-key", &client_pub_hex)
+                .body(Body::from(rerank_request_with_documents(
+                    MAX_RERANK_DOCUMENTS + 1,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_to_json(response).await;
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains(&format!("at most {MAX_RERANK_DOCUMENTS}")),
+        "unexpected message: {message}"
+    );
+    assert!(mock_server.received_requests().await.unwrap().is_empty());
+}
+
 // ---- Score endpoint ----
 
 #[tokio::test]
@@ -6136,6 +3965,33 @@ async fn test_images_generations_endpoint() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_to_json(response).await;
     assert_eq!(body["id"], "img-test");
+}
+
+#[tokio::test]
+async fn test_images_generations_rejects_out_of_range_count_before_dispatch() {
+    let backend = MockServer::start().await;
+    let app = build_test_app(&backend.uri());
+
+    for count in [serde_json::json!(0), serde_json::json!(11)] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/images/generations")
+                    .header("content-type", "application/json")
+                    .header(auth_header().0, auth_header().1)
+                    .body(Body::from(
+                        serde_json::json!({"model": "test-model", "prompt": "synthetic", "n": count})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(requests_seen(&backend).await, 0);
 }
 
 // ---- Signature endpoint invalid algo ----
@@ -6331,7 +4187,8 @@ async fn test_audio_transcriptions_multipart() {
         .and(path("/v1/audio/transcriptions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "trans-test",
-            "text": "Hello world"
+            "text": "Hello world",
+            "usage": {"type": "duration", "seconds": 1}
         })))
         .mount(&mock_server)
         .await;
@@ -6386,6 +4243,134 @@ async fn test_audio_transcriptions_multipart() {
     assert_eq!(sig_response.status(), StatusCode::OK);
 }
 
+#[tokio::test]
+async fn test_direct_audio_transcription_reports_duration() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-test",
+            "workspace_id": "ws-test",
+            "api_key_id": "key-test"
+        })))
+        .mount(&cloud_api)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/internal/usage"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_api)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "trans-direct",
+            "text": "synthetic",
+            "usage": {"type": "duration", "seconds": 1.25}
+        })))
+        .mount(&backend)
+        .await;
+
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+    let boundary = "----SyntheticAudioBoundary";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ntest-model\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n\
+         Content-Type: audio/wav\r\n\r\nsynthetic-audio\r\n--{boundary}--\r\n"
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("inference-id").is_some());
+
+    wait_for_usage_request(&cloud_api, 1).await;
+    let usage_reqs = get_usage_requests(&cloud_api).await;
+    assert_eq!(usage_reqs.len(), 1);
+    assert_eq!(usage_reqs[0]["type"], "audio_transcription");
+    assert_eq!(usage_reqs[0]["duration_seconds"], 2);
+    assert_eq!(usage_reqs[0]["id"], "trans-direct");
+}
+
+#[tokio::test]
+async fn test_audio_transcriptions_missing_duration_is_direct_only() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-test",
+            "workspace_id": "ws-test",
+            "api_key_id": "key-test"
+        })))
+        .mount(&cloud_api)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "trans-without-usage", "text": "synthetic"
+        })))
+        .mount(&backend)
+        .await;
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+    let boundary = "----SyntheticMissingUsageBoundary";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ntest-model\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n\
+         Content-Type: audio/wav\r\n\r\nsynthetic-audio\r\n--{boundary}--\r\n"
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(response.headers().get("inference-id").is_none());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("inference-id").is_none());
+    assert_eq!(body_to_json(response).await["id"], "trans-without-usage");
+    assert!(get_usage_requests(&cloud_api).await.is_empty());
+}
+
 // Regression: a multipart audio body larger than axum's 2 MiB DefaultBodyLimit
 // must still be accepted (the route disables the default limit so the handler's
 // own `max_audio_request_size` is the only ceiling). Before the fix this failed
@@ -6398,7 +4383,8 @@ async fn test_audio_transcriptions_large_body_not_rejected() {
         .and(path("/v1/audio/transcriptions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "trans-large",
-            "text": "ok"
+            "text": "ok",
+            "usage": {"type": "duration", "seconds": 1}
         })))
         .mount(&mock_server)
         .await;
@@ -6574,6 +4560,7 @@ fn build_test_app_with_cloud_api_retries(
         replica_state: None,
         model_name: "test-model".to_string(),
         tokens: vec!["test-token".to_string()],
+        token_labels: vec![],
         vllm_base_url: mock_url.to_string(),
         chat_completions_url: format!("{base}/v1/chat/completions"),
         completions_url: format!("{base}/v1/completions"),
@@ -6640,7 +4627,9 @@ fn build_test_app_with_cloud_api_retries(
         transcriptions_url_override: None,
         rerank_url_override: None,
         score_url_override: None,
+        rerank_limits: Default::default(),
         ohttp_enabled: false,
+        ohttp_max_inflight: 0,
         listen_port: 8000,
         listen_addr: "127.0.0.1".to_string(),
         backend_token: None,
@@ -6661,6 +4650,7 @@ fn build_test_app_with_cloud_api_retries(
         discount_to_user: None,
         backend_lora: None,
         strict_request_model: false,
+        request_guard: Default::default(),
         reasoning_off_effort: "none".to_string(),
         allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,
@@ -6690,17 +4680,6 @@ fn build_test_app_with_cloud_api_retries(
         web_context_search_api_key: None,
         agent_loop_max_iterations: 5,
         web_context_search_timeout_secs: 30,
-        fusion_enabled: false,
-        fusion_endpoints_url: "https://completions.near.ai/endpoints".to_string(),
-        fusion_endpoints_ttl_secs: 300,
-        fusion_internal_bearer_token: None,
-        fusion_default_analysis_models: Vec::new(),
-        fusion_max_panel_models: 8,
-        fusion_max_depth: 1,
-        fusion_panel_timeout_secs: 120,
-        fusion_max_response_bytes: 10 * 1024 * 1024,
-        fusion_internal_max_attempts: 2,
-        fusion_internal_retry_initial_backoff_ms: 1,
     };
 
     let ecdsa_key: [u8; 32] = [
@@ -6731,6 +4710,7 @@ fn build_test_app_with_cloud_api_retries(
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),
+        rerank_limiter: Default::default(),
         usage_report_delivery: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
@@ -6745,7 +4725,6 @@ fn build_test_app_with_cloud_api_retries(
         backend_pool,
         ohttp_gateway: None,
         ohttp_attestation_ed25519: None,
-        fusion_caches: Arc::new(fusion::FusionCaches::default()),
         vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(None, 1_200)),
         backend_affinity: Arc::new(
             vllm_proxy_rs::backend_affinity::BackendConversationAffinity::new(false, 1, 8, 1_200),
@@ -6778,7 +4757,7 @@ async fn test_cloud_api_key_valid() {
             "authorization",
             "Bearer sk-test-valid-key-12345678901",
         ))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true, "organization_id": "org-1", "workspace_id": "ws-1", "api_key_id": "key-1"})))
         .mount(&cloud_api)
         .await;
 
@@ -6786,7 +4765,7 @@ async fn test_cloud_api_key_valid() {
     let backend_response = serde_json::json!({
         "id": "chatcmpl-1",
         "object": "chat.completion",
-        "model": "test-model",
+        "model": "backend-alias",
         "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
     });
@@ -6817,6 +4796,178 @@ async fn test_cloud_api_key_valid() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("inference-id").is_some());
+    let body = body_to_json(response).await;
+    assert_eq!(body["model"], "test-model");
+}
+
+#[tokio::test]
+async fn direct_key_rejects_a_different_model_before_backend_dispatch() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-test",
+            "workspace_id": "ws-test",
+            "api_key_id": "key-test"
+        })))
+        .mount(&cloud_api)
+        .await;
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+
+    for (route, body) in [
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"model": "another-model", "messages": []}),
+        ),
+        (
+            "/v1/images/generations",
+            serde_json::json!({"model": "another-model", "prompt": "synthetic"}),
+        ),
+        (
+            "/v1/privacy/classify",
+            serde_json::json!({"model": "another-model", "input": "synthetic"}),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(route)
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{route}");
+    }
+    assert_eq!(requests_seen(&backend).await, 0);
+}
+
+#[tokio::test]
+async fn direct_privacy_classification_requires_billable_json() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-test",
+            "workspace_id": "ws-test",
+            "api_key_id": "key-test"
+        })))
+        .mount(&cloud_api)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/privacy/classify"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("synthetic-label", "text/plain"))
+        .mount(&backend)
+        .await;
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+    let body = serde_json::json!({"model": "test-model", "input": "synthetic"}).to_string();
+
+    let direct_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/privacy/classify")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(direct_response.status(), StatusCode::BAD_GATEWAY);
+    assert!(direct_response.headers().get("inference-id").is_none());
+
+    let trusted_response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/privacy/classify")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(trusted_response.status(), StatusCode::OK);
+    assert!(trusted_response.headers().get("inference-id").is_none());
+    assert_eq!(
+        body_to_bytes(trusted_response).await.as_slice(),
+        b"synthetic-label"
+    );
+    assert!(get_usage_requests(&cloud_api).await.is_empty());
+}
+
+#[tokio::test]
+async fn direct_key_requires_billing_identity_before_backend_dispatch() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})))
+        .mount(&cloud_api)
+        .await;
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .body(Body::from(r#"{"model":"test-model","messages":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(requests_seen(&backend).await, 0);
+}
+
+#[tokio::test]
+async fn direct_key_refuses_unbillable_backend_success() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-test",
+            "workspace_id": "ws-test",
+            "api_key_id": "key-test"
+        })))
+        .mount(&cloud_api)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "emb-without-usage", "data": [{"embedding": [0.5]}]
+        })))
+        .mount(&backend)
+        .await;
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .body(Body::from(r#"{"model":"test-model","input":"synthetic"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(response.headers().get("inference-id").is_none());
+    assert!(get_usage_requests(&cloud_api).await.is_empty());
 }
 
 #[tokio::test]
@@ -6924,7 +5075,7 @@ async fn test_cloud_api_key_retries_after_5xx() {
         .await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid": true, "organization_id": "org-1", "workspace_id": "ws-1", "api_key_id": "key-1"})))
         .with_priority(2)
         .mount(&cloud_api)
         .await;
@@ -7419,6 +5570,7 @@ data: [DONE]\n\n";
     });
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -7432,6 +5584,13 @@ data: [DONE]\n\n";
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    let inference_id = response
+        .headers()
+        .get("inference-id")
+        .expect("direct streaming response has an inference id")
+        .to_str()
+        .unwrap()
+        .to_string();
 
     // Consume the streaming body so the background task finishes
     use http_body_util::BodyExt;
@@ -7444,14 +5603,193 @@ data: [DONE]\n\n";
     assert_eq!(usage_reqs[0]["input_tokens"], 8);
     assert_eq!(usage_reqs[0]["output_tokens"], 3);
     assert_eq!(usage_reqs[0]["cache_read_tokens"], 6);
+    let usage_id = usage_reqs[0]["id"].as_str().unwrap();
+    assert!(usage_id.starts_with("stream-"));
+    assert_ne!(usage_id, "chatcmpl-stream-u1");
+    let namespace = uuid::Uuid::from_u128(0x1966acaf_9f95_5dab_b8f0_03a51c091314);
+    assert_eq!(
+        inference_id,
+        uuid::Uuid::new_v5(&namespace, usage_id.as_bytes()).to_string()
+    );
     // Reported via the service-token /v1/internal/usage path: cloud-api attributes
     // the usage from these identity fields in the body (not from an sk- bearer).
     assert_eq!(usage_reqs[0]["organization_id"], "org-test");
     assert_eq!(usage_reqs[0]["workspace_id"], "ws-test");
     assert_eq!(usage_reqs[0]["api_key_id"], "key-test");
+
+    let signature = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/signature/chatcmpl-stream-u1?signing_algo=ecdsa")
+                .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(signature.status(), StatusCode::OK);
 }
 
-/// Regression test for nearai/infra#98: an interrupted stream (no `[DONE]`,
+// Synthetic direct keys for the signature owner tests: the first two belong to
+// one organization and workspace, the third to another.
+const OWNER_A_BEARER: &str = "Bearer sk-test-owner-a-000000000001";
+const OWNER_A_SECOND_BEARER: &str = "Bearer sk-test-owner-a-000000000002";
+const OWNER_B_BEARER: &str = "Bearer sk-test-owner-b-000000000003";
+
+/// Cloud API stub for the three synthetic owner keys, plus a usage sink.
+async fn mount_signature_owner_cloud_api(cloud_api: &MockServer) {
+    for (bearer, org, workspace, key_id) in [
+        (OWNER_A_BEARER, "org-a", "ws-a", "key-a1"),
+        (OWNER_A_SECOND_BEARER, "org-a", "ws-a", "key-a2"),
+        (OWNER_B_BEARER, "org-b", "ws-b", "key-b"),
+    ] {
+        Mock::given(method("POST"))
+            .and(path("/v1/check_api_key"))
+            .and(header("authorization", bearer))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "organization_id": org,
+                "workspace_id": workspace,
+                "api_key_id": key_id
+            })))
+            .mount(cloud_api)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path("/v1/internal/usage"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(cloud_api)
+        .await;
+}
+
+/// Backend stream answering requests whose body contains `marker` with a
+/// completion that has the response id `chat_id`.
+async fn mount_signature_owner_stream(backend: &MockServer, marker: &str, chat_id: &str) {
+    let sse_body = format!(
+        "data: {{\"id\":\"{chat_id}\",\"choices\":[{{\"delta\":{{\"content\":\"hi\"}},\"index\":0}}]}}\n\n\
+         data: {{\"id\":\"{chat_id}\",\"choices\":[],\"usage\":{{\"prompt_tokens\":4,\"completion_tokens\":1,\"total_tokens\":5}}}}\n\n\
+         data: [DONE]\n\n"
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(wiremock::matchers::body_string_contains(marker))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_body),
+        )
+        .mount(backend)
+        .await;
+}
+
+/// Send a streaming chat request with `bearer` and read the stream to its end,
+/// so the background task has stored the signature.
+async fn stream_chat_for_signature(app: &axum::Router, bearer: &str, marker: &str) {
+    let request_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": marker}],
+        "stream": true
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", bearer)
+                .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = body_to_bytes(response).await;
+}
+
+async fn get_signature(app: &axum::Router, bearer: &str, chat_id: &str) -> (StatusCode, Vec<u8>) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/signature/{chat_id}?signing_algo=ecdsa"))
+                .header("authorization", bearer)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    (status, body_to_bytes(response).await)
+}
+
+/// A direct key's signature is readable by keys of the same organization and
+/// workspace and by a configured TOKEN caller, and answers a key of another
+/// owner exactly like an unknown id.
+#[tokio::test]
+async fn test_signature_lookup_is_scoped_to_direct_key_owner() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    mount_signature_owner_cloud_api(&cloud_api).await;
+    mount_signature_owner_stream(&backend, "owner-a-request", "chatcmpl-owner-a").await;
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+
+    stream_chat_for_signature(&app, OWNER_A_BEARER, "owner-a-request").await;
+
+    let (status, owner_body) = get_signature(&app, OWNER_A_BEARER, "chatcmpl-owner-a").await;
+    assert_eq!(status, StatusCode::OK);
+    let owner_json: serde_json::Value = serde_json::from_slice(&owner_body).unwrap();
+    assert!(owner_json["text"]
+        .as_str()
+        .unwrap()
+        .starts_with("test-model:"));
+
+    // Another key of the same organization and workspace.
+    let (status, same_owner_body) =
+        get_signature(&app, OWNER_A_SECOND_BEARER, "chatcmpl-owner-a").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(same_owner_body, owner_body);
+
+    // A key of another owner: the same answer as an id that does not exist.
+    let (status, other_owner_body) = get_signature(&app, OWNER_B_BEARER, "chatcmpl-owner-a").await;
+    let (missing_status, missing_body) =
+        get_signature(&app, OWNER_B_BEARER, "chatcmpl-does-not-exist").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(status, missing_status);
+    assert_eq!(other_owner_body, missing_body);
+
+    // The configured TOKEN caller (internal gateway) reads it unchanged.
+    let (status, trusted_body) = get_signature(&app, "Bearer test-token", "chatcmpl-owner-a").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(trusted_body, owner_body);
+}
+
+/// An entry stored without an owner (a configured TOKEN caller's response, or
+/// one stored before owners were recorded) stays readable by the TOKEN caller
+/// and is refused to every direct key.
+#[tokio::test]
+async fn test_signature_without_owner_is_refused_to_direct_keys() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    mount_signature_owner_cloud_api(&cloud_api).await;
+    mount_signature_owner_stream(&backend, "trusted-request", "chatcmpl-unowned").await;
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+
+    stream_chat_for_signature(&app, "Bearer test-token", "trusted-request").await;
+
+    let (status, _) = get_signature(&app, "Bearer test-token", "chatcmpl-unowned").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (missing_status, missing_body) =
+        get_signature(&app, OWNER_A_BEARER, "chatcmpl-does-not-exist").await;
+    for bearer in [OWNER_A_BEARER, OWNER_B_BEARER] {
+        let (status, body) = get_signature(&app, bearer, "chatcmpl-unowned").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(status, missing_status);
+        assert_eq!(body, missing_body);
+    }
+}
+
+/// An interrupted stream (no `[DONE]`,
 /// e.g. client disconnect or mid-stream upstream error) must still report the
 /// tokens already produced. cloud-api enables `continuous_usage_stats`, so each
 /// chunk carries running cumulative usage; the last value seen is the partial
@@ -7686,9 +6024,11 @@ async fn test_usage_reported_for_image_generation() {
         .and(path("/v1/images/generations"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "data": [
-                {"url": "https://example.com/img1.png"},
+                {"url": "https://example.com/img1.png", "file_path": "/synthetic/engine/path"},
                 {"url": "https://example.com/img2.png"}
-            ]
+            ],
+            "peak_memory_mb": 123,
+            "inference_time_s": 2.5
         })))
         .mount(&backend)
         .await;
@@ -7715,6 +6055,11 @@ async fn test_usage_reported_for_image_generation() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("inference-id").is_some());
+    let response_body = body_to_json(response).await;
+    assert!(response_body.get("peak_memory_mb").is_none());
+    assert!(response_body.get("inference_time_s").is_none());
+    assert!(response_body["data"][0].get("file_path").is_none());
 
     wait_for_usage_request(&cloud_api, 1).await;
     let usage_reqs = get_usage_requests(&cloud_api).await;
@@ -7781,7 +6126,7 @@ async fn test_usage_reported_for_embeddings() {
     let usage_reqs = get_usage_requests(&cloud_api).await;
     assert_eq!(usage_reqs.len(), 1, "Expected exactly one usage report");
     // Embeddings now report under their own input-only label instead of
-    // being mislabeled as chat_completion (nearai/infra#169). The
+    // being mislabeled as chat_completion. The
     // input-only wire variant carries no output_tokens field.
     assert_eq!(usage_reqs[0]["type"], "embedding");
     assert_eq!(usage_reqs[0]["input_tokens"], 4);
@@ -8900,7 +7245,8 @@ async fn test_encrypted_audio_transcription_signature_hashes_raw_request_and_res
 
     let backend_response = serde_json::json!({
         "id": "trans-enc1",
-        "text": "Hello world"
+        "text": "Hello world",
+        "usage": {"type": "duration", "seconds": 1}
     });
 
     Mock::given(method("POST"))
@@ -9005,6 +7351,310 @@ async fn test_encrypted_audio_transcription_signature_hashes_raw_request_and_res
             hex::encode(Sha256::digest(&response_bytes))
         )
     );
+}
+
+// ---- Multipart media with all-field encryption ----
+
+const SYNTHETIC_MEDIA: &str = "synthetic-media-bytes";
+
+/// A multipart body with an optional `prompt`, a `model` field, then one media part.
+fn media_form(boundary: &str, prompt: Option<&str>, media_name: &str, filename: &str) -> String {
+    let mut body = String::new();
+    if let Some(prompt) = prompt {
+        body.push_str(&format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n{prompt}\r\n"
+        ));
+    }
+    body.push_str(&format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ntest-model\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"{media_name}\"; filename=\"{filename}\"\r\n\
+         Content-Type: application/octet-stream\r\n\r\n{SYNTHETIC_MEDIA}\r\n--{boundary}--\r\n"
+    ));
+    body
+}
+
+async fn mount_multipart_backends(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/v1/images/edits"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "img-media-control",
+            "data": [{"url": "https://example.com/synthetic.png"}]
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "trans-media-control",
+            "text": "synthetic",
+            "usage": {"type": "duration", "seconds": 1}
+        })))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn multipart_media_with_all_field_encryption_is_refused_before_dispatch() {
+    use vllm_proxy_rs::encryption;
+
+    let backend = MockServer::start().await;
+    mount_multipart_backends(&backend).await;
+    let app = build_test_app(&backend.uri());
+    let client_pair = test_client_signing_pair();
+    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
+    let server_pub = hex::decode(test_ed25519_pub_key_hex()).unwrap();
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/e2ee-v3.json")).unwrap();
+    let v3 = &fixture["vectors"][0];
+
+    let boundary = "----SyntheticMediaBoundary";
+    let routes = [
+        (
+            "/v1/images/edits",
+            "image",
+            "not supported with all-field encryption",
+        ),
+        (
+            "/v1/images/edits",
+            "mask",
+            "not supported with all-field encryption",
+        ),
+        (
+            "/v1/audio/transcriptions",
+            "file",
+            "not supported with all-field encryption",
+        ),
+        // Unknown form fields are rejected before media handling.
+        (
+            "/v1/audio/transcriptions",
+            "upload",
+            "not a supported form field",
+        ),
+    ];
+
+    // v1/v2 with `X-Encrypt-All-Fields: true` (a valid encrypted prompt first),
+    // and v3, which always uses the extended field set.
+    let mut refused = Vec::new();
+    for version in [1u8, 2] {
+        let seal_ctx = encryption::EncryptionContext {
+            algo: encryption::EncryptionAlgo::Ed25519,
+            client_pub_key: server_pub.clone(),
+            version,
+            encrypt_all_fields: true,
+        };
+        let prompt =
+            encryption::encrypt_string("synthetic prompt", &seal_ctx, &client_pair).unwrap();
+        refused.push((
+            vec![
+                ("x-signing-algo", "ed25519".to_string()),
+                ("x-client-pub-key", client_pub_hex.clone()),
+                ("x-encryption-version", version.to_string()),
+                ("x-encrypt-all-fields", "true".to_string()),
+            ],
+            Some(prompt),
+        ));
+    }
+    for flag in [None, Some("false")] {
+        let mut headers = vec![
+            (
+                "x-signing-algo",
+                v3["signing_algo"].as_str().unwrap().to_string(),
+            ),
+            (
+                "x-client-pub-key",
+                v3["reply_public"].as_str().unwrap().to_string(),
+            ),
+            ("x-encryption-version", "3".to_string()),
+        ];
+        if let Some(flag) = flag {
+            headers.push(("x-encrypt-all-fields", flag.to_string()));
+        }
+        refused.push((headers, None));
+    }
+
+    for (headers, prompt) in &refused {
+        for (route, media_name, expected_error) in routes {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(route)
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .header(auth_header().0, auth_header().1);
+            for (name, value) in headers {
+                request = request.header(*name, value);
+            }
+            let body = media_form(boundary, prompt.as_deref(), media_name, "synthetic.bin");
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{route} {media_name} {headers:?}"
+            );
+            let text = String::from_utf8(body_to_bytes(response).await).unwrap();
+            assert!(text.contains(expected_error), "{text}");
+            assert!(!text.contains("synthetic.bin"));
+            assert!(!text.contains(SYNTHETIC_MEDIA));
+        }
+    }
+    assert_eq!(requests_seen(&backend).await, 0, "nothing was dispatched");
+
+    // Controls: no encryption, and v1 encryption without the all-field flag
+    // (only the prompt is encrypted), still reach the backend with the media.
+    let seal_ctx = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: server_pub,
+        version: 1,
+        encrypt_all_fields: false,
+    };
+    let prompt = encryption::encrypt_string("synthetic prompt", &seal_ctx, &client_pair).unwrap();
+    let controls = [
+        (Vec::new(), None),
+        (
+            vec![
+                ("x-signing-algo", "ed25519".to_string()),
+                ("x-client-pub-key", client_pub_hex.clone()),
+            ],
+            Some(prompt),
+        ),
+    ];
+    for (headers, prompt) in &controls {
+        for (route, media_name) in [
+            ("/v1/images/edits", "image"),
+            ("/v1/audio/transcriptions", "file"),
+        ] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(route)
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .header(auth_header().0, auth_header().1);
+            for (name, value) in headers {
+                request = request.header(*name, value);
+            }
+            let body = media_form(boundary, prompt.as_deref(), media_name, "synthetic.bin");
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{route} {headers:?}");
+        }
+    }
+    let received = backend.received_requests().await.unwrap();
+    assert_eq!(received.len(), 4);
+    for request in &received {
+        assert!(String::from_utf8_lossy(&request.body).contains(SYNTHETIC_MEDIA));
+    }
+}
+
+#[tokio::test]
+async fn legacy_all_fields_undecryptable_tool_field_is_refused_before_dispatch() {
+    use vllm_proxy_rs::encryption;
+
+    let backend = start_any_post_backend().await;
+    let app = build_test_app(&backend.uri());
+    let client_pair = test_client_signing_pair();
+    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
+    let server_pub = hex::decode(test_ed25519_pub_key_hex()).unwrap();
+    let marker = "synthetic plaintext marker";
+
+    let send = |version: u8, body: serde_json::Value| {
+        let app = app.clone();
+        let client_pub_hex = client_pub_hex.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .header(auth_header().0, auth_header().1)
+                        .header("x-signing-algo", "ed25519")
+                        .header("x-client-pub-key", &client_pub_hex)
+                        .header("x-encryption-version", version.to_string())
+                        .header("x-encrypt-all-fields", "true")
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            (
+                status,
+                String::from_utf8(body_to_bytes(response).await).unwrap(),
+            )
+        }
+    };
+
+    for (served, version) in [1u8, 2].into_iter().enumerate() {
+        let ctx = encryption::EncryptionContext {
+            algo: encryption::EncryptionAlgo::Ed25519,
+            client_pub_key: server_pub.clone(),
+            version,
+            encrypt_all_fields: true,
+        };
+        let seal = |plain: &str| encryption::encrypt_string(plain, &ctx, &client_pair).unwrap();
+        let valid = serde_json::json!({
+            "model": "test-model",
+            "stream": false,
+            "messages": [
+                {"role": "user", "content": seal("synthetic question")},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": seal("synthetic_tool"), "arguments": seal("{}")}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": seal("synthetic result")}
+            ],
+            "tools": [{"type": "function", "function": {
+                "name": seal("synthetic_tool"),
+                "description": seal("synthetic description"),
+                "parameters": seal("{\"type\":\"object\"}")
+            }}]
+        });
+
+        for pointer in [
+            "/messages/1/tool_calls/0/function/arguments",
+            "/messages/1/tool_calls/0/function/name",
+            "/tools/0/function/name",
+            "/tools/0/function/description",
+            "/tools/0/function/parameters",
+        ] {
+            for invalid in [marker, "deadbeef"] {
+                let mut body = valid.clone();
+                *body.pointer_mut(pointer).unwrap() = serde_json::json!(invalid);
+                let (status, text) = send(version, body).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "v{version} {pointer}");
+                assert!(!text.contains(invalid), "v{version} {pointer}");
+            }
+        }
+        // Only the earlier versions' controls reached the backend.
+        assert_eq!(requests_seen(&backend).await, served, "v{version}");
+
+        // Control: the same request with every field sealed is served, and the
+        // backend sees the decrypted values.
+        let (status, _) = send(version, valid).await;
+        assert_eq!(status, StatusCode::OK, "v{version}");
+        let received = backend.received_requests().await.unwrap();
+        assert_eq!(received.len(), served + 1, "v{version}");
+        let forwarded: serde_json::Value =
+            serde_json::from_slice(&received.last().unwrap().body).unwrap();
+        assert_eq!(
+            forwarded["messages"][1]["tool_calls"][0]["function"]["name"],
+            "synthetic_tool"
+        );
+        assert_eq!(
+            forwarded["tools"][0]["function"]["parameters"],
+            serde_json::json!({"type": "object"})
+        );
+    }
 }
 
 /// End-to-end test: a legacy client sends a Salsa20-encrypted request.
@@ -9226,6 +7876,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         replica_state: None,
         model_name: "test-model".to_string(),
         tokens: vec!["test-token".to_string()],
+        token_labels: vec![],
         vllm_base_url: mock_url.to_string(),
         chat_completions_url: format!("{base}/v1/chat/completions"),
         completions_url: format!("{base}/v1/completions"),
@@ -9290,7 +7941,9 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         transcriptions_url_override: None,
         rerank_url_override: None,
         score_url_override: None,
+        rerank_limits: Default::default(),
         ohttp_enabled: true,
+        ohttp_max_inflight: 0,
         listen_port: 0, // not used in oneshot tests
         listen_addr: "127.0.0.1".to_string(),
         backend_token: None,
@@ -9311,6 +7964,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         discount_to_user: None,
         backend_lora: None,
         strict_request_model: false,
+        request_guard: Default::default(),
         reasoning_off_effort: "none".to_string(),
         allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,
@@ -9340,17 +7994,6 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         web_context_search_api_key: None,
         agent_loop_max_iterations: 5,
         web_context_search_timeout_secs: 30,
-        fusion_enabled: false,
-        fusion_endpoints_url: "https://completions.near.ai/endpoints".to_string(),
-        fusion_endpoints_ttl_secs: 300,
-        fusion_internal_bearer_token: None,
-        fusion_default_analysis_models: Vec::new(),
-        fusion_max_panel_models: 8,
-        fusion_max_depth: 1,
-        fusion_panel_timeout_secs: 120,
-        fusion_max_response_bytes: 10 * 1024 * 1024,
-        fusion_internal_max_attempts: 2,
-        fusion_internal_retry_initial_backoff_ms: 1,
     };
 
     let ecdsa_key: [u8; 32] = [
@@ -9378,6 +8021,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),
+        rerank_limiter: Default::default(),
         usage_report_delivery: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
@@ -9392,7 +8036,6 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         backend_pool,
         ohttp_gateway: Some(Arc::new(ohttp_gw)),
         ohttp_attestation_ed25519: Some(ohttp_attestation_ed25519),
-        fusion_caches: Arc::new(fusion::FusionCaches::default()),
         vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(None, 1_200)),
         backend_affinity: Arc::new(
             vllm_proxy_rs::backend_affinity::BackendConversationAffinity::new(false, 1, 8, 1_200),
@@ -9558,6 +8201,81 @@ async fn test_ohttp_relay_garbage_body_returns_400() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn test_ohttp_relay_refuses_at_capacity_before_decapsulation_and_recovers() {
+    let mock = MockServer::start().await;
+    let limit = routes::ohttp::OhttpRelayLimit::new(1).unwrap();
+    let app = build_test_app_with_ohttp(&mock.uri()).layer(axum::Extension(limit.clone()));
+    let garbage = |content_type: &str| {
+        Request::post("/ohttp")
+            .header("content-type", content_type)
+            .body(Body::from(vec![0xDEu8; 100]))
+            .unwrap()
+    };
+
+    let held = limit.try_acquire().expect("the test takes the only slot");
+    for content_type in ["message/ohttp-req", "message/ohttp-chunked-req"] {
+        let response = app.clone().oneshot(garbage(content_type)).await.unwrap();
+        // Undecryptable bytes are a 400 once decapsulation runs; a 429 shows
+        // the slot is checked first.
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "{content_type}"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "{content_type}"
+        );
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["type"], "overloaded", "{content_type}");
+    }
+    assert_eq!(limit.available(), 0);
+
+    // Once the slot is free, requests are decapsulated again, and a failed
+    // decapsulation gives the slot back each time.
+    drop(held);
+    for content_type in [
+        "message/ohttp-req",
+        "message/ohttp-chunked-req",
+        "message/ohttp-req",
+    ] {
+        let response = app.clone().oneshot(garbage(content_type)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{content_type}");
+        assert_eq!(limit.available(), 1, "{content_type}");
+    }
+    assert!(mock.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_ohttp_relay_rejects_oversized_outer_body() {
+    let mock = MockServer::start().await;
+    let app = build_test_app_with_ohttp(&mock.uri());
+
+    // The test config accepts inner bodies up to 10 MiB (audio); the outer body
+    // may add framing headroom on top (about 10.7 MiB in all), and nothing
+    // beyond it is read.
+    let response = app
+        .oneshot(
+            Request::post("/ohttp")
+                .header("content-type", "message/ohttp-req")
+                .body(Body::from(vec![0xDEu8; 12 * 1024 * 1024]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(mock.received_requests().await.unwrap().is_empty());
+}
+
 fn assert_ohttp_attestation_fields(json: &serde_json::Value) {
     let ohttp_attestation = &json["ohttp_attestation"];
     assert!(
@@ -9680,6 +8398,15 @@ async fn test_ohttp_attestation_present_for_default_route() {
 /// Returns (base_url, server_handle, key_config_bytes).
 /// The server runs in the background; drop the handle to stop it.
 async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<()>, Vec<u8>) {
+    start_ohttp_server_with_relay_limit(mock_url, None).await
+}
+
+/// `start_ohttp_server` with an optional `POST /ohttp` in-flight cap installed
+/// the way `routes::build_app` installs it.
+async fn start_ohttp_server_with_relay_limit(
+    mock_url: &str,
+    relay_limit: Option<routes::ohttp::OhttpRelayLimit>,
+) -> (String, tokio::task::JoinHandle<()>, Vec<u8>) {
     let base = mock_url.trim_end_matches('/');
 
     let ed25519_key: [u8; 32] = [
@@ -9702,6 +8429,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         replica_state: None,
         model_name: "test-model".to_string(),
         tokens: vec!["test-token".to_string()],
+        token_labels: vec![],
         vllm_base_url: mock_url.to_string(),
         chat_completions_url: format!("{base}/v1/chat/completions"),
         completions_url: format!("{base}/v1/completions"),
@@ -9766,7 +8494,9 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         transcriptions_url_override: None,
         rerank_url_override: None,
         score_url_override: None,
+        rerank_limits: Default::default(),
         ohttp_enabled: true,
+        ohttp_max_inflight: 0,
         listen_port: port,
         listen_addr: "127.0.0.1".to_string(),
         backend_token: None,
@@ -9787,6 +8517,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         discount_to_user: None,
         backend_lora: None,
         strict_request_model: false,
+        request_guard: Default::default(),
         reasoning_off_effort: "none".to_string(),
         allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,
@@ -9816,17 +8547,6 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         web_context_search_api_key: None,
         agent_loop_max_iterations: 5,
         web_context_search_timeout_secs: 30,
-        fusion_enabled: false,
-        fusion_endpoints_url: "https://completions.near.ai/endpoints".to_string(),
-        fusion_endpoints_ttl_secs: 300,
-        fusion_internal_bearer_token: None,
-        fusion_default_analysis_models: Vec::new(),
-        fusion_max_panel_models: 8,
-        fusion_max_depth: 1,
-        fusion_panel_timeout_secs: 120,
-        fusion_max_response_bytes: 10 * 1024 * 1024,
-        fusion_internal_max_attempts: 2,
-        fusion_internal_retry_initial_backoff_ms: 1,
     };
 
     let ecdsa = signing::EcdsaContext::from_key_bytes(&ecdsa_key).unwrap();
@@ -9845,6 +8565,7 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),
+        rerank_limiter: Default::default(),
         usage_report_delivery: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
@@ -9859,7 +8580,6 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         backend_pool,
         ohttp_gateway: Some(Arc::new(ohttp_gw)),
         ohttp_attestation_ed25519: Some(ohttp_attestation_ed25519),
-        fusion_caches: Arc::new(fusion::FusionCaches::default()),
         vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(None, 1_200)),
         backend_affinity: Arc::new(
             vllm_proxy_rs::backend_affinity::BackendConversationAffinity::new(false, 1, 8, 1_200),
@@ -9873,7 +8593,11 @@ async fn start_ohttp_server(mock_url: &str) -> (String, tokio::task::JoinHandle<
         trust_proxy_headers: true,
     };
 
-    let app = routes::build_router()
+    let mut router = routes::build_router();
+    if let Some(limit) = relay_limit {
+        router = router.layer(axum::Extension(limit));
+    }
+    let app = router
         .layer(middleware::from_fn(rate_limit::rate_limit_middleware))
         .layer(axum::Extension(rate_limit_state))
         .layer(middleware::from_fn(request_id_middleware))
@@ -10143,6 +8867,92 @@ async fn test_ohttp_outer_authorization_relay_injected() {
         "Relay auth OK"
     );
     assert_eq!(resp_body["id"], "chatcmpl-relay");
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_ohttp_never_forwards_inner_tenant_or_request_id_headers() {
+    // The inner headers come from the end client. With a trusted outer bearer
+    // the loopback would believe X-Org-Id / X-Workspace-Id, so they are
+    // dropped; the loopback carries the outer request's id, not the inner one.
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-ohttp-tenant-strip",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+        })))
+        .mount(&mock)
+        .await;
+
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&mock.uri()).await;
+    let outer_request_id = "6f0c4d0e-8f2a-4c1e-9b7d-2a5e3c1f0a11";
+    let inner_request_id = "1b2c3d4e-5f60-4718-8293-a4b5c6d7e8f9";
+    let client = reqwest::Client::new();
+
+    for outer_auth in [true, false] {
+        let mut inner_req = bhttp::Message::request(
+            b"POST".to_vec(),
+            b"https".to_vec(),
+            b"localhost".to_vec(),
+            b"/v1/chat/completions".to_vec(),
+        );
+        inner_req.put_header("content-type", "application/json");
+        if !outer_auth {
+            inner_req.put_header("authorization", "Bearer test-token");
+        }
+        inner_req.put_header("x-org-id", "org-inner-spoof");
+        inner_req.put_header("x-workspace-id", "ws-inner-spoof");
+        inner_req.put_header("x-request-id", inner_request_id);
+        inner_req.write_content(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": false
+            }))
+            .unwrap(),
+        );
+
+        let (enc_request, client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+        let mut request = client
+            .post(format!("{base_url}/ohttp"))
+            .header("content-type", "message/ohttp-req")
+            .header("x-request-id", outer_request_id);
+        if outer_auth {
+            request = request.header("authorization", "Bearer test-token");
+        }
+        let response = request.body(enc_request).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let enc_response = response.bytes().await.unwrap();
+        let inner_resp = ohttp_decrypt_response(client_response, &enc_response);
+        assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+
+        let received = mock.received_requests().await.unwrap();
+        let upstream = received.last().expect("backend saw the inner request");
+        assert!(
+            !upstream.headers.contains_key("x-org-id"),
+            "outer_auth={outer_auth}"
+        );
+        assert!(
+            !upstream.headers.contains_key("x-workspace-id"),
+            "outer_auth={outer_auth}"
+        );
+        assert_eq!(
+            upstream
+                .headers
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok()),
+            Some(outer_request_id),
+            "outer_auth={outer_auth}"
+        );
+    }
 
     server_handle.abort();
 }
@@ -10557,7 +9367,8 @@ async fn test_ohttp_audio_transcriptions_allowed() {
         .and(path("/v1/audio/transcriptions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "trans-ohttp",
-            "text": "Hello world"
+            "text": "Hello world",
+            "usage": {"type": "duration", "seconds": 1}
         })))
         .mount(&mock)
         .await;
@@ -10603,6 +9414,353 @@ async fn test_ohttp_audio_transcriptions_allowed() {
     assert_eq!(mock.received_requests().await.unwrap().len(), 1);
 
     server_handle.abort();
+}
+
+// ---- Log privacy: request content never reaches logs or metrics ----
+
+/// Unique marker placed in every client-controlled part of a request.
+const ZDR_SENTINEL: &str = "zdrsentinel7f3a";
+
+#[derive(Clone, Default)]
+struct ZdrLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for ZdrLogs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The sentinel in a body, a model name, headers, a query string and, for
+/// multipart, a file name, a field name and a field value.
+fn zdr_json_body(stream: bool) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "model": format!("model-{ZDR_SENTINEL}"),
+        "messages": [{"role": "user", "content": format!("prompt {ZDR_SENTINEL}")}],
+        "prompt": format!("prompt {ZDR_SENTINEL}"),
+        "input": [format!("input {ZDR_SENTINEL}")],
+        "user": ZDR_SENTINEL,
+        "stream": stream
+    }))
+    .unwrap()
+}
+
+/// A form of supported fields only, so it reaches the backend: `file` is the
+/// name of the upload field (`file` for audio, `image` for image edits).
+fn zdr_multipart_body(boundary: &str, file: &str) -> Vec<u8> {
+    format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nmodel-{s}\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nprompt {s}\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"{file}\"; filename=\"{s}.bin\"\r\n\
+         Content-Type: application/octet-stream\r\n\r\nRIFF{s}\r\n--{boundary}--\r\n",
+        s = ZDR_SENTINEL
+    )
+    .into_bytes()
+}
+
+/// A form whose first field has a name no multipart route supports, so the
+/// request is refused by name before anything is forwarded.
+fn zdr_refused_multipart_body(boundary: &str) -> Vec<u8> {
+    format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"x_{s}\"\r\n\r\nvalue {s}\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nmodel-{s}\r\n\
+         --{boundary}--\r\n",
+        s = ZDR_SENTINEL
+    )
+    .into_bytes()
+}
+
+fn zdr_body_with_routable_model(body: Vec<u8>) -> Vec<u8> {
+    String::from_utf8(body)
+        .unwrap()
+        .replace(&format!("model-{ZDR_SENTINEL}"), "test-model")
+        .into_bytes()
+}
+
+fn zdr_request(uri: &str, bearer: &str, content_type: &str, body: Vec<u8>) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(format!("{uri}?q={ZDR_SENTINEL}"))
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("content-type", content_type)
+        .header("content-length", body.len())
+        .header("user-agent", format!("client-{ZDR_SENTINEL}"))
+        .header("x-request-id", format!("rid-{ZDR_SENTINEL}"))
+        .header("x-zdr-probe", ZDR_SENTINEL)
+        .header("x-forwarded-for", "203.0.113.77")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// A backend that answers every route with the sentinel in its body, as a
+/// model answer or as an engine error that quotes the prompt.
+async fn zdr_backend(status: u16) -> MockServer {
+    let mock = MockServer::start().await;
+    let message = format!("engine error quoting the prompt: {ZDR_SENTINEL}");
+    let template = if status >= 400 {
+        ResponseTemplate::new(status).set_body_json(serde_json::json!({
+            "error": {"message": message, "type": "BadRequestError"}
+        }))
+    } else {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-zdr",
+            "object": "chat.completion",
+            "text": format!("transcript {ZDR_SENTINEL}"),
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": format!("answer {ZDR_SENTINEL}")},
+                "text": format!("answer {ZDR_SENTINEL}"),
+                "finish_reason": "stop"
+            }],
+            "data": [{"embedding": [0.1], "index": 0, "url": format!("https://x/{ZDR_SENTINEL}")}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+        }))
+    };
+    Mock::given(method("POST"))
+        .respond_with(template)
+        .mount(&mock)
+        .await;
+    mock
+}
+
+async fn zdr_send(app: axum::Router, request: Request<Body>) {
+    let response = app.oneshot(request).await.unwrap();
+    let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+}
+
+/// Every route, on success and on an engine error, with the sentinel in each
+/// part of the request and of the backend's answer: no log line at the
+/// default level and no metric series may contain it.
+#[tokio::test]
+async fn request_content_never_reaches_logs_or_metrics() {
+    let cloud_api = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-zdr",
+            "workspace_id": "ws-zdr",
+            "api_key_id": "key-zdr"
+        })))
+        .mount(&cloud_api)
+        .await;
+
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let logs = ZdrLogs::default();
+    let writer = logs.clone();
+    let _subscriber = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .json()
+            // Every level of this crate's own lines, the default for the rest.
+            .with_env_filter(tracing_subscriber::EnvFilter::new(
+                "info,vllm_proxy_rs=trace",
+            ))
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    let _registered = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+
+    let boundary = "zdrboundary";
+    let multipart = format!("multipart/form-data; boundary={boundary}");
+    let sk = format!("sk-test-{ZDR_SENTINEL}-0123456789");
+    for status in [200, 400, 500] {
+        for bearer in ["test-token", sk.as_str()] {
+            let backend = zdr_backend(status).await;
+            let app = build_test_app_inner(
+                &backend.uri(),
+                TestAppOptions {
+                    cloud_api_url: Some(cloud_api.uri()),
+                    token_labels: vec!["cloud-api"],
+                    ..TestAppOptions::default()
+                },
+            );
+            for uri in [
+                "/v1/chat/completions",
+                "/v1/completions",
+                "/v1/embeddings",
+                "/v1/rerank",
+                "/v1/score",
+                "/v1/tokenize",
+                "/v1/privacy/classify",
+                "/v1/images/generations",
+            ] {
+                let request = zdr_request(
+                    uri,
+                    bearer,
+                    "application/json",
+                    zdr_body_with_routable_model(zdr_json_body(false)),
+                );
+                zdr_send(app.clone(), request).await;
+            }
+            for (uri, file) in [
+                ("/v1/audio/transcriptions", "file"),
+                ("/v1/images/edits", "image"),
+            ] {
+                for body in [
+                    zdr_body_with_routable_model(zdr_multipart_body(boundary, file)),
+                    zdr_refused_multipart_body(boundary),
+                ] {
+                    zdr_send(app.clone(), zdr_request(uri, bearer, &multipart, body)).await;
+                }
+            }
+            zdr_send(
+                app.clone(),
+                zdr_request(
+                    "/v1/chat/completions",
+                    bearer,
+                    "application/json",
+                    zdr_json_body(true),
+                ),
+            )
+            .await;
+            // A client that leaves while the backend is still working.
+            let slow = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_secs(30))
+                        .set_body_json(serde_json::json!({})),
+                )
+                .mount(&slow)
+                .await;
+            let slow_app = build_test_app_inner(
+                &slow.uri(),
+                TestAppOptions {
+                    cloud_api_url: Some(cloud_api.uri()),
+                    token_labels: vec!["cloud-api"],
+                    ..TestAppOptions::default()
+                },
+            );
+            for (uri, json) in [
+                ("/v1/chat/completions", true),
+                ("/v1/privacy/classify", true),
+                ("/v1/audio/transcriptions", false),
+            ] {
+                let request = if json {
+                    zdr_request(
+                        uri,
+                        bearer,
+                        "application/json",
+                        zdr_body_with_routable_model(zdr_json_body(false)),
+                    )
+                } else {
+                    zdr_request(
+                        uri,
+                        bearer,
+                        &multipart,
+                        zdr_body_with_routable_model(zdr_multipart_body(boundary, "file")),
+                    )
+                };
+                let dropped = tokio::time::timeout(
+                    Duration::from_millis(300),
+                    slow_app.clone().oneshot(request),
+                )
+                .await;
+                if let Ok(Ok(response)) = &dropped {
+                    panic!("{uri} returned {} before the deadline", response.status());
+                }
+                assert!(dropped.is_err(), "{uri}");
+            }
+            // Signature lookup with a client-chosen id.
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/v1/signature/{ZDR_SENTINEL}?q={ZDR_SENTINEL}"))
+                        .header("authorization", format!("Bearer {bearer}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        }
+    }
+
+    // Refused: a wrong token that carries the marker.
+    let backend = zdr_backend(200).await;
+    zdr_send(
+        build_test_app_inner(&backend.uri(), TestAppOptions::default()),
+        zdr_request(
+            "/v1/chat/completions",
+            &format!("wrong-{ZDR_SENTINEL}"),
+            "application/json",
+            zdr_json_body(false),
+        ),
+    )
+    .await;
+
+    // OHTTP: the same content inside the encrypted message.
+    let backend = zdr_backend(200).await;
+    let (base_url, server_handle, config_bytes) = start_ohttp_server(&backend.uri()).await;
+    let mut inner_req = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/chat/completions".to_vec(),
+    );
+    inner_req.put_header("content-type", "application/json");
+    inner_req.put_header("x-org-id", ZDR_SENTINEL);
+    inner_req.put_header("x-workspace-id", ZDR_SENTINEL);
+    inner_req.put_header("x-request-id", ZDR_SENTINEL);
+    inner_req.put_header("x-zdr-probe", ZDR_SENTINEL);
+    inner_req.write_content(zdr_json_body(false));
+    let (enc_request, _client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/ohttp"))
+        .header("content-type", "message/ohttp-req")
+        .header("authorization", "Bearer test-token")
+        .body(enc_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let _ = response.bytes().await;
+    server_handle.abort();
+
+    let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    // The success, engine-error, cancel and refusal paths all ran.
+    assert!(captured.contains("request completed"), "{captured}");
+    assert!(captured.contains("request cancelled"), "{captured}");
+    assert!(captured.contains("request finished"), "{captured}");
+    // A config-token request without an org id was counted and warned about.
+    assert!(
+        captured.contains("Trusted request on a customer route has no org id"),
+        "{captured}"
+    );
+    // Key-path lines name the backend's request id.
+    assert!(captured.contains("upstream_request_id"), "{captured}");
+    assert!(
+        captured.contains("Backend returned non-success status"),
+        "{captured}"
+    );
+    let leaked: Vec<&str> = captured
+        .lines()
+        .filter(|line| line.contains(ZDR_SENTINEL) || line.contains("203.0.113.77"))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "request content in logs:\n{}",
+        leaked.join("\n")
+    );
+    let rendered = handle.render();
+    assert!(
+        rendered.contains("inference_proxy_requests_without_tenant_total{"),
+        "{rendered}"
+    );
+    // The caller label is on the series; the token is not.
+    assert!(rendered.contains("caller=\"cloud-api\""), "{rendered}");
+    assert!(rendered.contains("caller=\"api_key\""), "{rendered}");
+    assert!(!captured.contains("test-token") && !rendered.contains("test-token"));
+    assert!(
+        !rendered.contains(ZDR_SENTINEL),
+        "request content in metrics:\n{rendered}"
+    );
 }
 
 // ---- Chunked OHTTP (streaming) tests ----
@@ -10720,6 +9878,142 @@ async fn test_ohttp_chunked_chat_completion() {
         resp_body["choices"][0]["message"]["content"],
         "Chunked OHTTP works!"
     );
+
+    server_handle.abort();
+}
+
+/// Wait (bounded) until every relay slot is free again.
+async fn wait_for_free_relay_slots(limit: &routes::ohttp::OhttpRelayLimit) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while limit.available() < limit.max_inflight() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "relay slot not released"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Chat completions the mock backend has received.
+async fn forwarded_chat_requests(mock: &MockServer) -> usize {
+    mock.received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/v1/chat/completions")
+        .count()
+}
+
+#[tokio::test]
+async fn test_ohttp_relay_limit_releases_slots_and_refuses_valid_requests_when_full() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-ohttp-limit",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+        })))
+        .mount(&mock)
+        .await;
+
+    let limit = routes::ohttp::OhttpRelayLimit::new(1).unwrap();
+    let (base_url, server_handle, config_bytes) =
+        start_ohttp_server_with_relay_limit(&mock.uri(), Some(limit.clone())).await;
+
+    let mut inner_req = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/chat/completions".to_vec(),
+    );
+    inner_req.put_header("content-type", "application/json");
+    inner_req.write_content(
+        serde_json::to_vec(&serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": false
+        }))
+        .unwrap(),
+    );
+    let client = reqwest::Client::new();
+
+    // Standard OHTTP: served with the only slot, which is free again after.
+    for _ in 0..2 {
+        let (enc_request, client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+        let response = client
+            .post(format!("{base_url}/ohttp"))
+            .header("content-type", "message/ohttp-req")
+            .header("authorization", "Bearer test-token")
+            .body(enc_request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let enc_response = response.bytes().await.unwrap();
+        let inner_resp = ohttp_decrypt_response(client_response, &enc_response);
+        assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+        wait_for_free_relay_slots(&limit).await;
+    }
+
+    // Chunked OHTTP: the slot is held by the streaming task and returned when
+    // the stream ends.
+    for _ in 0..2 {
+        let (status, _, inner_resp) = ohttp_chunked_roundtrip(
+            &base_url,
+            &config_bytes,
+            &inner_req,
+            Some("Bearer test-token"),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+        wait_for_free_relay_slots(&limit).await;
+    }
+    assert_eq!(forwarded_chat_requests(&mock).await, 4);
+
+    // With every slot taken, a valid request is refused and never forwarded.
+    let held = limit.try_acquire().expect("the test takes the only slot");
+    let (enc_request, _) = ohttp_encrypt_request(&config_bytes, &inner_req);
+    let response = client
+        .post(format!("{base_url}/ohttp"))
+        .header("content-type", "message/ohttp-req")
+        .header("authorization", "Bearer test-token")
+        .body(enc_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+        Some("1")
+    );
+    assert_eq!(forwarded_chat_requests(&mock).await, 4);
+
+    // And served again once the slot is free.
+    drop(held);
+    let (enc_request, client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+    let response = client
+        .post(format!("{base_url}/ohttp"))
+        .header("content-type", "message/ohttp-req")
+        .header("authorization", "Bearer test-token")
+        .body(enc_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let enc_response = response.bytes().await.unwrap();
+    let inner_resp = ohttp_decrypt_response(client_response, &enc_response);
+    assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+    assert_eq!(forwarded_chat_requests(&mock).await, 5);
 
     server_handle.abort();
 }
@@ -11966,6 +11260,177 @@ async fn single_model_process_refuses_a_colon_in_the_model_id() {
     assert_eq!(requests_seen(&backend).await, 0);
 }
 
+/// `(name, file name, value)` of one form part.
+type FormPart<'a> = (&'a str, Option<&'a str>, &'a str);
+
+/// A multipart body with boundary `B`; file parts are sent as `file_type`.
+fn form_body(parts: &[FormPart], file_type: &str) -> String {
+    let mut body = String::new();
+    for (name, file_name, value) in parts {
+        body.push_str(&format!(
+            "--B\r\nContent-Disposition: form-data; name=\"{name}\""
+        ));
+        if let Some(file_name) = file_name {
+            body.push_str(&format!(
+                "; filename=\"{file_name}\"\r\nContent-Type: {file_type}"
+            ));
+        }
+        body.push_str(&format!("\r\n\r\n{value}\r\n"));
+    }
+    body.push_str("--B--\r\n");
+    body
+}
+
+async fn post_form(app: &axum::Router, route: &str, body: String) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(route)
+                .header("content-type", "multipart/form-data; boundary=B")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// Posts `parts` to `route` and checks that the backend got one request with
+/// every part in the order sent: its name, file name, type and value.
+async fn assert_form_forwarded_unchanged(route: &str, parts: &[FormPart<'_>], file_type: &str) {
+    let backend = start_any_post_backend().await;
+    let app = build_test_app(&backend.uri());
+    let response = post_form(&app, route, form_body(parts, file_type)).await;
+    assert_eq!(response.status(), StatusCode::OK, "{route}");
+
+    let received = backend.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1, "{route}");
+    let forwarded = String::from_utf8_lossy(&received[0].body).into_owned();
+    let mut rest = forwarded.as_str();
+    for (name, file_name, value) in parts {
+        let part = match file_name {
+            Some(file_name) => format!(
+                "Content-Disposition: form-data; name=\"{name}\"; filename=\"{file_name}\"\r\n\
+                 Content-Type: {file_type}\r\n\r\n{value}\r\n"
+            ),
+            None => {
+                format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n")
+            }
+        };
+        let at = rest
+            .find(&part)
+            .unwrap_or_else(|| panic!("{route}: {name} not forwarded as sent:\n{forwarded}"));
+        rest = &rest[at + part.len()..];
+    }
+    assert_eq!(
+        forwarded.matches("Content-Disposition").count(),
+        parts.len()
+    );
+}
+
+/// Posts `supported` to `route` with each of `fields` added first, between
+/// and last: every form is a 400 that names the field, and the backend sees
+/// no request.
+async fn assert_form_fields_refused(route: &str, supported: [FormPart<'_>; 2], fields: &[&str]) {
+    let backend = start_any_post_backend().await;
+    let app = build_test_app(&backend.uri());
+    let [first, second] = supported;
+    for field in fields {
+        let extra = (*field, None, "value");
+        for parts in [
+            [extra, first, second],
+            [first, extra, second],
+            [first, second, extra],
+        ] {
+            let response = post_form(&app, route, form_body(&parts, "image/png")).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{route} {field}"
+            );
+            let body = body_to_json(response).await;
+            assert_eq!(
+                body["error"]["message"],
+                format!("`{field}` is not a supported form field on {route}")
+            );
+        }
+    }
+    assert_eq!(requests_seen(&backend).await, 0, "{route}");
+}
+
+#[tokio::test]
+async fn image_edit_forwards_supported_form_fields_unchanged() {
+    assert_form_forwarded_unchanged(
+        "/v1/images/edits",
+        &[
+            ("model", None, "test-model"),
+            ("prompt", None, "a cat wearing a hat"),
+            ("image[]", Some("first.png"), "firstpngdata"),
+            ("image[]", Some("second.png"), "secondpngdata"),
+            ("mask", Some("mask.png"), "maskpngdata"),
+            ("n", None, "2"),
+            ("size", None, "1024x1024"),
+            ("response_format", None, "b64_json"),
+            ("seed", None, "42"),
+            ("negative_prompt", None, "blurry"),
+        ],
+        "image/png",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn image_edit_refuses_unsupported_form_fields() {
+    assert_form_fields_refused(
+        "/v1/images/edits",
+        [
+            ("prompt", None, "a cat"),
+            ("image", Some("a.png"), "fakepngdata"),
+        ],
+        &[
+            "url",
+            "url[]",
+            "perf_dump_path",
+            "upscaling_model_path",
+            "enhance_prompt",
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn audio_transcription_forwards_supported_form_fields_unchanged() {
+    assert_form_forwarded_unchanged(
+        "/v1/audio/transcriptions",
+        &[
+            ("file", Some("speech.wav"), "fakewavdata"),
+            ("model", None, "test-model"),
+            ("language", None, "en"),
+            ("prompt", None, "names in this recording"),
+            ("response_format", None, "verbose_json"),
+            ("temperature", None, "0.2"),
+            ("timestamp_granularities[]", None, "word"),
+            ("timestamp_granularities[]", None, "segment"),
+        ],
+        "audio/wav",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn audio_transcription_refuses_unsupported_form_fields() {
+    assert_form_fields_refused(
+        "/v1/audio/transcriptions",
+        [
+            ("model", None, "test-model"),
+            ("file", Some("a.wav"), "fakewavdata"),
+        ],
+        &["url", "stream", "seed", "image", "unknown"],
+    )
+    .await;
+}
+
 async fn forwarded_lora_paths(backend: &MockServer) -> Vec<Option<String>> {
     backend
         .received_requests()
@@ -12415,4 +11880,518 @@ async fn size_tier_is_computed_from_the_decrypted_prompt() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[derive(Clone, Default)]
+struct CallerLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CallerLogs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A config token's `TOKEN_LABELS` entry is the request's `caller` on the
+/// completion line and on the completed-request metrics; the token itself
+/// appears in neither.
+#[tokio::test]
+async fn config_token_label_is_the_caller_on_logs_and_metrics() {
+    let mock = MockServer::start().await;
+    mount_chat_ok(&mock, "/v1/chat/completions", 1).await;
+    let app = build_test_app_inner(
+        &mock.uri(),
+        TestAppOptions {
+            token_labels: vec!["cloud-api"],
+            ..TestAppOptions::default()
+        },
+    );
+
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let logs = CallerLogs::default();
+    let writer = logs.clone();
+    let _subscriber = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("vllm_proxy_rs=info"))
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    let _registered = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+
+    let status = post_chat(
+        app,
+        "/v1/chat/completions",
+        &serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    let completed = captured
+        .lines()
+        .find(|line| line.contains("request completed"))
+        .unwrap_or_else(|| panic!("no completion line: {captured}"));
+    assert!(completed.contains("caller=\"cloud-api\""), "{completed}");
+    assert!(
+        completed.contains("auth_path=\"trusted_config_token\""),
+        "{completed}"
+    );
+
+    let rendered = handle.render();
+    let series = rendered
+        .lines()
+        .find(|line| line.starts_with("inference_proxy_completed_requests_total{"))
+        .unwrap_or_else(|| panic!("no completed series: {rendered}"));
+    assert!(series.contains("caller=\"cloud-api\""), "{series}");
+    for text in [&captured, &rendered] {
+        assert!(
+            !text.contains("test-token"),
+            "the token must never be logged"
+        );
+    }
+}
+
+fn json_log_lines(logs: &CallerLogs) -> Vec<serde_json::Value> {
+    String::from_utf8(logs.0.lock().unwrap().clone())
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+fn lines_with_message<'a>(
+    lines: &'a [serde_json::Value],
+    message: &str,
+) -> Vec<&'a serde_json::Value> {
+    lines
+        .iter()
+        .filter(|line| line["fields"]["message"] == message)
+        .collect()
+}
+
+/// A client that goes away before the backend answers leaves one
+/// `request cancelled` line that carries the request's ids, and a refused
+/// request leaves one `request finished` line.
+#[tokio::test]
+async fn dropped_request_logs_one_cancel_line_with_its_ids() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(30))
+                .set_body_json(serde_json::json!({})),
+        )
+        .mount(&mock)
+        .await;
+    let app = build_test_app_inner(
+        &mock.uri(),
+        TestAppOptions {
+            token_labels: vec!["cloud-api"],
+            ..TestAppOptions::default()
+        },
+    );
+
+    let logs = CallerLogs::default();
+    let writer = logs.clone();
+    let _subscriber = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("vllm_proxy_rs=info"))
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    let _registered = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+
+    let request_id = "3f1d2c4b-5a69-4788-9a0b-1c2d3e4f5a6b";
+    let body = serde_json::to_vec(&serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "CANCEL_PROMPT_SENTINEL"}],
+        "stream": false
+    }))
+    .unwrap();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("content-length", body.len())
+        .header("authorization", "Bearer test-token")
+        .header("x-request-id", request_id)
+        .header("x-org-id", "org-cancelled")
+        .header("x-workspace-id", "ws-cancelled")
+        .body(Body::from(body.clone()))
+        .unwrap();
+    let outcome =
+        tokio::time::timeout(Duration::from_millis(500), app.clone().oneshot(request)).await;
+    assert!(outcome.is_err(), "the backend is slower than the client");
+
+    let lines = json_log_lines(&logs);
+    let cancelled = lines_with_message(&lines, "request cancelled");
+    assert_eq!(cancelled.len(), 1, "{lines:#?}");
+    let fields = &cancelled[0]["fields"];
+    assert_eq!(fields["request_id"], request_id);
+    assert_eq!(fields["org_id"], "org-cancelled");
+    assert_eq!(fields["workspace_id"], "ws-cancelled");
+    assert_eq!(fields["auth_path"], "trusted_config_token");
+    assert_eq!(fields["tenant_context"], "trusted_headers");
+    assert_eq!(fields["caller"], "cloud-api");
+    assert_eq!(fields["route"], "/v1/chat/completions");
+    assert_eq!(fields["phase"], "before_response");
+    assert_eq!(fields["request_bytes"], body.len() as u64);
+    assert!(fields["elapsed_ms"].as_u64().unwrap() >= 400, "{fields}");
+    assert!(lines_with_message(&lines, "request finished").is_empty());
+    // A root event: only its own fields, nothing from the request span.
+    assert!(cancelled[0].get("span").is_none(), "{}", cancelled[0]);
+
+    // A refused request: one finish line, no tenant, nothing from the body.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer wrong-token")
+                .header("x-org-id", "org-unauthenticated")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let lines = json_log_lines(&logs);
+    let finished = lines_with_message(&lines, "request finished");
+    assert_eq!(finished.len(), 1, "{lines:#?}");
+    let fields = &finished[0]["fields"];
+    assert_eq!(fields["status"], 401);
+    assert_eq!(fields["org_id"], "");
+    assert_eq!(fields["auth_path"], "unknown");
+    assert_eq!(fields["caller"], "unknown");
+    assert_eq!(fields["outcome"], "complete");
+
+    let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    for secret in [
+        "CANCEL_PROMPT_SENTINEL",
+        "test-token",
+        "wrong-token",
+        "org-unauthenticated",
+    ] {
+        assert!(!captured.contains(secret), "{secret}: {captured}");
+    }
+}
+
+/// A trusted-only route records its caller too: its finish line says which
+/// config token was used, not `unknown`.
+#[tokio::test]
+async fn trusted_only_route_logs_its_caller() {
+    let mock = MockServer::start().await;
+    let app = build_test_app_inner(
+        &mock.uri(),
+        TestAppOptions {
+            token_labels: vec!["ops"],
+            ..TestAppOptions::default()
+        },
+    );
+    let logs = CallerLogs::default();
+    let writer = logs.clone();
+    let _subscriber = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("vllm_proxy_rs=info"))
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    let _registered = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/gpu_evidence")
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"nonce":"not-hex","no_gpu_mode":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let lines = json_log_lines(&logs);
+    let finished = lines_with_message(&lines, "request finished");
+    assert_eq!(finished.len(), 1, "{lines:#?}");
+    let fields = &finished[0]["fields"];
+    assert_eq!(fields["status"], 400);
+    assert_eq!(fields["auth_path"], "trusted_config_token");
+    assert_eq!(fields["caller"], "ops");
+    assert_eq!(fields["tenant_context"], "trusted_no_tenant");
+}
+
+// ---- Request field guard (request_guard.rs) ----
+
+#[tokio::test]
+async fn request_guard_refuses_out_of_bounds_fields_before_dispatch() {
+    let backend = start_any_post_backend().await;
+    let app = build_test_app(&backend.uri());
+    let cases = [
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"top_logprobs": 1000000}),
+            "top_logprobs",
+        ),
+        (
+            "/v1/completions",
+            serde_json::json!({"prompt": "x", "logprobs": 21}),
+            "logprobs",
+        ),
+        ("/v1/chat/completions", serde_json::json!({"n": 64}), "n"),
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"logit_bias": {"5": 1e39}}),
+            "logit_bias",
+        ),
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"stop_token_ids": [-1]}),
+            "stop_token_ids",
+        ),
+        (
+            "/v1/completions",
+            serde_json::json!({"prompt": "x", "logprob_start_len": -5}),
+            "logprob_start_len",
+        ),
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"min_tokens": 9, "max_tokens": 1}),
+            "min_tokens",
+        ),
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"temperature": "nan"}),
+            "temperature",
+        ),
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"model": "/a".repeat(4096)}),
+            "model",
+        ),
+        (
+            "/v1/embeddings",
+            serde_json::json!({"model": "/a".repeat(4096), "input": "x"}),
+            "model",
+        ),
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "file:///etc/passwd"}}
+            ]}]}),
+            "image_url",
+        ),
+    ];
+    for (route, mut body, param) in cases {
+        if body.get("messages").is_none() && route == "/v1/chat/completions" {
+            body["messages"] = serde_json::json!([{"role": "user", "content": "hi"}]);
+        }
+        let (status, response) = post_guarded(&app, route, &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{route} {param}");
+        assert_eq!(
+            response["error"]["type"], "invalid_request_error",
+            "{param}"
+        );
+        assert_eq!(response["error"]["param"], param, "{route}");
+    }
+    assert_eq!(requests_seen(&backend).await, 0);
+}
+
+#[tokio::test]
+async fn request_guard_strips_engine_internal_fields() {
+    let backend = start_any_post_backend().await;
+    let app = build_test_app(&backend.uri());
+    for route in ["/v1/chat/completions", "/v1/embeddings"] {
+        let body = serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "input": "x",
+            "kv_transfer_params": {"do_remote_prefill": true, "remote_prefill_cached_tokens": 99},
+            "vllm_xargs": {"kv_transfer_params": "x"},
+            "return_hidden_states": true,
+        });
+        let (status, _) = post_guarded(&app, route, &body).await;
+        assert_eq!(status, StatusCode::OK, "{route}");
+    }
+    let requests = backend.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        let forwarded: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        for key in ["kv_transfer_params", "vllm_xargs", "return_hidden_states"] {
+            assert!(forwarded.get(key).is_none(), "{} kept {key}", request.url);
+        }
+        assert_eq!(forwarded["model"], "test-model");
+    }
+}
+
+#[tokio::test]
+async fn image_routes_refuse_engine_only_fields() {
+    let backend = start_any_post_backend().await;
+    let app = build_test_app(&backend.uri());
+    let boundary = "----GuardBoundary";
+    let form = |extra: &str| {
+        format!(
+            "--{boundary}\r\n\
+             Content-Disposition: form-data; name=\"prompt\"\r\n\r\n\
+             a cat\r\n\
+             --{boundary}\r\n\
+             Content-Disposition: form-data; name=\"{extra}\"\r\n\r\n\
+             /tmp/value\r\n\
+             --{boundary}--\r\n"
+        )
+    };
+    let form_value = |name: &str, value: &str| {
+        format!(
+            "--{boundary}\r\n\
+             Content-Disposition: form-data; name=\"prompt\"\r\n\r\n\
+             a cat\r\n\
+             --{boundary}\r\n\
+             Content-Disposition: form-data; name=\"{name}\"\r\n\r\n\
+             {value}\r\n\
+             --{boundary}--\r\n"
+        )
+    };
+    let send = |body: String| {
+        app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/images/edits")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+    };
+
+    for field in [
+        "url",
+        "url[]",
+        "num_frames",
+        "upscaling_scale",
+        "enable_upscaling",
+        "perf_dump_path",
+        "cache_dit_params",
+        "upscaling_model_path",
+    ] {
+        let response = send(form(field)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{field}");
+    }
+    assert_eq!(requests_seen(&backend).await, 0);
+
+    let generate = |body: serde_json::Value| {
+        app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/images/generations")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+    };
+    for field in [
+        "diffusers_kwargs",
+        "perf_dump_path",
+        "upscaling_model_path",
+        "enable_upscaling",
+        "url",
+        "url[]",
+        "profile",
+        "cache_dit_params",
+        "attention_backend_override",
+    ] {
+        let mut body = serde_json::json!({"model": "test-model", "prompt": "a cat"});
+        body[field] = serde_json::json!({"x": 1});
+        let response = generate(body).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{field}");
+        let json = body_to_json(response).await;
+        assert!(json["error"]["message"].as_str().unwrap().contains(field));
+    }
+    assert_eq!(requests_seen(&backend).await, 0);
+
+    for (field, value) in [
+        ("n", serde_json::json!(64)),
+        ("n", serde_json::json!(11)),
+        ("size", serde_json::json!("8192x8192")),
+        ("num_inference_steps", serde_json::json!(100000)),
+    ] {
+        let mut body = serde_json::json!({"model": "test-model", "prompt": "a cat"});
+        body[field] = value;
+        let response = generate(body).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{field}");
+    }
+    let response = send(form_value("num_inference_steps", "100000"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(requests_seen(&backend).await, 0);
+
+    let response = generate(serde_json::json!({
+        "model": "test-model", "prompt": "a cat", "size": "512x512", "seed": 1
+    }))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(requests_seen(&backend).await, 1);
+}
+
+#[tokio::test]
+async fn structured_output_patterns_are_bounded_on_chat_and_completions() {
+    let backend = start_any_post_backend().await;
+    let app = build_test_app(&backend.uri());
+    let slow = "^(.{0,500}){0,500}$";
+    for (route, body) in [
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"messages": [{"role": "user", "content": "hi"}],
+                "structured_outputs": {"regex": slow}}),
+        ),
+        (
+            "/v1/chat/completions",
+            serde_json::json!({"messages": [{"role": "user", "content": "hi"}],
+                "response_format": {"type": "json_schema", "json_schema": {"name": "x",
+                    "schema": {"type": "string", "pattern": slow}}}}),
+        ),
+        (
+            "/v1/completions",
+            serde_json::json!({"prompt": "hi", "regex": "a{1000000}"}),
+        ),
+    ] {
+        let (status, response) = post_guarded(&app, route, &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{route} {body}");
+        assert_eq!(response["error"]["type"], "invalid_request_error");
+    }
+    assert_eq!(requests_seen(&backend).await, 0);
+
+    let body = serde_json::json!({"messages": [{"role": "user", "content": "hi"}],
+        "response_format": {"type": "json_schema", "json_schema": {"name": "x",
+            "schema": {"type": "string", "pattern": "^[a-z]{1,64}$"}}}});
+    let (status, _) = post_guarded(&app, "/v1/chat/completions", &body).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(requests_seen(&backend).await, 1);
 }

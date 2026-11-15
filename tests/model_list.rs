@@ -208,10 +208,10 @@ fn single_model_state(process: model_list::Process<'_>) -> AppState {
         backend_pool,
         ohttp_gateway: None,
         ohttp_attestation_ed25519: None,
-        fusion_caches: Arc::new(fusion::FusionCaches::default()),
         vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(None, 1_200)),
         models: None,
         api_key_cache: Default::default(),
+        rerank_limiter: Default::default(),
         usage_report_delivery: usage_report::UsageReportDelivery::new(config.usage_report.clone()),
         config,
     }
@@ -673,7 +673,7 @@ async fn text_completions_are_placed_billed_and_counted_as_their_model() {
         format!(
             "inference_proxy_completed_requests_total{{auth_path=\"cloud_api_key\",\
              ingress_route=\"missing\",tenant_context=\"verified\",\
-             request_id_origin=\"generated\",mode=\"json_via_stream\",model=\"{id}\"}} {count}"
+             request_id_origin=\"generated\",caller=\"api_key\",mode=\"json_via_stream\",model=\"{id}\"}} {count}"
         )
     };
     assert!(rendered.contains(&completed(ALPHA, 2)), "{rendered}");
@@ -978,12 +978,12 @@ async fn a_models_backend_token_and_priority_reach_only_its_own_backends() {
     // cloud-api sees the customer key on the key check and the usage token on
     // the reports; no backend token on anything.
     let to_cloud = cloud.received_requests().await.unwrap();
-    // One key check: cloud-api's 200 is reused for the key's other requests.
+    // Each direct request revalidates the key so revocation is observed.
     let key_checks = to_cloud
         .iter()
         .filter(|request| request.url.path() == "/v1/check_api_key")
         .count();
-    assert_eq!(key_checks, 1);
+    assert_eq!(key_checks, 6);
     assert!(to_cloud.len() >= 6, "{}", to_cloud.len());
     for request in &to_cloud {
         let expected = match request.url.path() {
@@ -3518,6 +3518,40 @@ async fn a_client_that_leaves_is_no_stream_error_and_is_counted_only_once_it_was
 }
 
 #[tokio::test]
+async fn http_metrics_use_route_labels() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let gateway = start_single(
+        &[
+            ("MODEL_NAME", ALPHA),
+            ("VLLM_BACKEND_URLS", "http://127.0.0.1:9"),
+        ],
+        Some(handle.clone()),
+    );
+
+    for uri in ["/v1/signature/example-1", "/example-2"] {
+        let request = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        gateway.app.clone().oneshot(request).await.unwrap();
+    }
+
+    let rendered = handle.render();
+    for expected in [
+        "http_requests_total{method=\"GET\",endpoint=\"/v1/signature/{chat_id}\",",
+        "http_requests_total{method=\"GET\",endpoint=\"CATCH_ALL\",",
+        "http_request_duration_seconds_count{method=\"GET\",endpoint=\"/v1/signature/{chat_id}\"}",
+        "http_request_duration_seconds_count{method=\"GET\",endpoint=\"CATCH_ALL\"}",
+    ] {
+        assert!(rendered.contains(expected), "{expected}: {rendered}");
+    }
+    assert!(!rendered.contains("example-"), "{rendered}");
+}
+
+#[tokio::test]
 async fn a_single_model_process_has_neither_per_model_response_series() {
     let backend = MockServer::start().await;
     mount_completions(&backend, CHAT, 1).await;
@@ -3636,10 +3670,10 @@ impl Logs {
 const REQUESTED: [&str; 2] = ["Example/ALPHA", "someone-elses/model-sentinel"];
 
 #[tokio::test]
-async fn a_single_model_lane_counts_how_the_requested_model_compares_and_serves_as_before() {
+async fn a_single_model_lane_counts_requested_models_and_limits_direct_callers() {
     let backend = MockServer::start().await;
     for route in ROUTES {
-        mount_completions(&backend, route, 6).await;
+        mount_completions(&backend, route, 2).await;
     }
     let cloud = cloud_api("sk-live-customer").await;
     let recorder = PrometheusBuilder::new().build_recorder();
@@ -3667,17 +3701,23 @@ async fn a_single_model_lane_counts_how_the_requested_model_compares_and_serves_
         Some(json!(42)),
     ];
     for route in ROUTES {
-        for model in &bodies {
-            // Whatever the body names, the one model answers — as it always has.
+        for (model, expected_status) in bodies.iter().zip([
+            StatusCode::OK,
+            StatusCode::NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            StatusCode::OK,
+            StatusCode::BAD_REQUEST,
+            StatusCode::BAD_REQUEST,
+        ]) {
             let request = post(route, Some("sk-live-customer"), &body_for(model.clone()));
             let response = gateway.app.clone().oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "{route} {model:?}");
+            assert_eq!(response.status(), expected_status, "{route} {model:?}");
             json_body(response).await;
         }
     }
     backend.verify().await;
-    // ... and is billed, under MODEL_NAME.
-    let reports = usage_reports(&cloud, 12).await;
+    // Accepted requests are billed under MODEL_NAME.
+    let reports = usage_reports(&cloud, 4).await;
     assert!(reports.iter().all(|report| report["model"] == ALPHA));
 
     let rendered = handle.render();

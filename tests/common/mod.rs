@@ -12,6 +12,7 @@ pub(crate) struct TestAppOptions {
     pub(crate) images_edits_url_override: Option<String>,
     pub(crate) transcriptions_url_override: Option<String>,
     pub(crate) rerank_url_override: Option<String>,
+    pub(crate) rerank_limiter: Option<Arc<rerank_limit::RerankLimiter>>,
 }
 
 pub(crate) fn test_signing_pair() -> signing::SigningPair {
@@ -37,6 +38,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         replica_state: None,
         model_name: "test-model".to_string(),
         tokens: vec!["test-token".to_string()],
+        token_labels: vec![],
         vllm_base_url: mock_url.to_string(),
         chat_completions_url: format!("{base}/v1/chat/completions"),
         completions_url: format!("{base}/v1/completions"),
@@ -99,7 +101,9 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         transcriptions_url_override: options.transcriptions_url_override,
         rerank_url_override: options.rerank_url_override,
         score_url_override: None,
+        rerank_limits: Default::default(),
         ohttp_enabled: false,
+        ohttp_max_inflight: 0,
         listen_port: 8000,
         listen_addr: "127.0.0.1".to_string(),
         backend_token: options.backend_token,
@@ -120,6 +124,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         discount_to_user: None,
         backend_lora: None,
         strict_request_model: false,
+        request_guard: Default::default(),
         reasoning_off_effort: "none".to_string(),
         allowed_org_ids: Vec::new(),
         sse_keepalive_secs: 0,
@@ -151,17 +156,6 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         web_context_search_url: None,
         agent_loop_max_iterations: 5,
         web_context_search_timeout_secs: 30,
-        fusion_enabled: false,
-        fusion_endpoints_url: "https://completions.near.ai/endpoints".to_string(),
-        fusion_endpoints_ttl_secs: 300,
-        fusion_internal_bearer_token: None,
-        fusion_default_analysis_models: Vec::new(),
-        fusion_max_panel_models: 8,
-        fusion_max_depth: 1,
-        fusion_panel_timeout_secs: 120,
-        fusion_max_response_bytes: 10 * 1024 * 1024,
-        fusion_internal_max_attempts: 2,
-        fusion_internal_retry_initial_backoff_ms: 1,
     };
 
     let signing_pair = test_signing_pair();
@@ -190,6 +184,7 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),
+        rerank_limiter: options.rerank_limiter.unwrap_or_default(),
         usage_report_delivery: Default::default(),
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
@@ -204,7 +199,6 @@ pub(crate) fn build_test_app(mock_url: &str, options: TestAppOptions) -> axum::R
         backend_pool,
         ohttp_gateway: None,
         ohttp_attestation_ed25519: None,
-        fusion_caches: Arc::new(fusion::FusionCaches::default()),
         vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(None, 1_200)),
         backend_affinity: Arc::new(
             vllm_proxy_rs::backend_affinity::BackendConversationAffinity::new(false, 1, 8, 1_200),

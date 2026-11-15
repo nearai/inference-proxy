@@ -1,9 +1,28 @@
+use std::sync::Arc;
+
+use axum::extract::MatchedPath;
 use axum::http::{HeaderMap, HeaderValue, Request};
 use axum::middleware::Next;
 use axum::response::Response;
 use tracing::Instrument;
 
+use crate::request_log::{RequestGuard, RequestIdentity, RequestRecord};
+
 use crate::auth::{AuthPath, RequestSource, RequireAuth};
+
+/// Route label for requests that matched no registered route.
+pub const UNMATCHED_ROUTE: &str = "CATCH_ALL";
+
+/// The route template a request matched (for example
+/// `/v1/signature/{chat_id}`), or [`UNMATCHED_ROUTE`]. Used for metric labels
+/// and log fields. Only meaningful in middleware that runs after routing
+/// (`Router::layer`).
+pub fn route_label<B>(request: &Request<B>) -> &str {
+    request
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or(UNMATCHED_ROUTE, MatchedPath::as_str)
+}
 
 /// Tracing correlation IDs for a request, parsed once by `request_id_middleware`
 /// from `X-Request-Id` and inserted into the request extensions. Handlers that
@@ -34,6 +53,9 @@ pub struct TracingIds {
     /// only for the trusted config-token/gateway path. Verified direct-key IDs
     /// are retained for logs but do not change the upstream wire contract.
     pub(crate) forward_tenant_headers: bool,
+    /// Shared with the request guard: the identity once authenticated, and
+    /// whether a completion line was written (`request_log`).
+    pub(crate) record: Arc<RequestRecord>,
 }
 
 impl TracingIds {
@@ -59,6 +81,7 @@ impl TracingIds {
             workspace_id: None,
             request_source: None,
             forward_tenant_headers: false,
+            record: Arc::default(),
         }
     }
 
@@ -70,15 +93,8 @@ impl TracingIds {
             return self.clone();
         }
 
-        let org_id = headers
-            .get("x-org-id")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        let workspace_id = headers
-            .get("x-workspace-id")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+        let org_id = non_empty_header(headers, "x-org-id");
+        let workspace_id = non_empty_header(headers, "x-workspace-id");
 
         Self {
             request_id: self.request_id.clone(),
@@ -88,6 +104,7 @@ impl TracingIds {
             workspace_id,
             request_source: self.request_source,
             forward_tenant_headers: true,
+            record: Arc::clone(&self.record),
         }
     }
 
@@ -99,10 +116,11 @@ impl TracingIds {
             request_id: self.request_id.clone(),
             upstream_request_id: self.upstream_request_id.clone(),
             request_id_inbound: self.request_id_inbound,
-            org_id: org_id.map(str::to_string),
-            workspace_id: workspace_id.map(str::to_string),
+            org_id: non_empty(org_id),
+            workspace_id: non_empty(workspace_id),
             request_source: self.request_source,
             forward_tenant_headers: false,
+            record: Arc::clone(&self.record),
         }
     }
 
@@ -136,6 +154,11 @@ impl TracingIds {
     /// the middleware-selected UUID request ID; tenant IDs appear only when a
     /// handler explicitly attached trusted tenant metadata.
     pub fn upstream_headers(&self) -> impl Iterator<Item = (&'static str, &str)> + '_ {
+        // Every backend request takes its headers from here: remember the id
+        // it carries for this request's finish or cancel line.
+        if let Some(upstream_request_id) = self.upstream_request_id_for_logs() {
+            self.record.note_upstream_request_id(upstream_request_id);
+        }
         let req = Some(("x-request-id", self.upstream_request_id.as_str()));
         let org = self
             .forward_tenant_headers
@@ -150,6 +173,31 @@ impl TracingIds {
         req.into_iter().chain(org).chain(ws)
     }
 
+    /// Record this request's authenticated identity for the request span and
+    /// the request's finish or cancel line. Called once auth has passed.
+    pub(crate) fn publish_identity(&self) {
+        let labels = crate::proxy::request_metric_labels(Some(self));
+        self.record.publish_identity(
+            &self.request_id,
+            RequestIdentity {
+                org_id: self.org_id.clone(),
+                workspace_id: self.workspace_id.clone(),
+                auth_path: labels.auth_path,
+                ingress_route: labels.ingress_route,
+                tenant_context: labels.tenant_context,
+                caller: labels.caller,
+            },
+        );
+    }
+
+    /// The request id sent to the backend, for log lines, when it differs from
+    /// `request_id` (the direct key path, which the gateway serves). It joins
+    /// this request's lines to the backend's, which log it as their own
+    /// request id. `None` on the trusted path, where the two are the same.
+    pub(crate) fn upstream_request_id_for_logs(&self) -> Option<&str> {
+        (self.upstream_request_id != self.request_id).then_some(self.upstream_request_id.as_str())
+    }
+
     /// Return `org_id` for log fields, defaulting to `""` when absent.
     /// Preserves pre-refactor behavior of recording an empty string rather
     /// than omitting the field entirely.
@@ -161,6 +209,19 @@ impl TracingIds {
     pub fn workspace_id_or_empty(&self) -> &str {
         self.workspace_id.as_deref().unwrap_or("")
     }
+}
+
+/// A tenant id header's value, or `None` when it is missing, not ASCII, or
+/// blank. A blank id names no tenant and must not count as one.
+fn non_empty_header(headers: &HeaderMap, name: &str) -> Option<String> {
+    non_empty(headers.get(name).and_then(|v| v.to_str().ok()))
+}
+
+fn non_empty(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
 }
 
 /// When the request reached the proxy, put in the request extensions by
@@ -185,45 +246,69 @@ impl RequestStart {
 /// the arrival instant in the request extensions for handlers, attaches the
 /// IDs to the tracing span so every log line carries them, and echoes
 /// `X-Request-Id` back to the caller.
+///
+/// The span declares the tenant and caller fields empty; the auth extractor
+/// records them once the caller is known. A [`RequestGuard`] follows the
+/// request to the end of its response body and writes its finish or cancel
+/// line (`request_log`).
 pub async fn request_id_middleware(mut request: Request<axum::body::Body>, next: Next) -> Response {
-    let tracing_ids = TracingIds::from_headers(request.headers());
-    request
-        .extensions_mut()
-        .insert(RequestStart(std::time::Instant::now()));
+    let mut tracing_ids = TracingIds::from_headers(request.headers());
+    let start = std::time::Instant::now();
+    request.extensions_mut().insert(RequestStart(start));
 
-    let method = request.method().to_string();
-    let path = request.uri().path().to_string();
+    let http_method = request.method().clone();
+    let method = http_method.to_string();
+    let path = route_label(&request).to_string();
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|matched| matched.as_str().to_string());
+    let request_bytes = request
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
     let span = tracing::info_span!(
         "request",
         request_id = %tracing_ids.request_id,
-        org_id = %tracing_ids.org_id_or_empty(),
-        workspace_id = %tracing_ids.workspace_id_or_empty(),
+        auth_path = tracing::field::Empty,
+        tenant_context = tracing::field::Empty,
+        caller = tracing::field::Empty,
         method = %method,
         path = %path,
     );
 
+    let record = Arc::new(RequestRecord::new(span.clone(), route));
+    tracing_ids.record = Arc::clone(&record);
     let echo_request_id = tracing_ids.request_id.clone();
+    let guard = RequestGuard::new(
+        record,
+        echo_request_id.clone(),
+        &http_method,
+        request_bytes,
+        start,
+    );
     request.extensions_mut().insert(tracing_ids);
 
+    // If this future is dropped before the response exists, `guard` drops
+    // with it and writes the cancel line.
     let mut response = next.run(request).instrument(span).await;
     if let Ok(val) = HeaderValue::from_str(&echo_request_id) {
         response.headers_mut().insert("x-request-id", val);
     }
-    tracing::debug!(
-        request_id = %echo_request_id,
-        method = %method,
-        path = %path,
-        status = response.status().as_u16(),
-        "request completed"
-    );
-    response
+    guard.attach(response)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderName, HeaderValue};
-    use axum::{body::Body, middleware::from_fn, routing::post, Router};
+    use axum::{
+        body::Body,
+        middleware::from_fn,
+        routing::{get, post},
+        Router,
+    };
     use std::io;
     use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
@@ -307,12 +392,14 @@ mod tests {
         let classified = trusted_ids.with_request_source(RequestSource {
             auth_path: crate::auth::AuthPath::TrustedConfigToken,
             ingress_route: crate::auth::IngressRouteKind::LongIndexed,
+            caller: crate::auth::CALLER_UNLABELED,
         });
         assert_eq!(
             classified.request_source,
             Some(RequestSource {
                 auth_path: crate::auth::AuthPath::TrustedConfigToken,
                 ingress_route: crate::auth::IngressRouteKind::LongIndexed,
+                caller: crate::auth::CALLER_UNLABELED,
             })
         );
 
@@ -325,6 +412,7 @@ mod tests {
             request_source: RequestSource {
                 auth_path: crate::auth::AuthPath::CloudApiKey,
                 ingress_route: crate::auth::IngressRouteKind::Canonical,
+                caller: crate::auth::CALLER_API_KEY,
             },
         };
         let verified_ids = ids.with_authenticated_context(&h, &direct_auth);
@@ -367,12 +455,50 @@ mod tests {
             request_source: RequestSource {
                 auth_path: crate::auth::AuthPath::TrustedConfigToken,
                 ingress_route: crate::auth::IngressRouteKind::Canonical,
+                caller: crate::auth::CALLER_UNLABELED,
             },
         };
         let trusted_ids = ids.with_authenticated_context(&h, &trusted_auth);
         let trusted_headers = trusted_ids.upstream_headers().collect::<Vec<_>>();
         assert!(trusted_headers.contains(&("x-org-id", "org-uuid-123")));
         assert!(trusted_headers.contains(&("x-workspace-id", "ws-uuid-456")));
+    }
+
+    #[test]
+    fn blank_tenant_headers_count_as_absent() {
+        let h = headers_with(&[("x-org-id", ""), ("x-workspace-id", "   ")]);
+        let ids = TracingIds::from_headers(&h).with_trusted_tenant_headers(&h, true);
+        assert!(ids.org_id.is_none());
+        assert!(ids.workspace_id.is_none());
+        let forwarded: Vec<_> = ids.upstream_headers().collect();
+        assert_eq!(forwarded, vec![("x-request-id", ids.request_id.as_str())]);
+
+        // One blank, one set: only the set one is kept and forwarded.
+        let h = headers_with(&[("x-org-id", "org-1"), ("x-workspace-id", "")]);
+        let ids = TracingIds::from_headers(&h).with_trusted_tenant_headers(&h, true);
+        assert_eq!(ids.org_id.as_deref(), Some("org-1"));
+        assert!(ids.workspace_id.is_none());
+        let forwarded: Vec<_> = ids.upstream_headers().collect();
+        assert!(forwarded.contains(&("x-org-id", "org-1")));
+        assert!(!forwarded.iter().any(|(name, _)| *name == "x-workspace-id"));
+
+        // A verified identity with blank fields is no identity either.
+        let direct_auth = RequireAuth {
+            cloud_api_key: Some("sk-test-redacted".to_string()),
+            org_id: Some(String::new()),
+            workspace_id: Some(" ".to_string()),
+            api_key_id: None,
+            request_id: None,
+            request_source: RequestSource {
+                auth_path: crate::auth::AuthPath::CloudApiKey,
+                ingress_route: crate::auth::IngressRouteKind::Canonical,
+                caller: crate::auth::CALLER_API_KEY,
+            },
+        };
+        let ids = TracingIds::from_headers(&HeaderMap::new())
+            .with_authenticated_context(&HeaderMap::new(), &direct_auth);
+        assert!(ids.org_id.is_none());
+        assert!(ids.workspace_id.is_none());
     }
 
     #[test]
@@ -437,11 +563,18 @@ mod tests {
             .expect("test request should complete");
 
         assert_eq!(response.status().as_u16(), 200);
+        // The request's line is written once its response body has been sent.
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("test body should read");
         let captured = logs.contents();
         assert!(captured.contains(request_id));
-        assert!(captured.contains("method=POST"));
-        assert!(captured.contains("path=/v1/chat/completions"));
-        assert!(captured.contains("status=200"));
+        assert!(captured.contains("method=\"POST\""), "{captured}");
+        assert!(
+            captured.contains("route=/v1/chat/completions"),
+            "{captured}"
+        );
+        assert!(captured.contains("status=200"), "{captured}");
         for forbidden in [
             "PROXY_PROMPT_SENTINEL",
             "sk-proxy-sentinel",
@@ -453,5 +586,55 @@ mod tests {
                 "captured logs must not contain {forbidden}; logs: {captured}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn request_span_uses_route_labels() {
+        let logs = CapturedLogs::default();
+        let writer_logs = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || writer_logs.writer())
+            .finish();
+        let app = Router::new()
+            .route(
+                "/v1/signature/{chat_id}",
+                get(|| async {
+                    tracing::warn!("inside handler");
+                    "ok"
+                }),
+            )
+            .fallback(|| async {
+                tracing::warn!("inside fallback");
+                axum::http::StatusCode::NOT_FOUND
+            })
+            .layer(from_fn(request_id_middleware));
+
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        for uri in ["/v1/signature/example-1", "/example-2"] {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("test request should build"),
+                )
+                .await
+                .expect("test request should complete");
+        }
+
+        let captured = logs.contents();
+        assert!(
+            captured.contains("path=/v1/signature/{chat_id}"),
+            "{captured}"
+        );
+        assert!(
+            captured.contains(&format!("path={UNMATCHED_ROUTE}")),
+            "{captured}"
+        );
+        assert!(captured.contains("inside handler"), "{captured}");
+        assert!(captured.contains("inside fallback"), "{captured}");
+        assert!(!captured.contains("example-"), "{captured}");
     }
 }

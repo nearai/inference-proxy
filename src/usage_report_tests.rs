@@ -201,6 +201,7 @@ impl Billing {
             request_source: RequestSource {
                 auth_path: AuthPath::CloudApiKey,
                 ingress_route: IngressRouteKind::Canonical,
+                caller: crate::auth::CALLER_API_KEY,
             },
             delivery: delivery.clone(),
         };
@@ -1452,6 +1453,7 @@ fn http_job(billing: &Billing) -> Job {
         request_source: RequestSource {
             auth_path: AuthPath::CloudApiKey,
             ingress_route: IngressRouteKind::Canonical,
+            caller: crate::auth::CALLER_API_KEY,
         },
         delivery: Arc::new(UsageReportDelivery::default()),
     };

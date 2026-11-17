@@ -60,7 +60,7 @@ pub fn build_app(state: AppState) -> Router {
             state.config.rate_limit_per_second,
             state.config.rate_limit_burst_size,
         ),
-        trust_proxy_headers: state.config.rate_limit_trust_proxy_headers,
+        trusted_proxies: state.config.rate_limit_trusted_proxies.clone().into(),
     };
     let mut router = build_router_for(&state);
     if state.ohttp_gateway.is_some() {

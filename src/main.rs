@@ -458,7 +458,7 @@ async fn serve(state: AppState, listen_addr: &str, listen_port: u16) -> anyhow::
     info!(
         per_second = state.config.rate_limit_per_second,
         burst = state.config.rate_limit_burst_size,
-        trust_proxy_headers = state.config.rate_limit_trust_proxy_headers,
+        trusted_proxy_ranges = state.config.rate_limit_trusted_proxies.len(),
         "Rate limiter configured"
     );
 
@@ -476,9 +476,12 @@ async fn serve(state: AppState, listen_addr: &str, listen_port: u16) -> anyhow::
     let listener = TcpListener::bind(addr).await?;
     info!("Listening on {addr}");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     // The server has stopped: every open request has ended, however long
     // that took. Only now do the usage reports still pending get their time

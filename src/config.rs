@@ -10,6 +10,30 @@ fn env_or(name: &str, default: &str) -> String {
     env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
+fn rate_limit_trusted_proxies() -> anyhow::Result<Vec<ipnet::IpNet>> {
+    if env_bool("RATE_LIMIT_NO_TRUST_PROXY") {
+        return Ok(Vec::new());
+    }
+    let value = env_or("RATE_LIMIT_TRUSTED_PROXIES", "");
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split(',')
+        .map(|entry| {
+            let entry = entry.trim();
+            entry
+                .parse::<ipnet::IpNet>()
+                .or_else(|_| entry.parse::<std::net::IpAddr>().map(ipnet::IpNet::from))
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "RATE_LIMIT_TRUSTED_PROXIES requires comma-separated IP addresses or CIDRs"
+                    )
+                })
+        })
+        .collect()
+}
+
 fn env_int(name: &str, default: usize) -> usize {
     env::var(name)
         .ok()
@@ -693,10 +717,8 @@ pub struct Config {
     // Rate limiting
     pub rate_limit_per_second: u64,
     pub rate_limit_burst_size: u32,
-    /// Trust X-Forwarded-For / X-Real-IP headers for rate-limit IP extraction.
-    /// Set to false when the proxy is directly internet-facing (no trusted
-    /// reverse proxy) to prevent IP spoofing that bypasses rate limits.
-    pub rate_limit_trust_proxy_headers: bool,
+    /// Peers allowed to supply forwarding headers for the per-IP limiter.
+    pub rate_limit_trusted_proxies: Vec<ipnet::IpNet>,
 
     // Timeouts
     pub timeout_secs: u64,
@@ -1554,7 +1576,7 @@ impl Config {
             git_rev,
             rate_limit_per_second: env_int("RATE_LIMIT_PER_SECOND", 100) as u64,
             rate_limit_burst_size: env_int("RATE_LIMIT_BURST_SIZE", 200) as u32,
-            rate_limit_trust_proxy_headers: !env_bool("RATE_LIMIT_NO_TRUST_PROXY"),
+            rate_limit_trusted_proxies: rate_limit_trusted_proxies()?,
             timeout_secs: env_int("VLLM_PROXY_TIMEOUT_SECS", 3600) as u64,
             stream_idle_timeout_secs: env_int("VLLM_PROXY_STREAM_IDLE_TIMEOUT_SECS", 0) as u64,
             timeout_tokenize_secs: 10,
@@ -2006,6 +2028,23 @@ mod tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn rate_limit_proxy_configuration() {
+        let load = |peers, disabled| {
+            with_env_vars(
+                &[
+                    ("RATE_LIMIT_TRUSTED_PROXIES", peers),
+                    ("RATE_LIMIT_NO_TRUST_PROXY", disabled),
+                ],
+                rate_limit_trusted_proxies,
+            )
+        };
+        assert!(load("", "0").unwrap().is_empty());
+        assert_eq!(load("192.0.2.2, 2001:db8::/64", "0").unwrap().len(), 2);
+        assert!(load("192.0.2.2", "1").unwrap().is_empty());
+        assert!(load("invalid", "0").is_err());
     }
 
     #[test]

@@ -4199,6 +4199,7 @@ dependencies = [
  "hkdf 0.13.0",
  "http-body 1.0.1",
  "http-body-util",
+ "ipnet",
  "k256",
  "metrics",
  "metrics-exporter-prometheus",

@@ -77,7 +77,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
         git_rev: "test-rev".to_string(),
         rate_limit_per_second: 1000,
         rate_limit_burst_size: 2000,
-        rate_limit_trust_proxy_headers: true,
+        rate_limit_trusted_proxies: Vec::new(),
         cloud_api_url: cloud_api_url.map(String::from),
         cloud_api_auth_max_attempts: 1,
         cloud_api_auth_initial_backoff_ms: 0,
@@ -211,7 +211,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
     let rate_limiter = rate_limit::build_rate_limiter(1000, 2000);
     let rate_limit_state = rate_limit::RateLimitState {
         limiter: rate_limiter,
-        trust_proxy_headers: true,
+        trusted_proxies: Default::default(),
     };
 
     routes::build_router()

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::Cursor;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -6,8 +7,9 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{header, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
+use futures_util::StreamExt;
 use futures_util::{AsyncReadExt, AsyncWriteExt};
-use http_body_util::BodyExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 use tracing::{info, warn};
@@ -67,6 +69,70 @@ impl OhttpRelayLimit {
     pub fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
         self.permits.clone().try_acquire_owned().ok()
     }
+}
+
+/// Shared payload-byte budget for buffered requests and standard responses.
+#[derive(Clone)]
+pub(super) struct BufferBudget(Arc<Semaphore>);
+
+impl BufferBudget {
+    pub(super) fn new(bytes: usize) -> Self {
+        Self(Arc::new(Semaphore::new(bytes.min(Semaphore::MAX_PERMITS))))
+    }
+}
+
+struct BufferedPayload {
+    bytes: Vec<u8>,
+    reservation: Option<OwnedSemaphorePermit>,
+}
+
+impl AsRef<[u8]> for BufferedPayload {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl BufferedPayload {
+    fn reserve(&mut self, budget: Option<&BufferBudget>, bytes: usize) -> Result<(), AppError> {
+        if let Some(budget) = budget {
+            let extra = u32::try_from(bytes)
+                .ok()
+                .and_then(|n| budget.0.clone().try_acquire_many_owned(n).ok())
+                .ok_or(AppError::Overloaded {
+                    reason: "ohttp_buffer",
+                    retry_after_secs: OHTTP_RELAY_RETRY_AFTER_SECS,
+                })?;
+            if let Some(held) = &mut self.reservation {
+                held.merge(extra);
+            } else {
+                self.reservation = Some(extra);
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn read_payload(
+    body: Body,
+    limit: usize,
+    budget: Option<&BufferBudget>,
+    too_large: impl Fn() -> AppError,
+    read_error: impl Fn() -> AppError,
+) -> Result<BufferedPayload, AppError> {
+    let mut payload = BufferedPayload {
+        bytes: Vec::new(),
+        reservation: None,
+    };
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| read_error())?;
+        if chunk.len() > limit - payload.bytes.len() {
+            return Err(too_large());
+        }
+        payload.reserve(budget, chunk.len())?;
+        payload.bytes.extend_from_slice(&chunk);
+    }
+    Ok(payload)
 }
 
 /// Largest outer `POST /ohttp` body read: the largest inner body any relayed
@@ -185,21 +251,20 @@ pub async fn ohttp_relay(
     };
 
     let max_body = max_outer_body_bytes(&state.config);
-    let limited_body = http_body_util::Limited::new(request.into_body(), max_body);
-    let enc_request = match limited_body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) if e.is::<http_body_util::LengthLimitError>() => {
+    let budget = request.extensions().get::<BufferBudget>().cloned();
+    let enc_request = read_payload(
+        request.into_body(),
+        max_body,
+        budget.as_ref(),
+        || {
             metrics::counter!("ohttp_errors_total", "reason" => "body_too_large").increment(1);
-            return Err(AppError::PayloadTooLarge { max_size: max_body });
-        }
-        Err(_) => {
-            return Err(AppError::BadRequest(
-                "Failed to read request body".to_string(),
-            ));
-        }
-    };
+            AppError::PayloadTooLarge { max_size: max_body }
+        },
+        || AppError::BadRequest("Failed to read request body".to_string()),
+    )
+    .await?;
 
-    if enc_request.is_empty() {
+    if enc_request.bytes.is_empty() {
         return Err(AppError::BadRequest("Empty OHTTP request".to_string()));
     }
 
@@ -207,7 +272,7 @@ pub async fn ohttp_relay(
         ohttp_relay_chunked(
             &state,
             gateway,
-            &enc_request,
+            &enc_request.bytes,
             outer_authorization,
             outer_request_id,
             relay_permit,
@@ -219,9 +284,10 @@ pub async fn ohttp_relay(
         let response = ohttp_relay_standard(
             &state,
             gateway,
-            &enc_request,
+            &enc_request.bytes,
             outer_authorization,
             outer_request_id,
+            budget.as_ref(),
         )
         .await;
         drop(relay_permit);
@@ -236,6 +302,7 @@ async fn ohttp_relay_standard(
     enc_request: &[u8],
     outer_authorization: Option<HeaderValue>,
     outer_request_id: Option<String>,
+    budget: Option<&BufferBudget>,
 ) -> Result<Response, AppError> {
     let start = Instant::now();
     metrics::counter!("ohttp_requests_total", "type" => "standard").increment(1);
@@ -251,7 +318,8 @@ async fn ohttp_relay_standard(
         .record(decap_duration.as_secs_f64());
 
     let (request_builder, _path_str) = parse_bhttp_and_build_loopback(
-        state,
+        state.config.listen_port,
+        state.config.timeout_secs,
         &bhttp_request,
         outer_authorization.as_ref(),
         outer_request_id.as_deref(),
@@ -267,14 +335,21 @@ async fn ohttp_relay_standard(
     let mut bhttp_response = bhttp::Message::response(bhttp_status);
     copy_response_headers(&loopback_response, &mut bhttp_response);
 
-    let response_body = loopback_response.bytes().await.map_err(|_| {
-        warn!(
-            error_kind = "loopback_body",
-            "Failed to read loopback response body"
-        );
-        AppError::Internal(anyhow::anyhow!("loopback response body failed"))
-    })?;
-    bhttp_response.write_content(&response_body);
+    let mut payload = read_payload(
+        Body::from_stream(loopback_response.bytes_stream()),
+        state.config.ohttp_max_response_size,
+        budget,
+        || AppError::UpstreamParsed {
+            status: StatusCode::BAD_GATEWAY,
+            message: "Response exceeds the standard OHTTP size limit".into(),
+            error_type: "upstream_error".into(),
+        },
+        || AppError::Internal(anyhow::anyhow!("loopback response body failed")),
+    )
+    .await?;
+    bhttp_response.write_content(&payload.bytes);
+    let body_len = payload.bytes.len();
+    drop(std::mem::take(&mut payload.bytes));
 
     // Encode and encapsulate.
     let mut bhttp_bytes = Vec::new();
@@ -282,11 +357,14 @@ async fn ohttp_relay_standard(
         .write_bhttp(bhttp::Mode::KnownLength, &mut bhttp_bytes)
         .map_err(|_| AppError::Internal(anyhow::anyhow!("Binary HTTP encoding failed")))?;
 
+    drop(bhttp_response);
     let enc_response = server_response.encapsulate(&bhttp_bytes).map_err(|_| {
         metrics::counter!("ohttp_errors_total", "reason" => "encapsulation_failed").increment(1);
         AppError::Internal(anyhow::anyhow!("OHTTP encapsulation failed"))
     })?;
 
+    payload.reserve(budget, enc_response.len().saturating_sub(body_len))?;
+    payload.bytes = enc_response;
     info!(
         decap_ms = decap_duration.as_millis(),
         total_ms = start.elapsed().as_millis(),
@@ -300,7 +378,7 @@ async fn ohttp_relay_standard(
             HeaderName::from_static("content-type"),
             HeaderValue::from_static("message/ohttp-res"),
         )],
-        enc_response,
+        Bytes::from_owner(payload),
     )
         .into_response())
 }
@@ -354,7 +432,8 @@ async fn ohttp_relay_chunked(
         .record(decap_duration.as_secs_f64());
 
     let (request_builder, _path_str) = parse_bhttp_and_build_loopback(
-        state,
+        state.config.listen_port,
+        state.config.timeout_secs,
         &bhttp_request,
         outer_authorization.as_ref(),
         outer_request_id.as_deref(),
@@ -583,7 +662,8 @@ fn collect_response_headers(response: &reqwest::Response) -> Vec<(Vec<u8>, Vec<u
 /// `X-Org-Id`, `X-Workspace-Id` and `X-Request-Id` are always dropped; the
 /// loopback carries the outer request id. See [`skip_inner_header`].
 fn parse_bhttp_and_build_loopback(
-    state: &AppState,
+    listen_port: u16,
+    timeout_secs: u64,
     bhttp_request: &[u8],
     outer_authorization: Option<&HeaderValue>,
     outer_request_id: Option<&str>,
@@ -616,11 +696,11 @@ fn parse_bhttp_and_build_loopback(
         AppError::BadRequest("Unsupported HTTP method".to_string())
     })?;
 
-    let loopback_url = validated_loopback_url(state.config.listen_port, &method, path_str)
+    let loopback_url = validated_loopback_url(listen_port, &method, path_str)
         .inspect_err(|_| log_rejected_inner_request("not_allowed", method.as_str(), path_bytes))?;
     let mut request_builder = OHTTP_LOOPBACK_CLIENT
         .request(method, loopback_url)
-        .timeout(Duration::from_secs(state.config.timeout_secs));
+        .timeout(Duration::from_secs(timeout_secs));
 
     let relay_outer_bearer = outer_authorization.filter(|value| {
         value
@@ -628,6 +708,14 @@ fn parse_bhttp_and_build_loopback(
             .is_ok_and(|header| header.starts_with("Bearer "))
     });
 
+    let connection_options: HashSet<HeaderName> = inner_msg
+        .header()
+        .fields()
+        .iter()
+        .filter(|f| f.name().eq_ignore_ascii_case(b"connection"))
+        .flat_map(|f| f.value().split(|b| *b == b','))
+        .filter_map(|token| HeaderName::from_bytes(token.trim_ascii()).ok())
+        .collect();
     for field in inner_msg.header().fields() {
         let name_bytes = field.name();
         let value_bytes = field.value();
@@ -641,7 +729,9 @@ fn parse_bhttp_and_build_loopback(
             HeaderValue::from_bytes(value_bytes),
         ) {
             (Ok(name), Ok(value)) => {
-                request_builder = request_builder.header(name, value);
+                if !connection_options.contains(&name) {
+                    request_builder = request_builder.header(name, value);
+                }
             }
             _ => {
                 warn!(
@@ -676,7 +766,19 @@ fn parse_bhttp_and_build_loopback(
 fn skip_inner_header(name: &[u8], relay_outer_bearer: bool) -> bool {
     name.eq_ignore_ascii_case(b"host")
         || name.eq_ignore_ascii_case(b"transfer-encoding")
-        || name.eq_ignore_ascii_case(b"connection")
+        || [
+            b"connection".as_slice(),
+            b"content-length",
+            b"te",
+            b"trailer",
+            b"upgrade",
+            b"keep-alive",
+            b"proxy-connection",
+            b"proxy-authenticate",
+            b"proxy-authorization",
+        ]
+        .iter()
+        .any(|field| name.eq_ignore_ascii_case(field))
         || is_inner_correlation_header(name)
         || (relay_outer_bearer && is_trusted_caller_header(name))
 }
@@ -896,6 +998,71 @@ mod tests {
             assert!(!skip_inner_header(name.as_bytes(), true), "{name}");
             assert!(!skip_inner_header(name.as_bytes(), false), "{name}");
         }
+    }
+
+    #[test]
+    fn loopback_derives_framing_and_removes_connection_options() {
+        let mut msg = bhttp::Message::request(
+            b"POST".to_vec(),
+            b"https".to_vec(),
+            b"localhost".to_vec(),
+            crate::routes::ROUTE_COMPLETIONS.as_bytes().to_vec(),
+        );
+        for (name, value) in [
+            ("content-length", "2"),
+            ("connection", " X-One, keep-alive"),
+            ("connection", "x-two"),
+            ("x-one", "a"),
+            ("X-Two", "b"),
+            ("te", "trailers"),
+            ("content-type", "application/json"),
+        ] {
+            msg.put_header(name, value);
+        }
+        msg.write_content(b"{}");
+        let mut encoded = Vec::new();
+        msg.write_bhttp(bhttp::Mode::KnownLength, &mut encoded)
+            .unwrap();
+        let (builder, _) = parse_bhttp_and_build_loopback(8000, 1, &encoded, None, None).unwrap();
+        let req = builder.build().unwrap();
+        assert_eq!(req.headers().len(), 1);
+        assert_eq!(req.headers()["content-type"], "application/json");
+        assert_eq!(req.body().unwrap().as_bytes().unwrap(), b"{}");
+    }
+
+    #[tokio::test]
+    async fn buffered_bodies_share_capacity_and_release_it_on_error_or_drop() {
+        let budget = BufferBudget::new(6);
+        let read = |chunks: Vec<&'static [u8]>, cap| {
+            let stream = futures_util::stream::iter(
+                chunks
+                    .into_iter()
+                    .map(|chunk| Ok::<_, std::io::Error>(Bytes::from_static(chunk))),
+            );
+            read_payload(
+                Body::from_stream(stream),
+                cap,
+                Some(&budget),
+                move || AppError::PayloadTooLarge { max_size: cap },
+                || unreachable!(),
+            )
+        };
+        let held = Bytes::from_owner(read(vec![b"abc"], 3).await.unwrap());
+        assert!(matches!(
+            read(vec![b"ab", b"cd"], 4).await,
+            Err(AppError::Overloaded { .. })
+        ));
+        assert_eq!(budget.0.available_permits(), 3);
+        drop(held);
+        assert!(matches!(
+            read(vec![b"ab", b"cd"], 3).await,
+            Err(AppError::PayloadTooLarge { .. })
+        ));
+        assert_eq!(budget.0.available_permits(), 6);
+        assert_eq!(
+            read(vec![b"abc", b"def"], 6).await.unwrap().as_ref(),
+            b"abcdef"
+        );
     }
 
     #[test]

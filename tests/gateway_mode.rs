@@ -155,6 +155,8 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         rerank_limits: Default::default(),
         ohttp_enabled: false,
         ohttp_max_inflight: 0,
+        ohttp_buffer_budget: 256 * 1024 * 1024,
+        ohttp_max_response_size: 32 * 1024 * 1024,
         listen_port: 8000,
         listen_addr: "127.0.0.1".to_string(),
         backend_token: options.backend_token.clone(),

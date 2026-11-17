@@ -54,20 +54,29 @@ pub async fn tokenize(
 ) -> Result<Response, AppError> {
     let request_body = read_body_with_limit(body, state.config.max_request_size).await?;
     let tracing_ids = tracing_ids.with_authenticated_context(&headers, &auth);
-    // Parsed only to be checked: the original bytes are what is forwarded.
-    let request_json = proxy::parse_json_object(&request_body)?;
+    let mut request_json = proxy::parse_json_object(&request_body)?;
     crate::model_list::guard_passthrough_body(&state, &request_json)?;
     guard_direct_model(&state, &request_json, auth.cloud_api_key.is_some())?;
-    if let Some(model) = request_json.get("model").and_then(|m| m.as_str()) {
-        state.config.request_guard.check_model_name(model)?;
-    }
+    // The same rules as the chat and completions routes (`request_guard.rs`):
+    // the engine builds a chat or completion request from this body. A
+    // stripped field means the body is re-serialized; otherwise the original
+    // bytes go through.
+    let stripped = state
+        .config
+        .request_guard
+        .apply_completion_body(&mut request_json)?;
+    let forward_body = if stripped {
+        serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?
+    } else {
+        request_body
+    };
 
     let (url, _guard) = state.backend_pool.select_url("/tokenize");
     proxy::proxy_simple(
         &state.backend_client,
         &url,
         reqwest::Method::POST,
-        Some(&request_body),
+        Some(&forward_body),
         "application/json",
         Some(std::time::Duration::from_secs(
             state.config.timeout_tokenize_secs,

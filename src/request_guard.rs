@@ -55,6 +55,19 @@ const FINITE_FLOAT_FIELDS: &[&str] = &[
     "repetition_penalty",
 ];
 
+/// Fields that are a list of token ids, or a list of such lists.
+const COMPLETION_TOKEN_ID_LISTS: &[&str] = &["allowed_token_ids", "input_ids"];
+const PASSTHROUGH_TOKEN_ID_LISTS: &[&str] = &["label_token_ids", "query"];
+
+/// Fields that are one token id.
+const PASSTHROUGH_TOKEN_IDS: &[&str] = &["embed_override_token_id"];
+
+/// Fields that take text, a list of texts, a list of token ids or a list of
+/// token id lists.
+const COMPLETION_TEXT_OR_TOKEN_IDS: &[&str] = &["prompt"];
+const PASSTHROUGH_TEXT_OR_TOKEN_IDS: &[&str] =
+    &["input", "items", "text_1", "text_2", "queries", "documents"];
+
 /// Upper bound for token ids when the vocabulary size is not configured.
 const DEFAULT_TOKEN_ID_BOUND: u64 = 1 << 31;
 
@@ -78,7 +91,8 @@ pub struct RequestGuardConfig {
     pub max_stop_chars: usize,
     /// Entries in `stop_token_ids` (`VLLM_PROXY_MAX_STOP_TOKEN_IDS`, default 64).
     pub max_stop_token_ids: usize,
-    /// Token ids in `logit_bias` and `stop_token_ids` must be below this
+    /// Token ids in `logit_bias`, `stop_token_ids` and inputs sent as token
+    /// ids must be below this
     /// (`VLLM_PROXY_VOCAB_SIZE`; 0 = unset, ids only need to be in `[0, 2^31)`).
     pub vocab_size: u64,
     /// Characters in `model` (`VLLM_PROXY_MAX_MODEL_NAME_CHARS`, default 256).
@@ -199,8 +213,9 @@ impl RequestGuardConfig {
         }
     }
 
-    /// Chat and text completions: every rule. Returns whether the body was
-    /// changed (a field stripped). Runs on the body as it will be forwarded.
+    /// Chat, text completions and tokenize: every rule. Returns whether the
+    /// body was changed (a field stripped). Runs on the body as it will be
+    /// forwarded.
     pub fn apply_completion_body(&self, body: &mut Value) -> Result<bool, AppError> {
         if !self.enabled {
             return Ok(false);
@@ -210,6 +225,12 @@ impl RequestGuardConfig {
         };
         self.check_model(obj)?;
         self.check_sampling(obj)?;
+        self.check_token_inputs(
+            obj,
+            &[],
+            COMPLETION_TOKEN_ID_LISTS,
+            COMPLETION_TEXT_OR_TOKEN_IDS,
+        )?;
         self.check_messages(obj)?;
         self.check_structured(obj)?;
         Ok(self.strip(body))
@@ -284,8 +305,9 @@ impl RequestGuardConfig {
         })
     }
 
-    /// Embeddings, rerank, score and image generation: the `model` cap and
-    /// the stripped fields (the sampling rules do not apply to these bodies).
+    /// Embeddings, rerank, score and image generation: the `model` cap, token
+    /// id inputs and the stripped fields (the sampling rules do not apply to
+    /// these bodies).
     pub fn apply_passthrough_body(&self, body: &mut Value) -> Result<bool, AppError> {
         if !self.enabled {
             return Ok(false);
@@ -294,7 +316,80 @@ impl RequestGuardConfig {
             return Ok(false);
         };
         self.check_model(obj)?;
+        self.check_token_inputs(
+            obj,
+            PASSTHROUGH_TOKEN_IDS,
+            PASSTHROUGH_TOKEN_ID_LISTS,
+            PASSTHROUGH_TEXT_OR_TOKEN_IDS,
+        )?;
         Ok(self.strip(body))
+    }
+
+    /// Inputs sent as token ids. In a list of ids every number, and every
+    /// string (the engines coerce numeric strings), must be a token id
+    /// (`valid_token_id`). `ids` are one id; `id_lists` are lists of ids or of
+    /// id lists; `text_or_ids` hold a list of ids unless every scalar entry
+    /// is a string, and lists of ids as entries. Text, lists of texts and
+    /// objects pass.
+    fn check_token_inputs(
+        &self,
+        body: &Map<String, Value>,
+        ids: &[&str],
+        id_lists: &[&str],
+        text_or_ids: &[&str],
+    ) -> Result<(), AppError> {
+        let is_id = |v: &Value| numeric(v).is_some_and(|x| self.valid_token_id(x));
+        let scalars_ok = |list: &[Value]| {
+            list.iter()
+                .all(|v| matches!(v, Value::Object(_) | Value::Array(_)) || is_id(v))
+        };
+        let bad = |field: &str| {
+            refuse(
+                "token_ids",
+                field,
+                format!(
+                    "Token ids in `{field}` must be non-negative integers within the model vocabulary."
+                ),
+            )
+        };
+        for field in ids {
+            if let Some(v @ (Value::Number(_) | Value::String(_))) = body.get(*field) {
+                if !is_id(v) {
+                    return Err(bad(field));
+                }
+            }
+        }
+        for field in id_lists {
+            let Some(Value::Array(list)) = body.get(*field) else {
+                continue;
+            };
+            let ok = list.iter().all(|item| match item {
+                Value::Array(inner) => scalars_ok(inner),
+                Value::Object(_) => true,
+                _ => is_id(item),
+            });
+            if !ok {
+                return Err(bad(field));
+            }
+        }
+        for field in text_or_ids {
+            let Some(Value::Array(list)) = body.get(*field) else {
+                continue;
+            };
+            // A flat list is text only when every scalar in it is a string.
+            let flat_ids = list
+                .iter()
+                .any(|v| matches!(v, Value::Number(_) | Value::Bool(_) | Value::Null));
+            let ok = list.iter().all(|item| match item {
+                Value::Array(inner) => scalars_ok(inner),
+                Value::Object(_) => true,
+                _ => !flat_ids || is_id(item),
+            });
+            if !ok {
+                return Err(bad(field));
+            }
+        }
+        Ok(())
     }
 
     /// Bounds on the image request fields of a JSON body (images/generations).
@@ -737,6 +832,117 @@ mod tests {
         );
         let ok: Map<String, Value> = (0..300).map(|i| (i.to_string(), json!(-100))).collect();
         passes(json!({ "logit_bias": ok }));
+    }
+
+    #[test]
+    fn token_id_inputs_are_bounded() {
+        let cfg = RequestGuardConfig {
+            vocab_size: 1000,
+            ..guard()
+        };
+        // Text completions and tokenize: `prompt` as ids or batches of ids.
+        for body in [
+            json!({"prompt": [1, 2, 1000]}),
+            json!({"prompt": [[1, 2], [3, 1000]]}),
+            json!({"prompt": [-1]}),
+            json!({"prompt": [1.5]}),
+            json!({"prompt": [1e30]}),
+            json!({"prompt": "x", "allowed_token_ids": [5, 1000]}),
+            // Numeric strings count as ids wherever the list holds ids.
+            json!({"prompt": [1, "1000"]}),
+            json!({"prompt": [1, "-1"]}),
+            json!({"prompt": [[1, "-1"]]}),
+            json!({"prompt": [["1000"]]}),
+            json!({"prompt": [1, "1_000"]}),
+            json!({"prompt": ["1000", true]}),
+            json!({"prompt": ["-1", null]}),
+            json!({"prompt": [true]}),
+            json!({"messages": [], "input_ids": [1, 1000]}),
+            json!({"messages": [], "input_ids": ["-1"]}),
+            json!({"prompt": "x", "allowed_token_ids": ["-1"]}),
+            json!({"prompt": "x", "allowed_token_ids": [true]}),
+        ] {
+            let mut b = body.clone();
+            match cfg.apply_completion_body(&mut b) {
+                Err(AppError::InvalidParam { .. }) => {}
+                other => panic!("{body}: {other:?}"),
+            }
+        }
+        for body in [
+            json!({"prompt": [0, 1, 999]}),
+            json!({"prompt": [[1, 2], [3, 999]]}),
+            json!({"prompt": "1000 1001"}),
+            json!({"prompt": ["text", "1000"]}),
+            json!({"prompt": []}),
+            json!({"prompt": "x", "allowed_token_ids": [5, 999]}),
+            json!({"prompt": [1, "999"]}),
+            json!({"prompt": ["-1", "text"]}),
+            json!({"prompt": "x", "allowed_token_ids": ["999"]}),
+            json!({"messages": [], "input_ids": [1, 999]}),
+            json!({"messages": [{"role": "user", "content": "hi"}]}),
+        ] {
+            let mut b = body.clone();
+            assert!(cfg.apply_completion_body(&mut b).is_ok(), "{body}");
+        }
+
+        // Embeddings, rerank and score.
+        for body in [
+            json!({"input": [1, 1000]}),
+            json!({"input": [[1], [1000]]}),
+            json!({"input": ["1000", false]}),
+            json!({"query": [1000], "items": ["a"]}),
+            json!({"query": "q", "items": [[1, 2], [1000]]}),
+            json!({"query": "q", "items": ["a"], "label_token_ids": [1, -5]}),
+            json!({"query": "q", "items": ["a"], "label_token_ids": ["-5"]}),
+            json!({"query": ["-1"], "items": ["a"]}),
+            json!({"query": "q", "items": ["a"], "label_token_ids": [[1], [-7]]}),
+            json!({"query": "q", "items": ["a"], "label_token_ids": [["1000"]]}),
+            json!({"input": "a", "embed_override_token_id": -1}),
+            json!({"input": "a", "embed_override_token_id": "1000"}),
+            json!({"query": "q", "items": [["1", "-1"]]}),
+            json!({"text_1": [1, 1000], "text_2": "b"}),
+            json!({"text_1": "a", "text_2": [[1000]]}),
+            json!({"queries": [[-1]], "documents": ["a"]}),
+            json!({"query": "q", "documents": [1, "1000"]}),
+        ] {
+            let mut b = body.clone();
+            assert!(cfg.apply_passthrough_body(&mut b).is_err(), "{body}");
+        }
+        for body in [
+            json!({"input": "text"}),
+            json!({"input": ["a", "b"]}),
+            json!({"input": [1, 999]}),
+            json!({"input": [[1], [999]]}),
+            json!({"input": [{"text": "a"}, {"image": "https://example.com/a.png"}]}),
+            json!({"query": "q", "documents": ["a", "b"]}),
+            json!({"query": [1, 2], "items": [[3], [4]], "label_token_ids": [5, 6]}),
+            json!({"query": {"content": [{"type": "text", "text": "q"}]}, "documents": ["a"]}),
+            json!({"text_1": "a", "text_2": ["b", "-1"]}),
+            json!({"query": "q", "documents": ["1000", "2000"]}),
+            json!({"input": [[{"type": "text", "text": "a"}]]}),
+            json!({"query": "q", "items": ["a"], "label_token_ids": [[1, 2], [3]]}),
+            json!({"input": "a", "embed_override_token_id": 999}),
+            json!({"query": [{"type": "text", "text": "q"}],
+                "documents": [[{"type": "text", "text": "d"}], "plain"]}),
+        ] {
+            let mut b = body.clone();
+            assert!(cfg.apply_passthrough_body(&mut b).is_ok(), "{body}");
+        }
+
+        // Without a configured vocabulary size ids only need to fit 31 bits.
+        passes(json!({"prompt": [1000, 2147483647]}));
+        assert_eq!(rejected_param(json!({"prompt": [2147483648u64]})), "prompt");
+        assert_eq!(
+            rejected_param(json!({"prompt": [9223372036854775808u64]})),
+            "prompt"
+        );
+        let mut body = json!({"prompt": [-1]});
+        assert!(RequestGuardConfig {
+            enabled: false,
+            ..guard()
+        }
+        .apply_completion_body(&mut body)
+        .is_ok());
     }
 
     #[test]

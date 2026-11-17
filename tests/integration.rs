@@ -12241,6 +12241,120 @@ async fn request_guard_strips_engine_internal_fields() {
 }
 
 #[tokio::test]
+async fn tokenize_applies_the_completion_field_rules() {
+    let backend = start_any_post_backend().await;
+    let app = build_test_app(&backend.uri());
+
+    // Refused before dispatch, like on chat completions.
+    for (body, param) in [
+        (
+            serde_json::json!({"model": "test-model", "prompt": "x", "ebnf": "root ::= \"a\""}),
+            "ebnf",
+        ),
+        (
+            serde_json::json!({"model": "test-model", "prompt": "x",
+                "sampling_params": {"grammar": "root ::= \"a\""}}),
+            "grammar",
+        ),
+        (
+            serde_json::json!({"model": "test-model", "prompt": [1, -1]}),
+            "prompt",
+        ),
+    ] {
+        let (status, response) = post_guarded(&app, "/v1/tokenize", &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{param}");
+        assert_eq!(response["error"]["param"], param);
+    }
+    assert_eq!(requests_seen(&backend).await, 0);
+
+    // Engine-internal fields are removed from the forwarded body.
+    let body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "custom_logit_processor": "x",
+        "session_params": {"id": "s"},
+    });
+    let (status, _) = post_guarded(&app, "/v1/tokenize", &body).await;
+    assert_eq!(status, StatusCode::OK);
+    // A body with nothing to remove is forwarded byte for byte.
+    let plain = r#"{ "model": "test-model",  "prompt": "hello" }"#;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tokenize")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(plain))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let requests = backend.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let forwarded: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert!(forwarded.get("custom_logit_processor").is_none());
+    assert!(forwarded.get("session_params").is_none());
+    assert_eq!(forwarded["messages"][0]["content"], "hi");
+    assert_eq!(requests[1].body, plain.as_bytes());
+}
+
+#[tokio::test]
+async fn token_id_inputs_are_checked_on_every_route() {
+    let backend = start_any_post_backend().await;
+    let app = build_test_app(&backend.uri());
+    for (route, body, param) in [
+        (
+            "/v1/completions",
+            serde_json::json!({"model": "test-model", "prompt": [1, 2, 4294967296u64]}),
+            "prompt",
+        ),
+        (
+            "/v1/completions",
+            serde_json::json!({"model": "test-model", "prompt": [[1], [-2]]}),
+            "prompt",
+        ),
+        (
+            "/v1/embeddings",
+            serde_json::json!({"model": "test-model", "input": [1, -2]}),
+            "input",
+        ),
+        (
+            "/v1/embeddings",
+            serde_json::json!({"model": "test-model", "input": [[1, "-2"]]}),
+            "input",
+        ),
+        (
+            "/v1/rerank",
+            serde_json::json!({"model": "test-model", "query": ["-1"], "documents": ["a"]}),
+            "query",
+        ),
+        (
+            "/v1/score",
+            serde_json::json!({"model": "test-model", "query": "q", "items": [[4294967296u64]]}),
+            "items",
+        ),
+    ] {
+        let (status, response) = post_guarded(&app, route, &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{route}");
+        assert_eq!(response["error"]["type"], "invalid_request_error");
+        assert_eq!(response["error"]["param"], param, "{route}");
+    }
+    assert_eq!(requests_seen(&backend).await, 0);
+
+    let (status, _) = post_guarded(
+        &app,
+        "/v1/embeddings",
+        &serde_json::json!({"model": "test-model", "input": [1, 2, 3]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn image_routes_refuse_engine_only_fields() {
     let backend = start_any_post_backend().await;
     let app = build_test_app(&backend.uri());

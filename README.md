@@ -156,7 +156,7 @@ All configuration is via environment variables:
 | `VLLM_PROXY_MAX_LOGIT_BIAS_ENTRIES` / `VLLM_PROXY_MAX_LOGIT_BIAS_VALUE` | No | `300` / `100` | Max `logit_bias` entries and `\|value\|`; keys must be token ids, values finite |
 | `VLLM_PROXY_MAX_STOP_SEQUENCES` / `VLLM_PROXY_MAX_STOP_SEQUENCE_CHARS` | No | `16` / `1024` | Max `stop` entries and characters per entry |
 | `VLLM_PROXY_MAX_STOP_TOKEN_IDS` | No | `64` | Max `stop_token_ids` entries; each must be a non-negative token id |
-| `VLLM_PROXY_VOCAB_SIZE` | No | unset | Token ids in `logit_bias` and `stop_token_ids` must be below this (unset: below 2^31) |
+| `VLLM_PROXY_VOCAB_SIZE` | No | unset | Token ids in `logit_bias`, `stop_token_ids`, `allowed_token_ids` and inputs sent as token ids (`prompt`, embeddings `input`, rerank and score inputs, `label_token_ids`) must be below this (unset: below 2^31) |
 | `VLLM_PROXY_MAX_MODEL_NAME_CHARS` | No | `256` | Max characters in `model` (also the multipart `model` field) |
 | `VLLM_PROXY_MAX_CONTENT_PART_UUID_CHARS` | No | `256` | Max characters in a content part `uuid` |
 | `VLLM_PROXY_MAX_IMAGE_N` | No | `10` | Image routes: max `n` |

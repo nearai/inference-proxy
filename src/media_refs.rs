@@ -17,7 +17,7 @@
 //!
 //! Only these input fields are walked, and inside a message only `content`:
 //! a tool schema or tool-call arguments with a property named `image_url` are
-//! not media.
+//! not media, and neither is another key of an entry of `messages`.
 
 use serde_json::{Map, Value};
 
@@ -136,7 +136,12 @@ pub fn parts(body: &Value) -> Result<Vec<Part<'_>>, TooDeep> {
     };
     for field in INPUT_FIELDS {
         if let Some(v) = obj.get(*field) {
-            walk_input(v, format!("/{}", escape(field)), 0, &mut out)?;
+            let kind = if *field == "messages" {
+                Holder::Message
+            } else {
+                Holder::Item
+            };
+            walk_input(v, format!("/{}", escape(field)), kind, 0, &mut out)?;
         }
     }
     Ok(out)
@@ -177,9 +182,20 @@ pub fn media_refs(body: &Value) -> Result<Vec<MediaRef>, TooDeep> {
 /// embeddings `input`) is five levels.
 const MAX_DEPTH: usize = 16;
 
+/// What an object met on the way down is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Holder {
+    /// An entry of `messages`: only its `content` holds parts. Its own keys
+    /// are message fields, which the engines read by name.
+    Message,
+    /// A content part or an input item: its keys can be media.
+    Item,
+}
+
 fn walk_input<'a>(
     v: &'a Value,
     pointer: String,
+    holder: Holder,
     depth: usize,
     out: &mut Vec<Part<'a>>,
 ) -> Result<(), TooDeep> {
@@ -189,19 +205,28 @@ fn walk_input<'a>(
     match v {
         Value::Array(items) => {
             for (i, item) in items.iter().enumerate() {
-                walk_input(item, format!("{pointer}/{i}"), depth + 1, out)?;
+                walk_input(item, format!("{pointer}/{i}"), holder, depth + 1, out)?;
             }
         }
         Value::Object(obj) => {
             // A content part, an embedding item (`{"text", "image",
-            // "video"}`), a chat message or a `{"content": [...]}` input. The
-            // object itself may carry a media key (the engines ignore keys
-            // they do not know, so a `role` or `content` next to one does
-            // not hide it), and its `content` may hold parts.
+            // "video"}`), a chat message or a `{"content": [...]}` input.
+            // Whatever sits under `content` is a part or a list of parts.
             if let Some(content) = obj.get("content") {
-                walk_input(content, format!("{pointer}/content"), depth + 1, out)?;
+                walk_input(
+                    content,
+                    format!("{pointer}/content"),
+                    Holder::Item,
+                    depth + 1,
+                    out,
+                )?;
             }
-            out.push(Part { pointer, obj });
+            // Outside `messages` the object itself may carry a media key
+            // (the engines ignore keys they do not know, so a `role` or
+            // `content` next to one does not hide it).
+            if holder == Holder::Item {
+                out.push(Part { pointer, obj });
+            }
         }
         _ => {}
     }

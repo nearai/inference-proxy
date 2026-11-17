@@ -187,6 +187,10 @@ pub async fn inline_remote_media(
         let normalized = normalize_image_url_input(url).into_owned();
         match scheme_of(&normalized).as_str() {
             "data" => {
+                // Forwarded as written, so it must be written plainly.
+                if !url.starts_with("data:") {
+                    return Err(reject("bad_data_url", Some(media.kind)));
+                }
                 let n = data_url_decoded_len(&normalized)
                     .ok_or_else(|| reject("bad_data_url", Some(media.kind)))?;
                 let cap = match media.kind {
@@ -294,11 +298,7 @@ pub async fn inline_remote_media(
     if media_refs::media_refs(request_json)
         .map_err(too_deep)?
         .iter()
-        .any(|m| {
-            m.value
-                .url()
-                .is_none_or(|u| scheme_of(&normalize_image_url_input(u)) != "data")
-        })
+        .any(|m| m.value.url().is_none_or(|u| !u.starts_with("data:")))
     {
         return Err(reject("not_inlined", None));
     }
@@ -613,6 +613,27 @@ mod tests {
 
     fn chat(parts: Value) -> Value {
         json!({"model": "m", "messages": [{"role": "user", "content": parts}]})
+    }
+
+    #[tokio::test]
+    async fn a_data_url_must_be_written_plainly() {
+        for written in [
+            "DATA:image/png;base64,AAAA",
+            " data:image/png;base64,AAAA",
+            "\u{1}data:image/png;base64,AAAA",
+            "d\nata:image/png;base64,AAAA",
+        ] {
+            let mut req = chat(json!([{"type": "image_url", "image_url": {"url": written}}]));
+            assert!(
+                inline_remote_media(&mut req, &cfg()).await.is_err(),
+                "{written:?}"
+            );
+            let mut item = json!({"input": [{"text": "a", "video": written}]});
+            assert!(
+                inline_remote_media(&mut item, &cfg()).await.is_err(),
+                "{written:?}"
+            );
+        }
     }
 
     #[tokio::test]

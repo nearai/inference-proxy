@@ -285,9 +285,24 @@ mod tests {
         let start = source.find("pub const POST_ROUTES").unwrap();
         let end = start + source[start..].find("\n];\n").unwrap();
         let outside = format!("{}{}", &source[..start], &source[end..]);
-        assert!(
-            !outside.contains("post("),
-            "register POST routes through POST_ROUTES"
+        for other_way in [
+            "post(",
+            "any(",
+            "routing::on",
+            "MethodFilter",
+            "post_service(",
+            ".merge(",
+            ".nest(",
+        ] {
+            assert!(
+                !outside.contains(other_way),
+                "register POST routes through POST_ROUTES, not `{other_way}`"
+            );
+        }
+        // The only fallback answers 404.
+        assert_eq!(
+            outside.matches(".fallback(").count(),
+            outside.matches(".fallback(unknown_route)").count()
         );
     }
 

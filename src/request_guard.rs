@@ -217,6 +217,10 @@ impl RequestGuardConfig {
         if !self.enabled {
             return Ok(false);
         }
+        if !body.is_object() {
+            return Ok(false);
+        }
+        let cleaned = self.check_media(body)?;
         let Some(obj) = body.as_object() else {
             return Ok(false);
         };
@@ -228,9 +232,8 @@ impl RequestGuardConfig {
             COMPLETION_TOKEN_ID_LISTS,
             COMPLETION_TEXT_OR_TOKEN_IDS,
         )?;
-        self.check_media(body)?;
         self.check_structured(obj)?;
-        Ok(self.strip(body))
+        Ok(self.strip(body) | cleaned)
     }
 
     /// Structured-output constraints anywhere outside the prompt: regexes,
@@ -309,6 +312,10 @@ impl RequestGuardConfig {
         if !self.enabled {
             return Ok(false);
         }
+        if !body.is_object() {
+            return Ok(false);
+        }
+        let cleaned = self.check_media(body)?;
         let Some(obj) = body.as_object() else {
             return Ok(false);
         };
@@ -319,8 +326,7 @@ impl RequestGuardConfig {
             PASSTHROUGH_TOKEN_ID_LISTS,
             PASSTHROUGH_TEXT_OR_TOKEN_IDS,
         )?;
-        self.check_media(body)?;
-        Ok(self.strip(body))
+        Ok(self.strip(body) | cleaned)
     }
 
     /// Inputs sent as token ids. In a list of ids every number, and every
@@ -670,8 +676,11 @@ impl RequestGuardConfig {
     }
 
     /// Content parts and input items on every route (`media_refs.rs`): the
-    /// `uuid` cap and the media URL scheme.
-    fn check_media(&self, body: &Value) -> Result<(), AppError> {
+    /// `uuid` cap and the media URL scheme. A URL written with leading
+    /// whitespace, control characters or an upper-case scheme is rewritten to
+    /// its plain form, so the engine reads the value that was checked.
+    /// Returns whether the body changed.
+    fn check_media(&self, body: &mut Value) -> Result<bool, AppError> {
         let too_deep = |_| {
             refuse(
                 "media_depth",
@@ -687,12 +696,26 @@ impl RequestGuardConfig {
                 }
             }
         }
+        let mut rewrites: Vec<(String, String)> = Vec::new();
         for media in crate::media_refs::media_refs(body).map_err(too_deep)? {
-            if let Some(url) = media.value.url() {
-                self.check_media_url(media.key, url)?;
+            let Some(url) = media.value.url() else {
+                continue;
+            };
+            if let Some(plain) = self.check_media_url(media.key, url)? {
+                let pointer = match media.value {
+                    crate::media_refs::MediaValue::Object(_) => format!("{}/url", media.pointer()),
+                    _ => media.pointer(),
+                };
+                rewrites.push((pointer, plain));
             }
         }
-        Ok(())
+        let changed = !rewrites.is_empty();
+        for (pointer, plain) in rewrites {
+            if let Some(slot) = body.pointer_mut(&pointer) {
+                *slot = Value::String(plain);
+            }
+        }
+        Ok(changed)
     }
 
     fn check_uuid(&self, obj: &Map<String, Value>) -> Result<(), AppError> {
@@ -714,23 +737,24 @@ impl RequestGuardConfig {
         Ok(())
     }
 
-    fn check_media_url(&self, field: &str, url: &str) -> Result<(), AppError> {
+    /// Checks the scheme of one media URL. Returns its plain form when the
+    /// value was not written that way.
+    fn check_media_url(&self, field: &str, url: &str) -> Result<Option<String>, AppError> {
         if !self.reject_local_media_urls {
-            return Ok(());
+            return Ok(None);
         }
-        let url = crate::image_validation::normalize_image_url_input(url);
-        let scheme = url
-            .split_once(':')
-            .map(|(s, _)| s.to_ascii_lowercase())
-            .unwrap_or_default();
-        if ALLOWED_MEDIA_SCHEMES.contains(&scheme.as_str()) {
-            return Ok(());
+        let normalized = crate::image_validation::normalize_image_url_input(url);
+        let (scheme, rest) = normalized.split_once(':').unwrap_or(("", ""));
+        let scheme = scheme.to_ascii_lowercase();
+        if !ALLOWED_MEDIA_SCHEMES.contains(&scheme.as_str()) {
+            return Err(refuse(
+                "media_url_scheme",
+                field,
+                format!("`{field}` must be an http, https or data URL."),
+            ));
         }
-        Err(refuse(
-            "media_url_scheme",
-            field,
-            format!("`{field}` must be an http, https or data URL."),
-        ))
+        let plain = format!("{scheme}:{rest}");
+        Ok((plain != url).then_some(plain))
     }
 }
 
@@ -758,6 +782,57 @@ mod tests {
         guard()
             .apply_completion_body(&mut body)
             .unwrap_or_else(|e| panic!("expected pass, got {e:?}"));
+    }
+
+    #[test]
+    fn media_urls_are_forwarded_in_their_plain_form() {
+        for (written, plain) in [
+            ("DATA:image/png;base64,AAAA", "data:image/png;base64,AAAA"),
+            (" data:image/png;base64,AAAA", "data:image/png;base64,AAAA"),
+            (
+                "\u{1}data:image/png;base64,AAAA",
+                "data:image/png;base64,AAAA",
+            ),
+            ("d\nata:image/png;base64,AAAA", "data:image/png;base64,AAAA"),
+            (
+                " HTTPS://media.example.com/a.png",
+                "https://media.example.com/a.png",
+            ),
+        ] {
+            let mut chat = json!({"messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": written}},
+                {"type": "video_url", "video_url": written},
+            ]}]});
+            assert!(guard().apply_completion_body(&mut chat).unwrap());
+            let parts = &chat["messages"][0]["content"];
+            assert_eq!(parts[0]["image_url"]["url"], plain);
+            assert_eq!(parts[1]["video_url"], plain);
+
+            let mut embed = json!({"input": [{"text": "a", "image": written}]});
+            assert!(guard().apply_passthrough_body(&mut embed).unwrap());
+            assert_eq!(embed["input"][0]["image"], plain);
+        }
+        // A plain value leaves the body as it was sent.
+        let mut plain = json!({"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]}]});
+        assert!(!guard().apply_completion_body(&mut plain).unwrap());
+    }
+
+    #[test]
+    fn message_fields_are_not_media() {
+        passes(json!({"messages": [
+            {"role": "user", "content": "hi", "image": "profile.png", "video": "clip"},
+        ]}));
+        // The same key in a content part or an input item is.
+        assert_eq!(
+            rejected_param(json!({"messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi", "image": "profile.png"}]},
+            ]})),
+            "image"
+        );
+        let mut item = json!({"input": [{"role": "user", "image": "profile.png"}]});
+        assert!(guard().apply_passthrough_body(&mut item).is_err());
     }
 
     #[test]

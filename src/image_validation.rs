@@ -954,6 +954,7 @@ pub(crate) fn is_disallowed_ip(ip: IpAddr) -> bool {
                 || o[0] >= 240                                 // 240.0.0.0/4 reserved
                 || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) // 198.18.0.0/15 benchmark
                 || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24
+                || (o[0] == 192 && o[1] == 88 && o[2] == 99) // 192.88.99.0/24 6to4 relay
         }
         IpAddr::V6(v6) => {
             if let Some(mapped) = v6.to_ipv4_mapped() {
@@ -980,6 +981,10 @@ pub(crate) fn is_disallowed_ip(ip: IpAddr) -> bool {
                         && seg[5] == 0
                 ) // 64:ff9b::/96 NAT64 well-known prefix
                 || (seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0x0001) // 64:ff9b:1::/48
+                || (seg[0] == 0 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0 && seg[4] == 0xffff && seg[5] == 0)
+                // ::ffff:0:0:0/96 IPv4-translated.
+                || (seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0)
+            // 100::/64 discard
         }
     }
 }
@@ -987,6 +992,16 @@ pub(crate) fn is_disallowed_ip(ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_translated_and_discard_ranges_are_not_public() {
+        for ip in ["192.88.99.1", "::ffff:0:127.0.0.1", "100::1"] {
+            assert!(is_disallowed_ip(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["192.88.98.1", "1.1.1.1", "2606:4700::1111"] {
+            assert!(!is_disallowed_ip(ip.parse().unwrap()), "{ip}");
+        }
+    }
 
     fn cfg() -> ImageValidationConfig {
         ImageValidationConfig {

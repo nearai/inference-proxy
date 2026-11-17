@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{Mutex, OnceCell, RwLock};
+use tokio::sync::{Mutex, OnceCell, RwLock, Semaphore};
 use tracing::{error, info, warn};
 
 use crate::types::AttestationReport;
@@ -21,6 +21,9 @@ use crate::types::AttestationReport;
 /// cloud-api saw a transport-level "error sending request for url"
 /// instead of the structured 5xx we'd otherwise return.
 const GPU_EVIDENCE_COLLECTION_TIMEOUT_SECS: u64 = 20;
+
+/// Fresh public requests, including those waiting for GPU collection.
+pub const DEFAULT_ATTESTATION_MAX_INFLIGHT: usize = 5;
 
 /// Cache key for nonce-less attestation reports.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -213,6 +216,7 @@ impl GpuEvidenceWorker {
 pub struct AttestationCache {
     /// Cached reports keyed by (signing_algo, include_tls_fingerprint).
     reports: RwLock<HashMap<AttestationCacheKey, CachedReport>>,
+    fresh_reports: Semaphore,
     /// Cache TTL in seconds.
     ttl_secs: u64,
     /// Cached dstack info (static for the lifetime of the process).
@@ -225,8 +229,13 @@ pub struct AttestationCache {
 
 impl AttestationCache {
     pub fn new(ttl_secs: u64) -> Self {
+        Self::with_max_inflight(ttl_secs, DEFAULT_ATTESTATION_MAX_INFLIGHT)
+    }
+
+    pub fn with_max_inflight(ttl_secs: u64, max_inflight: usize) -> Self {
         Self {
             reports: RwLock::new(HashMap::new()),
+            fresh_reports: Semaphore::new(max_inflight),
             ttl_secs,
             dstack_info: OnceCell::new(),
             gpu_worker: Mutex::new(None),
@@ -553,6 +562,7 @@ pub fn spawn_cache_refresh_task(
                         gpu_no_hw_mode,
                         tls_cert_fingerprint: None,
                     },
+                    rand::random(),
                     Some(&cache),
                     delegate_ctx.as_ref(),
                 )
@@ -594,6 +604,7 @@ pub fn spawn_cache_refresh_task(
                             gpu_no_hw_mode,
                             tls_cert_fingerprint: Some(fp.as_str()),
                         },
+                        rand::random(),
                         Some(&cache),
                         delegate_ctx.as_ref(),
                     )
@@ -631,6 +642,8 @@ pub fn spawn_cache_refresh_task(
 /// Errors from attestation generation.
 #[derive(Debug, thiserror::Error)]
 pub enum AttestationError {
+    #[error("Fresh attestation capacity reached")]
+    AtCapacity,
     /// User-provided nonce is invalid (bad hex or wrong length).
     #[error("{0}")]
     InvalidNonce(String),
@@ -723,6 +736,7 @@ print(json.dumps(evidence))
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(GPU_EVIDENCE_COLLECTION_TIMEOUT_SECS),
         tokio::process::Command::new("python3")
+            .kill_on_drop(true)
             .arg("-c")
             .arg(&script)
             .output(),
@@ -1256,10 +1270,10 @@ pub(crate) async fn collect_gpu_evidence_with_nonce_check(
 /// dstack info is cached for the process lifetime (it never changes).
 async fn generate_attestation_inner(
     params: AttestationParams<'_>,
+    nonce_bytes: [u8; 32],
     cache: Option<&AttestationCache>,
     delegate_ctx: Option<&DelegateContext<'_>>,
 ) -> Result<AttestationReport, AttestationError> {
-    let nonce_bytes = parse_nonce(params.nonce)?;
     let nonce_hex = hex::encode(nonce_bytes);
 
     // Build TDX report data (binds cert fingerprint when present)
@@ -1356,26 +1370,43 @@ pub async fn generate_attestation(
     cache: Option<&AttestationCache>,
     delegate_ctx: Option<&DelegateContext<'_>>,
 ) -> Result<AttestationResult, AttestationError> {
-    let is_nonceless = params.nonce.is_none();
-    let include_tls = params.tls_cert_fingerprint.is_some();
-    let signing_algo = params.signing_algo.to_string();
+    let (report, _) = generate_attestation_with_compose(params, cache, delegate_ctx, None).await?;
+    Ok(report)
+}
 
-    // For nonce-less requests, try the cache first (returns pre-serialized bytes).
-    if is_nonceless {
+pub(crate) async fn generate_attestation_with_compose(
+    params: AttestationParams<'_>,
+    cache: Option<&AttestationCache>,
+    delegate_ctx: Option<&DelegateContext<'_>>,
+    compose: Option<(&reqwest::Client, &str)>,
+) -> Result<(AttestationResult, Option<Box<serde_json::value::RawValue>>), AttestationError> {
+    if params.nonce.is_none() {
         if let Some(cache) = cache {
-            if let Some(bytes) = cache.get_bytes(&signing_algo, include_tls).await {
-                return Ok(AttestationResult::CachedBytes(bytes));
+            if let Some(bytes) = cache
+                .get_bytes(params.signing_algo, params.tls_cert_fingerprint.is_some())
+                .await
+            {
+                return Ok((AttestationResult::CachedBytes(bytes), None));
             }
         }
     }
 
-    // Generate fresh report. GPU evidence is serialized by the worker Mutex,
-    // but TDX quote runs concurrently.
-    let report = generate_attestation_inner(params, cache, delegate_ctx).await?;
-    // Don't cache here — the caller (route handler) caches after fetching
-    // compose-manager attestation so cached responses include the full chain.
-
-    Ok(AttestationResult::Fresh(Box::new(report)))
+    let nonce = params.nonce;
+    let nonce_bytes = parse_nonce(nonce)?;
+    let _permit = cache
+        .map(|cache| cache.fresh_reports.try_acquire())
+        .transpose()
+        .map_err(|_| AttestationError::AtCapacity)?;
+    let (report, compose_report) = tokio::try_join!(
+        generate_attestation_inner(params, nonce_bytes, cache, delegate_ctx),
+        async {
+            Ok(match compose {
+                Some((client, url)) => fetch_compose_manager_attestation(client, url, nonce).await,
+                None => None,
+            })
+        },
+    )?;
+    Ok((AttestationResult::Fresh(Box::new(report)), compose_report))
 }
 
 #[cfg(test)]
@@ -1700,6 +1731,60 @@ mod tests {
             info: serde_json::json!({}),
             tls_cert_fingerprint: None,
         }
+    }
+
+    #[tokio::test]
+    async fn attestation_capacity_preserves_cached_reports_and_nonce_validation() {
+        let cache = AttestationCache::with_max_inflight(300, 1);
+        let in_flight = cache.fresh_reports.try_acquire().unwrap();
+        let nonce = "ab".repeat(32);
+        let request = |nonce| AttestationParams {
+            nonce,
+            model_name: "test",
+            signing_algo: "ecdsa",
+            signing_address: "test",
+            signing_public_key: "test",
+            signing_address_bytes: &[1; 20],
+            gpu_no_hw_mode: true,
+            tls_cert_fingerprint: None,
+        };
+        let generate = |params| generate_attestation(params, Some(&cache), None);
+        assert!(matches!(
+            generate(request(None)).await,
+            Err(AttestationError::AtCapacity)
+        ));
+        cache
+            .set(
+                "ecdsa",
+                false,
+                make_test_report("ecdsa", "cached"),
+                None,
+                None,
+            )
+            .await;
+        let cached = cache.get_bytes("ecdsa", false).await.unwrap();
+        assert!(
+            matches!(generate(request(None)).await, Ok(AttestationResult::CachedBytes(bytes)) if bytes == cached)
+        );
+        assert!(matches!(
+            generate(request(Some(&nonce))).await,
+            Err(AttestationError::AtCapacity)
+        ));
+        assert!(matches!(
+            generate(request(Some("invalid"))).await,
+            Err(AttestationError::InvalidNonce(_))
+        ));
+
+        drop(in_flight);
+        let invalid_fingerprint = AttestationParams {
+            tls_cert_fingerprint: Some("invalid"),
+            ..request(Some(&nonce))
+        };
+        assert!(matches!(
+            generate(invalid_fingerprint).await,
+            Err(AttestationError::Internal(_))
+        ));
+        assert_eq!(cache.fresh_reports.available_permits(), 1);
     }
 
     #[tokio::test]

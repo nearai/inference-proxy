@@ -72,6 +72,7 @@ fn build_agent_loop_app_with_cloud_and_idle(
         media_inline: Default::default(),
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
+        attestation_max_inflight: 5,
         dev_mode: true,
         gpu_no_hw_mode: true,
         git_rev: "test-rev".to_string(),

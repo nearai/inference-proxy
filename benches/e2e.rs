@@ -66,6 +66,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         media_inline: Default::default(),
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
+        attestation_max_inflight: 5,
         dev_mode: true,
         gpu_no_hw_mode: true,
         git_rev: "bench".to_string(),

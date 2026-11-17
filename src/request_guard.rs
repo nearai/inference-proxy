@@ -616,6 +616,16 @@ impl RequestGuardConfig {
             }
         }
 
+        if let Some(x) = body.get("top_k").and_then(numeric) {
+            if x.is_nan() || x < -1.0 || x > i32::MAX as f64 {
+                return Err(refuse(
+                    "top_k",
+                    "top_k",
+                    "`top_k` must be -1 or a non-negative 32-bit integer.".to_string(),
+                ));
+            }
+        }
+
         // The engines take `max_completion_tokens` over `max_tokens`.
         let max_tokens = ["max_completion_tokens", "max_tokens"]
             .iter()
@@ -1011,6 +1021,29 @@ mod tests {
             "logprob_start_len"
         );
         passes(json!({"logprob_start_len": 0}));
+    }
+
+    #[test]
+    fn top_k_outside_the_32_bit_range_is_rejected() {
+        for bad in [
+            json!(-2),
+            json!(2147483648u64),
+            json!(1e30),
+            json!("2147483648"),
+            json!("nan"),
+        ] {
+            assert_eq!(rejected_param(json!({ "top_k": bad })), "top_k");
+        }
+        for ok in [
+            json!(-1),
+            json!(0),
+            json!(40),
+            json!(2147483647),
+            json!("40"),
+            json!(null),
+        ] {
+            passes(json!({ "top_k": ok }));
+        }
     }
 
     #[test]

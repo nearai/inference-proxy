@@ -57,15 +57,17 @@ pub async fn tokenize(
     let mut request_json = proxy::parse_json_object(&request_body)?;
     crate::model_list::guard_passthrough_body(&state, &request_json)?;
     guard_direct_model(&state, &request_json, auth.cloud_api_key.is_some())?;
-    // The same rules as the chat and completions routes (`request_guard.rs`):
-    // the engine builds a chat or completion request from this body. A
-    // stripped field means the body is re-serialized; otherwise the original
+    // The same rules as the chat and completions routes, and media inlining
+    // (`forward_body.rs`): the engine builds a chat or completion request
+    // from this body. A changed body is re-serialized; otherwise the original
     // bytes go through.
-    let stripped = state
-        .config
-        .request_guard
-        .apply_completion_body(&mut request_json)?;
-    let forward_body = if stripped {
+    let changed = crate::forward_body::prepare(
+        &state.config,
+        crate::forward_body::Rules::Completion,
+        &mut request_json,
+    )
+    .await?;
+    let forward_body = if changed {
         serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?
     } else {
         request_body
@@ -483,10 +485,12 @@ async fn json_passthrough_encrypted(
         guard_direct_model(&state, &request_json, direct_key)?;
         validate_image_count(endpoint, &request_json)?;
         validate_rerank_document_count(endpoint, &request_json)?;
-        state
-            .config
-            .request_guard
-            .apply_passthrough_body(&mut request_json)?;
+        crate::forward_body::prepare(
+            &state.config,
+            crate::forward_body::Rules::Passthrough,
+            &mut request_json,
+        )
+        .await?;
         if with_lora {
             crate::model_list::apply_backend_lora(&state, &mut request_json);
         }
@@ -501,13 +505,16 @@ async fn json_passthrough_encrypted(
         crate::model_list::guard_passthrough_body(&state, &request_json)?;
         guard_direct_model(&state, &request_json, direct_key)?;
         validate_image_count(endpoint, &request_json)?;
-        // A stripped field (`request_guard.rs`) means the body is re-serialized,
-        // like the adapter below; otherwise the original bytes go through.
-        let stripped = state
-            .config
-            .request_guard
-            .apply_passthrough_body(&mut request_json)?;
-        if with_lora || stripped {
+        // The field rules and media inlining (`forward_body.rs`). A changed
+        // body is re-serialized, like the adapter below; otherwise the
+        // original bytes go through.
+        let changed = crate::forward_body::prepare(
+            &state.config,
+            crate::forward_body::Rules::Passthrough,
+            &mut request_json,
+        )
+        .await?;
+        if with_lora || changed {
             let original_hash = hex::encode(sha2::Sha256::digest(&request_body));
             if with_lora {
                 crate::model_list::apply_backend_lora(&state, &mut request_json);

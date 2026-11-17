@@ -1,21 +1,26 @@
 //! Fetch remote media in the proxy and hand the engine bytes only.
 //!
-//! With `VLLM_PROXY_INLINE_MEDIA=1` every http(s) `image_url` and `audio_url`
-//! in a chat request is downloaded here and rewritten to a `data:` URL before
+//! With `VLLM_PROXY_INLINE_MEDIA=1` every http(s) image and audio URL in a
+//! forwarded body is downloaded here and rewritten to a `data:` URL before
 //! the request is forwarded, so the engine never has to reach the network. That
-//! is what lets the engine run on a Docker network with no route out.
+//! is what lets the engine run on a Docker network with no route out. Every
+//! route that forwards a JSON body runs this (`forward_body.rs`); the items
+//! are found by `media_refs.rs`, in chat content parts, embeddings inputs and
+//! scoring inputs alike.
 //!
 //! Fail closed: a remote item that cannot be fetched, is too large, or is not a
-//! supported image/audio format is a 400. Nothing remote ever reaches the
-//! engine while this is on. `data:` items and `input_audio` (already base64)
-//! are only checked against the size caps.
+//! supported image/audio format is a 400, and so is a remote video, a media
+//! value that is not a URL, or any other scheme. Nothing remote ever reaches
+//! the engine while this is on. `data:` items and `input_audio` (already
+//! base64) are only checked against the size caps.
 //!
 //! The proxy moves bytes and reads headers; it never decodes media. Decoding
 //! stays in the engine, which has no network and no secrets.
 //!
 //! The fetch reuses the image-validation client: no automatic redirects, every
-//! hop re-checked against the SSRF rules and the media-domain allowlist, and a
-//! DNS resolver that refuses names pointing at private ranges.
+//! hop re-checked against the host rules (no loopback, private, link-local or
+//! other non-public address, as a literal or through DNS) and the media-domain
+//! allowlist, and a DNS resolver that refuses names pointing at those ranges.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -33,6 +38,7 @@ use crate::image_validation::{
     is_disallowed_ip, is_image_magic, normalize_image_url_input,
     remote_host_matches_allowed_domains, validation_client,
 };
+use crate::media_refs::{self, MediaKind, MediaRef, MediaValue};
 
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
@@ -84,6 +90,8 @@ impl Default for MediaInlineConfig {
     }
 }
 
+/// The kinds the proxy can fetch. Video is never fetched: a remote video is
+/// refused while inlining is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Kind {
     Image,
@@ -105,112 +113,111 @@ impl Kind {
     }
 }
 
-/// Where a media URL lives in the request, so it can be rewritten in place.
-struct Slot {
-    msg: usize,
-    part: usize,
-    kind: Kind,
-    /// `{"image_url": "..."}` (bare string) instead of `{"image_url": {"url": "..."}}`.
-    bare: bool,
-}
-
-fn reject(reason: &'static str, kind: Option<Kind>) -> AppError {
+fn reject(reason: &'static str, kind: Option<MediaKind>) -> AppError {
     metrics::counter!(
         "inference_proxy_media_inline_total",
-        "kind" => kind.map(Kind::label).unwrap_or("any"),
+        "kind" => kind.map(MediaKind::label).unwrap_or("any"),
         "result" => reason
     )
     .increment(1);
     tracing::info!(
         reason,
-        kind = kind.map(Kind::label),
+        kind = kind.map(MediaKind::label),
         "media inline rejected request"
     );
     AppError::BadRequest(REJECT_MSG.to_string())
 }
 
-/// Rewrite every remote `image_url` / `audio_url` in `request_json` to a
-/// `data:` URL. No-op when disabled. `request_json` must already be decrypted.
+fn scheme_of(url: &str) -> String {
+    url.split_once(':')
+        .map(|(s, _)| s.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+/// Rewrite every remote media URL in `request_json` to a `data:` URL, on any
+/// route: chat content parts, embeddings inputs and scoring inputs alike
+/// (`media_refs.rs`). Returns whether the body changed. No-op when disabled.
+/// `request_json` must already be decrypted.
+///
+/// Fail closed: after the rewrite every media URL in the body must be a
+/// `data:` URL, otherwise the request is refused. A remote video, a value
+/// that is not a URL and any scheme other than http, https or data are
+/// refused.
 pub async fn inline_remote_media(
     request_json: &mut Value,
     cfg: &MediaInlineConfig,
-) -> Result<(), AppError> {
+) -> Result<bool, AppError> {
     if !cfg.enabled {
-        return Ok(());
+        return Ok(false);
     }
-    let Some(messages) = request_json.get("messages").and_then(|m| m.as_array()) else {
-        return Ok(());
-    };
 
-    let mut slots: Vec<(Slot, String)> = Vec::new();
+    let mut slots: Vec<(MediaRef, Kind, String)> = Vec::new();
     let mut inline_bytes: usize = 0;
-    for (mi, msg) in messages.iter().enumerate() {
-        let Some(parts) = msg.get("content").and_then(|c| c.as_array()) else {
-            continue;
-        };
-        for (pi, part) in parts.iter().enumerate() {
-            let ty = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            let (kind, field) = match ty {
-                "image_url" => (Kind::Image, "image_url"),
-                "audio_url" => (Kind::Audio, "audio_url"),
-                "input_audio" => {
-                    // Already base64 (OpenAI shape). Size cap only.
-                    let data = part
-                        .get("input_audio")
-                        .and_then(|a| a.get("data"))
-                        .and_then(|d| d.as_str())
-                        .ok_or_else(|| reject("malformed_part", Some(Kind::Audio)))?;
-                    let n = b64_decoded_len(data);
-                    if n > cfg.max_audio_bytes {
-                        return Err(reject("too_large", Some(Kind::Audio)));
-                    }
-                    inline_bytes = inline_bytes.saturating_add(n);
-                    continue;
-                }
-                _ => continue,
-            };
-            let (url, bare) = match part.get(field) {
-                Some(Value::Object(o)) => match o.get("url").and_then(|u| u.as_str()) {
-                    Some(u) => (u.to_string(), false),
-                    None => return Err(reject("malformed_part", Some(kind))),
-                },
-                Some(Value::String(s)) => (s.clone(), true),
-                _ => return Err(reject("malformed_part", Some(kind))),
-            };
-            let normalized = normalize_image_url_input(&url).into_owned();
-            let scheme = normalized
-                .split_once(':')
-                .map(|(s, _)| s.to_ascii_lowercase())
-                .unwrap_or_default();
-            match scheme.as_str() {
-                "data" => {
-                    let n = data_url_decoded_len(&normalized)
-                        .ok_or_else(|| reject("bad_data_url", Some(kind)))?;
-                    if n > kind.max_bytes(cfg) {
-                        return Err(reject("too_large", Some(kind)));
-                    }
-                    inline_bytes = inline_bytes.saturating_add(n);
-                }
-                "http" | "https" => slots.push((
-                    Slot {
-                        msg: mi,
-                        part: pi,
-                        kind,
-                        bare,
-                    },
-                    normalized,
-                )),
-                // Anything else would make the engine reach out (or read a
-                // local file): refuse.
-                _ => return Err(reject("unsupported_scheme", Some(kind))),
+    let too_deep = |_| reject("too_deep", None);
+    for part in media_refs::parts(request_json).map_err(too_deep)? {
+        // `input_audio` is already base64 (OpenAI shape). Size cap only.
+        if let Some(audio) = part.obj.get("input_audio") {
+            let data = audio
+                .get("data")
+                .and_then(Value::as_str)
+                .ok_or_else(|| reject("malformed_part", Some(MediaKind::Audio)))?;
+            let n = b64_decoded_len(data);
+            if n > cfg.max_audio_bytes {
+                return Err(reject("too_large", Some(MediaKind::Audio)));
             }
+            inline_bytes = inline_bytes.saturating_add(n);
+        }
+        // A part typed as image or audio must carry its URL.
+        if let Some(ty @ ("image_url" | "audio_url")) = part.obj.get("type").and_then(Value::as_str)
+        {
+            if part.obj.get(ty).is_none_or(|v| v.is_null()) {
+                let kind = if ty == "audio_url" {
+                    MediaKind::Audio
+                } else {
+                    MediaKind::Image
+                };
+                return Err(reject("malformed_part", Some(kind)));
+            }
+        }
+    }
+    for media in media_refs::media_refs(request_json).map_err(too_deep)? {
+        let Some(url) = media.value.url() else {
+            return Err(reject("malformed_part", Some(media.kind)));
+        };
+        let normalized = normalize_image_url_input(url).into_owned();
+        match scheme_of(&normalized).as_str() {
+            "data" => {
+                let n = data_url_decoded_len(&normalized)
+                    .ok_or_else(|| reject("bad_data_url", Some(media.kind)))?;
+                let cap = match media.kind {
+                    MediaKind::Image => cfg.max_image_bytes,
+                    MediaKind::Audio => cfg.max_audio_bytes,
+                    MediaKind::Video => cfg.max_total_bytes,
+                };
+                if n > cap {
+                    return Err(reject("too_large", Some(media.kind)));
+                }
+                inline_bytes = inline_bytes.saturating_add(n);
+            }
+            "http" | "https" => {
+                let kind = match media.kind {
+                    MediaKind::Image => Kind::Image,
+                    MediaKind::Audio => Kind::Audio,
+                    // The proxy does not fetch video, and the engine must not.
+                    MediaKind::Video => return Err(reject("unsupported_kind", Some(media.kind))),
+                };
+                slots.push((media, kind, normalized));
+            }
+            // Anything else would make the engine reach out (or read a
+            // local file): refuse.
+            _ => return Err(reject("unsupported_scheme", Some(media.kind))),
         }
     }
     if inline_bytes > cfg.max_total_bytes {
         return Err(reject("request_too_large", None));
     }
     if slots.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     // Fetch each distinct URL once, but remember how many parts use it: every
@@ -218,10 +225,10 @@ pub async fn inline_remote_media(
     // occurrence is charged against the request budget.
     let mut unique: Vec<(String, Kind)> = Vec::new();
     let mut uses: HashMap<(String, Kind), usize> = HashMap::new();
-    for (slot, url) in &slots {
-        let n = uses.entry((url.clone(), slot.kind)).or_insert(0);
+    for (_, kind, url) in &slots {
+        let n = uses.entry((url.clone(), *kind)).or_insert(0);
         if *n == 0 {
-            unique.push((url.clone(), slot.kind));
+            unique.push((url.clone(), *kind));
         }
         *n += 1;
     }
@@ -246,7 +253,7 @@ pub async fn inline_remote_media(
             })
             .buffer_unordered(per_request);
         while let Some((url, kind, r)) = results.next().await {
-            let (mime, bytes) = r.map_err(|reason| reject(reason, Some(kind)))?;
+            let (mime, bytes) = r.map_err(|reason| reject(reason, Some(kind.into())))?;
             let data_url = format!(
                 "data:{mime};base64,{}",
                 base64::engine::general_purpose::STANDARD.encode(&bytes)
@@ -260,35 +267,51 @@ pub async fn inline_remote_media(
         Err(_) => return Err(reject("deadline", None)),
     };
 
-    let messages = request_json
-        .get_mut("messages")
-        .and_then(|m| m.as_array_mut())
-        .expect("messages checked above");
-    for (slot, url) in slots {
+    for (media, kind, url) in slots {
         let data_url = fetched
-            .get(&(url, slot.kind))
+            .get(&(url, kind))
             .cloned()
             .expect("every slot was fetched");
-        let field = match slot.kind {
-            Kind::Image => "image_url",
-            Kind::Audio => "audio_url",
-        };
-        let part = &mut messages[slot.msg]["content"][slot.part];
-        if slot.bare {
-            // Engines (SGLang) only take the object shape; normalize the
-            // lenient bare-string form while we are rewriting it anyway.
-            part[field] = serde_json::json!({ "url": data_url });
-        } else {
-            part[field]["url"] = Value::String(data_url);
+        let slot = request_json
+            .pointer_mut(&media.pointer())
+            .expect("media pointer found above");
+        match (&media.value, media.rewrite_as_object()) {
+            (MediaValue::Object(_), _) => slot["url"] = Value::String(data_url),
+            // Engines (SGLang) only take the object shape for these parts;
+            // normalize the lenient bare-string form while rewriting it.
+            (_, true) => *slot = serde_json::json!({ "url": data_url }),
+            (_, false) => *slot = Value::String(data_url),
         }
         metrics::counter!(
             "inference_proxy_media_inline_total",
-            "kind" => slot.kind.label(),
+            "kind" => kind.label(),
             "result" => "inlined"
         )
         .increment(1);
     }
-    Ok(())
+
+    // What is forwarded holds `data:` URLs only.
+    if media_refs::media_refs(request_json)
+        .map_err(too_deep)?
+        .iter()
+        .any(|m| {
+            m.value
+                .url()
+                .is_none_or(|u| scheme_of(&normalize_image_url_input(u)) != "data")
+        })
+    {
+        return Err(reject("not_inlined", None));
+    }
+    Ok(true)
+}
+
+impl From<Kind> for MediaKind {
+    fn from(kind: Kind) -> Self {
+        match kind {
+            Kind::Image => MediaKind::Image,
+            Kind::Audio => MediaKind::Audio,
+        }
+    }
 }
 
 fn global_semaphore(permits: usize) -> &'static tokio::sync::Semaphore {
@@ -799,6 +822,141 @@ mod tests {
         let mut req =
             chat(json!([{"type":"image_url","image_url":{"url": format!("{}/r", server.uri())}}]));
         assert!(inline_remote_media(&mut req, &cfg()).await.is_err());
+    }
+
+    /// The production host rules: a name that resolves to loopback (here the
+    /// single-label `localhost`) and every spelling of a non-public literal
+    /// are refused before any request is sent.
+    #[tokio::test]
+    async fn non_public_names_and_literals_are_refused_without_a_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(PNG_1X1))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let port = server.address().port();
+        let prod = MediaInlineConfig {
+            allow_private_hosts: false,
+            ..cfg()
+        };
+        for u in [
+            format!("http://localhost:{port}/a.png"),
+            format!("http://LOCALHOST.:{port}/a.png"),
+            format!("http://2130706433:{port}/a.png"),
+            format!("http://0x7f.0.0.1:{port}/a.png"),
+            format!("http://0177.0.0.1:{port}/a.png"),
+            format!("http://127.1:{port}/a.png"),
+            format!("http://0.0.0.0:{port}/a.png"),
+            format!("http://[::ffff:127.0.0.1]:{port}/a.png"),
+            format!("http://[::1]:{port}/a.png"),
+            format!("http://user@127.0.0.1:{port}/a.png"),
+            "http://[fd00::1]/a.png".to_string(),
+            "http://[fe80::1]/a.png".to_string(),
+            "http://100.64.0.1/a.png".to_string(),
+            "http://172.17.0.1/a.png".to_string(),
+        ] {
+            let mut req = chat(json!([{"type":"image_url","image_url":{"url": u}}]));
+            assert!(inline_remote_media(&mut req, &prod).await.is_err(), "{u}");
+        }
+    }
+
+    #[test]
+    fn redirect_hops_always_refuse_non_public_literals() {
+        let permissive = cfg();
+        for u in [
+            "http://10.0.0.1/a",
+            "http://[::1]/a",
+            "http://169.254.169.254/a",
+        ] {
+            let url = reqwest::Url::parse(u).unwrap();
+            // A first hop may reach a private literal only when private
+            // hosts are allowed; a redirect hop never may.
+            assert!(preflight(&url, &permissive, false).is_ok(), "{u}");
+            assert!(preflight(&url, &permissive, true).is_err(), "{u}");
+            let prod = MediaInlineConfig {
+                allow_private_hosts: false,
+                ..cfg()
+            };
+            assert!(preflight(&url, &prod, false).is_err(), "{u}");
+        }
+        let restricted = MediaInlineConfig {
+            allowed_domains: vec!["media.example.com".to_string()],
+            ..cfg()
+        };
+        let other = reqwest::Url::parse("https://other.example.com/a").unwrap();
+        assert_eq!(
+            preflight(&other, &restricted, true),
+            Err("disallowed_domain")
+        );
+    }
+
+    #[tokio::test]
+    async fn media_in_every_input_shape_is_inlined() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/a.png"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(PNG_1X1))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let u = format!("{}/a.png", server.uri());
+        let mut body = json!({
+            "messages": [{"role": "user", "content": [
+                {"image_url": u},
+                {"type": "text", "text": "t", "uuid": "1", "image_url": {"url": u}},
+                {"type": "input_image", "image_url": u}
+            ]}],
+            "input": [{"text": "a", "image": u}, {"image": u, "content": "x"}],
+            "query": {"content": [{"type": "image_url", "image_url": {"url": u}}]},
+            "documents": [[{"type": "image_url", "image_url": {"url": u}}]]
+        });
+        assert!(inline_remote_media(&mut body, &cfg()).await.unwrap());
+        assert!(!body.to_string().contains(&server.uri()));
+        // Bare strings stay strings where the engine takes a string.
+        assert!(body["messages"][0]["content"][2]["image_url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+        assert!(body["input"][0]["image"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+        assert!(body["messages"][0]["content"][0]["image_url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+        // An object stays an object.
+        assert!(body["messages"][0]["content"][1]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:"));
+    }
+
+    #[tokio::test]
+    async fn what_cannot_be_inlined_is_refused() {
+        for body in [
+            // The proxy does not fetch video.
+            chat(json!([{"type":"video_url","video_url":{"url":"https://example.com/v.mp4"}}])),
+            chat(
+                json!([{"type":"text","text":"x","uuid":"1","video_url":"https://example.com/v"}]),
+            ),
+            json!({"input": [{"video": "https://example.com/v.mp4"}]}),
+            // A local path or bare base64 is not a URL the proxy can check.
+            json!({"input": [{"image": "/etc/hostname"}]}),
+            json!({"query": [{"type": "image_url", "image_url": {"url": "file:///x"}}], "documents": ["d"]}),
+            // Not a URL at all.
+            chat(json!([{"type":"image_url","image_url":{"detail":"low"}}])),
+            chat(json!([{"type":"image_url"}])),
+            json!({"input": [{"image": 5}]}),
+        ] {
+            let mut b = body.clone();
+            assert!(inline_remote_media(&mut b, &cfg()).await.is_err(), "{body}");
+        }
+        // `data:` video passes under the request cap.
+        let mut ok =
+            chat(json!([{"type":"video_url","video_url":{"url":"data:video/mp4;base64,AAAA"}}]));
+        assert!(!inline_remote_media(&mut ok, &cfg()).await.unwrap());
     }
 
     fn jpeg(w: u16, h: u16, fill: usize) -> Vec<u8> {

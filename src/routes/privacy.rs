@@ -52,11 +52,26 @@ pub async fn classify(
     body: Body,
 ) -> Result<Response, AppError> {
     let request_body = read_body_with_limit(body, state.config.max_request_size).await?;
+    let mut request_json = proxy::parse_json_object(&request_body)?;
     if auth.cloud_api_key.is_some() {
-        let request_json = proxy::parse_json_object(&request_body)?;
         crate::model_list::guard_request_body(&request_json, Some(&state.config.model_name))?;
     }
+    // The signature binds the body the client sent.
     let request_sha256 = hex::encode(Sha256::digest(&request_body));
+    // The field rules and media inlining every forwarding route runs
+    // (`forward_body.rs`). A changed body is re-serialized; otherwise the
+    // original bytes go through.
+    let changed = crate::forward_body::prepare(
+        &state.config,
+        crate::forward_body::Rules::Passthrough,
+        &mut request_json,
+    )
+    .await?;
+    let request_body = if changed {
+        serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?
+    } else {
+        request_body
+    };
     let path_with_query = match uri.query() {
         Some(query) => format!("{}?{query}", super::ROUTE_PRIVACY_CLASSIFY),
         None => super::ROUTE_PRIVACY_CLASSIFY.to_string(),

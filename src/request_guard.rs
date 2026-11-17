@@ -41,9 +41,6 @@ pub const IMAGE_BOUNDED_FIELDS: &[&str] = &["n", "size", "num_inference_steps", 
 /// path, `ftp:`, ...) is refused.
 const ALLOWED_MEDIA_SCHEMES: &[&str] = &["http", "https", "data"];
 
-/// Content-part keys that carry a media URL.
-const MEDIA_PART_FIELDS: &[&str] = &["image_url", "video_url", "audio_url", "input_image"];
-
 /// Sampling floats that must be finite numbers. JSON has no NaN/Infinity, but
 /// the engines' pydantic models coerce strings such as `"nan"` and `"inf"`.
 const FINITE_FLOAT_FIELDS: &[&str] = &[
@@ -231,7 +228,7 @@ impl RequestGuardConfig {
             COMPLETION_TOKEN_ID_LISTS,
             COMPLETION_TEXT_OR_TOKEN_IDS,
         )?;
-        self.check_messages(obj)?;
+        self.check_media(body)?;
         self.check_structured(obj)?;
         Ok(self.strip(body))
     }
@@ -305,9 +302,9 @@ impl RequestGuardConfig {
         })
     }
 
-    /// Embeddings, rerank, score and image generation: the `model` cap, token
-    /// id inputs and the stripped fields (the sampling rules do not apply to
-    /// these bodies).
+    /// Embeddings, rerank, score, image generation and privacy classify: the
+    /// `model` cap, token id inputs, the content-part rules and the stripped
+    /// fields (the sampling rules do not apply to these bodies).
     pub fn apply_passthrough_body(&self, body: &mut Value) -> Result<bool, AppError> {
         if !self.enabled {
             return Ok(false);
@@ -322,6 +319,7 @@ impl RequestGuardConfig {
             PASSTHROUGH_TOKEN_ID_LISTS,
             PASSTHROUGH_TEXT_OR_TOKEN_IDS,
         )?;
+        self.check_media(body)?;
         Ok(self.strip(body))
     }
 
@@ -671,30 +669,27 @@ impl RequestGuardConfig {
         Ok(())
     }
 
-    /// Content parts: the `uuid` cap and the media URL scheme.
-    fn check_messages(&self, body: &Map<String, Value>) -> Result<(), AppError> {
-        let Some(messages) = body.get("messages").and_then(Value::as_array) else {
-            return Ok(());
+    /// Content parts and input items on every route (`media_refs.rs`): the
+    /// `uuid` cap and the media URL scheme.
+    fn check_media(&self, body: &Value) -> Result<(), AppError> {
+        let too_deep = |_| {
+            refuse(
+                "media_depth",
+                "messages",
+                "The request input is nested too deeply.".to_string(),
+            )
         };
-        let parts = messages
-            .iter()
-            .filter_map(|m| m.get("content").and_then(Value::as_array))
-            .flatten()
-            .filter_map(Value::as_object);
-        for part in parts {
-            self.check_uuid(part)?;
-            for field in MEDIA_PART_FIELDS {
-                let url = match part.get(*field) {
-                    Some(Value::String(url)) => Some(url.as_str()),
-                    Some(Value::Object(media)) => {
-                        self.check_uuid(media)?;
-                        media.get("url").and_then(Value::as_str)
-                    }
-                    _ => None,
-                };
-                if let Some(url) = url {
-                    self.check_media_url(field, url)?;
+        for part in crate::media_refs::parts(body).map_err(too_deep)? {
+            self.check_uuid(part.obj)?;
+            for (key, _) in crate::media_refs::MEDIA_KEYS {
+                if let Some(Value::Object(media)) = part.obj.get(*key) {
+                    self.check_uuid(media)?;
                 }
+            }
+        }
+        for media in crate::media_refs::media_refs(body).map_err(too_deep)? {
+            if let Some(url) = media.value.url() {
+                self.check_media_url(media.key, url)?;
             }
         }
         Ok(())
@@ -1105,6 +1100,40 @@ mod tests {
         passes(json!({"messages": [{"role": "user", "content": [
             {"type": "video_url", "video_url": {"url": "HTTPS://example.com/v.mp4"}}
         ]}]}));
+    }
+
+    #[test]
+    fn media_url_scheme_applies_to_every_input_shape() {
+        let g = guard();
+        let bad = "file:///etc/passwd";
+        for mut body in [
+            json!({"messages": [{"role": "user", "content": [{"image_url": bad}]}]}),
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "text", "text": "x", "uuid": "1", "video_url": {"url": bad}}]}]}),
+            json!({"messages": [[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": bad}}]}]]}),
+        ] {
+            assert!(g.apply_completion_body(&mut body).is_err(), "{body}");
+        }
+        for mut body in [
+            json!({"input": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": bad}}]}]}),
+            json!({"messages": [{"role": "user", "content": [{"type": "audio_url", "audio_url": {"url": bad}}]}]}),
+            json!({"input": [{"text": "a", "image": "/etc/passwd"}]}),
+            json!({"input": [{"video": bad}]}),
+            json!({"query": {"content": [{"type": "image_url", "image_url": {"url": bad}}]}, "documents": ["d"]}),
+            json!({"query": "q", "documents": [[{"type": "video_url", "video_url": {"url": bad}}]]}),
+            json!({"text_1": "a", "text_2": [{"content": [{"image_url": bad}]}]}),
+            json!({"data_1": "a", "data_2": {"content": [{"image_url": {"url": bad}}]}}),
+            json!({"input": [{"image": bad, "content": "x"}]}),
+            json!({"documents": [[{"type": "image_url", "image_url": {"url": bad}, "role": "x"}]]}),
+        ] {
+            assert!(g.apply_passthrough_body(&mut body).is_err(), "{body}");
+        }
+        let mut ok = json!({"input": [{"image": "https://example.com/a.png"}],
+            "query": {"content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]}});
+        assert!(g.apply_passthrough_body(&mut ok).is_ok());
+        let mut long_uuid = json!({"documents": [{"content": [
+            {"type": "image_url", "image_url": {"url": "data:,"}, "uuid": "u".repeat(257)}]}]});
+        assert!(g.apply_passthrough_body(&mut long_uuid).is_err());
     }
 
     #[test]

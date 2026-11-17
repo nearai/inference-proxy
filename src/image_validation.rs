@@ -968,6 +968,9 @@ pub(crate) fn is_disallowed_ip(ip: IpAddr) -> bool {
                 || seg[0] == 0x2002 // 2002::/16 6to4
                 || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
                 || (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+                || (seg[0] & 0xffc0) == 0xfec0 // fec0::/10 site-local (deprecated)
+                || (seg[0] & 0xff00) == 0xff00 // ff00::/8 multicast
+                || (seg[0] == 0x2001 && seg[1] == 0x0db8) // 2001:db8::/32 documentation
                 || (
                     seg[0] == 0x0064
                         && seg[1] == 0xff9b
@@ -1466,6 +1469,13 @@ mod tests {
             "::0808:0808",
             "2002:0a00:0001::1",
             "2001:0000:4136:e378:8000:63bf:3fff:fdd2",
+            "fec0::1",
+            "ff02::1",
+            "2001:db8::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "192.0.0.8",
+            "192.0.2.1",
         ] {
             assert!(
                 is_disallowed_ip(ip.parse().unwrap()),
@@ -1483,6 +1493,31 @@ mod tests {
                 "{ip} should be allowed"
             );
         }
+    }
+
+    /// The resolver behind every media fetch refuses a name that resolves to
+    /// a non-public address, including a single-label name, and returns the
+    /// addresses it checked (the client connects to exactly those).
+    #[tokio::test]
+    async fn resolver_refuses_names_that_resolve_to_non_public_addresses() {
+        use reqwest::dns::Resolve as _;
+        use std::str::FromStr as _;
+        let strict = SsrfResolver {
+            allow_private_hosts: false,
+        };
+        for name in ["localhost", "localhost."] {
+            let name = reqwest::dns::Name::from_str(name).unwrap();
+            assert!(strict.resolve(name).await.is_err());
+        }
+        let permissive = SsrfResolver {
+            allow_private_hosts: true,
+        };
+        let addrs: Vec<SocketAddr> = permissive
+            .resolve(reqwest::dns::Name::from_str("localhost").unwrap())
+            .await
+            .unwrap()
+            .collect();
+        assert!(addrs.iter().all(|a| a.ip().is_loopback()));
     }
 
     #[tokio::test]

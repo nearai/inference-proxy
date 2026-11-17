@@ -127,9 +127,10 @@ async fn serve(
         },
     )?;
     crate::model_list::apply_backend_lora(&state, &mut request_json);
-    // Bounds on sampling fields, `model` and content parts, and
-    // engine-internal fields stripped (`request_guard.rs`). On the decrypted
-    // body, before anything below reads it.
+    // First half of `forward_body::prepare`: bounds on sampling fields,
+    // `model` and content parts, and engine-internal fields stripped
+    // (`request_guard.rs`). On the decrypted body, before anything below
+    // reads it. Media inlining runs after the admission precheck below.
     state
         .config
         .request_guard
@@ -211,10 +212,11 @@ async fn serve(
         .backend_affinity
         .key_for_chat_request(&request_json, model.id);
 
-    // Air-gapped engines: download remote images/audio here and forward
-    // `data:` URLs, so the engine never needs the network (fail closed, off
-    // unless VLLM_PROXY_INLINE_MEDIA=1). Before validation, which then only
-    // sees local `data:` URLs.
+    // Second half of `forward_body::prepare` (the field rules ran above):
+    // download remote images/audio here and forward `data:` URLs, so the
+    // engine never needs the network (fail closed, off unless
+    // VLLM_PROXY_INLINE_MEDIA=1). Before validation, which then only sees
+    // local `data:` URLs.
     crate::media_inline::inline_remote_media(&mut request_json, &state.config.media_inline())
         .await?;
     crate::image_validation::reject_invalid_images(&request_json, &state.config.image_validation())

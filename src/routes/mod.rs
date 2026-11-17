@@ -64,6 +64,9 @@ pub fn build_app(state: AppState) -> Router {
     };
     let mut router = build_router_for(&state);
     if state.ohttp_gateway.is_some() {
+        router = router.layer(axum::Extension(ohttp::BufferBudget::new(
+            state.config.ohttp_buffer_budget,
+        )));
         if let Some(limit) = ohttp::OhttpRelayLimit::new(state.config.ohttp_max_inflight) {
             router = router.layer(axum::Extension(limit));
         }

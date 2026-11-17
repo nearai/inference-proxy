@@ -799,6 +799,8 @@ pub struct Config {
     /// past the cap the relay answers 429 with `Retry-After`. See
     /// `routes::ohttp::OhttpRelayLimit`.
     pub ohttp_max_inflight: usize,
+    pub ohttp_buffer_budget: usize,
+    pub ohttp_max_response_size: usize,
     /// Listen port for the proxy (used by OHTTP handler for loopback requests).
     pub listen_port: u16,
     /// Interface to bind (`LISTEN_ADDR`, default `0.0.0.0`). Gateway
@@ -1571,6 +1573,8 @@ impl Config {
             health_check_timeout_secs: env_int("HEALTH_CHECK_TIMEOUT_SECS", 3) as u64,
             ohttp_enabled: env_bool("OHTTP_ENABLED"),
             ohttp_max_inflight: env_parse("OHTTP_MAX_INFLIGHT", DEFAULT_OHTTP_MAX_INFLIGHT)?,
+            ohttp_buffer_budget: env_parse("OHTTP_BUFFER_BUDGET_BYTES", 256 * 1024 * 1024)?,
+            ohttp_max_response_size: env_parse("OHTTP_MAX_RESPONSE_BYTES", 32 * 1024 * 1024)?,
             listen_port,
             listen_addr,
             backend_token,

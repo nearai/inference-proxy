@@ -118,6 +118,8 @@ All configuration is via environment variables:
 | `VLLM_PROXY_MAX_REQUEST_SIZE` | No | `10485760` | Max JSON request body (bytes) |
 | `VLLM_PROXY_MAX_IMAGE_REQUEST_SIZE` | No | `52428800` | Max image request body (bytes) |
 | `VLLM_PROXY_MAX_AUDIO_REQUEST_SIZE` | No | `104857600` | Max audio request body (bytes) |
+| `OHTTP_BUFFER_BUDGET_BYTES` | No | `268435456` | Shared payload bytes for OHTTP requests and buffered standard responses. Capacity exhaustion returns 429. Allow additional memory for decoding and encryption. |
+| `OHTTP_MAX_RESPONSE_BYTES` | No | `33554432` | Maximum inner response body for standard OHTTP. Larger responses require chunked OHTTP. |
 | `VLLM_PROXY_IMAGE_VALIDATION_DISABLED` | No | `false` | Disable pre-dispatch image URL/data validation |
 | `VLLM_PROXY_IMAGE_VALIDATION_TIMEOUT_SECS` | No | `5` | Per-fetch timeout and semaphore acquire deadline for validation |
 | `VLLM_PROXY_IMAGE_VALIDATION_MAX_BYTES` | No | `8192` | Max fetched/decode-head bytes used for image sniffing |

@@ -41,9 +41,6 @@ pub const IMAGE_BOUNDED_FIELDS: &[&str] = &["n", "size", "num_inference_steps", 
 /// path, `ftp:`, ...) is refused.
 const ALLOWED_MEDIA_SCHEMES: &[&str] = &["http", "https", "data"];
 
-/// Content-part keys that carry a media URL.
-const MEDIA_PART_FIELDS: &[&str] = &["image_url", "video_url", "audio_url", "input_image"];
-
 /// Sampling floats that must be finite numbers. JSON has no NaN/Infinity, but
 /// the engines' pydantic models coerce strings such as `"nan"` and `"inf"`.
 const FINITE_FLOAT_FIELDS: &[&str] = &[
@@ -54,6 +51,19 @@ const FINITE_FLOAT_FIELDS: &[&str] = &[
     "frequency_penalty",
     "repetition_penalty",
 ];
+
+/// Fields that are a list of token ids, or a list of such lists.
+const COMPLETION_TOKEN_ID_LISTS: &[&str] = &["allowed_token_ids", "input_ids"];
+const PASSTHROUGH_TOKEN_ID_LISTS: &[&str] = &["label_token_ids", "query"];
+
+/// Fields that are one token id.
+const PASSTHROUGH_TOKEN_IDS: &[&str] = &["embed_override_token_id"];
+
+/// Fields that take text, a list of texts, a list of token ids or a list of
+/// token id lists.
+const COMPLETION_TEXT_OR_TOKEN_IDS: &[&str] = &["prompt"];
+const PASSTHROUGH_TEXT_OR_TOKEN_IDS: &[&str] =
+    &["input", "items", "text_1", "text_2", "queries", "documents"];
 
 /// Upper bound for token ids when the vocabulary size is not configured.
 const DEFAULT_TOKEN_ID_BOUND: u64 = 1 << 31;
@@ -78,7 +88,8 @@ pub struct RequestGuardConfig {
     pub max_stop_chars: usize,
     /// Entries in `stop_token_ids` (`VLLM_PROXY_MAX_STOP_TOKEN_IDS`, default 64).
     pub max_stop_token_ids: usize,
-    /// Token ids in `logit_bias` and `stop_token_ids` must be below this
+    /// Token ids in `logit_bias`, `stop_token_ids` and inputs sent as token
+    /// ids must be below this
     /// (`VLLM_PROXY_VOCAB_SIZE`; 0 = unset, ids only need to be in `[0, 2^31)`).
     pub vocab_size: u64,
     /// Characters in `model` (`VLLM_PROXY_MAX_MODEL_NAME_CHARS`, default 256).
@@ -199,20 +210,30 @@ impl RequestGuardConfig {
         }
     }
 
-    /// Chat and text completions: every rule. Returns whether the body was
-    /// changed (a field stripped). Runs on the body as it will be forwarded.
+    /// Chat, text completions and tokenize: every rule. Returns whether the
+    /// body was changed (a field stripped). Runs on the body as it will be
+    /// forwarded.
     pub fn apply_completion_body(&self, body: &mut Value) -> Result<bool, AppError> {
         if !self.enabled {
             return Ok(false);
         }
+        if !body.is_object() {
+            return Ok(false);
+        }
+        let cleaned = self.check_media(body)?;
         let Some(obj) = body.as_object() else {
             return Ok(false);
         };
         self.check_model(obj)?;
         self.check_sampling(obj)?;
-        self.check_messages(obj)?;
+        self.check_token_inputs(
+            obj,
+            &[],
+            COMPLETION_TOKEN_ID_LISTS,
+            COMPLETION_TEXT_OR_TOKEN_IDS,
+        )?;
         self.check_structured(obj)?;
-        Ok(self.strip(body))
+        Ok(self.strip(body) | cleaned)
     }
 
     /// Structured-output constraints anywhere outside the prompt: regexes,
@@ -284,17 +305,95 @@ impl RequestGuardConfig {
         })
     }
 
-    /// Embeddings, rerank, score and image generation: the `model` cap and
-    /// the stripped fields (the sampling rules do not apply to these bodies).
+    /// Embeddings, rerank, score, image generation and privacy classify: the
+    /// `model` cap, token id inputs, the content-part rules and the stripped
+    /// fields (the sampling rules do not apply to these bodies).
     pub fn apply_passthrough_body(&self, body: &mut Value) -> Result<bool, AppError> {
         if !self.enabled {
             return Ok(false);
         }
+        if !body.is_object() {
+            return Ok(false);
+        }
+        let cleaned = self.check_media(body)?;
         let Some(obj) = body.as_object() else {
             return Ok(false);
         };
         self.check_model(obj)?;
-        Ok(self.strip(body))
+        self.check_token_inputs(
+            obj,
+            PASSTHROUGH_TOKEN_IDS,
+            PASSTHROUGH_TOKEN_ID_LISTS,
+            PASSTHROUGH_TEXT_OR_TOKEN_IDS,
+        )?;
+        Ok(self.strip(body) | cleaned)
+    }
+
+    /// Inputs sent as token ids. In a list of ids every number, and every
+    /// string (the engines coerce numeric strings), must be a token id
+    /// (`valid_token_id`). `ids` are one id; `id_lists` are lists of ids or of
+    /// id lists; `text_or_ids` hold a list of ids unless every scalar entry
+    /// is a string, and lists of ids as entries. Text, lists of texts and
+    /// objects pass.
+    fn check_token_inputs(
+        &self,
+        body: &Map<String, Value>,
+        ids: &[&str],
+        id_lists: &[&str],
+        text_or_ids: &[&str],
+    ) -> Result<(), AppError> {
+        let is_id = |v: &Value| numeric(v).is_some_and(|x| self.valid_token_id(x));
+        let scalars_ok = |list: &[Value]| {
+            list.iter()
+                .all(|v| matches!(v, Value::Object(_) | Value::Array(_)) || is_id(v))
+        };
+        let bad = |field: &str| {
+            refuse(
+                "token_ids",
+                field,
+                format!(
+                    "Token ids in `{field}` must be non-negative integers within the model vocabulary."
+                ),
+            )
+        };
+        for field in ids {
+            if let Some(v @ (Value::Number(_) | Value::String(_))) = body.get(*field) {
+                if !is_id(v) {
+                    return Err(bad(field));
+                }
+            }
+        }
+        for field in id_lists {
+            let Some(Value::Array(list)) = body.get(*field) else {
+                continue;
+            };
+            let ok = list.iter().all(|item| match item {
+                Value::Array(inner) => scalars_ok(inner),
+                Value::Object(_) => true,
+                _ => is_id(item),
+            });
+            if !ok {
+                return Err(bad(field));
+            }
+        }
+        for field in text_or_ids {
+            let Some(Value::Array(list)) = body.get(*field) else {
+                continue;
+            };
+            // A flat list is text only when every scalar in it is a string.
+            let flat_ids = list
+                .iter()
+                .any(|v| matches!(v, Value::Number(_) | Value::Bool(_) | Value::Null));
+            let ok = list.iter().all(|item| match item {
+                Value::Array(inner) => scalars_ok(inner),
+                Value::Object(_) => true,
+                _ => !flat_ids || is_id(item),
+            });
+            if !ok {
+                return Err(bad(field));
+            }
+        }
+        Ok(())
     }
 
     /// Bounds on the image request fields of a JSON body (images/generations).
@@ -521,6 +620,16 @@ impl RequestGuardConfig {
             }
         }
 
+        if let Some(x) = body.get("top_k").and_then(numeric) {
+            if x.is_nan() || x < -1.0 || x > i32::MAX as f64 {
+                return Err(refuse(
+                    "top_k",
+                    "top_k",
+                    "`top_k` must be -1 or a non-negative 32-bit integer.".to_string(),
+                ));
+            }
+        }
+
         // The engines take `max_completion_tokens` over `max_tokens`.
         let max_tokens = ["max_completion_tokens", "max_tokens"]
             .iter()
@@ -566,33 +675,47 @@ impl RequestGuardConfig {
         Ok(())
     }
 
-    /// Content parts: the `uuid` cap and the media URL scheme.
-    fn check_messages(&self, body: &Map<String, Value>) -> Result<(), AppError> {
-        let Some(messages) = body.get("messages").and_then(Value::as_array) else {
-            return Ok(());
+    /// Content parts and input items on every route (`media_refs.rs`): the
+    /// `uuid` cap and the media URL scheme. A URL written with leading
+    /// whitespace, control characters or an upper-case scheme is rewritten to
+    /// its plain form, so the engine reads the value that was checked.
+    /// Returns whether the body changed.
+    fn check_media(&self, body: &mut Value) -> Result<bool, AppError> {
+        let too_deep = |_| {
+            refuse(
+                "media_depth",
+                "messages",
+                "The request input is nested too deeply.".to_string(),
+            )
         };
-        let parts = messages
-            .iter()
-            .filter_map(|m| m.get("content").and_then(Value::as_array))
-            .flatten()
-            .filter_map(Value::as_object);
-        for part in parts {
-            self.check_uuid(part)?;
-            for field in MEDIA_PART_FIELDS {
-                let url = match part.get(*field) {
-                    Some(Value::String(url)) => Some(url.as_str()),
-                    Some(Value::Object(media)) => {
-                        self.check_uuid(media)?;
-                        media.get("url").and_then(Value::as_str)
-                    }
-                    _ => None,
-                };
-                if let Some(url) = url {
-                    self.check_media_url(field, url)?;
+        for part in crate::media_refs::parts(body).map_err(too_deep)? {
+            self.check_uuid(part.obj)?;
+            for (key, _) in crate::media_refs::MEDIA_KEYS {
+                if let Some(Value::Object(media)) = part.obj.get(*key) {
+                    self.check_uuid(media)?;
                 }
             }
         }
-        Ok(())
+        let mut rewrites: Vec<(String, String)> = Vec::new();
+        for media in crate::media_refs::media_refs(body).map_err(too_deep)? {
+            let Some(url) = media.value.url() else {
+                continue;
+            };
+            if let Some(plain) = self.check_media_url(media.key, url)? {
+                let pointer = match media.value {
+                    crate::media_refs::MediaValue::Object(_) => format!("{}/url", media.pointer()),
+                    _ => media.pointer(),
+                };
+                rewrites.push((pointer, plain));
+            }
+        }
+        let changed = !rewrites.is_empty();
+        for (pointer, plain) in rewrites {
+            if let Some(slot) = body.pointer_mut(&pointer) {
+                *slot = Value::String(plain);
+            }
+        }
+        Ok(changed)
     }
 
     fn check_uuid(&self, obj: &Map<String, Value>) -> Result<(), AppError> {
@@ -614,23 +737,24 @@ impl RequestGuardConfig {
         Ok(())
     }
 
-    fn check_media_url(&self, field: &str, url: &str) -> Result<(), AppError> {
+    /// Checks the scheme of one media URL. Returns its plain form when the
+    /// value was not written that way.
+    fn check_media_url(&self, field: &str, url: &str) -> Result<Option<String>, AppError> {
         if !self.reject_local_media_urls {
-            return Ok(());
+            return Ok(None);
         }
-        let url = crate::image_validation::normalize_image_url_input(url);
-        let scheme = url
-            .split_once(':')
-            .map(|(s, _)| s.to_ascii_lowercase())
-            .unwrap_or_default();
-        if ALLOWED_MEDIA_SCHEMES.contains(&scheme.as_str()) {
-            return Ok(());
+        let normalized = crate::image_validation::normalize_image_url_input(url);
+        let (scheme, rest) = normalized.split_once(':').unwrap_or(("", ""));
+        let scheme = scheme.to_ascii_lowercase();
+        if !ALLOWED_MEDIA_SCHEMES.contains(&scheme.as_str()) {
+            return Err(refuse(
+                "media_url_scheme",
+                field,
+                format!("`{field}` must be an http, https or data URL."),
+            ));
         }
-        Err(refuse(
-            "media_url_scheme",
-            field,
-            format!("`{field}` must be an http, https or data URL."),
-        ))
+        let plain = format!("{scheme}:{rest}");
+        Ok((plain != url).then_some(plain))
     }
 }
 
@@ -658,6 +782,57 @@ mod tests {
         guard()
             .apply_completion_body(&mut body)
             .unwrap_or_else(|e| panic!("expected pass, got {e:?}"));
+    }
+
+    #[test]
+    fn media_urls_are_forwarded_in_their_plain_form() {
+        for (written, plain) in [
+            ("DATA:image/png;base64,AAAA", "data:image/png;base64,AAAA"),
+            (" data:image/png;base64,AAAA", "data:image/png;base64,AAAA"),
+            (
+                "\u{1}data:image/png;base64,AAAA",
+                "data:image/png;base64,AAAA",
+            ),
+            ("d\nata:image/png;base64,AAAA", "data:image/png;base64,AAAA"),
+            (
+                " HTTPS://media.example.com/a.png",
+                "https://media.example.com/a.png",
+            ),
+        ] {
+            let mut chat = json!({"messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": written}},
+                {"type": "video_url", "video_url": written},
+            ]}]});
+            assert!(guard().apply_completion_body(&mut chat).unwrap());
+            let parts = &chat["messages"][0]["content"];
+            assert_eq!(parts[0]["image_url"]["url"], plain);
+            assert_eq!(parts[1]["video_url"], plain);
+
+            let mut embed = json!({"input": [{"text": "a", "image": written}]});
+            assert!(guard().apply_passthrough_body(&mut embed).unwrap());
+            assert_eq!(embed["input"][0]["image"], plain);
+        }
+        // A plain value leaves the body as it was sent.
+        let mut plain = json!({"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]}]});
+        assert!(!guard().apply_completion_body(&mut plain).unwrap());
+    }
+
+    #[test]
+    fn message_fields_are_not_media() {
+        passes(json!({"messages": [
+            {"role": "user", "content": "hi", "image": "profile.png", "video": "clip"},
+        ]}));
+        // The same key in a content part or an input item is.
+        assert_eq!(
+            rejected_param(json!({"messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi", "image": "profile.png"}]},
+            ]})),
+            "image"
+        );
+        let mut item = json!({"input": [{"role": "user", "image": "profile.png"}]});
+        assert!(guard().apply_passthrough_body(&mut item).is_err());
     }
 
     #[test]
@@ -740,6 +915,117 @@ mod tests {
     }
 
     #[test]
+    fn token_id_inputs_are_bounded() {
+        let cfg = RequestGuardConfig {
+            vocab_size: 1000,
+            ..guard()
+        };
+        // Text completions and tokenize: `prompt` as ids or batches of ids.
+        for body in [
+            json!({"prompt": [1, 2, 1000]}),
+            json!({"prompt": [[1, 2], [3, 1000]]}),
+            json!({"prompt": [-1]}),
+            json!({"prompt": [1.5]}),
+            json!({"prompt": [1e30]}),
+            json!({"prompt": "x", "allowed_token_ids": [5, 1000]}),
+            // Numeric strings count as ids wherever the list holds ids.
+            json!({"prompt": [1, "1000"]}),
+            json!({"prompt": [1, "-1"]}),
+            json!({"prompt": [[1, "-1"]]}),
+            json!({"prompt": [["1000"]]}),
+            json!({"prompt": [1, "1_000"]}),
+            json!({"prompt": ["1000", true]}),
+            json!({"prompt": ["-1", null]}),
+            json!({"prompt": [true]}),
+            json!({"messages": [], "input_ids": [1, 1000]}),
+            json!({"messages": [], "input_ids": ["-1"]}),
+            json!({"prompt": "x", "allowed_token_ids": ["-1"]}),
+            json!({"prompt": "x", "allowed_token_ids": [true]}),
+        ] {
+            let mut b = body.clone();
+            match cfg.apply_completion_body(&mut b) {
+                Err(AppError::InvalidParam { .. }) => {}
+                other => panic!("{body}: {other:?}"),
+            }
+        }
+        for body in [
+            json!({"prompt": [0, 1, 999]}),
+            json!({"prompt": [[1, 2], [3, 999]]}),
+            json!({"prompt": "1000 1001"}),
+            json!({"prompt": ["text", "1000"]}),
+            json!({"prompt": []}),
+            json!({"prompt": "x", "allowed_token_ids": [5, 999]}),
+            json!({"prompt": [1, "999"]}),
+            json!({"prompt": ["-1", "text"]}),
+            json!({"prompt": "x", "allowed_token_ids": ["999"]}),
+            json!({"messages": [], "input_ids": [1, 999]}),
+            json!({"messages": [{"role": "user", "content": "hi"}]}),
+        ] {
+            let mut b = body.clone();
+            assert!(cfg.apply_completion_body(&mut b).is_ok(), "{body}");
+        }
+
+        // Embeddings, rerank and score.
+        for body in [
+            json!({"input": [1, 1000]}),
+            json!({"input": [[1], [1000]]}),
+            json!({"input": ["1000", false]}),
+            json!({"query": [1000], "items": ["a"]}),
+            json!({"query": "q", "items": [[1, 2], [1000]]}),
+            json!({"query": "q", "items": ["a"], "label_token_ids": [1, -5]}),
+            json!({"query": "q", "items": ["a"], "label_token_ids": ["-5"]}),
+            json!({"query": ["-1"], "items": ["a"]}),
+            json!({"query": "q", "items": ["a"], "label_token_ids": [[1], [-7]]}),
+            json!({"query": "q", "items": ["a"], "label_token_ids": [["1000"]]}),
+            json!({"input": "a", "embed_override_token_id": -1}),
+            json!({"input": "a", "embed_override_token_id": "1000"}),
+            json!({"query": "q", "items": [["1", "-1"]]}),
+            json!({"text_1": [1, 1000], "text_2": "b"}),
+            json!({"text_1": "a", "text_2": [[1000]]}),
+            json!({"queries": [[-1]], "documents": ["a"]}),
+            json!({"query": "q", "documents": [1, "1000"]}),
+        ] {
+            let mut b = body.clone();
+            assert!(cfg.apply_passthrough_body(&mut b).is_err(), "{body}");
+        }
+        for body in [
+            json!({"input": "text"}),
+            json!({"input": ["a", "b"]}),
+            json!({"input": [1, 999]}),
+            json!({"input": [[1], [999]]}),
+            json!({"input": [{"text": "a"}, {"image": "https://example.com/a.png"}]}),
+            json!({"query": "q", "documents": ["a", "b"]}),
+            json!({"query": [1, 2], "items": [[3], [4]], "label_token_ids": [5, 6]}),
+            json!({"query": {"content": [{"type": "text", "text": "q"}]}, "documents": ["a"]}),
+            json!({"text_1": "a", "text_2": ["b", "-1"]}),
+            json!({"query": "q", "documents": ["1000", "2000"]}),
+            json!({"input": [[{"type": "text", "text": "a"}]]}),
+            json!({"query": "q", "items": ["a"], "label_token_ids": [[1, 2], [3]]}),
+            json!({"input": "a", "embed_override_token_id": 999}),
+            json!({"query": [{"type": "text", "text": "q"}],
+                "documents": [[{"type": "text", "text": "d"}], "plain"]}),
+        ] {
+            let mut b = body.clone();
+            assert!(cfg.apply_passthrough_body(&mut b).is_ok(), "{body}");
+        }
+
+        // Without a configured vocabulary size ids only need to fit 31 bits.
+        passes(json!({"prompt": [1000, 2147483647]}));
+        assert_eq!(rejected_param(json!({"prompt": [2147483648u64]})), "prompt");
+        assert_eq!(
+            rejected_param(json!({"prompt": [9223372036854775808u64]})),
+            "prompt"
+        );
+        let mut body = json!({"prompt": [-1]});
+        assert!(RequestGuardConfig {
+            enabled: false,
+            ..guard()
+        }
+        .apply_completion_body(&mut body)
+        .is_ok());
+    }
+
+    #[test]
     fn vocab_size_bounds_token_ids() {
         let cfg = RequestGuardConfig {
             vocab_size: 1000,
@@ -808,6 +1094,29 @@ mod tests {
     }
 
     #[test]
+    fn top_k_outside_the_32_bit_range_is_rejected() {
+        for bad in [
+            json!(-2),
+            json!(2147483648u64),
+            json!(1e30),
+            json!("2147483648"),
+            json!("nan"),
+        ] {
+            assert_eq!(rejected_param(json!({ "top_k": bad })), "top_k");
+        }
+        for ok in [
+            json!(-1),
+            json!(0),
+            json!(40),
+            json!(2147483647),
+            json!("40"),
+            json!(null),
+        ] {
+            passes(json!({ "top_k": ok }));
+        }
+    }
+
+    #[test]
     fn min_tokens_must_not_exceed_max_tokens() {
         assert_eq!(
             rejected_param(json!({"min_tokens": 10, "max_tokens": 5})),
@@ -866,6 +1175,40 @@ mod tests {
         passes(json!({"messages": [{"role": "user", "content": [
             {"type": "video_url", "video_url": {"url": "HTTPS://example.com/v.mp4"}}
         ]}]}));
+    }
+
+    #[test]
+    fn media_url_scheme_applies_to_every_input_shape() {
+        let g = guard();
+        let bad = "file:///etc/passwd";
+        for mut body in [
+            json!({"messages": [{"role": "user", "content": [{"image_url": bad}]}]}),
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "text", "text": "x", "uuid": "1", "video_url": {"url": bad}}]}]}),
+            json!({"messages": [[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": bad}}]}]]}),
+        ] {
+            assert!(g.apply_completion_body(&mut body).is_err(), "{body}");
+        }
+        for mut body in [
+            json!({"input": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": bad}}]}]}),
+            json!({"messages": [{"role": "user", "content": [{"type": "audio_url", "audio_url": {"url": bad}}]}]}),
+            json!({"input": [{"text": "a", "image": "/etc/passwd"}]}),
+            json!({"input": [{"video": bad}]}),
+            json!({"query": {"content": [{"type": "image_url", "image_url": {"url": bad}}]}, "documents": ["d"]}),
+            json!({"query": "q", "documents": [[{"type": "video_url", "video_url": {"url": bad}}]]}),
+            json!({"text_1": "a", "text_2": [{"content": [{"image_url": bad}]}]}),
+            json!({"data_1": "a", "data_2": {"content": [{"image_url": {"url": bad}}]}}),
+            json!({"input": [{"image": bad, "content": "x"}]}),
+            json!({"documents": [[{"type": "image_url", "image_url": {"url": bad}, "role": "x"}]]}),
+        ] {
+            assert!(g.apply_passthrough_body(&mut body).is_err(), "{body}");
+        }
+        let mut ok = json!({"input": [{"image": "https://example.com/a.png"}],
+            "query": {"content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]}});
+        assert!(g.apply_passthrough_body(&mut ok).is_ok());
+        let mut long_uuid = json!({"documents": [{"content": [
+            {"type": "image_url", "image_url": {"url": "data:,"}, "uuid": "u".repeat(257)}]}]});
+        assert!(g.apply_passthrough_body(&mut long_uuid).is_err());
     }
 
     #[test]

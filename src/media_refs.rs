@@ -15,7 +15,8 @@
 //!   `text_2`, `data_1`, `data_2`) holding `{"content": [parts]}`, a list of
 //!   parts, or lists of those.
 //!
-//! Only these input fields are walked, and inside a message only `content`:
+//! Only these input fields are walked, and inside a message only `content`
+//! (and a `reasoning` given as a part):
 //! a tool schema or tool-call arguments with a property named `image_url` are
 //! not media, and neither is another key of an entry of `messages`.
 
@@ -212,14 +213,17 @@ fn walk_input<'a>(
             // A content part, an embedding item (`{"text", "image",
             // "video"}`), a chat message or a `{"content": [...]}` input.
             // Whatever sits under `content` is a part or a list of parts.
-            if let Some(content) = obj.get("content") {
-                walk_input(
-                    content,
-                    format!("{pointer}/content"),
-                    Holder::Item,
-                    depth + 1,
-                    out,
-                )?;
+            // A message's `reasoning` can be a part too.
+            for key in ["content", "reasoning", "reasoning_content"] {
+                if let Some(inner) = obj.get(key) {
+                    walk_input(
+                        inner,
+                        format!("{pointer}/{key}"),
+                        Holder::Item,
+                        depth + 1,
+                        out,
+                    )?;
+                }
             }
             // Outside `messages` the object itself may carry a media key
             // (the engines ignore keys they do not know, so a `role` or
@@ -249,6 +253,35 @@ mod tests {
             .into_iter()
             .map(|r| (r.pointer(), r.key, r.value.url().map(str::to_string)))
             .collect()
+    }
+
+    #[test]
+    fn a_part_under_reasoning_is_walked() {
+        let found = urls(json!({"messages": [{
+            "role": "assistant",
+            "content": "a",
+            "reasoning": {"type": "prompt_embeds", "image_url": "https://media.example.com/a.png"},
+            "reasoning_content": [{"video_url": {"url": "https://media.example.com/b.mp4"}}],
+        }]}));
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "/messages/0/reasoning/image_url".to_string(),
+                    "image_url",
+                    Some("https://media.example.com/a.png".to_string())
+                ),
+                (
+                    "/messages/0/reasoning_content/0/video_url".to_string(),
+                    "video_url",
+                    Some("https://media.example.com/b.mp4".to_string())
+                ),
+            ]
+        );
+        // Text reasoning is not a part.
+        assert!(
+            urls(json!({"messages": [{"role": "assistant", "reasoning": "image_url"}]})).is_empty()
+        );
     }
 
     #[test]

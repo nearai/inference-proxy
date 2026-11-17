@@ -31,7 +31,7 @@ Rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-proxy) (Python).
 | POST | `/v1/images/edits` | Yes | Image editing (multipart). A form field outside the supported list (`IMAGE_EDIT_FORM_FIELDS`) is a 400 |
 | POST | `/v1/audio/transcriptions` | Yes | Audio transcription (multipart). A form field outside the supported list (`AUDIO_TRANSCRIPTION_FORM_FIELDS`) is a 400 |
 | GET | `/v1/signature/{chat_id}` | Yes | Retrieve cached signature |
-| GET | `/v1/attestation/report` | No | TEE attestation report |
+| GET | `/v1/attestation/report` | No | TEE attestation report. Cached reports remain available when fresh requests are at capacity. |
 | POST | `/internal/gpu_evidence` | Trusted token | Sibling-proxy GPU evidence |
 
 All other paths return `404` locally. They are never forwarded to the backend
@@ -118,6 +118,8 @@ All configuration is via environment variables:
 | `VLLM_PROXY_MAX_REQUEST_SIZE` | No | `10485760` | Max JSON request body (bytes) |
 | `VLLM_PROXY_MAX_IMAGE_REQUEST_SIZE` | No | `52428800` | Max image request body (bytes) |
 | `VLLM_PROXY_MAX_AUDIO_REQUEST_SIZE` | No | `104857600` | Max audio request body (bytes) |
+| `OHTTP_BUFFER_BUDGET_BYTES` | No | `268435456` | Shared payload bytes for OHTTP requests and buffered standard responses. Capacity exhaustion returns 429. Allow additional memory for decoding and encryption. |
+| `OHTTP_MAX_RESPONSE_BYTES` | No | `33554432` | Maximum inner response body for standard OHTTP. Larger responses require chunked OHTTP. |
 | `VLLM_PROXY_IMAGE_VALIDATION_DISABLED` | No | `false` | Disable pre-dispatch image URL/data validation |
 | `VLLM_PROXY_IMAGE_VALIDATION_TIMEOUT_SECS` | No | `5` | Per-fetch timeout and semaphore acquire deadline for validation |
 | `VLLM_PROXY_IMAGE_VALIDATION_MAX_BYTES` | No | `8192` | Max fetched/decode-head bytes used for image sniffing |
@@ -133,6 +135,7 @@ All configuration is via environment variables:
 | `VLLM_BACKEND_TOKEN` | No | unset | Bearer attached to backend requests only (gateway mode: the backends are CVM inference-proxies and accept it as a trusted config token). Never sent to cloud-api |
 | `VLLM_BACKEND_PRIORITY` | No | unset | Gateway mode: engine priority for this proxy's traffic, sent as `X-NearAI-Priority` on every backend request (e.g. `-1` for the OpenRouter lane). The CVM proxy honors the header only from callers using its `TOKEN`; it sets `priority` on every chat/completions body itself (header value or 0), discarding client values |
 | `VLLM_BACKEND_HEALTH_PATH` | No | `/health` | Path probed by the pool health checker and `/healthz` |
+| `ATTESTATION_MAX_INFLIGHT` | No | `5` | Maximum fresh public attestation requests per process, including requests waiting for GPU collection. At capacity the endpoint returns 429 with `Retry-After: 2`. Must be positive. |
 | `NON_TEE_DEPLOYMENT` | No | `false` | This proxy runs outside a TEE: `/healthz` skips the dstack probe, the attestation cache refresh is not started, and `/v1/attestation/report`, `/v1/signature/{id}`, `/internal/gpu_evidence` return 404 |
 | `VLLM_PROXY_PRIORITY_LOWER_FIRST` | No | `false` | The engine runs the lowest `priority` first (vLLM `--scheduling-policy priority`): the proxy writes the negated value, so `X-NearAI-Priority` keeps one meaning (higher = more important; the OpenRouter lane's `-1` and reseller orgs' `-2` run after cloud-api's 0) on SGLang and vLLM. Leave off for SGLang |
 | `VLLM_PROXY_PRIORITY_SIZE_TIERS` | No | unset (off) | CVM proxy only: size bonus on the engine `priority`, `MAX_TOKENS:BONUS,...,*:BONUS` (e.g. `16000:10,65536:5,*:0`; estimated prompt tokens, ascending, inclusive; bonus 0-99; last entry `*`; malformed = startup error). Engine value = caller class × 100 + bonus, then `VLLM_PROXY_PRIORITY_LOWER_FIRST` negation, so short prompts run first within a class and never outrank a higher class. Set it only on proxies whose engine runs priority scheduling (SGLang `--enable-priority-scheduling`; vLLM `--scheduling-policy priority`); see docs/gateway-mode.md §Priority for the preemption-threshold interaction |

@@ -11,22 +11,14 @@ use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageTyp
 use crate::routes::chat::read_body_with_limit;
 use crate::{AppState, TracingIds};
 
-const EXCLUDED_REQUEST_HEADERS: &[&str] = &[
-    "host",
-    "content-length",
-    "transfer-encoding",
-    "connection",
-    "keep-alive",
-    "te",
-    "trailer",
-    "upgrade",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "authorization",
-    "x-request-id",
-    "x-org-id",
-    "x-workspace-id",
-    crate::vllm_dp_affinity::DATA_PARALLEL_RANK_HEADER,
+const FORWARDED_REQUEST_HEADERS: &[&str] = &[
+    "content-type",
+    "content-encoding",
+    "accept",
+    "x-signing-algo",
+    "x-client-pub-key",
+    "x-encryption-version",
+    "x-encrypt-all-fields",
 ];
 
 const EXCLUDED_RESPONSE_HEADERS: &[&str] = &[
@@ -81,7 +73,7 @@ pub async fn classify(
 
     let mut request = state.backend_client.post(&backend_url);
     for (name, value) in &headers {
-        if !EXCLUDED_REQUEST_HEADERS.contains(&name.as_str()) {
+        if FORWARDED_REQUEST_HEADERS.contains(&name.as_str()) {
             request = request.header(name, value);
         }
     }

@@ -621,7 +621,7 @@ impl RequestGuardConfig {
         }
 
         if let Some(x) = body.get("top_k").and_then(numeric) {
-            if x.is_nan() || x < -1.0 || x > i32::MAX as f64 {
+            if x.is_nan() || x.fract() != 0.0 || x < -1.0 || x > i32::MAX as f64 {
                 return Err(refuse(
                     "top_k",
                     "top_k",
@@ -1101,6 +1101,9 @@ mod tests {
             json!(1e30),
             json!("2147483648"),
             json!("nan"),
+            json!(1.5),
+            json!(-0.5),
+            json!("1.5"),
         ] {
             assert_eq!(rejected_param(json!({ "top_k": bad })), "top_k");
         }
@@ -1109,6 +1112,7 @@ mod tests {
             json!(0),
             json!(40),
             json!(2147483647),
+            json!(40.0),
             json!("40"),
             json!(null),
         ] {

@@ -165,11 +165,7 @@ pub(crate) fn sanitized_upstream_url_for_logs(url: &str) -> String {
             parsed.set_fragment(None);
             parsed.to_string()
         }
-        Err(_) => url
-            .split(['?', '#'])
-            .next()
-            .unwrap_or("<invalid upstream url>")
-            .to_string(),
+        Err(_) => "<invalid upstream url>".to_string(),
     }
 }
 

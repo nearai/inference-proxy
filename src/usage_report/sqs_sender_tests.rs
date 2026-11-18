@@ -41,9 +41,7 @@ pub(super) fn counter(recorder: &PrometheusRecorder, family: &str, label: &str) 
 
 /// `2026-10-20T12:00:00Z`, the time every signature here is made at.
 fn fixed_time() -> SystemTime {
-    let timestamp = "2026-10-20T12:00:00Z".parse::<Timestamp>().unwrap();
-
-    SystemTime::try_from(timestamp).unwrap()
+    SystemTime::from("2026-10-20T12:00:00Z".parse::<Timestamp>().unwrap())
 }
 
 /// A sender against `endpoint` (a stand-in for SQS), holding credentials
@@ -194,6 +192,7 @@ async fn sqs_send_is_signed_and_carries_the_http_usage_body() {
             panic!("a usage message");
         };
         assert_eq!(envelope.v, 1);
+        assert_eq!(SystemTime::from(envelope.emitted_at), fixed_time());
         assert_eq!(envelope.producer, Producer::OpenrouterGateway);
         assert_eq!(
             serde_json::to_value(&envelope.usage).unwrap(),
@@ -244,6 +243,17 @@ fn the_queue_carries_the_body_the_proxy_builds_for_each_usage_type() {
         };
         assert_eq!(serde_json::to_value(&envelope.usage).unwrap(), body);
     }
+}
+
+#[test]
+fn an_out_of_range_event_timestamp_is_refused() {
+    let mut job = job_with(
+        &chat_body("chatcmpl-1"),
+        &Arc::new(UsageReportDelivery::default()),
+    );
+    job.emitted_at = SystemTime::from(Timestamp::MAX) + Duration::from_secs(1);
+    let refused = message_body(&job).unwrap_err();
+    assert_eq!(refused.reason, "sqs_invalid");
 }
 
 /// A field the usage schema does not carry is refused as a final
@@ -307,9 +317,7 @@ fn sigv4_matches_aws_test_vector() {
         "test",
     );
     let identity = credentials.into();
-    let timestamp = "2015-08-30T12:36:00Z".parse::<Timestamp>().unwrap();
-    let time = SystemTime::try_from(timestamp).unwrap();
-
+    let time = SystemTime::from("2015-08-30T12:36:00Z".parse::<Timestamp>().unwrap());
     let params = v4::SigningParams::builder()
         .identity(&identity)
         .region("us-east-1")

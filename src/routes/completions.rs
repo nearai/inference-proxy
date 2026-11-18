@@ -101,6 +101,8 @@ async fn serve(
             crate::model_list::checked_model(&state, model.id)
         },
     )?;
+    // See the chat route: engine-crashing sampling parameters are a 400.
+    crate::sampling_params::validate_completion(&request_json)?;
     crate::model_list::apply_backend_lora(&state, &mut request_json);
     // The field rules and media inlining (`forward_body.rs`); the body is
     // re-serialized below in any case.

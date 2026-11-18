@@ -340,9 +340,13 @@ pub(crate) async fn read_bounded(
 }
 
 fn parse_expiration(text: &str) -> Result<SystemTime, String> {
+    let invalid = "credentials endpoint gave an Expiration that is not RFC 3339";
+    if !matches!(text.as_bytes().get(10), Some(b'T' | b't' | b' ')) {
+        return Err(invalid.to_owned());
+    }
     OffsetDateTime::parse(text, &Rfc3339)
         .map(SystemTime::from)
-        .map_err(|_| "credentials endpoint gave an Expiration that is not RFC 3339".to_string())
+        .map_err(|_| invalid.to_owned())
 }
 
 /// Mocks of an IMDSv2 endpoint, shared with the sender's tests.
@@ -425,6 +429,7 @@ mod tests {
     fn expiration_must_be_rfc3339() {
         assert!(parse_expiration("2026-10-20T12:00:00Z").is_ok());
         assert!(parse_expiration("tomorrow").is_err());
+        assert!(parse_expiration("2026-10-20X12:00:00Z").is_err());
     }
 
     /// The full IMDSv2 flow against a server that, like `aws_signing_helper

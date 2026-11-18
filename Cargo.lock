@@ -697,8 +697,8 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cloud-platform-events"
-version = "2.0.0"
-source = "git+https://github.com/nearai/cloud-platform-events?tag=v2.1.0#ab70e1ae6af60b9746bb62dede3834d403220c3f"
+version = "2.1.0"
+source = "git+https://github.com/nearai/cloud-platform-events?tag=v2.1.0#1b6db24cb09947962b805cff17005054ca17d10d"
 dependencies = [
  "jiff",
  "serde",

@@ -1102,7 +1102,7 @@ pub(crate) fn spawn_usage_report(reporter: &UsageReporter, mut body: serde_json:
     reporter.delivery.submit(crate::usage_report::Job {
         body: payload,
         completed_at: std::time::Instant::now(),
-        emitted_at: chrono::Utc::now(),
+        emitted_at: std::time::SystemTime::now(),
         reporter: reporter.clone(),
     });
 }

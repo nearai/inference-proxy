@@ -30,8 +30,8 @@
 use std::time::{Duration, SystemTime};
 
 use aws_credential_types::Credentials;
-use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 /// A client that treats a 3xx as the answer it is. The metadata requests carry
 /// a session token in a custom header, which reqwest's redirect handling does
@@ -340,8 +340,8 @@ pub(crate) async fn read_bounded(
 }
 
 fn parse_expiration(text: &str) -> Result<SystemTime, String> {
-    DateTime::parse_from_rfc3339(text)
-        .map(|time| SystemTime::from(time.with_timezone(&Utc)))
+    OffsetDateTime::parse(text, &Rfc3339)
+        .map(SystemTime::from)
         .map_err(|_| "credentials endpoint gave an Expiration that is not RFC 3339".to_string())
 }
 
@@ -407,7 +407,7 @@ mod tests {
             "SecretAccessKey": "secret",
             "Token": "session-token",
             "Code": "Success",
-            "Expiration": (Utc::now() + chrono::TimeDelta::hours(1)).to_rfc3339(),
+            "Expiration": (OffsetDateTime::now_utc() + Duration::from_secs(3600)).format(&Rfc3339).unwrap(),
         })
     }
 

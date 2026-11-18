@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use aws_credential_types::Credentials;
 use bytes::Bytes;
@@ -40,11 +41,7 @@ pub(super) fn counter(recorder: &PrometheusRecorder, family: &str, label: &str) 
 
 /// `2026-10-20T12:00:00Z`, the time every signature here is made at.
 fn fixed_time() -> SystemTime {
-    SystemTime::from(
-        chrono::DateTime::parse_from_rfc3339("2026-10-20T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc),
-    )
+    SystemTime::from(OffsetDateTime::parse("2026-10-20T12:00:00Z", &Rfc3339).unwrap())
 }
 
 /// A sender against `endpoint` (a stand-in for SQS), holding credentials
@@ -122,9 +119,7 @@ pub(super) fn job_with(body: &Value, delivery: &Arc<UsageReportDelivery>) -> Job
         },
         body: Bytes::from(serde_json::to_vec(body).unwrap()),
         completed_at: Instant::now(),
-        emitted_at: chrono::DateTime::parse_from_rfc3339("2026-10-20T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc),
+        emitted_at: fixed_time(),
     }
 }
 
@@ -310,11 +305,7 @@ fn sigv4_matches_aws_test_vector() {
         "test",
     );
     let identity = credentials.into();
-    let time = SystemTime::from(
-        chrono::DateTime::parse_from_rfc3339("2015-08-30T12:36:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc),
-    );
+    let time = SystemTime::from(OffsetDateTime::parse("2015-08-30T12:36:00Z", &Rfc3339).unwrap());
     let params = v4::SigningParams::builder()
         .identity(&identity)
         .region("us-east-1")
@@ -596,7 +587,9 @@ async fn an_unreachable_queue_is_a_retryable_connect_error() {
 async fn endpoint_credentials_are_cached_until_near_expiry_and_sent_as_a_session() {
     let server = MockServer::start().await;
     mount_imds_session(&server).await;
-    let in_an_hour = (chrono::Utc::now() + chrono::TimeDelta::hours(1)).to_rfc3339();
+    let in_an_hour = (OffsetDateTime::now_utc() + Duration::from_secs(3600))
+        .format(&Rfc3339)
+        .unwrap();
     Mock::given(method("GET"))
         .and(path(ROLE_CREDENTIALS_PATH))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -648,7 +641,9 @@ async fn endpoint_credentials_are_cached_until_near_expiry_and_sent_as_a_session
 async fn endpoint_credentials_due_for_refresh_are_fetched_again() {
     let server = MockServer::start().await;
     mount_imds_session(&server).await;
-    let in_a_minute = (chrono::Utc::now() + chrono::TimeDelta::minutes(1)).to_rfc3339();
+    let in_a_minute = (OffsetDateTime::now_utc() + Duration::from_secs(60))
+        .format(&Rfc3339)
+        .unwrap();
     Mock::given(method("GET"))
         .and(path(ROLE_CREDENTIALS_PATH))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -729,7 +724,9 @@ fn the_transport_gauge_names_a_non_default_transport_only() {
 async fn refused_credentials_are_forgotten_and_fetched_again() {
     let server = MockServer::start().await;
     mount_imds_session(&server).await;
-    let in_an_hour = (chrono::Utc::now() + chrono::TimeDelta::hours(1)).to_rfc3339();
+    let in_an_hour = (OffsetDateTime::now_utc() + Duration::from_secs(3600))
+        .format(&Rfc3339)
+        .unwrap();
     Mock::given(method("GET"))
         .and(path(ROLE_CREDENTIALS_PATH))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -798,7 +795,9 @@ async fn credentials_endpoint_failures_are_retried_and_nothing_is_sent() {
 async fn one_attempt_has_one_timeout_across_credentials_and_send() {
     let creds = MockServer::start().await;
     mount_imds_session(&creds).await;
-    let in_an_hour = (chrono::Utc::now() + chrono::TimeDelta::hours(1)).to_rfc3339();
+    let in_an_hour = (OffsetDateTime::now_utc() + Duration::from_secs(3600))
+        .format(&Rfc3339)
+        .unwrap();
     Mock::given(method("GET"))
         .and(path(ROLE_CREDENTIALS_PATH))
         .respond_with(
@@ -887,7 +886,9 @@ async fn an_oversize_report_is_refused_at_submit_and_counted() {
 async fn a_denied_fresh_session_is_retried_with_new_credentials() {
     let creds = MockServer::start().await;
     mount_imds_session(&creds).await;
-    let in_an_hour = (chrono::Utc::now() + chrono::TimeDelta::hours(1)).to_rfc3339();
+    let in_an_hour = (OffsetDateTime::now_utc() + Duration::from_secs(3600))
+        .format(&Rfc3339)
+        .unwrap();
     Mock::given(method("GET"))
         .and(path(ROLE_CREDENTIALS_PATH))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({

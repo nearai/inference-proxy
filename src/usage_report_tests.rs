@@ -1461,7 +1461,7 @@ fn http_job(billing: &Billing) -> Job {
         reporter,
         body: bytes::Bytes::from_static(br#"{"id":"report-1"}"#),
         completed_at: Instant::now(),
-        emitted_at: chrono::Utc::now(),
+        emitted_at: std::time::SystemTime::now(),
     }
 }
 

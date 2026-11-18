@@ -8,6 +8,7 @@ use tokio::net::UnixStream;
 use tracing::warn;
 
 use crate::backend_pool::BackendGuard;
+use crate::proxy::sanitized_upstream_url_for_logs;
 use crate::AppState;
 
 /// GET / → {}
@@ -259,7 +260,7 @@ async fn check_backend(
             // keep-alive pool. Without this, every probe opens a new TCP +
             // TLS connection — wasteful at the 5s interval model-proxy uses.
             if let Err(e) = resp.bytes().await {
-                warn!(check = "backend", url = %url, error = %e, "drain failed");
+                warn!(check = "backend", url = %sanitized_upstream_url_for_logs(&url), error = %e.without_url(), "drain failed");
                 return Err(BACKEND_UNREACHABLE);
             }
             Ok(())
@@ -267,20 +268,20 @@ async fn check_backend(
         Ok(resp) => {
             let status = resp.status();
             let _ = resp.bytes().await;
-            warn!(check = "backend", url = %url, status = %status, "backend returned non-success");
+            warn!(check = "backend", url = %sanitized_upstream_url_for_logs(&url), status = %status, "backend returned non-success");
             Err(http_status_token(status))
         }
         Err(e) if e.is_timeout() => {
             warn!(
                 check = "backend",
-                url = %url,
+                url = %sanitized_upstream_url_for_logs(&url),
                 timeout_ms = BACKEND_PROBE_TIMEOUT.as_millis() as u64,
                 "backend probe timed out"
             );
             Err(BACKEND_TIMEOUT)
         }
         Err(e) => {
-            warn!(check = "backend", url = %url, error = %e, "backend probe failed");
+            warn!(check = "backend", url = %sanitized_upstream_url_for_logs(&url), error = %e.without_url(), "backend probe failed");
             Err(BACKEND_UNREACHABLE)
         }
     }

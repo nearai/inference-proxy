@@ -3,6 +3,7 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
+use crate::proxy::sanitized_upstream_url_for_logs;
 
 #[cfg(test)]
 #[path = "startup_checks_tests.rs"]
@@ -65,7 +66,7 @@ pub async fn run_startup_checks(
     config: &Config,
 ) -> Result<(), StartupCheckError> {
     info!(
-        backends = ?config.backend_urls,
+        backend_count = config.backend_urls.len(),
         model = %config.model_name,
         retries = config.startup_check_retries,
         retry_delay_secs = config.startup_check_retry_delay_secs,
@@ -90,7 +91,7 @@ pub async fn run_startup_checks(
         let models_url = format!("{base}/v1/models");
         let chat_url = format!("{base}/v1/chat/completions");
 
-        info!(backend = %base_url, "Checking backend...");
+        info!(backend = %sanitized_upstream_url_for_logs(base_url), "Checking backend...");
 
         // Check 1: /v1/models — backend reachable, model loaded
         if let Err(e) = run_with_retries("models", retries, delay, || {
@@ -98,7 +99,7 @@ pub async fn run_startup_checks(
         })
         .await
         {
-            warn!(backend = %base_url, error = %e, "Backend failed models check");
+            warn!(backend = %sanitized_upstream_url_for_logs(base_url), error = %e, "Backend failed models check");
             last_error = Some(e);
             continue;
         }
@@ -109,7 +110,7 @@ pub async fn run_startup_checks(
         })
         .await
         {
-            warn!(backend = %base_url, error = %e, "Backend failed chat completions check");
+            warn!(backend = %sanitized_upstream_url_for_logs(base_url), error = %e, "Backend failed chat completions check");
             last_error = Some(e);
             continue;
         }
@@ -120,12 +121,12 @@ pub async fn run_startup_checks(
         })
         .await
         {
-            warn!(backend = %base_url, error = %e, "Backend failed streaming check");
+            warn!(backend = %sanitized_upstream_url_for_logs(base_url), error = %e, "Backend failed streaming check");
             last_error = Some(e);
             continue;
         }
 
-        info!(backend = %base_url, "All checks passed");
+        info!(backend = %sanitized_upstream_url_for_logs(base_url), "All checks passed");
         any_passed = true;
     }
 
@@ -204,7 +205,7 @@ async fn check_models(
     expected_model: &str,
     timeout: Duration,
 ) -> Result<(), StartupCheckError> {
-    info!(url = %models_url, "Checking /v1/models endpoint...");
+    info!(url = %sanitized_upstream_url_for_logs(models_url), "Checking /v1/models endpoint...");
 
     let start = std::time::Instant::now();
     let response = client
@@ -213,21 +214,22 @@ async fn check_models(
         .send()
         .await
         .map_err(|e| {
+            let e = e.without_url();
             error!(
-                url = %models_url,
+                url = %sanitized_upstream_url_for_logs(models_url),
                 elapsed_ms = start.elapsed().as_millis() as u64,
                 error = %e,
                 "Failed to connect to backend /v1/models"
             );
             StartupCheckError::ConnectionFailed {
-                url: models_url.to_string(),
-                source: e,
+                url: sanitized_upstream_url_for_logs(models_url),
+                source: e.without_url(),
             }
         })?;
 
     let status = response.status();
     debug!(
-        url = %models_url,
+        url = %sanitized_upstream_url_for_logs(models_url),
         status = status.as_u16(),
         elapsed_ms = start.elapsed().as_millis() as u64,
         "Received /v1/models response"
@@ -236,14 +238,14 @@ async fn check_models(
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
         error!(
-            url = %models_url,
+            url = %sanitized_upstream_url_for_logs(models_url),
             status = status.as_u16(),
             body_len = body.len(),
             has_body = !body.is_empty(),
             "Backend /v1/models returned non-success status"
         );
         return Err(StartupCheckError::UnexpectedStatus {
-            url: models_url.to_string(),
+            url: sanitized_upstream_url_for_logs(models_url),
             status: status.as_u16(),
             body,
         });
@@ -254,8 +256,8 @@ async fn check_models(
         .text()
         .await
         .map_err(|e| StartupCheckError::ConnectionFailed {
-            url: models_url.to_string(),
-            source: e,
+            url: sanitized_upstream_url_for_logs(models_url),
+            source: e.without_url(),
         })?;
 
     // Attempt to parse JSON; treat malformed/non-JSON responses as a protocol error, not connectivity.
@@ -263,7 +265,7 @@ async fn check_models(
         Ok(json) => json,
         Err(parse_error) => {
             error!(
-                url = %models_url,
+                url = %sanitized_upstream_url_for_logs(models_url),
                 status = status.as_u16(),
                 body_len = body_text.len(),
                 has_body = !body_text.is_empty(),
@@ -271,7 +273,7 @@ async fn check_models(
                 "Backend /v1/models returned invalid JSON"
             );
             return Err(StartupCheckError::UnexpectedStatus {
-                url: models_url.to_string(),
+                url: sanitized_upstream_url_for_logs(models_url),
                 status: status.as_u16(),
                 body: body_text,
             });
@@ -348,7 +350,7 @@ async fn check_chat_completions_with_tools(
     let request_body = build_tools_request(model_name, stream);
 
     info!(
-        url = %chat_completions_url,
+        url = %sanitized_upstream_url_for_logs(chat_completions_url),
         mode,
         model = %model_name,
         request_message_count = request_body
@@ -371,22 +373,23 @@ async fn check_chat_completions_with_tools(
         .send()
         .await
         .map_err(|e| {
+            let e = e.without_url();
             error!(
-                url = %chat_completions_url,
+                url = %sanitized_upstream_url_for_logs(chat_completions_url),
                 mode,
                 elapsed_ms = start.elapsed().as_millis() as u64,
                 error = %e,
                 "Failed to connect to backend for chat completions check"
             );
             StartupCheckError::ConnectionFailed {
-                url: chat_completions_url.to_string(),
-                source: e,
+                url: sanitized_upstream_url_for_logs(chat_completions_url),
+                source: e.without_url(),
             }
         })?;
 
     let status = response.status();
     debug!(
-        url = %chat_completions_url,
+        url = %sanitized_upstream_url_for_logs(chat_completions_url),
         mode,
         status = status.as_u16(),
         elapsed_ms = start.elapsed().as_millis() as u64,
@@ -396,7 +399,7 @@ async fn check_chat_completions_with_tools(
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
         error!(
-            url = %chat_completions_url,
+            url = %sanitized_upstream_url_for_logs(chat_completions_url),
             mode,
             status = status.as_u16(),
             elapsed_ms = start.elapsed().as_millis() as u64,
@@ -405,7 +408,7 @@ async fn check_chat_completions_with_tools(
             "Backend chat completions returned non-success status"
         );
         return Err(StartupCheckError::UnexpectedStatus {
-            url: chat_completions_url.to_string(),
+            url: sanitized_upstream_url_for_logs(chat_completions_url),
             status: status.as_u16(),
             body,
         });
@@ -443,7 +446,7 @@ async fn validate_non_streaming_response(
             .json()
             .await
             .map_err(|e| StartupCheckError::ChatCompletionFailed {
-                reason: format!("Failed to parse response as JSON: {e}"),
+                reason: format!("Failed to parse response as JSON: {}", e.without_url()),
             })?;
 
     let body_len = serde_json::to_string(&body).map_or(0, |body| body.len());
@@ -529,7 +532,7 @@ async fn validate_streaming_response(response: reqwest::Response) -> Result<(), 
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| StartupCheckError::ChatCompletionFailed {
-            reason: format!("Error reading stream: {e}"),
+            reason: format!("Error reading stream: {}", e.without_url()),
         })?;
 
         buffer.push_str(&String::from_utf8_lossy(&chunk));

@@ -59,13 +59,26 @@ async fn startup_checks_logs_redact_response_bodies_and_request_payloads() {
         .mount(&models_server)
         .await;
     let client = reqwest::Client::new();
-    let models_url = format!("{}/v1/models", models_server.uri());
+    let models_url = format!("{}/v1/models?key=URL_QUERY_SENTINEL", models_server.uri()).replacen(
+        "http://",
+        "http://URL_USER_SENTINEL:URL_PASSWORD_SENTINEL@",
+        1,
+    );
     let models_result =
         check_models(&client, &models_url, "test-model", Duration::from_secs(5)).await;
     assert!(matches!(
         models_result,
         Err(StartupCheckError::UnexpectedStatus { .. })
     ));
+
+    let error_message = models_result.unwrap_err().to_string();
+    for secret in [
+        "URL_QUERY_SENTINEL",
+        "URL_USER_SENTINEL",
+        "URL_PASSWORD_SENTINEL",
+    ] {
+        assert!(!error_message.contains(secret));
+    }
 
     let chat_error_server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -120,6 +133,9 @@ async fn startup_checks_logs_redact_response_bodies_and_request_payloads() {
     assert!(captured.contains("tool_count=1"));
     assert!(captured.contains("content_len="));
     for forbidden in [
+        "URL_QUERY_SENTINEL",
+        "URL_USER_SENTINEL",
+        "URL_PASSWORD_SENTINEL",
         "MODELS_RESPONSE_BODY_SENTINEL",
         "CHAT_RESPONSE_BODY_SENTINEL",
         "MODEL_TEXT_RESPONSE_SENTINEL",

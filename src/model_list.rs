@@ -926,8 +926,8 @@ impl ModelList {
             );
             info!(
                 model = %model.id,
-                backends = ?model.backend_urls,
-                long_context_backends = ?model.backend_long_context_urls,
+                backend_count = model.backend_urls.len(),
+                long_context_backend_count = model.backend_long_context_urls.len(),
                 long_context_above_tokens = model.long_context_above_tokens,
                 tier_strict = model.backend_tier_strict,
                 engine_probes,

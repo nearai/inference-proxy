@@ -238,3 +238,17 @@ fn test_first_sse_error_event_detection() {
     assert!(first_sse_error_event(b"garbage").is_none());
     assert!(first_sse_error_event(&[0xff, 0xfe]).is_none());
 }
+
+#[test]
+fn upstream_url_logs_omit_credentials_and_url_suffixes() {
+    assert_eq!(
+        sanitized_upstream_url_for_logs(
+            "https://example-user:example-password@example.com/v1?key=example-key#example-fragment"
+        ),
+        "https://example.com/v1"
+    );
+    assert_eq!(
+        sanitized_upstream_url_for_logs("https://example-user:example-password@invalid host/v1"),
+        "<invalid upstream url>"
+    );
+}

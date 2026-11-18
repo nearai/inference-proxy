@@ -341,7 +341,7 @@ pub(crate) async fn read_bounded(
 
 fn parse_expiration(text: &str) -> Result<SystemTime, String> {
     text.parse::<Timestamp>()
-        .map(SystemTime::from)
+        .and_then(SystemTime::try_from)
         .map_err(|_| "credentials endpoint gave an invalid Expiration timestamp".to_owned())
 }
 

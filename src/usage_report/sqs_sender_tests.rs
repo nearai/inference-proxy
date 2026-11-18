@@ -41,7 +41,9 @@ pub(super) fn counter(recorder: &PrometheusRecorder, family: &str, label: &str) 
 
 /// `2026-10-20T12:00:00Z`, the time every signature here is made at.
 fn fixed_time() -> SystemTime {
-    SystemTime::from("2026-10-20T12:00:00Z".parse::<Timestamp>().unwrap())
+    let timestamp = "2026-10-20T12:00:00Z".parse::<Timestamp>().unwrap();
+
+    SystemTime::try_from(timestamp).unwrap()
 }
 
 /// A sender against `endpoint` (a stand-in for SQS), holding credentials
@@ -305,7 +307,9 @@ fn sigv4_matches_aws_test_vector() {
         "test",
     );
     let identity = credentials.into();
-    let time = SystemTime::from("2015-08-30T12:36:00Z".parse::<Timestamp>().unwrap());
+    let timestamp = "2015-08-30T12:36:00Z".parse::<Timestamp>().unwrap();
+    let time = SystemTime::try_from(timestamp).unwrap();
+
     let params = v4::SigningParams::builder()
         .identity(&identity)
         .region("us-east-1")

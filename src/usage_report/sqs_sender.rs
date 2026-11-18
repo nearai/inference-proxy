@@ -303,7 +303,7 @@ fn message_body(job: &Job) -> Result<String, Refused> {
     UsageEnvelope {
         v: CURRENT_USAGE_VERSION,
         producer: Producer::OpenrouterGateway,
-        emitted_at: job.emitted_at,
+        emitted_at: job.emitted_at.into(),
         usage,
     }
     .try_to_json()

@@ -162,7 +162,7 @@ pub(crate) struct Job {
     pub completed_at: Instant,
     /// The same instant on the wall clock: the envelope's `emitted_at`, set
     /// once so that every attempt carries the same message.
-    pub emitted_at: chrono::DateTime<chrono::Utc>,
+    pub emitted_at: std::time::SystemTime,
 }
 
 /// What a sender made of one attempt, in the terms of the shared delivery.

@@ -4188,14 +4188,14 @@ async fn test_images_edits_multipart() {
 }
 
 #[tokio::test]
-async fn test_direct_audio_usage_and_local_fallback_bill_before_encryption() {
+async fn test_direct_audio_provider_usage_bills_before_encryption() {
     use vllm_proxy_rs::encryption;
     for (audio, filename, mime, provider_usage, local_seconds, billed_seconds) in [
         (
             include_bytes!("fixtures/audio/silence.wav").as_slice(),
             "silence.wav",
             "audio/wav",
-            serde_json::Value::Null,
+            serde_json::json!({"type":"duration","seconds":2}),
             Some(2),
             2,
         ),

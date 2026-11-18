@@ -7,9 +7,8 @@ resolver = "3"
 publish = false
 
 [dependencies]
-# Demux uploaded audio for duration-only billing when the provider omits duration.
+# Read uploaded audio timing for optional admission estimation.
 lofty = "0.25.5"
-matroska-demuxer = "0.8.1"
 # Async runtime & web
 tokio = { version = "1.53.3", features = ["full"] }
 axum = { version = "0.8", features = ["multipart"] }

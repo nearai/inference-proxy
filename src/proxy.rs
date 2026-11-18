@@ -710,7 +710,7 @@ pub(crate) fn build_usage_body(
                 "id": id,
             }))
         }
-        UsageType::AudioTranscription { duration_seconds } => {
+        UsageType::AudioTranscription { .. } => {
             let usage = &response_data["usage"];
             let usage_seconds = (usage["type"] == "duration")
                 .then(|| usage["seconds"].as_f64())
@@ -722,8 +722,7 @@ pub(crate) fn build_usage_body(
                 .into_iter()
                 .flatten()
                 .find(|n| n.is_finite() && *n > 0.0 && n.ceil() <= f64::from(i32::MAX))
-                .map(|n| n.ceil() as i32)
-                .or(*duration_seconds)?;
+                .map(|n| n.ceil() as i32)?;
             Some(
                 serde_json::json!({"type":"audio_transcription", "model":model_name,
                 "duration_seconds":seconds, "id":id}),
@@ -1402,7 +1401,11 @@ async fn admit_json_attempt(
             match features {
                 Ok(features) => *measured = Some(features),
                 Err(_)
-                    if reporter.admission_mode == crate::monetary_budget::AdmissionMode::Audit =>
+                    if matches!(
+                        reporter.admission_mode,
+                        crate::monetary_budget::AdmissionMode::Auto
+                            | crate::monetary_budget::AdmissionMode::Audit
+                    ) =>
                 {
                     tracing::warn!("Admission audit could not measure request");
                     return Ok(());
@@ -4509,6 +4512,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn monetary_auto_continues_on_unavailability_but_preserves_quota_refusals() {
+        use crate::monetary_budget::AdmissionMode;
+        use axum::response::IntoResponse;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let ledger = MockServer::start().await;
+        for status in [400_u16, 402, 403, 429, 404, 500, 503, 200] {
+            ledger.reset().await;
+            Mock::given(wiremock::matchers::path("/v1/internal/budget"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("invalid decision"))
+                .mount(&ledger)
+                .await;
+            for mode in [AdmissionMode::default(), AdmissionMode::Enforce] {
+                let mut reporter =
+                    reporter_with(Some("token"), Some("org"), Some("ws"), Some("key"));
+                reporter.cloud_api_url = Some(ledger.uri());
+                reporter.admission_mode = mode;
+                let result = crate::monetary_budget::admit(
+                    &mut reporter,
+                    &UsageType::ChatCompletion,
+                    &serde_json::json!({}),
+                    1,
+                )
+                .await;
+                let valid_denial = matches!(status, 400 | 402 | 403 | 429);
+                if mode == AdmissionMode::Auto && !valid_denial {
+                    assert!(result.is_ok(), "{status}: {result:?}");
+                } else {
+                    assert_eq!(
+                        result.unwrap_err().into_response().status().as_u16(),
+                        if valid_denial { status } else { 503 }
+                    );
+                }
+                assert!(reporter.budget_report_id.is_none());
+            }
+        }
+        for body in [
+            Bytes::from_static(br#"{"n":0}"#),
+            Bytes::from_static(b"invalid JSON"),
+        ] {
+            let mut opts = test_proxy_opts();
+            let mut reporter = reporter_with(Some("token"), Some("org"), Some("ws"), Some("key"));
+            reporter.admission_mode = AdmissionMode::default();
+            opts.usage_reporter = Some(reporter);
+            assert!(admit_json_attempt(&mut opts, &body, &mut None)
+                .await
+                .is_ok());
+            opts.usage_reporter.as_mut().unwrap().admission_mode = AdmissionMode::Enforce;
+            assert!(admit_json_attempt(&mut opts, &body, &mut None)
+                .await
+                .is_err());
+        }
+        let mut reporter = reporter_with(None, Some("org"), Some("ws"), Some("key"));
+        reporter.admission_mode = AdmissionMode::default();
+        assert!(crate::monetary_budget::admit(
+            &mut reporter,
+            &UsageType::ChatCompletion,
+            &serde_json::json!({}),
+            1,
+        )
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
     async fn monetary_failures_release_only_pre_dispatch_and_mark_other_outcomes_unknown() {
         use wiremock::matchers::{body_json, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4626,7 +4693,7 @@ mod tests {
                 .await;
             let completion = serde_json::json!({
                 "id":"test-response", "choices":[{"index":0,"delta":{},"finish_reason":"stop"}],
-                "usage":{"prompt_tokens":1,"completion_tokens":1}, "text":"ok"
+                "usage":{"prompt_tokens":1,"completion_tokens":1}, "text":"ok", "duration":1
             });
             let response = match (kind, success) {
                 ("sse", true) => ResponseTemplate::new(200)
@@ -4861,7 +4928,7 @@ mod tests {
                 .mount(&ledger)
                 .await;
             let mut reporter = reporter_with(Some("token"), Some("org"), Some("ws"), Some("key"));
-            assert_eq!(reporter.admission_mode, AdmissionMode::default());
+            reporter.admission_mode = AdmissionMode::default();
             reporter.cloud_api_url = Some(ledger.uri());
             crate::monetary_budget::admit(
                 &mut reporter,
@@ -5421,7 +5488,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_audio_usage_prefers_provider_seconds_then_duration_then_file() {
+    fn test_build_audio_usage_requires_provider_seconds_or_duration() {
         for (response, expected) in [
             (
                 serde_json::json!({"usage":{"type":"duration","seconds":91}}),
@@ -5450,7 +5517,7 @@ mod tests {
                 );
                 assert_eq!(
                     report.as_ref().and_then(|r| r["duration_seconds"].as_i64()),
-                    expected.or(local_duration).map(i64::from),
+                    expected.map(i64::from),
                     "{response}"
                 );
                 if let Some(report) = report {
@@ -5463,7 +5530,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_audio_usage_invalid_seconds_allow_duration_and_file_fallback() {
+    fn test_build_audio_usage_invalid_seconds_require_provider_duration() {
         for usage in [
             serde_json::json!({"type":"duration","seconds":0}),
             serde_json::json!({"type":"duration","seconds":-1}),
@@ -5474,8 +5541,10 @@ mod tests {
             serde_json::json!(null),
             serde_json::json!([]),
         ] {
-            for (duration, expected) in [(serde_json::json!(1.25), 2), (serde_json::json!(null), 3)]
-            {
+            for (duration, expected) in [
+                (serde_json::json!(1.25), Some(2)),
+                (serde_json::json!(null), None),
+            ] {
                 let response = serde_json::json!({"usage":usage,"duration":duration});
                 let report = build_usage_body(
                     &UsageType::AudioTranscription {
@@ -5484,9 +5553,12 @@ mod tests {
                     &response,
                     "audio-model",
                     "transcription-id",
-                )
-                .unwrap();
-                assert_eq!(report["duration_seconds"], expected, "{response}");
+                );
+                assert_eq!(
+                    report.and_then(|r| r["duration_seconds"].as_i64()),
+                    expected,
+                    "{response}"
+                );
             }
         }
     }

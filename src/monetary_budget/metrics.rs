@@ -3,6 +3,7 @@ use crate::error::AppError;
 
 pub fn mode_label(mode: AdmissionMode) -> &'static str {
     match mode {
+        AdmissionMode::Auto => "auto",
         AdmissionMode::Off => "off",
         AdmissionMode::Audit => "audit",
         AdmissionMode::Enforce => "enforce",
@@ -18,6 +19,7 @@ pub fn rpc_result(
         Ok(AdmissionMode::Off) => "off",
         Ok(AdmissionMode::Audit) => "audit",
         Ok(AdmissionMode::Enforce) => "admitted",
+        Ok(AdmissionMode::Auto) => "unavailable",
         Err(AppError::InsufficientCredits) => "budget_exceeded",
         Err(AppError::Overloaded { .. } | AppError::RateLimited) => "unsettled_limit",
         Err(AppError::BadRequest(_)) => "invalid_estimate",

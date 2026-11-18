@@ -12,6 +12,7 @@ mod metrics;
 #[serde(rename_all = "snake_case")]
 pub enum AdmissionMode {
     #[default]
+    Auto,
     Enforce,
     Audit,
     Off,
@@ -21,10 +22,11 @@ impl std::str::FromStr for AdmissionMode {
     type Err = anyhow::Error;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
+            "auto" => Ok(Self::Auto),
             "enforce" => Ok(Self::Enforce),
             "audit" => Ok(Self::Audit),
             "off" => Ok(Self::Off),
-            _ => anyhow::bail!("MONETARY_ADMISSION must be enforce, audit, or off"),
+            _ => anyhow::bail!("MONETARY_ADMISSION must be auto, enforce, audit, or off"),
         }
     }
 }
@@ -68,8 +70,15 @@ pub(crate) async fn admit(
     let measured = features(kind, body, executions);
     match measured {
         Ok(features) => admit_features(reporter, &features).await,
-        Err(_) if reporter.admission_mode == AdmissionMode::Audit => {
-            tracing::warn!("Admission audit could not measure request");
+        Err(_)
+            if matches!(
+                reporter.admission_mode,
+                AdmissionMode::Auto | AdmissionMode::Audit
+            ) =>
+        {
+            tracing::warn!(
+                "Admission could not measure request; continuing with normal usage reporting"
+            );
             Ok(())
         }
         Err(error) => Err(error),
@@ -91,8 +100,11 @@ pub(crate) async fn admit_features(
     if result.is_err() {
         reporter.budget_report_id = None;
     }
-    if reporter.admission_mode == AdmissionMode::Audit && result.is_err() {
-        tracing::warn!("Admission audit unavailable; continuing with normal usage reporting");
+    let unavailable = matches!(&result, Err(AppError::UpstreamParsed { status, .. }) if *status == StatusCode::SERVICE_UNAVAILABLE);
+    if (reporter.admission_mode == AdmissionMode::Audit && result.is_err())
+        || (reporter.admission_mode == AdmissionMode::Auto && unavailable)
+    {
+        tracing::warn!("Admission unavailable; continuing with normal usage reporting");
         Ok(())
     } else {
         result.map(|_| ())
@@ -103,8 +115,12 @@ pub(crate) async fn admit_features(
 struct AdmissionResponse {
     id: Option<String>,
     model: String,
-    #[serde(default)]
+    #[serde(default = "legacy_response_mode")]
     mode: AdmissionMode,
+}
+
+fn legacy_response_mode() -> AdmissionMode {
+    AdmissionMode::Enforce
 }
 
 async fn request_admission(
@@ -139,7 +155,7 @@ async fn request_admission(
         .bearer_auth(token).timeout(Duration::from_millis(reporter.admission_timeout_ms)).json(&json!({
             "id": id.to_string(), "organization_id": org, "workspace_id": workspace, "api_key_id": key,
             "model": reporter.model_name, "features": features,
-            "mode": reporter.admission_mode,
+            "mode": if reporter.admission_mode == AdmissionMode::Auto { AdmissionMode::Enforce } else { reporter.admission_mode },
         })).send().await.map_err(|_| unavailable())?;
     let status = response.status();
     if !status.is_success() {
@@ -164,7 +180,10 @@ async fn request_admission(
     let admitted: AdmissionResponse = response.json().await.map_err(|_| unavailable())?;
     match (admitted.mode, admitted.id) {
         (AdmissionMode::Enforce, Some(returned)) if returned == id.to_string() => {
-            if reporter.admission_mode != AdmissionMode::Enforce {
+            if !matches!(
+                reporter.admission_mode,
+                AdmissionMode::Auto | AdmissionMode::Enforce
+            ) {
                 return Err(unavailable());
             }
             reporter.budget_report_id = Some(id.to_string());

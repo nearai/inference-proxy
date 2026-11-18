@@ -583,11 +583,12 @@ Inference parameters, output limits, media support, and response formats are pre
 
 The API selects the organization policy. Its default policy is audit, which estimates
 without creating a hold. Explicitly enabled organizations can enforce reservations.
-`MONETARY_ADMISSION=enforce|audit|off` controls the proxy's participation and defaults to
-`enforce`: it follows the API's decision, including an explicit audit or off result.
-It does not force organizations to enforce. Setting the proxy to `audit` forces
-non-blocking audit behavior; `off` skips admission. Both retain actual usage reporting.
-An enforcing proxy fails closed when no valid decision is available.
+`MONETARY_ADMISSION=auto|enforce|audit|off` controls the proxy's participation and defaults
+to `auto`: it follows valid API decisions, including quota refusals, but continues normal
+usage reporting if admission is unavailable or local estimation fails. Explicit `enforce`
+also rejects on those failures. Neither setting forces an organization to enforce.
+Setting the proxy to `audit` forces non-blocking audit behavior; `off` skips admission.
+Every mode retains actual usage reporting.
 
 `MONETARY_ADMISSION_TIMEOUT_MS` defaults to 2000 and accepts 100–10000 milliseconds.
 Invalid mode or timeout settings fail startup. Capacity refusals return 429 with
@@ -600,8 +601,8 @@ free execution slots while retaining funding for a bounded grace period. Failed 
 retains the original expiry fallback. No receipt persistence is added.
 
 Request features are reused across connection retries. Audio duration prefers reported
-usage, then the response duration, then bounded local frame/sample timing. The byte-based
-estimate is never billed as actual duration. Existing usage delivery and media handling
+usage, then the response duration. Local frame/sample timing and byte counts are used
+only for estimation; missing provider duration produces no usage charge. Existing usage delivery and media handling
 remain unchanged. Embedding, rerank, privacy, and score retain their existing admission
 behavior.
 

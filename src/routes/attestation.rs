@@ -76,35 +76,12 @@ pub async fn attestation_report(
     } else {
         None
     };
-    // For nonce-provided requests we know the result will be a fresh report —
-    // the nonce is cryptographically bound so the cache can't be used. Start
-    // the compose-manager fetch immediately in a background task so it runs
-    // concurrently with GPU-evidence collection + TDX-quote generation, saving
-    // ~50 ms server-side when compose-manager is configured.
-    // For nonce-less requests we skip the early fetch: they usually hit the
-    // cache (background refresh keeps it warm) so the compose-manager
-    // attestation is already included in the cached bytes.
-    let early_cm_handle = if query.nonce.is_some() {
-        if let Some(ref url) = state.config.compose_manager_url {
-            let url = url.clone();
-            let client = state.http_client.clone();
-            let nonce = query.nonce.clone();
-            Some(tokio::spawn(async move {
-                crate::attestation::fetch_compose_manager_attestation(
-                    &client,
-                    &url,
-                    nonce.as_deref(),
-                )
-                .await
-            }))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let result = crate::attestation::generate_attestation(
+    let compose = state
+        .config
+        .compose_manager_url
+        .as_deref()
+        .map(|url| (&state.http_client, url));
+    let (result, cm_attestation) = crate::attestation::generate_attestation_with_compose(
         crate::attestation::AttestationParams {
             model_name: &state.config.model_name,
             signing_address: &signing_address,
@@ -117,9 +94,14 @@ pub async fn attestation_report(
         },
         Some(&state.attestation_cache),
         delegate_ctx.as_ref(),
+        compose,
     )
     .await
     .map_err(|e| match e {
+        crate::attestation::AttestationError::AtCapacity => AppError::Overloaded {
+            reason: "attestation",
+            retry_after_secs: 2,
+        },
         crate::attestation::AttestationError::InvalidNonce(msg) => AppError::BadRequest(msg),
         crate::attestation::AttestationError::Internal(e) => AppError::Internal(e),
     })?;
@@ -133,23 +115,7 @@ pub async fn attestation_report(
             bytes,
         )
             .into_response()),
-        // Fresh report: obtain compose-manager attestation (already in flight if nonce
-        // was provided) and return.
         AttestationResult::Fresh(report) => {
-            let cm_attestation = if let Some(handle) = early_cm_handle {
-                // Nonce-provided: compose-manager fetch was running concurrently.
-                handle.await.unwrap_or(None)
-            } else if let Some(ref url) = state.config.compose_manager_url {
-                // Nonce-less cache miss (rare — background refresh keeps cache warm):
-                // fall back to sequential fetch.
-                crate::attestation::fetch_compose_manager_attestation(&state.http_client, url, None)
-                    .await
-            } else {
-                None
-            };
-
-            // Cache nonce-less reports so subsequent requests get the full response
-            // including compose-manager attestation.
             let ohttp_attestation = state.ohttp_attestation_ed25519.clone();
 
             // Cache nonce-less reports so subsequent requests get the full response

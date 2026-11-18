@@ -217,8 +217,9 @@ async fn main() -> anyhow::Result<()> {
     } else if config.backend_conversation_affinity {
         info!("VLLM_BACKEND_CONVERSATION_AFFINITY set but only one backend is configured; nothing to pin");
     }
-    let attestation_cache = Arc::new(attestation::AttestationCache::new(
+    let attestation_cache = Arc::new(attestation::AttestationCache::with_max_inflight(
         config.attestation_cache_ttl_secs,
+        config.attestation_max_inflight,
     ));
 
     // Initialize HTTP client with connection pooling.

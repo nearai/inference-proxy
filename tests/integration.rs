@@ -41,6 +41,9 @@ struct TestAppOptions {
     priority_lower_first: bool,
     /// `TOKEN_LABELS`, one per token.
     token_labels: Vec<&'static str>,
+    /// OHTTP relay on, looping back to `listen_port`.
+    ohttp: bool,
+    listen_port: u16,
 }
 
 impl Default for TestAppOptions {
@@ -63,6 +66,8 @@ impl Default for TestAppOptions {
             priority_size_tiers: None,
             priority_lower_first: false,
             token_labels: Vec::new(),
+            ohttp: false,
+            listen_port: 8000,
         }
     }
 }
@@ -213,6 +218,7 @@ fn build_test_app_inner_with_pool(
         },
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
+        attestation_max_inflight: 5,
         dev_mode: true,
         gpu_no_hw_mode: true,
         git_rev: "test-rev".to_string(),
@@ -251,9 +257,11 @@ fn build_test_app_inner_with_pool(
         rerank_url_override: None,
         score_url_override: None,
         rerank_limits: Default::default(),
-        ohttp_enabled: false,
+        ohttp_enabled: options.ohttp,
         ohttp_max_inflight: 0,
-        listen_port: 8000,
+        ohttp_buffer_budget: 256 * 1024 * 1024,
+        ohttp_max_response_size: 32 * 1024 * 1024,
+        listen_port: options.listen_port,
         listen_addr: "127.0.0.1".to_string(),
         backend_token: None,
         backend_priority: None,
@@ -366,7 +374,9 @@ fn build_test_app_inner_with_pool(
         ),
         backend_pool: backend_pool.clone(),
         admission,
-        ohttp_gateway: None,
+        ohttp_gateway: options.ohttp.then(|| {
+            Arc::new(vllm_proxy_rs::ohttp_gateway::OhttpGateway::new(&ed25519_key).unwrap())
+        }),
         ohttp_attestation_ed25519: None,
         vllm_dp_affinity: Arc::new(vllm_dp_affinity::VllmDpAffinity::new(
             options.vllm_data_parallel_size,
@@ -4737,6 +4747,7 @@ fn build_test_app_with_cloud_api_retries(
         media_inline: Default::default(),
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
+        attestation_max_inflight: 5,
         cloud_api_url: Some(cloud_api_url.to_string()),
         cloud_api_auth_max_attempts: max_attempts,
         cloud_api_auth_initial_backoff_ms: initial_backoff_ms,
@@ -4776,6 +4787,8 @@ fn build_test_app_with_cloud_api_retries(
         rerank_limits: Default::default(),
         ohttp_enabled: false,
         ohttp_max_inflight: 0,
+        ohttp_buffer_budget: 256 * 1024 * 1024,
+        ohttp_max_response_size: 32 * 1024 * 1024,
         listen_port: 8000,
         listen_addr: "127.0.0.1".to_string(),
         backend_token: None,
@@ -8176,6 +8189,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         media_inline: Default::default(),
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
+        attestation_max_inflight: 5,
         dev_mode: true,
         gpu_no_hw_mode: true,
         git_rev: "test-rev".to_string(),
@@ -8213,6 +8227,8 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         rerank_limits: Default::default(),
         ohttp_enabled: true,
         ohttp_max_inflight: 0,
+        ohttp_buffer_budget: 256 * 1024 * 1024,
+        ohttp_max_response_size: 32 * 1024 * 1024,
         listen_port: 0, // not used in oneshot tests
         listen_addr: "127.0.0.1".to_string(),
         backend_token: None,
@@ -8733,6 +8749,7 @@ async fn start_ohttp_server_with_relay_limit(
         media_inline: Default::default(),
         chat_cache_expiration_secs: 1200,
         attestation_cache_ttl_secs: 300,
+        attestation_max_inflight: 5,
         dev_mode: true,
         gpu_no_hw_mode: true,
         git_rev: "test-rev".to_string(),
@@ -8770,6 +8787,8 @@ async fn start_ohttp_server_with_relay_limit(
         rerank_limits: Default::default(),
         ohttp_enabled: true,
         ohttp_max_inflight: 0,
+        ohttp_buffer_budget: 256 * 1024 * 1024,
+        ohttp_max_response_size: 32 * 1024 * 1024,
         listen_port: port,
         listen_addr: "127.0.0.1".to_string(),
         backend_token: None,
@@ -12523,6 +12542,120 @@ async fn request_guard_strips_engine_internal_fields() {
 }
 
 #[tokio::test]
+async fn tokenize_applies_the_completion_field_rules() {
+    let backend = start_any_post_backend().await;
+    let app = build_test_app(&backend.uri());
+
+    // Refused before dispatch, like on chat completions.
+    for (body, param) in [
+        (
+            serde_json::json!({"model": "test-model", "prompt": "x", "ebnf": "root ::= \"a\""}),
+            "ebnf",
+        ),
+        (
+            serde_json::json!({"model": "test-model", "prompt": "x",
+                "sampling_params": {"grammar": "root ::= \"a\""}}),
+            "grammar",
+        ),
+        (
+            serde_json::json!({"model": "test-model", "prompt": [1, -1]}),
+            "prompt",
+        ),
+    ] {
+        let (status, response) = post_guarded(&app, "/v1/tokenize", &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{param}");
+        assert_eq!(response["error"]["param"], param);
+    }
+    assert_eq!(requests_seen(&backend).await, 0);
+
+    // Engine-internal fields are removed from the forwarded body.
+    let body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "custom_logit_processor": "x",
+        "session_params": {"id": "s"},
+    });
+    let (status, _) = post_guarded(&app, "/v1/tokenize", &body).await;
+    assert_eq!(status, StatusCode::OK);
+    // A body with nothing to remove is forwarded byte for byte.
+    let plain = r#"{ "model": "test-model",  "prompt": "hello" }"#;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tokenize")
+                .header("content-type", "application/json")
+                .header(auth_header().0, auth_header().1)
+                .body(Body::from(plain))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let requests = backend.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let forwarded: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert!(forwarded.get("custom_logit_processor").is_none());
+    assert!(forwarded.get("session_params").is_none());
+    assert_eq!(forwarded["messages"][0]["content"], "hi");
+    assert_eq!(requests[1].body, plain.as_bytes());
+}
+
+#[tokio::test]
+async fn token_id_inputs_are_checked_on_every_route() {
+    let backend = start_any_post_backend().await;
+    let app = build_test_app(&backend.uri());
+    for (route, body, param) in [
+        (
+            "/v1/completions",
+            serde_json::json!({"model": "test-model", "prompt": [1, 2, 4294967296u64]}),
+            "prompt",
+        ),
+        (
+            "/v1/completions",
+            serde_json::json!({"model": "test-model", "prompt": [[1], [-2]]}),
+            "prompt",
+        ),
+        (
+            "/v1/embeddings",
+            serde_json::json!({"model": "test-model", "input": [1, -2]}),
+            "input",
+        ),
+        (
+            "/v1/embeddings",
+            serde_json::json!({"model": "test-model", "input": [[1, "-2"]]}),
+            "input",
+        ),
+        (
+            "/v1/rerank",
+            serde_json::json!({"model": "test-model", "query": ["-1"], "documents": ["a"]}),
+            "query",
+        ),
+        (
+            "/v1/score",
+            serde_json::json!({"model": "test-model", "query": "q", "items": [[4294967296u64]]}),
+            "items",
+        ),
+    ] {
+        let (status, response) = post_guarded(&app, route, &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{route}");
+        assert_eq!(response["error"]["type"], "invalid_request_error");
+        assert_eq!(response["error"]["param"], param, "{route}");
+    }
+    assert_eq!(requests_seen(&backend).await, 0);
+
+    let (status, _) = post_guarded(
+        &app,
+        "/v1/embeddings",
+        &serde_json::json!({"model": "test-model", "input": [1, 2, 3]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn image_routes_refuse_engine_only_fields() {
     let backend = start_any_post_backend().await;
     let app = build_test_app(&backend.uri());
@@ -12670,4 +12803,400 @@ async fn structured_output_patterns_are_bounded_on_chat_and_completions() {
     let (status, _) = post_guarded(&app, "/v1/chat/completions", &body).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(requests_seen(&backend).await, 1);
+}
+
+// ---- Media on every forwarding route ----
+
+const MEDIA_PNG_1X1: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0x0D, b'I', b'H', b'D', b'R', 0, 0, 0,
+    1, 0, 0, 0, 1, 8, 2, 0, 0, 0,
+];
+
+/// A backend that answers every POST and serves `/media/a.png` (a PNG) and
+/// `/media/gone.png` (404).
+async fn start_media_backend() -> MockServer {
+    let server = start_any_post_backend().await;
+    Mock::given(method("GET"))
+        .and(path("/media/a.png"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA_PNG_1X1))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/media/gone.png"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    server
+}
+
+fn inline_media_app(backend: &MockServer) -> axum::Router {
+    build_test_app_inner(
+        &backend.uri(),
+        TestAppOptions {
+            // Private hosts allowed so the fetch may target the loopback mock.
+            image_validation: true,
+            media_inline: true,
+            ..Default::default()
+        },
+    )
+}
+
+/// One body with media in every shape the engines accept: chat parts (typed,
+/// without a type, with a `uuid`, Responses style), chat messages and batched
+/// conversations in input fields, SGLang embedding items (also with a stray
+/// `content`), vLLM scoring `{"content": [...]}` inputs and SGLang rerank
+/// part lists (also with a stray `role`).
+fn media_canary(url: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": "test-model",
+        "prompt": "x",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {"url": url}},
+            {"image_url": url},
+            {"type": "text", "text": "x", "uuid": "u1", "image_url": {"url": url}},
+            {"type": "input_image", "image_url": url}
+        ]}],
+        "input": [
+            {"text": "a", "image": url},
+            {"image": url, "content": "x"},
+            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]}
+        ],
+        "query": {"content": [{"type": "image_url", "image_url": {"url": url}}]},
+        "documents": [
+            [{"type": "image_url", "image_url": {"url": url}}],
+            [{"type": "image_url", "image_url": {"url": url}, "role": "x"}],
+            "plain"
+        ],
+        "items": [{"content": [{"image_url": url}]}],
+        "text_1": "a",
+        "text_2": [{"content": [{"type": "image_url", "image_url": {"url": url}}]}],
+        "data_1": [[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]}]],
+        "data_2": [{"role": "user", "content": [{"image_url": url}]}]
+    })
+}
+
+/// Bodies the upstream received on `route_path`'s backend path.
+async fn forwarded_bodies(backend: &MockServer) -> Vec<String> {
+    backend
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.method.as_str() == "POST")
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .collect()
+}
+
+/// Every POST route the router registers (`routes::POST_ROUTES`, the only
+/// place POST routes are registered) either runs the shared forwarding step
+/// or opts out with a reason. For every route that runs it, with inlining on
+/// the upstream never receives a remote media URL in any shape: it is inlined,
+/// or the request is refused before dispatch. A route added later is probed
+/// here without any change to this test.
+#[tokio::test]
+async fn no_forwarding_route_hands_the_upstream_a_remote_media_url() {
+    use vllm_proxy_rs::routes::{ClientBody, POST_ROUTES};
+    let mut probed = Vec::new();
+    for route in POST_ROUTES {
+        if route.body != ClientBody::Forwarded {
+            continue;
+        }
+        probed.push(route.path);
+        let backend = start_media_backend().await;
+        let app = inline_media_app(&backend);
+        let url = format!("{}/media/a.png", backend.uri());
+        let (status, _) = post_guarded(&app, route.path, &media_canary(&url)).await;
+        let bodies = forwarded_bodies(&backend).await;
+        for body in &bodies {
+            assert!(
+                !body.contains(&backend.uri()),
+                "{}: a remote media URL reached the upstream",
+                route.path
+            );
+        }
+        if route.path == routes::ROUTE_IMAGES_GENERATIONS {
+            // Only the image-generation keys are forwarded there.
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{}", route.path);
+            assert!(bodies.is_empty());
+        } else {
+            assert_eq!(status, StatusCode::OK, "{}", route.path);
+            assert_eq!(bodies.len(), 1, "{}", route.path);
+            let forwarded: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+            for pointer in [
+                "/messages/0/content/1/image_url/url",
+                "/messages/0/content/2/image_url",
+                "/messages/0/content/3/image_url/url",
+                "/messages/0/content/4/image_url",
+                "/input/0/image",
+                "/input/1/image",
+                "/input/2/content/0/image_url/url",
+                "/query/content/0/image_url/url",
+                "/documents/0/0/image_url/url",
+                "/documents/1/0/image_url/url",
+                "/items/0/content/0/image_url",
+                "/text_2/0/content/0/image_url/url",
+                "/data_1/0/0/content/0/image_url/url",
+                "/data_2/0/content/0/image_url",
+            ] {
+                let value = forwarded.pointer(pointer).and_then(|v| v.as_str());
+                assert!(
+                    value.is_some_and(|v| v.starts_with("data:image/png;base64,")),
+                    "{} {pointer}: {value:?}",
+                    route.path
+                );
+            }
+        }
+
+        // What cannot be inlined is refused and nothing is forwarded.
+        let backend = start_media_backend().await;
+        let app = inline_media_app(&backend);
+        let gone = format!("{}/media/gone.png", backend.uri());
+        for body in [
+            serde_json::json!({"model": "test-model", "prompt": "x",
+                "messages": [{"role": "user", "content": [{"image_url": gone}]}]}),
+            serde_json::json!({"model": "test-model", "prompt": "x", "input": [{"image": gone}]}),
+            serde_json::json!({"model": "test-model", "prompt": "x", "query": "q",
+                "documents": [{"content": [{"type": "video_url", "video_url": {"url": gone}}]}]}),
+            serde_json::json!({"model": "test-model", "prompt": "x", "text_1": "a",
+                "text_2": [[{"type": "image_url", "image_url": {"url": "file:///etc/hostname"}}]]}),
+        ] {
+            let (status, response) = post_guarded(&app, route.path, &body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{} {body}", route.path);
+            let message = response["error"]["message"].as_str().unwrap_or("");
+            assert!(!message.contains("gone.png") && !message.contains("/etc/"));
+        }
+        assert!(
+            forwarded_bodies(&backend).await.is_empty(),
+            "{}",
+            route.path
+        );
+    }
+    assert!(probed.contains(&routes::ROUTE_TOKENIZE));
+    assert!(probed.contains(&routes::ROUTE_EMBEDDINGS));
+}
+
+/// With inlining off, every forwarding route still refuses media URLs whose
+/// scheme is not http, https or data, in every shape, and forwards an http(s)
+/// URL unchanged as before.
+#[tokio::test]
+async fn forwarding_routes_apply_the_media_scheme_rule_without_inlining() {
+    use vllm_proxy_rs::routes::{ClientBody, POST_ROUTES};
+    for route in POST_ROUTES
+        .iter()
+        .filter(|r| r.body == ClientBody::Forwarded)
+        .filter(|r| r.path != routes::ROUTE_IMAGES_GENERATIONS)
+    {
+        let backend = start_any_post_backend().await;
+        let app = build_test_app(&backend.uri());
+        let (status, response) =
+            post_guarded(&app, route.path, &media_canary("file:///etc/hostname")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{}", route.path);
+        assert_eq!(response["error"]["type"], "invalid_request_error");
+        assert_eq!(requests_seen(&backend).await, 0, "{}", route.path);
+
+        let url = "https://media.example.com/a.png";
+        let (status, _) = post_guarded(&app, route.path, &media_canary(url)).await;
+        assert_eq!(status, StatusCode::OK, "{}", route.path);
+        assert!(forwarded_bodies(&backend).await[0].contains(url));
+    }
+}
+
+/// The multipart routes opt out of the JSON step: their forms carry no URL
+/// field, and a field that would take one is refused before dispatch.
+#[tokio::test]
+async fn multipart_routes_refuse_url_fields() {
+    let backend = start_any_post_backend().await;
+    let app = inline_media_app(&backend);
+    let boundary = "----MediaBoundary";
+    for (route, field) in [
+        (routes::ROUTE_IMAGES_EDITS, "url"),
+        (routes::ROUTE_IMAGES_EDITS, "url[]"),
+        (routes::ROUTE_IMAGES_EDITS, "image_url"),
+        (routes::ROUTE_AUDIO_TRANSCRIPTIONS, "audio_url"),
+        (routes::ROUTE_AUDIO_TRANSCRIPTIONS, "url"),
+    ] {
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"\r\n\r\n\
+             {}/media/a.png\r\n--{boundary}--\r\n",
+            backend.uri()
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(route)
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .header(auth_header().0, auth_header().1)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{route} {field}"
+        );
+    }
+    assert_eq!(requests_seen(&backend).await, 0);
+}
+
+/// Encrypted bodies are checked after decryption: a remote image inside the
+/// decrypted chat content, and plaintext media next to an encrypted
+/// embeddings input, reach the upstream as `data:` URLs only.
+#[tokio::test]
+async fn decrypted_bodies_reach_the_upstream_with_data_urls_only() {
+    use vllm_proxy_rs::encryption;
+    let backend = start_media_backend().await;
+    let app = inline_media_app(&backend);
+    let client_pair = test_client_signing_pair();
+    let server_pub_bytes = hex::decode(test_ed25519_pub_key_hex()).unwrap();
+    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
+    let enc = encryption::EncryptionContext {
+        algo: encryption::EncryptionAlgo::Ed25519,
+        client_pub_key: server_pub_bytes,
+        version: 1,
+        encrypt_all_fields: false,
+    };
+    let url = format!("{}/media/a.png", backend.uri());
+    let content = serde_json::json!([
+        {"type": "text", "text": "what is this"},
+        {"image_url": url},
+        {"type": "input_image", "image_url": url}
+    ]);
+    let chat = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": encryption::encrypt_string(
+            &content.to_string(), &enc, &client_pair).unwrap()}],
+    });
+    let embeddings = serde_json::json!({
+        "model": "test-model",
+        "input": encryption::encrypt_string("hello", &enc, &client_pair).unwrap(),
+        "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]}],
+    });
+    for (route, body) in [
+        (routes::ROUTE_CHAT_COMPLETIONS, chat),
+        (routes::ROUTE_EMBEDDINGS, embeddings),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(route)
+                    .header("content-type", "application/json")
+                    .header(auth_header().0, auth_header().1)
+                    .header("x-signing-algo", "ed25519")
+                    .header("x-client-pub-key", &client_pub_hex)
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{route}");
+    }
+    let bodies = forwarded_bodies(&backend).await;
+    assert_eq!(bodies.len(), 2);
+    for body in bodies {
+        assert!(!body.contains(&backend.uri()));
+        assert!(body.contains("data:image/png;base64,"));
+    }
+}
+
+/// The OHTTP relay sends the decapsulated inner request back through the
+/// router, so the inner chat body gets the chat route's media inlining.
+#[tokio::test]
+async fn ohttp_inner_requests_reach_the_upstream_with_data_urls_only() {
+    let backend = start_media_backend().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = build_test_app_inner(
+        &backend.uri(),
+        TestAppOptions {
+            image_validation: true,
+            media_inline: true,
+            ohttp: true,
+            listen_port: port,
+            ..Default::default()
+        },
+    );
+    let served = app.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, served).await.unwrap();
+    });
+
+    // The gateway's key config, as a client fetches it.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(routes::ROUTE_OHTTP_CONFIG)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let key_config = body_to_bytes(response).await;
+    let mut config = ohttp::KeyConfig::decode(&key_config).unwrap();
+    let client = ohttp::ClientRequest::from_config(&mut config).unwrap();
+
+    let url = format!("{}/media/a.png", backend.uri());
+    let inner_body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": url}},
+            {"type": "text", "text": "x", "uuid": "u1", "image_url": url}
+        ]}],
+    });
+    let mut inner = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"http".to_vec(),
+        b"localhost".to_vec(),
+        routes::ROUTE_CHAT_COMPLETIONS.as_bytes().to_vec(),
+    );
+    inner.put_header("authorization", "Bearer test-token");
+    inner.put_header("content-type", "application/json");
+    inner.write_content(serde_json::to_vec(&inner_body).unwrap());
+    let mut inner_bytes = Vec::new();
+    inner
+        .write_bhttp(bhttp::Mode::KnownLength, &mut inner_bytes)
+        .unwrap();
+    let (enc_request, client_response) = client.encapsulate(&inner_bytes).unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(routes::ROUTE_OHTTP_RELAY)
+                .header("content-type", "message/ohttp-req")
+                .body(Body::from(enc_request))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let enc_response = body_to_bytes(response).await;
+    let decrypted = client_response.decapsulate(&enc_response).unwrap();
+    let inner_response = bhttp::Message::read_bhttp(&mut Cursor::new(&decrypted)).unwrap();
+    assert_eq!(inner_response.control().status().map(u16::from), Some(200));
+
+    let bodies = forwarded_bodies(&backend).await;
+    assert_eq!(bodies.len(), 1);
+    assert!(!bodies[0].contains(&backend.uri()));
+    let forwarded: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+    for pointer in [
+        "/messages/0/content/0/image_url/url",
+        "/messages/0/content/1/image_url",
+    ] {
+        assert!(forwarded
+            .pointer(pointer)
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| v.starts_with("data:image/png;base64,")));
+    }
 }

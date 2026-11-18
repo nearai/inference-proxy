@@ -11,22 +11,14 @@ use crate::proxy::{self, make_usage_reporter, ProxyOpts, ResponseShape, UsageTyp
 use crate::routes::chat::read_body_with_limit;
 use crate::{AppState, TracingIds};
 
-const EXCLUDED_REQUEST_HEADERS: &[&str] = &[
-    "host",
-    "content-length",
-    "transfer-encoding",
-    "connection",
-    "keep-alive",
-    "te",
-    "trailer",
-    "upgrade",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "authorization",
-    "x-request-id",
-    "x-org-id",
-    "x-workspace-id",
-    crate::vllm_dp_affinity::DATA_PARALLEL_RANK_HEADER,
+const FORWARDED_REQUEST_HEADERS: &[&str] = &[
+    "content-type",
+    "content-encoding",
+    "accept",
+    "x-signing-algo",
+    "x-client-pub-key",
+    "x-encryption-version",
+    "x-encrypt-all-fields",
 ];
 
 const EXCLUDED_RESPONSE_HEADERS: &[&str] = &[
@@ -52,11 +44,26 @@ pub async fn classify(
     body: Body,
 ) -> Result<Response, AppError> {
     let request_body = read_body_with_limit(body, state.config.max_request_size).await?;
+    let mut request_json = proxy::parse_json_object(&request_body)?;
     if auth.cloud_api_key.is_some() {
-        let request_json = proxy::parse_json_object(&request_body)?;
         crate::model_list::guard_request_body(&request_json, Some(&state.config.model_name))?;
     }
+    // The signature binds the body the client sent.
     let request_sha256 = hex::encode(Sha256::digest(&request_body));
+    // The field rules and media inlining every forwarding route runs
+    // (`forward_body.rs`). A changed body is re-serialized; otherwise the
+    // original bytes go through.
+    let changed = crate::forward_body::prepare(
+        &state.config,
+        crate::forward_body::Rules::Passthrough,
+        &mut request_json,
+    )
+    .await?;
+    let request_body = if changed {
+        serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?
+    } else {
+        request_body
+    };
     let path_with_query = match uri.query() {
         Some(query) => format!("{}?{query}", super::ROUTE_PRIVACY_CLASSIFY),
         None => super::ROUTE_PRIVACY_CLASSIFY.to_string(),
@@ -66,7 +73,7 @@ pub async fn classify(
 
     let mut request = state.backend_client.post(&backend_url);
     for (name, value) in &headers {
-        if !EXCLUDED_REQUEST_HEADERS.contains(&name.as_str()) {
+        if FORWARDED_REQUEST_HEADERS.contains(&name.as_str()) {
             request = request.header(name, value);
         }
     }

@@ -303,7 +303,10 @@ fn message_body(job: &Job) -> Result<String, Refused> {
     UsageEnvelope {
         v: CURRENT_USAGE_VERSION,
         producer: Producer::OpenrouterGateway,
-        emitted_at: job.emitted_at.into(),
+        emitted_at: job
+            .emitted_at
+            .try_into()
+            .map_err(|_| refuse("event timestamp is out of range".to_owned()))?,
         usage,
     }
     .try_to_json()

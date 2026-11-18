@@ -192,6 +192,7 @@ async fn sqs_send_is_signed_and_carries_the_http_usage_body() {
             panic!("a usage message");
         };
         assert_eq!(envelope.v, 1);
+        assert_eq!(SystemTime::from(envelope.emitted_at), fixed_time());
         assert_eq!(envelope.producer, Producer::OpenrouterGateway);
         assert_eq!(
             serde_json::to_value(&envelope.usage).unwrap(),
@@ -242,6 +243,17 @@ fn the_queue_carries_the_body_the_proxy_builds_for_each_usage_type() {
         };
         assert_eq!(serde_json::to_value(&envelope.usage).unwrap(), body);
     }
+}
+
+#[test]
+fn an_out_of_range_event_timestamp_is_refused() {
+    let mut job = job_with(
+        &chat_body("chatcmpl-1"),
+        &Arc::new(UsageReportDelivery::default()),
+    );
+    job.emitted_at = SystemTime::from(Timestamp::MAX) + Duration::from_secs(1);
+    let refused = message_body(&job).unwrap_err();
+    assert_eq!(refused.reason, "sqs_invalid");
 }
 
 /// A field the usage schema does not carry is refused as a final

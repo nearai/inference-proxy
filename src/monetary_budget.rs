@@ -8,6 +8,8 @@ use std::time::Duration;
 
 mod metrics;
 
+const POLICY_UNAVAILABLE: &str = "admission_policy_unavailable";
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdmissionMode {
@@ -100,6 +102,11 @@ pub(crate) async fn admit_features(
     if result.is_err() {
         reporter.budget_report_id = None;
     }
+    // A policy that has not loaded is an explicit refusal before dispatch.
+    if matches!(&result, Err(AppError::UpstreamParsed { error_type, .. }) if error_type == POLICY_UNAVAILABLE)
+    {
+        return result.map(|_| ());
+    }
     let unavailable = matches!(&result, Err(AppError::UpstreamParsed { status, .. }) if *status == StatusCode::SERVICE_UNAVAILABLE);
     if (reporter.admission_mode == AdmissionMode::Audit && result.is_err())
         || (reporter.admission_mode == AdmissionMode::Auto && unavailable)
@@ -165,6 +172,24 @@ async fn request_admission(
             cleanup.disarm();
         }
         return Err(match status {
+            StatusCode::SERVICE_UNAVAILABLE => {
+                let body = response.json::<Value>().await.ok();
+                if body
+                    .as_ref()
+                    .and_then(|v| v.pointer("/error/type"))
+                    .and_then(Value::as_str)
+                    == Some(POLICY_UNAVAILABLE)
+                {
+                    cleanup.disarm();
+                    AppError::UpstreamParsed {
+                        status,
+                        message: "Admission policy unavailable".into(),
+                        error_type: POLICY_UNAVAILABLE.into(),
+                    }
+                } else {
+                    unavailable()
+                }
+            }
             StatusCode::PAYMENT_REQUIRED => AppError::InsufficientCredits,
             StatusCode::TOO_MANY_REQUESTS => AppError::Overloaded {
                 reason: "usage_capacity",

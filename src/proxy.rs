@@ -4897,6 +4897,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_policy_unavailable_stops_dispatch_in_every_admitting_mode() {
+        use crate::monetary_budget::AdmissionMode;
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let ledger = MockServer::start().await;
+        let upstream = MockServer::start().await;
+        Mock::given(path("/v1/internal/budget"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                "error": {"type": "admission_policy_unavailable"}
+            })))
+            .expect(3)
+            .mount(&ledger)
+            .await;
+        for mode in [
+            AdmissionMode::Auto,
+            AdmissionMode::Audit,
+            AdmissionMode::Enforce,
+        ] {
+            let mut reporter = reporter_with(Some("token"), Some("org"), Some("ws"), Some("key"));
+            reporter.cloud_api_url = Some(ledger.uri());
+            reporter.admission_mode = mode;
+            let mut opts = test_proxy_opts();
+            opts.usage_reporter = Some(reporter);
+            let result = send_upstream(
+                &reqwest::Client::new(),
+                &mut format!("{}/chat", upstream.uri()),
+                Bytes::from_static(br#"{"model":"test","messages":[],"max_tokens":1}"#),
+                &mut opts,
+                "test",
+            )
+            .await;
+            assert!(
+                matches!(result, Err(AppError::UpstreamParsed { status, .. }) if status == StatusCode::SERVICE_UNAVAILABLE)
+            );
+            assert!(opts.usage_reporter.unwrap().budget_report_id.is_none());
+        }
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn default_proxy_follows_the_organization_admission_decision() {
         use crate::monetary_budget::AdmissionMode;
         use wiremock::matchers::path;

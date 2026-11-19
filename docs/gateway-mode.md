@@ -587,7 +587,9 @@ without creating a hold. Explicitly enabled organizations can enforce reservatio
 to `auto`: it follows valid API decisions, including quota refusals, but continues normal
 usage reporting if admission is unavailable or local estimation fails. Explicit `enforce`
 also rejects on those failures. Neither setting forces an organization to enforce.
-Setting the proxy to `audit` forces non-blocking audit behavior; `off` skips admission.
+Setting the proxy to `audit` requests estimates and continues on ordinary admission errors.
+When the API explicitly reports that its policy has never loaded, `auto`, `audit`, and
+`enforce` return HTTP 503 before forwarding the request. The `off` mode skips admission.
 Every mode retains actual usage reporting.
 
 `MONETARY_ADMISSION_TIMEOUT_MS` defaults to 2000 and accepts 100–10000 milliseconds.

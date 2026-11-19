@@ -7,6 +7,7 @@ ignore = [
     # Rust 1.94.1, and the reproducible Dockerfile pins Rust 1.93.0. Drop this entry
     # when the toolchain moves to 1.94.1 and the AWS crates are updated.
     { id = "RUSTSEC-2026-0441", reason = "unmaintained pin-utils via aws-smithy; fix needs Rust 1.94.1 (Dockerfile pins 1.93.0)" },
+    { id = "RUSTSEC-2026-0543", reason = "transitive Chrono dependency in the event envelope" },
 ]
 
 [licenses]

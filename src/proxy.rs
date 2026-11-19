@@ -165,11 +165,7 @@ pub(crate) fn sanitized_upstream_url_for_logs(url: &str) -> String {
             parsed.set_fragment(None);
             parsed.to_string()
         }
-        Err(_) => url
-            .split(['?', '#'])
-            .next()
-            .unwrap_or("<invalid upstream url>")
-            .to_string(),
+        Err(_) => "<invalid upstream url>".to_string(),
     }
 }
 
@@ -1102,7 +1098,7 @@ pub(crate) fn spawn_usage_report(reporter: &UsageReporter, mut body: serde_json:
     reporter.delivery.submit(crate::usage_report::Job {
         body: payload,
         completed_at: std::time::Instant::now(),
-        emitted_at: chrono::Utc::now(),
+        emitted_at: std::time::SystemTime::now(),
         reporter: reporter.clone(),
     });
 }

@@ -703,6 +703,7 @@ pub struct Config {
     pub chat_cache_expiration_secs: u64,
     /// TTL for cached nonce-less attestation reports (seconds).
     pub attestation_cache_ttl_secs: u64,
+    pub attestation_max_inflight: usize,
 
     // TLS certificate binding
     pub tls_cert_path: Option<String>,
@@ -821,6 +822,8 @@ pub struct Config {
     /// past the cap the relay answers 429 with `Retry-After`. See
     /// `routes::ohttp::OhttpRelayLimit`.
     pub ohttp_max_inflight: usize,
+    pub ohttp_buffer_budget: usize,
+    pub ohttp_max_response_size: usize,
     /// Listen port for the proxy (used by OHTTP handler for loopback requests).
     pub listen_port: u16,
     /// Interface to bind (`LISTEN_ADDR`, default `0.0.0.0`). Gateway
@@ -1571,6 +1574,10 @@ impl Config {
             media_inline: media_inline_from_env()?,
             chat_cache_expiration_secs: env_int("CHAT_CACHE_EXPIRATION", 1200) as u64,
             attestation_cache_ttl_secs: env_int("ATTESTATION_CACHE_TTL", 300) as u64,
+            attestation_max_inflight: env_parse(
+                "ATTESTATION_MAX_INFLIGHT",
+                crate::attestation::DEFAULT_ATTESTATION_MAX_INFLIGHT,
+            )?,
             dev_mode: env_bool("DEV"),
             gpu_no_hw_mode: env_bool("GPU_NO_HW_MODE"),
             git_rev,
@@ -1593,6 +1600,8 @@ impl Config {
             health_check_timeout_secs: env_int("HEALTH_CHECK_TIMEOUT_SECS", 3) as u64,
             ohttp_enabled: env_bool("OHTTP_ENABLED"),
             ohttp_max_inflight: env_parse("OHTTP_MAX_INFLIGHT", DEFAULT_OHTTP_MAX_INFLIGHT)?,
+            ohttp_buffer_budget: env_parse("OHTTP_BUFFER_BUDGET_BYTES", 256 * 1024 * 1024)?,
+            ohttp_max_response_size: env_parse("OHTTP_MAX_RESPONSE_BYTES", 32 * 1024 * 1024)?,
             listen_port,
             listen_addr,
             backend_token,
@@ -1677,6 +1686,12 @@ impl Config {
         };
 
         // Validate attestation cache TTL (TTL/2 is used as refresh interval, so TTL < 2 would cause a busy loop)
+        if !(1..=tokio::sync::Semaphore::MAX_PERMITS).contains(&config.attestation_max_inflight) {
+            anyhow::bail!(
+                "ATTESTATION_MAX_INFLIGHT must be between 1 and {}",
+                tokio::sync::Semaphore::MAX_PERMITS
+            );
+        }
         if config.attestation_cache_ttl_secs < 2 {
             anyhow::bail!(
                 "ATTESTATION_CACHE_TTL must be at least 2 (got {})",
@@ -2065,6 +2080,31 @@ mod tests {
         assert_eq!(with("0").unwrap().ohttp_max_inflight, 0);
         let err = with("lots").unwrap_err().to_string();
         assert!(err.contains("OHTTP_MAX_INFLIGHT"), "{err}");
+    }
+
+    #[test]
+    fn attestation_max_inflight_configuration() {
+        let load = |limit| {
+            with_env_vars(
+                &[
+                    ("TOKEN", "t"),
+                    ("MODEL_NAME", "m"),
+                    ("ATTESTATION_MAX_INFLIGHT", limit),
+                ],
+                Config::from_env,
+            )
+        };
+        assert_eq!(
+            load("").unwrap().attestation_max_inflight,
+            crate::attestation::DEFAULT_ATTESTATION_MAX_INFLIGHT
+        );
+        assert_eq!(load("2").unwrap().attestation_max_inflight, 2);
+        for invalid in ["0", "invalid", &usize::MAX.to_string()] {
+            assert!(load(invalid)
+                .unwrap_err()
+                .to_string()
+                .contains("ATTESTATION_MAX_INFLIGHT"));
+        }
     }
 
     #[test]

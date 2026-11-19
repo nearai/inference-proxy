@@ -30,7 +30,7 @@
 use std::time::{Duration, SystemTime};
 
 use aws_credential_types::Credentials;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Deserialize;
 
 /// A client that treats a 3xx as the answer it is. The metadata requests carry
@@ -340,9 +340,9 @@ pub(crate) async fn read_bounded(
 }
 
 fn parse_expiration(text: &str) -> Result<SystemTime, String> {
-    DateTime::parse_from_rfc3339(text)
-        .map(|time| SystemTime::from(time.with_timezone(&Utc)))
-        .map_err(|_| "credentials endpoint gave an Expiration that is not RFC 3339".to_string())
+    text.parse::<Timestamp>()
+        .map(SystemTime::from)
+        .map_err(|_| "credentials endpoint gave an invalid Expiration timestamp".to_owned())
 }
 
 /// Mocks of an IMDSv2 endpoint, shared with the sender's tests.
@@ -407,7 +407,7 @@ mod tests {
             "SecretAccessKey": "secret",
             "Token": "session-token",
             "Code": "Success",
-            "Expiration": (Utc::now() + chrono::TimeDelta::hours(1)).to_rfc3339(),
+            "Expiration": (Timestamp::now() + Duration::from_secs(3600)).to_string(),
         })
     }
 
@@ -424,7 +424,12 @@ mod tests {
     #[test]
     fn expiration_must_be_rfc3339() {
         assert!(parse_expiration("2026-10-20T12:00:00Z").is_ok());
+        assert_eq!(
+            parse_expiration("2026-10-20T12:00Z[UTC]"),
+            parse_expiration("2026-10-20T12:00:00Z")
+        );
         assert!(parse_expiration("tomorrow").is_err());
+        assert!(parse_expiration("2026-10-20X12:00:00Z").is_err());
     }
 
     /// The full IMDSv2 flow against a server that, like `aws_signing_helper

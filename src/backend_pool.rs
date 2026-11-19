@@ -6,6 +6,7 @@ use tracing::{debug, info, warn};
 
 use crate::context_tier::ContextTier;
 use crate::model_metrics::{model_counter, model_gauge, ModelLabel};
+use crate::proxy::sanitized_upstream_url_for_logs;
 
 /// A single backend instance (e.g., one vLLM process).
 pub struct Backend {
@@ -561,7 +562,7 @@ pub fn spawn_health_check(
                         backend.consecutive_failures.store(0, Ordering::Relaxed);
                         backend.healthy.store(true, Ordering::Relaxed);
                         if was_unhealthy {
-                            info!(backend = %backend.base_url, "Backend recovered");
+                            info!(backend = %sanitized_upstream_url_for_logs(&backend.base_url), "Backend recovered");
                         }
                     }
                     Ok(resp) => {
@@ -571,7 +572,7 @@ pub fn spawn_health_check(
                             let was_healthy = backend.healthy.swap(false, Ordering::Relaxed);
                             if was_healthy {
                                 warn!(
-                                    backend = %backend.base_url,
+                                    backend = %sanitized_upstream_url_for_logs(&backend.base_url),
                                     status = %resp.status(),
                                     failures,
                                     "Backend marked unhealthy"
@@ -579,7 +580,7 @@ pub fn spawn_health_check(
                             }
                         } else {
                             debug!(
-                                backend = %backend.base_url,
+                                backend = %sanitized_upstream_url_for_logs(&backend.base_url),
                                 status = %resp.status(),
                                 failures,
                                 max_failures,
@@ -594,16 +595,16 @@ pub fn spawn_health_check(
                             let was_healthy = backend.healthy.swap(false, Ordering::Relaxed);
                             if was_healthy {
                                 warn!(
-                                    backend = %backend.base_url,
-                                    error = %e,
+                                    backend = %sanitized_upstream_url_for_logs(&backend.base_url),
+                                    error = %e.without_url(),
                                     failures,
                                     "Backend marked unhealthy"
                                 );
                             }
                         } else {
                             debug!(
-                                backend = %backend.base_url,
-                                error = %e,
+                                backend = %sanitized_upstream_url_for_logs(&backend.base_url),
+                                error = %e.without_url(),
                                 failures,
                                 max_failures,
                                 "Backend health check failed"

@@ -102,11 +102,14 @@ async fn serve(
         },
     )?;
     crate::model_list::apply_backend_lora(&state, &mut request_json);
-    // See the chat route (`request_guard.rs`).
-    state
-        .config
-        .request_guard
-        .apply_completion_body(&mut request_json)?;
+    // The field rules and media inlining (`forward_body.rs`); the body is
+    // re-serialized below in any case.
+    crate::forward_body::prepare(
+        &state.config,
+        crate::forward_body::Rules::Completion,
+        &mut request_json,
+    )
+    .await?;
     // Size bonus on the engine `priority`, from the decrypted prompt; see the
     // chat route.
     if let Some(tiers) = &state.config.priority_size_tiers {

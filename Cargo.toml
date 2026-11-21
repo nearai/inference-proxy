@@ -7,6 +7,8 @@ resolver = "3"
 publish = false
 
 [dependencies]
+# Read uploaded audio timing for optional admission estimation.
+lofty = "0.25.5"
 # Async runtime & web
 tokio = { version = "1.53.3", features = ["full"] }
 axum = { version = "0.8", features = ["multipart"] }

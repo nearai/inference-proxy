@@ -610,9 +610,42 @@ queueing" refusal. The consequences are deliberate:
   together with `WEB_CONTEXT_SEARCH_URL` is refused at startup: that mode
   places its own backend requests, which no tier restriction reaches.
 
+## Monetary admission and final receipts
+
+Direct requests obtain an admission decision before chat/completions, image generation/edit,
+and audio transcription. Requests already admitted by the API are not admitted twice.
+Inference parameters, output limits, media support, and response formats are preserved.
+
+The API selects the organization policy. Its default policy is audit, which estimates
+without creating a hold. Explicitly enabled organizations can enforce reservations.
+`MONETARY_ADMISSION=auto|enforce|audit|off` controls the proxy's participation and defaults
+to `auto`: it follows valid API decisions, including quota refusals, but continues normal
+usage reporting if admission is unavailable or local estimation fails. Explicit `enforce`
+also rejects on those failures. Neither setting forces an organization to enforce.
+Setting the proxy to `audit` requests estimates and continues on ordinary admission errors.
+When the API explicitly reports that its policy has never loaded, `auto`, `audit`, and
+`enforce` return HTTP 503 before forwarding the request. The `off` mode skips admission.
+Every mode retains actual usage reporting.
+
+`MONETARY_ADMISSION_TIMEOUT_MS` defaults to 2000 and accepts 100–10000 milliseconds.
+Invalid mode or timeout settings fail startup. Capacity refusals return 429 with
+`Retry-After`; invalid admission metadata returns 400.
+
+Final usage carries its admission identifier separately from the provider identifier.
+Actual usage remains authoritative and can exceed the estimate. Duplicate delivery
+settles once. Confirmed undispatched attempts release their holds; uncertain outcomes
+free execution slots while retaining funding for a bounded grace period. Failed cleanup
+retains the original expiry fallback. No receipt persistence is added.
+
+Request features are reused across connection retries. Audio duration prefers reported
+usage, then the response duration. Local frame/sample timing and byte counts are used
+only for estimation; missing provider duration produces no usage charge. Existing usage delivery and media handling
+remain unchanged. Embedding, rerank, privacy, and score retain their existing admission
+behavior.
+
 ## Usage report delivery
 
-Every request made with a customer key ends with one usage report, to cloud-api
+For legacy reports without an admission, each customer-key request ends with one usage report, to cloud-api
 over HTTP (the default) or to the usage queue with `VLLM_PROXY_USAGE_REPORT_TRANSPORT=sqs`
 (step 6 above). Over SQS a report is validated and serialized once when it is
 submitted, and a report the queue cannot carry (over 256 KiB, or a field the

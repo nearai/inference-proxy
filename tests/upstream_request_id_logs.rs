@@ -86,6 +86,7 @@ fn chat(api_key: &str) -> Request<Body> {
 #[tokio::test]
 async fn direct_requests_log_the_backend_request_id() {
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({

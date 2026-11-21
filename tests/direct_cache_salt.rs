@@ -44,6 +44,7 @@ async fn mount_key(cloud_api: &MockServer, key: &str, identity: Value) {
 async fn harness() -> Harness {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     mount_key(
         &cloud_api,

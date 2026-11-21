@@ -5,6 +5,9 @@
 //! endpoint. The test app wires them up via `web_context_search_url` and
 //! `VLLM_BACKEND_URLS` in `Config`.
 
+#[path = "common/budget.rs"]
+mod budget_fixture;
+
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -39,6 +42,8 @@ fn build_agent_loop_app_with_cloud_and_idle(
 ) -> axum::Router {
     let base = upstream_mock_url.trim_end_matches('/');
     let config = config::Config {
+        monetary_admission_mode: Default::default(),
+        monetary_admission_timeout_ms: 2000,
         model_list: None,
         replica_state: None,
         model_name: "test-model".to_string(),
@@ -186,11 +191,13 @@ fn build_agent_loop_app_with_cloud_and_idle(
         upstream_mock_url.to_string(),
     ]));
 
+    let usage_report_delivery =
+        vllm_proxy_rs::usage_report::UsageReportDelivery::new(config.usage_report.clone());
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),
         rerank_limiter: Default::default(),
-        usage_report_delivery: Default::default(),
+        usage_report_delivery,
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),
@@ -1813,14 +1820,13 @@ async fn brave_formatted_output_is_truncated() {
     );
 }
 
-/// An interrupted agent loop (the final
-/// upstream turn carries usage but is cut off before `[DONE]`) must still bill
-/// the tokens already produced — while still withholding the signature, since
-/// the response is incomplete and cannot be verified.
+/// Admission preserves billing of known cumulative usage after interruption;
+/// an incomplete response still has no signature.
 #[tokio::test]
-async fn interrupted_agent_loop_reports_usage_without_signature() {
+async fn interrupted_agent_loop_reports_known_usage_with_admission() {
     let upstream = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     // sk- key validation succeeds → usage reporter is active for this request.
     // Identity fields enable the service-token /v1/internal/usage reporting path.
@@ -1895,6 +1901,14 @@ async fn interrupted_agent_loop_reports_usage_without_signature() {
     assert_eq!(usage["input_tokens"], 15);
     assert_eq!(usage["output_tokens"], 3);
     assert_report_matches_header(usage, &inference_id, "chatcmpl-INT");
+    let requests = cloud_api.received_requests().await.unwrap();
+    let admission = requests
+        .iter()
+        .find(|r| r.url.path() == "/v1/internal/budget")
+        .expect("loop must reserve before dispatch");
+    let metadata: serde_json::Value = serde_json::from_slice(&admission.body).unwrap();
+    assert!(metadata["features"]["executions"].as_i64().unwrap() > 1);
+    assert_eq!(usage["admission_id"], metadata["id"]);
 
     // ...but no signature is cached over the incomplete response.
     let sig_response = app_for_sig
@@ -1922,6 +1936,7 @@ const DIRECT_KEY_BEARER: &str = "Bearer sk-test-agent-loop-direct-0001";
 
 /// Cloud API stub: key check with full billing identity, plus a usage sink.
 async fn mount_direct_key_cloud_api(cloud_api: &MockServer) {
+    budget_fixture::mount(cloud_api).await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({

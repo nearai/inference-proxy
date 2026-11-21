@@ -100,6 +100,9 @@ pub(super) fn chat_body(id: &str) -> Value {
 pub(super) fn job_with(body: &Value, delivery: &Arc<UsageReportDelivery>) -> Job {
     Job {
         reporter: UsageReporter {
+            budget_report_id: None,
+            admission_mode: crate::monetary_budget::AdmissionMode::Enforce,
+            admission_timeout_ms: 2000,
             http_client: reqwest::Client::new(),
             cloud_api_url: None,
             model_name: "test-model".to_string(),
@@ -227,7 +230,9 @@ fn the_queue_carries_the_body_the_proxy_builds_for_each_usage_type() {
         (UsageType::Rerank, json!({"usage": {"prompt_tokens": 2048}})),
         (UsageType::Score, json!({"usage": {"prompt_tokens": 96}})),
         (
-            UsageType::AudioTranscription,
+            UsageType::AudioTranscription {
+                duration_seconds: None,
+            },
             json!({"usage": {"type": "duration", "seconds": 1.25}}),
         ),
     ];

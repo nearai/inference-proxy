@@ -1,4 +1,7 @@
 use std::io::Cursor;
+#[path = "common/budget.rs"]
+mod budget_fixture;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -175,6 +178,8 @@ fn build_test_app_inner_with_pool(
     };
 
     let config = config::Config {
+        monetary_admission_mode: Default::default(),
+        monetary_admission_timeout_ms: 2000,
         model_list: None,
         replica_state: None,
         model_name: "test-model".to_string(),
@@ -350,11 +355,13 @@ fn build_test_app_inner_with_pool(
         backend_pool.len(),
         Arc::new(vllm_proxy_rs::engine_load::EngineLoad::disabled()),
     ));
+    let usage_report_delivery =
+        vllm_proxy_rs::usage_report::UsageReportDelivery::new(config.usage_report.clone());
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),
         rerank_limiter: Default::default(),
-        usage_report_delivery: Default::default(),
+        usage_report_delivery,
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),
@@ -1046,6 +1053,7 @@ async fn test_completions_replica_hint_routes_to_hinted_backend() {
 async fn test_cloud_api_key_check_is_repeated_across_requests() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
     mount_completions_ok(&backend, 2).await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -1081,6 +1089,7 @@ async fn test_cloud_api_key_check_is_repeated_across_requests() {
 async fn test_cloud_api_key_is_checked_on_every_request_until_accepted() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
     mount_completions_ok(&backend, 2).await;
     // wiremock matches in priority order: lower number wins.
     Mock::given(method("POST"))
@@ -1132,6 +1141,7 @@ async fn test_cloud_api_key_is_checked_on_every_request_until_accepted() {
 async fn test_cloud_api_key_5xx_is_not_kept() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
     mount_completions_ok(&backend, 2).await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -1175,6 +1185,7 @@ async fn test_completions_replica_hint_is_dropped_for_cloud_api_key_auth() {
     let backend_a = MockServer::start().await;
     let backend_b = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
     mount_completions_ok(&backend_a, 1).await;
     mount_completions_ok(&backend_b, 0).await;
     Mock::given(method("POST"))
@@ -1221,6 +1232,7 @@ async fn test_chat_completions_replica_hint_is_dropped_for_cloud_api_key_auth() 
     let backend_a = MockServer::start().await;
     let backend_b = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
     mount_chat_ok(&backend_a, "/v1/chat/completions", 1).await;
     mount_chat_ok(&backend_b, "/v1/chat/completions", 0).await;
     Mock::given(method("POST"))
@@ -2735,6 +2747,7 @@ async fn test_invalid_json_body() {
 async fn test_non_object_json_body_is_rejected_before_dispatch() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     // An `sk-` caller with usage reporting on, and an engine that answers
     // anything with billable usage: a dispatched request would be billed.
@@ -3451,6 +3464,7 @@ async fn test_internal_gpu_evidence_requires_auth() {
 async fn test_internal_gpu_evidence_rejects_cloud_api_keys() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -4184,6 +4198,140 @@ async fn test_images_edits_multipart() {
 }
 
 #[tokio::test]
+async fn test_direct_audio_provider_usage_bills_before_encryption() {
+    use vllm_proxy_rs::encryption;
+    for (audio, filename, mime, provider_usage, local_seconds, billed_seconds) in [
+        (
+            include_bytes!("fixtures/audio/silence.wav").as_slice(),
+            "silence.wav",
+            "audio/wav",
+            serde_json::json!({"type":"duration","seconds":2}),
+            Some(2),
+            2,
+        ),
+        (
+            include_bytes!("fixtures/audio/silence-vorbis.webm").as_slice(),
+            "silence.webm",
+            "audio/webm",
+            serde_json::json!({"type":"duration","seconds":4}),
+            None,
+            4,
+        ),
+    ] {
+        for encrypted in [false, true] {
+            let backend = MockServer::start().await;
+            let cloud_api = MockServer::start().await;
+            budget_fixture::mount(&cloud_api).await;
+            Mock::given(method("POST"))
+                .and(path("/v1/check_api_key"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "organization_id":"org-test", "workspace_id":"ws-test", "api_key_id":"key-test"
+                })))
+                .mount(&cloud_api)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/v1/internal/usage"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&cloud_api)
+                .await;
+            let mut upstream_response = serde_json::json!({"id":"audio-metered", "text":"hello"});
+            if !provider_usage.is_null() {
+                upstream_response["usage"] = provider_usage.clone();
+            }
+            Mock::given(method("POST"))
+                .and(path("/v1/audio/transcriptions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response))
+                .expect(1)
+                .mount(&backend)
+                .await;
+            let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+            let pair = test_client_signing_pair();
+            let client_public = pair.ed25519.signing_public_key.clone();
+            let prompt = if encrypted {
+                encryption::encrypt_string(
+                    "transcribe",
+                    &encryption::EncryptionContext {
+                        algo: encryption::EncryptionAlgo::Ed25519,
+                        client_pub_key: hex::decode(test_ed25519_pub_key_hex()).unwrap(),
+                        version: 1,
+                        encrypt_all_fields: false,
+                    },
+                    &pair,
+                )
+                .unwrap()
+            } else {
+                "transcribe".into()
+            };
+            let boundary = "AudioDurationBoundary";
+            let mut body = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ntest-model\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\njson\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n{prompt}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: {mime}\r\n\r\n").into_bytes();
+            body.extend_from_slice(audio);
+            body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .header("authorization", "Bearer sk-test-valid-key-12345678901");
+            if encrypted {
+                request = request
+                    .header("x-signing-algo", "ed25519")
+                    .header("x-client-pub-key", &client_public);
+            }
+            let response = app
+                .oneshot(request.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let response = body_to_json(response).await;
+            assert!(response["duration"].is_null());
+            if encrypted {
+                let plaintext = encryption::decrypt_string(
+                    response["text"].as_str().unwrap(),
+                    &encryption::EncryptionContext {
+                        algo: encryption::EncryptionAlgo::Ed25519,
+                        client_pub_key: hex::decode(client_public).unwrap(),
+                        version: 1,
+                        encrypt_all_fields: false,
+                    },
+                    &pair,
+                )
+                .unwrap();
+                assert_eq!(plaintext, "hello");
+            } else {
+                assert_eq!(response["text"], "hello");
+            }
+            wait_for_usage_request(&cloud_api, 1).await;
+            let usage = get_usage_requests(&cloud_api).await;
+            assert_eq!(usage.len(), 1);
+            assert_eq!(usage[0]["type"], "audio_transcription");
+            assert_eq!(usage[0]["duration_seconds"], billed_seconds);
+            assert!(usage[0]["admission_id"].as_str().is_some());
+            let admissions = cloud_api.received_requests().await.unwrap();
+            let admission = admissions
+                .iter()
+                .find(|request| request.url.path() == "/v1/internal/budget")
+                .unwrap();
+            let admission: serde_json::Value = serde_json::from_slice(&admission.body).unwrap();
+            assert_eq!(
+                admission["features"]["audio_duration_seconds"].as_i64(),
+                local_seconds
+            );
+            assert_eq!(usage[0]["admission_id"], admission["id"]);
+            let upstream = backend.received_requests().await.unwrap();
+            assert!(upstream[0]
+                .body
+                .windows(audio.len())
+                .any(|bytes| bytes == audio));
+            let multipart = String::from_utf8_lossy(&upstream[0].body);
+            assert!(multipart.contains("\r\njson\r\n"));
+            assert!(!multipart.contains("verbose_json"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_audio_transcriptions_multipart() {
     let mock_server = MockServer::start().await;
 
@@ -4251,6 +4399,7 @@ async fn test_audio_transcriptions_multipart() {
 async fn test_direct_audio_transcription_reports_duration() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -4312,6 +4461,7 @@ async fn test_direct_audio_transcription_reports_duration() {
 async fn test_audio_transcriptions_missing_duration_is_direct_only() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -4560,6 +4710,8 @@ fn build_test_app_with_cloud_api_retries(
     let base = mock_url.trim_end_matches('/');
 
     let config = config::Config {
+        monetary_admission_mode: Default::default(),
+        monetary_admission_timeout_ms: 2000,
         model_list: None,
         replica_state: None,
         model_name: "test-model".to_string(),
@@ -4714,11 +4866,13 @@ fn build_test_app_with_cloud_api_retries(
         mock_url.to_string(),
     ]));
 
+    let usage_report_delivery =
+        vllm_proxy_rs::usage_report::UsageReportDelivery::new(config.usage_report.clone());
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),
         rerank_limiter: Default::default(),
-        usage_report_delivery: Default::default(),
+        usage_report_delivery,
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),
@@ -4756,6 +4910,7 @@ fn build_test_app_with_cloud_api_retries(
 async fn test_cloud_api_key_valid() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     // Mock the cloud API check endpoint to return 200
     Mock::given(method("POST"))
@@ -4980,6 +5135,7 @@ async fn direct_key_refuses_unbillable_backend_success() {
 #[tokio::test]
 async fn test_cloud_api_key_unauthorized() {
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -5010,6 +5166,7 @@ async fn test_cloud_api_key_unauthorized() {
 #[tokio::test]
 async fn test_cloud_api_key_insufficient_credits() {
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -5040,6 +5197,7 @@ async fn test_cloud_api_key_insufficient_credits() {
 #[tokio::test]
 async fn test_cloud_api_key_rate_limited() {
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -5069,6 +5227,7 @@ async fn test_cloud_api_key_rate_limited() {
 async fn test_cloud_api_key_retries_after_5xx() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     // First call to /v1/check_api_key returns 503; the next returns 200.
     // wiremock matches in priority order: lower number wins, expectation
@@ -5126,6 +5285,7 @@ async fn test_cloud_api_key_retries_after_5xx() {
 #[tokio::test]
 async fn test_cloud_api_key_no_retry_on_4xx() {
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     // Always return 401. With max_attempts=3, the proxy must NOT retry — a
     // genuine 4xx is the upstream's verdict on the token, not a transient blip.
@@ -5160,6 +5320,7 @@ async fn test_cloud_api_key_no_retry_on_4xx() {
 #[tokio::test]
 async fn test_cloud_api_key_exhausts_retries_on_persistent_5xx() {
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     // 5xx every time. With max_attempts=3, expect exactly 3 calls and a 401
     // back to the client (we don't expose 5xx details to callers).
@@ -5193,6 +5354,7 @@ async fn test_cloud_api_key_exhausts_retries_on_persistent_5xx() {
 async fn test_proxy_token_still_works_with_cloud_api_configured() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     let backend_response = serde_json::json!({
         "id": "chatcmpl-1",
@@ -5285,6 +5447,7 @@ async fn get_usage_requests(cloud_api: &MockServer) -> Vec<serde_json::Value> {
 async fn test_usage_reported_for_cloud_api_key_non_streaming() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
     let request_id = "550e8400-e29b-41d4-a716-446655440000";
 
     Mock::given(method("POST"))
@@ -5381,6 +5544,7 @@ async fn test_responses_endpoint_refused_instead_of_billing_silently() {
     // until a dedicated Responses usage parser exists.
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -5535,6 +5699,7 @@ async fn test_similar_unknown_paths_are_refused() {
 async fn test_usage_reported_for_streaming_chat_with_cloud_api_key() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -5645,6 +5810,7 @@ const OWNER_B_BEARER: &str = "Bearer sk-test-owner-b-000000000003";
 
 /// Cloud API stub for the three synthetic owner keys, plus a usage sink.
 async fn mount_signature_owner_cloud_api(cloud_api: &MockServer) {
+    budget_fixture::mount(cloud_api).await;
     for (bearer, org, workspace, key_id) in [
         (OWNER_A_BEARER, "org-a", "ws-a", "key-a1"),
         (OWNER_A_SECOND_BEARER, "org-a", "ws-a", "key-a2"),
@@ -5803,9 +5969,10 @@ async fn test_signature_without_owner_is_refused_to_direct_keys() {
 /// figure we bill. The signature must still be withheld — a partial response
 /// cannot be verified.
 #[tokio::test]
-async fn test_usage_reported_for_interrupted_stream_without_done() {
+async fn test_interrupted_stream_reports_known_usage_with_admission() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -5870,18 +6037,41 @@ data: {\"id\":\"chatcmpl-interrupted\",\"choices\":[{\"delta\":{\"content\":\"lo
 
     assert_eq!(response.status(), StatusCode::OK);
 
+    let inference_id = response.headers()["inference-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+
     // Consume the streaming body so the background task finishes
     use http_body_util::BodyExt;
     let _ = response.into_body().collect().await;
 
-    // Usage IS reported with the last cumulative counts seen before interruption.
     wait_for_usage_request(&cloud_api, 1).await;
-    let usage_reqs = get_usage_requests(&cloud_api).await;
-    assert_eq!(usage_reqs.len(), 1, "Expected exactly one usage report");
-    assert_eq!(usage_reqs[0]["type"], "chat_completion");
-    assert_eq!(usage_reqs[0]["input_tokens"], 8);
-    assert_eq!(usage_reqs[0]["output_tokens"], 2);
-    assert_eq!(usage_reqs[0]["cache_read_tokens"], 6);
+    let usage = get_usage_requests(&cloud_api).await;
+    assert_eq!(usage.len(), 1);
+    let usage_id = usage[0]["id"].as_str().unwrap();
+    assert!(usage_id.starts_with("stream-"));
+    assert_eq!(
+        inference_id,
+        uuid::Uuid::new_v5(
+            &uuid::Uuid::from_u128(0x1966acaf_9f95_5dab_b8f0_03a51c091314),
+            usage_id.as_bytes(),
+        )
+        .to_string()
+    );
+    assert_eq!(usage[0]["input_tokens"], 8);
+    assert_eq!(usage[0]["output_tokens"], 2);
+    assert_eq!(usage[0]["cache_read_tokens"], 6);
+    let admissions: Vec<_> = cloud_api
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path() == "/v1/internal/budget")
+        .collect();
+    assert_eq!(admissions.len(), 1);
+    let admission: serde_json::Value = serde_json::from_slice(&admissions[0].body).unwrap();
+    assert_eq!(usage[0]["admission_id"], admission["id"]);
 
     // ...but the signature is still withheld: a partial stream cannot be verified.
     let sig_response = app
@@ -5901,6 +6091,7 @@ data: {\"id\":\"chatcmpl-interrupted\",\"choices\":[{\"delta\":{\"content\":\"lo
 async fn test_no_usage_reported_for_proxy_token() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -5950,6 +6141,7 @@ async fn test_no_usage_reported_for_proxy_token() {
 async fn test_usage_report_failure_does_not_affect_response() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -6010,6 +6202,7 @@ async fn test_usage_report_failure_does_not_affect_response() {
 async fn test_usage_reported_for_image_generation() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -6074,6 +6267,85 @@ async fn test_usage_reported_for_image_generation() {
     assert_eq!(usage_reqs[0]["type"], "image_generation");
     assert_eq!(usage_reqs[0]["model"], "test-model");
     assert_eq!(usage_reqs[0]["image_count"], 2);
+    let requests = cloud_api.received_requests().await.unwrap();
+    let admissions: Vec<_> = requests
+        .iter()
+        .filter(|request| request.url.path() == "/v1/internal/budget")
+        .collect();
+    assert_eq!(
+        admissions.len(),
+        1,
+        "image generation reserves exactly once"
+    );
+    let admission: serde_json::Value = serde_json::from_slice(&admissions[0].body).unwrap();
+    assert_eq!(admission["features"]["inference_type"], "image_generation");
+    assert_eq!(usage_reqs[0]["admission_id"], admission["id"]);
+}
+
+#[tokio::test]
+async fn test_direct_image_generation_budget_denial_prevents_plain_and_encrypted_dispatch() {
+    use vllm_proxy_rs::encryption;
+
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id":"org-test", "workspace_id":"ws-test", "api_key_id":"key-test"
+        })))
+        .expect(2)
+        .mount(&cloud_api)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/internal/budget"))
+        .respond_with(ResponseTemplate::new(402))
+        .expect(2)
+        .mount(&cloud_api)
+        .await;
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+    let client_pair = test_client_signing_pair();
+    for encrypted in [false, true] {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/v1/images/generations")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer sk-test-valid-key-12345678901");
+        let prompt = if encrypted {
+            request = request
+                .header("x-signing-algo", "ed25519")
+                .header("x-client-pub-key", &client_pair.ed25519.signing_public_key);
+            encryption::encrypt_string(
+                "a cat",
+                &encryption::EncryptionContext {
+                    algo: encryption::EncryptionAlgo::Ed25519,
+                    client_pub_key: hex::decode(test_ed25519_pub_key_hex()).unwrap(),
+                    version: 1,
+                    encrypt_all_fields: false,
+                },
+                &client_pair,
+            )
+            .unwrap()
+        } else {
+            "a cat".to_owned()
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                request
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "model":"test-model", "prompt":prompt
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+    assert!(backend.received_requests().await.unwrap().is_empty());
+    assert!(get_usage_requests(&cloud_api).await.is_empty());
 }
 
 #[tokio::test]
@@ -6149,6 +6421,7 @@ async fn test_streaming_includes_usage_injected_for_cloud_key() {
 
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
 
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
@@ -7879,6 +8152,8 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
     ];
 
     let config = config::Config {
+        monetary_admission_mode: Default::default(),
+        monetary_admission_timeout_ms: 2000,
         model_list: None,
         replica_state: None,
         model_name: "test-model".to_string(),
@@ -7925,7 +8200,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         cloud_api_auth_max_attempts: 1,
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
-        cloud_api_usage_token: None,
+        cloud_api_usage_token: Some("test-usage-token".into()),
         usage_report: Default::default(),
         usage_report_transport: Default::default(),
         compose_manager_url: None,
@@ -8028,11 +8303,13 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
 
     let backend_pool = Arc::new(backend_pool::BackendPool::new(vec![mock_url.to_string()]));
 
+    let usage_report_delivery =
+        vllm_proxy_rs::usage_report::UsageReportDelivery::new(config.usage_report.clone());
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),
         rerank_limiter: Default::default(),
-        usage_report_delivery: Default::default(),
+        usage_report_delivery,
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(chat_cache),
@@ -8435,6 +8712,8 @@ async fn start_ohttp_server_with_relay_limit(
     let port = listener.local_addr().unwrap().port();
 
     let config = config::Config {
+        monetary_admission_mode: Default::default(),
+        monetary_admission_timeout_ms: 2000,
         model_list: None,
         replica_state: None,
         model_name: "test-model".to_string(),
@@ -8481,7 +8760,7 @@ async fn start_ohttp_server_with_relay_limit(
         cloud_api_auth_max_attempts: 1,
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
-        cloud_api_usage_token: None,
+        cloud_api_usage_token: Some("test-usage-token".into()),
         usage_report: Default::default(),
         usage_report_transport: Default::default(),
         compose_manager_url: None,
@@ -8575,11 +8854,13 @@ async fn start_ohttp_server_with_relay_limit(
         .handle();
     let backend_pool = Arc::new(backend_pool::BackendPool::new(vec![mock_url.to_string()]));
 
+    let usage_report_delivery =
+        vllm_proxy_rs::usage_report::UsageReportDelivery::new(config.usage_report.clone());
     let state = AppState {
         models: None,
         api_key_cache: Default::default(),
         rerank_limiter: Default::default(),
-        usage_report_delivery: Default::default(),
+        usage_report_delivery,
         config: Arc::new(config),
         signing: Arc::new(signing_pair),
         cache: Arc::new(cache::ChatCache::new("test-model", 1200)),
@@ -9551,6 +9832,7 @@ async fn zdr_send(app: axum::Router, request: Request<Body>) {
 #[tokio::test]
 async fn request_content_never_reaches_logs_or_metrics() {
     let cloud_api = MockServer::start().await;
+    budget_fixture::mount(&cloud_api).await;
     Mock::given(method("POST"))
         .and(path("/v1/check_api_key"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({

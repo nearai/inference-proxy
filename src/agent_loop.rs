@@ -149,14 +149,13 @@ pub async fn run_chat_completion(
     // Pick one backend; reuse it across every iteration so the engine can
     // prefix-cache across rounds (each iteration's prompt = prior iteration +
     // a few new messages, so the cache hit rate should be very high).
-    let (upstream_url, backend_guard) = state.backend_pool.select_url("/v1/chat/completions");
 
     // Direct-key billing: refuse before dispatch when usage could not be
     // reported, and fix the billing ID now so the `inference-id` header on the
     // 200 and the usage report name the same inference. The provider chat ID
     // is still what the response carries and what the signature is cached
     // under. Trusted callers have no reporter, no billing ID and no header.
-    let usage_reporter = make_usage_reporter(&auth, &state);
+    let mut usage_reporter = make_usage_reporter(&auth, &state);
     let (billing_id, inference_id) = match direct_stream_billing_id(usage_reporter.as_ref())
         .map_err(|err| err.for_encrypted_request(chunk_transform.is_some()))?
     {
@@ -169,13 +168,26 @@ pub async fn run_chat_completion(
     // on iteration 0 would arrive as a 200 text/event-stream followed by a
     // broken / empty body, hiding the real failure from the client. Only
     // when this first call succeeds do we return 200 + spawn the loop.
+    if let Some(reporter) = usage_reporter.as_mut() {
+        let executions = i32::try_from(state.config.agent_loop_max_iterations)
+            .map_err(|_| AppError::BadRequest("Too many agent iterations".into()))?;
+        crate::monetary_budget::admit(
+            reporter,
+            &crate::proxy::UsageType::ChatCompletion,
+            &request_json,
+            executions,
+        )
+        .await?;
+    }
     let first_request_body =
         serde_json::to_vec(&request_json).map_err(|e| AppError::Internal(e.into()))?;
-    let first_response = send_upstream(
+    let (upstream_url, backend_guard) = state.backend_pool.select_url("/v1/chat/completions");
+    let (first_response, mut attempt_cleanup) = send_upstream(
         &state.backend_client,
         &upstream_url,
         first_request_body,
         &tracing_ids,
+        usage_reporter.as_ref(),
     )
     .await
     .map_err(|err| err.for_encrypted_request(chunk_transform.is_some()))?;
@@ -256,6 +268,8 @@ pub async fn run_chat_completion(
             ),
         );
 
+        attempt_cleanup.disarm();
+
         match outcome {
             Ok(result) => {
                 info!(
@@ -270,6 +284,14 @@ pub async fn run_chat_completion(
                     completed_cleanly = result.completed_cleanly,
                     "agent loop completed"
                 );
+
+                if let Some(error) = result.downstream_error {
+                    error!(error = %error, "Agent loop failed");
+                    let _ = tx
+                        .send(Err(std::io::Error::other(format!("agent loop: {error}"))))
+                        .await;
+                    return;
+                }
 
                 // Only sign / cache when the stream closed cleanly (final `[DONE]`
                 // was sent downstream): a partial response cannot be verified.
@@ -430,6 +452,7 @@ struct LoopResult {
     /// terminator) and the final `[DONE]` was sent downstream. False on
     /// client disconnect or upstream stream ending without a `[DONE]`.
     completed_cleanly: bool,
+    downstream_error: Option<AppError>,
 }
 
 async fn drive_loop(
@@ -444,12 +467,13 @@ async fn drive_loop(
     let mut iterations: u32 = 0;
     let terminated_by;
     let mut completed_cleanly = false;
+    let mut downstream_error = None;
     // The iter-0 upstream Response is already in hand (see
     // `run_chat_completion`); subsequent iterations build their own via
     // `send_upstream`.
     let mut next_response: Option<reqwest::Response> = Some(first_response);
 
-    loop {
+    'executions: loop {
         // Bail out early if the client has gone away — avoids issuing another
         // upstream LLM request or a Brave call we'd only throw away on send.
         if ctx.tx.is_closed() {
@@ -458,7 +482,7 @@ async fn drive_loop(
         }
 
         if iterations >= ctx.max_iterations {
-            emit_max_iterations_terminator(
+            let result = emit_max_iterations_terminator(
                 ctx.tx,
                 ctx.chunk_transform,
                 &mut hasher,
@@ -466,10 +490,17 @@ async fn drive_loop(
                 model_echo.as_deref(),
                 created,
             )
-            .await?;
-            forward_done(ctx.tx, &mut hasher).await?;
+            .await;
+            if let Err(error) = result {
+                downstream_error = Some(error);
+                terminated_by = "downstream_error";
+                break;
+            }
+            match forward_done(ctx.tx, &mut hasher).await {
+                Ok(()) => completed_cleanly = true,
+                Err(error) => downstream_error = Some(error),
+            }
             terminated_by = "max_iterations";
-            completed_cleanly = true;
             break;
         }
 
@@ -482,7 +513,7 @@ async fn drive_loop(
                 let body = serde_json::to_vec(ctx.request_json)
                     .map_err(|e| AppError::Internal(e.into()))?;
                 let send_outcome = tokio::select! {
-                    r = send_upstream(ctx.backend_client, ctx.upstream_url, body, ctx.tracing_ids) => Some(r),
+                    r = send_upstream(ctx.backend_client, ctx.upstream_url, body, ctx.tracing_ids, None) => Some(r),
                     _ = ctx.tx.closed() => None,
                 };
                 let Some(send_outcome) = send_outcome else {
@@ -490,7 +521,7 @@ async fn drive_loop(
                     break;
                 };
                 match send_outcome {
-                    Ok(r) => r,
+                    Ok((response, _cleanup)) => response,
                     Err(AppError::Upstream { status, body }) => {
                         warn!(
                             status = %status,
@@ -570,6 +601,12 @@ async fn drive_loop(
             "agent loop iteration"
         );
 
+        if let Some(error) = iter_outcome.downstream_error {
+            downstream_error = Some(error);
+            terminated_by = "downstream_error";
+            break;
+        }
+
         // Client disconnected mid-iteration.
         if iter_outcome.client_disconnected {
             terminated_by = "client_disconnect";
@@ -611,7 +648,10 @@ async fn drive_loop(
                 terminated_by = "upstream_eof";
                 break;
             }
-            forward_done(ctx.tx, &mut hasher).await?;
+            match forward_done(ctx.tx, &mut hasher).await {
+                Ok(()) => completed_cleanly = true,
+                Err(error) => downstream_error = Some(error),
+            }
             terminated_by = match iter_outcome.finish_reason.as_deref() {
                 Some(r) => match r {
                     "stop" => "model_stop",
@@ -621,7 +661,6 @@ async fn drive_loop(
                 },
                 None => "upstream_eof",
             };
-            completed_cleanly = true;
             break;
         }
 
@@ -719,7 +758,7 @@ async fn drive_loop(
                 }
             };
 
-            emit_tool_result_chunk(
+            if let Err(error) = emit_tool_result_chunk(
                 ctx.tx,
                 ctx.chunk_transform,
                 &mut hasher,
@@ -730,7 +769,12 @@ async fn drive_loop(
                 status,
                 &output,
             )
-            .await?;
+            .await
+            {
+                downstream_error = Some(error);
+                terminated_by = "downstream_error";
+                break 'executions;
+            }
 
             tool_messages.push(json!({
                 "role": "tool",
@@ -766,6 +810,7 @@ async fn drive_loop(
         iterations,
         terminated_by,
         completed_cleanly,
+        downstream_error,
     })
 }
 
@@ -838,6 +883,7 @@ struct IterOutcome {
     /// these as upstream failure prevents signing a "successful" response
     /// over an aborted generation.
     upstream_error: Option<Value>,
+    downstream_error: Option<AppError>,
 }
 
 async fn run_iteration(
@@ -863,8 +909,10 @@ async fn run_iteration(
         saw_done: false,
         client_disconnected: false,
         upstream_error: None,
+        downstream_error: None,
     };
     let mut received_upstream_chunk = false;
+    let mut billing_parser = crate::proxy::SseParser::new();
 
     // SSE line loop. We hold off forwarding `[DONE]` until the caller decides
     // whether to continue looping; everything else is forwarded as it arrives.
@@ -876,6 +924,9 @@ async fn run_iteration(
                 match chunk {
                     Some(Ok(chunk)) => {
                         received_upstream_chunk = true;
+                        // Observe the whole received chunk before any downstream write can fail.
+                        // This consumes no additional upstream data after cancellation.
+                        billing_parser.process_chunk(&chunk);
                         byte_buf.extend_from_slice(&chunk);
 
                         while let Some(nl) = byte_buf.iter().position(|b| *b == b'\n') {
@@ -952,7 +1003,10 @@ async fn run_iteration(
                                 normalize_chat_chunk(&mut parsed);
 
                                 if let Some(transform) = ctx.chunk_transform {
-                                    transform(&mut parsed)?;
+                                    if let Err(error) = transform(&mut parsed) {
+                                        outcome.downstream_error = Some(error);
+                                        break 'outer;
+                                    }
                                 }
 
                                 let serialized = serde_json::to_string(&parsed)
@@ -1028,6 +1082,17 @@ async fn run_iteration(
         }
     }
 
+    billing_parser.finish();
+    if billing_parser.seen_done && billing_parser.take_error_event().is_none() {
+        if let Some((input, output)) = billing_parser
+            .usage
+            .filter(|(input, output)| *input >= 0 && *output >= 0)
+        {
+            outcome.input_tokens = input as u64;
+            outcome.output_tokens = output as u64;
+            outcome.saw_done = true;
+        }
+    }
     Ok(outcome)
 }
 
@@ -1133,7 +1198,8 @@ async fn send_upstream(
     upstream_url: &str,
     body: Vec<u8>,
     tracing_ids: &TracingIds,
-) -> Result<reqwest::Response, AppError> {
+    reporter: Option<&crate::proxy::UsageReporter>,
+) -> Result<(reqwest::Response, crate::monetary_budget::AttemptCleanup), AppError> {
     let mut req = client
         .post(upstream_url)
         .header("content-type", "application/json")
@@ -1141,9 +1207,8 @@ async fn send_upstream(
     for (k, v) in tracing_ids.upstream_headers() {
         req = req.header(k, v);
     }
-    let response = req
-        .body(body)
-        .send()
+    let request = req.body(body);
+    let (response, attempt_cleanup) = crate::monetary_budget::send(request, reporter)
         .await
         .map_err(|e| AppError::Internal(e.into()))?;
 
@@ -1155,7 +1220,7 @@ async fn send_upstream(
             body,
         });
     }
-    Ok(response)
+    Ok((response, attempt_cleanup))
 }
 
 // ── synthetic chunks ────────────────────────────────────────────────
@@ -1493,6 +1558,101 @@ fn format_context_response(resp: &BraveContextResponse, max_sources: Option<u32>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn final_usage_survives_client_disconnect_before_downstream_done() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        let body = concat!(
+            "data: {\"id\":\"final-loop\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"id\":\"final-loop\",\"choices\":[{\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+            .mount(&upstream)
+            .await;
+        let client = reqwest::Client::new();
+        let response = client.get(upstream.uri()).send().await.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            let mut request = json!({"messages":[]});
+            let tracing = TracingIds::from_headers(&Default::default());
+            let mut usage = UsageTally::default();
+            let result = drive_loop(
+                LoopCtx {
+                    client: &client,
+                    backend_client: &client,
+                    upstream_url: "http://unused.invalid",
+                    request_json: &mut request,
+                    tx: &tx,
+                    chunk_transform: None,
+                    max_iterations: 1,
+                    brave_url: "http://unused.invalid",
+                    brave_key: "unused",
+                    count: None,
+                    tool_timeout: Duration::from_secs(1),
+                    stream_idle_timeout_secs: 0,
+                    tracing_ids: &tracing,
+                },
+                response,
+                &mut usage,
+            )
+            .await;
+            (result, usage)
+        });
+        rx.recv().await.unwrap().unwrap();
+        let final_chunk = rx.recv().await.unwrap().unwrap();
+        assert!(std::str::from_utf8(&final_chunk).unwrap().contains("usage"));
+        rx.close(); // Reject downstream [DONE] after the final upstream counters were read.
+        let (result, usage) = task.await.unwrap();
+        let result = result.unwrap();
+        assert!(!result.completed_cleanly);
+        assert_eq!(usage.totals(), (3, 2));
+    }
+
+    #[tokio::test]
+    async fn final_usage_buffered_with_done_survives_transform_failure() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::start().await;
+        let body = concat!(
+            "data: {\"id\":\"final-loop\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"id\":\"final-loop\",\"choices\":[{\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+            .mount(&upstream)
+            .await;
+        let client = reqwest::Client::new();
+        let response = client.get(upstream.uri()).send().await.unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let transform: ChunkTransform = std::sync::Arc::new(|_| {
+            Err(AppError::Internal(anyhow::anyhow!(
+                "injected encryption failure"
+            )))
+        });
+        let mut hasher = Sha256::new();
+        let tracing = TracingIds::from_headers(&Default::default());
+        let mut usage = UsageTally::default();
+        let outcome = run_iteration(
+            IterCtx {
+                usage: &mut usage,
+                tx: &tx,
+                hasher: &mut hasher,
+                chunk_transform: Some(&transform),
+                rewrite_id_to: None,
+                stream_idle_timeout_secs: 0,
+                tracing_ids: &tracing,
+            },
+            response,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.downstream_error.is_some());
+        assert!(outcome.saw_done);
+        assert_eq!((outcome.input_tokens, outcome.output_tokens), (3, 2));
+    }
 
     #[test]
     fn usage_tally_keeps_latest_cumulative_and_sums_calls() {

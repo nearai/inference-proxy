@@ -33,6 +33,8 @@ fn build_test_app(mock_url: &str) -> axum::Router {
     let base = mock_url.trim_end_matches('/');
 
     let config = config::Config {
+        monetary_admission_mode: Default::default(),
+        monetary_admission_timeout_ms: 2000,
         model_list: None,
         replica_state: None,
         model_name: "bench-model".to_string(),

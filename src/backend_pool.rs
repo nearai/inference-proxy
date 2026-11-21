@@ -21,6 +21,10 @@ pub struct Backend {
     /// to this, so embeddings, images, probes and the like cannot fill it).
     pub lane_conns: AtomicU32,
     pub consecutive_failures: AtomicU32,
+    /// Optional ceiling on this backend's in-flight lane requests, for a
+    /// host that holds fewer than its peers (`backend_max_inflight`). Only
+    /// read by admission's `backend_limits`.
+    pub max_inflight: Option<u32>,
 }
 
 impl Backend {
@@ -32,6 +36,7 @@ impl Backend {
             active_conns: AtomicU32::new(0),
             lane_conns: AtomicU32::new(0),
             consecutive_failures: AtomicU32::new(0),
+            max_inflight: None,
         }
     }
 
@@ -240,6 +245,40 @@ impl BackendPool {
             untiered,
             model: None,
         }
+    }
+
+    /// Per-backend in-flight ceilings, one slot per backend of each tier in
+    /// pool order (empty = no ceilings for that tier).
+    ///
+    /// # Panics
+    /// When a non-empty list does not match its tier's backend count; the
+    /// model list checks this at startup.
+    pub fn with_host_caps(mut self, base: &[Option<u32>], long: &[Option<u32>]) -> Self {
+        let base_count = self
+            .backends
+            .iter()
+            .filter(|b| b.tier == ContextTier::Base)
+            .count();
+        let long_count = self.backends.len() - base_count;
+        assert!(
+            base.is_empty() || base.len() == base_count,
+            "base host caps must match the base backends"
+        );
+        assert!(
+            long.is_empty() || long.len() == long_count,
+            "long host caps must match the long-context backends"
+        );
+        // An empty list leaves its tier uncapped.
+        let mut base_caps = base.iter().copied();
+        let mut long_caps = long.iter().copied();
+        for backend in &mut self.backends {
+            let backend = Arc::get_mut(backend).expect("pool is not shared yet");
+            backend.max_inflight = match backend.tier {
+                ContextTier::Base => base_caps.next().flatten(),
+                ContextTier::Long => long_caps.next().flatten(),
+            };
+        }
+        self
     }
 
     /// The pool of one entry of a model list: its series, and those of the

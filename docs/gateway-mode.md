@@ -231,6 +231,14 @@ on an HTTP 200. With `VLLM_PROXY_STREAM_ERROR_PEEK_MS` the gateway holds the
 stream's status line for up to that long, so the rejection surfaces as a
 status; with `VLLM_PROXY_MAP_QUEUE_FULL_TO_429` that status is 429.
 
+A backend that is itself an inference-proxy answers 429 with error type
+`overloaded` (and `Retry-After`) when its own in-flight bound is full. The
+gateway treats a 429 whose parsed error type is exactly `overloaded` like the
+engine rejections above: the host counts as saturated for the back-pressure
+TTL and placement steers around it. The message text is not matched, a 429 of
+any other type sets nothing, and the client's response and retry behaviour are
+unchanged.
+
 ### Silence during a long prefill
 
 An engine sends the SSE response headers only together with its first event —

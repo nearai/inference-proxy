@@ -123,7 +123,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         git_rev: "test-rev".to_string(),
         rate_limit_per_second: 100,
         rate_limit_burst_size: 200,
-        rate_limit_trust_proxy_headers: true,
+        rate_limit_trusted_proxies: Vec::new(),
         cloud_api_url: options.cloud_api_url.clone(),
         cloud_api_auth_max_attempts: 1,
         cloud_api_auth_initial_backoff_ms: 0,
@@ -310,7 +310,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
     };
     let rate_limit_state = rate_limit::RateLimitState {
         limiter: rate_limit::build_rate_limiter(100, 200),
-        trust_proxy_headers: true,
+        trusted_proxies: Default::default(),
     };
     let router = routes::build_router()
         .layer(middleware::from_fn(rate_limit::rate_limit_middleware))

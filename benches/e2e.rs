@@ -72,7 +72,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
         git_rev: "bench".to_string(),
         rate_limit_per_second: 10000,
         rate_limit_burst_size: 20000,
-        rate_limit_trust_proxy_headers: false,
+        rate_limit_trusted_proxies: Vec::new(),
         cloud_api_url: None,
         cloud_api_auth_max_attempts: 1,
         cloud_api_auth_initial_backoff_ms: 0,
@@ -199,7 +199,7 @@ fn build_test_app(mock_url: &str) -> axum::Router {
     let rate_limiter = rate_limit::build_rate_limiter(10000, 20000);
     let rate_limit_state = rate_limit::RateLimitState {
         limiter: rate_limiter,
-        trust_proxy_headers: false,
+        trusted_proxies: Default::default(),
     };
 
     routes::build_router()

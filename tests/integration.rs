@@ -219,7 +219,7 @@ fn build_test_app_inner_with_pool(
         git_rev: "test-rev".to_string(),
         rate_limit_per_second: options.rate_per_second,
         rate_limit_burst_size: options.rate_burst,
-        rate_limit_trust_proxy_headers: true,
+        rate_limit_trusted_proxies: Vec::new(),
         cloud_api_url: options.cloud_api_url.clone(),
         cloud_api_auth_max_attempts: 1,
         cloud_api_auth_initial_backoff_ms: 0,
@@ -381,7 +381,7 @@ fn build_test_app_inner_with_pool(
     let rate_limiter = rate_limit::build_rate_limiter(options.rate_per_second, options.rate_burst);
     let rate_limit_state = rate_limit::RateLimitState {
         limiter: rate_limiter,
-        trust_proxy_headers: true,
+        trusted_proxies: Default::default(),
     };
 
     let router = routes::build_router()
@@ -4611,7 +4611,7 @@ fn build_test_app_with_cloud_api_retries(
         git_rev: "test-rev".to_string(),
         rate_limit_per_second: 100,
         rate_limit_burst_size: 200,
-        rate_limit_trust_proxy_headers: true,
+        rate_limit_trusted_proxies: Vec::new(),
         tls_cert_path: None,
         timeout_secs: 30,
         stream_idle_timeout_secs: 0,
@@ -4742,7 +4742,7 @@ fn build_test_app_with_cloud_api_retries(
     let rate_limiter = rate_limit::build_rate_limiter(100, 200);
     let rate_limit_state = rate_limit::RateLimitState {
         limiter: rate_limiter,
-        trust_proxy_headers: true,
+        trusted_proxies: Default::default(),
     };
 
     routes::build_router()
@@ -7920,7 +7920,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
         git_rev: "test-rev".to_string(),
         rate_limit_per_second: 100,
         rate_limit_burst_size: 200,
-        rate_limit_trust_proxy_headers: true,
+        rate_limit_trusted_proxies: Vec::new(),
         cloud_api_url: None,
         cloud_api_auth_max_attempts: 1,
         cloud_api_auth_initial_backoff_ms: 0,
@@ -8056,7 +8056,7 @@ fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
     let rate_limiter = rate_limit::build_rate_limiter(100, 200);
     let rate_limit_state = rate_limit::RateLimitState {
         limiter: rate_limiter,
-        trust_proxy_headers: true,
+        trusted_proxies: Default::default(),
     };
 
     routes::build_router()
@@ -8476,7 +8476,7 @@ async fn start_ohttp_server_with_relay_limit(
         git_rev: "test-rev".to_string(),
         rate_limit_per_second: 100,
         rate_limit_burst_size: 200,
-        rate_limit_trust_proxy_headers: true,
+        rate_limit_trusted_proxies: Vec::new(),
         cloud_api_url: None,
         cloud_api_auth_max_attempts: 1,
         cloud_api_auth_initial_backoff_ms: 0,
@@ -8603,7 +8603,7 @@ async fn start_ohttp_server_with_relay_limit(
     let rate_limiter = rate_limit::build_rate_limiter(100, 200);
     let rate_limit_state = rate_limit::RateLimitState {
         limiter: rate_limiter,
-        trust_proxy_headers: true,
+        trusted_proxies: Default::default(),
     };
 
     let mut router = routes::build_router();

@@ -359,6 +359,33 @@ bounds become 19 and 22, while long stays at 12. A full shared budget refuses
 both tiers. These bounds follow the destination backend during fallback and
 connection failover; the context threshold and engine back-pressure policy are unchanged.
 
+### Per-host ceilings
+
+A model-list entry may give a host a lower in-flight ceiling than its peers,
+for a backend whose own proxy holds fewer requests: `backend_max_inflight`
+(base tier) and `long_context.backend_max_inflight` (long tier) list one
+positive integer or `null` per backend, in the order of the matching
+`backend_urls`. A list of the wrong length, or a `0` or negative entry, is a
+start-up error naming the model and the key, as is a ceiling on a model whose
+admission is off. Without the keys the limits are exactly the ones above;
+there is no environment variable.
+
+A capped host never holds more than its ceiling. Uncapped hosts may hold more
+than the even split.
+
+- Borrowing on, base tier: the base budget (the current budget less the
+  long-tier reserve) is split max-min fairly. Hosts whose ceiling is below the
+  even share of what is left keep their ceiling, and the other hosts divide the
+  remainder, rounded up. If every base host is capped and the ceilings sum to no
+  more than the base budget, each host gets its ceiling.
+- Borrowing on, long tier: the limit above, at most the ceiling.
+- Borrowing off: the uniform share, at most the ceiling.
+
+Every limit is at least 1. The budget ramps, so the split is recomputed with
+each limit lookup. For example, with a budget of 432, a long-tier reserve of
+56 and a long-host limit of 56, base hosts with ceilings `[null, null, 64]`
+get `156, 156, 64`, and the one long host gets 56.
+
 ### Reserving budget for the long tier
 
 Without a reserve, a flood of short requests can hold the whole budget. The
@@ -783,6 +810,7 @@ cannot silently become a default.
 | `id` | required | The exact cloud-api model name. Requests select the model by it and usage is billed under it. |
 | `backend_urls` | required | The model's backends, as `VLLM_BACKEND_URLS` lists them. |
 | `backend_probe_urls` | no engine view | One engine-load probe per backend, same order, as `VLLM_BACKEND_PROBE_URLS`. |
+| `backend_max_inflight` | no ceilings | One entry per `backend_urls` entry, same order: a positive integer, or `null` for no ceiling on that host. See [Per-host ceilings](#per-host-ceilings). Needs `admission_max_inflight` above 0. |
 | `long_context` | no tier | The model's long-context tier, see the next table. |
 | `admission_max_inflight` | `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` | The model's in-flight budget; `0` = no admission for it. |
 | `admission_start_inflight` | `VLLM_PROXY_ADMISSION_START_INFLIGHT` when that is set, else the model's own maximum | Budget at start-up. |
@@ -802,6 +830,7 @@ for such a block; a model without one has no tier, whatever they say):
 | --- | --- | --- |
 | `backend_urls` | required | The tier's backends, as `VLLM_BACKEND_LONG_CONTEXT_URLS`. |
 | `backend_probe_urls` | none | One probe per tier backend; required exactly when the model has `backend_probe_urls`. |
+| `backend_max_inflight` | no ceilings | Per-host ceilings for the tier's backends, as for the base tier. |
 | `above_tokens` | `VLLM_BACKEND_LONG_CONTEXT_ABOVE_TOKENS` | Estimated input tokens above which a request goes to the tier. |
 | `strict` | `VLLM_BACKEND_TIER_STRICT` | Refuse instead of placing on the other tier. |
 | `borrowing` | `VLLM_PROXY_ADMISSION_TIER_BORROWING` | Base hosts may use the idle shared budget. |

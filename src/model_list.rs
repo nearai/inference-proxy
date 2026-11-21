@@ -88,6 +88,11 @@ pub struct ModelConfig {
     pub backend_probe_urls: Vec<String>,
     pub backend_long_context_urls: Vec<String>,
     pub backend_long_context_probe_urls: Vec<String>,
+    /// Per-host in-flight ceilings, aligned with `backend_urls` and
+    /// `backend_long_context_urls`; empty when the tier has none. A list key
+    /// only (`backend_max_inflight`, `long_context.backend_max_inflight`).
+    pub backend_max_inflight: Vec<Option<u32>>,
+    pub backend_long_context_max_inflight: Vec<Option<u32>>,
     pub long_context_above_tokens: u64,
     pub backend_tier_strict: bool,
     pub admission_max_inflight: u32,
@@ -134,6 +139,11 @@ impl std::fmt::Debug for ModelConfig {
             .field(
                 "backend_long_context_probe_urls",
                 &self.backend_long_context_probe_urls,
+            )
+            .field("backend_max_inflight", &self.backend_max_inflight)
+            .field(
+                "backend_long_context_max_inflight",
+                &self.backend_long_context_max_inflight,
             )
             .field("long_context_above_tokens", &self.long_context_above_tokens)
             .field("backend_tier_strict", &self.backend_tier_strict)
@@ -269,6 +279,9 @@ struct ModelEntry {
     backend_urls: Vec<String>,
     #[serde(default)]
     backend_probe_urls: Vec<String>,
+    /// One ceiling per `backend_urls` entry, `null` for none.
+    #[serde(default)]
+    backend_max_inflight: Option<Vec<Option<i64>>>,
     long_context: Option<LongContextEntry>,
     admission_max_inflight: Option<u32>,
     admission_start_inflight: Option<u32>,
@@ -327,6 +340,9 @@ struct LongContextEntry {
     backend_urls: Vec<String>,
     #[serde(default)]
     backend_probe_urls: Vec<String>,
+    /// One ceiling per `backend_urls` entry, `null` for none.
+    #[serde(default)]
+    backend_max_inflight: Option<Vec<Option<i64>>>,
     above_tokens: Option<u64>,
     strict: Option<bool>,
     borrowing: Option<bool>,
@@ -459,6 +475,7 @@ fn resolve(
         anyhow::bail!("`backend_urls` is empty: a model needs at least one backend");
     }
     let backend_probe_urls = urls("backend_probe_urls", entry.backend_probe_urls)?;
+    let backend_urls_len = backend_urls.len();
 
     let admission_max_inflight = entry
         .admission_max_inflight
@@ -484,6 +501,12 @@ fn resolve(
         backend_probe_urls,
         backend_long_context_urls: Vec::new(),
         backend_long_context_probe_urls: Vec::new(),
+        backend_max_inflight: host_caps(
+            "backend_max_inflight",
+            entry.backend_max_inflight,
+            backend_urls_len,
+        )?,
+        backend_long_context_max_inflight: Vec::new(),
         long_context_above_tokens: 0,
         backend_tier_strict: false,
         admission_max_inflight,
@@ -526,6 +549,11 @@ fn resolve(
                 "`long_context.backend_urls` is empty: leave `long_context` out for a model without a tier"
             );
         }
+        model.backend_long_context_max_inflight = host_caps(
+            "long_context.backend_max_inflight",
+            tier.backend_max_inflight,
+            model.backend_long_context_urls.len(),
+        )?;
         model.backend_long_context_probe_urls =
             urls("long_context.backend_probe_urls", tier.backend_probe_urls)?;
         model.long_context_above_tokens = tier
@@ -542,6 +570,35 @@ fn resolve(
             .unwrap_or(defaults.admission_long_reserved_inflight);
     }
     Ok(model)
+}
+
+/// A `backend_max_inflight` list: one positive ceiling or `null` per backend
+/// of its tier. An absent key is no ceilings (an empty list); one with the
+/// wrong length, or a zero or negative entry, is a mistake in the file.
+fn host_caps(
+    key: &str,
+    raw: Option<Vec<Option<i64>>>,
+    backends: usize,
+) -> anyhow::Result<Vec<Option<u32>>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    if raw.len() != backends {
+        anyhow::bail!(
+            "`{key}` has {} entries but its tier lists {backends} backends: one entry (a positive number or null) per backend, in the same order",
+            raw.len()
+        );
+    }
+    raw.into_iter()
+        .map(|cap| match cap {
+            None => Ok(None),
+            Some(cap) => u32::try_from(cap)
+                .ok()
+                .filter(|&cap| cap > 0)
+                .map(Some)
+                .ok_or_else(|| anyhow::anyhow!("`{key}`: {cap} is not a positive integer")),
+        })
+        .collect()
 }
 
 /// Base URLs as the variables hold them: trimmed, no trailing slash. A blank
@@ -629,6 +686,16 @@ fn validate(model: &ModelConfig, process: &ProcessSettings) -> anyhow::Result<()
         retry_after_secs: process.admission_retry_after_secs,
     })?;
     check_probe_urls(&model.backend_urls, &model.backend_probe_urls)?;
+    let has_caps = model
+        .backend_max_inflight
+        .iter()
+        .chain(&model.backend_long_context_max_inflight)
+        .any(Option::is_some);
+    if has_caps && model.admission_max_inflight == 0 {
+        anyhow::bail!(
+            "`backend_max_inflight` needs admission (`admission_max_inflight`): per-host ceilings are applied by admission and would never be used"
+        );
+    }
     // By endpoint, so the rules that one backend, and one engine, serves one
     // tier hold however a host is spelled (`endpoint`).
     check_long_context_tier(&TierKnobs {
@@ -888,6 +955,10 @@ impl ModelList {
                 BackendPool::with_long_context(
                     model.backend_urls.clone(),
                     model.backend_long_context_urls.clone(),
+                )
+                .with_host_caps(
+                    &model.backend_max_inflight,
+                    &model.backend_long_context_max_inflight,
                 )
                 .with_model(Some(label)),
             );

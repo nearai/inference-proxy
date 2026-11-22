@@ -245,11 +245,7 @@ impl AttestationCache {
     /// Get cached dstack info, fetching it once on first call.
     async fn get_dstack_info(&self) -> anyhow::Result<serde_json::Value> {
         self.dstack_info
-            .get_or_try_init(|| async {
-                let client = dstack_sdk::dstack_client::DstackClient::new(None);
-                let info = client.info().await?;
-                serde_json::to_value(&info).map_err(anyhow::Error::from)
-            })
+            .get_or_try_init(fetch_dstack_info)
             .await
             .cloned()
     }
@@ -1290,17 +1286,29 @@ async fn generate_attestation_inner(
         fp_bytes.as_deref(),
     );
 
-    // Run TDX quote and GPU evidence collection in parallel.
-    // These are independent: TDX quote talks to dstack via Unix socket,
+    // dstack info is static — use cached value if available. It also tells
+    // which CPU TEE this is, so it is read before the quote.
+    let info_value = if let Some(cache) = cache {
+        cache
+            .get_dstack_info()
+            .await
+            .map_err(AttestationError::Internal)?
+    } else {
+        fetch_dstack_info()
+            .await
+            .map_err(AttestationError::Internal)?
+    };
+    let tdx = info_is_tdx(&info_value);
+
+    // Run the CPU TEE quote and GPU evidence collection in parallel.
+    // These are independent: the quote talks to dstack via Unix socket,
     // GPU evidence uses the persistent Python worker (or subprocess fallback).
     let gpu_no_hw_mode = params.gpu_no_hw_mode;
     let nonce_hex_clone = nonce_hex.clone();
     let nonce_bytes_for_verify = nonce_bytes;
-    let (quote_result, gpu_evidence) = tokio::try_join!(
+    let (cvm_evidence, gpu_evidence) = tokio::try_join!(
         async {
-            let client = dstack_sdk::dstack_client::DstackClient::new(None);
-            client
-                .get_quote(report_data)
+            collect_cvm_evidence(report_data, tdx)
                 .await
                 .map_err(AttestationError::Internal)
         },
@@ -1317,22 +1325,7 @@ async fn generate_attestation_inner(
         },
     )?;
 
-    let event_log: serde_json::Value = serde_json::from_str(&quote_result.event_log)
-        .map_err(|e| AttestationError::Internal(anyhow::Error::from(e)))?;
     let nvidia_payload = build_nvidia_payload(&nonce_hex, &gpu_evidence);
-
-    // dstack info is static — use cached value if available.
-    let info_value = if let Some(cache) = cache {
-        cache
-            .get_dstack_info()
-            .await
-            .map_err(AttestationError::Internal)?
-    } else {
-        let client = dstack_sdk::dstack_client::DstackClient::new(None);
-        let info = client.info().await.map_err(AttestationError::Internal)?;
-        serde_json::to_value(&info)
-            .map_err(|e| AttestationError::Internal(anyhow::Error::from(e)))?
-    };
 
     Ok(AttestationReport {
         model_name: params.model_name.to_string(),
@@ -1340,11 +1333,61 @@ async fn generate_attestation_inner(
         signing_algo: params.signing_algo.to_string(),
         signing_public_key: params.signing_public_key.to_string(),
         request_nonce: nonce_hex,
-        intel_quote: quote_result.quote,
+        intel_quote: cvm_evidence.intel_quote,
         nvidia_payload,
-        event_log,
+        event_log: cvm_evidence.event_log,
         info: info_value,
+        dstack_attestation: cvm_evidence.dstack_attestation,
         tls_cert_fingerprint: params.tls_cert_fingerprint.map(|s| s.to_string()),
+    })
+}
+
+/// The guest agent's `Info` as JSON. The typed SDK call requires the TDX
+/// measurement fields, which are null on other CPU TEEs, so it falls back to
+/// the untyped response there.
+async fn fetch_dstack_info() -> anyhow::Result<serde_json::Value> {
+    let client = dstack_sdk::dstack_client::DstackClient::new(None);
+    match client.info().await {
+        Ok(info) => serde_json::to_value(&info).map_err(anyhow::Error::from),
+        Err(_) => client.info_raw().await,
+    }
+}
+
+/// Whether `info` (from [`fetch_dstack_info`]) comes from an Intel TDX guest.
+fn info_is_tdx(info: &serde_json::Value) -> bool {
+    info.pointer("/tcb_info/mrtd")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|mrtd| !mrtd.is_empty())
+}
+
+/// CPU TEE evidence for one report.
+struct CvmEvidence {
+    intel_quote: String,
+    event_log: serde_json::Value,
+    dstack_attestation: Option<String>,
+}
+
+/// TDX: the quote and its event log (`GetQuote`, TDX only in dstack 0.6).
+/// Other CPU TEEs: dstack's platform-neutral `Attest`.
+async fn collect_cvm_evidence(report_data: Vec<u8>, tdx: bool) -> anyhow::Result<CvmEvidence> {
+    let client = dstack_sdk::dstack_client::DstackClient::new(None);
+    if tdx {
+        let quote = client.get_quote(report_data).await?;
+        let event_log = serde_json::from_str(&quote.event_log)?;
+        return Ok(CvmEvidence {
+            intel_quote: quote.quote,
+            event_log,
+            dstack_attestation: None,
+        });
+    }
+    let attested = client.attest(report_data).await?;
+    if attested.attestation.is_empty() {
+        anyhow::bail!("dstack Attest returned an empty attestation");
+    }
+    Ok(CvmEvidence {
+        intel_quote: String::new(),
+        event_log: serde_json::Value::Array(Vec::new()),
+        dstack_attestation: Some(attested.attestation),
     })
 }
 
@@ -1729,8 +1772,20 @@ mod tests {
             nvidia_payload: "payload".to_string(),
             event_log: serde_json::json!({}),
             info: serde_json::json!({}),
+            dstack_attestation: None,
             tls_cert_fingerprint: None,
         }
+    }
+
+    #[test]
+    fn info_is_tdx_only_with_an_mrtd() {
+        let tdx = serde_json::json!({"tcb_info": {"mrtd": "ab12", "rtmr0": "00"}});
+        let snp = serde_json::json!({"tcb_info": {"mrtd": null, "os_image_hash": "d7"}});
+        let empty = serde_json::json!({"tcb_info": {"mrtd": ""}});
+        assert!(info_is_tdx(&tdx));
+        assert!(!info_is_tdx(&snp));
+        assert!(!info_is_tdx(&empty));
+        assert!(!info_is_tdx(&serde_json::json!({})));
     }
 
     #[tokio::test]

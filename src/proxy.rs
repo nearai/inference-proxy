@@ -1595,14 +1595,27 @@ fn terminal_transport_error(
 /// The engine answered a lane request with an error instead of generating:
 /// no TTFT observation for it, and an admission rejection (queue full,
 /// priority abort) tells the admission controller which backend is saturated.
-fn note_engine_error(permit: Option<&crate::admission::Permit>, message: Option<&str>) {
+/// A 429 whose parsed error type is exactly `overloaded` (the shape of
+/// `AppError::Overloaded`, which a CVM proxy answers with when it is full)
+/// counts as one too. `status` and `error_type` are `None` for an SSE error
+/// event, which has no HTTP status of its own.
+fn note_engine_error(
+    permit: Option<&crate::admission::Permit>,
+    message: Option<&str>,
+    status: Option<u16>,
+    error_type: Option<&str>,
+) {
     let Some(permit) = permit else {
         return;
     };
     permit.abandon();
-    if message.is_some_and(message_is_queue_full) {
+    if message.is_some_and(message_is_queue_full) || is_overloaded_rejection(status, error_type) {
         permit.observe_backpressure();
     }
+}
+
+fn is_overloaded_rejection(status: Option<u16>, error_type: Option<&str>) -> bool {
+    status == Some(429) && error_type == Some("overloaded")
 }
 
 /// Apply upstream tracing headers to a `reqwest::RequestBuilder`. No-op when
@@ -1887,6 +1900,8 @@ async fn proxy_json_request_inner(
         note_engine_error(
             opts.admission.as_ref(),
             info.as_ref().map(|i| i.message.as_str()),
+            Some(status.as_u16()),
+            info.as_ref().map(|i| i.error_type.as_str()),
         );
         return Err(AppError::Upstream {
             status: effective_error_status(
@@ -1976,6 +1991,8 @@ async fn proxy_json_request_inner(
                     note_engine_error(
                         opts.admission.as_ref(),
                         error.get("message").and_then(|m| m.as_str()),
+                        None,
+                        None,
                     );
                 }
                 if stream_parser.seen_generation_output {
@@ -2009,6 +2026,8 @@ async fn proxy_json_request_inner(
             note_engine_error(
                 opts.admission.as_ref(),
                 info.as_ref().map(|i| i.message.as_str()),
+                Some(status_code.as_u16()),
+                info.as_ref().map(|i| i.error_type.as_str()),
             );
             return Err(AppError::Upstream {
                 // A client media-fetch failure can arrive as an SSE error chunk
@@ -2087,6 +2106,8 @@ async fn proxy_json_request_inner(
             note_engine_error(
                 opts.admission.as_ref(),
                 info.as_ref().map(|i| i.message.as_str()),
+                Some(code),
+                info.as_ref().map(|i| i.error_type.as_str()),
             );
             return Err(AppError::Upstream {
                 status: effective_error_status(code, info.as_ref(), opts.map_queue_full_to_429),
@@ -2746,6 +2767,8 @@ async fn open_upstream_stream(
         note_engine_error(
             opts.admission.as_ref(),
             info.as_ref().map(|i| i.message.as_str()),
+            Some(status.as_u16()),
+            info.as_ref().map(|i| i.error_type.as_str()),
         );
         return Err(AppError::Upstream {
             status: effective_error_status(
@@ -2788,6 +2811,8 @@ async fn open_upstream_stream(
                     note_engine_error(
                         opts.admission.as_ref(),
                         info.as_ref().map(|i| i.message.as_str()),
+                        Some(code),
+                        info.as_ref().map(|i| i.error_type.as_str()),
                     );
                     metrics::counter!("upstream_stream_first_event_errors_total").increment(1);
                     return Err(AppError::Upstream {
@@ -3143,6 +3168,8 @@ async fn proxy_streaming_request_inner(
                                 note_engine_error(
                                     admission.as_ref(),
                                     error.get("message").and_then(|m| m.as_str()),
+                                    None,
+                                    None,
                                 );
                             }
                             if parser.seen_generation_output {
@@ -7098,5 +7125,114 @@ data: [DONE]
             "the clock must already cover the engine's silence, got {waited:?}"
         );
         server.abort();
+    }
+
+    fn overload_controller() -> Arc<crate::admission::AdmissionController> {
+        Arc::new(crate::admission::AdmissionController::new(
+            Some(crate::admission::AdmissionConfig {
+                max_inflight: 8,
+                tier_borrowing: false,
+                long_max_inflight_per_host: 0,
+                long_reserved_inflight: 0,
+                start_inflight: 8,
+                ramp_step: 1,
+                ramp_interval: std::time::Duration::from_secs(60),
+                ttft_p95_max: None,
+                backpressure_ttl: std::time::Duration::from_secs(10),
+                queue_saturated_at: 1,
+                retry_after: std::time::Duration::from_secs(2),
+            }),
+            2,
+            Arc::new(crate::engine_load::EngineLoad::disabled()),
+        ))
+    }
+
+    /// What a CVM proxy that is full answers with, as the gateway parses it.
+    async fn overloaded_error_type() -> String {
+        use axum::response::IntoResponse;
+        let response = AppError::Overloaded {
+            reason: "budget",
+            retry_after_secs: 2,
+        }
+        .into_response();
+        assert_eq!(response.status(), 429);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        parse_upstream_error(&body).expect("parses").error_type
+    }
+
+    #[tokio::test]
+    async fn only_a_429_of_type_overloaded_sets_backpressure() {
+        let error_type = overloaded_error_type().await;
+        assert_eq!(error_type, "overloaded");
+        let pool =
+            crate::backend_pool::BackendPool::new(vec!["http://b0".into(), "http://b1".into()]);
+        for (status, error_type, saturated) in [
+            (Some(429), Some("overloaded"), true),
+            (Some(429), Some("rate_limited"), false),
+            (Some(429), Some("unknown"), false),
+            (Some(429), None, false),
+            (Some(503), Some("overloaded"), false),
+            (None, Some("overloaded"), false),
+            (None, None, false),
+        ] {
+            let controller = overload_controller();
+            let permit = controller.try_admit(&pool, None).unwrap().unwrap();
+            permit.attach_backend(1);
+            note_engine_error(
+                Some(&permit),
+                Some("The endpoint is at capacity. Please retry later."),
+                status,
+                error_type,
+            );
+            assert_eq!(
+                controller.backend_saturated(1),
+                saturated,
+                "{status:?} {error_type:?}"
+            );
+            assert!(!controller.backend_saturated(0));
+        }
+    }
+
+    #[test]
+    fn selection_steers_around_a_backpressured_host_while_others_have_room() {
+        let pool =
+            crate::backend_pool::BackendPool::new(vec!["http://b0".into(), "http://b1".into()]);
+        let controller = overload_controller();
+        let held = controller.try_admit(&pool, None).unwrap().unwrap();
+        held.attach_backend(1);
+        note_engine_error(Some(&held), None, Some(429), Some("overloaded"));
+        // Host 0 is busier, host 1 is backpressured: the one with room wins.
+        pool.backends()[0]
+            .lane_conns
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+        pool.backends()[0]
+            .active_conns
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+        let permit = controller.try_admit(&pool, None).unwrap().unwrap();
+        let avoid = |index: usize| permit.backend_saturated(index);
+        let engine = |_: usize| None;
+        let policy = crate::backend_pool::Policy {
+            max_conns: Some(4),
+            max_conns_by_backend: None,
+            requested_tier: None,
+            avoid: &avoid,
+            engine: &engine,
+            tier: None,
+        };
+        let picked = pool
+            .select_with_preference_bounded(None, 0, &policy)
+            .expect("a host has room");
+        assert_eq!(picked.index, 0);
+        drop(picked);
+        // Bounded placement skips an avoided host outright: with host 0 full
+        // too there is no pick (the caller answers with a host-share refusal).
+        pool.backends()[0]
+            .lane_conns
+            .store(4, std::sync::atomic::Ordering::Relaxed);
+        assert!(pool
+            .select_with_preference_bounded(None, 0, &policy)
+            .is_none());
     }
 }

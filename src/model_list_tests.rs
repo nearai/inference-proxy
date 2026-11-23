@@ -1544,3 +1544,64 @@ fn a_lora_form_field_keeps_the_lora_refusal() {
         }
     }
 }
+
+#[test]
+fn per_host_caps_are_read_per_tier_and_checked() {
+    let models = parse_list(tiered(
+        serde_json::json!({"backend_max_inflight": [8]}),
+        serde_json::json!({"backend_max_inflight": [null], "admission_max_inflight": 48}),
+    ))
+    .unwrap();
+    assert_eq!(models[0].backend_max_inflight, vec![None]);
+    assert_eq!(models[0].backend_long_context_max_inflight, vec![Some(8)]);
+    // Absent keys: no caps, as before.
+    let models = parse_list(one(serde_json::json!({}))).unwrap();
+    assert!(models[0].backend_max_inflight.is_empty());
+    assert!(models[0].backend_long_context_max_inflight.is_empty());
+
+    let cases = [
+        (
+            one(
+                serde_json::json!({"backend_max_inflight": [64, 64], "admission_max_inflight": 48}),
+            ),
+            "`backend_max_inflight` has 2 entries but its tier lists 1 backends",
+        ),
+        (
+            one(serde_json::json!({"backend_max_inflight": [], "admission_max_inflight": 48})),
+            "`backend_max_inflight` has 0 entries",
+        ),
+        (
+            one(serde_json::json!({"backend_max_inflight": [0], "admission_max_inflight": 48})),
+            "`backend_max_inflight`: 0 is not a positive integer",
+        ),
+        (
+            one(serde_json::json!({"backend_max_inflight": [-3], "admission_max_inflight": 48})),
+            "`backend_max_inflight`: -3 is not a positive integer",
+        ),
+        (
+            tiered(
+                serde_json::json!({"backend_max_inflight": [1, 2]}),
+                serde_json::json!({}),
+            ),
+            "`long_context.backend_max_inflight` has 2 entries",
+        ),
+        (
+            tiered(
+                serde_json::json!({"backend_max_inflight": [0]}),
+                serde_json::json!({}),
+            ),
+            "`long_context.backend_max_inflight`: 0 is not a positive integer",
+        ),
+        (
+            one(serde_json::json!({"backend_max_inflight": [64]})),
+            "`backend_max_inflight` needs admission",
+        ),
+    ];
+    for (list, expected) in cases {
+        let error = error_of(list);
+        assert!(
+            error.contains("model \"m\"") && error.contains(expected),
+            "{expected}: {error}"
+        );
+    }
+}

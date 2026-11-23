@@ -1839,6 +1839,9 @@ impl Config {
             backend_probe_urls: self.backend_probe_urls.clone(),
             backend_long_context_urls: self.backend_long_context_urls.clone(),
             backend_long_context_probe_urls: self.backend_long_context_probe_urls.clone(),
+            // A key of the list file only: no variable sets it.
+            backend_max_inflight: Vec::new(),
+            backend_long_context_max_inflight: Vec::new(),
             long_context_above_tokens: self.long_context_above_tokens,
             backend_tier_strict: self.backend_tier_strict,
             admission_max_inflight: self.admission_max_inflight,

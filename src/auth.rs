@@ -361,6 +361,11 @@ impl FromRequestParts<AppState> for RequireAuth {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let auth = Self::authenticate(parts, state).await?;
+        crate::direct_deprecation::mark(
+            parts,
+            &auth.request_source,
+            state.config.non_tee_deployment,
+        );
         // Every authenticated route passes here: record who the request is
         // from on its span and for its finish or cancel line.
         if let Some(ids) = parts.extensions.get::<TracingIds>() {

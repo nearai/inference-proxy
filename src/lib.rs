@@ -38,6 +38,7 @@ pub mod request_tracing;
 pub mod rerank_limit;
 pub mod response_format;
 pub mod routes;
+pub mod sampling_params;
 pub mod signing;
 pub mod startup_checks;
 pub mod structured_regex;

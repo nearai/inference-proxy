@@ -770,9 +770,24 @@ fn build_nvidia_payload(nonce_hex: &str, evidences: &serde_json::Value) -> Strin
     serde_json::json!({
         "nonce": nonce_hex,
         "evidence_list": evidences,
-        "arch": "HOPPER",
+        "arch": nvidia_arch(evidences),
     })
     .to_string()
+}
+
+/// GPU architecture for the NVIDIA payload, which names one per request: the
+/// one every evidence entry reports (e.g. `BLACKWELL` on B200), or `HOPPER`,
+/// the previous fixed value, when the entries carry none or disagree.
+fn nvidia_arch(evidences: &serde_json::Value) -> &str {
+    let mut archs = evidences
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|e| e.get("arch").and_then(serde_json::Value::as_str));
+    match archs.next() {
+        Some(Some(first)) if archs.all(|a| a == Some(first)) => first,
+        _ => "HOPPER",
+    }
 }
 
 /// Compute SHA-256 hash of a PEM certificate's Subject Public Key Info (SPKI).
@@ -1575,6 +1590,24 @@ mod tests {
         assert_eq!(payload["nonce"], "abc123");
         assert_eq!(payload["arch"], "HOPPER");
         assert_eq!(payload["evidence_list"][0]["gpu"], "H100");
+    }
+
+    #[test]
+    fn nvidia_payload_arch_follows_the_evidence() {
+        let arch = |evidence: serde_json::Value| -> String {
+            let payload: serde_json::Value =
+                serde_json::from_str(&build_nvidia_payload("ab", &evidence)).unwrap();
+            payload["arch"].as_str().unwrap().to_string()
+        };
+        let blackwell = serde_json::json!([{"arch": "BLACKWELL"}, {"arch": "BLACKWELL"}]);
+        assert_eq!(arch(blackwell), "BLACKWELL");
+        assert_eq!(arch(serde_json::json!([{"arch": "HOPPER"}])), "HOPPER");
+        // Mixed, missing on one entry, or empty: the previous fixed value.
+        let mixed = serde_json::json!([{"arch": "BLACKWELL"}, {"arch": "HOPPER"}]);
+        assert_eq!(arch(mixed), "HOPPER");
+        let partial = serde_json::json!([{"arch": "BLACKWELL"}, {"gpu": "x"}]);
+        assert_eq!(arch(partial), "HOPPER");
+        assert_eq!(arch(serde_json::json!([])), "HOPPER");
     }
 
     /// Build a synthetic per-GPU evidence binary in the format observed in

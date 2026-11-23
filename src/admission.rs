@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
-use crate::backend_pool::BackendPool;
+use crate::backend_pool::{Backend, BackendPool};
 use crate::context_tier::{ContextTier, TierDecision};
 use crate::engine_load::EngineLoad;
 use crate::model_metrics::{model_counter, model_gauge, model_histogram, ModelLabel};
@@ -193,6 +193,59 @@ pub struct AdmissionController {
     queue_tripped: [AtomicBool; 2],
 }
 
+/// How the base tier's budget splits over its hosts when some are capped.
+struct BaseShare {
+    /// What an uncapped host may hold.
+    share: u32,
+    /// Every host is capped and the caps fit the budget: each gets its cap.
+    caps_fit: bool,
+}
+
+impl BaseShare {
+    fn share_for(&self, cap: Option<u32>) -> u32 {
+        match cap {
+            Some(cap) if self.caps_fit => cap,
+            _ => self.share,
+        }
+    }
+}
+
+/// Max-min fair split of `budget` over `hosts` base hosts, `caps` holding one
+/// optional ceiling per host. Hosts whose cap is below the even split of what
+/// is left are held to it and the rest split the remainder, so the result is
+/// `ceil(budget / hosts)` when nothing is capped.
+fn base_fair_share(budget: u32, hosts: u32, caps: &[Option<u32>]) -> BaseShare {
+    let mut ceilings: Vec<u64> = caps.iter().flatten().map(|&cap| u64::from(cap)).collect();
+    ceilings.sort_unstable();
+    let hosts = u64::from(hosts);
+    let budget = u64::from(budget);
+    let mut taken = 0u64;
+    for (k, ceiling) in ceilings.iter().enumerate() {
+        let open = hosts - k as u64;
+        let share = budget.saturating_sub(taken).div_ceil(open);
+        if share <= *ceiling {
+            return BaseShare {
+                share: u32::try_from(share).unwrap_or(u32::MAX),
+                caps_fit: false,
+            };
+        }
+        taken += ceiling;
+    }
+    let open = hosts - ceilings.len() as u64;
+    if open == 0 {
+        // Every host is capped: the caps hold whenever they fit the budget,
+        // and otherwise the even split over all hosts was already accepted.
+        return BaseShare {
+            share: 1,
+            caps_fit: true,
+        };
+    }
+    BaseShare {
+        share: u32::try_from(budget.saturating_sub(taken).div_ceil(open)).unwrap_or(u32::MAX),
+        caps_fit: false,
+    }
+}
+
 impl AdmissionController {
     /// `backend_count` sizes the per-backend back-pressure slots; it must be
     /// the pool size (backend indexes are stable for the process lifetime).
@@ -329,27 +382,44 @@ impl AdmissionController {
     pub fn backend_limits(&self, pool: &BackendPool) -> Option<Vec<u32>> {
         let config = self.config.as_ref()?;
         let budget = self.budget().max(1);
+        let capped = |backend: &Backend, limit: u32| {
+            backend
+                .max_inflight
+                .map_or(limit, |cap| limit.min(cap))
+                .max(1)
+        };
         if !config.tier_borrowing {
-            return Some(vec![self.host_share(pool.healthy_count())?; pool.len()]);
+            let share = self.host_share(pool.healthy_count())?;
+            return Some(
+                pool.backends()
+                    .iter()
+                    .map(|backend| capped(backend, share))
+                    .collect(),
+            );
         }
-        let base_count = pool
+        let base_caps: Vec<Option<u32>> = pool
             .backends()
             .iter()
             .filter(|b| b.tier == ContextTier::Base)
-            .count()
-            .max(1) as u32;
+            .map(|b| b.max_inflight)
+            .collect();
+        let base_count = base_caps.len().max(1) as u32;
         let long_limit = budget
             .div_ceil(pool.len().max(1) as u32)
             .min(config.long_max_inflight_per_host);
         // Base hosts share what the long-tier reserve leaves, so their bounds
-        // add up to what the base tier may hold at all.
+        // add up to what the base tier may hold at all; a capped host takes
+        // at most its cap and the others split the remainder.
         let base_budget = self.base_budget().max(1);
+        let base_share = base_fair_share(base_budget, base_count, &base_caps);
         Some(
             pool.backends()
                 .iter()
                 .map(|backend| match backend.tier {
-                    ContextTier::Base => base_budget.div_ceil(base_count),
-                    ContextTier::Long => long_limit,
+                    ContextTier::Base => {
+                        capped(backend, base_share.share_for(backend.max_inflight))
+                    }
+                    ContextTier::Long => capped(backend, long_limit),
                 })
                 .collect(),
         )
@@ -1929,5 +1999,109 @@ mod tests {
             RejectReason::Budget
         );
         assert_eq!(c.inflight(), 2);
+    }
+
+    fn capped_pool(base: &[Option<u32>], long: &[Option<u32>]) -> BackendPool {
+        BackendPool::with_long_context(
+            (0..base.len())
+                .map(|i| format!("http://b{i}:8000"))
+                .collect(),
+            (0..long.len())
+                .map(|i| format!("http://l{i}:8000"))
+                .collect(),
+        )
+        .with_host_caps(base, long)
+    }
+
+    fn borrowing(max: u32, reserve: u32, long_ceiling: u32) -> Arc<AdmissionController> {
+        controller(
+            AdmissionConfig {
+                max_inflight: max,
+                start_inflight: max,
+                tier_borrowing: true,
+                long_max_inflight_per_host: long_ceiling,
+                long_reserved_inflight: reserve,
+                ..config()
+            },
+            8,
+        )
+    }
+
+    #[test]
+    fn no_caps_keep_the_even_split_for_any_budget_and_count() {
+        for base in 1..=6usize {
+            for budget in [1u32, 7, 32, 100, 432, 433] {
+                let uncapped = capped_pool(&vec![None; base], &[None]);
+                let plain = BackendPool::with_long_context(
+                    (0..base).map(|i| format!("http://b{i}:8000")).collect(),
+                    vec!["http://l0:8000".into()],
+                );
+                let c = borrowing(budget.max(2), 1, 12);
+                c.budget.store(budget, Ordering::Relaxed);
+                let expected = c.backend_limits(&plain).unwrap();
+                assert_eq!(c.backend_limits(&uncapped).unwrap(), expected);
+                let base_budget = c.base_budget().max(1);
+                assert!(expected[..base]
+                    .iter()
+                    .all(|&l| l == base_budget.div_ceil(base as u32)));
+            }
+        }
+    }
+
+    #[test]
+    fn a_capped_base_host_is_held_to_its_cap_and_the_rest_share_the_remainder() {
+        let p = capped_pool(&[None, None, Some(64)], &[None]);
+        let c = borrowing(432, 56, 56);
+        assert_eq!(c.backend_limits(&p).unwrap(), vec![156, 156, 64, 56]);
+    }
+
+    #[test]
+    fn caps_above_the_share_budget_below_the_caps_and_all_capped() {
+        // Cap above the even share: nothing changes.
+        let p = capped_pool(&[None, None, Some(500)], &[None]);
+        let c = borrowing(432, 56, 56);
+        assert_eq!(c.backend_limits(&p).unwrap(), vec![126, 126, 126, 56]);
+        // Budget below the sum of the caps: the even split applies.
+        let p = capped_pool(&[Some(64), Some(64), Some(64)], &[None]);
+        let c = borrowing(100, 10, 12);
+        assert_eq!(c.backend_limits(&p).unwrap(), vec![30, 30, 30, 12]);
+        // Every host capped and the caps fit: the caps hold.
+        let p = capped_pool(&[Some(10), Some(20), Some(30)], &[None]);
+        let c = borrowing(432, 56, 56);
+        assert_eq!(c.backend_limits(&p).unwrap(), vec![10, 20, 30, 56]);
+        // Two small caps below the share, one host open.
+        let p = capped_pool(&[Some(10), Some(20), None], &[None]);
+        assert_eq!(c.backend_limits(&p).unwrap(), vec![10, 20, 346, 56]);
+        // Limits never drop below one.
+        let p = capped_pool(&[Some(1), None], &[None]);
+        let c = borrowing(2, 1, 12);
+        assert_eq!(c.backend_limits(&p).unwrap(), vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn caps_apply_to_the_long_tier_and_without_borrowing_and_follow_the_ramp() {
+        let p = capped_pool(&[None, None], &[Some(5)]);
+        let c = borrowing(48, 12, 30);
+        assert_eq!(c.backend_limits(&p).unwrap(), vec![18, 18, 5]);
+        // The ramp moves the budget; caps re-apply at each step.
+        c.budget.store(24, Ordering::Relaxed);
+        assert_eq!(c.backend_limits(&p).unwrap(), vec![6, 6, 5]);
+
+        let p = capped_pool(&[None, Some(4), None], &[]);
+        let legacy = controller(
+            AdmissionConfig {
+                max_inflight: 48,
+                start_inflight: 48,
+                ..config()
+            },
+            3,
+        );
+        assert_eq!(legacy.backend_limits(&p).unwrap(), vec![16, 4, 16]);
+    }
+
+    #[test]
+    #[should_panic(expected = "base host caps must match")]
+    fn a_cap_list_of_the_wrong_length_is_refused_by_the_pool() {
+        capped_pool(&[None, None], &[]).with_host_caps(&[Some(1)], &[]);
     }
 }

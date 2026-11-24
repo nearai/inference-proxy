@@ -173,6 +173,16 @@ pub struct Policy<'a> {
     pub hold_pin_at_limit: bool,
 }
 
+/// Why a bounded selection found no backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionRefusal {
+    /// The pinned backend is healthy, in tier and at its limit and the
+    /// policy holds the pin there (`Policy::hold_pin_at_limit`).
+    PinnedAtLimit,
+    /// No backend was eligible (full, avoided, unhealthy, contention).
+    Other,
+}
+
 fn never(_: usize) -> bool {
     false
 }
@@ -361,6 +371,17 @@ impl BackendPool {
         max_imbalance: u32,
         policy: &Policy<'_>,
     ) -> Option<Selection> {
+        self.try_select_with_preference_bounded(preferred, max_imbalance, policy)
+            .ok()
+    }
+
+    /// `select_with_preference_bounded` that says why it refused.
+    pub fn try_select_with_preference_bounded(
+        &self,
+        preferred: Option<usize>,
+        max_imbalance: u32,
+        policy: &Policy<'_>,
+    ) -> Result<Selection, SelectionRefusal> {
         // Without a bound (admission off) keep the legacy degradation when
         // every backend is unhealthy; with one, refusing is the point.
         self.reserve(preferred, max_imbalance, policy, !policy.bounded())
@@ -378,7 +399,7 @@ impl BackendPool {
             avoid: &avoid,
             ..*policy
         };
-        self.reserve(None, 0, &policy, false)
+        self.reserve(None, 0, &policy, false).ok()
     }
 
     /// Whether `policy` holds a conversation pinned to `preferred` at its
@@ -434,17 +455,22 @@ impl BackendPool {
         max_imbalance: u32,
         policy: &Policy<'_>,
         degrade_when_all_unhealthy: bool,
-    ) -> Option<Selection> {
+    ) -> Result<Selection, SelectionRefusal> {
         let attempts = (self.backends.len() * 4).max(RESERVE_ATTEMPTS);
         for _ in 0..attempts {
+            // Opt-in: a pin at its limit stays put and the request is
+            // refused. Decided here, once per pick, so a lost reservation
+            // race re-checks it, and the refusal's reason is this decision
+            // rather than a later re-read of the counters.
+            if self.pin_held(preferred, policy) {
+                self.record_selection_refusal(policy, Some("pinned_host_limit"));
+                return Err(SelectionRefusal::PinnedAtLimit);
+            }
             let Some((index, outcome)) =
                 self.pick(preferred, max_imbalance, policy, degrade_when_all_unhealthy)
             else {
-                let reason = self
-                    .pin_held(preferred, policy)
-                    .then_some("pinned_host_limit");
-                self.record_selection_refusal(policy, reason);
-                return None;
+                self.record_selection_refusal(policy, None);
+                return Err(SelectionRefusal::Other);
             };
             let backend = &self.backends[index];
             // Rust 1.99 renamed this to `try_update`, which is unavailable
@@ -461,7 +487,7 @@ impl BackendPool {
                     });
             if taken.is_ok() {
                 backend.active_conns.fetch_add(1, Ordering::Relaxed);
-                return Some(Selection {
+                return Ok(Selection {
                     backend: backend.clone(),
                     index,
                     outcome,
@@ -470,7 +496,7 @@ impl BackendPool {
             }
         }
         self.record_selection_refusal(policy, Some("reservation_contention"));
-        None
+        Err(SelectionRefusal::Other)
     }
 
     fn record_selection_refusal(&self, policy: &Policy<'_>, reason: Option<&'static str>) {
@@ -526,13 +552,6 @@ impl BackendPool {
             let usable = only.healthy.load(Ordering::Relaxed) || degrade_when_all_unhealthy;
             return (usable && !avoid(0) && under_bound(0, only) && only.in_tier(policy.tier))
                 .then_some((0, SelectionOutcome::Single));
-        }
-
-        // Opt-in: a pin at its limit stays put and the request is refused.
-        // Checked on every pick, so a lost reservation race re-picks into
-        // this refusal rather than moving the pin.
-        if self.pin_held(preferred, policy) {
-            return None;
         }
 
         let eligible = |index: usize, backend: &Backend| {

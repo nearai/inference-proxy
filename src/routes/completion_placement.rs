@@ -1,6 +1,6 @@
 use crate::admission::{Permit, RejectReason};
 use crate::backend_affinity::{ConversationKey, ReplicaHint};
-use crate::backend_pool::{BackendGuard, Policy};
+use crate::backend_pool::{BackendGuard, Policy, SelectionRefusal};
 use crate::context_tier::{ContextTier, TierDecision};
 use crate::error::AppError;
 use crate::model_list::ModelView;
@@ -47,7 +47,7 @@ pub(super) fn place_completion(
         hold_pin_at_limit: model.affinity_hold_at_limit,
     };
     let place = |tier| {
-        model.backend_affinity.place(
+        model.backend_affinity.try_place(
             model.backend_pool,
             affinity_key,
             hint,
@@ -61,7 +61,7 @@ pub(super) fn place_completion(
     // marked unhealthy. Fall back to the remaining fleet rather than refuse
     // (non-strict only: strict's `recheck_restriction` never returns `None`,
     // so this never widens the search there).
-    if placement.is_none()
+    if placement.is_err()
         && restrict.is_some_and(|tier| {
             crate::context_tier::recheck_restriction(model.backend_pool, tier, strict).is_none()
         })
@@ -70,8 +70,8 @@ pub(super) fn place_completion(
         placement = place(None);
     }
     let placement = match placement {
-        Some(placement) => placement,
-        None => {
+        Ok(placement) => placement,
+        Err(refusal) => {
             // `restrict` can only still be `Some(tier)` here with `tier`
             // truly empty in strict mode (non-strict already cleared it
             // above whenever that was the reason placement failed): refuse
@@ -96,15 +96,10 @@ pub(super) fn place_completion(
                     }
                 }
             }
-            let held = model.backend_affinity.pin_held(
-                model.backend_pool,
-                affinity_key,
-                &policy_for(restrict),
-            );
-            return Err(AppError::from(model.admission.reject(if held {
-                RejectReason::PinnedHostLimit
-            } else {
-                RejectReason::HostShare
+            // The reason is the selection's own, not a re-read of the load.
+            return Err(AppError::from(model.admission.reject(match refusal {
+                SelectionRefusal::PinnedAtLimit => RejectReason::PinnedHostLimit,
+                SelectionRefusal::Other => RejectReason::HostShare,
             })));
         }
     };

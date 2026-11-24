@@ -490,9 +490,12 @@ upstream:
    request is refused with a 429 (reason `pinned_host_limit`, also the
    `admission_selection_failures_total` reason) and the pin stays, so a full
    fleet does not turn cached prefixes into cold prefills on other hosts. A
-   pin that is unhealthy, queueing or steered around, outside the request's
-   tier, a new conversation, a connection fail-over and a replica hint behave
-   as without it.
+   pin that is unhealthy, queueing or steered around, or outside the
+   request's tier still moves, as do a new conversation and a connection
+   fail-over. A replica hint is judged by its own guard, not the hold: an
+   honoured hint still re-pins the conversation, so it can move a held one,
+   and a hint refused because every host is full is refused under the usual
+   reasons, never `pinned_host_limit`.
 
 A refusal is `429` with `Retry-After: VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS`
 and an error of type `overloaded`; the slot is released when the response —

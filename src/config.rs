@@ -971,6 +971,11 @@ pub struct Config {
     /// (`VLLM_BACKEND_CONNECT_FAILOVER`). HTTP errors, queue-full included,
     /// are never retried.
     pub backend_connect_failover: bool,
+    /// Keep a conversation pinned to a healthy backend that is at its limit
+    /// and refuse the request (429) instead of moving the pin
+    /// (`VLLM_BACKEND_AFFINITY_HOLD_AT_LIMIT`, default off). In list mode the
+    /// default of each model's `affinity_hold_at_limit`.
+    pub affinity_hold_at_limit: bool,
     /// Pool proxy: at most this many requests in flight per backend
     /// (`VLLM_BACKEND_MAX_INFLIGHT`, 0 = unbounded). A request that finds every
     /// healthy backend at the bound is refused with 429 `overloaded` instead of
@@ -1389,6 +1394,7 @@ impl Config {
             })?;
         }
         let backend_connect_failover = env_bool("VLLM_BACKEND_CONNECT_FAILOVER");
+        let affinity_hold_at_limit = env_bool("VLLM_BACKEND_AFFINITY_HOLD_AT_LIMIT");
         let backend_max_inflight = match env_parse::<u32>("VLLM_BACKEND_MAX_INFLIGHT", 0)? {
             0 => None,
             bound => Some(bound),
@@ -1616,6 +1622,7 @@ impl Config {
             admission_queue_saturated_at,
             admission_retry_after_secs,
             backend_connect_failover,
+            affinity_hold_at_limit,
             backend_max_inflight,
             replica_state,
             backend_probe_urls,
@@ -1737,6 +1744,7 @@ impl Config {
                 admission_start_inflight: admission_start_inflight_is_set
                     .then_some(config.admission_start_inflight),
                 admission_queue_saturated_at: config.admission_queue_saturated_at,
+                affinity_hold_at_limit: config.affinity_hold_at_limit,
                 admission_tier_borrowing: config.admission_tier_borrowing,
                 admission_long_max_inflight_per_host: config.admission_long_max_inflight_per_host,
                 admission_long_reserved_inflight: config.admission_long_reserved_inflight,
@@ -1782,6 +1790,7 @@ impl Config {
         self.admission_max_inflight = 0;
         self.admission_start_inflight = 0;
         self.admission_queue_saturated_at = 1;
+        self.affinity_hold_at_limit = false;
         self.admission_tier_borrowing = false;
         self.admission_long_max_inflight_per_host = 0;
         self.admission_long_reserved_inflight = 0;
@@ -1825,6 +1834,7 @@ impl Config {
             admission_max_inflight: self.admission_max_inflight,
             admission_start_inflight: self.admission_start_inflight,
             admission_queue_saturated_at: self.admission_queue_saturated_at,
+            affinity_hold_at_limit: self.affinity_hold_at_limit,
             admission_tier_borrowing: self.admission_tier_borrowing,
             admission_long_max_inflight_per_host: self.admission_long_max_inflight_per_host,
             admission_long_reserved_inflight: self.admission_long_reserved_inflight,
@@ -2295,6 +2305,7 @@ mod tests {
             "VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT",
             "VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS",
             "VLLM_BACKEND_CONNECT_FAILOVER",
+            "VLLM_BACKEND_AFFINITY_HOLD_AT_LIMIT",
             "VLLM_BACKEND_MAX_INFLIGHT",
             "VLLM_BACKEND_PROBE_URLS",
             "VLLM_BACKEND_PROBE_INTERVAL_SECS",
@@ -4685,5 +4696,91 @@ mod tests {
                 assert!(!config.single_model().merge_system_messages);
             },
         );
+    }
+
+    #[test]
+    fn test_affinity_hold_at_limit_env_and_list_key() {
+        let list = |entry: serde_json::Value| {
+            let mut alpha = serde_json::json!({
+                "id": "example/alpha",
+                "backend_urls": ["https://alpha-b1.example"]
+            });
+            alpha
+                .as_object_mut()
+                .unwrap()
+                .extend(entry.as_object().unwrap().clone());
+            serde_json::json!({"models": [
+                alpha,
+                {"id": "example/beta", "backend_urls": ["https://beta-b1.example"]}
+            ]})
+        };
+        let hold = |config: &Config| {
+            config
+                .model_list
+                .as_ref()
+                .unwrap()
+                .models
+                .iter()
+                .map(|model| model.affinity_hold_at_limit)
+                .collect::<Vec<_>>()
+        };
+
+        // Off by default, in both modes.
+        with_model_list(&list(serde_json::json!({})), &[], || {
+            let config = Config::from_env().unwrap();
+            assert!(!config.affinity_hold_at_limit);
+            assert_eq!(hold(&config), [false, false]);
+        });
+        // The key sets one model; an omitted key takes the default, never
+        // another model's value.
+        with_model_list(
+            &list(serde_json::json!({"affinity_hold_at_limit": true})),
+            &[],
+            || assert_eq!(hold(&Config::from_env().unwrap()), [true, false]),
+        );
+        // The variable is the default of every model that omits the key.
+        with_model_list(
+            &list(serde_json::json!({})),
+            &[("VLLM_BACKEND_AFFINITY_HOLD_AT_LIMIT", "1")],
+            || assert_eq!(hold(&Config::from_env().unwrap()), [true, true]),
+        );
+        with_model_list(
+            &list(serde_json::json!({"affinity_hold_at_limit": false})),
+            &[("VLLM_BACKEND_AFFINITY_HOLD_AT_LIMIT", "1")],
+            || assert_eq!(hold(&Config::from_env().unwrap()), [false, true]),
+        );
+        // A value that is not a boolean fails startup.
+        for value in [serde_json::json!("true"), serde_json::json!(1)] {
+            let error = with_model_list(
+                &list(serde_json::json!({"affinity_hold_at_limit": value})),
+                &[],
+                || {
+                    Config::from_env()
+                        .expect_err("the list must be refused")
+                        .to_string()
+                },
+            );
+            assert!(
+                error.contains("not a valid model list") && error.contains("expected a boolean"),
+                "{value}: {error}"
+            );
+        }
+
+        // One model from env.
+        for (raw, expected) in [("1", true), ("true", true), ("0", false), ("", false)] {
+            with_clean_env(
+                &[("MODEL_NAME", "example/alpha"), ("TOKEN", "t")],
+                &[
+                    ("NON_TEE_DEPLOYMENT", "1"),
+                    ("VLLM_BACKEND_URLS", "https://alpha-b1.example"),
+                    ("VLLM_BACKEND_AFFINITY_HOLD_AT_LIMIT", raw),
+                ],
+                || {
+                    let config = Config::from_env().unwrap();
+                    assert_eq!(config.affinity_hold_at_limit, expected, "{raw:?}");
+                    assert_eq!(config.single_model().affinity_hold_at_limit, expected);
+                },
+            );
+        }
     }
 }

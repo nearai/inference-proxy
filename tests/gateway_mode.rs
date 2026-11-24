@@ -36,6 +36,8 @@ struct GatewayOptions {
     /// Backend base URLs; empty = just the mock server.
     backend_urls: Vec<String>,
     backend_conversation_affinity: bool,
+    /// `VLLM_BACKEND_AFFINITY_HOLD_AT_LIMIT`.
+    affinity_hold_at_limit: bool,
     admission_max_inflight: u32,
     admission_tier_borrowing: bool,
     admission_long_max_inflight_per_host: u32,
@@ -200,6 +202,7 @@ fn build_gateway_with_state(mock_url: &str, options: GatewayOptions) -> (axum::R
         admission_queue_saturated_at: options.admission_queue_saturated_at.unwrap_or(1),
         admission_retry_after_secs: 2,
         backend_connect_failover: options.backend_connect_failover,
+        affinity_hold_at_limit: options.affinity_hold_at_limit,
         backend_max_inflight: options.backend_max_inflight,
         backend_probe_urls: options.backend_probe_urls.clone(),
         backend_probe_interval_secs: 2,
@@ -2221,6 +2224,101 @@ async fn oneshot_with_rejection_reason_metric(
     let response = app.oneshot(request).await.unwrap();
     drop(guard);
     (response, handle.render())
+}
+
+/// Two hosts with one slot each (`admission_max_inflight: 2`). Turn 0 pins
+/// the conversation on `a`; a slow turn 1 then holds `a`'s only slot while
+/// `b` is idle, and turn 2 arrives. Returns turn 2's response and the
+/// metrics rendered around it, once `a` has been released again.
+async fn conversation_with_its_host_full(
+    hold: bool,
+    a: &MockServer,
+    b: &MockServer,
+) -> (axum::response::Response, String, axum::Router) {
+    let app = build_gateway(
+        &a.uri(),
+        GatewayOptions {
+            backend_urls: vec![a.uri(), b.uri()],
+            backend_conversation_affinity: true,
+            affinity_hold_at_limit: hold,
+            admission_max_inflight: 2,
+            ..Default::default()
+        },
+    );
+    let first = app
+        .clone()
+        .oneshot(chat_request(conversation(0)))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let slow = tokio::spawn({
+        let app = app.clone();
+        async move {
+            let mut body = conversation(1);
+            body["user"] = "holder".into();
+            app.oneshot(chat_request(body)).await.unwrap()
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (response, rendered) =
+        oneshot_with_rejection_reason_metric(app.clone(), chat_request(conversation(2))).await;
+    assert_eq!(slow.await.unwrap().status(), StatusCode::OK);
+    (response, rendered, app)
+}
+
+async fn mount_holder_and_chat(mock: &MockServer, chats: u64) {
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"user": "holder"}),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(chat_completion_json())
+                .set_delay(Duration::from_millis(500)),
+        )
+        .expect(1)
+        .mount(mock)
+        .await;
+    mount_chat(mock, chats).await;
+}
+
+#[tokio::test]
+async fn a_held_pin_at_its_host_limit_is_refused_and_keeps_its_slot_accounting() {
+    let a = MockServer::start().await;
+    let b = MockServer::start().await;
+    // Turn 0, then (after the refusal) turn 3; the slow turn 1 is counted
+    // separately. Nothing may reach `b`.
+    mount_holder_and_chat(&a, 2).await;
+    mount_chat(&b, 0).await;
+    let (response, rendered, app) = conversation_with_its_host_full(true, &a, &b).await;
+    assert_overloaded(response).await;
+    assert!(
+        rendered.contains("admission_rejections_total{reason=\"pinned_host_limit\"} 1"),
+        "{rendered}"
+    );
+    // `a` is free again: the pin was kept and no slot leaked.
+    let response = app
+        .clone()
+        .oneshot(chat_request(conversation(3)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    a.verify().await;
+    b.verify().await;
+}
+
+#[tokio::test]
+async fn without_the_hold_a_pin_at_its_host_limit_moves_to_the_idle_host() {
+    let a = MockServer::start().await;
+    let b = MockServer::start().await;
+    mount_holder_and_chat(&a, 1).await;
+    mount_chat(&b, 1).await;
+    let (response, rendered, _app) = conversation_with_its_host_full(false, &a, &b).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!rendered.contains("pinned_host_limit"), "{rendered}");
+    a.verify().await;
+    b.verify().await;
 }
 
 #[tokio::test]

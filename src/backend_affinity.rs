@@ -20,7 +20,7 @@ use std::time::Duration;
 use moka::sync::Cache;
 use serde_json::Value;
 
-use crate::backend_pool::{BackendGuard, BackendPool, Policy, Selection};
+use crate::backend_pool::{BackendGuard, BackendPool, Policy, Selection, SelectionRefusal};
 use crate::model_metrics::{model_counter, model_gauge};
 use crate::vllm_dp_affinity::conversation_key;
 
@@ -132,7 +132,8 @@ impl BackendConversationAffinity {
     /// (engine back-pressure, non-empty engine queue) and supplies the engine
     /// view: a pinned conversation whose backend is at the bound or avoided is
     /// moved to the least-loaded eligible backend, and `None` means no backend
-    /// has room.
+    /// has room. With `policy.hold_pin_at_limit` a pin at the bound is not
+    /// moved: the result is `None` and the assignment stays.
     ///
     /// `hint` is honoured under the same guard as a pin: the backend must be
     /// healthy and eligible (tier, admission, not avoided or queueing), and,
@@ -146,6 +147,19 @@ impl BackendConversationAffinity {
         path: &str,
         policy: &Policy<'_>,
     ) -> Option<Placement> {
+        self.try_place(pool, key, hint, path, policy).ok()
+    }
+
+    /// `place` that says why it refused: `PinnedAtLimit` only when the
+    /// conversation's own pin was held (never for a refused replica hint).
+    pub fn try_place(
+        &self,
+        pool: &BackendPool,
+        key: Option<ConversationKey>,
+        hint: ReplicaHint,
+        path: &str,
+        policy: &Policy<'_>,
+    ) -> Result<Placement, SelectionRefusal> {
         match hint {
             ReplicaHint::Absent => {}
             ReplicaHint::Invalid => {
@@ -157,18 +171,27 @@ impl BackendConversationAffinity {
                     .increment(1);
             }
             ReplicaHint::Index(i) => {
-                let sel = pool.select_with_preference_bounded(Some(i), self.max_imbalance, policy);
+                // A hint is not a pin: it keeps its own guard, hold or not.
+                let hint_policy = Policy {
+                    hold_pin_at_limit: false,
+                    ..*policy
+                };
+                let sel = pool.try_select_with_preference_bounded(
+                    Some(i),
+                    self.max_imbalance,
+                    &hint_policy,
+                );
                 match sel {
-                    Some(sel) if sel.index == i => {
+                    Ok(sel) if sel.index == i => {
                         model_counter!(pool.model(), "placement_hint_honored_total").increment(1);
                         if let Some(k) = key {
                             if self.enabled {
                                 self.repin(k, i);
                             }
                         }
-                        return Some(Placement::new(sel, path));
+                        return Ok(Placement::new(sel, path));
                     }
-                    Some(sel) => {
+                    Ok(sel) => {
                         let reason = if !pool.backends()[i].healthy.load(Ordering::Relaxed) {
                             "unhealthy"
                         } else {
@@ -180,7 +203,7 @@ impl BackendConversationAffinity {
                         // the reservation before the existing path runs.
                         drop(sel);
                     }
-                    None => {
+                    Err(_) => {
                         // Nothing is eligible under `policy` (`pick`'s scan ignores
                         // `preferred`), and the probe already recorded that refusal;
                         // the fallback would only refuse and count it again.
@@ -191,20 +214,22 @@ impl BackendConversationAffinity {
                         };
                         model_counter!(pool.model(), "placement_hint_overridden_total", "reason" => reason)
                             .increment(1);
-                        return None;
+                        // The probe never holds a pin, so this is never
+                        // `PinnedAtLimit` even when the pin is also full.
+                        return Err(SelectionRefusal::Other);
                     }
                 }
             }
         }
 
         let Some(key) = key else {
-            let selection = pool.select_with_preference_bounded(None, 0, policy)?;
-            return Some(Placement::new(selection, path));
+            let selection = pool.try_select_with_preference_bounded(None, 0, policy)?;
+            return Ok(Placement::new(selection, path));
         };
 
         let existing = self.assignments.get(&key);
         let selection =
-            pool.select_with_preference_bounded(existing, self.max_imbalance, policy)?;
+            pool.try_select_with_preference_bounded(existing, self.max_imbalance, policy)?;
         if existing != Some(selection.index) {
             // New conversation, or the pinned backend was unhealthy/overloaded:
             // remember where this turn actually went so the next turn follows
@@ -228,7 +253,7 @@ impl BackendConversationAffinity {
         model_gauge!(pool.model(), "backend_affinity_assignments")
             .set(self.assignments.entry_count() as f64);
 
-        Some(Placement::new(selection, path))
+        Ok(Placement::new(selection, path))
     }
 
     /// Move a conversation to `index` (connection fail-over placed it there).
@@ -727,5 +752,61 @@ mod tests {
         assert!(aff
             .place(&pool, None, ReplicaHint::Index(0), "/x", &policy)
             .is_none());
+    }
+
+    #[test]
+    fn hold_keeps_the_pin_at_the_limit_and_default_moves_it() {
+        let pool = two_backend_pool();
+        let affinity = BackendConversationAffinity::new(true, 2, 8, 1_200);
+        let key = affinity.key_for_chat_request(&turn(0), "model").unwrap();
+        let first = affinity
+            .place(&pool, Some(key), ReplicaHint::Absent, "/x", &share2())
+            .unwrap();
+        let pinned = first.index;
+        drop(first);
+        set_lane_conns(&pool, pinned, 2);
+        let hold = Policy {
+            hold_pin_at_limit: true,
+            ..share2()
+        };
+
+        assert_eq!(
+            affinity
+                .try_place(&pool, Some(key), ReplicaHint::Absent, "/x", &hold)
+                .err(),
+            Some(SelectionRefusal::PinnedAtLimit)
+        );
+        // A refused hint probe is not the pin's refusal, even with the pin full.
+        set_lane_conns(&pool, 1 - pinned, 2);
+        assert_eq!(
+            affinity
+                .try_place(
+                    &pool,
+                    Some(key),
+                    ReplicaHint::Index(1 - pinned),
+                    "/x",
+                    &hold
+                )
+                .err(),
+            Some(SelectionRefusal::Other)
+        );
+        set_lane_conns(&pool, 1 - pinned, 0);
+        assert_eq!(affinity.assignment(&key), Some(pinned), "no re-pin");
+
+        // A replica hint keeps its own rules: it is not a pin.
+        let other = 1 - pinned;
+        let hinted = affinity
+            .place(&pool, Some(key), ReplicaHint::Index(other), "/x", &hold)
+            .unwrap();
+        assert_eq!(hinted.index, other);
+        drop(hinted);
+        affinity.repin(key, pinned);
+
+        // Without the hold the same state moves the conversation.
+        let moved = affinity
+            .place(&pool, Some(key), ReplicaHint::Absent, "/x", &share2())
+            .unwrap();
+        assert_eq!(moved.index, other);
+        assert_eq!(affinity.assignment(&key), Some(other));
     }
 }

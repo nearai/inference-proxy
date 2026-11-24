@@ -35,18 +35,25 @@ pub(super) fn place_completion(
     let limits = model.admission.backend_limits(model.backend_pool);
     let mut restrict = tier.and_then(|decision| decision.restrict);
     let requested_tier = tier.map(|decision| decision.estimated);
+    let avoid = |index: usize| model.admission.backend_saturated(index);
+    let engine = |index: usize| model.admission.engine(index);
+    let policy_for = |tier| Policy {
+        max_conns: state.config.backend_max_inflight,
+        max_conns_by_backend: limits.as_deref(),
+        requested_tier,
+        avoid: &avoid,
+        engine: &engine,
+        tier,
+        hold_pin_at_limit: model.affinity_hold_at_limit,
+    };
     let place = |tier| {
-        let policy = Policy {
-            max_conns: state.config.backend_max_inflight,
-            max_conns_by_backend: limits.as_deref(),
-            requested_tier,
-            avoid: &|index| model.admission.backend_saturated(index),
-            engine: &|index| model.admission.engine(index),
-            tier,
-        };
-        model
-            .backend_affinity
-            .place(model.backend_pool, affinity_key, hint, path, &policy)
+        model.backend_affinity.place(
+            model.backend_pool,
+            affinity_key,
+            hint,
+            path,
+            &policy_for(tier),
+        )
     };
 
     let mut placement = place(restrict);
@@ -89,9 +96,16 @@ pub(super) fn place_completion(
                     }
                 }
             }
-            return Err(AppError::from(
-                model.admission.reject(RejectReason::HostShare),
-            ));
+            let held = model.backend_affinity.pin_held(
+                model.backend_pool,
+                affinity_key,
+                &policy_for(restrict),
+            );
+            return Err(AppError::from(model.admission.reject(if held {
+                RejectReason::PinnedHostLimit
+            } else {
+                RejectReason::HostShare
+            })));
         }
     };
     if let Some(permit) = admission.as_ref() {

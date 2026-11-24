@@ -167,6 +167,10 @@ pub struct Policy<'a> {
     /// Only backends of this context tier are candidates (`None` = the whole
     /// pool; see `context_tier.rs`).
     pub tier: Option<ContextTier>,
+    /// A pinned conversation whose healthy, unavoided, in-tier backend is at
+    /// its limit is refused instead of rebalanced, so its prefix cache is not
+    /// abandoned for a cold prefill elsewhere (`BackendPool::pin_held`).
+    pub hold_pin_at_limit: bool,
 }
 
 fn never(_: usize) -> bool {
@@ -198,6 +202,7 @@ impl Policy<'static> {
         avoid: &never,
         engine: &unknown,
         tier: None,
+        hold_pin_at_limit: false,
     };
 }
 
@@ -376,6 +381,26 @@ impl BackendPool {
         self.reserve(None, 0, &policy, false)
     }
 
+    /// Whether `policy` holds a conversation pinned to `preferred` at its
+    /// limit: the backend is in range, healthy, in tier and not avoided, and
+    /// its lane count has reached the limit. Then a selection refuses rather
+    /// than moves the pin; any other reason to leave the pin is unaffected.
+    pub fn pin_held(&self, preferred: Option<usize>, policy: &Policy<'_>) -> bool {
+        if !policy.hold_pin_at_limit || self.backends.len() == 1 {
+            return false;
+        }
+        let Some(index) = preferred.filter(|index| *index < self.backends.len()) else {
+            return false;
+        };
+        let backend = &self.backends[index];
+        backend.healthy.load(Ordering::Relaxed)
+            && backend.in_tier(policy.tier)
+            && !(policy.avoid)(index)
+            && policy
+                .limit(index)
+                .is_some_and(|max| backend.lane_conns.load(Ordering::Relaxed) >= max)
+    }
+
     /// Whether some backend other than `index` is healthy (fail-over could
     /// go somewhere, share and avoidance aside).
     pub fn has_healthy_other_than(&self, index: usize) -> bool {
@@ -415,7 +440,10 @@ impl BackendPool {
             let Some((index, outcome)) =
                 self.pick(preferred, max_imbalance, policy, degrade_when_all_unhealthy)
             else {
-                self.record_selection_refusal(policy, None);
+                let reason = self
+                    .pin_held(preferred, policy)
+                    .then_some("pinned_host_limit");
+                self.record_selection_refusal(policy, reason);
                 return None;
             };
             let backend = &self.backends[index];
@@ -498,6 +526,13 @@ impl BackendPool {
             let usable = only.healthy.load(Ordering::Relaxed) || degrade_when_all_unhealthy;
             return (usable && !avoid(0) && under_bound(0, only) && only.in_tier(policy.tier))
                 .then_some((0, SelectionOutcome::Single));
+        }
+
+        // Opt-in: a pin at its limit stays put and the request is refused.
+        // Checked on every pick, so a lost reservation race re-picks into
+        // this refusal rather than moving the pin.
+        if self.pin_held(preferred, policy) {
+            return None;
         }
 
         let eligible = |index: usize, backend: &Backend| {
@@ -1161,5 +1196,130 @@ mod tests {
         let b = Backend::new("http://b1:8000/".to_string(), ContextTier::Base);
         assert_eq!(b.url("/v1/models"), "http://b1:8000/v1/models");
         assert_eq!(b.url(""), "http://b1:8000");
+    }
+
+    fn holding(max_conns: u32) -> Policy<'static> {
+        Policy {
+            max_conns: Some(max_conns),
+            hold_pin_at_limit: true,
+            ..Policy::NONE
+        }
+    }
+
+    #[test]
+    fn test_hold_refuses_a_pin_at_the_limit_while_others_have_room() {
+        let pool = two_backends();
+        set_conns(&pool, 0, 2);
+        let policy = holding(2);
+        assert!(pool.pin_held(Some(0), &policy));
+        assert!(pool
+            .select_with_preference_bounded(Some(0), 8, &policy)
+            .is_none());
+        // Nothing was taken from either host.
+        assert_eq!(pool.backends()[0].lane_conns.load(Ordering::Relaxed), 2);
+        assert_eq!(pool.backends()[1].lane_conns.load(Ordering::Relaxed), 0);
+        // Room again: the pin is served.
+        set_conns(&pool, 0, 1);
+        assert!(!pool.pin_held(Some(0), &policy));
+        let sel = pool
+            .select_with_preference_bounded(Some(0), 8, &policy)
+            .unwrap();
+        assert_eq!((sel.index, sel.outcome), (0, SelectionOutcome::Pinned));
+    }
+
+    #[test]
+    fn test_hold_off_rebalances_a_pin_at_the_limit() {
+        let pool = two_backends();
+        set_conns(&pool, 0, 2);
+        let policy = bounded(2);
+        assert!(!pool.pin_held(Some(0), &policy));
+        let sel = pool
+            .select_with_preference_bounded(Some(0), 8, &policy)
+            .unwrap();
+        assert_eq!((sel.index, sel.outcome), (1, SelectionOutcome::Rebalanced));
+    }
+
+    #[test]
+    fn test_hold_still_moves_avoided_unhealthy_and_out_of_tier_pins() {
+        // Avoided pin, at its limit: back-pressure moves it as before.
+        let pool = two_backends();
+        set_conns(&pool, 0, 2);
+        let avoid = |index: usize| index == 0;
+        let policy = Policy {
+            avoid: &avoid,
+            ..holding(2)
+        };
+        assert!(!pool.pin_held(Some(0), &policy));
+        let sel = pool
+            .select_with_preference_bounded(Some(0), 8, &policy)
+            .unwrap();
+        assert_eq!((sel.index, sel.outcome), (1, SelectionOutcome::Rebalanced));
+        drop(sel);
+
+        // Unhealthy pin, at its limit.
+        let pool = two_backends();
+        set_conns(&pool, 0, 2);
+        pool.backends()[0].healthy.store(false, Ordering::Relaxed);
+        let sel = pool
+            .select_with_preference_bounded(Some(0), 8, &holding(2))
+            .unwrap();
+        assert_eq!((sel.index, sel.outcome), (1, SelectionOutcome::Unhealthy));
+        drop(sel);
+
+        // Pin outside the requested tier.
+        let pool = tiered();
+        set_conns(&pool, 0, 2);
+        let policy = Policy {
+            tier: Some(ContextTier::Long),
+            ..holding(2)
+        };
+        assert!(!pool.pin_held(Some(0), &policy));
+        let sel = pool
+            .select_with_preference_bounded(Some(0), 8, &policy)
+            .unwrap();
+        assert_eq!(sel.index, 2);
+    }
+
+    #[test]
+    fn test_hold_does_not_affect_new_conversations_or_failover() {
+        let pool = two_backends();
+        set_conns(&pool, 0, 2);
+        set_conns(&pool, 1, 1);
+        let policy = holding(2);
+        let sel = pool
+            .select_with_preference_bounded(None, 8, &policy)
+            .unwrap();
+        assert_eq!((sel.index, sel.outcome), (1, SelectionOutcome::New));
+        drop(sel);
+        let sel = pool.select_excluding(1, &Policy { ..policy });
+        assert!(sel.is_none(), "host 0 is full, host 1 is excluded");
+        set_conns(&pool, 0, 0);
+        assert_eq!(pool.select_excluding(1, &policy).unwrap().index, 0);
+    }
+
+    #[test]
+    fn test_hold_keeps_the_pin_when_everything_is_full() {
+        let pool = two_backends();
+        set_conns(&pool, 0, 2);
+        set_conns(&pool, 1, 2);
+        let policy = holding(2);
+        assert!(pool.pin_held(Some(1), &policy));
+        assert!(pool
+            .select_with_preference_bounded(Some(1), 8, &policy)
+            .is_none());
+        // A new conversation is refused by the plain host limit instead.
+        assert!(!pool.pin_held(None, &policy));
+    }
+
+    #[test]
+    fn test_hold_without_engine_view_still_rebalances_on_imbalance() {
+        // Under the limit, the gateway-count imbalance bound is untouched.
+        let pool = two_backends();
+        set_conns(&pool, 0, 9);
+        let policy = holding(100);
+        let sel = pool
+            .select_with_preference_bounded(Some(0), 8, &policy)
+            .unwrap();
+        assert_eq!((sel.index, sel.outcome), (1, SelectionOutcome::Rebalanced));
     }
 }

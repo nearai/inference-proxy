@@ -485,6 +485,15 @@ upstream:
    there. Only when no host has room is the request refused (reason
    `host_share`).
 
+   With `VLLM_BACKEND_AFFINITY_HOLD_AT_LIMIT=1` (default off) a pinned
+   conversation whose healthy host is only at its share is not moved: the
+   request is refused with a 429 (reason `pinned_host_limit`, also the
+   `admission_selection_failures_total` reason) and the pin stays, so a full
+   fleet does not turn cached prefixes into cold prefills on other hosts. A
+   pin that is unhealthy, queueing or steered around, outside the request's
+   tier, a new conversation, a connection fail-over and a replica hint behave
+   as without it.
+
 A refusal is `429` with `Retry-After: VLLM_PROXY_ADMISSION_RETRY_AFTER_SECS`
 and an error of type `overloaded`; the slot is released when the response —
 the whole stream, for SSE — is complete. Nothing is retried on the engine's
@@ -823,6 +832,7 @@ cannot silently become a default.
 | `admission_max_inflight` | `VLLM_PROXY_ADMISSION_MAX_INFLIGHT` | The model's in-flight budget; `0` = no admission for it. |
 | `admission_start_inflight` | `VLLM_PROXY_ADMISSION_START_INFLIGHT` when that is set, else the model's own maximum | Budget at start-up. |
 | `admission_queue_saturated_at` | `VLLM_PROXY_ADMISSION_QUEUE_SATURATED_AT` | Engine queue depth at which a backend counts as saturated. |
+| `affinity_hold_at_limit` | `VLLM_BACKEND_AFFINITY_HOLD_AT_LIMIT` | `true` or `false`: hold a pinned conversation at its host's limit instead of moving it, see [Admission budget](#admission-budget). |
 | `capacity_requests_per_minute` | `VLLM_PROXY_CAPACITY_REQUESTS_PER_MINUTE` | Requests per minute declared on the model's `/v1/models` entry. |
 | `discount_to_user` | `VLLM_PROXY_DISCOUNT_TO_USER` | A JSON number under the same rules as the variable; `0` = list price. Published on the model's entry and sent on its usage reports. |
 | `reasoning_off_effort` | `VLLM_PROXY_REASONING_OFF_EFFORT` | What "no reasoning" means for this model. |

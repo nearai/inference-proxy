@@ -132,7 +132,8 @@ impl BackendConversationAffinity {
     /// (engine back-pressure, non-empty engine queue) and supplies the engine
     /// view: a pinned conversation whose backend is at the bound or avoided is
     /// moved to the least-loaded eligible backend, and `None` means no backend
-    /// has room.
+    /// has room. With `policy.hold_pin_at_limit` a pin at the bound is not
+    /// moved: the result is `None` and the assignment stays.
     ///
     /// `hint` is honoured under the same guard as a pin: the backend must be
     /// healthy and eligible (tier, admission, not avoided or queueing), and,
@@ -157,7 +158,13 @@ impl BackendConversationAffinity {
                     .increment(1);
             }
             ReplicaHint::Index(i) => {
-                let sel = pool.select_with_preference_bounded(Some(i), self.max_imbalance, policy);
+                // A hint is not a pin: it keeps its own guard, hold or not.
+                let hint_policy = Policy {
+                    hold_pin_at_limit: false,
+                    ..*policy
+                };
+                let sel =
+                    pool.select_with_preference_bounded(Some(i), self.max_imbalance, &hint_policy);
                 match sel {
                     Some(sel) if sel.index == i => {
                         model_counter!(pool.model(), "placement_hint_honored_total").increment(1);
@@ -229,6 +236,18 @@ impl BackendConversationAffinity {
             .set(self.assignments.entry_count() as f64);
 
         Some(Placement::new(selection, path))
+    }
+
+    /// Whether `place` refused `key` because `policy` holds its pin at the
+    /// backend limit (`BackendPool::pin_held`); the pin is unchanged.
+    pub fn pin_held(
+        &self,
+        pool: &BackendPool,
+        key: Option<ConversationKey>,
+        policy: &Policy<'_>,
+    ) -> bool {
+        key.and_then(|key| self.assignments.get(&key))
+            .is_some_and(|index| pool.pin_held(Some(index), policy))
     }
 
     /// Move a conversation to `index` (connection fail-over placed it there).
@@ -727,5 +746,45 @@ mod tests {
         assert!(aff
             .place(&pool, None, ReplicaHint::Index(0), "/x", &policy)
             .is_none());
+    }
+
+    #[test]
+    fn hold_keeps_the_pin_at_the_limit_and_default_moves_it() {
+        let pool = two_backend_pool();
+        let affinity = BackendConversationAffinity::new(true, 2, 8, 1_200);
+        let key = affinity.key_for_chat_request(&turn(0), "model").unwrap();
+        let first = affinity
+            .place(&pool, Some(key), ReplicaHint::Absent, "/x", &share2())
+            .unwrap();
+        let pinned = first.index;
+        drop(first);
+        set_lane_conns(&pool, pinned, 2);
+        let hold = Policy {
+            hold_pin_at_limit: true,
+            ..share2()
+        };
+
+        assert!(affinity
+            .place(&pool, Some(key), ReplicaHint::Absent, "/x", &hold)
+            .is_none());
+        assert!(affinity.pin_held(&pool, Some(key), &hold));
+        assert!(!affinity.pin_held(&pool, Some(key), &share2()));
+        assert_eq!(affinity.assignment(&key), Some(pinned), "no re-pin");
+
+        // A replica hint keeps its own rules: it is not a pin.
+        let other = 1 - pinned;
+        let hinted = affinity
+            .place(&pool, Some(key), ReplicaHint::Index(other), "/x", &hold)
+            .unwrap();
+        assert_eq!(hinted.index, other);
+        drop(hinted);
+        affinity.repin(key, pinned);
+
+        // Without the hold the same state moves the conversation.
+        let moved = affinity
+            .place(&pool, Some(key), ReplicaHint::Absent, "/x", &share2())
+            .unwrap();
+        assert_eq!(moved.index, other);
+        assert_eq!(affinity.assignment(&key), Some(other));
     }
 }

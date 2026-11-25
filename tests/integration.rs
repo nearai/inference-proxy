@@ -4310,6 +4310,70 @@ async fn test_direct_audio_transcription_reports_duration() {
 }
 
 #[tokio::test]
+async fn test_direct_audio_transcription_verbose_duration_is_billed() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-test",
+            "workspace_id": "ws-test",
+            "api_key_id": "key-test"
+        })))
+        .mount(&cloud_api)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/internal/usage"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_api)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .and(wiremock::matchers::body_string_contains("verbose_json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "text": "synthetic",
+            "duration": "1.25",
+            "language": "en",
+            "segments": []
+        })))
+        .mount(&backend)
+        .await;
+
+    let app = build_test_app_with_cloud_api(&backend.uri(), &cloud_api.uri());
+    let boundary = "----SyntheticVerboseAudioBoundary";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ntest-model\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\nverbose_json\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n\
+         Content-Type: audio/wav\r\n\r\nsynthetic-audio\r\n--{boundary}--\r\n"
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .header("authorization", "Bearer sk-test-valid-key-12345678901")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("inference-id").is_some());
+    assert_eq!(body_to_json(response).await["duration"], "1.25");
+    wait_for_usage_request(&cloud_api, 1).await;
+    let usage_reqs = get_usage_requests(&cloud_api).await;
+    assert_eq!(usage_reqs.len(), 1);
+    assert_eq!(usage_reqs[0]["type"], "audio_transcription");
+    assert_eq!(usage_reqs[0]["duration_seconds"], 2);
+}
+
+#[tokio::test]
 async fn test_audio_transcriptions_missing_duration_is_direct_only() {
     let backend = MockServer::start().await;
     let cloud_api = MockServer::start().await;
@@ -8420,6 +8484,14 @@ async fn start_ohttp_server_with_relay_limit(
     mock_url: &str,
     relay_limit: Option<routes::ohttp::OhttpRelayLimit>,
 ) -> (String, tokio::task::JoinHandle<()>, Vec<u8>) {
+    start_ohttp_server_with_options(mock_url, relay_limit, None).await
+}
+
+async fn start_ohttp_server_with_options(
+    mock_url: &str,
+    relay_limit: Option<routes::ohttp::OhttpRelayLimit>,
+    cloud_api_url: Option<&str>,
+) -> (String, tokio::task::JoinHandle<()>, Vec<u8>) {
     let base = mock_url.trim_end_matches('/');
 
     let ed25519_key: [u8; 32] = [
@@ -8480,11 +8552,11 @@ async fn start_ohttp_server_with_relay_limit(
         rate_limit_per_second: 100,
         rate_limit_burst_size: 200,
         rate_limit_trust_proxy_headers: true,
-        cloud_api_url: None,
+        cloud_api_url: cloud_api_url.map(str::to_string),
         cloud_api_auth_max_attempts: 1,
         cloud_api_auth_initial_backoff_ms: 0,
         cloud_api_auth_timeout_secs: 5,
-        cloud_api_usage_token: None,
+        cloud_api_usage_token: cloud_api_url.map(|_| "test-usage-token".to_string()),
         usage_report: Default::default(),
         usage_report_transport: Default::default(),
         compose_manager_url: None,
@@ -9429,6 +9501,79 @@ async fn test_ohttp_audio_transcriptions_allowed() {
     let body: serde_json::Value = serde_json::from_slice(inner_resp.content()).unwrap();
     assert_eq!(body["id"], "trans-ohttp");
     assert_eq!(mock.received_requests().await.unwrap().len(), 1);
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_ohttp_direct_audio_verbose_duration_is_billed() {
+    let backend = MockServer::start().await;
+    let cloud_api = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/check_api_key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organization_id": "org-test",
+            "workspace_id": "ws-test",
+            "api_key_id": "key-test"
+        })))
+        .mount(&cloud_api)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/internal/usage"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_api)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .and(wiremock::matchers::body_string_contains("verbose_json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "text": "synthetic",
+            "duration": 1.25,
+            "language": "en",
+            "segments": []
+        })))
+        .mount(&backend)
+        .await;
+    let (base_url, server_handle, config_bytes) =
+        start_ohttp_server_with_options(&backend.uri(), None, Some(&cloud_api.uri())).await;
+
+    let boundary = "----OhttpVerboseAudioBoundary";
+    let multipart_body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ntest-model\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\nverbose_json\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n\
+         Content-Type: audio/wav\r\n\r\nsynthetic-audio\r\n--{boundary}--\r\n"
+    );
+    let mut inner_req = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"localhost".to_vec(),
+        b"/v1/audio/transcriptions".to_vec(),
+    );
+    inner_req.put_header(
+        "content-type",
+        format!("multipart/form-data; boundary={boundary}").as_bytes(),
+    );
+    inner_req.put_header("authorization", "Bearer sk-test-valid-key-12345678901");
+    inner_req.write_content(multipart_body.into_bytes());
+
+    let (enc_request, client_response) = ohttp_encrypt_request(&config_bytes, &inner_req);
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/ohttp"))
+        .header("content-type", "message/ohttp-req")
+        .body(enc_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let inner_resp = ohttp_decrypt_response(client_response, &response.bytes().await.unwrap());
+    assert_eq!(inner_resp.control().status().unwrap().code(), 200);
+    let body: serde_json::Value = serde_json::from_slice(inner_resp.content()).unwrap();
+    assert_eq!(body["duration"], 1.25);
+    wait_for_usage_request(&cloud_api, 1).await;
+    let usage_reqs = get_usage_requests(&cloud_api).await;
+    assert_eq!(usage_reqs.len(), 1);
+    assert_eq!(usage_reqs[0]["duration_seconds"], 2);
 
     server_handle.abort();
 }

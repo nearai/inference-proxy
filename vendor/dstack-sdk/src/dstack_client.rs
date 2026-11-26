@@ -171,6 +171,15 @@ impl DstackClient {
         Ok(InfoResponse::validated_from_value(response)?)
     }
 
+    /// Return Info with a decoded TCB object, including platform-specific measurements.
+    pub async fn info_raw(&self) -> Result<Value> {
+        let mut info: Value = self.send_rpc_request("/Info", &json!({})).await?;
+        if let Some(tcb) = info.get("tcb_info").and_then(Value::as_str) {
+            info["tcb_info"] = serde_json::from_str(tcb)?;
+        }
+        Ok(info)
+    }
+
     /// Query the guest-agent version.
     ///
     /// Returns `Ok(VersionResponse)` on OS >= 0.5.7.

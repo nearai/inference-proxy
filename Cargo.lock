@@ -395,12 +395,6 @@ checksum = "fd307490d624467aa6f74b0eabb77633d1f758a7b25f12bceb0b22e08d9726f6"
 
 [[package]]
 name = "base64"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e1b586273c5702936fe7b7d6896644d8be71e6314cfe09d3167c95f712589e8"
-
-[[package]]
-name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
@@ -1733,6 +1727,9 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "hkdf"
@@ -3588,14 +3585,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde-human-bytes"
-version = "0.1.3"
+name = "serde_bytes"
+version = "0.11.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3aff481ca1fe108deba0f217b45d9f1d494e7e7f906bcc7366d8a5648c5a1e65"
+checksum = "a5d440709e79d88e51ac01c4b72fc6cb7314017bb7da9eeff678aa94c10e3ea8"
 dependencies = [
- "base64 0.13.1",
- "hex",
  "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -4482,7 +4478,7 @@ dependencies = [
  "rustls",
  "semver",
  "serde",
- "serde-human-bytes",
+ "serde_bytes",
  "serde_json",
  "sha2 0.11.0",
  "sha3",

@@ -1,13 +1,13 @@
 # vllm-proxy-rs
 
-Rust proxy for vLLM/sglang inference engines running in GPU TEE environments. Adds Intel TDX + NVIDIA GPU attestation and cryptographic signing (ECDSA secp256k1 + Ed25519) to standard OpenAI-compatible API endpoints.
+Rust proxy for vLLM/sglang inference engines running in GPU TEE environments. Adds CPU attestation (Intel TDX or AMD SEV-SNP), NVIDIA GPU attestation and cryptographic signing (ECDSA secp256k1 + Ed25519) to standard OpenAI-compatible API endpoints.
 
 Rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-proxy) (Python).
 
 ## Features
 
 - **Dual signing** — every response is signed with both ECDSA (EIP-191, secp256k1) and Ed25519. Signatures are cached and retrievable per chat ID.
-- **TEE attestation** — returns the hex-encoded dstack evidence in `dstack_attestation`, alongside the Intel TDX `intel_quote` and `event_log` from that evidence. NVIDIA GPU evidence is collected separately.
+- **TEE attestation** — returns hex-encoded Intel TDX or AMD SEV-SNP evidence in `dstack_attestation`. Intel reports also expose `intel_quote` and `event_log`. On AMD these legacy fields are `""` and `[]`. NVIDIA GPU evidence is collected separately.
 - **Backend-agnostic** — works with any OpenAI-compatible backend (vLLM, sglang, etc.).
 - **Streaming support** — SSE streams are hashed incrementally and signed on completion.
 - **In-memory cache** — moka-based TTL cache for signatures (no Redis dependency).
@@ -427,7 +427,7 @@ src/
   error.rs            # AppError -> OpenAI-style JSON error responses
   types.rs            # SignedChat, AttestationReport, SignatureResponse
   signing.rs          # ECDSA (secp256k1) + Ed25519 signing, key derivation
-  attestation.rs      # TDX + GPU attestation report generation
+  attestation.rs      # CPU + GPU attestation report generation
   cache.rs            # moka in-memory cache with TTL
   proxy.rs            # Generic proxy helpers (JSON, streaming SSE, multipart)
   auth.rs             # Bearer token auth extractor

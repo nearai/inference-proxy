@@ -11,7 +11,7 @@ use crate::types::AttestationReport;
 use dstack_sdk::dstack_client::DstackClient;
 
 mod dstack_report;
-use dstack_report::{GuestInfo, TdxEvidence};
+use dstack_report::{GuestInfo, PlatformEvidence};
 
 /// Per-call timeout for the Python evidence collector (persistent worker
 /// `collect()` and one-shot subprocess fallback).
@@ -247,9 +247,13 @@ impl AttestationCache {
     }
 
     /// Get cached dstack info, fetching it once on first call.
-    async fn get_dstack_info(&self) -> anyhow::Result<GuestInfo> {
+    async fn get_dstack_info(
+        &self,
+        client: &DstackClient,
+        platform: &PlatformEvidence,
+    ) -> anyhow::Result<GuestInfo> {
         self.dstack_info
-            .get_or_try_init(GuestInfo::fetch)
+            .get_or_try_init(|| GuestInfo::fetch(client, platform))
             .await
             .cloned()
     }
@@ -771,10 +775,20 @@ print(json.dumps(evidence))
 
 /// Build NVIDIA payload JSON.
 fn build_nvidia_payload(nonce_hex: &str, evidences: &serde_json::Value) -> String {
+    let mut architectures = evidences.as_array().into_iter().flatten().map(|entry| {
+        entry
+            .get("arch")
+            .and_then(|arch| arch.as_str())
+            .filter(|arch| !arch.is_empty())
+    });
+    let arch = match architectures.next() {
+        Some(Some(first)) if architectures.all(|arch| arch == Some(first)) => first,
+        _ => "HOPPER",
+    };
     serde_json::json!({
         "nonce": nonce_hex,
         "evidence_list": evidences,
-        "arch": "HOPPER",
+        "arch": arch,
     })
     .to_string()
 }
@@ -1264,7 +1278,7 @@ pub(crate) async fn collect_gpu_evidence_with_nonce_check(
 /// Generate a complete attestation report (core logic, no caching).
 ///
 /// Parallelizes the two slow operations:
-/// - TDX quote generation (dstack Unix socket RPC)
+/// - CPU attestation (dstack Unix socket RPC)
 /// - GPU evidence collection (Python subprocess with NVML)
 ///
 /// dstack info is cached for the process lifetime (it never changes).
@@ -1276,7 +1290,7 @@ async fn generate_attestation_inner(
 ) -> Result<AttestationReport, AttestationError> {
     let nonce_hex = hex::encode(nonce_bytes);
 
-    // Build TDX report data (binds cert fingerprint when present)
+    // Bind the signing address and optional TLS fingerprint to the caller nonce.
     let fp_bytes = params
         .tls_cert_fingerprint
         .map(hex::decode)
@@ -1290,43 +1304,30 @@ async fn generate_attestation_inner(
         fp_bytes.as_deref(),
     );
 
-    // Run TDX quote and GPU evidence collection in parallel.
-    // These are independent: TDX quote talks to dstack via Unix socket,
-    // GPU evidence uses the persistent Python worker (or subprocess fallback).
-    let gpu_no_hw_mode = params.gpu_no_hw_mode;
-    let nonce_hex_clone = nonce_hex.clone();
-    let nonce_bytes_for_verify = nonce_bytes;
+    // Collect independent CPU and GPU evidence for the same nonce in parallel.
+    let client = DstackClient::new(None);
     let (attest_result, gpu_evidence) = tokio::try_join!(
-        async {
-            let client = DstackClient::new(None);
-            client
-                .attest(report_data)
-                .await
-                .map_err(AttestationError::Internal)
-        },
-        async {
-            collect_gpu_evidence_with_nonce_check(
-                &nonce_hex_clone,
-                &nonce_bytes_for_verify,
-                gpu_no_hw_mode,
-                cache,
-                delegate_ctx,
-            )
-            .await
-            .map_err(AttestationError::Internal)
-        },
-    )?;
+        client.attest(report_data),
+        collect_gpu_evidence_with_nonce_check(
+            &nonce_hex,
+            &nonce_bytes,
+            params.gpu_no_hw_mode,
+            cache,
+            delegate_ctx,
+        ),
+    )
+    .map_err(AttestationError::Internal)?;
 
-    let mut evidence = TdxEvidence::decode(&attest_result).map_err(AttestationError::Internal)?;
+    let evidence = PlatformEvidence::decode(&attest_result).map_err(AttestationError::Internal)?;
     let nvidia_payload = build_nvidia_payload(&nonce_hex, &gpu_evidence);
 
     let guest = match cache {
-        Some(cache) => cache.get_dstack_info().await,
-        None => GuestInfo::fetch().await,
+        Some(cache) => cache.get_dstack_info(&client, &evidence).await,
+        None => GuestInfo::fetch(&client, &evidence).await,
     }
     .map_err(AttestationError::Internal)?;
-    let event_log = evidence
-        .report_event_log(guest.modern_event_log)
+    let (intel_quote, event_log) = evidence
+        .into_intel_fields(guest.modern_event_log)
         .map_err(AttestationError::Internal)?;
 
     Ok(AttestationReport {
@@ -1336,7 +1337,7 @@ async fn generate_attestation_inner(
         signing_public_key: params.signing_public_key.to_string(),
         request_nonce: nonce_hex,
         dstack_attestation: Some(attest_result.attestation),
-        intel_quote: hex::encode(evidence.quote),
+        intel_quote,
         nvidia_payload,
         event_log,
         info: guest.info,
@@ -1528,6 +1529,23 @@ mod tests {
         assert_eq!(payload["nonce"], "abc123");
         assert_eq!(payload["arch"], "HOPPER");
         assert_eq!(payload["evidence_list"][0]["gpu"], "H100");
+    }
+
+    #[test]
+    fn nvidia_payload_uses_the_shared_gpu_architecture() {
+        let arch = |evidence| {
+            let payload: serde_json::Value =
+                serde_json::from_str(&build_nvidia_payload("ab", &evidence)).unwrap();
+            payload["arch"].clone()
+        };
+        assert_eq!(
+            arch(serde_json::json!([{"arch":"BLACKWELL"}, {"arch":"BLACKWELL"}])),
+            "BLACKWELL"
+        );
+        assert_eq!(
+            arch(serde_json::json!([{"arch":"HOPPER"}, {"arch":"BLACKWELL"}])),
+            "HOPPER"
+        );
     }
 
     /// Build a synthetic per-GPU evidence binary in the format observed in

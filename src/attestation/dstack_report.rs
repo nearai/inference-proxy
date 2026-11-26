@@ -15,8 +15,13 @@ pub(super) struct GuestInfo {
 }
 
 impl GuestInfo {
-    pub async fn fetch() -> Result<Self> {
-        let client = DstackClient::new(None);
+    pub async fn fetch(client: &DstackClient, platform: &PlatformEvidence) -> Result<Self> {
+        if let PlatformEvidence::SevSnp(_) = platform {
+            return Ok(Self {
+                info: client.info_raw().await?,
+                modern_event_log: false,
+            });
+        }
         let (info, version) = tokio::join!(client.info(), client.version());
         // Attest predates Version. Guests before 0.6 strip runtime digests.
         let modern_event_log = match version {
@@ -48,7 +53,7 @@ impl GuestInfo {
 
 #[derive(Decode, Deserialize)]
 pub(super) struct TdxEvidence {
-    pub quote: Vec<u8>,
+    quote: Vec<u8>,
     event_log: Vec<TdxEvent>,
 }
 
@@ -56,10 +61,17 @@ pub(super) struct TdxEvidence {
 struct TdxEvent {
     imr: u32,
     event_type: u32,
-    #[serde(with = "serde_human_bytes", default)]
+    #[serde(
+        deserialize_with = "serde_bytes::deserialize",
+        serialize_with = "hex::serde::serialize",
+        default
+    )]
     digest: Vec<u8>,
     event: String,
-    #[serde(with = "serde_human_bytes")]
+    #[serde(
+        deserialize_with = "serde_bytes::deserialize",
+        serialize_with = "hex::serde::serialize"
+    )]
     event_payload: Vec<u8>,
     #[codec(skip)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -78,12 +90,24 @@ struct AttestationV1 {
 }
 
 #[derive(Deserialize)]
-struct PlatformEvidence {
-    kind: String,
-    data: TdxEvidence,
+#[serde(tag = "kind", content = "data")]
+pub(super) enum PlatformEvidence {
+    #[serde(rename = "tdx", alias = "gcp-tdx")]
+    Tdx(TdxEvidence),
+    #[serde(rename = "sev-snp")]
+    SevSnp(SnpEvidence),
 }
 
-impl TdxEvidence {
+#[derive(Decode, Deserialize)]
+pub(super) struct SnpEvidence {
+    report: Vec<u8>,
+    #[serde(rename = "cert_chain")]
+    _cert_chain: Vec<Vec<u8>>,
+    #[serde(rename = "mr_config")]
+    _mr_config: String,
+}
+
+impl PlatformEvidence {
     pub fn decode(response: &AttestResponse) -> Result<Self> {
         ensure!(
             response.attestation.len() <= 2 * MAX_ATTESTATION_BYTES,
@@ -95,15 +119,25 @@ impl TdxEvidence {
         match bytes.as_slice() {
             [0, platform, rest @ ..] => {
                 let mut tail = rest;
-                ensure!(*platform <= 1, "Expected TDX evidence in SCALE attestation");
-                let evidence = <Self as Decode>::decode(&mut tail)
-                    .context("Invalid dstack SCALE TDX evidence")?;
-                if *platform == 1 {
-                    // GCP appends a TPM quote after the TDX evidence.
-                    type Pcr = (u32, String, Vec<u8>);
-                    type TpmQuote = (Vec<u8>, Vec<u8>, Vec<Pcr>, Vec<u8>, u8, Vec<(u32, Vec<u8>)>);
-                    TpmQuote::skip(&mut tail)?;
-                }
+                let evidence = match platform {
+                    0 | 1 => {
+                        let tdx = TdxEvidence::decode(&mut tail)
+                            .context("Invalid dstack SCALE TDX evidence")?;
+                        if *platform == 1 {
+                            // GCP appends a TPM quote after the TDX evidence.
+                            type Pcr = (u32, String, Vec<u8>);
+                            type TpmQuote =
+                                (Vec<u8>, Vec<u8>, Vec<Pcr>, Vec<u8>, u8, Vec<(u32, Vec<u8>)>);
+                            TpmQuote::skip(&mut tail)?;
+                        }
+                        Self::Tdx(tdx)
+                    }
+                    3 => Self::SevSnp(
+                        SnpEvidence::decode(&mut tail)
+                            .context("Invalid dstack SCALE SEV-SNP evidence")?,
+                    ),
+                    _ => bail!("Unsupported dstack SCALE platform {platform}"),
+                };
                 // Shared SCALE trailer: runtime events, report data, and VM config.
                 <(Vec<(String, Vec<u8>)>, [u8; 64], String)>::skip(&mut tail)?;
                 ensure!(tail.is_empty(), "Trailing data in SCALE attestation");
@@ -122,17 +156,28 @@ impl TdxEvidence {
                     "Unsupported dstack attestation version {}",
                     att.version
                 );
-                ensure!(
-                    matches!(att.platform.kind.as_str(), "tdx" | "gcp-tdx"),
-                    "Expected TDX platform evidence"
-                );
-                Ok(att.platform.data)
+                Ok(att.platform)
             }
             _ => bail!("Unknown dstack attestation format"),
         }
     }
 
-    pub fn report_event_log(&mut self, modern_event_log: bool) -> Result<serde_json::Value> {
+    pub fn into_intel_fields(self, modern_event_log: bool) -> Result<(String, serde_json::Value)> {
+        match self {
+            Self::Tdx(mut tdx) => {
+                let event_log = tdx.report_event_log(modern_event_log)?;
+                Ok((hex::encode(tdx.quote), event_log))
+            }
+            Self::SevSnp(snp) => {
+                ensure!(!snp.report.is_empty(), "Empty dstack SEV-SNP report");
+                Ok((String::new(), serde_json::json!([])))
+            }
+        }
+    }
+}
+
+impl TdxEvidence {
+    fn report_event_log(&mut self, modern_event_log: bool) -> Result<serde_json::Value> {
         for entry in &mut self.event_log {
             if entry.event_type == RUNTIME_EVENT {
                 if !modern_event_log && entry.version.unwrap_or(1) == 1 {
@@ -179,20 +224,76 @@ mod tests {
             "{}",
         )
             .encode();
-        let mut evidence = TdxEvidence::decode(&attest(&bytes)).unwrap();
-        assert_eq!(hex::encode(&evidence.quote), "b0a1");
+        let evidence = PlatformEvidence::decode(&attest(&bytes)).unwrap();
+        let (quote, log) = evidence.into_intel_fields(false).unwrap();
+        assert_eq!(quote, "b0a1");
         assert_eq!(
-            evidence.report_event_log(false).unwrap(),
+            log,
             json!([
                 {"imr":0, "event_type":10, "digest":"ab", "event":"", "event_payload":""},
                 {"imr":3, "event_type":RUNTIME_EVENT, "digest":"", "event":"test", "event_payload":"23"}
             ])
         );
-        let mut evidence = TdxEvidence::decode(&attest(&bytes)).unwrap();
-        let log = evidence.report_event_log(true).unwrap();
+        let evidence = PlatformEvidence::decode(&attest(&bytes)).unwrap();
+        let (_, log) = evidence.into_intel_fields(true).unwrap();
         assert_eq!(log[0]["event_payload"], hex::encode("ACPI DATA"));
         assert_eq!(log[1]["digest"], "cd");
-        assert!(TdxEvidence::decode(&attest(&bytes[..bytes.len() - 1])).is_err());
+        assert!(PlatformEvidence::decode(&attest(&bytes[..bytes.len() - 1])).is_err());
+    }
+
+    #[tokio::test]
+    async fn snp_accepts_nullable_info_and_has_no_legacy_intel_fields() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+
+        let server = MockServer::start().await;
+        let tcb = json!({"mrtd":null, "rtmr3":null, "event_log":[]});
+        Mock::given(method("POST"))
+            .and(path("/Info"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"tcb_info":tcb.to_string()})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = DstackClient::new(Some(&server.uri()));
+
+        let report = vec![0x42u8; 1184];
+        let cert_chain = vec![vec![1u8, 2]];
+        let scale = (
+            0u8,
+            3u8,
+            &report,
+            &cert_chain,
+            "{}",
+            Vec::<(String, Vec<u8>)>::new(),
+            [0u8; 64],
+            "{}",
+        )
+            .encode();
+        let msgpack = rmp_serde::to_vec_named(&json!({
+            "version": 1,
+            "platform": {"kind":"sev-snp", "data":{"report":report, "cert_chain":cert_chain, "mr_config":"{}"}},
+            "stack": {"kind":"dstack", "data":{"report_data":vec![0;64], "runtime_events":[], "config":"{}"}}
+        })).unwrap();
+        let evidence = PlatformEvidence::decode(&attest(&scale)).unwrap();
+        let guest = GuestInfo::fetch(&client, &evidence).await.unwrap();
+        assert_eq!(guest.info["tcb_info"], tcb);
+        let expected = (String::new(), json!([]));
+        assert_eq!(
+            evidence.into_intel_fields(guest.modern_event_log).unwrap(),
+            expected
+        );
+        assert_eq!(
+            PlatformEvidence::decode(&attest(&msgpack))
+                .unwrap()
+                .into_intel_fields(false)
+                .unwrap(),
+            expected
+        );
+        assert!(PlatformEvidence::decode(&attest(&scale[..scale.len() - 1])).is_err());
     }
 
     #[test]
@@ -200,20 +301,21 @@ mod tests {
         let envelope = |version, kind| {
             json!({
                 "version": version,
-                "platform": {"kind": kind, "data": {"quote":[171,205], "event_log":[
+                "platform": {"data": {"quote":[171,205], "event_log":[
                     {"imr":1,"event_type":1,"event":"boot","event_payload":[52],"digest":[43]},
                     {"imr":3,"event_type":RUNTIME_EVENT,"event":"test","event_payload":[35],
                      "digest":[205],"version":2,"preimage":"abcd"}
-                ]}},
+                ]}, "kind":kind},
                 "stack": {"kind":"dstack","data":{"report_data":vec![66;64],"runtime_events":[],"config":"{}"}}
             })
         };
         let encode = |value| rmp_serde::to_vec_named(&value).unwrap();
         let mut bytes = encode(envelope(1, "tdx"));
-        let mut evidence = TdxEvidence::decode(&attest(&bytes)).unwrap();
-        assert_eq!(hex::encode(&evidence.quote), "abcd");
+        let evidence = PlatformEvidence::decode(&attest(&bytes)).unwrap();
+        let (quote, log) = evidence.into_intel_fields(true).unwrap();
+        assert_eq!(quote, "abcd");
         assert_eq!(
-            evidence.report_event_log(true).unwrap(),
+            log,
             json!([
                 {"imr":1,"event_type":1,"event":"boot","event_payload":"","digest":"2b"},
                 {"imr":3,"event_type":RUNTIME_EVENT,"event":"test","event_payload":"23",
@@ -221,8 +323,8 @@ mod tests {
             ])
         );
         bytes.push(0);
-        assert!(TdxEvidence::decode(&attest(&bytes)).is_err());
-        assert!(TdxEvidence::decode(&attest(&encode(envelope(2, "tdx")))).is_err());
-        assert!(TdxEvidence::decode(&attest(&encode(envelope(1, "sev-snp")))).is_err());
+        assert!(PlatformEvidence::decode(&attest(&bytes)).is_err());
+        assert!(PlatformEvidence::decode(&attest(&encode(envelope(2, "tdx")))).is_err());
+        assert!(PlatformEvidence::decode(&attest(&encode(envelope(1, "sev-snp")))).is_err());
     }
 }

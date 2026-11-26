@@ -7,7 +7,7 @@ Rewrite of [nearai/vllm-proxy](https://github.com/nearai/vllm-proxy) (Python).
 ## Features
 
 - **Dual signing** — every response is signed with both ECDSA (EIP-191, secp256k1) and Ed25519. Signatures are cached and retrievable per chat ID.
-- **TEE attestation** — generates Intel TDX quotes via [dstack-sdk](https://github.com/Dstack-TEE/dstack) and NVIDIA GPU evidence via Python subprocess.
+- **TEE attestation** — returns the hex-encoded dstack evidence in `dstack_attestation`, alongside the Intel TDX `intel_quote` and `event_log` from that evidence. NVIDIA GPU evidence is collected separately.
 - **Backend-agnostic** — works with any OpenAI-compatible backend (vLLM, sglang, etc.).
 - **Streaming support** — SSE streams are hashed incrementally and signed on completion.
 - **In-memory cache** — moka-based TTL cache for signatures (no Redis dependency).

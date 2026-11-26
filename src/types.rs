@@ -19,6 +19,9 @@ pub struct AttestationReport {
     pub signing_algo: String,
     pub signing_public_key: String,
     pub request_nonce: String,
+    /// Original hex-encoded evidence from dstack Attest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dstack_attestation: Option<String>,
     pub intel_quote: String,
     pub nvidia_payload: String,
     pub event_log: serde_json::Value,

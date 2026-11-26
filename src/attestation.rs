@@ -8,6 +8,10 @@ use tokio::sync::{Mutex, OnceCell, RwLock, Semaphore};
 use tracing::{error, info, warn};
 
 use crate::types::AttestationReport;
+use dstack_sdk::dstack_client::DstackClient;
+
+mod dstack_report;
+use dstack_report::{GuestInfo, TdxEvidence};
 
 /// Per-call timeout for the Python evidence collector (persistent worker
 /// `collect()` and one-shot subprocess fallback).
@@ -220,7 +224,7 @@ pub struct AttestationCache {
     /// Cache TTL in seconds.
     ttl_secs: u64,
     /// Cached dstack info (static for the lifetime of the process).
-    dstack_info: OnceCell<serde_json::Value>,
+    dstack_info: OnceCell<GuestInfo>,
     /// Persistent GPU evidence worker process. Protected by Mutex which also
     /// serializes GPU evidence calls (only one NVML call at a time).
     /// The outer Option is None until first use; the worker is lazily spawned.
@@ -243,13 +247,9 @@ impl AttestationCache {
     }
 
     /// Get cached dstack info, fetching it once on first call.
-    async fn get_dstack_info(&self) -> anyhow::Result<serde_json::Value> {
+    async fn get_dstack_info(&self) -> anyhow::Result<GuestInfo> {
         self.dstack_info
-            .get_or_try_init(|| async {
-                let client = dstack_sdk::dstack_client::DstackClient::new(None);
-                let info = client.info().await?;
-                serde_json::to_value(&info).map_err(anyhow::Error::from)
-            })
+            .get_or_try_init(GuestInfo::fetch)
             .await
             .cloned()
     }
@@ -1296,11 +1296,11 @@ async fn generate_attestation_inner(
     let gpu_no_hw_mode = params.gpu_no_hw_mode;
     let nonce_hex_clone = nonce_hex.clone();
     let nonce_bytes_for_verify = nonce_bytes;
-    let (quote_result, gpu_evidence) = tokio::try_join!(
+    let (attest_result, gpu_evidence) = tokio::try_join!(
         async {
-            let client = dstack_sdk::dstack_client::DstackClient::new(None);
+            let client = DstackClient::new(None);
             client
-                .get_quote(report_data)
+                .attest(report_data)
                 .await
                 .map_err(AttestationError::Internal)
         },
@@ -1317,22 +1317,17 @@ async fn generate_attestation_inner(
         },
     )?;
 
-    let event_log: serde_json::Value = serde_json::from_str(&quote_result.event_log)
-        .map_err(|e| AttestationError::Internal(anyhow::Error::from(e)))?;
+    let mut evidence = TdxEvidence::decode(&attest_result).map_err(AttestationError::Internal)?;
     let nvidia_payload = build_nvidia_payload(&nonce_hex, &gpu_evidence);
 
-    // dstack info is static — use cached value if available.
-    let info_value = if let Some(cache) = cache {
-        cache
-            .get_dstack_info()
-            .await
-            .map_err(AttestationError::Internal)?
-    } else {
-        let client = dstack_sdk::dstack_client::DstackClient::new(None);
-        let info = client.info().await.map_err(AttestationError::Internal)?;
-        serde_json::to_value(&info)
-            .map_err(|e| AttestationError::Internal(anyhow::Error::from(e)))?
-    };
+    let guest = match cache {
+        Some(cache) => cache.get_dstack_info().await,
+        None => GuestInfo::fetch().await,
+    }
+    .map_err(AttestationError::Internal)?;
+    let event_log = evidence
+        .report_event_log(guest.modern_event_log)
+        .map_err(AttestationError::Internal)?;
 
     Ok(AttestationReport {
         model_name: params.model_name.to_string(),
@@ -1340,10 +1335,11 @@ async fn generate_attestation_inner(
         signing_algo: params.signing_algo.to_string(),
         signing_public_key: params.signing_public_key.to_string(),
         request_nonce: nonce_hex,
-        intel_quote: quote_result.quote,
+        dstack_attestation: Some(attest_result.attestation),
+        intel_quote: hex::encode(evidence.quote),
         nvidia_payload,
         event_log,
-        info: info_value,
+        info: guest.info,
         tls_cert_fingerprint: params.tls_cert_fingerprint.map(|s| s.to_string()),
     })
 }
@@ -1725,6 +1721,7 @@ mod tests {
             signing_algo: algo.to_string(),
             signing_public_key: "pk".to_string(),
             request_nonce: nonce.to_string(),
+            dstack_attestation: Some("abcd".to_string()),
             intel_quote: "quote".to_string(),
             nvidia_payload: "payload".to_string(),
             event_log: serde_json::json!({}),

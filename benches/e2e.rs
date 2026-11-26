@@ -307,7 +307,7 @@ fn bench_attestation_cache_operations(c: &mut Criterion) {
         signing_algo: "ecdsa".to_string(),
         signing_public_key: "04abcdef".to_string(),
         request_nonce: hex::encode([0xAA; 32]),
-        dstack_attestation: Some("ab".repeat(2048)),
+        dstack_attestation: "ab".repeat(2048),
         intel_quote: "base64quote".repeat(100),
         nvidia_payload: serde_json::json!({
             "nonce": hex::encode([0xAA; 32]),
@@ -346,7 +346,7 @@ fn bench_attestation_report_serialization(c: &mut Criterion) {
         signing_algo: "ecdsa".to_string(),
         signing_public_key: hex::encode([0xAB; 65]),
         request_nonce: hex::encode([0xCD; 32]),
-        dstack_attestation: Some("ab".repeat(2048)),
+        dstack_attestation: "ab".repeat(2048),
         intel_quote: "base64encodedquotedata".repeat(50),
         nvidia_payload: serde_json::json!({
             "nonce": hex::encode([0xCD; 32]),

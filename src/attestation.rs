@@ -2,12 +2,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use dstack_sdk::dstack_client::DstackClient;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, OnceCell, RwLock, Semaphore};
 use tracing::{error, info, warn};
 
+mod intel_report;
+
 use crate::types::AttestationReport;
+use intel_report::IntelEventLogFormat;
 
 /// Per-call timeout for the Python evidence collector (persistent worker
 /// `collect()` and one-shot subprocess fallback).
@@ -220,7 +224,7 @@ pub struct AttestationCache {
     /// Cache TTL in seconds.
     ttl_secs: u64,
     /// Cached dstack info (static for the lifetime of the process).
-    dstack_info: OnceCell<serde_json::Value>,
+    dstack_info: OnceCell<GuestInfo>,
     /// Persistent GPU evidence worker process. Protected by Mutex which also
     /// serializes GPU evidence calls (only one NVML call at a time).
     /// The outer Option is None until first use; the worker is lazily spawned.
@@ -243,7 +247,7 @@ impl AttestationCache {
     }
 
     /// Get cached dstack info, fetching it once on first call.
-    async fn get_dstack_info(&self) -> anyhow::Result<serde_json::Value> {
+    async fn get_dstack_info(&self) -> anyhow::Result<GuestInfo> {
         self.dstack_info
             .get_or_try_init(fetch_dstack_info)
             .await
@@ -1275,7 +1279,7 @@ pub(crate) async fn collect_gpu_evidence_with_nonce_check(
 /// Generate a complete attestation report (core logic, no caching).
 ///
 /// Parallelizes the two slow operations:
-/// - TDX quote generation (dstack Unix socket RPC)
+/// - CPU attestation generation (dstack Unix socket RPC)
 /// - GPU evidence collection (Python subprocess with NVML)
 ///
 /// dstack info is cached for the process lifetime (it never changes).
@@ -1287,7 +1291,7 @@ async fn generate_attestation_inner(
 ) -> Result<AttestationReport, AttestationError> {
     let nonce_hex = hex::encode(nonce_bytes);
 
-    // Build TDX report data (binds cert fingerprint when present)
+    // Build CPU report data (binds cert fingerprint when present)
     let fp_bytes = params
         .tls_cert_fingerprint
         .map(hex::decode)
@@ -1303,7 +1307,7 @@ async fn generate_attestation_inner(
 
     // dstack info is static — use cached value if available. It also tells
     // which CPU TEE this is, so it is read before the quote.
-    let info_value = if let Some(cache) = cache {
+    let guest = if let Some(cache) = cache {
         cache
             .get_dstack_info()
             .await
@@ -1313,7 +1317,6 @@ async fn generate_attestation_inner(
             .await
             .map_err(AttestationError::Internal)?
     };
-    let tdx = info_is_tdx(&info_value);
 
     // Run the CPU TEE quote and GPU evidence collection in parallel.
     // These are independent: the quote talks to dstack via Unix socket,
@@ -1323,7 +1326,7 @@ async fn generate_attestation_inner(
     let nonce_bytes_for_verify = nonce_bytes;
     let (cvm_evidence, gpu_evidence) = tokio::try_join!(
         async {
-            collect_cvm_evidence(report_data, tdx)
+            collect_cvm_evidence(&DstackClient::new(None), report_data, guest.intel_format)
                 .await
                 .map_err(AttestationError::Internal)
         },
@@ -1351,21 +1354,33 @@ async fn generate_attestation_inner(
         intel_quote: cvm_evidence.intel_quote,
         nvidia_payload,
         event_log: cvm_evidence.event_log,
-        info: info_value,
-        dstack_attestation: cvm_evidence.dstack_attestation,
+        info: guest.info,
+        dstack_attestation: Some(cvm_evidence.dstack_attestation),
         tls_cert_fingerprint: params.tls_cert_fingerprint.map(|s| s.to_string()),
     })
+}
+
+#[derive(Clone)]
+struct GuestInfo {
+    info: serde_json::Value,
+    intel_format: Option<IntelEventLogFormat>,
 }
 
 /// The guest agent's `Info` as JSON. The typed SDK call requires the TDX
 /// measurement fields, which are null on other CPU TEEs, so it falls back to
 /// the untyped response there.
-async fn fetch_dstack_info() -> anyhow::Result<serde_json::Value> {
-    let client = dstack_sdk::dstack_client::DstackClient::new(None);
-    match client.info().await {
-        Ok(info) => serde_json::to_value(&info).map_err(anyhow::Error::from),
-        Err(_) => client.info_raw().await,
-    }
+async fn fetch_dstack_info() -> anyhow::Result<GuestInfo> {
+    let client = DstackClient::new(None);
+    let info = match client.info().await {
+        Ok(info) => serde_json::to_value(info)?,
+        Err(_) => client.info_raw().await?,
+    };
+    let intel_format = if info_is_tdx(&info) {
+        Some(IntelEventLogFormat::from_guest(&client).await?)
+    } else {
+        None
+    };
+    Ok(GuestInfo { info, intel_format })
 }
 
 /// Whether `info` (from [`fetch_dstack_info`]) comes from an Intel TDX guest.
@@ -1379,30 +1394,28 @@ fn info_is_tdx(info: &serde_json::Value) -> bool {
 struct CvmEvidence {
     intel_quote: String,
     event_log: serde_json::Value,
-    dstack_attestation: Option<String>,
+    dstack_attestation: String,
 }
 
-/// TDX: the quote and its event log (`GetQuote`, TDX only in dstack 0.6).
-/// Other CPU TEEs: dstack's platform-neutral `Attest`.
-async fn collect_cvm_evidence(report_data: Vec<u8>, tdx: bool) -> anyhow::Result<CvmEvidence> {
-    let client = dstack_sdk::dstack_client::DstackClient::new(None);
-    if tdx {
-        let quote = client.get_quote(report_data).await?;
-        let event_log = serde_json::from_str(&quote.event_log)?;
-        return Ok(CvmEvidence {
-            intel_quote: quote.quote,
-            event_log,
-            dstack_attestation: None,
-        });
-    }
+/// Collect one CPU attestation and project the existing public fields on Intel.
+async fn collect_cvm_evidence(
+    client: &DstackClient,
+    report_data: Vec<u8>,
+    intel_format: Option<IntelEventLogFormat>,
+) -> anyhow::Result<CvmEvidence> {
     let attested = client.attest(report_data).await?;
-    if attested.attestation.is_empty() {
-        anyhow::bail!("dstack Attest returned an empty attestation");
-    }
+    anyhow::ensure!(
+        !attested.attestation.is_empty(),
+        "dstack Attest returned an empty attestation"
+    );
+    let (intel_quote, event_log) = match intel_format {
+        Some(format) => intel_report::legacy_fields(&attested, format)?,
+        None => (String::new(), serde_json::json!([])),
+    };
     Ok(CvmEvidence {
-        intel_quote: String::new(),
-        event_log: serde_json::Value::Array(Vec::new()),
-        dstack_attestation: Some(attested.attestation),
+        intel_quote,
+        event_log,
+        dstack_attestation: attested.attestation,
     })
 }
 

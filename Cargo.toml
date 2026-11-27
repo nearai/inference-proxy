@@ -77,7 +77,7 @@ rustls = { version = "0.23.45", default-features = false, features = ["ring"] }
 
 [dependencies.nv-attestation-sdk]
 git = "https://github.com/NVIDIA/attestation-sdk.git"
-tag = "2026.06.09"
+tag = "2026.10.02"
 optional = true
 
 [features]

@@ -86,8 +86,7 @@ Other endpoint transforms:
 Image editing and audio transcription accept multipart media. Their uploaded
 image or audio bytes are not encrypted by this field protocol. Requests with
 multipart media and all-field encryption are refused until encrypted media
-uploads are supported. This includes every V3 media upload and V1/V2 uploads
-with `X-Encrypt-All-Fields: true`.
+uploads are supported.
 
 Rerank results are sorted by relevance inside the model proxy before scores are
 encrypted. Gateways preserve that ordering.
@@ -106,16 +105,14 @@ fields, with filtering inside nested containers. Engine extensions such as
 are removed. Standard output logprob tokens and bytes remain encrypted.
 Response IDs, model identifiers, usage counts, and completion controls remain visible.
 
-For encrypted requests in every version, upstream HTTP and SSE errors use a
+For encrypted requests, upstream HTTP and SSE errors use a
 fixed message and safe status/type information.
 
 ## Compatibility
 
-V1/v2 select the extended field policy with `X-Encrypt-All-Fields`; non-empty
-protected strings must decrypt successfully. Without that flag, legacy
-extended fields keep their existing behavior.
-V3 requires support in the model proxy and any gateway on the request path.
-Clients must not downgrade to an older protocol version on failure.
+Field encryption requires an explicit `X-Encryption-Version: 3`. Requests that
+select an earlier version or omit the version while requesting field encryption
+receive HTTP 400. Requests without field encryption can omit the version.
 
 A replay with the original reply key can still be processed; its response is
 encrypted to that key. Replay prevention and authentication of other request

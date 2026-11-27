@@ -1451,6 +1451,7 @@ async fn send_upstream(
                     avoid: &avoid,
                     engine: &engine,
                     tier,
+                    hold_pin_at_limit: false,
                 };
                 pool.select_excluding(failed, &policy)
             };
@@ -7023,6 +7024,7 @@ data: [DONE]
             avoid: &avoid,
             engine: &engine,
             tier: None,
+            hold_pin_at_limit: false,
         };
         let picked = pool
             .select_with_preference_bounded(None, 0, &policy)

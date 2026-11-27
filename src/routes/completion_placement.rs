@@ -1,6 +1,6 @@
 use crate::admission::{Permit, RejectReason};
 use crate::backend_affinity::{ConversationKey, ReplicaHint};
-use crate::backend_pool::{BackendGuard, Policy};
+use crate::backend_pool::{BackendGuard, Policy, SelectionRefusal};
 use crate::context_tier::{ContextTier, TierDecision};
 use crate::error::AppError;
 use crate::model_list::ModelView;
@@ -35,18 +35,25 @@ pub(super) fn place_completion(
     let limits = model.admission.backend_limits(model.backend_pool);
     let mut restrict = tier.and_then(|decision| decision.restrict);
     let requested_tier = tier.map(|decision| decision.estimated);
+    let avoid = |index: usize| model.admission.backend_saturated(index);
+    let engine = |index: usize| model.admission.engine(index);
+    let policy_for = |tier| Policy {
+        max_conns: state.config.backend_max_inflight,
+        max_conns_by_backend: limits.as_deref(),
+        requested_tier,
+        avoid: &avoid,
+        engine: &engine,
+        tier,
+        hold_pin_at_limit: model.affinity_hold_at_limit,
+    };
     let place = |tier| {
-        let policy = Policy {
-            max_conns: state.config.backend_max_inflight,
-            max_conns_by_backend: limits.as_deref(),
-            requested_tier,
-            avoid: &|index| model.admission.backend_saturated(index),
-            engine: &|index| model.admission.engine(index),
-            tier,
-        };
-        model
-            .backend_affinity
-            .place(model.backend_pool, affinity_key, hint, path, &policy)
+        model.backend_affinity.try_place(
+            model.backend_pool,
+            affinity_key,
+            hint,
+            path,
+            &policy_for(tier),
+        )
     };
 
     let mut placement = place(restrict);
@@ -54,7 +61,7 @@ pub(super) fn place_completion(
     // marked unhealthy. Fall back to the remaining fleet rather than refuse
     // (non-strict only: strict's `recheck_restriction` never returns `None`,
     // so this never widens the search there).
-    if placement.is_none()
+    if placement.is_err()
         && restrict.is_some_and(|tier| {
             crate::context_tier::recheck_restriction(model.backend_pool, tier, strict).is_none()
         })
@@ -63,8 +70,8 @@ pub(super) fn place_completion(
         placement = place(None);
     }
     let placement = match placement {
-        Some(placement) => placement,
-        None => {
+        Ok(placement) => placement,
+        Err(refusal) => {
             // `restrict` can only still be `Some(tier)` here with `tier`
             // truly empty in strict mode (non-strict already cleared it
             // above whenever that was the reason placement failed): refuse
@@ -89,9 +96,11 @@ pub(super) fn place_completion(
                     }
                 }
             }
-            return Err(AppError::from(
-                model.admission.reject(RejectReason::HostShare),
-            ));
+            // The reason is the selection's own, not a re-read of the load.
+            return Err(AppError::from(model.admission.reject(match refusal {
+                SelectionRefusal::PinnedAtLimit => RejectReason::PinnedHostLimit,
+                SelectionRefusal::Other => RejectReason::HostShare,
+            })));
         }
     };
     if let Some(permit) = admission.as_ref() {

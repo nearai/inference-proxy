@@ -113,6 +113,9 @@ pub enum RejectReason {
     LongReserve,
     /// Every backend is at its per-host share (or steered around).
     HostShare,
+    /// The conversation's pinned backend is at its per-host share and the
+    /// gateway holds the pin there (`VLLM_BACKEND_AFFINITY_HOLD_AT_LIMIT`).
+    PinnedHostLimit,
     /// Every healthy backend recently rejected at engine admission.
     BackendQueue,
     /// The lane's own time-to-first-generation is above the bound.
@@ -129,6 +132,7 @@ impl RejectReason {
             RejectReason::Budget => "budget",
             RejectReason::LongReserve => "long_reserve",
             RejectReason::HostShare => "host_share",
+            RejectReason::PinnedHostLimit => "pinned_host_limit",
             RejectReason::BackendQueue => "backend_queue",
             RejectReason::Ttft => "ttft",
             RejectReason::TierUnavailable => "tier_unavailable",

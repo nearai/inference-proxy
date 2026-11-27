@@ -4280,6 +4280,7 @@ dependencies = [
  "hkdf",
  "http-body 1.0.1",
  "http-body-util",
+ "ipnet",
  "jiff",
  "k256",
  "metrics",

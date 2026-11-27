@@ -781,6 +781,8 @@ fn skip_inner_header(name: &[u8], relay_outer_bearer: bool) -> bool {
         .any(|field| name.eq_ignore_ascii_case(field))
         || is_inner_correlation_header(name)
         || (relay_outer_bearer && is_trusted_caller_header(name))
+        || name.eq_ignore_ascii_case(b"x-forwarded-for")
+        || name.eq_ignore_ascii_case(b"x-real-ip")
 }
 
 /// Headers honoured only from a trusted (config-token) caller, plus the inner
@@ -935,6 +937,14 @@ mod tests {
     use futures_util::io::Cursor as FuturesCursor;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn inner_client_address_headers_are_never_forwarded() {
+        for name in ["X-Forwarded-For", "X-Real-IP"] {
+            assert!(skip_inner_header(name.as_bytes(), true));
+            assert!(skip_inner_header(name.as_bytes(), false));
+        }
+    }
 
     #[test]
     fn inner_correlation_headers_are_never_forwarded() {

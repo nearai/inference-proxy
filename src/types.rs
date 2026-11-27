@@ -23,6 +23,11 @@ pub struct AttestationReport {
     pub nvidia_payload: String,
     pub event_log: serde_json::Value,
     pub info: serde_json::Value,
+    /// dstack `Attest` output (hex) on CPU TEEs other than Intel TDX, e.g.
+    /// AMD SEV-SNP. `intel_quote` is empty and `event_log` is `[]` then; the
+    /// attestation carries the platform report and its event log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dstack_attestation: Option<String>,
     /// SHA-256 hash of the TLS certificate's SPKI, if configured.
     /// When present, report_data[..32] = SHA256(signing_address_bytes || cert_fingerprint_bytes).
     #[serde(skip_serializing_if = "Option::is_none")]

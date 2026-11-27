@@ -171,6 +171,18 @@ impl DstackClient {
         Ok(InfoResponse::validated_from_value(response)?)
     }
 
+    /// `Info` as untyped JSON, with `tcb_info` decoded from its JSON string.
+    /// Unlike `info()`, it does not require the TDX measurement fields, which
+    /// are null on other platforms (e.g. AMD SEV-SNP).
+    pub async fn info_raw(&self) -> Result<Value> {
+        let mut response: Value = self.send_rpc_request("/Info", &json!({})).await?;
+        if let Some(tcb_info) = response.get("tcb_info").and_then(Value::as_str) {
+            let parsed: Value = serde_json::from_str(tcb_info)?;
+            response["tcb_info"] = parsed;
+        }
+        Ok(response)
+    }
+
     /// Query the guest-agent version.
     ///
     /// Returns `Ok(VersionResponse)` on OS >= 0.5.7.

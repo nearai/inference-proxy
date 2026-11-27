@@ -316,6 +316,7 @@ fn bench_attestation_cache_operations(c: &mut Criterion) {
         .to_string(),
         event_log: serde_json::json!({"entries": []}),
         info: serde_json::json!({"version": "1.0"}),
+        dstack_attestation: None,
         tls_cert_fingerprint: None,
     };
     rt.block_on(cache.set("ecdsa", false, report.clone(), None, None));
@@ -360,6 +361,7 @@ fn bench_attestation_report_serialization(c: &mut Criterion) {
             {"type": "measure", "data": "another event"},
         ]}),
         info: serde_json::json!({"version": "1.0", "tcb": "123"}),
+        dstack_attestation: None,
         tls_cert_fingerprint: None,
     };
 

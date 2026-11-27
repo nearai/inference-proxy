@@ -360,7 +360,7 @@ mod nacl_v2 {
 
 mod ecies {
     use aes_gcm::{
-        aead::{Aead, AeadCore, KeyInit, OsRng, Payload},
+        aead::{Aead, KeyInit, Nonce, Payload},
         Aes256Gcm,
     };
     use hkdf::Hkdf;
@@ -395,7 +395,7 @@ mod ecies {
 
         let cipher =
             Aes256Gcm::new_from_slice(&aes_key).map_err(|e| format!("AES key init failed: {e}"))?;
-        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let nonce = Nonce::<Aes256Gcm>::generate();
         let ciphertext = cipher
             .encrypt(
                 &nonce,
@@ -432,8 +432,9 @@ mod ecies {
 
         let ephemeral_pub = PublicKey::from_sec1_bytes(&data[..65])
             .map_err(|e| format!("Invalid ephemeral public key: {e}"))?;
-        #[allow(deprecated)] // generic-array 0.x from_slice deprecation; fixed when deps upgrade
-        let nonce = aes_gcm::Nonce::from_slice(&data[65..77]);
+        let nonce: &Nonce<Aes256Gcm> = data[65..77]
+            .try_into()
+            .expect("nonce slice is exactly 12 bytes");
         let ciphertext = &data[77..];
 
         // Perform ECDH using the server's secret key

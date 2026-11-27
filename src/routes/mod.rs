@@ -271,7 +271,13 @@ pub fn build_router() -> Router<AppState> {
         .route(ROUTE_OHTTP_WELL_KNOWN, get(ohttp::ohttp_config))
         .route(ROUTE_OHTTP_CONFIG, get(ohttp::ohttp_config));
     // Authenticated endpoints, the internal route and the OHTTP relay.
-    with_post_routes(router, false).fallback(unknown_route)
+    // Direct access gets the deprecation headers (`direct_deprecation`); list
+    // mode only runs as a gateway lane, so it has no such layer.
+    with_post_routes(router, false)
+        .fallback(unknown_route)
+        .layer(axum::middleware::from_fn(
+            crate::direct_deprecation::notice_middleware,
+        ))
 }
 
 #[cfg(test)]

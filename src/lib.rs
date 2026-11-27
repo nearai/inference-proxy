@@ -14,6 +14,7 @@ pub mod cache_salt;
 pub mod config;
 pub mod content_policy;
 pub mod context_tier;
+pub mod direct_deprecation;
 pub mod encryption;
 pub mod engine_load;
 pub mod error;

@@ -98,6 +98,9 @@ pub struct ModelConfig {
     pub admission_max_inflight: u32,
     pub admission_start_inflight: u32,
     pub admission_queue_saturated_at: u32,
+    /// Hold a pinned conversation at its backend's limit instead of moving
+    /// it (`affinity_hold_at_limit`).
+    pub affinity_hold_at_limit: bool,
     pub admission_tier_borrowing: bool,
     pub admission_long_max_inflight_per_host: u32,
     pub admission_long_reserved_inflight: u32,
@@ -153,6 +156,7 @@ impl std::fmt::Debug for ModelConfig {
                 "admission_queue_saturated_at",
                 &self.admission_queue_saturated_at,
             )
+            .field("affinity_hold_at_limit", &self.affinity_hold_at_limit)
             .field("admission_tier_borrowing", &self.admission_tier_borrowing)
             .field(
                 "admission_long_max_inflight_per_host",
@@ -229,6 +233,7 @@ pub struct ModelDefaults {
     /// entry then starts at its own maximum, as a single model does.
     pub admission_start_inflight: Option<u32>,
     pub admission_queue_saturated_at: u32,
+    pub affinity_hold_at_limit: bool,
     pub admission_tier_borrowing: bool,
     pub admission_long_max_inflight_per_host: u32,
     pub admission_long_reserved_inflight: u32,
@@ -286,6 +291,7 @@ struct ModelEntry {
     admission_max_inflight: Option<u32>,
     admission_start_inflight: Option<u32>,
     admission_queue_saturated_at: Option<u32>,
+    affinity_hold_at_limit: Option<bool>,
     capacity_requests_per_minute: Option<u64>,
     discount_to_user: Option<f64>,
     reasoning_off_effort: Option<String>,
@@ -517,6 +523,9 @@ fn resolve(
         admission_queue_saturated_at: entry
             .admission_queue_saturated_at
             .unwrap_or(defaults.admission_queue_saturated_at),
+        affinity_hold_at_limit: entry
+            .affinity_hold_at_limit
+            .unwrap_or(defaults.affinity_hold_at_limit),
         admission_tier_borrowing: false,
         admission_long_max_inflight_per_host: 0,
         admission_long_reserved_inflight: 0,
@@ -840,6 +849,7 @@ impl ServedModel {
             reasoning_effort_map: (!self.config.reasoning_effort_map.is_empty())
                 .then_some(&self.config.reasoning_effort_map),
             merge_system_messages: self.config.merge_system_messages,
+            affinity_hold_at_limit: self.config.affinity_hold_at_limit,
             trusted_by_backends: self.config.backend_token.is_some(),
             discount_to_user: self.config.discount_to_user,
         }
@@ -868,6 +878,10 @@ pub struct ModelView<'a> {
     /// The model's `merge_system_messages`. Always `false` for the single
     /// model: the key exists in a list only.
     pub merge_system_messages: bool,
+    /// Hold a pinned conversation at its backend's limit
+    /// (`VLLM_BACKEND_AFFINITY_HOLD_AT_LIMIT`, or the model's
+    /// `affinity_hold_at_limit`).
+    pub affinity_hold_at_limit: bool,
     /// A backend token is configured: the backends are inference-proxies
     /// that trust this process, i.e. it runs as a gateway lane.
     pub trusted_by_backends: bool,
@@ -888,6 +902,7 @@ impl<'a> ModelView<'a> {
             reasoning_off_effort: &state.config.reasoning_off_effort,
             reasoning_effort_map: None,
             merge_system_messages: false,
+            affinity_hold_at_limit: state.config.affinity_hold_at_limit,
             trusted_by_backends: state.config.backend_token.is_some(),
             discount_to_user: state.config.discount_to_user,
         }

@@ -118,6 +118,7 @@ fn omitted_keys_fall_back_to_the_process_level_values() {
         admission_max_inflight: 48,
         admission_start_inflight: Some(24),
         admission_queue_saturated_at: 4,
+        affinity_hold_at_limit: false,
         admission_tier_borrowing: true,
         admission_long_max_inflight_per_host: 12,
         admission_long_reserved_inflight: 8,

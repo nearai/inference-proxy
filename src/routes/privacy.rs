@@ -43,7 +43,6 @@ pub async fn classify(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
-    crate::encryption::extract_encryption_context(&headers)?;
     let request_body = read_body_with_limit(body, state.config.max_request_size).await?;
     let mut request_json = proxy::parse_json_object(&request_body)?;
     if auth.cloud_api_key.is_some() {

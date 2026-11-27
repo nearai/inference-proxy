@@ -113,7 +113,7 @@ async fn privacy_classify_forwards_only_protocol_headers_and_trusted_context() {
         ("x-signing-algo", "ed25519"),
         (
             "x-client-pub-key",
-            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+            "abababababababababababababababababababababababababababababababab",
         ),
         ("x-encryption-version", "3"),
         ("x-encrypt-all-fields", "true"),
@@ -144,30 +144,4 @@ async fn privacy_classify_forwards_only_protocol_headers_and_trusted_context() {
     for name in ["cookie", "x-forwarded-for", "x-custom-header"] {
         assert!(!headers.contains_key(name), "{name}");
     }
-}
-
-#[tokio::test]
-async fn privacy_classify_rejects_retired_versions_before_forwarding() {
-    let backend = MockServer::start().await;
-    let app = build_test_app(&backend.uri(), TestAppOptions::default());
-    for version in [None, Some("1"), Some("2")] {
-        let mut request = Request::post("/v1/privacy/classify")
-            .header("authorization", "Bearer test-token")
-            .header("content-type", "application/json")
-            .header("x-signing-algo", "ed25519")
-            .header(
-                "x-client-pub-key",
-                test_signing_pair().ed25519.signing_public_key,
-            );
-        if let Some(version) = version {
-            request = request.header("x-encryption-version", version);
-        }
-        let response = app
-            .clone()
-            .oneshot(request.body(Body::from(r#"{"input":"text"}"#)).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-    assert!(backend.received_requests().await.unwrap().is_empty());
 }

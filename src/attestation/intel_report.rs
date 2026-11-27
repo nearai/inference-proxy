@@ -8,10 +8,12 @@ use std::io::Cursor;
 const MAX_ATTESTATION_BYTES: usize = 10 * 1024 * 1024;
 const RUNTIME_EVENT: u32 = 0x0800_0001;
 
-/// Serialization used by the guest's GetQuote event log.
+/// Intel `GetQuote` event log format for the dstack guest agent version.
 #[derive(Clone, Copy)]
 pub(super) enum IntelEventLogFormat {
+    /// dstack 0.5.x returns an empty digest for runtime events.
     Before06,
+    /// The format introduced in dstack 0.6.x keeps runtime digests and the `ACPI DATA` marker.
     Since06,
 }
 

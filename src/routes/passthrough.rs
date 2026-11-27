@@ -653,8 +653,7 @@ fn refuse_media_with_all_fields(
     file_name: Option<&str>,
     content_type: Option<&str>,
 ) -> Result<(), AppError> {
-    let all_fields = enc_ctx.is_some_and(|ctx| ctx.all_fields());
-    if all_fields && is_media_part(name, file_name, content_type) {
+    if enc_ctx.is_some() && is_media_part(name, file_name, content_type) {
         return Err(AppError::BadRequest(
             ENCRYPTED_MEDIA_UNSUPPORTED.to_string(),
         ));
@@ -732,12 +731,10 @@ mod tests {
         assert!(validate_image_count(Endpoint::Embeddings, &serde_json::json!({"n": 32})).is_ok());
     }
 
-    fn ctx(version: u8, encrypt_all_fields: bool) -> encryption::EncryptionContext {
+    fn ctx() -> encryption::EncryptionContext {
         encryption::EncryptionContext {
             algo: encryption::EncryptionAlgo::Ed25519,
             client_pub_key: vec![0; 32],
-            version,
-            encrypt_all_fields,
         }
     }
 
@@ -771,21 +768,11 @@ mod tests {
         let refuse = |enc: Option<&encryption::EncryptionContext>| {
             refuse_media_with_all_fields(enc, media.0, media.1, media.2)
         };
-        // No encryption, and v1/v2 without the all-field flag: unchanged.
         assert!(refuse(None).is_ok());
-        assert!(refuse(Some(&ctx(1, false))).is_ok());
-        assert!(refuse(Some(&ctx(2, false))).is_ok());
-        // All-field mode in every version.
-        for enc in [ctx(1, true), ctx(2, true), ctx(3, false), ctx(3, true)] {
-            match refuse(Some(&enc)) {
-                Err(AppError::BadRequest(message)) => {
-                    assert_eq!(message, ENCRYPTED_MEDIA_UNSUPPORTED);
-                    assert!(!message.contains("synthetic.bin"));
-                }
-                other => panic!("v{}: unexpected {other:?}", enc.version),
-            }
-        }
+        assert!(
+            matches!(refuse(Some(&ctx())), Err(AppError::BadRequest(message)) if message == ENCRYPTED_MEDIA_UNSUPPORTED)
+        );
         // Plain form values are still accepted in all-field mode.
-        assert!(refuse_media_with_all_fields(Some(&ctx(1, true)), "model", None, None).is_ok());
+        assert!(refuse_media_with_all_fields(Some(&ctx()), "model", None, None).is_ok());
     }
 }

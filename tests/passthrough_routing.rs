@@ -3,7 +3,6 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use sha2::{Digest, Sha256};
 use tower::ServiceExt;
-use vllm_proxy_rs::encryption;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -242,7 +241,7 @@ async fn override_multipart_passthrough_uses_plain_client_without_backend_bearer
 }
 
 #[tokio::test]
-async fn encrypted_image_edit_signature_hashes_raw_request_and_response() {
+async fn image_edit_signature_hashes_raw_request_and_response() {
     let backend = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/images/edits"))
@@ -254,34 +253,19 @@ async fn encrypted_image_edit_signature_hashes_raw_request_and_response() {
         .mount(&backend)
         .await;
     let app = build_test_app(&backend.uri(), TestAppOptions::default());
-    let signing = test_signing_pair();
-    let public_key = signing.ed25519.signing_public_key.clone();
-    let encryption_context = encryption::EncryptionContext {
-        algo: encryption::EncryptionAlgo::Ed25519,
-        client_pub_key: hex::decode(&public_key).unwrap(),
-        version: 1,
-        encrypt_all_fields: false,
-    };
-    let encrypted_prompt =
-        encryption::encrypt_string("edit this", &encryption_context, &signing).unwrap();
-    let boundary = "EncryptedImageBoundary";
+    let prompt = "edit this";
+    let boundary = "ImageEditBoundary";
     let body = format!(
         "--{boundary}\r\n\
          Content-Disposition: form-data; name=\"prompt\"\r\n\r\n\
-         {encrypted_prompt}\r\n\
+         {prompt}\r\n\
          --{boundary}\r\n\
          Content-Disposition: form-data; name=\"image\"; filename=\"image.png\"\r\n\
          Content-Type: image/png\r\n\r\n\
          fakepngdata\r\n\
          --{boundary}--\r\n"
     );
-    let mut request = multipart_request("/v1/images/edits", boundary, body);
-    request
-        .headers_mut()
-        .insert("x-signing-algo", "ed25519".parse().unwrap());
-    request
-        .headers_mut()
-        .insert("x-client-pub-key", public_key.parse().unwrap());
+    let request = multipart_request("/v1/images/edits", boundary, body);
 
     let response = app.clone().oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -300,7 +284,7 @@ async fn encrypted_image_edit_signature_hashes_raw_request_and_response() {
         .as_str()
         .unwrap()
         .to_string();
-    let request_bytes = format!("{encrypted_prompt}fakepngdata");
+    let request_bytes = format!("{prompt}fakepngdata");
     assert_eq!(
         signed_text,
         format!(

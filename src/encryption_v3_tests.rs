@@ -54,9 +54,9 @@ fn encrypt_request(
                 .unwrap()
                 .try_into()
                 .unwrap();
-            nacl_v2::encrypt_with_aad(
+            ed25519_suite::encrypt_with_aad(
                 text.as_bytes(),
-                &nacl::ed25519_public_to_x25519(&public).unwrap(),
+                &ed25519_suite::ed25519_public_to_x25519(&public).unwrap(),
                 &aad,
             )
             .unwrap()
@@ -66,7 +66,7 @@ fn encrypt_request(
 }
 
 #[test]
-fn shared_vectors_bind_canonical_reply_key_and_reject_downgrade() {
+fn shared_vectors_bind_canonical_reply_key() {
     for vector in vectors() {
         let server = pair(&hex::decode(vector["model_secret"].as_str().unwrap()).unwrap());
         let ctx = context(&vector, None);
@@ -85,11 +85,6 @@ fn shared_vectors_bind_canonical_reply_key_and_reject_downgrade() {
                 raw.request_aad(field).unwrap()
             );
             assert!(decrypt_string_for_field(ciphertext, &raw, &server, field).is_ok());
-        }
-        for version in [1, 2] {
-            let mut downgraded = ctx.clone();
-            downgraded.version = version;
-            assert!(decrypt_string_for_field(ciphertext, &downgraded, &server, field).is_err());
         }
         let mut replaced = ctx.clone();
         replaced.client_pub_key = hex::decode(vector["model_public"].as_str().unwrap()).unwrap();
@@ -218,12 +213,6 @@ fn v3_encrypts_json_and_stream_fields_regardless_of_flag() {
         let client = pair(&hex::decode(vector["reply_secret"].as_str().unwrap()).unwrap());
         for flag in [None, Some("false"), Some("true")] {
             let ctx = context(&vector, flag);
-            assert!(ctx.encrypt_all_fields);
-            // Response wire format remains v2 (empty AAD).
-            let response_ctx = EncryptionContext {
-                version: 2,
-                ..ctx.clone()
-            };
             for stream in [false, true] {
                 let key = if stream { "delta" } else { "message" };
                 let mut response = json!({"choices":[{key:{"content":"answer","refusal":"no","tool_calls":[{"function":{"name":"tool","arguments":"{}"}}],"function_call":{"name":"old","arguments":"{}"}},"logprobs":{"content":[{"token":"secret","bytes":[115],"top_logprobs":[{"token":"other","bytes":[111]}]}]}}, {"logprobs":{"refusal":[{"token":"hidden","bytes":[104]}]}}]});
@@ -260,10 +249,7 @@ fn v3_encrypts_json_and_stream_fields_regardless_of_flag() {
                 ] {
                     let cipher = response.pointer(&path).unwrap().as_str().unwrap();
                     assert_ne!(cipher, expected);
-                    assert_eq!(
-                        decrypt_string(cipher, &response_ctx, &client).unwrap(),
-                        expected
-                    );
+                    assert_eq!(decrypt_string(cipher, &ctx, &client).unwrap(), expected);
                 }
             }
         }
@@ -273,7 +259,7 @@ fn v3_encrypts_json_and_stream_fields_regardless_of_flag() {
 #[test]
 fn malformed_version_does_not_select_legacy() {
     let vector = vectors().remove(0);
-    for version in ["invalid", "", "4"] {
+    for version in ["invalid", "", "1", "2", "4"] {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("x-signing-algo", "ecdsa".parse().unwrap());
         headers.insert(
@@ -333,10 +319,6 @@ fn v3_protects_other_endpoint_fields_and_completion_logprobs() {
             decrypt_request_fields(&mut body, endpoint, &ctx, &server).unwrap();
             assert_eq!(body.pointer(path).unwrap(), &vector["plaintext"]);
         }
-        let response_ctx = EncryptionContext {
-            version: 2,
-            ..ctx.clone()
-        };
         let logprobs =
             json!({"tokens":["private token"],"top_logprobs":[{"private alternative":-1.0}]});
         for stream in [false, true] {
@@ -348,7 +330,7 @@ fn v3_protects_other_endpoint_fields_and_completion_logprobs() {
             }
             let clear = decrypt_string(
                 body["choices"][0]["logprobs"].as_str().unwrap(),
-                &response_ctx,
+                &ctx,
                 &client,
             )
             .unwrap();
@@ -358,41 +340,31 @@ fn v3_protects_other_endpoint_fields_and_completion_logprobs() {
 }
 
 #[test]
-fn v3_completion_metadata_options_keep_legacy_compatibility() {
+fn v3_completion_metadata_options_are_validated() {
     let vector = vectors().remove(0);
     let server = pair(&hex::decode(vector["model_secret"].as_str().unwrap()).unwrap());
-    for version in [1, 2, 3] {
-        let ctx = EncryptionContext {
-            version,
-            ..context(&vector, None)
-        };
-        for endpoint in [Endpoint::ChatCompletions, Endpoint::Completions] {
-            for (field, value) in [
-                ("return_token_ids", json!(true)),
-                ("return_token_ids", json!("true")),
-                ("return_prompt_text", json!(true)),
-                ("prompt_logprobs", json!(0)),
-                ("prompt_logprobs", json!(1)),
-            ] {
-                let mut request = json!({field: value});
-                let result = decrypt_request_fields(&mut request, endpoint, &ctx, &server);
-                if version == 3 {
-                    assert!(
-                        matches!(result, Err(AppError::BadRequest(message)) if message.contains(field))
-                    );
-                } else {
-                    result.unwrap();
-                    assert_eq!(request[field], value);
-                }
-            }
-            let mut request = json!({
-                "return_token_ids": false,
-                "return_prompt_text": null,
-                "prompt_logprobs": null,
-                "logprobs": true,
-            });
-            decrypt_request_fields(&mut request, endpoint, &ctx, &server).unwrap();
+    let ctx = context(&vector, None);
+    for endpoint in [Endpoint::ChatCompletions, Endpoint::Completions] {
+        for (field, value) in [
+            ("return_token_ids", json!(true)),
+            ("return_token_ids", json!("true")),
+            ("return_prompt_text", json!(true)),
+            ("prompt_logprobs", json!(0)),
+            ("prompt_logprobs", json!(1)),
+        ] {
+            let mut request = json!({field: value});
+            let result = decrypt_request_fields(&mut request, endpoint, &ctx, &server);
+            assert!(
+                matches!(result, Err(AppError::BadRequest(message)) if message.contains(field))
+            );
         }
+        let mut request = json!({
+            "return_token_ids": false,
+            "return_prompt_text": null,
+            "prompt_logprobs": null,
+            "logprobs": true,
+        });
+        decrypt_request_fields(&mut request, endpoint, &ctx, &server).unwrap();
     }
 }
 
@@ -412,43 +384,34 @@ fn v3_removes_completion_metadata_from_json_and_sse() {
         "future_engine_field": "private value",
         "prompt_logprobs": [{"101": {"decoded_token": "private", "logprob": -1.0}}],
     });
-    for version in [1, 2, 3] {
-        let ctx = EncryptionContext {
-            version,
-            ..context(&vector, None)
-        };
-        for endpoint in [Endpoint::ChatCompletions, Endpoint::Completions] {
-            for stream in [false, true] {
-                let key = if stream { "delta" } else { "message" };
-                let mut choice = metadata.clone();
-                choice[key] = metadata.clone();
-                choice["index"] = json!(0);
-                let mut response = metadata.clone();
-                response["choices"] = json!([choice]);
-                response["id"] = json!("chat-test");
-                response["usage"] = json!({"prompt_tokens": 2});
-                if stream {
-                    encrypt_streaming_chunk(&mut response, endpoint, &ctx, &server).unwrap();
-                } else {
-                    encrypt_response_fields(&mut response, endpoint, &ctx, &server).unwrap();
-                }
-                for object in [
-                    &response,
-                    &response["choices"][0],
-                    &response["choices"][0][key],
-                ] {
-                    for (field, expected) in metadata.as_object().unwrap() {
-                        if version == 3 {
-                            assert!(object.get(field).is_none(), "{endpoint:?}: {field}");
-                        } else {
-                            assert_eq!(&object[field], expected);
-                        }
-                    }
-                }
-                assert_eq!(response["id"], "chat-test");
-                assert_eq!(response["usage"]["prompt_tokens"], 2);
-                assert_eq!(response["choices"][0]["index"], 0);
+    let ctx = context(&vector, None);
+    for endpoint in [Endpoint::ChatCompletions, Endpoint::Completions] {
+        for stream in [false, true] {
+            let key = if stream { "delta" } else { "message" };
+            let mut choice = metadata.clone();
+            choice[key] = metadata.clone();
+            choice["index"] = json!(0);
+            let mut response = metadata.clone();
+            response["choices"] = json!([choice]);
+            response["id"] = json!("chat-test");
+            response["usage"] = json!({"prompt_tokens": 2});
+            if stream {
+                encrypt_streaming_chunk(&mut response, endpoint, &ctx, &server).unwrap();
+            } else {
+                encrypt_response_fields(&mut response, endpoint, &ctx, &server).unwrap();
             }
+            for object in [
+                &response,
+                &response["choices"][0],
+                &response["choices"][0][key],
+            ] {
+                for field in metadata.as_object().unwrap().keys() {
+                    assert!(object.get(field).is_none(), "{endpoint:?}: {field}");
+                }
+            }
+            assert_eq!(response["id"], "chat-test");
+            assert_eq!(response["usage"]["prompt_tokens"], 2);
+            assert_eq!(response["choices"][0]["index"], 0);
         }
     }
 }
@@ -508,63 +471,45 @@ fn v3_encrypts_rerank_scores() {
     for vector in vectors() {
         let server = pair(&hex::decode(vector["model_secret"].as_str().unwrap()).unwrap());
         let client = pair(&hex::decode(vector["reply_secret"].as_str().unwrap()).unwrap());
-        for version in [2, 3] {
-            let ctx = EncryptionContext {
-                version,
-                ..context(&vector, None)
-            };
-            let mut response = json!({"results":[{"index":0,"relevance_score":0.25,"document":{"text":"document"}},{"index":1,"relevance_score":0.75}]});
-            encrypt_response_fields(&mut response, Endpoint::Rerank, &ctx, &server).unwrap();
-            if version == 3 {
-                let response_ctx = EncryptionContext { version: 2, ..ctx };
-                assert_eq!(
-                    decrypt_string(
-                        response["results"][0]["relevance_score"].as_str().unwrap(),
-                        &response_ctx,
-                        &client
-                    )
-                    .unwrap(),
-                    "0.75"
-                );
-            } else {
-                assert_eq!(response["results"][0]["relevance_score"], 0.25);
-            }
-            assert_eq!(
-                response["results"][0]["index"],
-                if version == 3 { 1 } else { 0 }
-            );
-        }
+        let ctx = context(&vector, None);
+        let mut response = json!({"results":[{"index":0,"relevance_score":0.25,"document":{"text":"document"}},{"index":1,"relevance_score":0.75}]});
+        encrypt_response_fields(&mut response, Endpoint::Rerank, &ctx, &server).unwrap();
+        assert_eq!(
+            decrypt_string(
+                response["results"][0]["relevance_score"].as_str().unwrap(),
+                &ctx,
+                &client
+            )
+            .unwrap(),
+            "0.75"
+        );
+        assert_eq!(response["results"][0]["index"], 1);
     }
 }
 
 #[test]
-fn encrypted_error_events_use_fixed_messages_in_every_version() {
+fn encrypted_error_events_use_fixed_messages() {
     let vector = vectors().remove(0);
     let server = pair(&hex::decode(vector["model_secret"].as_str().unwrap()).unwrap());
-    for version in [1, 2, 3] {
-        let ctx = EncryptionContext {
-            version,
-            ..context(&vector, None)
-        };
-        for error in [
-            json!({"error":{"message":"private value","type":"private type","code":400},"extra":"private value"}),
-            json!({"object":"error","message":"private value","type":"BadRequestError"}),
-        ] {
-            for streaming in [false, true] {
-                let mut value = error.clone();
-                if streaming {
-                    encrypt_streaming_chunk(&mut value, Endpoint::ChatCompletions, &ctx, &server)
-                        .unwrap();
-                } else {
-                    encrypt_response_fields(&mut value, Endpoint::ChatCompletions, &ctx, &server)
-                        .unwrap();
-                }
-                assert_eq!(
-                    value["error"]["message"],
-                    crate::error::E2EE_UPSTREAM_MESSAGE
-                );
-                assert!(!value.to_string().contains("private"));
+    let ctx = context(&vector, None);
+    for error in [
+        json!({"error":{"message":"private value","type":"private type","code":400},"extra":"private value"}),
+        json!({"object":"error","message":"private value","type":"BadRequestError"}),
+    ] {
+        for streaming in [false, true] {
+            let mut value = error.clone();
+            if streaming {
+                encrypt_streaming_chunk(&mut value, Endpoint::ChatCompletions, &ctx, &server)
+                    .unwrap();
+            } else {
+                encrypt_response_fields(&mut value, Endpoint::ChatCompletions, &ctx, &server)
+                    .unwrap();
             }
+            assert_eq!(
+                value["error"]["message"],
+                crate::error::E2EE_UPSTREAM_MESSAGE
+            );
+            assert!(!value.to_string().contains("private"));
         }
     }
 }

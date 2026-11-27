@@ -1433,17 +1433,18 @@ async fn e2ee_without_encrypt_all_fields_encrypts_tool_result() {
     let enc_for_request = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
-        version: 1,
-        encrypt_all_fields: false,
     };
     let dec_for_response = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: client_pub_bytes,
-        version: 1,
-        encrypt_all_fields: false,
     };
-    let encrypted_content =
-        encryption::encrypt_string("hello", &enc_for_request, &client_pair).unwrap();
+    let encrypted_content = encryption::encrypt_request_field(
+        "hello",
+        &enc_for_request,
+        &client_pair,
+        "messages[].content",
+    )
+    .unwrap();
 
     let request_body = serde_json::json!({
         "model": "test-model",
@@ -1459,6 +1460,7 @@ async fn e2ee_without_encrypt_all_fields_encrypts_tool_result() {
                 .uri("/v1/chat/completions")
                 .header("authorization", "Bearer test-token")
                 .header("content-type", "application/json")
+                .header("x-encryption-version", "3")
                 .header("x-signing-algo", "ed25519")
                 .header("x-client-pub-key", &client_pub_hex)
                 // NOTE: deliberately NOT setting `x-encrypt-all-fields`.

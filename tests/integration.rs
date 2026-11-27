@@ -2627,19 +2627,19 @@ async fn test_tool_call_arguments_are_normalized_after_decryption() {
     let enc = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
-        version: 1,
-        encrypt_all_fields: true,
     };
-    let seal = |plain: &str| encryption::encrypt_string(plain, &enc, &client_pair).unwrap();
+    let seal = |plain: &str, label: &str| {
+        encryption::encrypt_request_field(plain, &enc, &client_pair, label).unwrap()
+    };
 
     let request_body = serde_json::json!({
         "model": "test-model",
         "messages": [
-            {"role": "user", "content": seal("time?")},
+            {"role": "user", "content": seal("time?", "messages[].content")},
             {"role": "assistant", "content": null, "tool_calls": [
-                {"id": "call_1", "type": "function", "function": {"name": seal("get_time"), "arguments": seal("")}}
+                {"id": "call_1", "type": "function", "function": {"name": seal("get_time", "messages[].tool_calls[].function.name"), "arguments": seal("", "messages[].tool_calls[].function.arguments")}}
             ]},
-            {"role": "tool", "tool_call_id": "call_1", "content": seal("12:00")}
+            {"role": "tool", "tool_call_id": "call_1", "content": seal("12:00", "messages[].content")}
         ],
         "stream": false
     });
@@ -2651,6 +2651,7 @@ async fn test_tool_call_arguments_are_normalized_after_decryption() {
                 .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
                 .header(auth_header().0, auth_header().1)
+                .header("x-encryption-version", "3")
                 .header("x-signing-algo", "ed25519")
                 .header("x-client-pub-key", &client_pub_hex)
                 .header("x-encrypt-all-fields", "true")
@@ -2775,10 +2776,13 @@ async fn test_non_object_json_body_is_rejected_before_dispatch() {
             .header("content-type", "application/json")
             .header("authorization", "Bearer sk-test-valid-key-12345678901");
         if encrypted {
-            request = request.header("x-signing-algo", "ed25519").header(
-                "x-client-pub-key",
-                test_client_signing_pair().ed25519.signing_public_key,
-            );
+            request = request
+                .header("x-encryption-version", "3")
+                .header("x-signing-algo", "ed25519")
+                .header(
+                    "x-client-pub-key",
+                    test_client_signing_pair().ed25519.signing_public_key,
+                );
         }
         app.clone().oneshot(request.body(Body::from(body)).unwrap())
     };
@@ -3882,6 +3886,7 @@ async fn test_encrypted_rerank_rejects_too_many_documents_before_decrypt() {
                 .uri("/v1/rerank")
                 .header("content-type", "application/json")
                 .header(auth_header().0, auth_header().1)
+                .header("x-encryption-version", "3")
                 .header("x-signing-algo", "ed25519")
                 .header("x-client-pub-key", &client_pub_hex)
                 .body(Body::from(rerank_request_with_documents(
@@ -6284,20 +6289,21 @@ async fn test_encrypted_chat_non_streaming_ed25519() {
     let enc_for_request = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
-        version: 1,
-        encrypt_all_fields: false,
     };
 
     let dec_for_response = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: client_pub_bytes,
-        version: 1,
-        encrypt_all_fields: false,
     };
 
     // Encrypt the message content (client encrypts with server's pub key)
-    let encrypted_content =
-        encryption::encrypt_string("Hi", &enc_for_request, &client_pair).unwrap();
+    let encrypted_content = encryption::encrypt_request_field(
+        "Hi",
+        &enc_for_request,
+        &client_pair,
+        "messages[].content",
+    )
+    .unwrap();
 
     let request_body = serde_json::json!({
         "model": "test-model",
@@ -6312,6 +6318,7 @@ async fn test_encrypted_chat_non_streaming_ed25519() {
                 .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
                 .header(auth_header().0, auth_header().1)
+                .header("x-encryption-version", "3")
                 .header("x-signing-algo", "ed25519")
                 .header("x-client-pub-key", &client_pub_hex)
                 .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
@@ -6338,8 +6345,6 @@ async fn test_encrypted_chat_non_streaming_ed25519() {
     let wrong_ctx = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: hex::decode(&server_pub_hex).unwrap(),
-        version: 1,
-        encrypt_all_fields: false,
     };
     assert!(
         encryption::decrypt_string(encrypted_response, &wrong_ctx, &server_pair).is_err(),
@@ -6370,18 +6375,17 @@ async fn test_encrypted_chat_image_validation_rejects_decrypted_bad_image() {
     let enc_for_request = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
-        version: 1,
-        encrypt_all_fields: false,
     };
 
     let content = serde_json::json!([
         {"type": "text", "text": "what is this"},
         {"type": "image_url", "image_url": {"url": "file:///etc/passwd"}}
     ]);
-    let encrypted_content = encryption::encrypt_string(
+    let encrypted_content = encryption::encrypt_request_field(
         &serde_json::to_string(&content).unwrap(),
         &enc_for_request,
         &client_pair,
+        "messages[].content",
     )
     .unwrap();
 
@@ -6398,6 +6402,7 @@ async fn test_encrypted_chat_image_validation_rejects_decrypted_bad_image() {
                 .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
                 .header(auth_header().0, auth_header().1)
+                .header("x-encryption-version", "3")
                 .header("x-signing-algo", "ed25519")
                 .header("x-client-pub-key", &client_pub_hex)
                 .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
@@ -6444,17 +6449,19 @@ async fn test_encrypted_chat_streaming_ed25519() {
     let enc_for_request = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
-        version: 1,
-        encrypt_all_fields: false,
     };
     let dec_for_response = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: client_pub_bytes,
-        version: 1,
-        encrypt_all_fields: false,
     };
 
-    let encrypted_msg = encryption::encrypt_string("Hi", &enc_for_request, &client_pair).unwrap();
+    let encrypted_msg = encryption::encrypt_request_field(
+        "Hi",
+        &enc_for_request,
+        &client_pair,
+        "messages[].content",
+    )
+    .unwrap();
 
     let request_body = serde_json::json!({
         "model": "test-model",
@@ -6469,6 +6476,7 @@ async fn test_encrypted_chat_streaming_ed25519() {
                 .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
                 .header(auth_header().0, auth_header().1)
+                .header("x-encryption-version", "3")
                 .header("x-signing-algo", "ed25519")
                 .header("x-client-pub-key", &client_pub_hex)
                 .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
@@ -6590,6 +6598,7 @@ async fn test_encryption_invalid_algo_returns_400() {
                 .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
                 .header(auth_header().0, auth_header().1)
+                .header("x-encryption-version", "3")
                 .header("x-signing-algo", "rsa")
                 .header("x-client-pub-key", "aa".repeat(32))
                 .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
@@ -6656,18 +6665,15 @@ async fn test_encrypted_completions_ed25519() {
     let enc_for_request = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
-        version: 1,
-        encrypt_all_fields: false,
     };
     let dec_for_response = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: client_pub_bytes,
-        version: 1,
-        encrypt_all_fields: false,
     };
 
     let encrypted_prompt =
-        encryption::encrypt_string("Once upon a", &enc_for_request, &client_pair).unwrap();
+        encryption::encrypt_request_field("Once upon a", &enc_for_request, &client_pair, "prompt")
+            .unwrap();
 
     let request_body = serde_json::json!({
         "model": "test-model",
@@ -6682,6 +6688,7 @@ async fn test_encrypted_completions_ed25519() {
                 .uri("/v1/completions")
                 .header("content-type", "application/json")
                 .header(auth_header().0, auth_header().1)
+                .header("x-encryption-version", "3")
                 .header("x-signing-algo", "ed25519")
                 .header("x-client-pub-key", &client_pub_hex)
                 .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
@@ -6732,19 +6739,21 @@ async fn test_encrypted_signature_covers_plaintext() {
     let enc_for_request = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
-        version: 1,
-        encrypt_all_fields: false,
     };
 
     // Context for decrypting response (uses client's pub key, matching what the server sees)
     let dec_for_response = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: client_pub_bytes,
-        version: 1,
-        encrypt_all_fields: false,
     };
 
-    let encrypted_msg = encryption::encrypt_string("Hi", &enc_for_request, &client_pair).unwrap();
+    let encrypted_msg = encryption::encrypt_request_field(
+        "Hi",
+        &enc_for_request,
+        &client_pair,
+        "messages[].content",
+    )
+    .unwrap();
 
     let request_body = serde_json::json!({
         "model": "test-model",
@@ -6760,6 +6769,7 @@ async fn test_encrypted_signature_covers_plaintext() {
                 .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
                 .header(auth_header().0, auth_header().1)
+                .header("x-encryption-version", "3")
                 .header("x-signing-algo", "ed25519")
                 .header("x-client-pub-key", &client_pub_hex)
                 .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
@@ -6855,12 +6865,15 @@ async fn test_encrypted_streaming_signature_covers_transformed_bytes() {
     let enc_for_request = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
-        version: 1,
-        encrypt_all_fields: false,
     };
 
-    let encrypted_msg =
-        encryption::encrypt_string("Hello", &enc_for_request, &client_pair).unwrap();
+    let encrypted_msg = encryption::encrypt_request_field(
+        "Hello",
+        &enc_for_request,
+        &client_pair,
+        "messages[].content",
+    )
+    .unwrap();
 
     let request_body = serde_json::json!({
         "model": "test-model",
@@ -6876,6 +6889,7 @@ async fn test_encrypted_streaming_signature_covers_transformed_bytes() {
                 .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
                 .header(auth_header().0, auth_header().1)
+                .header("x-encryption-version", "3")
                 .header("x-signing-algo", "ed25519")
                 .header("x-client-pub-key", &client_pub_hex)
                 .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
@@ -6959,18 +6973,19 @@ async fn test_encrypted_chat_non_streaming_ecdsa() {
     let enc_for_request = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ecdsa,
         client_pub_key: server_ecdsa_pub,
-        version: 1,
-        encrypt_all_fields: false,
     };
     let dec_for_response = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ecdsa,
         client_pub_key: client_ecdsa_pub,
-        version: 1,
-        encrypt_all_fields: false,
     };
 
-    let encrypted_content =
-        encryption::encrypt_string("ECDSA test", &enc_for_request, &client_pair).unwrap();
+    let encrypted_content = encryption::encrypt_request_field(
+        "ECDSA test",
+        &enc_for_request,
+        &client_pair,
+        "messages[].content",
+    )
+    .unwrap();
 
     let request_body = serde_json::json!({
         "model": "test-model",
@@ -6985,6 +7000,7 @@ async fn test_encrypted_chat_non_streaming_ecdsa() {
                 .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
                 .header(auth_header().0, auth_header().1)
+                .header("x-encryption-version", "3")
                 .header("x-signing-algo", "ecdsa")
                 .header("x-client-pub-key", &client_ecdsa_pub_hex)
                 .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
@@ -7034,13 +7050,15 @@ async fn test_encrypted_embeddings_ed25519() {
     let enc_for_request = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
-        version: 1,
-        encrypt_all_fields: false,
     };
 
     // Each string element is individually encrypted (matching Python proxy)
-    let enc_hello = encryption::encrypt_string("hello", &enc_for_request, &client_pair).unwrap();
-    let enc_world = encryption::encrypt_string("world", &enc_for_request, &client_pair).unwrap();
+    let enc_hello =
+        encryption::encrypt_request_field("hello", &enc_for_request, &client_pair, "input")
+            .unwrap();
+    let enc_world =
+        encryption::encrypt_request_field("world", &enc_for_request, &client_pair, "input")
+            .unwrap();
 
     let request_body = serde_json::json!({
         "model": "test-model",
@@ -7054,6 +7072,7 @@ async fn test_encrypted_embeddings_ed25519() {
                 .uri("/v1/embeddings")
                 .header("content-type", "application/json")
                 .header(auth_header().0, auth_header().1)
+                .header("x-encryption-version", "3")
                 .header("x-signing-algo", "ed25519")
                 .header("x-client-pub-key", &client_pub_hex)
                 .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
@@ -7073,8 +7092,6 @@ async fn test_encrypted_embeddings_ed25519() {
     let dec_ctx = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: hex::decode(&client_pub_hex).unwrap(),
-        version: 1,
-        encrypt_all_fields: false,
     };
     let decrypted =
         encryption::decrypt_string(encrypted_embedding, &dec_ctx, &client_pair).unwrap();
@@ -7111,18 +7128,15 @@ async fn test_encrypted_images_generations_ed25519() {
     let enc_for_request = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
-        version: 1,
-        encrypt_all_fields: false,
     };
     let dec_for_response = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: client_pub_bytes,
-        version: 1,
-        encrypt_all_fields: false,
     };
 
     let encrypted_prompt =
-        encryption::encrypt_string("a cat", &enc_for_request, &client_pair).unwrap();
+        encryption::encrypt_request_field("a cat", &enc_for_request, &client_pair, "prompt")
+            .unwrap();
 
     let request_body = serde_json::json!({
         "model": "test-model",
@@ -7136,6 +7150,7 @@ async fn test_encrypted_images_generations_ed25519() {
                 .uri("/v1/images/generations")
                 .header("content-type", "application/json")
                 .header(auth_header().0, auth_header().1)
+                .header("x-encryption-version", "3")
                 .header("x-signing-algo", "ed25519")
                 .header("x-client-pub-key", &client_pub_hex)
                 .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
@@ -7187,18 +7202,15 @@ async fn test_encrypted_streaming_completions_ed25519() {
     let enc_for_request = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
-        version: 1,
-        encrypt_all_fields: false,
     };
     let dec_for_response = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: client_pub_bytes,
-        version: 1,
-        encrypt_all_fields: false,
     };
 
     let encrypted_prompt =
-        encryption::encrypt_string("Once upon", &enc_for_request, &client_pair).unwrap();
+        encryption::encrypt_request_field("Once upon", &enc_for_request, &client_pair, "prompt")
+            .unwrap();
 
     let request_body = serde_json::json!({
         "model": "test-model",
@@ -7213,6 +7225,7 @@ async fn test_encrypted_streaming_completions_ed25519() {
                 .uri("/v1/completions")
                 .header("content-type", "application/json")
                 .header(auth_header().0, auth_header().1)
+                .header("x-encryption-version", "3")
                 .header("x-signing-algo", "ed25519")
                 .header("x-client-pub-key", &client_pub_hex)
                 .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
@@ -7240,126 +7253,6 @@ async fn test_encrypted_streaming_completions_ed25519() {
             }
         }
     }
-}
-
-// ---- Multipart: signature covers raw request and encrypted response ----
-
-#[tokio::test]
-async fn test_encrypted_audio_transcription_signature_hashes_raw_request_and_response() {
-    use sha2::{Digest, Sha256};
-    use vllm_proxy_rs::encryption;
-
-    let mock_server = MockServer::start().await;
-    let client_pair = test_client_signing_pair();
-
-    let backend_response = serde_json::json!({
-        "id": "trans-enc1",
-        "text": "Hello world",
-        "usage": {"type": "duration", "seconds": 1}
-    });
-
-    Mock::given(method("POST"))
-        .and(path("/v1/audio/transcriptions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&backend_response))
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app(&mock_server.uri());
-
-    let server_pub_hex = test_ed25519_pub_key_hex();
-    let server_pub_bytes = hex::decode(&server_pub_hex).unwrap();
-    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
-    let client_pub_bytes = hex::decode(&client_pub_hex).unwrap();
-
-    let enc_for_request = encryption::EncryptionContext {
-        algo: encryption::EncryptionAlgo::Ed25519,
-        client_pub_key: server_pub_bytes,
-        version: 1,
-        encrypt_all_fields: false,
-    };
-    let dec_for_response = encryption::EncryptionContext {
-        algo: encryption::EncryptionAlgo::Ed25519,
-        client_pub_key: client_pub_bytes,
-        version: 1,
-        encrypt_all_fields: false,
-    };
-
-    // Encrypt the prompt field
-    let encrypted_prompt =
-        encryption::encrypt_string("transcribe this", &enc_for_request, &client_pair).unwrap();
-
-    let boundary = "----TestBoundary99999";
-    let body = format!(
-        "--{boundary}\r\n\
-         Content-Disposition: form-data; name=\"model\"\r\n\r\n\
-         whisper-1\r\n\
-         --{boundary}\r\n\
-         Content-Disposition: form-data; name=\"prompt\"\r\n\r\n\
-         {encrypted_prompt}\r\n\
-         --{boundary}\r\n\
-         Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n\
-         Content-Type: audio/wav\r\n\r\n\
-         fakeaudiodata\r\n\
-         --{boundary}--\r\n"
-    );
-
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/audio/transcriptions")
-                .header(
-                    "content-type",
-                    format!("multipart/form-data; boundary={boundary}"),
-                )
-                .header(auth_header().0, auth_header().1)
-                .header("x-signing-algo", "ed25519")
-                .header("x-client-pub-key", &client_pub_hex)
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-
-    // Collect raw response bytes to hash what the client receives
-    let response_bytes = body_to_bytes(response).await;
-    let body_json: serde_json::Value = serde_json::from_slice(&response_bytes).unwrap();
-
-    // Verify the text field is encrypted and can be decrypted
-    let encrypted_text = body_json["text"].as_str().unwrap();
-    assert_ne!(encrypted_text, "Hello world");
-    let decrypted =
-        encryption::decrypt_string(encrypted_text, &dec_for_response, &client_pair).unwrap();
-    assert_eq!(decrypted, "Hello world");
-
-    // Fetch the cached signature
-    let sig_response = app
-        .oneshot(
-            Request::builder()
-                .uri("/v1/signature/trans-enc1?signing_algo=ed25519")
-                .header(auth_header().0, auth_header().1)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(sig_response.status(), StatusCode::OK);
-    let sig_body = body_to_json(sig_response).await;
-    let signed_text = sig_body["text"].as_str().unwrap();
-
-    let request_bytes = format!("whisper-1{encrypted_prompt}fakeaudiodata");
-    assert_eq!(
-        signed_text,
-        format!(
-            "test-model:{}:{}",
-            hex::encode(Sha256::digest(request_bytes)),
-            hex::encode(Sha256::digest(&response_bytes))
-        )
-    );
 }
 
 // ---- Multipart media with all-field encryption ----
@@ -7404,14 +7297,9 @@ async fn mount_multipart_backends(server: &MockServer) {
 
 #[tokio::test]
 async fn multipart_media_with_all_field_encryption_is_refused_before_dispatch() {
-    use vllm_proxy_rs::encryption;
-
     let backend = MockServer::start().await;
     mount_multipart_backends(&backend).await;
     let app = build_test_app(&backend.uri());
-    let client_pair = test_client_signing_pair();
-    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
-    let server_pub = hex::decode(test_ed25519_pub_key_hex()).unwrap();
     let fixture: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/e2ee-v3.json")).unwrap();
     let v3 = &fixture["vectors"][0];
@@ -7441,28 +7329,7 @@ async fn multipart_media_with_all_field_encryption_is_refused_before_dispatch() 
         ),
     ];
 
-    // v1/v2 with `X-Encrypt-All-Fields: true` (a valid encrypted prompt first),
-    // and v3, which always uses the extended field set.
     let mut refused = Vec::new();
-    for version in [1u8, 2] {
-        let seal_ctx = encryption::EncryptionContext {
-            algo: encryption::EncryptionAlgo::Ed25519,
-            client_pub_key: server_pub.clone(),
-            version,
-            encrypt_all_fields: true,
-        };
-        let prompt =
-            encryption::encrypt_string("synthetic prompt", &seal_ctx, &client_pair).unwrap();
-        refused.push((
-            vec![
-                ("x-signing-algo", "ed25519".to_string()),
-                ("x-client-pub-key", client_pub_hex.clone()),
-                ("x-encryption-version", version.to_string()),
-                ("x-encrypt-all-fields", "true".to_string()),
-            ],
-            Some(prompt),
-        ));
-    }
     for flag in [None, Some("false")] {
         let mut headers = vec![
             (
@@ -7478,10 +7345,10 @@ async fn multipart_media_with_all_field_encryption_is_refused_before_dispatch() 
         if let Some(flag) = flag {
             headers.push(("x-encrypt-all-fields", flag.to_string()));
         }
-        refused.push((headers, None));
+        refused.push(headers);
     }
 
-    for (headers, prompt) in &refused {
+    for headers in &refused {
         for (route, media_name, expected_error) in routes {
             let mut request = Request::builder()
                 .method("POST")
@@ -7494,7 +7361,7 @@ async fn multipart_media_with_all_field_encryption_is_refused_before_dispatch() 
             for (name, value) in headers {
                 request = request.header(*name, value);
             }
-            let body = media_form(boundary, prompt.as_deref(), media_name, "synthetic.bin");
+            let body = media_form(boundary, None, media_name, "synthetic.bin");
             let response = app
                 .clone()
                 .oneshot(request.body(Body::from(body)).unwrap())
@@ -7513,364 +7380,34 @@ async fn multipart_media_with_all_field_encryption_is_refused_before_dispatch() 
     }
     assert_eq!(requests_seen(&backend).await, 0, "nothing was dispatched");
 
-    // Controls: no encryption, and v1 encryption without the all-field flag
-    // (only the prompt is encrypted), still reach the backend with the media.
-    let seal_ctx = encryption::EncryptionContext {
-        algo: encryption::EncryptionAlgo::Ed25519,
-        client_pub_key: server_pub,
-        version: 1,
-        encrypt_all_fields: false,
-    };
-    let prompt = encryption::encrypt_string("synthetic prompt", &seal_ctx, &client_pair).unwrap();
-    let controls = [
-        (Vec::new(), None),
-        (
-            vec![
-                ("x-signing-algo", "ed25519".to_string()),
-                ("x-client-pub-key", client_pub_hex.clone()),
-            ],
-            Some(prompt),
-        ),
-    ];
-    for (headers, prompt) in &controls {
-        for (route, media_name) in [
-            ("/v1/images/edits", "image"),
-            ("/v1/audio/transcriptions", "file"),
-        ] {
-            let mut request = Request::builder()
-                .method("POST")
-                .uri(route)
-                .header(
-                    "content-type",
-                    format!("multipart/form-data; boundary={boundary}"),
-                )
-                .header(auth_header().0, auth_header().1);
-            for (name, value) in headers {
-                request = request.header(*name, value);
-            }
-            let body = media_form(boundary, prompt.as_deref(), media_name, "synthetic.bin");
-            let response = app
-                .clone()
-                .oneshot(request.body(Body::from(body)).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "{route} {headers:?}");
-        }
+    for (route, media_name) in [
+        ("/v1/images/edits", "image"),
+        ("/v1/audio/transcriptions", "file"),
+    ] {
+        let request = Request::builder()
+            .method("POST")
+            .uri(route)
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .header(auth_header().0, auth_header().1);
+        let body = media_form(boundary, None, media_name, "synthetic.bin");
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{route}");
     }
     let received = backend.received_requests().await.unwrap();
-    assert_eq!(received.len(), 4);
+    assert_eq!(received.len(), 2);
     for request in &received {
         assert!(String::from_utf8_lossy(&request.body).contains(SYNTHETIC_MEDIA));
     }
 }
 
-#[tokio::test]
-async fn legacy_all_fields_undecryptable_tool_field_is_refused_before_dispatch() {
-    use vllm_proxy_rs::encryption;
-
-    let backend = start_any_post_backend().await;
-    let app = build_test_app(&backend.uri());
-    let client_pair = test_client_signing_pair();
-    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
-    let server_pub = hex::decode(test_ed25519_pub_key_hex()).unwrap();
-    let marker = "synthetic plaintext marker";
-
-    let send = |version: u8, body: serde_json::Value| {
-        let app = app.clone();
-        let client_pub_hex = client_pub_hex.clone();
-        async move {
-            let response = app
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/v1/chat/completions")
-                        .header("content-type", "application/json")
-                        .header(auth_header().0, auth_header().1)
-                        .header("x-signing-algo", "ed25519")
-                        .header("x-client-pub-key", &client_pub_hex)
-                        .header("x-encryption-version", version.to_string())
-                        .header("x-encrypt-all-fields", "true")
-                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            let status = response.status();
-            (
-                status,
-                String::from_utf8(body_to_bytes(response).await).unwrap(),
-            )
-        }
-    };
-
-    for (served, version) in [1u8, 2].into_iter().enumerate() {
-        let ctx = encryption::EncryptionContext {
-            algo: encryption::EncryptionAlgo::Ed25519,
-            client_pub_key: server_pub.clone(),
-            version,
-            encrypt_all_fields: true,
-        };
-        let seal = |plain: &str| encryption::encrypt_string(plain, &ctx, &client_pair).unwrap();
-        let valid = serde_json::json!({
-            "model": "test-model",
-            "stream": false,
-            "messages": [
-                {"role": "user", "content": seal("synthetic question")},
-                {"role": "assistant", "content": null, "tool_calls": [{
-                    "id": "call_1", "type": "function",
-                    "function": {"name": seal("synthetic_tool"), "arguments": seal("{}")}
-                }]},
-                {"role": "tool", "tool_call_id": "call_1", "content": seal("synthetic result")}
-            ],
-            "tools": [{"type": "function", "function": {
-                "name": seal("synthetic_tool"),
-                "description": seal("synthetic description"),
-                "parameters": seal("{\"type\":\"object\"}")
-            }}]
-        });
-
-        for pointer in [
-            "/messages/1/tool_calls/0/function/arguments",
-            "/messages/1/tool_calls/0/function/name",
-            "/tools/0/function/name",
-            "/tools/0/function/description",
-            "/tools/0/function/parameters",
-        ] {
-            for invalid in [marker, "deadbeef"] {
-                let mut body = valid.clone();
-                *body.pointer_mut(pointer).unwrap() = serde_json::json!(invalid);
-                let (status, text) = send(version, body).await;
-                assert_eq!(status, StatusCode::BAD_REQUEST, "v{version} {pointer}");
-                assert!(!text.contains(invalid), "v{version} {pointer}");
-            }
-        }
-        // Only the earlier versions' controls reached the backend.
-        assert_eq!(requests_seen(&backend).await, served, "v{version}");
-
-        // Control: the same request with every field sealed is served, and the
-        // backend sees the decrypted values.
-        let (status, _) = send(version, valid).await;
-        assert_eq!(status, StatusCode::OK, "v{version}");
-        let received = backend.received_requests().await.unwrap();
-        assert_eq!(received.len(), served + 1, "v{version}");
-        let forwarded: serde_json::Value =
-            serde_json::from_slice(&received.last().unwrap().body).unwrap();
-        assert_eq!(
-            forwarded["messages"][1]["tool_calls"][0]["function"]["name"],
-            "synthetic_tool"
-        );
-        assert_eq!(
-            forwarded["tools"][0]["function"]["parameters"],
-            serde_json::json!({"type": "object"})
-        );
-    }
-}
-
-/// End-to-end test: a legacy client sends a Salsa20-encrypted request.
-/// The server's ChaCha20-first decrypt should fall back to Salsa20 and succeed.
-/// The response (encrypted by the server with ChaCha20) should be decryptable by the client.
-#[tokio::test]
-async fn test_encrypted_chat_salsa20_fallback_e2e() {
-    use crypto_box::{
-        aead::{Aead, AeadCore, OsRng},
-        PublicKey, SalsaBox, SecretKey,
-    };
-    use vllm_proxy_rs::encryption;
-
-    let mock_server = MockServer::start().await;
-    let client_pair = test_client_signing_pair();
-
-    let backend_response = serde_json::json!({
-        "id": "chatcmpl-salsa-fallback",
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": "Salsa fallback works!"},
-            "finish_reason": "stop"
-        }],
-        "usage": {"prompt_tokens": 5, "completion_tokens": 4}
-    });
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&backend_response))
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app(&mock_server.uri());
-
-    // Derive server's X25519 public key from its Ed25519 public key
-    let server_pub_hex = test_ed25519_pub_key_hex();
-    let server_ed25519_pub: [u8; 32] = hex::decode(&server_pub_hex).unwrap().try_into().unwrap();
-    let server_x25519_pub = {
-        use ed25519_dalek::VerifyingKey;
-        let vk = VerifyingKey::from_bytes(&server_ed25519_pub).unwrap();
-        vk.to_montgomery().to_bytes()
-    };
-
-    // Encrypt "Hi from legacy client" using SalsaBox (simulating an old client)
-    let recipient = PublicKey::from(server_x25519_pub);
-    let ephemeral_secret = SecretKey::generate(&mut OsRng);
-    let ephemeral_public = ephemeral_secret.public_key();
-    let salsa_box = SalsaBox::new(&recipient, &ephemeral_secret);
-    let nonce = SalsaBox::generate_nonce(&mut OsRng);
-    let ciphertext = salsa_box
-        .encrypt(&nonce, b"Hi from legacy client".as_ref())
-        .unwrap();
-
-    // Wire format: [ephemeral_pubkey(32)][nonce(24)][ciphertext+tag]
-    let mut wire = Vec::with_capacity(32 + 24 + ciphertext.len());
-    wire.extend_from_slice(ephemeral_public.as_bytes());
-    wire.extend_from_slice(&nonce);
-    wire.extend_from_slice(&ciphertext);
-    let encrypted_content = hex::encode(&wire);
-
-    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
-
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": encrypted_content}],
-        "stream": false
-    });
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .header("x-signing-algo", "ed25519")
-                .header("x-client-pub-key", &client_pub_hex)
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "Salsa20-encrypted request should succeed via fallback"
-    );
-
-    let body = body_to_json(response).await;
-    assert_eq!(body["id"], "chatcmpl-salsa-fallback");
-
-    // Response is encrypted with ChaCha20 — client can decrypt with its own keys
-    let encrypted_response = body["choices"][0]["message"]["content"].as_str().unwrap();
-    assert_ne!(encrypted_response, "Salsa fallback works!");
-
-    let client_pub_bytes = hex::decode(&client_pub_hex).unwrap();
-    let dec_for_response = encryption::EncryptionContext {
-        algo: encryption::EncryptionAlgo::Ed25519,
-        client_pub_key: client_pub_bytes,
-        version: 1,
-        encrypt_all_fields: false,
-    };
-    let decrypted =
-        encryption::decrypt_string(encrypted_response, &dec_for_response, &client_pair).unwrap();
-    assert_eq!(decrypted, "Salsa fallback works!");
-}
-
-/// End-to-end test: v2 encryption (X25519 + HKDF + XChaCha20-Poly1305).
-/// Client sends X-Encryption-Version: 2 header, server uses the v2 encrypt/decrypt path.
-#[tokio::test]
-async fn test_encrypted_chat_non_streaming_ed25519_v2() {
-    use vllm_proxy_rs::encryption;
-
-    let mock_server = MockServer::start().await;
-    let client_pair = test_client_signing_pair();
-
-    let backend_response = serde_json::json!({
-        "id": "chatcmpl-v2",
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": "Hello from v2!"},
-            "finish_reason": "stop"
-        }],
-        "usage": {"prompt_tokens": 5, "completion_tokens": 4}
-    });
-
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&backend_response))
-        .mount(&mock_server)
-        .await;
-
-    let app = build_test_app(&mock_server.uri());
-
-    let server_pub_hex = test_ed25519_pub_key_hex();
-    let server_pub_bytes = hex::decode(&server_pub_hex).unwrap();
-    let client_pub_hex = client_pair.ed25519.signing_public_key.clone();
-    let client_pub_bytes = hex::decode(&client_pub_hex).unwrap();
-
-    // Encrypt with v2 (HKDF + XChaCha20-Poly1305)
-    let enc_for_request = encryption::EncryptionContext {
-        algo: encryption::EncryptionAlgo::Ed25519,
-        client_pub_key: server_pub_bytes,
-        version: 2,
-        encrypt_all_fields: false,
-    };
-
-    let encrypted_content =
-        encryption::encrypt_string("Hi v2", &enc_for_request, &client_pair).unwrap();
-
-    let request_body = serde_json::json!({
-        "model": "test-model",
-        "messages": [{"role": "user", "content": encrypted_content}],
-        "stream": false
-    });
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header(auth_header().0, auth_header().1)
-                .header("x-signing-algo", "ed25519")
-                .header("x-client-pub-key", &client_pub_hex)
-                .header("x-encryption-version", "2")
-                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_to_json(response).await;
-    assert_eq!(body["id"], "chatcmpl-v2");
-
-    // Response is encrypted with v2 — client can decrypt
-    let encrypted_response = body["choices"][0]["message"]["content"].as_str().unwrap();
-    assert_ne!(encrypted_response, "Hello from v2!");
-
-    let dec_for_response = encryption::EncryptionContext {
-        algo: encryption::EncryptionAlgo::Ed25519,
-        client_pub_key: client_pub_bytes.clone(),
-        version: 2,
-        encrypt_all_fields: false,
-    };
-    let decrypted =
-        encryption::decrypt_string(encrypted_response, &dec_for_response, &client_pair).unwrap();
-    assert_eq!(decrypted, "Hello from v2!");
-
-    // v1 decrypt should NOT work on v2 ciphertext
-    let v1_ctx = encryption::EncryptionContext {
-        algo: encryption::EncryptionAlgo::Ed25519,
-        client_pub_key: client_pub_bytes,
-        version: 1,
-        encrypt_all_fields: false,
-    };
-    assert!(
-        encryption::decrypt_string(encrypted_response, &v1_ctx, &client_pair).is_err(),
-        "v1 decrypt must not work on v2 ciphertext"
-    );
-}
-
-// ---- OHTTP Gateway tests ----
-
-/// Build a test app with OHTTP enabled and a real OhttpGateway in state.
+// OHTTP test helpers
 fn build_test_app_with_ohttp(mock_url: &str) -> axum::Router {
     let base = mock_url.trim_end_matches('/');
 
@@ -10819,8 +10356,6 @@ async fn test_e2ee_v3_authenticates_before_upstream_and_forces_response_encrypti
                 EncryptionAlgo::Ed25519
             },
             client_pub_key: hex::decode(vector["reply_public"].as_str().unwrap()).unwrap(),
-            version: 2,
-            encrypt_all_fields: true,
         };
         for streaming in [false, true] {
             let upstream = MockServer::start().await;
@@ -10867,23 +10402,22 @@ async fn test_e2ee_v3_authenticates_before_upstream_and_forces_response_encrypti
             let body = serde_json::json!({"model":"test-model","messages":[{"role":"user","content":vector["ciphertext"]}],"stream":streaming,"logprobs":true});
             // Wrong reply key and explicit legacy downgrade both stop before inference.
             for (reply, version) in [
-                (vector["model_public"].as_str().unwrap(), "3"),
-                (vector["reply_public"].as_str().unwrap(), "2"),
+                (vector["model_public"].as_str().unwrap(), Some("3")),
+                (vector["reply_public"].as_str().unwrap(), Some("2")),
+                (vector["reply_public"].as_str().unwrap(), Some("1")),
+                (vector["reply_public"].as_str().unwrap(), None),
             ] {
+                let mut request = Request::post("/v1/chat/completions")
+                    .header(auth_header().0, auth_header().1)
+                    .header("content-type", "application/json")
+                    .header("x-signing-algo", algo)
+                    .header("x-client-pub-key", reply);
+                if let Some(version) = version {
+                    request = request.header("x-encryption-version", version);
+                }
                 let result = app
                     .clone()
-                    .oneshot(
-                        Request::builder()
-                            .method("POST")
-                            .uri("/v1/chat/completions")
-                            .header(auth_header().0, auth_header().1)
-                            .header("content-type", "application/json")
-                            .header("x-signing-algo", algo)
-                            .header("x-client-pub-key", reply)
-                            .header("x-encryption-version", version)
-                            .body(Body::from(body.to_string()))
-                            .unwrap(),
-                    )
+                    .oneshot(request.body(Body::from(body.to_string())).unwrap())
                     .await
                     .unwrap();
                 assert_eq!(result.status(), StatusCode::BAD_REQUEST);
@@ -11165,11 +10699,14 @@ async fn guard_runs_on_the_decrypted_body_of_an_encrypted_request() {
     let enc_for_request = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: hex::decode(test_ed25519_pub_key_hex()).unwrap(),
-        version: 1,
-        encrypt_all_fields: false,
     };
-    let encrypted =
-        encryption::encrypt_string("secret prompt", &enc_for_request, &client_pair).unwrap();
+    let encrypted = encryption::encrypt_request_field(
+        "secret prompt",
+        &enc_for_request,
+        &client_pair,
+        "messages[].content",
+    )
+    .unwrap();
 
     let mut statuses = Vec::new();
     for extra in [
@@ -11192,6 +10729,7 @@ async fn guard_runs_on_the_decrypted_body_of_an_encrypted_request() {
                     .uri("/v1/chat/completions")
                     .header("content-type", "application/json")
                     .header(auth_header().0, auth_header().1)
+                    .header("x-encryption-version", "3")
                     .header("x-signing-algo", "ed25519")
                     .header("x-client-pub-key", &client_pub_hex)
                     .body(Body::from(serde_json::to_vec(&body).unwrap()))
@@ -11552,11 +11090,11 @@ async fn backend_lora_embeddings_signature_covers_original_request() {
     let enc_for_request = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: hex::decode(test_ed25519_pub_key_hex()).unwrap(),
-        version: 1,
-        encrypt_all_fields: false,
     };
-    let enc_a = encryption::encrypt_string("hello", &enc_for_request, &client_pair).unwrap();
-    let enc_b = encryption::encrypt_string("world", &enc_for_request, &client_pair).unwrap();
+    let enc_a = encryption::encrypt_request_field("hello", &enc_for_request, &client_pair, "input")
+        .unwrap();
+    let enc_b = encryption::encrypt_request_field("world", &enc_for_request, &client_pair, "input")
+        .unwrap();
     let enc_bytes = format!(
         r#"{{ "model" : "test-model",  "input" : [ {} ,  {} ] }}"#,
         serde_json::to_string(&enc_a).unwrap(),
@@ -11572,6 +11110,7 @@ async fn backend_lora_embeddings_signature_covers_original_request() {
             .header(auth_header().0, auth_header().1);
         if encrypted {
             builder = builder
+                .header("x-encryption-version", "3")
                 .header("x-signing-algo", "ed25519")
                 .header("x-client-pub-key", &client_pub_hex);
         }
@@ -11854,13 +11393,17 @@ async fn size_tier_is_computed_from_the_decrypted_prompt() {
     let enc_for_request = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: hex::decode(test_ed25519_pub_key_hex()).unwrap(),
-        version: 1,
-        encrypt_all_fields: false,
     };
     // "Hi" is 4 estimated tokens (one message); its hex ciphertext is far
     // above the 10-token bound, so tier 0 (bonus 5) proves the estimate read
     // the plaintext, and not what the client put on the wire.
-    let ciphertext = encryption::encrypt_string("Hi", &enc_for_request, &client_pair).unwrap();
+    let ciphertext = encryption::encrypt_request_field(
+        "Hi",
+        &enc_for_request,
+        &client_pair,
+        "messages[].content",
+    )
+    .unwrap();
     assert!(ciphertext.len() > 100);
 
     let app = priority_app(&mock.uri(), Some("10:5,*:0"), false);
@@ -11882,6 +11425,7 @@ async fn size_tier_is_computed_from_the_decrypted_prompt() {
                 .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
                 .header(auth_header().0, auth_header().1)
+                .header("x-encryption-version", "3")
                 .header("x-signing-algo", "ed25519")
                 .header("x-client-pub-key", &client_pair.ed25519.signing_public_key)
                 .body(Body::from(
@@ -12782,8 +12326,6 @@ async fn decrypted_bodies_reach_the_upstream_with_data_urls_only() {
     let enc = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: server_pub_bytes,
-        version: 1,
-        encrypt_all_fields: false,
     };
     let url = format!("{}/media/a.png", backend.uri());
     let content = serde_json::json!([
@@ -12793,12 +12335,12 @@ async fn decrypted_bodies_reach_the_upstream_with_data_urls_only() {
     ]);
     let chat = serde_json::json!({
         "model": "test-model",
-        "messages": [{"role": "user", "content": encryption::encrypt_string(
-            &content.to_string(), &enc, &client_pair).unwrap()}],
+        "messages": [{"role": "user", "content": encryption::encrypt_request_field(
+            &content.to_string(), &enc, &client_pair, "messages[].content").unwrap()}],
     });
     let embeddings = serde_json::json!({
         "model": "test-model",
-        "input": encryption::encrypt_string("hello", &enc, &client_pair).unwrap(),
+        "input": encryption::encrypt_request_field("hello", &enc, &client_pair, "input").unwrap(),
         "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]}],
     });
     for (route, body) in [
@@ -12813,6 +12355,7 @@ async fn decrypted_bodies_reach_the_upstream_with_data_urls_only() {
                     .uri(route)
                     .header("content-type", "application/json")
                     .header(auth_header().0, auth_header().1)
+                    .header("x-encryption-version", "3")
                     .header("x-signing-algo", "ed25519")
                     .header("x-client-pub-key", &client_pub_hex)
                     .body(Body::from(serde_json::to_vec(&body).unwrap()))

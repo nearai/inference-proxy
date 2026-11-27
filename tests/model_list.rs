@@ -1835,10 +1835,11 @@ async fn encrypted_system_messages_are_merged_after_they_are_decrypted() {
     let for_gateway = encryption::EncryptionContext {
         algo: encryption::EncryptionAlgo::Ed25519,
         client_pub_key: hex::decode(&gateway.state.signing.ed25519.signing_public_key).unwrap(),
-        version: 1,
-        encrypt_all_fields: false,
     };
-    let encrypted = |text: &str| encryption::encrypt_string(text, &for_gateway, &client).unwrap();
+    let encrypted = |text: &str| {
+        encryption::encrypt_request_field(text, &for_gateway, &client, "messages[].content")
+            .unwrap()
+    };
     let body = json!({"model": ALPHA, "messages": [
         system(encrypted(FIRST_PROMPT)),
         {"role": "user", "content": encrypted("hello")},
@@ -1849,6 +1850,7 @@ async fn encrypted_system_messages_are_merged_after_they_are_decrypted() {
         .uri(CHAT)
         .header("content-type", "application/json")
         .header("authorization", "Bearer test-token")
+        .header("x-encryption-version", "3")
         .header("x-signing-algo", "ed25519")
         .header("x-client-pub-key", &client.ed25519.signing_public_key)
         .body(Body::from(serde_json::to_vec(&body).unwrap()))

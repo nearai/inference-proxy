@@ -2,7 +2,7 @@ use anyhow::{bail, ensure, Context, Result};
 use dstack_sdk::dstack_client::{AttestResponse, DstackClient};
 use http_client_unix_domain_socket::ErrorAndResponseJson;
 use parity_scale_codec::Decode;
-use serde::{de::IgnoredAny, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 
 const MAX_ATTESTATION_BYTES: usize = 10 * 1024 * 1024;
@@ -78,8 +78,6 @@ struct TdxEvent {
 struct AttestationV1 {
     version: u64,
     platform: TdxPlatform,
-    #[serde(rename = "stack")]
-    _stack: IgnoredAny,
 }
 
 #[derive(Deserialize)]
